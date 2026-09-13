@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -64,18 +65,29 @@ public:
         VernonProgramBundleLoadOptions bundleOptions{};
         bundleOptions.struct_size = sizeof(bundleOptions);
         bundleOptions.bundle_directory = vernon_external_engine::graphics_bundle::kCookedDirectory;
-        try {
-            const auto asset = vernon::runtime::ProgramAsset::load(
-                runtime_, vernon_external_engine::graphics_bundle::kManifest,
-                vernon_external_engine::graphics_bundle::kManifestSize, &bundleOptions);
-            program_.emplace(asset.resolve());
-            instance_ = std::make_unique<vernon::runtime::ProgramInstance>(*program_);
-        } catch (const std::exception &exception) {
-            const std::string diagnostic = vernon_external_engine::programRuntimeError(runtime_);
+        auto assetResult =
+            vernon::runtime::ProgramAsset::load(runtime_, vernon_external_engine::graphics_bundle::kManifest,
+                                                vernon_external_engine::graphics_bundle::kManifestSize, &bundleOptions);
+        if (assetResult.isErr()) {
             std::cerr << "failed to load the Mandelbulb Program: "
-                      << (diagnostic.empty() ? exception.what() : diagnostic) << '\n';
+                      << vernon_external_engine::programRuntimeError(runtime_, assetResult.error()) << '\n';
             return false;
         }
+        auto asset = std::move(assetResult).value();
+        auto executableResult = asset.resolve();
+        if (executableResult.isErr()) {
+            std::cerr << "failed to load the Mandelbulb Program: "
+                      << vernon_external_engine::programRuntimeError(runtime_, executableResult.error()) << '\n';
+            return false;
+        }
+        program_.emplace(std::move(executableResult).value());
+        auto instanceResult = vernon::runtime::ProgramInstance::create(*program_);
+        if (instanceResult.isErr()) {
+            std::cerr << "failed to load the Mandelbulb Program: "
+                      << vernon_external_engine::programRuntimeError(runtime_, instanceResult.error()) << '\n';
+            return false;
+        }
+        instance_.emplace(std::move(instanceResult).value());
         VernonProgramExecutable *pipeline = program_->get();
 
         constexpr std::array<float, 6> positions{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
@@ -138,10 +150,11 @@ public:
         power_ = 8.0F + std::sin(phase * 0.21F) * 0.18F;
         const vernon_external_engine::ProgramGraphicsInvocation graphics{&renderPass_, &drawCommand_, &dynamicState_,
                                                                          renderTargetRevision_};
-        std::string error;
-        if (!vernon_external_engine::invokeProgram(runtime_, *program_, *instance_, arguments_.data(),
-                                                   arguments_.size(), &graphics, error)) {
-            std::cerr << "Mandelbulb Program invocation failed: " << error << '\n';
+        auto invocationResult = vernon_external_engine::invokeProgram(*program_, *instance_, arguments_.data(),
+                                                                      arguments_.size(), &graphics);
+        if (invocationResult.isErr()) {
+            std::cerr << "Mandelbulb Program invocation failed: "
+                      << vernon_external_engine::programRuntimeError(runtime_, invocationResult.error()) << '\n';
             return false;
         }
         if (frame_++ == 0)
@@ -221,7 +234,7 @@ private:
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
     std::optional<vernon::runtime::ProgramExecutable> program_;
-    std::unique_ptr<vernon::runtime::ProgramInstance> instance_;
+    std::optional<vernon::runtime::ProgramInstance> instance_;
     VernonRhiBuffer vertexBuffer_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference vertexReference_{};
     VernonRhiImage image_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};

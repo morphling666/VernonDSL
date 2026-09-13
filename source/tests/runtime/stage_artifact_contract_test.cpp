@@ -76,14 +76,14 @@ TEST(StageArtifactContract, ComparesApiAndCpuHostRequirements) {
 #endif
 #undef VERNON_TEST_TRIPLE_ARCH
 #endif
-    std::string error;
-    EXPECT_TRUE(validateCpuRuntimeRequirements(triple, format, error)) << error;
+    EXPECT_TRUE(validateCpuRuntimeRequirements(triple, format).isOk());
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
-    EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "macho", error));
+    const auto rejected = validateCpuRuntimeRequirements(triple, "macho");
 #else
-    EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "wasm", error));
+    const auto rejected = validateCpuRuntimeRequirements(triple, "wasm");
 #endif
-    EXPECT_NE(error.find("runtime provides"), std::string::npos);
+    ASSERT_TRUE(rejected.isErr());
+    EXPECT_EQ(rejected.error(), vernon::runtime::StageArtifactError::UnsupportedCpuTarget);
 }
 
 TEST(StageArtifactContract, ParsesStructuredLeafPathsAndStaticShapes) {

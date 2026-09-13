@@ -255,7 +255,7 @@ TEST_P(RhiResourceLifetime, FailedCommandDestroyRollsBackAndCanRetry) {
     descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
     VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_TRUE(vernon::rhi::beginProviderRendering(device, encoder));
+    ASSERT_TRUE(vernon::rhi::beginProviderRendering(device, encoder).isOk());
 
     EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(vernonRhiCommandEncoderEndRendering(device, encoder), VERNON_RHI_STATUS_OK);
@@ -331,9 +331,10 @@ TEST_P(RhiResourceLifetime, SubmitMovesRetainedLeaseAndCompletionKeepsOnlyDevice
     barrier.buffer = retained;
     ASSERT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, retained), VERNON_RHI_STATUS_OK);
-    const uint64_t encoderKey = vernon::rhi::commandEncoderKey(device, encoder);
-    ASSERT_NE(encoderKey, 0u);
-    EXPECT_EQ(vernon::rhi::bufferResource(device, retained), 0u);
+    auto encoderKeyResult = vernon::rhi::commandEncoderKey(device, encoder);
+    ASSERT_TRUE(encoderKeyResult.isOk());
+    const uint64_t encoderKey = encoderKeyResult.value();
+    EXPECT_TRUE(vernon::rhi::bufferResource(device, retained).isErr());
     const uint64_t retainedKey =
         (static_cast<uint64_t>(retained.generation) << 32) | (static_cast<uint64_t>(retained.index) + 1);
     EXPECT_TRUE(
@@ -467,8 +468,9 @@ TEST_P(RhiResourceLifetime, ResolveRequiresExactRetainedLeaseAfterPublicDestroy)
     descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
     VernonRhiBuffer buffer{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &buffer), VERNON_RHI_STATUS_OK);
-    const uint64_t key = vernon::rhi::bufferResource(device, buffer);
-    ASSERT_NE(key, 0u);
+    auto keyResult = vernon::rhi::bufferResource(device, buffer);
+    ASSERT_TRUE(keyResult.isOk());
+    const uint64_t key = keyResult.value();
     auto retained = vernon::rhi::retainResource(device, vernon::rhi::ResourceKind::Buffer, key);
     ASSERT_TRUE(retained.isOk());
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);

@@ -22,8 +22,11 @@ std::vector<program_execution::CanonicalValueSnapshot>
 captureValues(const ProgramResidualPlan &plan, const program_execution::ProgramInvocationState &invocation) {
     std::vector<program_execution::CanonicalValueSnapshot> result;
     result.reserve(plan.retainedValues.size());
-    for (uint32_t value : plan.retainedValues)
-        result.push_back(ownRetainedStorage(invocation.snapshotValue(value)));
+    for (uint32_t value : plan.retainedValues) {
+        auto snapshot = invocation.snapshotValue(value);
+        if (snapshot)
+            result.push_back(ownRetainedStorage(std::move(snapshot).value()));
+    }
     return result;
 }
 
@@ -102,8 +105,11 @@ bool RetainedPullbackState::importInto(program_execution::ProgramInvocationState
                                        ProgramTapeScratch &tapeScratch, bool importTape, std::string &error) const {
     if (importTape)
         tapeScratch.importSnapshot(tape_);
-    if (!invocation.importStorageSnapshots(storages_, error))
+    auto importedStorages = invocation.importStorageSnapshots(storages_);
+    if (importedStorages.isErr()) {
+        error = program_execution::programInvocationErrorMessage(importedStorages.error());
         return false;
+    }
     for (const program_execution::CanonicalValueSnapshot &snapshot : values_) {
         if (!importTape) {
             if (snapshot.value < tapeValues_.size() && tapeValues_[snapshot.value])
@@ -118,8 +124,11 @@ bool RetainedPullbackState::importInto(program_execution::ProgramInvocationState
                 snapshot.logical.ownership == program_execution::ProgramValueOwnership::TapeCarrier)
                 continue;
         }
-        if (!invocation.importSnapshot(snapshot, error))
+        auto imported = invocation.importSnapshot(snapshot);
+        if (imported.isErr()) {
+            error = program_execution::programInvocationErrorMessage(imported.error());
             return false;
+        }
     }
     return true;
 }

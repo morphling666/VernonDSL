@@ -350,8 +350,11 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
     auto native = nativeCommandEncoder(adapter, commandEncoder);
     if (!native)
         return RhiAdapterResult<void>{vernon::err(std::move(native).error())};
-    if (std::move(native).value() != reinterpret_cast<uintptr_t>(pipeline->device) ||
-        commandEncoderRendering(adapter, commandEncoder))
+    const uint64_t nativeValue = std::move(native).value();
+    auto rendering = commandEncoderRendering(adapter, commandEncoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (nativeValue != reinterpret_cast<uintptr_t>(pipeline->device) || std::move(rendering).value())
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"cuda_dispatch_command_encoder_is_invalid", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -515,9 +518,10 @@ VernonRuntimeRhiAdapter *createCudaAdapter(std::unique_ptr<rhi_adapter::CudaAdap
 VernonRuntimeRhiAdapter *createCudaRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
     if (backend != VERNON_RHI_BACKEND_CUDA)
         return nullptr;
-    auto *deviceState = static_cast<rhi::cuda::DeviceState *>(rhi::deviceState(device, backend));
-    if (!deviceState)
+    auto resolvedDeviceState = rhi::deviceState(device, backend);
+    if (resolvedDeviceState.isErr())
         return nullptr;
+    auto *deviceState = static_cast<rhi::cuda::DeviceState *>(resolvedDeviceState.value());
     auto state = std::unique_ptr<rhi_adapter::CudaAdapterState>(new (std::nothrow) rhi_adapter::CudaAdapterState());
     if (!state)
         return nullptr;

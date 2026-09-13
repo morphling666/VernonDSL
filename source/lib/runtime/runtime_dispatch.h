@@ -11,6 +11,7 @@
 #include "resolved_stage_invocation.h"
 #include "runtime_state.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,43 +21,49 @@ struct VernonRuntimeContext;
 
 namespace vernon::runtime {
 
+template <typename T> using RuntimeResult = vernon::Result<T, vernon::RuntimeError>;
+
 bool isOpenGLBackend(VernonRuntimeBackend backend);
-bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic);
-bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex);
-bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevice device);
+RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic);
+RuntimeResult<void> initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex);
+RuntimeResult<void> initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevice device);
 void destroyBackend(VernonRuntimeContext &context);
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &capabilities);
-bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
+RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
 
-VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint);
-VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
+RuntimeResult<void> registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint);
+using BackendStageLoadResult = vernon::Result<std::unique_ptr<VernonStageExecutable>, BackendPipelineFailure>;
+BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,
                                                        size_t artifactSize, const std::string &entry,
                                                        VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots);
-bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
-                            VernonStageExecutable &pipeline);
+BackendPipelineResult resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                             VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);
-VernonStatus invokeBackendPipeline(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation,
-                                   const PlannedGraphicsInvocation &plan);
-VernonStatus invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
-VernonStatus executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
-                                         const program::Graph &graph, program_execution::ProgramInvocationState &frame,
-                                         const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
-                                         program_execution::SubmissionState &submission);
+RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline,
+                                          const VernonStageInvocationDescriptor &invocation,
+                                          const PlannedGraphicsInvocation &plan);
+RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
+RuntimeResult<void>
+executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
+                            const program::Graph &graph, program_execution::ProgramInvocationState &frame,
+                            const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+                            program_execution::SubmissionState &submission);
 
-VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
-                                       uint64_t size, VernonRuntimeProviderResourceReference &output);
-bool resolveBackendRhiBufferReference(VernonRuntimeContext &context,
-                                      const VernonRuntimeProviderResourceReference &reference, VernonRhiBuffer &output);
-VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,
-                                          VernonRuntimeProviderResourceReference &output);
-VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhiSampler sampler,
-                                        VernonRuntimeProviderResourceReference &output);
-VernonStatus describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource,
-                                  VernonRuntimeProviderImageDescription &description);
-VernonStatus referenceBackendCommandEncoder(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
-                                            VernonRuntimeProviderObject &output);
+RuntimeResult<VernonRuntimeProviderResourceReference>
+referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size);
+RuntimeResult<VernonRhiBuffer>
+resolveBackendRhiBufferReference(VernonRuntimeContext &context,
+                                 const VernonRuntimeProviderResourceReference &reference);
+RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiImageView(VernonRuntimeContext &context,
+                                                                                   VernonRhiImageView view);
+RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiSampler(VernonRuntimeContext &context,
+                                                                                 VernonRhiSampler sampler);
+RuntimeResult<VernonRuntimeProviderImageDescription>
+describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
+RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
+                                                                          VernonRhiCommandEncoder encoder);
 
 } // namespace vernon::runtime
 

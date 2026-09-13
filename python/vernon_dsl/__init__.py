@@ -4,9 +4,10 @@ The compiler reads source through :mod:`ast`; it never imports or executes the
 input module. These Python objects exist for editor completion and type syntax.
 """
 
-from typing import Annotated
+from importlib import import_module
+from typing import TYPE_CHECKING, Annotated, Any
 
-from . import ad, interop, storage
+from . import ad
 from .compiler import Compiler, compile_file, compile_source
 from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
@@ -48,91 +49,6 @@ from .intrinsics import (
     workgroup_barrier,
     workgroup_storage,
 )
-from .module import Module
-from .program_assets import (
-    ProgramAssetDeclaration,
-    load_program,
-    program_asset,
-)
-from .render import (
-    AttachmentOperation,
-    BlendFactor,
-    BlendOperation,
-    ColorBlendState,
-    ColorWrite,
-    CompareOperation,
-    CullMode,
-    DepthStencilState,
-    DrawCommand,
-    DynamicState,
-    FrontFace,
-    GraphicsPipelineState,
-    GraphicsTargetFormats,
-    IndexBufferView,
-    LoadOperation,
-    PrimitiveTopology,
-    RasterizationState,
-    RenderPass,
-    StencilFaceState,
-    StencilOperation,
-    StoreOperation,
-    clear,
-    clear_depth,
-    color_output,
-    depth_output,
-    discard,
-    draw,
-    dynamic_state,
-    graphics_state,
-    index_buffer,
-    lines,
-    load,
-    points,
-    preserve,
-    render_pass,
-    target_formats,
-    triangles,
-)
-from .runtime import (
-    Architecture,
-    Kernel,
-    Pipeline,
-    RenderTarget,
-    RuntimeConfiguration,
-    RuntimeSession,
-    SamplerState,
-    TensorLayout,
-    TensorStorage,
-    TensorView,
-    Texture,
-    TextureFormat,
-    TextureView,
-    cpu,
-    cuda,
-    current_session,
-    d32_float,
-    d32_float_s8_uint,
-    directx,
-    init,
-    metal,
-    opengl,
-    opengles,
-    pipeline,
-    r8_unorm,
-    r11g11b10_float,
-    r16_float,
-    r32_float,
-    register_external_opengl_context,
-    rg8_unorm,
-    rgb8_unorm,
-    rgba8_srgb,
-    rgba8_unorm,
-    rgba16_float,
-    rgba32_float,
-    sampler,
-    vulkan,
-)
-from .storage import empty, empty_like, from_values, zeros, zeros_like
 from .types import (
     Feature,
     Matrix,
@@ -160,6 +76,200 @@ from .types import (
     varying,
     write,
 )
+
+if TYPE_CHECKING:
+    from . import interop, storage
+    from .module import Module
+    from .program_assets import ProgramAssetDeclaration, load_program, program_asset
+    from .render import (
+        AttachmentOperation,
+        BlendFactor,
+        BlendOperation,
+        ColorBlendState,
+        ColorWrite,
+        CompareOperation,
+        CullMode,
+        DepthStencilState,
+        DrawCommand,
+        DynamicState,
+        FrontFace,
+        GraphicsPipelineState,
+        GraphicsTargetFormats,
+        IndexBufferView,
+        LoadOperation,
+        PrimitiveTopology,
+        RasterizationState,
+        RenderPass,
+        StencilFaceState,
+        StencilOperation,
+        StoreOperation,
+        clear,
+        clear_depth,
+        color_output,
+        depth_output,
+        discard,
+        draw,
+        dynamic_state,
+        graphics_state,
+        index_buffer,
+        lines,
+        load,
+        points,
+        preserve,
+        render_pass,
+        target_formats,
+        triangles,
+    )
+    from .runtime import (
+        Architecture,
+        Kernel,
+        Pipeline,
+        RenderTarget,
+        RuntimeConfiguration,
+        RuntimeSession,
+        SamplerState,
+        TensorLayout,
+        TensorStorage,
+        TensorView,
+        Texture,
+        TextureFormat,
+        TextureView,
+        cpu,
+        cuda,
+        current_session,
+        d32_float,
+        d32_float_s8_uint,
+        directx,
+        init,
+        metal,
+        opengl,
+        opengles,
+        pipeline,
+        r8_unorm,
+        r11g11b10_float,
+        r16_float,
+        r32_float,
+        register_external_opengl_context,
+        rg8_unorm,
+        rgb8_unorm,
+        rgba8_srgb,
+        rgba8_unorm,
+        rgba16_float,
+        rgba32_float,
+        sampler,
+        vulkan,
+    )
+    from .storage import empty, empty_like, from_values, zeros, zeros_like
+
+_LAZY_MODULES = frozenset({"interop", "storage"})
+_LAZY_PROGRAM_ASSET_EXPORTS = frozenset({"ProgramAssetDeclaration", "load_program", "program_asset"})
+_LAZY_RENDER_EXPORTS = frozenset(
+    {
+        "AttachmentOperation",
+        "BlendFactor",
+        "BlendOperation",
+        "ColorBlendState",
+        "ColorWrite",
+        "CompareOperation",
+        "CullMode",
+        "DepthStencilState",
+        "DrawCommand",
+        "DynamicState",
+        "FrontFace",
+        "GraphicsPipelineState",
+        "GraphicsTargetFormats",
+        "IndexBufferView",
+        "LoadOperation",
+        "PrimitiveTopology",
+        "RasterizationState",
+        "RenderPass",
+        "StencilFaceState",
+        "StencilOperation",
+        "StoreOperation",
+        "clear",
+        "clear_depth",
+        "color_output",
+        "depth_output",
+        "discard",
+        "draw",
+        "dynamic_state",
+        "graphics_state",
+        "index_buffer",
+        "lines",
+        "load",
+        "points",
+        "preserve",
+        "render_pass",
+        "target_formats",
+        "triangles",
+    }
+)
+_LAZY_RUNTIME_EXPORTS = frozenset(
+    {
+        "Architecture",
+        "Kernel",
+        "Pipeline",
+        "RenderTarget",
+        "RuntimeConfiguration",
+        "RuntimeSession",
+        "SamplerState",
+        "TensorLayout",
+        "TensorStorage",
+        "TensorView",
+        "Texture",
+        "TextureFormat",
+        "TextureView",
+        "cpu",
+        "cuda",
+        "current_session",
+        "d32_float",
+        "d32_float_s8_uint",
+        "directx",
+        "init",
+        "metal",
+        "opengl",
+        "opengles",
+        "pipeline",
+        "r8_unorm",
+        "r11g11b10_float",
+        "r16_float",
+        "r32_float",
+        "register_external_opengl_context",
+        "rg8_unorm",
+        "rgb8_unorm",
+        "rgba8_srgb",
+        "rgba8_unorm",
+        "rgba16_float",
+        "rgba32_float",
+        "sampler",
+        "vulkan",
+    }
+)
+_LAZY_STORAGE_EXPORTS = frozenset({"empty", "empty_like", "from_values", "zeros", "zeros_like"})
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_MODULES:
+        value = import_module(f".{name}", __name__)
+    elif name == "Module":
+        value = getattr(import_module(".module", __name__), name)
+    elif name in _LAZY_PROGRAM_ASSET_EXPORTS:
+        value = getattr(import_module(".program_assets", __name__), name)
+    elif name in _LAZY_RENDER_EXPORTS:
+        value = getattr(import_module(".render", __name__), name)
+    elif name in _LAZY_RUNTIME_EXPORTS:
+        value = getattr(import_module(".runtime", __name__), name)
+    elif name in _LAZY_STORAGE_EXPORTS:
+        value = getattr(import_module(".storage", __name__), name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__ = [
     "Annotated",

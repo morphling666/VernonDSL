@@ -188,13 +188,16 @@ RhiAdapterResult<void> retainCommandObjects(VernonRuntimeRhiAdapter &adapter, Ve
     pipeline.references.fetch_add(1, std::memory_order_relaxed);
     if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
         releaseCommandPipeline(&pipeline, 0);
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_command_pipeline_cleanup_registration_failed", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_command_pipeline_cleanup_registration_failed", 0, 0}})};
     }
     if (bindings) {
         bindings->references.fetch_add(1, std::memory_order_relaxed);
         if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
             releaseCommandBindings(bindings, 0);
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_command_bindings_cleanup_registration_failed", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"metal_command_bindings_cleanup_registration_failed", 0, 0}})};
         }
     }
     return RhiAdapterResult<void>{vernon::ok()};
@@ -218,30 +221,35 @@ RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProvid
          descriptor->stage != VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) ||
         !stringEquals(descriptor->format, "msl") || !descriptor->data || descriptor->size == 0 ||
         !descriptor->entry.data || descriptor->entry.size == 0)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_shader_descriptor", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_adapter_received_an_invalid_shader_descriptor", 0, 0}})};
     @autoreleasepool {
-        NSString *source = [[NSString alloc] initWithBytes:descriptor->data
-                                                    length:descriptor->size
-                                                  encoding:NSUTF8StringEncoding];
+        NSString *source =
+            [[NSString alloc] initWithBytes:descriptor->data length:descriptor->size encoding:NSUTF8StringEncoding];
         NSString *entry = [[NSString alloc] initWithBytes:descriptor->entry.data
                                                    length:descriptor->entry.size
                                                  encoding:NSUTF8StringEncoding];
         if (!source || !entry)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_shader_source_or_entry_point_is_not_valid_utf8", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_shader_source_or_entry_point_is_not_valid_utf8", 0, 0}})};
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         options.languageVersion = MTLLanguageVersion2_4;
         NSError *error = nil;
         id<MTLLibrary> library = [metalDevice(adapter).device newLibraryWithSource:source options:options error:&error];
         if (!library) {
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"metal_compile_shader_library", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                                            {"metal_compile_shader_library", 0, 0}})};
         }
         id<MTLFunction> function = [library newFunctionWithName:entry];
         if (!function)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_shader_entry_point_was_not_found", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"metal_shader_entry_point_was_not_found", 0, 0}})};
         auto shader = std::unique_ptr<PreparedShader>(new (std::nothrow) PreparedShader());
         if (!shader)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_shader_preparation_ran_out_of_memory", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"metal_shader_preparation_ran_out_of_memory", 0, 0}})};
         shader->library = library;
         shader->function = function;
         shader->stage = descriptor->stage;
@@ -257,7 +265,8 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         (descriptor->binding_count && !descriptor->bindings) ||
         (descriptor->vertex_attribute_count && !descriptor->vertex_attributes))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_pipeline_layout", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_pipeline_layout", 0, 0}})};
     try {
         auto layout = std::make_unique<PreparedLayout>();
         layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
@@ -304,7 +313,9 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                  entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_VERTEX) ||
                 !layout->slotIndices.emplace(entry.slot, index).second ||
                 (argumentResource && !argumentLocations.emplace(entry.stage_mask, entry.set, entry.binding).second))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_layout_contains_an_unsupported_or_duplicate_binding", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_layout_contains_an_unsupported_or_duplicate_binding", 0, 0}})};
             if (argumentResource) {
                 if (bufferKind)
                     argumentBuffers += entry.array_count;
@@ -317,10 +328,13 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
         }
         if ((argumentBuffers || argumentTextures || argumentSamplers) &&
             !metalDevice(adapter).argumentBufferEncodingSupported)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::Unsupported, {"metal_argument_buffer_encoding_is_unavailable_on_this_device", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(
+                vernon::ProviderError{vernon::ProviderErrorCode::Unsupported,
+                                      {"metal_argument_buffer_encoding_is_unavailable_on_this_device", 0, 0}})};
         if (metalDevice(adapter).device.argumentBuffersSupport < MTLArgumentBuffersTier2 &&
             (argumentBuffers > 31 || argumentTextures > 31 || argumentSamplers > 16 || writableTexture))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_layout_requires_argument_buffers_tier_2", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"metal_layout_requires_argument_buffers_tier_2", 0, 0}})};
         for (size_t index = 0; index < descriptor->vertex_attribute_count; ++index) {
             const auto &attribute = descriptor->vertex_attributes[index];
             const bool bindingExists =
@@ -329,14 +343,17 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                 });
             if (!bindingExists || attribute.location >= 31 || attribute.component_count == 0 ||
                 attribute.component_count > 4)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_vertex_attribute_is_invalid_or_references_an_unknown_binding", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"metal_vertex_attribute_is_invalid_or_references_an_unknown_binding", 0, 0}})};
             layout->vertexAttributes.push_back(attribute);
         }
         *output = toHandle(layout.release());
         adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
         return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_layout_preparation_ran_out_of_memory", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_layout_preparation_ran_out_of_memory", 0, 0}})};
     }
 }
 
@@ -460,17 +477,23 @@ RhiAdapterResult<void> initializeArgumentGroupsResult(VernonRuntimeRhiAdapter &a
                 return candidate && candidate->stage == entry.stage_mask;
             });
             if (shader == shaders.end())
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_layout_references_a_missing_shader_stage", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_argument_buffer_layout_references_a_missing_shader_stage", 0, 0}})};
             id<MTLArgumentEncoder> encoder = [(*shader)->function newArgumentEncoderWithBufferIndex:entry.set];
             if (!encoder || encoder.encodedLength == 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_shader_has_no_argument_buffer_at_the_reflected_buffer_index", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"metal_shader_has_no_argument_buffer_at_the_reflected_buffer_index", 0, 0}})};
             argumentGroups.push_back({entry.stage_mask, entry.set, (*shader)->function});
         }
         layout.argumentGroups = std::move(argumentGroups);
         return RhiAdapterResult<void>{vernon::ok()};
     } @catch (NSException *exception) {
         (void)exception;
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_layout_encoding_raised_an_exception", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_argument_buffer_layout_encoding_raised_an_exception", 0, 0}})};
     }
 }
 
@@ -480,11 +503,13 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     PreparedLayout *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || !layout || !descriptor->shaders ||
         descriptor->shader_count == 0)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_pipeline", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_pipeline", 0, 0}})};
     @autoreleasepool {
         auto pipeline = std::unique_ptr<PreparedPipeline>(new (std::nothrow) PreparedPipeline());
         if (!pipeline)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_pipeline_preparation_ran_out_of_memory", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"metal_pipeline_preparation_ran_out_of_memory", 0, 0}})};
         pipeline->owner = &adapter;
         adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
         pipeline->pushConstantSize = layout->pushConstantSize;
@@ -496,12 +521,14 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
             if (!shader || shader->stage != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE ||
                 descriptor->workgroup_size[0] == 0 || descriptor->workgroup_size[1] == 0 ||
                 descriptor->workgroup_size[2] == 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_compute_pipeline", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                      {"metal_adapter_received_an_invalid_compute_pipeline", 0, 0}})};
             auto groupsStatus = initializeArgumentGroupsResult(adapter, *layout, {shader});
             if (!groupsStatus)
                 return groupsStatus;
-            pipeline->compute = [metalDevice(adapter).device newComputePipelineStateWithFunction:shader->function
-                                                                                           error:&error];
+            pipeline->compute =
+                [metalDevice(adapter).device newComputePipelineStateWithFunction:shader->function error:&error];
             if (!pipeline->compute) {
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"metal_create_compute_pipeline", 0, 0}})};
@@ -509,7 +536,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
             const uint64_t total = static_cast<uint64_t>(descriptor->workgroup_size[0]) *
                                    descriptor->workgroup_size[1] * descriptor->workgroup_size[2];
             if (!total || total > pipeline->compute.maxTotalThreadsPerThreadgroup)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_compute_workgroup_exceeds_pipeline_limits", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                      {"metal_compute_workgroup_exceeds_pipeline_limits", 0, 0}})};
             std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
         } else if (descriptor->kind == VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE) {
             PreparedShader *vertex = nullptr;
@@ -522,7 +551,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                     fragment = shader;
             }
             if (!vertex || !fragment)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_is_missing_a_vertex_or_fragment_shader", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_graphics_pipeline_is_missing_a_vertex_or_fragment_shader", 0, 0}})};
             auto groupsStatus = initializeArgumentGroupsResult(adapter, *layout, {vertex, fragment});
             if (!groupsStatus)
                 return groupsStatus;
@@ -543,21 +574,27 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                 !std::isfinite(descriptor->rasterization.depth_bias_slope) ||
                 descriptor->color_blend_count != descriptor->color_format_count ||
                 (descriptor->color_blend_count && !descriptor->color_blends))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_uses_an_unsupported_attachment_configuration", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"metal_graphics_pipeline_uses_an_unsupported_attachment_configuration", 0, 0}})};
             MTLRenderPipelineDescriptor *nativeDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
             nativeDescriptor.vertexFunction = vertex->function;
             nativeDescriptor.fragmentFunction = fragment->function;
             nativeDescriptor.rasterSampleCount = std::max(1u, descriptor->sample_count);
             if (!layout->vertexAttributes.empty()) {
                 if (!descriptor->vertex_strides || descriptor->vertex_stride_count == 0)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_has_no_vertex_strides", 0, 0}})};
+                    return RhiAdapterResult<void>{
+                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                          {"metal_graphics_pipeline_has_no_vertex_strides", 0, 0}})};
                 MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
                 for (const auto &entry : layout->entries) {
                     if (entry.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                         continue;
                     if (entry.binding >= descriptor->vertex_stride_count ||
                         descriptor->vertex_strides[entry.binding] == 0)
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_has_an_invalid_vertex_stride", 0, 0}})};
+                        return RhiAdapterResult<void>{vernon::err(
+                            vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_graphics_pipeline_has_an_invalid_vertex_stride", 0, 0}})};
                     vertexDescriptor.layouts[entry.binding].stride = descriptor->vertex_strides[entry.binding];
                     vertexDescriptor.layouts[entry.binding].stepFunction =
                         entry.divisor ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
@@ -566,7 +603,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                 for (const auto &attribute : layout->vertexAttributes) {
                     const MTLVertexFormat format = vertexFormat(attribute.dtype, attribute.component_count);
                     if (format == MTLVertexFormatInvalid)
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_has_an_unsupported_vertex_format", 0, 0}})};
+                        return RhiAdapterResult<void>{vernon::err(
+                            vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_graphics_pipeline_has_an_unsupported_vertex_format", 0, 0}})};
                     vertexDescriptor.attributes[attribute.location].format = format;
                     vertexDescriptor.attributes[attribute.location].offset = attribute.relative_offset;
                     vertexDescriptor.attributes[attribute.location].bufferIndex = attribute.binding;
@@ -576,7 +615,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
             for (size_t index = 0; index < descriptor->color_format_count; ++index) {
                 const MTLPixelFormat format = static_cast<MTLPixelFormat>(descriptor->color_formats[index]);
                 if (format == MTLPixelFormatInvalid)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_contains_an_invalid_color_format", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(
+                        vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_graphics_pipeline_contains_an_invalid_color_format", 0, 0}})};
                 auto *attachment = nativeDescriptor.colorAttachments[index];
                 attachment.pixelFormat = format;
                 const auto &blend = descriptor->color_blends[index];
@@ -589,7 +630,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                     !blendFactor(blend.destination_alpha_factor, destinationAlpha) ||
                     !blendOperation(blend.color_operation, colorOperation) ||
                     !blendOperation(blend.alpha_operation, alphaOperation))
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_contains_an_invalid_blend_state", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(
+                        vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_graphics_pipeline_contains_an_invalid_blend_state", 0, 0}})};
                 attachment.blendingEnabled = blend.blend_enabled;
                 attachment.sourceRGBBlendFactor = sourceColor;
                 attachment.destinationRGBBlendFactor = destinationColor;
@@ -602,8 +645,8 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
             nativeDescriptor.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(descriptor->depth_stencil_format);
             if (descriptor->depth_stencil_format == MTLPixelFormatDepth32Float_Stencil8)
                 nativeDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-            pipeline->render = [metalDevice(adapter).device newRenderPipelineStateWithDescriptor:nativeDescriptor
-                                                                                           error:&error];
+            pipeline->render =
+                [metalDevice(adapter).device newRenderPipelineStateWithDescriptor:nativeDescriptor error:&error];
             if (!pipeline->render) {
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"metal_create_render_pipeline", 0, 0}})};
@@ -616,7 +659,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                     !compareFunction(state.depth_test ? state.depth_compare : VERNON_RHI_COMPARE_ALWAYS,
                                      depthCompare) ||
                     (state.stencil_test && descriptor->depth_stencil_format != MTLPixelFormatDepth32Float_Stencil8))
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_contains_an_invalid_depth_stencil_state", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::InvalidArgument,
+                        {"metal_graphics_pipeline_contains_an_invalid_depth_stencil_state", 0, 0}})};
                 depthDescriptor.depthCompareFunction = depthCompare;
                 depthDescriptor.depthWriteEnabled = state.depth_write;
                 if (state.stencil_test) {
@@ -624,7 +669,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                     MTLStencilDescriptor *back = [[MTLStencilDescriptor alloc] init];
                     if (!configureStencilFace(state.front, front) || !configureStencilFace(state.back, back) ||
                         state.stencil_read_mask > UINT8_MAX || state.stencil_write_mask > UINT8_MAX)
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_graphics_pipeline_contains_an_unsupported_stencil_state", 0, 0}})};
+                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                            vernon::ProviderErrorCode::InvalidArgument,
+                            {"metal_graphics_pipeline_contains_an_unsupported_stencil_state", 0, 0}})};
                     front.readMask = state.stencil_read_mask;
                     front.writeMask = state.stencil_write_mask;
                     back.readMask = state.stencil_read_mask;
@@ -635,7 +682,8 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                 pipeline->depthStencil =
                     [metalDevice(adapter).device newDepthStencilStateWithDescriptor:depthDescriptor];
                 if (!pipeline->depthStencil)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_depth_state_creation_failed", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::BackendFailure, {"metal_depth_state_creation_failed", 0, 0}})};
             }
             pipeline->colorFormatCount = descriptor->color_format_count;
             for (size_t index = 0; index < descriptor->color_format_count; ++index)
@@ -651,7 +699,9 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
             pipeline->depthBiasSlope = descriptor->rasterization.depth_bias_slope;
             pipeline->graphics = true;
         } else {
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_unknown_pipeline_kind", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_adapter_received_an_unknown_pipeline_kind", 0, 0}})};
         }
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
@@ -666,7 +716,9 @@ RhiAdapterResult<void> createArgumentBuffersResult(VernonRuntimeRhiAdapter &adap
         std::lock_guard<std::mutex> guard(layout.mutex);
         if (layout.argumentGroups.empty()) {
             if (required && std::any_of(layout.entries.begin(), layout.entries.end(), isArgumentResource))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_layout_has_no_prepared_pipeline", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_argument_buffer_layout_has_no_prepared_pipeline", 0, 0}})};
             return RhiAdapterResult<void>{vernon::ok()};
         }
         std::vector<PreparedBindingSet::ArgumentBuffer> argumentBuffers;
@@ -674,14 +726,17 @@ RhiAdapterResult<void> createArgumentBuffersResult(VernonRuntimeRhiAdapter &adap
         for (const auto &group : layout.argumentGroups) {
             id<MTLArgumentEncoder> encoder = [group.function newArgumentEncoderWithBufferIndex:group.index];
             if (!encoder || encoder.encodedLength == 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_could_not_create_an_argument_encoder_for_the_binding_set", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_could_not_create_an_argument_encoder_for_the_binding_set", 0, 0}})};
             argumentBuffers.push_back({group.stage, group.index, encoder, nil});
         }
         output = std::move(argumentBuffers);
         return RhiAdapterResult<void>{vernon::ok()};
     } @catch (NSException *exception) {
         (void)exception;
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_creation_raised_an_exception", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_creation_raised_an_exception", 0, 0}})};
     }
 }
 
@@ -695,7 +750,9 @@ RhiAdapterResult<void> encodeArgumentBuffersResult(VernonRuntimeRhiAdapter &adap
                 [metalDevice(adapter).device newBufferWithLength:argumentBuffer.encoder.encodedLength
                                                          options:MTLResourceStorageModeShared];
             if (!argumentBuffer.buffer)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_argument_buffer_snapshot_allocation_failed", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                      {"metal_argument_buffer_snapshot_allocation_failed", 0, 0}})};
             [argumentBuffer.encoder setArgumentBuffer:argumentBuffer.buffer offset:0];
             for (const auto &slot : slots) {
                 if (!isArgumentResource(slot.layout) || slot.layout.stage_mask != argumentBuffer.stage ||
@@ -731,20 +788,25 @@ RhiAdapterResult<void> encodeArgumentBuffersResult(VernonRuntimeRhiAdapter &adap
         return RhiAdapterResult<void>{vernon::ok()};
     } @catch (NSException *exception) {
         (void)exception;
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_argument_buffer_resource_encoding_raised_an_exception", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_argument_buffer_resource_encoding_raised_an_exception", 0, 0}})};
     }
 }
 
 RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount && !values))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
     std::vector<size_t> valueIndices(bindings.slots.size());
     std::vector<uint8_t> seen(bindings.slots.size());
     for (size_t index = 0; index < valueCount; ++index) {
         const auto found = bindings.layout->slotIndices.find(values[index].slot);
         if (found == bindings.layout->slotIndices.end() || seen[found->second])
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_slot_is_invalid_or_duplicated", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_slot_is_invalid_or_duplicated", 0, 0}})};
         seen[found->second] = 1;
         valueIndices[found->second] = index;
     }
@@ -752,14 +814,20 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
         const auto &slot = bindings.slots[index];
         const auto &value = values[valueIndices[index]];
         if (value.kind != slot.layout.kind)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_kind_does_not_match_the_prepared_layout", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_binding_kind_does_not_match_the_prepared_layout", 0, 0}})};
         if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             if (!value.payload.inline_value.data || value.payload.inline_value.size != slot.layout.element_size)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_inline_binding_has_an_invalid_physical_size", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                      {"metal_inline_binding_has_an_invalid_physical_size", 0, 0}})};
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                    (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE)) {
             if (value.payload.sampler.resource.resource.value)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_default_sampler_binding_also_supplied_a_resource", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"metal_default_sampler_binding_also_supplied_a_resource", 0, 0}})};
         } else {
             const auto *resource = providerBindingResource(value);
             const bool image = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
@@ -768,12 +836,15 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource : kRhiBufferResource;
             if (!resource ||
                 (image ? !isRhiImageReference(*resource) : (resource->identity & kRhiResourceKindMask) != expectedKind))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_resource_binding_has_the_wrong_type_is_stale_or_belongs_to_another_device", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"metal_resource_binding_has_the_wrong_type_is_stale_or_belongs_to_another_device", 0, 0}})};
             auto resolved = resolveRhiResource(adapter, *resource);
             if (!resolved)
                 return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value.payload.buffer.stride == 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_vertex_binding_has_no_stride", 0, 0}})};
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument, {"metal_vertex_binding_has_no_stride", 0, 0}})};
         }
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
@@ -788,7 +859,9 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 slot.inlineBuffer = [metalDevice(adapter).device newBufferWithLength:value.payload.inline_value.size
                                                                              options:MTLResourceStorageModeShared];
                 if (!slot.inlineBuffer)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_inline_argument_buffer_resource_allocation_failed", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(
+                        vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                              {"metal_inline_argument_buffer_resource_allocation_failed", 0, 0}})};
                 std::memcpy(slot.inlineBuffer.contents, value.payload.inline_value.data,
                             value.payload.inline_value.size);
             } else {
@@ -810,7 +883,8 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 descriptor.supportArgumentBuffers = YES;
                 slot.defaultSampler = [metalDevice(adapter).device newSamplerStateWithDescriptor:descriptor];
                 if (!slot.defaultSampler)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_default_sampler_creation_failed", 0, 0}})};
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::BackendFailure, {"metal_default_sampler_creation_failed", 0, 0}})};
             } else {
                 slot.defaultSampler = nil;
             }
@@ -827,7 +901,9 @@ RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimePro
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     PreparedLayout *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || !layout)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
     try {
         auto bindings = std::make_unique<PreparedBindingSet>();
         bindings->layout = layout;
@@ -844,7 +920,8 @@ RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimePro
         adapter.bindingCreations.fetch_add(1, std::memory_order_relaxed);
         return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_binding_set_preparation_ran_out_of_memory", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_binding_set_preparation_ran_out_of_memory", 0, 0}})};
     }
 }
 
@@ -859,20 +936,27 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         (!bindings && pipeline->layout && !pipeline->layout->entries.empty()) || descriptor->group_count[1] == 0 ||
         descriptor->group_count[2] == 0 || descriptor->push_constant_size != pipeline->pushConstantSize ||
         (descriptor->push_constant_size && !descriptor->push_constants))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_dispatch", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_dispatch", 0, 0}})};
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
     const uint64_t native = std::move(nativeCommand).value();
-    if (commandEncoderRendering(adapter, commandEncoder))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_dispatch_command_encoder_is_invalid", 0, 0}})};
+    auto rendering = commandEncoderRendering(adapter, commandEncoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (std::move(rendering).value())
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"metal_dispatch_command_encoder_is_invalid", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_could_not_retain_provider_objects", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_could_not_retain_provider_objects", 0, 0}})};
     id<MTLCommandBuffer> commandBuffer =
         (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     if (!encoder)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_compute_command_encoder_creation_failed", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_compute_command_encoder_creation_failed", 0, 0}})};
     [encoder setComputePipelineState:pipeline->compute];
     std::unique_lock<std::mutex> guard;
     if (bindings)
@@ -909,7 +993,9 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                 continue;
             if (!retainCommandResource(adapter, commandEncoder, slot.resource)) {
                 [encoder endEncoding];
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_could_not_retain_a_bound_resource", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                      {"metal_dispatch_could_not_retain_a_bound_resource", 0, 0}})};
             }
             auto resolution = resolveCommandRhiResource(adapter, commandEncoder, slot.resource);
             if (!resolution) {
@@ -927,7 +1013,9 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
             }
             if ((slot.layout.access & 2u) && !recordCommandWriteResource(adapter, commandEncoder, slot.resource)) {
                 [encoder endEncoding];
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_could_not_track_a_writable_resource", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                      {"metal_dispatch_could_not_track_a_writable_resource", 0, 0}})};
             }
         }
         for (const auto &argumentBuffer : bindings->argumentBuffers)
@@ -941,7 +1029,8 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
             threadsPerThreadgroup:MTLSizeMake(pipeline->workgroup[0], pipeline->workgroup[1], pipeline->workgroup[2])];
     [encoder endEncoding];
     if (!recordProviderCommand(adapter, commandEncoder, false))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_command_encoder_state_changed", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_dispatch_command_encoder_state_changed", 0, 0}})};
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
@@ -1001,7 +1090,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         (descriptor->depth_stencil_view.resource.value && !pipeline->depthStencil) ||
         (!descriptor->depth_stencil_view.resource.value && pipeline->depthStencil) || descriptor->instance_count == 0 ||
         (!descriptor->index_count && descriptor->vertex_count == 0))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_or_unsupported_draw", 0, 0}})};
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_adapter_received_an_invalid_or_unsupported_draw", 0, 0}})};
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
@@ -1009,9 +1100,10 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     auto renderingClaimResult = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingDynamic);
     if (!renderingClaimResult)
         return RhiAdapterResult<void>{vernon::err(std::move(renderingClaimResult).error())};
-    const int renderingClaim = std::move(renderingClaimResult).value();
+    const vernon::rhi::CommandRenderingClaim renderingClaim = std::move(renderingClaimResult).value();
     RenderingClaimRollback renderingClaimRollback{adapter.rhiDevice, commandEncoder.value,
-                                                   vernon::rhi::CommandRenderingDynamic, renderingClaim != 0};
+                                                  vernon::rhi::CommandRenderingDynamic,
+                                                  renderingClaim == vernon::rhi::CommandRenderingClaim::Acquired};
     rhi::metal::RenderingState requested;
     requested.colorCount = descriptor->color_attachment_count;
     requested.hasDepth = descriptor->depth_stencil_view.resource.value != 0;
@@ -1023,7 +1115,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         const auto &source = descriptor->color_attachments[index];
         if (source.location >= pipeline->colorFormatCount || seenLocations[source.location] ||
             !retainCommandResource(adapter, commandEncoder, source.view))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_an_invalid_color_attachment", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_draw_contains_an_invalid_color_attachment", 0, 0}})};
         seenLocations[source.location] = true;
         auto resolution = resolveCommandRhiResource(adapter, commandEncoder, source.view);
         if (!resolution)
@@ -1032,12 +1126,17 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
         if (!texture || texture.pixelFormat != pipeline->colorFormats[source.location] ||
             texture.sampleCount != pipeline->sampleCount)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_an_incompatible_color_attachment", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_draw_contains_an_incompatible_color_attachment", 0, 0}})};
         VernonRhiLoadOperation load = static_cast<VernonRhiLoadOperation>(source.load_operation);
         VernonRhiStoreOperation store = static_cast<VernonRhiStoreOperation>(source.store_operation);
         float clear[4];
         std::copy(std::begin(source.clear_color), std::end(source.clear_color), clear);
-        if (commandEncoderHasRenderingDescriptor(adapter, commandEncoder)) {
+        auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+        if (!hasRenderingDescriptor)
+            return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
+        if (std::move(hasRenderingDescriptor).value()) {
             auto operations = commandColorOperations(adapter, commandEncoder, index, load, store, clear);
             if (!operations)
                 return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
@@ -1062,14 +1161,18 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     uint64_t depthResource = 0;
     if (requested.hasDepth) {
         if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_an_invalid_depth_attachment", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_draw_contains_an_invalid_depth_attachment", 0, 0}})};
         auto resolution = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
         if (!resolution)
             return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
         const uint64_t resolved = std::move(resolution).value();
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
         if (!texture || texture.pixelFormat != pipeline->depthFormat || texture.sampleCount != pipeline->sampleCount)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_an_incompatible_depth_attachment", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_draw_contains_an_incompatible_depth_attachment", 0, 0}})};
         VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
         VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
         VernonRhiLoadOperation stencilLoad = static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
@@ -1077,7 +1180,10 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
         float clearDepth = descriptor->clear_depth;
         uint32_t clearStencil = descriptor->clear_stencil;
-        if (commandEncoderHasRenderingDescriptor(adapter, commandEncoder)) {
+        auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+        if (!hasRenderingDescriptor)
+            return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
+        if (std::move(hasRenderingDescriptor).value()) {
             auto operations = commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad,
                                                      stencilStore, clearDepth, clearStencil);
             if (!operations)
@@ -1094,7 +1200,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             pass.stencilAttachment.clearStencil = clearStencil;
         } else if (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD ||
                    clearStencil != 0) {
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(
+                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                      {"metal_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
         }
         requested.depth = {descriptor->depth_stencil_view.identity,
                            descriptor->depth_stencil_view.resource.value,
@@ -1107,20 +1215,22 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         depthTarget = depthResource = resolved;
     }
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_retain_provider_objects", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_retain_provider_objects", 0, 0}})};
     id<MTLRenderCommandEncoder> encoder = nil;
-    if (renderingClaim != 0) {
+    if (renderingClaim == vernon::rhi::CommandRenderingClaim::Acquired) {
         id<MTLCommandBuffer> commandBuffer =
             (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
         encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_creation_failed", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_creation_failed", 0, 0}})};
         auto rendering = std::make_unique<rhi::metal::RenderingState>(requested);
         rendering->encoder = encoder;
         const uint64_t renderingValue = reinterpret_cast<uintptr_t>(rendering.get());
-        auto installed = rhi::installCommandRenderingObject(
-            adapter.rhiDevice, commandEncoder.value, renderingValue, renderTargets.data(), renderResources.data(),
-            renderTargets.size(), depthTarget, depthResource);
+        auto installed = rhi::installCommandRenderingObject(adapter.rhiDevice, commandEncoder.value, renderingValue,
+                                                            renderTargets.data(), renderResources.data(),
+                                                            renderTargets.size(), depthTarget, depthResource);
         if (!installed) {
             [encoder endEncoding];
             return RhiAdapterResult<void>{vernon::err(providerError(std::move(installed).error()))};
@@ -1128,16 +1238,23 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         renderingClaimRollback.commit();
         [[maybe_unused]] auto *ownedRendering = rendering.release();
     } else {
-        auto renderingObject = commandRenderingObject(adapter, commandEncoder, 0);
+        auto renderingObject = commandRenderingObject(adapter, commandEncoder, vernon::Option<uint64_t>{});
         if (!renderingObject)
             return RhiAdapterResult<void>{vernon::err(std::move(renderingObject).error())};
-        const uint64_t renderingValue = std::move(renderingObject).value();
+        auto renderingValueOption = std::move(renderingObject).value();
+        if (!renderingValueOption)
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::LifecycleFailure, {"metal_rendering_object_is_unavailable", 0, 0}})};
+        const uint64_t renderingValue = std::move(renderingValueOption).value();
         auto *rendering = reinterpret_cast<rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingValue));
         if (!rendering || !sameRenderScope(*rendering, requested))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_attachments_do_not_match_the_active_render_scope", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(
+                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                      {"metal_draw_attachments_do_not_match_the_active_render_scope", 0, 0}})};
         encoder = rendering->encoder;
         if (!encoder)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_is_unavailable", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_is_unavailable", 0, 0}})};
     }
     [encoder setRenderPipelineState:pipeline->render];
     if (pipeline->depthStencil)
@@ -1180,7 +1297,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                 if (slot.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                     continue;
                 if (!retainCommandResource(adapter, commandEncoder, slot.resource))
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_retain_a_vertex_buffer", 0, 0}})};
+                    return RhiAdapterResult<void>{
+                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                          {"metal_draw_could_not_retain_a_vertex_buffer", 0, 0}})};
                 auto resolution = resolveCommandRhiResource(adapter, commandEncoder, slot.resource);
                 if (!resolution)
                     return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
@@ -1198,7 +1317,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER && slot.defaultSampler)
                 continue;
             if (!retainCommandResource(adapter, commandEncoder, slot.resource))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_retain_a_bound_resource", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                      {"metal_draw_could_not_retain_a_bound_resource", 0, 0}})};
             auto resolution = resolveCommandRhiResource(adapter, commandEncoder, slot.resource);
             if (!resolution)
                 return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
@@ -1216,7 +1337,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                               stages:renderStages(slot.layout.stage_mask)];
             }
             if ((slot.layout.access & 2u) && !recordCommandWriteResource(adapter, commandEncoder, slot.resource))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_track_a_writable_resource", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                      {"metal_draw_could_not_track_a_writable_resource", 0, 0}})};
         }
         for (const auto &argumentBuffer : bindings->argumentBuffers) {
             if (argumentBuffer.stage == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX)
@@ -1233,14 +1356,17 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
     if (descriptor->index_count) {
         if (descriptor->index_type != 0 || !retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_an_unsupported_index_buffer", 0, 0}})};
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"metal_draw_contains_an_unsupported_index_buffer", 0, 0}})};
         auto resolution = resolveCommandRhiResource(adapter, commandEncoder, descriptor->index_buffer);
         if (!resolution)
             return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
         const uint64_t resolved = std::move(resolution).value();
         id<MTLBuffer> indexBuffer = (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(resolved));
         if (!indexBuffer)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_a_stale_index_buffer", 0, 0}})};
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"metal_draw_contains_a_stale_index_buffer", 0, 0}})};
         [encoder drawIndexedPrimitives:primitive
                             indexCount:descriptor->index_count
                              indexType:MTLIndexTypeUInt32
@@ -1257,7 +1383,8 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                    baseInstance:descriptor->first_instance];
     }
     if (!recordProviderCommand(adapter, commandEncoder, true))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_draw_command_encoder_state_changed", 0, 0}})};
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_draw_command_encoder_state_changed", 0, 0}})};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -1386,9 +1513,10 @@ vernon::runtime::metalRhiAdapterDeviceCapabilities(const VernonRuntimeRhiAdapter
 VernonRuntimeRhiAdapter *vernon::runtime::createMetalRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
     if (backend != VERNON_RHI_BACKEND_METAL)
         return nullptr;
-    auto *deviceState = static_cast<rhi::metal::DeviceState *>(rhi::deviceState(device, backend));
-    if (!deviceState)
+    auto resolvedDeviceState = rhi::deviceState(device, backend);
+    if (resolvedDeviceState.isErr())
         return nullptr;
+    auto *deviceState = static_cast<rhi::metal::DeviceState *>(resolvedDeviceState.value());
     auto state = std::unique_ptr<rhi_adapter::MetalAdapterState>(new (std::nothrow) rhi_adapter::MetalAdapterState());
     auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
     if (!state || !adapter)

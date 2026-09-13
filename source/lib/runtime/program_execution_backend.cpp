@@ -21,9 +21,15 @@
 namespace vernon::runtime::program {
 namespace {
 
+using StageLoadResult = vernon::Result<std::unique_ptr<VernonStageExecutable>, Diagnostic>;
+
 bool reject(Diagnostic &diagnostic, std::string code, std::string path, std::string message) {
     diagnostic = {std::move(code), "resolve", std::move(path), std::move(message)};
     return false;
+}
+
+ProgramLoadError programLoadError(const Diagnostic &diagnostic) {
+    return {diagnostic.code, diagnostic.path, diagnostic.message};
 }
 
 std::string physicalStageIdentity(const StageArtifact &stage) {
@@ -115,29 +121,30 @@ bool loadModuleBytes(const ArtifactSystem &artifacts, const std::string &artifac
     return loadCodeModuleBytes(artifacts, artifactId, bundleRoot, stage->second.modules.front(), bytes, diagnostic);
 }
 
-VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
-                                                   const ArtifactSystem &artifacts,
-                                                   const std::filesystem::path &bundleRoot, const Node &node,
-                                                   const ResolvedStage &resolvedStage, Diagnostic &diagnostic) {
+StageLoadResult loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
+                                            const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot,
+                                            const Node &node, const ResolvedStage &resolvedStage,
+                                            Diagnostic &diagnostic) {
     const StageArtifact &artifact = resolvedStage.stage;
-    if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA)
-        return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs/0/nodes/0/operation",
-                      "graphics Program requires a GPU backend"),
-               nullptr;
+    if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA) {
+        reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs/0/nodes/0/operation",
+               "graphics Program requires a GPU backend");
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
     TargetBindingPlan bindingPlan;
     if (!buildTargetBindingPlan(program, node, resolvedStage, context.backend, bindingPlan, diagnostic))
-        return nullptr;
+        return StageLoadResult{vernon::err(diagnostic)};
     StageBindingPlan stagePlan;
     ReflectedEntry reflection;
     if (!buildStageBindingPlan(bindingPlan, stagePlan, reflection, diagnostic))
-        return nullptr;
+        return StageLoadResult{vernon::err(diagnostic)};
 
     BackendStageBuildInputs inputs;
     inputs.context = &context;
     for (const CodeModule &module : artifact.modules) {
         std::vector<uint8_t> bytes;
         if (!loadCodeModuleBytes(artifacts, resolvedStage.artifact, bundleRoot, module, bytes, diagnostic))
-            return nullptr;
+            return StageLoadResult{vernon::err(diagnostic)};
         LoadedStageArtifact stage;
         stage.entry = module.entryPoint;
         for (const vernon::runtime::NativeResourceSlot &slot : artifact.nativeSlots)
@@ -156,37 +163,42 @@ VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context
             stagePlan.fragment = key;
     }
     auto child = RuntimeChildLifecycle::reserve(context.owner);
-    if (child.isErr())
-        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages",
-                      "runtime context cannot admit a graphics Stage"),
-               nullptr;
+    if (child.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages", "runtime context cannot admit a graphics Stage");
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
     auto pipeline = std::make_unique<VernonStageExecutable>();
     pipeline->lifecycle.emplace(std::move(child).value());
     pipeline->context = &context;
     pipeline->bindingProjection = std::move(stagePlan);
     rebuildStageBindingLayoutViews(pipeline->bindingProjection);
-    if (!resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline))
-        return reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
-                      invocationDiagnostic(context)),
-               nullptr;
+    auto resolved = resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline);
+    if (resolved.isErr()) {
+        reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
+               renderBackendPipelineError(resolved.error()));
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
     auto published = pipeline->lifecycle.value().publish();
-    if (published.isErr())
-        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages", "cannot publish graphics Stage"), nullptr;
-    return pipeline.release();
+    if (published.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages", "cannot publish graphics Stage");
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
+    return StageLoadResult{vernon::ok(std::move(pipeline))};
 }
 
-VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
-                                               const std::filesystem::path &bundleRoot,
-                                               const ResolvedExecutableNode &node, Diagnostic &diagnostic) {
+StageLoadResult loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
+                                        const std::filesystem::path &bundleRoot, const ResolvedExecutableNode &node,
+                                        Diagnostic &diagnostic) {
     const ResolvedStage &stage = *node.stage;
-    if (stage.stage.modules.size() != 1)
-        return reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
-                      "compute node has no resolved code module"),
-               nullptr;
+    if (stage.stage.modules.size() != 1) {
+        reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
+               "compute node has no resolved code module");
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
     StageBindingPlan stagePlan;
     ReflectedEntry reflection;
     if (!buildStageBindingPlan(node.plan, stagePlan, reflection, diagnostic))
-        return nullptr;
+        return StageLoadResult{vernon::err(diagnostic)};
     std::vector<uint8_t> moduleBytes;
     // CPU code modules are relocatable objects linked by the embedding
     // application. The runtime resolves their registered entry point and must
@@ -194,7 +206,7 @@ VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, co
     // their shader module bytes here.
     if (context.backend != VERNON_RUNTIME_CPU &&
         !loadModuleBytes(artifacts, stage.artifact, bundleRoot, moduleBytes, diagnostic))
-        return nullptr;
+        return StageLoadResult{vernon::err(diagnostic)};
     const std::string &entryName = stage.stage.modules.front().entryPoint;
     VernonCpuEntryPoint cpuEntry{};
     if (context.backend == VERNON_RUNTIME_CPU) {
@@ -202,38 +214,40 @@ VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, co
         if (!findRegisteredCpuEntry(context, entryName, cpuEntry, error)) {
             reject(diagnostic, "PROGRAM_ARTIFACT_ENTRY_POINT",
                    "/artifact_system/artifacts/" + stage.artifact + "/modules/0/entry_point", std::move(error));
-            return nullptr;
+            return StageLoadResult{vernon::err(diagnostic)};
         }
     }
-    VernonStageExecutable *pipeline = loadBackendTypedComputePipeline(
-        context, std::move(stagePlan), std::move(reflection), moduleBytes.empty() ? nullptr : moduleBytes.data(),
-        moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
-    if (!pipeline)
+    auto pipeline = loadBackendTypedComputePipeline(context, std::move(stagePlan), std::move(reflection),
+                                                    moduleBytes.empty() ? nullptr : moduleBytes.data(),
+                                                    moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
+    if (pipeline.isErr()) {
         reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + stage.artifact,
-               invocationDiagnostic(context));
-    return pipeline;
+               renderBackendPipelineError(pipeline.error()));
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
+    return StageLoadResult{vernon::ok(std::move(pipeline).value())};
 }
 
 } // namespace
 
-VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context,
-                                                    std::shared_ptr<const ResolvedProgram> program,
-                                                    const ArtifactSystem &artifacts,
-                                                    const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
+ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
+                                             std::shared_ptr<const ResolvedProgram> program,
+                                             const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot,
+                                             Diagnostic &diagnostic) {
     diagnostic = {};
     auto child = RuntimeChildLifecycle::reserve(context.owner);
     if (child.isErr()) {
         reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "runtime context cannot admit a Program executable");
-        return nullptr;
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     }
     auto instanceOwner = vernon::OwnerControlBlock::create();
     if (instanceOwner.isErr()) {
         reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot create Program executable lifecycle");
-        return nullptr;
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     }
     ResolvedExecutablePlan executable;
     if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
-        return nullptr;
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     auto plan = std::make_shared<ResolvedExecutionPlan>();
     plan->resolvedProgram = std::move(program);
     plan->boundaryLayoutViews.resize(plan->resolvedProgram->program.abi.boundarySlots.size());
@@ -249,19 +263,19 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
         const std::string identity = physicalStageIdentity(node.stage->stage);
         auto cached = cachedStages.find(identity);
         if (cached == cachedStages.end()) {
-            std::shared_ptr<VernonStageExecutable> child(
-                executionKind(*node.node) == ExecutionKind::Graphics
-                    ? loadGraphicsProgramPipeline(context, *plan->resolvedProgram, artifacts, bundleRoot, *node.node,
-                                                  *node.stage, diagnostic)
-                    : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic),
-                vernon::runtime::destroyResolvedStage);
-            if (!child) {
+            auto loaded = executionKind(*node.node) == ExecutionKind::Graphics
+                              ? loadGraphicsProgramPipeline(context, *plan->resolvedProgram, artifacts, bundleRoot,
+                                                            *node.node, *node.stage, diagnostic)
+                              : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic);
+            if (loaded.isErr()) {
                 if (diagnostic.code.empty())
                     reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/stages/" + node.node->stage,
                            invocationDiagnostic(context).empty() ? "backend did not report a stage load error"
                                                                  : invocationDiagnostic(context));
-                return nullptr;
+                return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
             }
+            std::shared_ptr<VernonStageExecutable> child(std::move(loaded).value().release(),
+                                                         vernon::runtime::destroyResolvedStage);
             cached = cachedStages.emplace(identity, plan->stageCache.size()).first;
             plan->stageCache.push_back(std::move(child));
         }
@@ -270,10 +284,11 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
             if (!internalSource(binding.source))
                 projections.push_back({binding.projection.value, binding.projection.leaf, binding});
         const std::optional<GraphDirection> direction = graphDirection(node.graph);
-        if (!direction)
-            return reject(diagnostic, "PROGRAM_GRAPH_DIRECTION", "/graphs",
-                          "resolved node has an unsupported graph direction"),
-                   nullptr;
+        if (!direction) {
+            reject(diagnostic, "PROGRAM_GRAPH_DIRECTION", "/graphs",
+                   "resolved node has an unsupported graph direction");
+            return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+        }
         ResolvedOperationControls controls;
         if (executionKind(*node.node) == ExecutionKind::Compute) {
             const ComputeOperation &compute = computeOperation(*node.node);
@@ -306,41 +321,40 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
         plan->nodes.emplace(
             key, ResolvedNodePlan{key, plan->stageCache[cached->second], std::move(projections), std::move(controls)});
     }
-    if (!buildResolvedExecutionPolicies(*plan, diagnostic) || !validateResolvedExecutionPlan(*plan, diagnostic))
-        return nullptr;
+    if (buildResolvedExecutionPolicies(*plan, diagnostic).isErr() ||
+        validateResolvedExecutionPlan(*plan, diagnostic).isErr())
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(child).value(),
                                                               std::move(instanceOwner).value(), std::move(plan));
-    if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
-        return reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
-                      invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
-                                                            : invocationDiagnostic(context)),
-               nullptr;
+    if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {})) {
+        reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
+               invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
+                                                     : invocationDiagnostic(context));
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    }
     auto published = pipeline->lifecycle.publish();
-    if (published.isErr())
-        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot publish Program executable"), nullptr;
-    return pipeline.release();
+    if (published.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot publish Program executable");
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    }
+    return ProgramLoadResult{vernon::ok(std::move(pipeline))};
 }
 
-VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const Program &program,
-                                                    const ArtifactSystem &artifacts,
-                                                    const std::filesystem::path &bundleRoot, std::string &error) {
+ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context, const Program &program,
+                                             const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot) {
     Diagnostic diagnostic;
-    const auto failed = [&]() -> VernonProgramExecutable * {
-        error =
-            diagnostic.code + (diagnostic.path.empty() ? ": " : " at " + diagnostic.path + ": ") + diagnostic.message;
-        return nullptr;
-    };
-    ResolvedProgram resolved;
-    if (!resolve(program, artifacts, resolved, diagnostic)) {
+    auto resolved = resolve(program, artifacts, diagnostic);
+    if (resolved.isErr()) {
         if (diagnostic.code.empty())
             reject(diagnostic, "PROGRAM_RESOLUTION_FAILED", "", "Program resolver rejected input without a diagnostic");
-        return failed();
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     }
-    auto owner = std::make_shared<ResolvedProgram>(std::move(resolved));
-    if (VernonProgramExecutable *loaded =
-            loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic))
-        return loaded;
-    return failed();
+    auto owner = std::make_shared<ResolvedProgram>(std::move(resolved).value());
+    return loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic);
+}
+
+std::string renderProgramLoadError(const ProgramLoadError &error) {
+    return error.code + (error.path.empty() ? ": " : " at " + error.path + ": ") + error.message;
 }
 
 } // namespace vernon::runtime::program

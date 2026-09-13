@@ -48,7 +48,14 @@ bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallback
     return false;
 }
 
-void DeviceState::makeCurrent() const { callbacks.make_current(callbacks.user_data); }
+bool DeviceState::makeCurrent() const noexcept {
+    try {
+        callbacks.make_current(callbacks.user_data);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 
 bool DeviceState::supportsCompute() const {
     return embeddedProfile ? (callbacks.api_version_major > 3 ||

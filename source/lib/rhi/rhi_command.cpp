@@ -1,7 +1,11 @@
 #include "VernonRHI.h"
 
 #include "image_data_layout.h"
+#include "image_descriptor_validation.h"
+#include "public_c_boundary.h"
+#include "rhi_deferred_action.h"
 #include "rhi_internal.h"
+#include "rhi_pending_write.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +17,16 @@
 #include <utility>
 #include <vector>
 
+vernon::Result<void, vernon::RhiError> vernon::rhi::invokeDeferredAction(const DeferredAction &action,
+                                                                         const char *operation) noexcept {
+    try {
+        action.function(action.context, action.object);
+        return Result<void, RhiError>{ok()};
+    } catch (...) {
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::BackendFailure, {operation, action.object, 0}})};
+    }
+}
+
 namespace {
 
 using EncoderLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::CommandEncoderResourceTag>;
@@ -23,11 +37,7 @@ using CompletionHandle = vernon::rhi::ResourceHandle<vernon::rhi::CompletionReso
 struct EncoderSlot {
     explicit EncoderSlot(EncoderLifecycle value) noexcept : lifecycle(std::move(value)) {}
 
-    struct Cleanup {
-        void *context{};
-        uint64_t object{};
-        void (*function)(void *, uint64_t){};
-    };
+    using Cleanup = vernon::rhi::DeferredAction;
     struct RetainedResource {
         vernon::rhi::ResourceKind kind{};
         uint64_t key{};
@@ -98,7 +108,8 @@ struct EncoderSlot {
     bool nativeOwned{};
     bool activeCounted{};
     bool exclusiveDeviceSlot{};
-    std::vector<ColorOperation> colorOperations;
+    std::array<ColorOperation, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorOperations{};
+    size_t colorOperationCount{};
     DepthOperation depthOperation;
     std::vector<Cleanup> cleanups;
     std::vector<Cleanup> rollbacks;
@@ -391,18 +402,6 @@ reserveCompletionSlot(vernon::rhi::CommandDeviceStateControl &state) noexcept {
     return state.completionSlots.emplace("reserve_completion", std::move(lifecycle).value());
 }
 
-vernon::Result<void, vernon::RhiError>
-releaseLeases(std::vector<vernon::rhi::RetainedRhiResourceLease> &leases) noexcept {
-    for (auto lease = leases.rbegin(); lease != leases.rend(); ++lease) {
-        if (!lease->active())
-            continue;
-        auto released = lease->release();
-        if (released.isErr())
-            return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(released).error())};
-    }
-    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
-}
-
 vernon::Result<void, vernon::RhiError> rollbackRetainedResources(VernonRhiDevice device, EncoderSlot &slot,
                                                                  size_t checkpoint) noexcept {
     for (;;) {
@@ -438,6 +437,19 @@ vernon::Result<void, vernon::RhiError> rollbackRetainedResources(VernonRhiDevice
     }
 }
 
+template <typename Identities, typename Actions>
+void retainFailedActionIdentities(Identities &identities, const Actions &actions) noexcept {
+    for (auto identity = identities.begin(); identity != identities.end();) {
+        const bool retained = std::any_of(actions.begin(), actions.end(), [&](const auto &action) {
+            return action.context == identity->context && action.function == identity->function;
+        });
+        if (retained)
+            ++identity;
+        else
+            identity = identities.erase(identity);
+    }
+}
+
 vernon::Result<void, vernon::RhiError> teardownEncoder(void *context, EncoderHandle) noexcept {
     auto &slot = *static_cast<EncoderSlot *>(context);
     VernonRhiDevice device{};
@@ -467,24 +479,30 @@ vernon::Result<void, vernon::RhiError> teardownEncoder(void *context, EncoderHan
         cleanups = std::move(slot.cleanups);
         rollbacks = std::move(slot.rollbacks);
         resources = std::move(slot.retainedResourceLeases);
-        slot.cleanupIdentities.clear();
-        slot.rollbackIdentities.clear();
         slot.retainedResourceIdentities.clear();
     }
     if (abandonNative)
         vernon::rhi::abandonCommandRecording(device, native);
-    for (auto rollback = rollbacks.rbegin(); rollback != rollbacks.rend(); ++rollback)
-        rollback->function(rollback->context, rollback->object);
-    for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
-        cleanup->function(cleanup->context, cleanup->object);
-    auto released = releaseLeases(resources);
+    auto deferred = vernon::rhi::drainDeferredRollbackAndCleanup(rollbacks, cleanups);
+    auto released = vernon::rhi::releaseRetainedResourcesReverse(resources);
     releaseUploadBytes(*state, uploadBytes);
-    if (released.isErr()) {
+    if (deferred.isErr() || released.isErr()) {
         std::lock_guard<std::mutex> guard(slot.mutex);
+        retainFailedActionIdentities(slot.cleanupIdentities, cleanups);
+        retainFailedActionIdentities(slot.rollbackIdentities, rollbacks);
+        slot.cleanups = std::move(cleanups);
+        slot.rollbacks = std::move(rollbacks);
         slot.retainedResourceLeases = std::move(resources);
+        if (deferred.isErr())
+            return deferred;
         return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(released).error())};
     }
     resources.clear();
+    {
+        std::lock_guard<std::mutex> guard(slot.mutex);
+        slot.cleanupIdentities.clear();
+        slot.rollbackIdentities.clear();
+    }
     if (activeCounted) {
         std::lock_guard<std::mutex> guard(state->quotaMutex);
         if (!state->activeEncoderCount)
@@ -557,7 +575,7 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
         retireBackend = slot->backendRetirementRequired;
     }
     if (retireBackend)
-        backendCompleted = vernon::rhi::completeCommandRecording(slot->device, slot->native);
+        backendCompleted = vernon::rhi::completeCommandRecording(slot->device, slot->native).isOk();
     {
         std::lock_guard lock(slot->mutex);
         if (!backendCompleted) {
@@ -572,9 +590,8 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
         slot->backendRetirementRequired = false;
         releaseAdmission = std::exchange(slot->admissionHeld, false);
     }
-    for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
-        cleanup->function(cleanup->context, cleanup->object);
-    auto released = releaseLeases(resources);
+    auto cleanedUp = vernon::rhi::drainDeferredActionsReverse(cleanups, "completion_cleanup_callback");
+    auto released = vernon::rhi::releaseRetainedResourcesReverse(resources);
     auto &state = vernon::rhi::commandDeviceState(pinned.state);
     releaseUploadBytes(state, uploadBytes);
     if (releaseAdmission)
@@ -582,14 +599,23 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
     VernonRhiStatus result{};
     {
         std::lock_guard lock(slot->mutex);
+        if (cleanedUp.isErr()) {
+            slot->state = VERNON_RHI_COMPLETION_FAILED;
+            if (slot->result == VERNON_RHI_STATUS_OK)
+                slot->result = vernon::toVernonRhiStatus(cleanedUp.error());
+            slot->cleanups = std::move(cleanups);
+        } else {
+            slot->cleanups.clear();
+        }
         if (released.isErr()) {
             slot->state = VERNON_RHI_COMPLETION_FAILED;
-            slot->result = vernon::toVernonRhiStatus(released.error());
+            if (slot->result == VERNON_RHI_STATUS_OK)
+                slot->result = vernon::toVernonRhiStatus(released.error());
             slot->retainedResourceLeases = std::move(resources);
         } else {
             resources.clear();
             slot->retainedResourceLeases.clear();
-            slot->finalized = true;
+            slot->finalized = cleanedUp.isOk();
         }
         slot->observing = false;
         result = slot->result;
@@ -643,8 +669,8 @@ bool vernon::rhi::deviceHasActiveCommandEncoder(VernonRhiDevice device) {
     return local.activeEncoderCount != 0;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
-                                                           const VernonRhiCommandLimits *limits) {
+static VernonRhiStatus vernonRhiDeviceSetCommandLimitsBusiness(VernonRhiDevice device,
+                                                               const VernonRhiCommandLimits *limits) {
     if (!limits || limits->struct_size < sizeof(*limits) || !limits->max_active_recordings ||
         !limits->max_in_flight_submissions || !limits->max_live_completions || !limits->max_upload_bytes)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -665,7 +691,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice devic
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice device, VernonRhiCommandLimits *output) {
+static VernonRhiStatus vernonRhiDeviceGetCommandLimitsBusiness(VernonRhiDevice device, VernonRhiCommandLimits *output) {
     if (!output || output->struct_size < sizeof(*output))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto retained = vernon::rhi::commandState(device);
@@ -678,9 +704,9 @@ extern "C" VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice devic
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
-                                                               const VernonRhiCommandEncoderDescriptor *descriptor,
-                                                               VernonRhiCommandEncoder *output) {
+static VernonRhiStatus vernonRhiDeviceCreateCommandEncoderBusiness(VernonRhiDevice device,
+                                                                   const VernonRhiCommandEncoderDescriptor *descriptor,
+                                                                   VernonRhiCommandEncoder *output) {
     if (output)
         *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor))
@@ -747,7 +773,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice d
         slot->nativeOwned = false;
         slot->activeCounted = false;
         slot->exclusiveDeviceSlot = exclusive;
-        slot->colorOperations.clear();
+        slot->colorOperationCount = 0;
         slot->depthOperation = {};
         slot->cleanups.clear();
         slot->rollbacks.clear();
@@ -760,13 +786,14 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice d
         slot->unknownPendingWrites = false;
     }
 
-    uint64_t native{};
-    VernonRhiBackend backend{};
-    if (!vernon::rhi::beginCommandRecording(device, native, backend)) {
+    auto recording = vernon::rhi::beginCommandRecording(device);
+    if (recording.isErr()) {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->alive = false;
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return vernon::toVernonRhiStatus(recording.error());
     }
+    const uint64_t native = recording.value().native;
+    const VernonRhiBackend backend = recording.value().backend;
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->native = native;
@@ -793,22 +820,22 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice d
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDevice device,
-                                                                VernonRhiCommandEncoder encoder) {
+static vernon::Result<void, vernon::RhiError>
+vernonRhiDeviceDestroyCommandEncoderImpl(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
     auto retained = vernon::rhi::commandState(device);
     if (retained.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(retained).error())};
     auto stateRef = std::move(retained).value();
     auto &state = vernon::rhi::commandDeviceState(stateRef);
     EncoderSlot *slot = state.encoderSlots.get(encoder.index);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = slot->lifecycle.destroyPublic({encoder.index, encoder.generation});
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
+        return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{
+            vernon::RhiErrorCode::InvalidArgument, {"destroy_command_encoder", encoder.generation, encoder.index}})};
+    return slot->lifecycle.destroyPublic({encoder.index, encoder.generation});
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                          const VernonRhiBarrier *barriers, size_t barrierCount) {
+static VernonRhiStatus vernonRhiCommandEncoderBarrierBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                              const VernonRhiBarrier *barriers, size_t barrierCount) {
     auto slot = lookup(device, encoder);
     if (!slot || (barrierCount && !barriers))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -860,8 +887,9 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
             return vernon::toVernonRhiStatus(retained.error());
         }
     }
-    const VernonRhiStatus recordStatus =
-        barrierCount ? vernon::rhi::recordBarriers(device, key, native, barriers, barrierCount) : VERNON_RHI_STATUS_OK;
+    auto recorded = barrierCount ? vernon::rhi::recordBarriers(device, key, native, barriers, barrierCount)
+                                 : vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    VernonRhiStatus recordStatus = recorded.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(recorded.error());
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
@@ -880,10 +908,11 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
     return recordStatus;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                             VernonRhiBuffer source, uint64_t sourceOffset,
-                                                             VernonRhiBuffer destination, uint64_t destinationOffset,
-                                                             uint64_t size) {
+static VernonRhiStatus vernonRhiCommandEncoderCopyBufferBusiness(VernonRhiDevice device,
+                                                                 VernonRhiCommandEncoder encoder,
+                                                                 VernonRhiBuffer source, uint64_t sourceOffset,
+                                                                 VernonRhiBuffer destination,
+                                                                 uint64_t destinationOffset, uint64_t size) {
     auto slot = lookup(device, encoder);
     if (!slot || !validHandle(source) || !validHandle(destination) || !size)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -919,18 +948,16 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice dev
             return vernon::toVernonRhiStatus(rolledBack.error());
         return vernon::toVernonRhiStatus(retainedDestination.error());
     }
-    const VernonRhiStatus recordStatus =
+    auto recorded =
         vernon::rhi::recordBufferCopy(device, native, source, sourceOffset, destination, destinationOffset, size);
+    VernonRhiStatus recordStatus = recorded.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(recorded.error());
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
-        if (recordStatus == VERNON_RHI_STATUS_OK) {
-            try {
-                slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Buffer, destinationResource});
-            } catch (const std::bad_alloc &) {
-                slot->unknownPendingWrites = true;
-            }
-        } else
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            vernon::rhi::recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites,
+                                            vernon::rhi::ResourceKind::Buffer, destinationResource);
+        else
             slot->failed = true;
     }
     return recordStatus;
@@ -977,16 +1004,17 @@ bool validateImageCopies(VernonRhiDevice device, VernonRhiImage source, VernonRh
                          const VernonRhiImageCopyRegion *regions, size_t regionCount) {
     VernonRhiImageDescriptor sourceDescriptor{};
     VernonRhiImageDescriptor destinationDescriptor{};
-    const uint64_t sourceResource = vernon::rhi::imageResource(device, source);
-    const uint64_t destinationResource = vernon::rhi::imageResource(device, destination);
-    if (!sourceResource || !destinationResource ||
-        !vernon::rhi::describeImageResource(device, sourceResource, sourceDescriptor) ||
-        !vernon::rhi::describeImageResource(device, destinationResource, destinationDescriptor) ||
+    auto sourceResource = vernon::rhi::imageResource(device, source);
+    auto destinationResource = vernon::rhi::imageResource(device, destination);
+    if (sourceResource.isErr() || destinationResource.isErr() ||
+        vernon::rhi::describeImageResource(device, sourceResource.value(), sourceDescriptor).isErr() ||
+        vernon::rhi::describeImageResource(device, destinationResource.value(), destinationDescriptor).isErr() ||
         sourceDescriptor.format != destinationDescriptor.format ||
         sourceDescriptor.dimension != destinationDescriptor.dimension ||
         sourceDescriptor.sample_count != destinationDescriptor.sample_count ||
         !(sourceDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
-        !(destinationDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) || sourceResource == destinationResource)
+        !(destinationDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
+        sourceResource.value() == destinationResource.value())
         return false;
     const uint32_t availableAspects = vernon::rhi::imageFormatAspects(sourceDescriptor.format);
     for (size_t index = 0; index < regionCount; ++index) {
@@ -1009,10 +1037,10 @@ bool validateImageCopies(VernonRhiDevice device, VernonRhiImage source, VernonRh
 
 } // namespace
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                            VernonRhiImage source, VernonRhiImage destination,
-                                                            const VernonRhiImageCopyRegion *regions,
-                                                            size_t regionCount) {
+static VernonRhiStatus vernonRhiCommandEncoderCopyImageBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                                VernonRhiImage source, VernonRhiImage destination,
+                                                                const VernonRhiImageCopyRegion *regions,
+                                                                size_t regionCount) {
     auto slot = lookup(device, encoder);
     if (!slot || !validHandle(source) || !validHandle(destination) || !regionCount || !regions ||
         !validateImageCopies(device, source, destination, regions, regionCount))
@@ -1049,26 +1077,25 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice devi
             return vernon::toVernonRhiStatus(rolledBack.error());
         return vernon::toVernonRhiStatus(retainedDestination.error());
     }
-    const VernonRhiStatus recordStatus =
-        vernon::rhi::recordImageCopy(device, key, native, source, destination, regions, regionCount);
+    auto recorded = vernon::rhi::recordImageCopy(device, key, native, source, destination, regions, regionCount);
+    VernonRhiStatus recordStatus = recorded.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(recorded.error());
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
-        if (recordStatus == VERNON_RHI_STATUS_OK) {
-            try {
-                slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Image, destinationResource});
-            } catch (const std::bad_alloc &) {
-                slot->unknownPendingWrites = true;
-            }
-        } else
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            vernon::rhi::recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites,
+                                            vernon::rhi::ResourceKind::Image, destinationResource);
+        else
             slot->failed = true;
     }
     return recordStatus;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                               VernonRhiBuffer destination, uint64_t destinationOffset,
-                                                               const void *source, uint64_t size) {
+static VernonRhiStatus vernonRhiCommandEncoderUploadBufferBusiness(VernonRhiDevice device,
+                                                                   VernonRhiCommandEncoder encoder,
+                                                                   VernonRhiBuffer destination,
+                                                                   uint64_t destinationOffset, const void *source,
+                                                                   uint64_t size) {
     if (!source || !size)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto slot = lookup(device, encoder);
@@ -1101,9 +1128,9 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice d
     return status;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
-                                                                 VernonRhiCommandEncoder encoder,
-                                                                 const VernonRhiRenderingDescriptor *descriptor) {
+static VernonRhiStatus vernonRhiCommandEncoderBeginRenderingBusiness(VernonRhiDevice device,
+                                                                     VernonRhiCommandEncoder encoder,
+                                                                     const VernonRhiRenderingDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !validRendering(*descriptor))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto slot = lookup(device, encoder);
@@ -1112,11 +1139,7 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    try {
-        slot->colorOperations.resize(descriptor->color_attachment_count);
-    } catch (const std::bad_alloc &) {
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
+    slot->colorOperationCount = descriptor->color_attachment_count;
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
         const auto &source = descriptor->color_attachments[index];
         auto &target = slot->colorOperations[index];
@@ -1147,8 +1170,8 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDevice device,
-                                                               VernonRhiCommandEncoder encoder) {
+static VernonRhiStatus vernonRhiCommandEncoderEndRenderingBusiness(VernonRhiDevice device,
+                                                                   VernonRhiCommandEncoder encoder) {
     auto slot = lookup(device, encoder);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1156,7 +1179,7 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDevice d
     if (!slot->alive || slot->initializing || slot->busy || !slot->rendering || slot->finished)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     uint32_t colorDiscardMask = 0;
-    for (size_t index = 0; index < slot->colorOperations.size(); ++index)
+    for (size_t index = 0; index < slot->colorOperationCount; ++index)
         if (slot->colorOperations[index].store == VERNON_RHI_STORE_DISCARD)
             colorDiscardMask |= uint32_t{1} << slot->colorOperations[index].location;
     const uint32_t depthStencilDiscard =
@@ -1166,23 +1189,27 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDevice d
         (slot->depthOperation.present && slot->depthOperation.stencilStore == VERNON_RHI_STORE_DISCARD
              ? VERNON_RHI_ATTACHMENT_STENCIL
              : 0);
-    if (slot->backendRendering &&
-        !vernon::rhi::endCommandRendering(device, slot->native, slot->backend, slot->backendRendering, colorDiscardMask,
-                                          depthStencilDiscard, slot->colorResources.data(), slot->colorResources.size(),
-                                          slot->depthResource, slot->backendRenderingObject))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    if (slot->backendRendering) {
+        auto ended = vernon::rhi::endCommandRendering(device, slot->native, slot->backend, slot->backendRendering,
+                                                      colorDiscardMask, depthStencilDiscard,
+                                                      slot->colorResources.data(), slot->colorResources.size(),
+                                                      slot->depthResource, slot->backendRenderingObject);
+        if (ended.isErr())
+            return vernon::toVernonRhiStatus(ended.error());
+    }
     slot->backendRendering = 0;
     slot->backendRenderingObject = 0;
     slot->rendering = false;
     slot->hasRenderingDescriptor = false;
-    slot->colorOperations.clear();
+    slot->colorOperationCount = 0;
     slot->depthOperation = {};
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhiDevice device,
-                                                                       VernonRhiCommandEncoder encoder,
-                                                                       uint32_t location, const float clearColor[4]) {
+static VernonRhiStatus vernonRhiCommandEncoderClearColorAttachmentBusiness(VernonRhiDevice device,
+                                                                           VernonRhiCommandEncoder encoder,
+                                                                           uint32_t location,
+                                                                           const float clearColor[4]) {
     auto slot = lookup(device, encoder);
     if (!slot || !clearColor)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1190,29 +1217,29 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhi
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished || location >= 8)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!slot->backendRendering) {
-        const auto operation = std::find_if(slot->colorOperations.begin(), slot->colorOperations.end(),
+        const auto end = slot->colorOperations.begin() + static_cast<std::ptrdiff_t>(slot->colorOperationCount);
+        const auto operation = std::find_if(slot->colorOperations.begin(), end,
                                             [location](const auto &value) { return value.location == location; });
-        if (operation == slot->colorOperations.end())
+        if (operation == end)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         operation->load = VERNON_RHI_LOAD_CLEAR;
         std::copy(clearColor, clearColor + 4, operation->clear.begin());
         ++slot->stats.clear_count;
         return VERNON_RHI_STATUS_OK;
     }
-    const VernonRhiStatus status = vernon::rhi::clearCommandColor(
-        device, slot->native, slot->backend, slot->backendRendering, slot->backendRenderingObject, slot->renderX,
-        slot->renderY, slot->renderWidth, slot->renderHeight, slot->renderLayers, slot->colorTargets[location],
-        location, clearColor);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
+    auto cleared = vernon::rhi::clearCommandColor(device, slot->native, slot->backend, slot->backendRendering,
+                                                  slot->backendRenderingObject, slot->renderX, slot->renderY,
+                                                  slot->renderWidth, slot->renderHeight, slot->renderLayers,
+                                                  slot->colorTargets[location], location, clearColor);
+    if (cleared.isErr())
+        return vernon::toVernonRhiStatus(cleared.error());
     ++slot->stats.clear_count;
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(VernonRhiDevice device,
-                                                                              VernonRhiCommandEncoder encoder,
-                                                                              float clearDepth, uint32_t clearStencil,
-                                                                              uint32_t aspects) {
+static VernonRhiStatus
+vernonRhiCommandEncoderClearDepthStencilAttachmentBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                           float clearDepth, uint32_t clearStencil, uint32_t aspects) {
     auto slot = lookup(device, encoder);
     if (!slot || clearDepth < 0.0f || clearDepth > 1.0f || !aspects ||
         (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)))
@@ -1234,17 +1261,17 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(Ve
         ++slot->stats.clear_count;
         return VERNON_RHI_STATUS_OK;
     }
-    const VernonRhiStatus status = vernon::rhi::clearCommandDepthStencil(
-        device, slot->native, slot->backend, slot->backendRendering, slot->backendRenderingObject, slot->renderX,
-        slot->renderY, slot->renderWidth, slot->renderHeight, slot->renderLayers, slot->depthTarget, clearDepth,
-        clearStencil, aspects);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
+    auto cleared = vernon::rhi::clearCommandDepthStencil(device, slot->native, slot->backend, slot->backendRendering,
+                                                         slot->backendRenderingObject, slot->renderX, slot->renderY,
+                                                         slot->renderWidth, slot->renderHeight, slot->renderLayers,
+                                                         slot->depthTarget, clearDepth, clearStencil, aspects);
+    if (cleared.isErr())
+        return vernon::toVernonRhiStatus(cleared.error());
     ++slot->stats.clear_count;
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
+static VernonRhiStatus vernonRhiCommandEncoderFinishBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
     auto slot = lookup(device, encoder);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1255,8 +1282,8 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device,
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                 VernonRhiCompletion *output) {
+static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                     VernonRhiCompletion *output) {
     if (output)
         *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     auto slot = lookup(device, encoder);
@@ -1315,8 +1342,6 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
     completionCreationGuard.unlock();
     uint64_t native{};
     bool computeWrites{};
-    bool completed{};
-    bool externalCompletion{};
     bool invalidEncoder{};
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
@@ -1329,7 +1354,8 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
         }
     }
     if (invalidEncoder) {
-        (void)completion->lifecycle.destroyPublic({handle.index, handle.generation});
+        if (completion->lifecycle.destroyPublic({handle.index, handle.generation}).isErr())
+            vernon::resultContractViolation();
         releaseSubmission(state);
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
@@ -1341,13 +1367,13 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
             std::lock_guard<std::mutex> guard(slot->mutex);
             slot->busy = false;
         }
-        (void)completion->lifecycle.destroyPublic({handle.index, handle.generation});
+        if (completion->lifecycle.destroyPublic({handle.index, handle.generation}).isErr())
+            vernon::resultContractViolation();
         releaseSubmission(state);
         return vernon::toVernonRhiStatus(destroyAttempt.error());
     }
-    const bool submitted =
-        vernon::rhi::submitCommandRecording(device, native, computeWrites, completed, externalCompletion);
-    if (!submitted) {
+    auto submitted = vernon::rhi::submitCommandRecording(device, native, computeWrites);
+    if (submitted.isErr()) {
         {
             std::lock_guard<std::mutex> guard(slot->mutex);
             slot->busy = false;
@@ -1355,10 +1381,13 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
         auto rolledBack = destroyAttempt.value().rollback();
         if (rolledBack.isErr())
             vernon::resultContractViolation();
-        (void)completion->lifecycle.destroyPublic({handle.index, handle.generation});
+        if (completion->lifecycle.destroyPublic({handle.index, handle.generation}).isErr())
+            vernon::resultContractViolation();
         releaseSubmission(state);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return vernon::toVernonRhiStatus(submitted.error());
     }
+    const bool completed = submitted.value().completed;
+    const bool externalCompletion = submitted.value().externalCompletion;
     VernonRhiBackend submittedBackend{};
     VernonRhiCommandEncoderStats submittedStats{};
     std::vector<EncoderSlot::Cleanup> submittedCleanups;
@@ -1408,8 +1437,8 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, VernonRhiCompletion completion,
-                                                       VernonRhiCompletionState *output) {
+static VernonRhiStatus vernonRhiCompletionGetStateBusiness(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                           VernonRhiCompletionState *output) {
     auto slot = lookup(device, completion);
     if (!slot || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1426,13 +1455,12 @@ extern "C" VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, V
         native = slot->native;
     }
     if (shouldPoll) {
-        bool completed{};
-        bool succeeded{};
-        if (vernon::rhi::pollCommandRecording(device, native, completed, succeeded) && completed) {
+        auto polled = vernon::rhi::pollCommandRecording(device, native);
+        if (polled.isOk() && polled.value().completed) {
             std::lock_guard<std::mutex> guard(slot->mutex);
             if (slot->state == VERNON_RHI_COMPLETION_PENDING) {
-                slot->state = succeeded ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_FAILED;
-                slot->result = succeeded ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+                slot->state = polled.value().succeeded ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_FAILED;
+                slot->result = polled.value().succeeded ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
             }
             shouldFinalize = true;
         }
@@ -1444,13 +1472,13 @@ extern "C" VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, V
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCompletionWait(VernonRhiDevice device, VernonRhiCompletion completion) {
+static VernonRhiStatus vernonRhiCompletionWaitBusiness(VernonRhiDevice device, VernonRhiCompletion completion) {
     auto slot = lookup(device, completion);
     return slot ? observeCompletion(slot) : VERNON_RHI_STATUS_INVALID_ARGUMENT;
 }
 
-extern "C" VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device, VernonRhiCompletion completion,
-                                                     VernonRhiStatus result) {
+static VernonRhiStatus vernonRhiCompletionSignalBusiness(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                         VernonRhiStatus result) {
     auto slot = lookup(device, completion);
     if (!slot || static_cast<uint32_t>(result) > static_cast<uint32_t>(VERNON_RHI_STATUS_RESOURCE_EXHAUSTED))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1465,8 +1493,9 @@ extern "C" VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device, Ver
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice device, VernonRhiCompletion completion,
-                                                              VernonRhiCommandEncoderStats *output) {
+static VernonRhiStatus vernonRhiCompletionGetCommandStatsBusiness(VernonRhiDevice device,
+                                                                  VernonRhiCompletion completion,
+                                                                  VernonRhiCommandEncoderStats *output) {
     auto slot = lookup(device, completion);
     if (!slot || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1477,7 +1506,8 @@ extern "C" VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice de
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice device, VernonRhiCompletion completion) {
+static VernonRhiStatus vernonRhiDeviceDestroyCompletionBusiness(VernonRhiDevice device,
+                                                                VernonRhiCompletion completion) {
     auto slot = lookup(device, completion);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1496,93 +1526,201 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice devi
     return status;
 }
 
-uint64_t vernon::rhi::commandEncoderKey(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
+#define VERNON_COMMAND_STATUS_BOUNDARY(name, parameters, arguments)                                                    \
+    static vernon::Result<void, vernon::RhiError> name##Impl parameters {                                              \
+        return vernon::rhi::publicStatusResult(name##Business arguments, #name);                                       \
+    }                                                                                                                  \
+    extern "C" VernonRhiStatus name parameters {                                                                       \
+        return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
+    }
+
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceSetCommandLimits,
+                               (VernonRhiDevice device, const VernonRhiCommandLimits *limits), (device, limits))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceGetCommandLimits,
+                               (VernonRhiDevice device, VernonRhiCommandLimits *output), (device, output))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceCreateCommandEncoder,
+                               (VernonRhiDevice device, const VernonRhiCommandEncoderDescriptor *descriptor,
+                                VernonRhiCommandEncoder *output),
+                               (device, descriptor, output))
+extern "C" VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDevice device,
+                                                                VernonRhiCommandEncoder encoder) {
+    return vernon::rhi::publicStatusBoundary([&] { return vernonRhiDeviceDestroyCommandEncoderImpl(device, encoder); });
+}
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderBarrier,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                const VernonRhiBarrier *barriers, size_t barrierCount),
+                               (device, encoder, barriers, barrierCount))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderCopyBuffer,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonRhiBuffer source,
+                                uint64_t sourceOffset, VernonRhiBuffer destination, uint64_t destinationOffset,
+                                uint64_t size),
+                               (device, encoder, source, sourceOffset, destination, destinationOffset, size))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderCopyImage,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonRhiImage source,
+                                VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
+                                size_t regionCount),
+                               (device, encoder, source, destination, regions, regionCount))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderUploadBuffer,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonRhiBuffer destination,
+                                uint64_t destinationOffset, const void *source, uint64_t size),
+                               (device, encoder, destination, destinationOffset, source, size))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderBeginRendering,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                const VernonRhiRenderingDescriptor *descriptor),
+                               (device, encoder, descriptor))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderEndRendering,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder), (device, encoder))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderClearColorAttachment,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, uint32_t location,
+                                const float clearColor[4]),
+                               (device, encoder, location, clearColor))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderClearDepthStencilAttachment,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, float clearDepth,
+                                uint32_t clearStencil, uint32_t aspects),
+                               (device, encoder, clearDepth, clearStencil, aspects))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderFinish, (VernonRhiDevice device, VernonRhiCommandEncoder encoder),
+                               (device, encoder))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceSubmit,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonRhiCompletion *output),
+                               (device, encoder, output))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionGetState,
+                               (VernonRhiDevice device, VernonRhiCompletion completion,
+                                VernonRhiCompletionState *output),
+                               (device, completion, output))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionWait, (VernonRhiDevice device, VernonRhiCompletion completion),
+                               (device, completion))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionSignal,
+                               (VernonRhiDevice device, VernonRhiCompletion completion, VernonRhiStatus result),
+                               (device, completion, result))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionGetCommandStats,
+                               (VernonRhiDevice device, VernonRhiCompletion completion,
+                                VernonRhiCommandEncoderStats *output),
+                               (device, completion, output))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceDestroyCompletion,
+                               (VernonRhiDevice device, VernonRhiCompletion completion), (device, completion))
+
+#undef VERNON_COMMAND_STATUS_BOUNDARY
+
+vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::commandEncoderKey(VernonRhiDevice device,
+                                                                          VernonRhiCommandEncoder encoder) noexcept {
     auto slot = lookup(device, encoder);
     if (!slot)
-        return 0;
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_encoder_key", encoder.generation, encoder.index}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && !slot->initializing ? logicalResourceKey(encoder) : 0;
+    if (!slot->alive || slot->initializing)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_encoder_key", encoder.generation, encoder.index}})};
+    return Result<uint64_t, RhiError>{ok(logicalResourceKey(encoder))};
 }
 
-uint64_t vernon::rhi::commandEncoderNative(VernonRhiDevice device, uint64_t key, VernonRhiBackend backend) {
+vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::commandEncoderNative(VernonRhiDevice device, uint64_t key,
+                                                                             VernonRhiBackend backend) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return 0;
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_encoder_native", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && !slot->initializing && !slot->busy && slot->backend == backend && !slot->finished
-               ? slot->native
-               : 0;
+    if (!slot->alive || slot->initializing || slot->busy || slot->backend != backend || slot->finished)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_encoder_native", key, 0}})};
+    return Result<uint64_t, RhiError>{ok(slot->native)};
 }
 
-bool vernon::rhi::commandEncoderRendering(VernonRhiDevice device, uint64_t key) {
+vernon::Result<bool, vernon::RhiError> vernon::rhi::commandEncoderRendering(VernonRhiDevice device,
+                                                                            uint64_t key) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<bool, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_encoder_rendering", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && slot->rendering && !slot->finished;
+    if (!slot->alive || slot->finished)
+        return Result<bool, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_encoder_rendering", key, 0}})};
+    return Result<bool, RhiError>{ok(slot->rendering)};
 }
 
-bool vernon::rhi::commandEncoderHasRenderingDescriptor(VernonRhiDevice device, uint64_t key) {
+vernon::Result<bool, vernon::RhiError> vernon::rhi::commandEncoderHasRenderingDescriptor(VernonRhiDevice device,
+                                                                                         uint64_t key) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<bool, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_rendering_descriptor", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && slot->rendering && slot->hasRenderingDescriptor && !slot->finished;
+    if (!slot->alive || !slot->rendering || slot->finished)
+        return Result<bool, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_rendering_descriptor", key, 0}})};
+    return Result<bool, RhiError>{ok(slot->hasRenderingDescriptor)};
 }
 
-bool vernon::rhi::commandColorOperations(VernonRhiDevice device, uint64_t key, size_t index,
-                                         VernonRhiLoadOperation &load, VernonRhiStoreOperation &store, float clear[4]) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::commandColorOperations(VernonRhiDevice device, uint64_t key,
+                                                                           size_t index, VernonRhiLoadOperation &load,
+                                                                           VernonRhiStoreOperation &store,
+                                                                           float clear[4]) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_color_operations", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || !slot->rendering)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_color_operations", key, 0}})};
     if (!slot->hasRenderingDescriptor)
-        return true;
-    if (index >= slot->colorOperations.size())
-        return false;
+        return Result<void, RhiError>{ok()};
+    if (index >= slot->colorOperationCount)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_color_operations", key, uint32_t(index)}})};
     const auto &operations = slot->colorOperations[index];
     load = operations.load;
     store = operations.store;
     std::copy(operations.clear.begin(), operations.clear.end(), clear);
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::commandDepthOperations(VernonRhiDevice device, uint64_t key, VernonRhiLoadOperation &depthLoad,
-                                         VernonRhiStoreOperation &depthStore, VernonRhiLoadOperation &stencilLoad,
-                                         VernonRhiStoreOperation &stencilStore, float &clearDepth,
-                                         uint32_t &clearStencil) {
+vernon::Result<void, vernon::RhiError>
+vernon::rhi::commandDepthOperations(VernonRhiDevice device, uint64_t key, VernonRhiLoadOperation &depthLoad,
+                                    VernonRhiStoreOperation &depthStore, VernonRhiLoadOperation &stencilLoad,
+                                    VernonRhiStoreOperation &stencilStore, float &clearDepth,
+                                    uint32_t &clearStencil) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_depth_operations", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || !slot->rendering)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_depth_operations", key, 0}})};
     if (!slot->hasRenderingDescriptor || !slot->depthOperation.present)
-        return true;
+        return Result<void, RhiError>{ok()};
     depthLoad = slot->depthOperation.depthLoad;
     depthStore = slot->depthOperation.depthStore;
     stencilLoad = slot->depthOperation.stencilLoad;
     stencilStore = slot->depthOperation.stencilStore;
     clearDepth = slot->depthOperation.clearDepth;
     clearStencil = slot->depthOperation.clearStencil;
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-int vernon::rhi::claimCommandRendering(VernonRhiDevice device, uint64_t key, uint32_t backendKind) {
+vernon::Result<vernon::rhi::CommandRenderingClaim, vernon::RhiError>
+vernon::rhi::claimCommandRendering(VernonRhiDevice device, uint64_t key, uint32_t backendKind) noexcept {
     if (!backendKind)
-        return -1;
+        return Result<CommandRenderingClaim, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"claim_command_rendering", key, backendKind}})};
     auto slot = lookupKey(device, key);
     if (!slot)
-        return -1;
+        return Result<CommandRenderingClaim, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"claim_command_rendering", key, backendKind}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished)
-        return -1;
+        return Result<CommandRenderingClaim, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"claim_command_rendering", key, backendKind}})};
     if (slot->backendRendering)
-        return slot->backendRendering == backendKind ? 0 : -1;
+        return slot->backendRendering == backendKind
+                   ? Result<CommandRenderingClaim, RhiError>{ok(CommandRenderingClaim::Existing)}
+                   : Result<CommandRenderingClaim, RhiError>{
+                         err(RhiError{RhiErrorCode::LifecycleFailure, {"claim_command_rendering", key, backendKind}})};
     slot->backendRendering = backendKind;
-    return 1;
+    return Result<CommandRenderingClaim, RhiError>{ok(CommandRenderingClaim::Acquired)};
 }
 
 void vernon::rhi::rollbackCommandRenderingClaim(VernonRhiDevice device, uint64_t key, uint32_t backendKind) noexcept {
@@ -1594,16 +1732,20 @@ void vernon::rhi::rollbackCommandRenderingClaim(VernonRhiDevice device, uint64_t
         slot->backendRendering = 0;
 }
 
-uint64_t vernon::rhi::commandRenderingObject(VernonRhiDevice device, uint64_t key, uint64_t candidate) {
+vernon::Result<vernon::Option<uint64_t>, vernon::RhiError>
+vernon::rhi::commandRenderingObject(VernonRhiDevice device, uint64_t key, Option<uint64_t> candidate) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return 0;
+        return Result<Option<uint64_t>, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_rendering_object", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished)
-        return 0;
+        return Result<Option<uint64_t>, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"command_rendering_object", key, 0}})};
     if (candidate && !slot->backendRenderingObject)
-        slot->backendRenderingObject = candidate;
-    return slot->backendRenderingObject;
+        slot->backendRenderingObject = candidate.value();
+    return Result<Option<uint64_t>, RhiError>{
+        ok(slot->backendRenderingObject ? Option<uint64_t>{some(slot->backendRenderingObject)} : Option<uint64_t>{})};
 }
 
 vernon::Result<void, vernon::RhiError>
@@ -1631,49 +1773,54 @@ vernon::rhi::installCommandRenderingObject(VernonRhiDevice device, uint64_t key,
     return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::beginProviderRendering(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::beginProviderRendering(VernonRhiDevice device,
+                                                                           VernonRhiCommandEncoder encoder) noexcept {
     auto slot = lookup(device, encoder);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{err(
+            RhiError{RhiErrorCode::InvalidArgument, {"begin_provider_rendering", encoder.generation, encoder.index}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished)
-        return false;
+        return Result<void, RhiError>{err(
+            RhiError{RhiErrorCode::LifecycleFailure, {"begin_provider_rendering", encoder.generation, encoder.index}})};
     slot->rendering = true;
     slot->hasRenderingDescriptor = false;
-    slot->colorOperations.clear();
+    slot->colorOperationCount = 0;
     slot->depthOperation = {};
     ++slot->stats.rendering_scope_count;
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::recordProviderCommand(VernonRhiDevice device, uint64_t key, bool draw) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordProviderCommand(VernonRhiDevice device, uint64_t key,
+                                                                          bool draw) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"record_provider_command", key, uint32_t(draw)}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || slot->finished || (draw != slot->rendering))
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"record_provider_command", key, uint32_t(draw)}})};
     if (draw)
         ++slot->stats.draw_count;
     else
         ++slot->stats.dispatch_count;
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::recordCommandWriteResource(VernonRhiDevice device, uint64_t key, ResourceKind kind,
-                                             uint64_t resourceKey) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordCommandWriteResource(VernonRhiDevice device, uint64_t key,
+                                                                               ResourceKind kind,
+                                                                               uint64_t resourceKey) noexcept {
     auto slot = lookupKey(device, key);
     if (!slot || !resourceKey)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"record_command_write", resourceKey, uint32_t(kind)}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || slot->finished)
-        return false;
-    try {
-        slot->pendingWriteResources.insert({kind, resourceKey});
-    } catch (const std::bad_alloc &) {
-        slot->unknownPendingWrites = true;
-    }
-    return true;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"record_command_write", resourceKey, uint32_t(kind)}})};
+    recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites, kind, resourceKey);
+    return Result<void, RhiError>{ok()};
 }
 
 static vernon::Result<void, vernon::RhiError> retainCommandResourceImpl(VernonRhiDevice device, uint64_t key,
@@ -1762,26 +1909,28 @@ vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::resolveCommandResource(V
         err(RhiError{RhiErrorCode::LifecycleFailure, {"resolve_command_resource", resourceKey, 0}})};
 }
 
-bool vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key, void *context, uint64_t object,
-                                      void (*cleanup)(void *, uint64_t)) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key,
+                                                                        void *context, uint64_t object,
+                                                                        void (*cleanup)(void *, uint64_t)) noexcept {
     if (!cleanup)
-        return false;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"defer_command_cleanup", key, 0}})};
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
-    std::lock_guard<std::mutex> guard(slot->mutex);
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"defer_command_cleanup", key, 0}})};
+    std::unique_lock<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->finished)
-        return false;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::LifecycleFailure, {"defer_command_cleanup", key, 0}})};
     if (object == 0) {
         const EncoderSlot::ActionIdentity identity{context, cleanup};
         if (slot->cleanupIdentities.find(identity) != slot->cleanupIdentities.end()) {
-            cleanup(context, 0);
-            return true;
+            guard.unlock();
+            return invokeDeferredAction({context, 0, cleanup}, "duplicate_command_cleanup_callback");
         }
         try {
             slot->cleanupIdentities.insert(identity);
         } catch (const std::bad_alloc &) {
-            return false;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"defer_command_cleanup", key, 0}})};
         }
     }
     try {
@@ -1789,50 +1938,59 @@ bool vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key, void
     } catch (const std::bad_alloc &) {
         if (object == 0)
             slot->cleanupIdentities.erase({context, cleanup});
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"defer_command_cleanup", key, 0}})};
     }
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::deferCommandRollback(VernonRhiDevice device, uint64_t key, void *context, uint64_t object,
-                                       void (*rollback)(void *, uint64_t)) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::deferCommandRollback(VernonRhiDevice device, uint64_t key,
+                                                                         void *context, uint64_t object,
+                                                                         void (*rollback)(void *, uint64_t)) noexcept {
     if (!context || !rollback)
-        return false;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"defer_command_rollback", key, 0}})};
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"defer_command_rollback", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->finished)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"defer_command_rollback", key, 0}})};
     const EncoderSlot::ActionIdentity identity{context, rollback};
     if (slot->rollbackIdentities.find(identity) != slot->rollbackIdentities.end())
-        return true;
+        return Result<void, RhiError>{ok()};
     try {
         slot->rollbackIdentities.insert(identity);
         slot->rollbacks.push_back({context, object, rollback});
     } catch (const std::bad_alloc &) {
         slot->rollbackIdentities.erase(identity);
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"defer_command_rollback", key, 0}})};
     }
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool vernon::rhi::setCommandRenderingTargets(VernonRhiDevice device, uint64_t key, const uint64_t *colors,
-                                             const uint64_t *resources, size_t colorCount, uint64_t depth,
-                                             uint64_t depthResource) {
+vernon::Result<void, vernon::RhiError> vernon::rhi::setCommandRenderingTargets(VernonRhiDevice device, uint64_t key,
+                                                                               const uint64_t *colors,
+                                                                               const uint64_t *resources,
+                                                                               size_t colorCount, uint64_t depth,
+                                                                               uint64_t depthResource) noexcept {
     if (colorCount > VERNON_RHI_MAX_COLOR_ATTACHMENTS || (colorCount && (!colors || !resources)))
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"set_command_rendering_targets", key, 0}})};
     auto slot = lookupKey(device, key);
     if (!slot)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"set_command_rendering_targets", key, 0}})};
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"set_command_rendering_targets", key, 0}})};
     if (colorCount) {
         std::copy(colors, colors + colorCount, slot->colorTargets.begin());
         std::copy(resources, resources + colorCount, slot->colorResources.begin());
     }
     slot->depthTarget = depth;
     slot->depthResource = depthResource;
-    return true;
+    return Result<void, RhiError>{ok()};
 }

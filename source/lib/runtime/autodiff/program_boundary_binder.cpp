@@ -88,9 +88,11 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 return false;
             }
             if (transaction.mode == program::PublicationCommitMode::InPlace) {
-                if (boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage ||
-                    !request.publication->bindInPlace(slot, *supplied->second, error))
-                    return false;
+                if (boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage)
+                    return error = "in-place publication boundary is not Storage-backed", false;
+                auto bound = request.publication->bindInPlace(slot, *supplied->second);
+                if (bound.isErr())
+                    return error = program_execution::publicationErrorMessage(bound.error()), false;
                 inPlaceOwners.insert(key);
                 continue;
             }
@@ -106,23 +108,28 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             }
             if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
                 VernonProgramArgument staging{};
-                if (!request.publication->bindImageCommit(context, slot, *target, *supplied->second, staging, error))
-                    return false;
+                auto bound = request.publication->bindImageCommit(context, slot, *target, *supplied->second, staging);
+                if (bound.isErr())
+                    return error = program_execution::publicationErrorMessage(bound.error()), false;
                 externalValues.emplace(transaction.value, staging);
                 backings[transaction.stagingOwner.id].external = std::move(staging);
             } else if (supplied->second->kind != VERNON_PROGRAM_TENSOR) {
                 error = "commit-after-success publication has an unsupported resource kind";
                 return false;
             } else if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                VernonRhiBuffer destination{};
-                if (!resolveBackendRhiBufferReference(context, supplied->second->tensor.resource, destination)) {
+                auto destination = resolveBackendRhiBufferReference(context, supplied->second->tensor.resource);
+                if (destination.isErr()) {
                     error = "PublicationPlan device output is not backed by a referenced Vernon RHI buffer";
                     return false;
                 }
-                if (!request.publication->bindDeviceCommit(slot, *target, *supplied->second, destination, error))
-                    return false;
-            } else if (!request.publication->bindHostCommit(slot, *target, *supplied->second, error)) {
-                return false;
+                auto bound =
+                    request.publication->bindDeviceCommit(slot, *target, *supplied->second, destination.value());
+                if (bound.isErr())
+                    return error = program_execution::publicationErrorMessage(bound.error()), false;
+            } else {
+                auto bound = request.publication->bindHostCommit(slot, *target, *supplied->second);
+                if (bound.isErr())
+                    return error = program_execution::publicationErrorMessage(bound.error()), false;
             }
             stagedOwners.emplace(key, slot);
         }

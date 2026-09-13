@@ -2,6 +2,7 @@
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
 #include "opengl_backend.h"
+#include "public_c_boundary.h"
 
 #include <algorithm>
 #include <array>
@@ -141,8 +142,6 @@ template <typename Slot, typename Handle> auto pinSlot(Slot *slot, Handle handle
                                                       {"pin_opengl_resource", handle.generation, handle.index}})};
     return slot->lifecycle.pin({handle.index, handle.generation});
 }
-
-VernonRhiStatus statusFromError(const vernon::RhiError &error) noexcept { return vernon::toVernonRhiStatus(error); }
 
 template <typename Slot, typename Handle> bool publicSlot(Slot *slot, Handle handle) noexcept {
     if (!slot)
@@ -321,14 +320,14 @@ Enum imageDataFormat(VernonRhiImageDataFormat format) {
                                                                               : 0;
 }
 
-VernonRhiStatus fail(OpenGLDevice &device, std::string message,
-                     VernonRhiStatus status = VERNON_RHI_STATUS_INVALID_ARGUMENT) {
+vernon::RhiError fail(OpenGLDevice &device, std::string message,
+                      vernon::RhiErrorCode code = vernon::RhiErrorCode::InvalidArgument) {
     device.error = std::move(message);
-    return status;
+    return {code, {"opengl_backend", 0, 0}};
 }
 
-vernon::Result<VernonRhiDevice, vernon::RhiError>
-createOpenGLDeviceResult(const VernonOpenGLContextCallbacks *callbacks, bool embeddedProfile) {
+vernon::Result<VernonRhiDevice, vernon::RhiError> createOpenGLDeviceImpl(const VernonOpenGLContextCallbacks *callbacks,
+                                                                         bool embeddedProfile) {
     if (!callbacks)
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"create_opengl_device", 0, 0}})};
@@ -358,25 +357,25 @@ namespace vernon::rhi::opengl_api {
 
 extern "C" VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
                                                                        uint32_t embeddedProfile) {
-    auto created = createOpenGLDeviceResult(callbacks, embeddedProfile != 0);
-    if (created.isOk())
-        return created.value();
-    setDeviceCreationError("OpenGL device creation failed");
-    return invalidDevice();
+    return publicHandleBoundary([&] { return createOpenGLDeviceImpl(callbacks, embeddedProfile != 0); },
+                                invalidDevice());
 }
 
-VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
-
+Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", 0, 0}})};
     if (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE))
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", descriptor->flags, 0}})};
     if (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags)
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", descriptor->flags, 0}})};
     if (descriptor->backend == VERNON_RHI_BACKEND_OPENGL || descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES)
-        return vernonRhiCreateOpenGLDevice(descriptor->opengl_callbacks,
-                                           descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES);
-    return invalidDevice();
+        return createOpenGLDeviceImpl(descriptor->opengl_callbacks,
+                                      descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES);
+    return Result<VernonRhiDevice, RhiError>{
+        err(RhiError{RhiErrorCode::Unsupported, {"create_owned_opengl_device", descriptor->backend, 0}})};
 }
 
 vernon::Result<void, vernon::RhiError> destroyDevice(VernonRhiDevice handle) noexcept {
@@ -391,157 +390,173 @@ vernon::Result<vernon::rhi::CommandDeviceStateRef, vernon::RhiError> commandStat
     return device.value().device().commandState.retain();
 }
 
-VernonStringView lastError(VernonRhiDevice handle) {
+Option<VernonStringView> lastError(VernonRhiDevice handle) {
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return {};
+        return Option<VernonStringView>{};
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> guard(state.mutex);
-    return {state.error.data(), state.error.size()};
+    return Option<VernonStringView>{some(VernonStringView{state.error.data(), state.error.size()})};
 }
 
-VernonRhiStatus synchronize(VernonRhiDevice handle) {
+Result<void, RhiError> synchronize(VernonRhiDevice handle) {
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     state.state.driver.finish();
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor,
-                             VernonRhiBuffer *output) {
+Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        descriptor->size == 0 || descriptor->size > (std::numeric_limits<size_t>::max)() ||
+    if (device.isErr())
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(device).error())};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
         descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        return Result<VernonRhiBuffer, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_buffer", 0, 0}})};
     auto owner = device.value().retainOwner();
     if (owner.isErr())
-        return statusFromError(owner.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(owner).error())};
     auto reservation = vernon::rhi::ResourceCreationReservation::create(owner.value());
     if (reservation.isErr())
-        return statusFromError(reservation.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(reservation).error())};
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> allocationGuard(state.resourceAllocationMutex);
     auto available = availableSlot<BufferSlot, BufferLifecycle>(state.buffers);
     if (available.isErr())
-        return statusFromError(available.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(available).error())};
     BufferSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (!state.state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), state.error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<VernonRhiBuffer, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"create_opengl_buffer", descriptor->size, 0}})};
     slot.descriptor = *descriptor;
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &state, teardownBuffer);
     if (published.isErr()) {
         state.state.destroyBuffer(slot.buffer);
         slot.buffer = {};
         slot.descriptor = {};
-        return statusFromError(published.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(published).error())};
     }
-    *output = {published.value().index, published.value().generation};
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiBuffer, RhiError>{
+        ok(VernonRhiBuffer{published.value().index, published.value().generation})};
 }
 
-VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
-                             uint64_t size) {
+Result<void, RhiError> uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
+                                    uint64_t size) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !source)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (!source)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"upload_opengl_buffer", 0, 0}})};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     auto pin = pinSlot(slot, buffer);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
-        return fail(state, "OpenGL RHI buffer upload range is invalid");
-    return state.state.uploadBuffer(slot->buffer, static_cast<size_t>(offset), source, static_cast<size_t>(size),
-                                    state.error)
-               ? VERNON_RHI_STATUS_OK
-               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(fail(state, "OpenGL RHI buffer upload range is invalid"))};
+    if (!state.state.uploadBuffer(slot->buffer, static_cast<size_t>(offset), source, static_cast<size_t>(size),
+                                  state.error))
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::BackendFailure, {"upload_opengl_buffer", offset, 0}})};
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
-                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+Result<void, RhiError> uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                          const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !ranges || rangeCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (!ranges || rangeCount == 0)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"upload_opengl_buffer_ranges", rangeCount, 0}})};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     auto pin = pinSlot(slot, buffer);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
             range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
-            return fail(state, "OpenGL RHI buffer upload range is invalid");
+            return Result<void, RhiError>{err(fail(state, "OpenGL RHI buffer upload range is invalid"))};
     }
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!state.state.uploadBuffer(slot->buffer, static_cast<size_t>(range.offset), range.source,
                                       static_cast<size_t>(range.size), state.error))
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::BackendFailure, {"upload_opengl_buffer_ranges", index, 0}})};
     }
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
-                               uint64_t size) {
+Result<void, RhiError> downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset,
+                                      void *destination, uint64_t size) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !destination)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (!destination)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_buffer", 0, 0}})};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     auto pin = pinSlot(slot, buffer);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
-        return fail(state, "OpenGL RHI buffer readback range is invalid");
-    return state.state.downloadBuffer(slot->buffer, static_cast<size_t>(offset), destination, static_cast<size_t>(size),
-                                      state.error)
-               ? VERNON_RHI_STATUS_OK
-               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(fail(state, "OpenGL RHI buffer readback range is invalid"))};
+    if (!state.state.downloadBuffer(slot->buffer, static_cast<size_t>(offset), destination, static_cast<size_t>(size),
+                                    state.error))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_buffer", offset, 0}})};
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
-                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+Result<void, RhiError> downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                            const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !ranges || rangeCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (!ranges || rangeCount == 0)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_buffer_ranges", rangeCount, 0}})};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     auto pin = pinSlot(slot, buffer);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_buffer_ranges", 0, 0}})};
     size_t totalSize = 0;
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferDownloadRange &range = ranges[index];
         if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
             range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
-            return fail(state, "OpenGL RHI buffer readback range is invalid");
+            return Result<void, RhiError>{err(fail(state, "OpenGL RHI buffer readback range is invalid"))};
         if (range.size > (std::numeric_limits<size_t>::max)() - totalSize)
-            return fail(state, "OpenGL RHI batched buffer readback size overflows");
+            return Result<void, RhiError>{err(fail(state, "OpenGL RHI batched buffer readback size overflows"))};
         totalSize += static_cast<size_t>(range.size);
     }
     Buffer staging;
     if (!state.state.createBuffer(staging, totalSize, state.error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_buffer_ranges", totalSize, 0}})};
     std::vector<size_t> stagingOffsets;
     stagingOffsets.reserve(rangeCount);
     size_t stagingOffset = 0;
@@ -550,37 +565,43 @@ VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buf
         if (!state.state.copyBuffer(slot->buffer, static_cast<size_t>(ranges[index].offset), staging, stagingOffset,
                                     static_cast<size_t>(ranges[index].size), state.error)) {
             state.state.destroyBuffer(staging);
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_buffer_ranges", index, 0}})};
         }
         stagingOffset += static_cast<size_t>(ranges[index].size);
     }
     std::vector<uint8_t> packed(totalSize);
     if (!state.state.downloadBuffer(staging, 0, packed.data(), packed.size(), state.error)) {
         state.state.destroyBuffer(staging);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_buffer_ranges", totalSize, 0}})};
     }
     state.state.destroyBuffer(staging);
     for (size_t index = 0; index < rangeCount; ++index)
         std::memcpy(ranges[index].destination, packed.data() + stagingOffsets[index],
                     static_cast<size_t>(ranges[index].size));
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<bool, RhiError> isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
-    return publicSlot(indexedSlot(state.buffers, buffer.index), buffer);
+    auto pin = pinSlot(indexedSlot(state.buffers, buffer.index), buffer);
+    if (pin.isErr())
+        return Result<bool, RhiError>{err(std::move(pin).error())};
+    return Result<bool, RhiError>{ok(true)};
 }
 
-VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor,
-                            VernonRhiImage *output) {
+Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (device.isErr())
+        return Result<VernonRhiImage, RhiError>{err(std::move(device).error())};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
+        return Result<VernonRhiImage, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image", 0, 0}})};
     FormatInfo format;
     const Enum target = imageTarget(descriptor->dimension);
     const bool validCube =
@@ -597,23 +618,24 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         descriptor->depth == 0 || descriptor->mip_levels == 0 || descriptor->sample_count != 1 || !validCube ||
         !validDimension || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
-        return fail(state, "OpenGL RHI image descriptor is invalid");
+        return Result<VernonRhiImage, RhiError>{err(fail(state, "OpenGL RHI image descriptor is invalid"))};
     auto owner = device.value().retainOwner();
     if (owner.isErr())
-        return statusFromError(owner.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(owner).error())};
     auto reservation = vernon::rhi::ResourceCreationReservation::create(owner.value());
     if (reservation.isErr())
-        return statusFromError(reservation.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> allocationGuard(state.resourceAllocationMutex);
     auto available = availableSlot<ImageSlot, ImageLifecycle>(state.images);
     if (available.isErr())
-        return statusFromError(available.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(available).error())};
     ImageSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     state.state.driver.genTextures(1, &slot.image.name);
     if (!slot.image.name)
-        return fail(state, "OpenGL RHI image allocation failed", VERNON_RHI_STATUS_INTERNAL_ERROR);
+        return Result<VernonRhiImage, RhiError>{
+            err(fail(state, "OpenGL RHI image allocation failed", RhiErrorCode::BackendFailure))};
     slot.image.imported = false;
     {
         auto &driver = state.state.driver;
@@ -645,23 +667,24 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         slot.image = {};
         slot.descriptor = {};
         slot.target = 0;
-        return statusFromError(published.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(published).error())};
     }
-    *output = {published.value().index, published.value().generation};
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiImage, RhiError>{ok(VernonRhiImage{published.value().index, published.value().generation})};
 }
 
-VernonRhiStatus setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
-                                const VernonRhiSamplerDescriptor *descriptor) {
+Result<void, RhiError> setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
+                                       const VernonRhiSamplerDescriptor *descriptor) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !descriptor || descriptor->struct_size < sizeof(*descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"set_opengl_sampler", 0, 0}})};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     const Int minFilter = samplerFilter(descriptor->min_filter);
     const Int magFilter = samplerFilter(descriptor->mag_filter);
     const Int addressU = samplerAddress(descriptor->address_u);
@@ -671,7 +694,7 @@ VernonRhiStatus setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
     state.state.makeCurrent();
     if (!slot || !minFilter || (descriptor->mag_filter > VERNON_RHI_FILTER_LINEAR) || !magFilter || !addressU ||
         !addressV || !addressW)
-        return fail(state, "OpenGL RHI image sampler descriptor is invalid");
+        return Result<void, RhiError>{err(fail(state, "OpenGL RHI image sampler descriptor is invalid"))};
     auto &driver = state.state.driver;
     driver.bindTexture(slot->target, slot->image.name);
     driver.texParameteri(slot->target, 0x2802, addressU);
@@ -681,24 +704,26 @@ VernonRhiStatus setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
     driver.texParameteri(slot->target, 0x2801, minFilter);
     driver.texParameteri(slot->target, 0x2800, magFilter);
     driver.bindTexture(slot->target, 0);
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const VernonRhiImageUploadDescriptor *uploads,
-                            size_t uploadCount) {
+Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
+                                   const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || (uploadCount != 0 && !uploads))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    if (uploadCount != 0 && !uploads)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"upload_opengl_image", 0, 0}})};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     FormatInfo storageFormat;
     if (!slot || !formatInfo(slot->descriptor.format, storageFormat))
-        return fail(state, "OpenGL RHI image storage format is invalid");
+        return Result<void, RhiError>{err(fail(state, "OpenGL RHI image storage format is invalid"))};
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const Enum sourceFormat = imageDataFormat(upload.source_format);
@@ -719,7 +744,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
             upload.depth > mipDepth - upload.offset_z ||
             !vernon::rhi::imageTransferAspectMatches(slot->descriptor.format, upload.aspect, upload.source_format,
                                                      upload.source_type))
-            return fail(state, "OpenGL RHI image upload descriptor is invalid");
+            return Result<void, RhiError>{err(fail(state, "OpenGL RHI image upload descriptor is invalid"))};
     }
     state.state.makeCurrent();
     auto &driver = state.state.driver;
@@ -747,7 +772,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
                                  static_cast<Size>(upload.height), sourceFormat, type, upload.data);
     }
     driver.bindTexture(slot->target, 0);
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
 bool validImageDownload(const ImageSlot &slot, const VernonRhiImageDownloadDescriptor &download,
@@ -757,8 +782,8 @@ bool validImageDownload(const ImageSlot &slot, const VernonRhiImageDownloadDescr
     return destination && expected && size == *expected && formatInfo(slot.descriptor.format, format);
 }
 
-VernonRhiStatus downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
-                                    const VernonRhiImageDownloadDescriptor &download, void *destination) {
+Result<void, RhiError> downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
+                                           const VernonRhiImageDownloadDescriptor &download, void *destination) {
     const size_t expected = *imageDownloadByteSize(slot.descriptor, download);
     FormatInfo format;
     formatInfo(slot.descriptor.format, format);
@@ -777,8 +802,9 @@ VernonRhiStatus downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
                                            static_cast<Size>(download.height), static_cast<Size>(download.depth),
                                            externalFormat, allocationType, expected / download.depth, destination,
                                            state.error)
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+                   ? Result<void, RhiError>{ok()}
+                   : Result<void, RhiError>{
+                         err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_image", 0, 0}})};
     const Enum target = slot.descriptor.dimension == VERNON_RHI_IMAGE_CUBE
                             ? vernon::rhi::opengl::kTextureCubeMapPositiveX + download.array_layer
                             : slot.target;
@@ -787,14 +813,15 @@ VernonRhiStatus downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
                                            static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
                                            static_cast<Size>(download.width), static_cast<Size>(download.height),
                                            externalFormat, allocationType, destination, state.error)
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+                   ? Result<void, RhiError>{ok()}
+                   : Result<void, RhiError>{
+                         err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_image", 0, 0}})};
     std::vector<uint8_t> native(expected);
     if (!state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level),
                                      static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
                                      static_cast<Size>(download.width), static_cast<Size>(download.height),
                                      format.external, format.allocationType, native.data(), state.error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_image", 0, 0}})};
     auto *output = static_cast<uint8_t *>(destination);
     const size_t pixels = static_cast<size_t>(download.width) * download.height;
     for (size_t index = 0; index < pixels; ++index) {
@@ -806,127 +833,134 @@ VernonRhiStatus downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
         storePackedDepthStencil(output + index * packedDepthStencilPixelSize, depth,
                                 static_cast<uint8_t>(stencilWord & 0xff));
     }
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
-                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
+Result<void, RhiError> downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                                     const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
     if (!download || download->struct_size < sizeof(*download))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image", 0, 0}})};
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     if (!slot || !validImageDownload(*slot, *download, destination, size))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image", 0, 0}})};
     state.state.makeCurrent();
     return downloadImageLocked(state, *slot, *download, destination);
 }
 
-VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
-                                   const VernonRhiImageDownload *downloads, size_t downloadCount) {
+Result<void, RhiError> downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
+                                          const VernonRhiImageDownload *downloads, size_t downloadCount) {
     if (!downloads || downloadCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image_batch", downloadCount, 0}})};
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image_batch", 0, 0}})};
     for (size_t index = 0; index < downloadCount; ++index)
         if (downloads[index].descriptor.struct_size < sizeof(downloads[index].descriptor) ||
             !validImageDownload(*slot, downloads[index].descriptor, downloads[index].destination,
                                 downloads[index].size))
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image_batch", index, 0}})};
     state.state.makeCurrent();
     for (size_t index = 0; index < downloadCount; ++index) {
-        const VernonRhiStatus status =
-            downloadImageLocked(state, *slot, downloads[index].descriptor, downloads[index].destination);
-        if (status != VERNON_RHI_STATUS_OK)
-            return status;
+        auto downloaded = downloadImageLocked(state, *slot, downloads[index].descriptor, downloads[index].destination);
+        if (downloaded.isErr())
+            return downloaded;
     }
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
+Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     if (!slot || slot->descriptor.mip_levels < 2 || !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
         !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
         slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
         slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"generate_opengl_mipmaps", image.generation, image.index}})};
     state.state.makeCurrent();
     state.state.driver.bindTexture(slot->target, slot->image.name);
     state.state.driver.generateMipmap(slot->target);
     state.state.driver.bindTexture(slot->target, 0);
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus bindImage(VernonRhiDevice handle, VernonRhiImage image, uint32_t textureUnit) {
+Result<void, RhiError> bindImage(VernonRhiDevice handle, VernonRhiImage image, uint32_t textureUnit) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     state.state.driver.activeTexture(vernon::rhi::opengl::kTexture0 + textureUnit);
     state.state.driver.bindTexture(slot->target, slot->image.name);
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
+Result<void, RhiError> destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = slot->lifecycle.destroyPublic({image.index, image.generation});
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusFromError(destroyed.error());
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_image", image.generation, image.index}})};
+    return slot->lifecycle.destroyPublic({image.index, image.generation});
 }
 
-uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
+Result<bool, RhiError> isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
-    return publicSlot(indexedSlot(state.images, image.index), image);
+    auto pin = pinSlot(indexedSlot(state.images, image.index), image);
+    if (pin.isErr())
+        return Result<bool, RhiError>{err(std::move(pin).error())};
+    return Result<bool, RhiError>{ok(true)};
 }
 
-VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor,
-                              VernonRhiSampler *output) {
+Result<VernonRhiSampler, RhiError> createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (device.isErr())
+        return Result<VernonRhiSampler, RhiError>{err(std::move(device).error())};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
+        return Result<VernonRhiSampler, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_sampler", 0, 0}})};
     const Int minFilter = samplerFilter(descriptor->min_filter);
     const Int magFilter = samplerFilter(descriptor->mag_filter);
     const Int addressU = samplerAddress(descriptor->address_u);
@@ -934,103 +968,112 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
     const Int addressW = samplerAddress(descriptor->address_w);
     if (!minFilter || descriptor->mag_filter > VERNON_RHI_FILTER_LINEAR || !magFilter || !addressU || !addressV ||
         !addressW)
-        return fail(device.value().device(), "OpenGL RHI sampler descriptor is invalid");
+        return Result<VernonRhiSampler, RhiError>{
+            err(fail(device.value().device(), "OpenGL RHI sampler descriptor is invalid"))};
     auto owner = device.value().retainOwner();
     if (owner.isErr())
-        return statusFromError(owner.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(owner).error())};
     auto reservation = vernon::rhi::ResourceCreationReservation::create(owner.value());
     if (reservation.isErr())
-        return statusFromError(reservation.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(reservation).error())};
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> allocationGuard(state.resourceAllocationMutex);
     auto available = availableSlot<SamplerSlot, SamplerLifecycle>(state.samplers);
     if (available.isErr())
-        return statusFromError(available.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(available).error())};
     SamplerSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (!state.state.createSampler(slot.sampler, addressU, addressV, addressW, minFilter, magFilter, state.error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<VernonRhiSampler, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"create_opengl_sampler", 0, 0}})};
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &state, teardownSampler);
     if (published.isErr()) {
         state.state.destroySampler(slot.sampler);
         slot.sampler = {};
-        return statusFromError(published.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(published).error())};
     }
-    *output = {published.value().index, published.value().generation};
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiSampler, RhiError>{
+        ok(VernonRhiSampler{published.value().index, published.value().generation})};
 }
 
-VernonRhiStatus destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
+Result<void, RhiError> destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     SamplerSlot *slot = indexedSlot(state.samplers, sampler.index);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = slot->lifecycle.destroyPublic({sampler.index, sampler.generation});
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusFromError(destroyed.error());
+        return Result<void, RhiError>{err(
+            RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_sampler", sampler.generation, sampler.index}})};
+    return slot->lifecycle.destroyPublic({sampler.index, sampler.generation});
 }
 
-uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
+Result<bool, RhiError> isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
-    return publicSlot(indexedSlot(state.samplers, sampler.index), sampler);
+    auto pin = pinSlot(indexedSlot(state.samplers, sampler.index), sampler);
+    if (pin.isErr())
+        return Result<bool, RhiError>{err(std::move(pin).error())};
+    return Result<bool, RhiError>{ok(true)};
 }
 
-VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image, uint64_t *output) {
+Result<uint64_t, RhiError> getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
     auto pin = pinSlot(slot, image);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<uint64_t, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    *output = slot->image.name;
-    return VERNON_RHI_STATUS_OK;
+    return Result<uint64_t, RhiError>{ok(uint64_t(slot->image.name))};
 }
 
-VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
-                                VernonRhiImageView *output) {
+Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
+                                                     const VernonRhiImageViewDescriptor *descriptor) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
-        !descriptor->mip_level_count || !descriptor->array_layer_count || !descriptor->aspects)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (device.isErr())
+        return Result<VernonRhiImageView, RhiError>{err(std::move(device).error())};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->mip_level_count ||
+        !descriptor->array_layer_count || !descriptor->aspects)
+        return Result<VernonRhiImageView, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image_view", 0, 0}})};
     OpenGLDevice &state = device.value().device();
     ImageSlot *parent = indexedSlot(state.images, descriptor->image.index);
     auto parentPin = pinSlot(parent, descriptor->image);
     if (parentPin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImageView, RhiError>{err(std::move(parentPin).error())};
     FormatInfo format{};
     if (!parent || !formatInfo(descriptor->format, format))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImageView, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image_view", 0, 0}})};
     if (!vernon::rhi::validImageViewDescriptor(parent->descriptor, *descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImageView, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image_view", 0, 0}})};
     if (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->array_layer_count != 1)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return Result<VernonRhiImageView, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"create_opengl_image_view", 0, 0}})};
     auto parentLease = parent->lifecycle.retain({descriptor->image.index, descriptor->image.generation});
     if (parentLease.isErr())
-        return statusFromError(parentLease.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(parentLease).error())};
     auto owner = device.value().retainOwner();
     if (owner.isErr())
-        return statusFromError(owner.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(owner).error())};
     auto reservation = vernon::rhi::ResourceCreationReservation::create(owner.value());
     if (reservation.isErr())
-        return statusFromError(reservation.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> allocationGuard(state.resourceAllocationMutex);
     auto available = availableSlot<ImageViewSlot, ImageViewLifecycle>(state.imageViews);
     if (available.isErr())
-        return statusFromError(available.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(available).error())};
     ImageViewSlot &slot = *available.value();
     std::unique_lock<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
@@ -1043,14 +1086,16 @@ VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageView
     if (!identityView) {
         if (state.state.embeddedProfile || !state.state.driver.textureView) {
             guard.unlock();
-            return VERNON_RHI_STATUS_UNSUPPORTED;
+            return Result<VernonRhiImageView, RhiError>{
+                err(RhiError{RhiErrorCode::Unsupported, {"create_opengl_image_view", 0, 0}})};
         }
         auto &owned = slot.backing.emplace<OwnedTextureViewBacking>();
         state.state.driver.genTextures(1, &owned.image.name);
         if (!owned.image.name) {
             slot.backing.emplace<IdentityImageViewBacking>();
             guard.unlock();
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return Result<VernonRhiImageView, RhiError>{
+                err(RhiError{RhiErrorCode::BackendFailure, {"create_opengl_image_view", 0, 0}})};
         }
         owned.image.imported = false;
         slot.target = imageTarget(descriptor->dimension);
@@ -1074,98 +1119,96 @@ VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageView
         slot.target = 0;
         guard.unlock();
         slot.parent.reset();
-        return statusFromError(published.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(published).error())};
     }
-    *output = {published.value().index, published.value().generation};
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiImageView, RhiError>{
+        ok(VernonRhiImageView{published.value().index, published.value().generation})};
 }
 
-VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
+Result<void, RhiError> destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageViewSlot *slot = indexedSlot(state.imageViews, view.index);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = slot->lifecycle.destroyPublic({view.index, view.generation});
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusFromError(destroyed.error());
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_image_view", view.generation, view.index}})};
+    return slot->lifecycle.destroyPublic({view.index, view.generation});
 }
 
-VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view, uint64_t *output) {
+Result<uint64_t, RhiError> getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view) {
     auto device = lookupDevice(handle);
-    if (device.isErr() || !output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageViewSlot *slot = indexedSlot(state.imageViews, view.index);
     auto pin = pinSlot(slot, view);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<uint64_t, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    *output = imageViewName(*slot);
-    return VERNON_RHI_STATUS_OK;
+    return Result<uint64_t, RhiError>{ok(uint64_t(imageViewName(*slot)))};
 }
 
-VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<void, RhiError> destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = slot->lifecycle.destroyPublic({buffer.index, buffer.generation});
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusFromError(destroyed.error());
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_buffer", buffer.generation, buffer.index}})};
+    return slot->lifecycle.destroyPublic({buffer.index, buffer.generation});
 }
 
-VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer, void **output) {
+Result<void *, RhiError> getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
-    if (device.isErr() || !output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (device.isErr())
+        return Result<void *, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
     auto pin = pinSlot(slot, buffer);
     if (pin.isErr())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void *, RhiError>{err(std::move(pin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    *output = reinterpret_cast<void *>(static_cast<uintptr_t>(slot->buffer.name));
-    return VERNON_RHI_STATUS_OK;
+    return Result<void *, RhiError>{ok(reinterpret_cast<void *>(static_cast<uintptr_t>(slot->buffer.name)))};
 }
 
 bool ownsDevice(VernonRhiDevice handle) { return lookupDevice(handle).isOk(); }
 
-void *deviceStateForBackend(VernonRhiDevice handle) {
-    auto device = lookupDevice(handle);
-    return device.isOk() ? &device.value().device().state : nullptr;
-}
-
-bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
-    native = 0;
+Result<void *, RhiError> deviceStateForBackend(VernonRhiDevice handle) {
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return false;
+        return Result<void *, RhiError>{err(std::move(device).error())};
+    return Result<void *, RhiError>{ok(static_cast<void *>(&device.value().device().state))};
+}
+
+Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<CommandRecording, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    backend = state.state.embeddedProfile ? VERNON_RHI_BACKEND_OPENGL_ES : VERNON_RHI_BACKEND_OPENGL;
-    native = reinterpret_cast<uintptr_t>(&state.state);
-    return true;
+    const VernonRhiBackend backend =
+        state.state.embeddedProfile ? VERNON_RHI_BACKEND_OPENGL_ES : VERNON_RHI_BACKEND_OPENGL;
+    return Result<CommandRecording, RhiError>{ok(CommandRecording{reinterpret_cast<uintptr_t>(&state.state), backend})};
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
-                    bool &externalCompletion) {
-    completed = false;
-    externalCompletion = false;
+Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint64_t native,
+                                                   bool computeWrites) noexcept {
     auto device = lookupDevice(handle);
     if (device.isErr())
-        return false;
+        return Result<CommandSubmission, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     if (native != reinterpret_cast<uintptr_t>(&state.state))
-        return false;
+        return Result<CommandSubmission, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"submit_opengl_commands", native, 0}})};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (computeWrites) {
@@ -1176,29 +1219,34 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
         else
             state.state.driver.finish();
     }
-    completed = true;
-    return true;
+    return Result<CommandSubmission, RhiError>{ok(CommandSubmission{true, false})};
 }
 
-bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+Result<void, RhiError> completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) noexcept {
     auto device = lookupDevice(handle);
-    return device.isOk() && native == reinterpret_cast<uintptr_t>(&device.value().device().state);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    return native == reinterpret_cast<uintptr_t>(&device.value().device().state)
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{
+                     err(RhiError{RhiErrorCode::InvalidArgument, {"complete_opengl_commands", native, 0}})};
 }
 
-void abandonCommands(VernonRhiDevice handle, uint64_t native) {
+void abandonCommands(VernonRhiDevice handle, uint64_t native) noexcept {
     auto device = lookupDevice(handle);
     if (device.isOk() && native == reinterpret_cast<uintptr_t>(&device.value().device().state))
         return;
 }
 
-bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, const VernonRhiBarrier *barriers,
-                    size_t barrierCount) {
+Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                      const VernonRhiBarrier *barriers, size_t barrierCount) noexcept {
     auto device = lookupDevice(handle);
     if (device.isOk()) {
         OpenGLDevice &deviceState = device.value().device();
         std::lock_guard<std::mutex> guard(deviceState.mutex);
         if (native != reinterpret_cast<uintptr_t>(&deviceState.state))
-            return false;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_opengl", native, 0}})};
         uint32_t bits = 0;
         for (size_t index = 0; index < barrierCount; ++index) {
             const uint32_t access = barriers[index].destination_access;
@@ -1254,58 +1302,67 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
                 // scopes, for example when sampling a depth attachment.
                 deviceState.state.driver.finish();
         }
-        return true;
+        return Result<void, RhiError>{ok()};
     }
-    return false;
+    return Result<void, RhiError>{err(std::move(device).error())};
 }
 
-bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
-                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source,
+                                        uint64_t sourceOffset, VernonRhiBuffer destination, uint64_t destinationOffset,
+                                        uint64_t size) noexcept {
     auto device = lookupDevice(handle);
     if (device.isErr() || !size)
-        return false;
+        return device.isErr() ? Result<void, RhiError>{err(std::move(device).error())}
+                              : Result<void, RhiError>{err(
+                                    RhiError{RhiErrorCode::InvalidArgument, {"recordBufferCopy_opengl", native, 0}})};
     OpenGLDevice &state = device.value().device();
     if (native != reinterpret_cast<uintptr_t>(&state.state))
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBufferCopy_opengl", native, 0}})};
     BufferSlot *sourceSlot = indexedSlot(state.buffers, source.index);
     BufferSlot *destinationSlot = indexedSlot(state.buffers, destination.index);
     auto sourcePin = pinSlot(sourceSlot, source);
     auto destinationPin = pinSlot(destinationSlot, destination);
     if (sourcePin.isErr() || destinationPin.isErr())
-        return false;
+        return sourcePin.isErr() ? Result<void, RhiError>{err(std::move(sourcePin).error())}
+                                 : Result<void, RhiError>{err(std::move(destinationPin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (sourceOffset > sourceSlot->descriptor.size || size > sourceSlot->descriptor.size - sourceOffset ||
         destinationOffset > destinationSlot->descriptor.size ||
         size > destinationSlot->descriptor.size - destinationOffset)
-        return false;
-    return state.state.copyBuffer(sourceSlot->buffer, static_cast<size_t>(sourceOffset), destinationSlot->buffer,
-                                  static_cast<size_t>(destinationOffset), static_cast<size_t>(size), state.error);
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBufferCopy_opengl", native, 0}})};
+    if (!state.state.copyBuffer(sourceSlot->buffer, static_cast<size_t>(sourceOffset), destinationSlot->buffer,
+                                static_cast<size_t>(destinationOffset), static_cast<size_t>(size), state.error))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"recordBufferCopy_opengl", native, 0}})};
+    return Result<void, RhiError>{ok()};
 }
 
-bool supportsImageCopy(VernonRhiDevice handle) {
-    auto device = lookupDevice(handle);
-    return device.isOk() && device.value().device().state.driver.copyImageSubData;
-}
-
-bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
-                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
+                                       VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
+                                       size_t regionCount) noexcept {
     auto device = lookupDevice(handle);
     if (device.isErr() || !regions || !regionCount)
-        return false;
+        return device.isErr() ? Result<void, RhiError>{err(std::move(device).error())}
+                              : Result<void, RhiError>{err(
+                                    RhiError{RhiErrorCode::InvalidArgument, {"recordImageCopy_opengl", native, 0}})};
     OpenGLDevice &state = device.value().device();
     if (native != reinterpret_cast<uintptr_t>(&state.state))
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordImageCopy_opengl", native, 0}})};
     ImageSlot *sourceSlot = indexedSlot(state.images, source.index);
     ImageSlot *destinationSlot = indexedSlot(state.images, destination.index);
     auto sourcePin = pinSlot(sourceSlot, source);
     auto destinationPin = pinSlot(destinationSlot, destination);
     if (sourcePin.isErr() || destinationPin.isErr())
-        return false;
+        return sourcePin.isErr() ? Result<void, RhiError>{err(std::move(sourcePin).error())}
+                                 : Result<void, RhiError>{err(std::move(destinationPin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     if (!state.state.driver.copyImageSubData)
-        return false;
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"recordImageCopy_opengl", native, 0}})};
     for (size_t index = 0; index < regionCount; ++index) {
         const VernonRhiImageCopyRegion &region = regions[index];
         const Int sourceZ = sourceSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
@@ -1321,21 +1378,23 @@ bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRh
             static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y), destinationZ,
             static_cast<Size>(region.width), static_cast<Size>(region.height), static_cast<Size>(region.depth));
     }
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                  uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
-                  size_t colorCount, uint64_t depthResource, uint64_t) {
+Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                    uint32_t backendKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
+                                    const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,
+                                    uint64_t) noexcept {
 
     if ((backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) &&
         backendKind == CommandRenderingStateless) {
         auto device = lookupDevice(handle);
         if (device.isErr())
-            return false;
+            return Result<void, RhiError>{err(std::move(device).error())};
         OpenGLDevice &state = device.value().device();
         if (native != reinterpret_cast<uintptr_t>(&state.state))
-            return false;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"endRendering_opengl", native, 0}})};
         std::array<vernon::rhi::opengl::Enum, 9> discarded{};
         size_t discardedCount = 0;
         for (size_t index = 0; index < colorCount; ++index)
@@ -1350,42 +1409,50 @@ bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend back
         if (discardedCount && state.state.driver.invalidateFramebuffer)
             state.state.driver.invalidateFramebuffer(vernon::rhi::opengl::kFramebuffer,
                                                      static_cast<Size>(discardedCount), discarded.data());
-        return true;
+        return Result<void, RhiError>{ok()};
     }
-    return false;
+    return Result<void, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"endRendering_opengl", native, backendKind}})};
 }
 
-bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, uint64_t,
-                int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
-                uint32_t location, const float color[4]) {
+Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                  uint32_t backendKind, uint64_t, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                  uint32_t layers, uint64_t target, uint32_t location, const float color[4]) noexcept {
 
     if (backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) {
         auto device = lookupDevice(handle);
         if (device.isErr() || backendKind != CommandRenderingStateless)
-            return false;
+            return device.isErr() ? Result<void, RhiError>{err(std::move(device).error())}
+                                  : Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument,
+                                                                        {"clearColor_opengl", native, backendKind}})};
         OpenGLDevice &state = device.value().device();
         if (native != reinterpret_cast<uintptr_t>(&state.state))
-            return false;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_opengl", native, 0}})};
         std::lock_guard<std::mutex> guard(state.mutex);
         state.state.makeCurrent();
         state.state.driver.clearBufferfv(vernon::rhi::opengl::kColor, static_cast<Int>(location), color);
-        return true;
+        return Result<void, RhiError>{ok()};
     }
-    return false;
+    return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_opengl", native, backend}})};
 }
 
-bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                       uint64_t, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
-                       uint64_t target, float depth, uint32_t stencil, uint32_t aspects) {
+Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                         uint32_t backendKind, uint64_t, int32_t x, int32_t y, uint32_t width,
+                                         uint32_t height, uint32_t layers, uint64_t target, float depth,
+                                         uint32_t stencil, uint32_t aspects) noexcept {
 
     if (backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) {
         auto device = lookupDevice(handle);
         if (device.isErr() || backendKind != CommandRenderingStateless ||
             (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)) || !aspects)
-            return false;
+            return device.isErr() ? Result<void, RhiError>{err(std::move(device).error())}
+                                  : Result<void, RhiError>{err(RhiError{
+                                        RhiErrorCode::InvalidArgument, {"clearDepthStencil_opengl", native, aspects}})};
         OpenGLDevice &state = device.value().device();
         if (native != reinterpret_cast<uintptr_t>(&state.state))
-            return false;
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_opengl", native, 0}})};
         std::lock_guard<std::mutex> guard(state.mutex);
         state.state.makeCurrent();
         if (aspects == (VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL))
@@ -1396,38 +1463,29 @@ bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend
             const Int value = static_cast<Int>(stencil);
             state.state.driver.clearBufferiv(vernon::rhi::opengl::kStencil, 0, &value);
         }
-        return true;
+        return Result<void, RhiError>{ok()};
     }
-    return false;
+    return Result<void, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_opengl", native, backend}})};
 }
 
-uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupDevice(handle);
-    return device.isOk() && publicSlot(indexedSlot(device.value().device().buffers, buffer.index), buffer)
-               ? resourceKey(buffer)
-               : 0;
-}
+#define VERNON_OPENGL_RESOURCE_RESULT(name, Handle, slots)                                                             \
+    Result<uint64_t, RhiError> name(VernonRhiDevice deviceHandle, Handle handle) noexcept {                            \
+        auto device = lookupDevice(deviceHandle);                                                                      \
+        if (device.isErr())                                                                                            \
+            return Result<uint64_t, RhiError>{err(std::move(device).error())};                                         \
+        auto pin = pinSlot(indexedSlot(device.value().device().slots, handle.index), handle);                          \
+        if (pin.isErr())                                                                                               \
+            return Result<uint64_t, RhiError>{err(std::move(pin).error())};                                            \
+        return Result<uint64_t, RhiError>{ok(resourceKey(handle))};                                                    \
+    }
 
-uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
-    auto device = lookupDevice(handle);
-    return device.isOk() && publicSlot(indexedSlot(device.value().device().images, image.index), image)
-               ? resourceKey(image)
-               : 0;
-}
+VERNON_OPENGL_RESOURCE_RESULT(bufferResource, VernonRhiBuffer, buffers)
+VERNON_OPENGL_RESOURCE_RESULT(imageResource, VernonRhiImage, images)
+VERNON_OPENGL_RESOURCE_RESULT(imageViewResource, VernonRhiImageView, imageViews)
+VERNON_OPENGL_RESOURCE_RESULT(samplerResource, VernonRhiSampler, samplers)
 
-uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
-    auto device = lookupDevice(handle);
-    return device.isOk() && publicSlot(indexedSlot(device.value().device().imageViews, view.index), view)
-               ? resourceKey(view)
-               : 0;
-}
-
-uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
-    auto device = lookupDevice(handle);
-    return device.isOk() && publicSlot(indexedSlot(device.value().device().samplers, sampler.index), sampler)
-               ? resourceKey(sampler)
-               : 0;
-}
+#undef VERNON_OPENGL_RESOURCE_RESULT
 
 vernon::Result<vernon::rhi::RetainedRhiResourceLease, vernon::RhiError>
 retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) noexcept {
@@ -1536,106 +1594,99 @@ vernon::Result<uint64_t, vernon::RhiError> resolveResource(VernonRhiDevice handl
         vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"resolve_opengl_resource", key, uint32_t(kind)}})};
 }
 
-vernon::Result<void, vernon::RhiError> describeImageResource(VernonRhiDevice handle, uint64_t key,
-                                                             VernonRhiImageDescriptor *descriptor) noexcept {
+vernon::Result<ImageResourceDescription, vernon::RhiError> describeImageResource(VernonRhiDevice handle,
+                                                                                 uint64_t key) noexcept {
     auto device = lookupDevice(handle);
     ImageLifecycle::Handle resource{};
-    if (device.isErr() || !descriptor || !decodeResourceKey(key, resource))
-        return vernon::Result<void, vernon::RhiError>{
+    if (device.isErr() || !decodeResourceKey(key, resource))
+        return vernon::Result<ImageResourceDescription, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"describe_opengl_image", key, 0}})};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, resource.index);
     if (!slot)
-        return vernon::Result<void, vernon::RhiError>{
+        return vernon::Result<ImageResourceDescription, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"describe_opengl_image", key, 0}})};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    *descriptor = slot->descriptor;
-    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    return vernon::Result<ImageResourceDescription, vernon::RhiError>{
+        vernon::ok(ImageResourceDescription{slot->descriptor})};
 }
 
-vernon::Result<void, vernon::RhiError> describeImageViewResource(VernonRhiDevice handle, uint64_t key,
-                                                                 VernonRhiImageViewDescriptor *view,
-                                                                 VernonRhiImageDescriptor *image,
-                                                                 uint64_t *parentKey) noexcept {
+vernon::Result<ImageViewResourceDescription, vernon::RhiError> describeImageViewResource(VernonRhiDevice handle,
+                                                                                         uint64_t key) noexcept {
     auto device = lookupDevice(handle);
     ImageViewLifecycle::Handle resource{};
-    if (device.isErr() || !view || !image || !parentKey || !decodeResourceKey(key, resource))
-        return vernon::Result<void, vernon::RhiError>{vernon::err(
+    if (device.isErr() || !decodeResourceKey(key, resource))
+        return vernon::Result<ImageViewResourceDescription, vernon::RhiError>{vernon::err(
             vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"describe_opengl_image_view", key, 0}})};
     OpenGLDevice &state = device.value().device();
     ImageViewSlot *slot = indexedSlot(state.imageViews, resource.index);
     if (!slot)
-        return vernon::Result<void, vernon::RhiError>{vernon::err(
+        return vernon::Result<ImageViewResourceDescription, vernon::RhiError>{vernon::err(
             vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"describe_opengl_image_view", key, 0}})};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    *view = slot->descriptor;
-    *image = slot->imageDescriptor;
-    *parentKey = slot->parentKey;
-    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    return vernon::Result<ImageViewResourceDescription, vernon::RhiError>{
+        vernon::ok(ImageViewResourceDescription{slot->descriptor, slot->imageDescriptor, slot->parentKey})};
 }
 
 } // namespace vernon::rhi::opengl_api
 
 const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
     using namespace opengl_api;
-    static const BackendDispatch dispatch{
-        VERNON_RHI_BACKEND_OPENGL,
-        0,
-        nullptr,
-        ownsDevice,
-        createOwnedDevice,
-        destroyDevice,
-        lastError,
-        synchronize,
-        deviceStateForBackend,
-        commandState,
-        createBuffer,
-        uploadBuffer,
-        uploadBufferRanges,
-        downloadBufferRanges,
-        downloadBuffer,
-        destroyBuffer,
-        isBufferValid,
-        getBufferNativeHandle,
-        createImage,
-        setImageSampler,
-        uploadImage,
-        downloadImage,
-        downloadImageBatch,
-        generateImageMipmaps,
-        bindImage,
-        destroyImage,
-        isImageValid,
-        getImageNativeHandle,
-        createSampler,
-        destroySampler,
-        isSamplerValid,
-        bufferResource,
-        imageResource,
-        samplerResource,
-        retainResource,
-        resolveResource,
-        describeImageResource,
-        beginCommands,
-        submitCommands,
-        nullptr,
-        completeBorrowedCommands,
-        abandonCommands,
-        recordBarriers,
-        recordBufferCopy,
-        supportsImageCopy,
-        recordImageCopy,
-        endRendering,
-        clearColor,
-        clearDepthStencil,
-        nullptr,
-        createImageView,
-        destroyImageView,
-        getImageViewNativeHandle,
-        imageViewResource,
-        describeImageViewResource,
-    };
+    static const BackendDispatch dispatch = [] {
+        BackendDispatch result{};
+        result.backend = VERNON_RHI_BACKEND_OPENGL;
+        result.ownsDevice = ownsDevice;
+        result.createOwnedDevice = createOwnedDevice;
+        result.destroyDevice = destroyDevice;
+        result.lastError = lastError;
+        result.synchronize = synchronize;
+        result.deviceState = deviceStateForBackend;
+        result.commandState = commandState;
+        result.createBuffer = createBuffer;
+        result.uploadBuffer = uploadBuffer;
+        result.uploadBufferRanges = uploadBufferRanges;
+        result.downloadBufferRanges = downloadBufferRanges;
+        result.downloadBuffer = downloadBuffer;
+        result.destroyBuffer = destroyBuffer;
+        result.isBufferValid = isBufferValid;
+        result.getBufferNativeHandle = getBufferNativeHandle;
+        result.createImage.emplace(createImage);
+        result.setImageSampler.emplace(setImageSampler);
+        result.uploadImage.emplace(uploadImage);
+        result.downloadImage.emplace(downloadImage);
+        result.downloadImageBatch.emplace(downloadImageBatch);
+        result.generateImageMipmaps.emplace(generateImageMipmaps);
+        result.bindImage.emplace(bindImage);
+        result.destroyImage.emplace(destroyImage);
+        result.isImageValid.emplace(isImageValid);
+        result.getImageNativeHandle.emplace(getImageNativeHandle);
+        result.createSampler.emplace(createSampler);
+        result.destroySampler.emplace(destroySampler);
+        result.isSamplerValid.emplace(isSamplerValid);
+        result.bufferResource = bufferResource;
+        result.imageResource.emplace(imageResource);
+        result.samplerResource.emplace(samplerResource);
+        result.retainResource = retainResource;
+        result.resolveRetainedResource = resolveResource;
+        result.describeImageResource.emplace(describeImageResource);
+        result.beginCommands = beginCommands;
+        result.submitCommands = submitCommands;
+        result.completeBorrowedCommands.emplace(completeBorrowedCommands);
+        result.abandonCommands.emplace(abandonCommands);
+        result.recordBarriers.emplace(recordBarriers);
+        result.recordBufferCopy.emplace(recordBufferCopy);
+        result.recordImageCopy.emplace(recordImageCopy);
+        result.endRendering.emplace(endRendering);
+        result.clearColor.emplace(clearColor);
+        result.clearDepthStencil.emplace(clearDepthStencil);
+        result.createImageView.emplace(createImageView);
+        result.destroyImageView.emplace(destroyImageView);
+        result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);
+        result.imageViewResource.emplace(imageViewResource);
+        result.describeImageViewResource.emplace(describeImageViewResource);
+        return result;
+    }();
     return dispatch;
 }

@@ -175,8 +175,8 @@ struct PlanFixture {
 TEST(ResolvedExecutionPlan, SharedStageRetainsNoNodeProjectionState) {
     PlanFixture fixture;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isOk()) << diagnostic.message;
     const ResolvedNodePlan *first = fixture.plan.node(GraphDirection::Forward, 0);
     const ResolvedNodePlan *second = fixture.plan.node(GraphDirection::Forward, 1);
     ASSERT_NE(first, nullptr);
@@ -189,8 +189,8 @@ TEST(ResolvedExecutionPlan, SharedStageRetainsNoNodeProjectionState) {
 TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodiffPolicies) {
     PlanFixture fixture;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isOk()) << diagnostic.message;
 
     ASSERT_EQ(fixture.plan.aliasDomains.size(), 2u);
     const AliasDomainPlan &firstDomain = fixture.plan.aliasDomains.at(0);
@@ -286,14 +286,14 @@ TEST(ResolvedExecutionPlan, GroupsAdjacentVersionContinuousGraphicsNodesIntoOneS
                                ResolvedNodePlan{{GraphDirection::Forward, second.id}, fixture.graphics, {}, controls});
 
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
     ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
     EXPECT_EQ(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
 
     forward.nodes[forward.nodes.size() - 2].accesses.push_back(
         {AccessKind::Write, 0, 1, 0, 1, std::nullopt, "read_write"});
     forward.nodes.back().accesses.push_back({AccessKind::Read, 0, 1, 1, 1, std::nullopt, "read"});
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
     ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
     EXPECT_NE(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
     forward.nodes[forward.nodes.size() - 2].accesses.pop_back();
@@ -301,7 +301,7 @@ TEST(ResolvedExecutionPlan, GroupsAdjacentVersionContinuousGraphicsNodesIntoOneS
 
     std::get<GraphicsOperation>(forward.nodes.back().operation).colorAttachments[0].formats = {
         VERNON_TEXTURE_RGBA8_SRGB};
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
     ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
     EXPECT_NE(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
 }
@@ -310,8 +310,8 @@ TEST(ResolvedExecutionPlan, OrdersDeviceResultTransferBeforeUniformConsumer) {
     PlanFixture fixture;
     fixture.plan.nodes.at({GraphDirection::Forward, 1}).projections[0].target.carrier = TargetCarrier::UniformBuffer;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isOk()) << diagnostic.message;
 
     const auto transfer = std::find_if(
         fixture.plan.transfers.edges.begin(), fixture.plan.transfers.edges.end(), [](const ResolvedTransferEdge &edge) {
@@ -330,8 +330,8 @@ TEST(ResolvedExecutionPlan, CpuUsesSameLogicalUniformProjectionWithoutDeviceTran
     fixture.context->backend = VERNON_RUNTIME_CPU;
     fixture.plan.nodes.at({GraphDirection::Forward, 1}).projections[0].target.carrier = TargetCarrier::UniformBuffer;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isOk()) << diagnostic.message;
 
     EXPECT_FALSE(fixture.plan.requiresDevice(GraphDirection::Forward, 1));
     EXPECT_EQ(fixture.plan.node(GraphDirection::Forward, 1)->projections[0].target.projection.value, 1u);
@@ -344,8 +344,8 @@ TEST(ResolvedExecutionPlan, RejectsPhysicalReadWithoutDominatingProducer) {
     PlanFixture fixture;
     fixture.resolved->program.values[1].origin.node = 99;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-    EXPECT_FALSE(validateResolvedExecutionPlan(fixture.plan, diagnostic));
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
     EXPECT_EQ(diagnostic.code, "PROGRAM_EXECUTION_PLAN");
     EXPECT_NE(diagnostic.message.find("dominating producer"), std::string::npos);
 }
@@ -354,7 +354,7 @@ TEST(ResolvedExecutionPlan, RejectsMissingAliasBarrierAndPublicationStagingTarge
     {
         PlanFixture fixture;
         Diagnostic diagnostic;
-        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
         fixture.plan.hazards.edges.erase(
             std::remove_if(fixture.plan.hazards.edges.begin(), fixture.plan.hazards.edges.end(),
                            [](const ResolvedDependencyEdge &edge) {
@@ -362,15 +362,15 @@ TEST(ResolvedExecutionPlan, RejectsMissingAliasBarrierAndPublicationStagingTarge
                                       edge.successor.node == 3;
                            }),
             fixture.plan.hazards.edges.end());
-        EXPECT_FALSE(validateResolvedExecutionPlan(fixture.plan, diagnostic));
+        EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
         EXPECT_NE(diagnostic.message.find("conflicting alias"), std::string::npos);
     }
     {
         PlanFixture fixture;
         fixture.resolved->program.abi.publication.targets.clear();
         Diagnostic diagnostic;
-        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
-        EXPECT_FALSE(validateResolvedExecutionPlan(fixture.plan, diagnostic));
+        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+        EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
         EXPECT_NE(diagnostic.message.find("staging target"), std::string::npos);
     }
 }

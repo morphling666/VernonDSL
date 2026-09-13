@@ -2,7 +2,6 @@
 
 #include <gtest/gtest.h>
 
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -12,7 +11,7 @@ using vernon::runtime::DirtyRangeSet;
 
 TEST(DirtyRangeSet, CoalescesOverlappingAndAdjacentRanges) {
     DirtyRangeSet dirty(64);
-    dirty.mark({{16, 24}, {0, 8}, {8, 20}}, false);
+    ASSERT_TRUE(dirty.mark({{16, 24}, {0, 8}, {8, 20}}, false).isOk());
 
     ASSERT_EQ(dirty.ranges().size(), 1u);
     const std::pair<size_t, size_t> expected{0, 24};
@@ -21,8 +20,8 @@ TEST(DirtyRangeSet, CoalescesOverlappingAndAdjacentRanges) {
 
 TEST(DirtyRangeSet, PromotesHalfAllocationToFullUpload) {
     DirtyRangeSet dirty(64);
-    dirty.mark({{0, 16}}, true);
-    dirty.mark({{32, 48}}, true);
+    ASSERT_TRUE(dirty.mark({{0, 16}}, true).isOk());
+    ASSERT_TRUE(dirty.mark({{32, 48}}, true).isOk());
 
     ASSERT_EQ(dirty.ranges().size(), 1u);
     const std::pair<size_t, size_t> expected{0, 64};
@@ -31,7 +30,14 @@ TEST(DirtyRangeSet, PromotesHalfAllocationToFullUpload) {
 
 TEST(DirtyRangeSet, RejectsRangesOutsideAllocation) {
     DirtyRangeSet dirty(16);
-    EXPECT_THROW(dirty.mark({{8, 17}}, false), std::invalid_argument);
+    auto result = dirty.mark({{8, 17}}, false);
+    ASSERT_TRUE(result.isErr());
+    EXPECT_EQ(result.error(), vernon::runtime::DirtyRangeError::InvalidRange);
+    EXPECT_TRUE(dirty.empty());
+
+    auto promotion = dirty.shouldPromoteFull({{9, 8}});
+    ASSERT_TRUE(promotion.isErr());
+    EXPECT_EQ(promotion.error(), vernon::runtime::DirtyRangeError::InvalidRange);
 }
 
 } // namespace

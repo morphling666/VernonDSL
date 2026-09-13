@@ -463,17 +463,25 @@ bool loadCpuNativeArtifact(VernonRuntimeContext &context, const CpuNativeArtifac
         // Relocatable CPU artifacts are linked into the embedding application.
         // Runtime resolution is deliberately metadata + registry only: loading
         // object bytes here would require a platform linker or ORC JIT.
-        std::filesystem::path unused;
-        if (!resolveCpuNativeArtifact(artifact, unused, &metadata, error) ||
-            !findRegisteredCpuEntry(context, artifact.symbol, state.entry, error))
+        auto resolved = resolveCpuNativeArtifact(artifact);
+        if (resolved.isErr()) {
+            error = renderStageArtifactError(resolved.error(), &artifact);
+            return false;
+        }
+        metadata = std::move(resolved).value().reflection;
+        if (!findRegisteredCpuEntry(context, artifact.symbol, state.entry, error))
             return false;
         return true;
     }
 
-    std::filesystem::path libraryPath;
-    if (!resolveCpuNativeArtifact(artifact, libraryPath, &metadata, error))
+    auto resolved = resolveCpuNativeArtifact(artifact);
+    if (resolved.isErr()) {
+        error = renderStageArtifactError(resolved.error(), &artifact);
         return false;
-    const std::string nativePath = libraryPath.u8string();
+    }
+    ResolvedCpuNativeArtifact native = std::move(resolved).value();
+    metadata = std::move(native.reflection);
+    const std::string nativePath = native.libraryPath.u8string();
     if (!state.nativeLibrary.open(nativePath.c_str(), error))
         return false;
     state.entry = reinterpret_cast<VernonCpuEntryPoint>(state.nativeLibrary.symbol(artifact.symbol.c_str()));

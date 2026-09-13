@@ -133,9 +133,13 @@ void BindingTransaction::rollback() noexcept {
     if (finished_)
         return;
     try {
-        std::lock_guard lock(state_->mutex_);
-        ++state_->telemetry_.rollbackCount;
-        finished_ = true;
+        {
+            std::lock_guard lock(state_->mutex_);
+            ++state_->telemetry_.rollbackCount;
+            finished_ = true;
+        }
+        updates_.clear();
+        frozenSnapshot_.reset();
     } catch (...) {
         vernon::resultContractViolation();
     }

@@ -13,6 +13,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION
@@ -47,18 +48,29 @@ public:
         bundleOptions.struct_size = sizeof(bundleOptions);
         bundleOptions.bundle_directory = vernon_external_engine::cpu_bundle::kCookedDirectory;
         const VernonProgramBundleLoadOptions *loadOptions = &bundleOptions;
-        try {
-            const auto asset =
-                vernon::runtime::ProgramAsset::load(runtime_, vernon_external_engine::cpu_bundle::kManifest,
-                                                    vernon_external_engine::cpu_bundle::kManifestSize, loadOptions);
-            program_.emplace(asset.resolve());
-            instance_ = std::make_unique<vernon::runtime::ProgramInstance>(*program_);
-        } catch (const std::exception &exception) {
-            const std::string diagnostic = vernon_external_engine::programRuntimeError(runtime_);
-            std::cerr << "failed to load the fractal Program: " << (diagnostic.empty() ? exception.what() : diagnostic)
-                      << '\n';
+        auto assetResult =
+            vernon::runtime::ProgramAsset::load(runtime_, vernon_external_engine::cpu_bundle::kManifest,
+                                                vernon_external_engine::cpu_bundle::kManifestSize, loadOptions);
+        if (assetResult.isErr()) {
+            std::cerr << "failed to load the fractal Program: "
+                      << vernon_external_engine::programRuntimeError(runtime_, assetResult.error()) << '\n';
             return false;
         }
+        auto asset = std::move(assetResult).value();
+        auto executableResult = asset.resolve();
+        if (executableResult.isErr()) {
+            std::cerr << "failed to load the fractal Program: "
+                      << vernon_external_engine::programRuntimeError(runtime_, executableResult.error()) << '\n';
+            return false;
+        }
+        program_.emplace(std::move(executableResult).value());
+        auto instanceResult = vernon::runtime::ProgramInstance::create(*program_);
+        if (instanceResult.isErr()) {
+            std::cerr << "failed to load the fractal Program: "
+                      << vernon_external_engine::programRuntimeError(runtime_, instanceResult.error()) << '\n';
+            return false;
+        }
+        instance_.emplace(std::move(instanceResult).value());
         VernonProgramExecutable *pipeline = program_->get();
 
         constexpr std::array<const char *, 5> names{"pixels", "time", "__grid_x", "__grid_y", "__grid_z"};
@@ -124,10 +136,11 @@ public:
 
     bool renderFrame(double elapsedSeconds, uint32_t, uint32_t) override {
         time_ = static_cast<float>(elapsedSeconds);
-        std::string error;
-        if (!vernon_external_engine::invokeProgram(runtime_, *program_, *instance_, arguments_.data(),
-                                                   arguments_.size(), nullptr, error)) {
-            std::cerr << "fractal Program invocation failed: " << error << '\n';
+        auto invocationResult =
+            vernon_external_engine::invokeProgram(*program_, *instance_, arguments_.data(), arguments_.size(), nullptr);
+        if (invocationResult.isErr()) {
+            std::cerr << "fractal Program invocation failed: "
+                      << vernon_external_engine::programRuntimeError(runtime_, invocationResult.error()) << '\n';
             return false;
         }
         if (headless_) {
@@ -175,7 +188,7 @@ private:
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
     std::optional<vernon::runtime::ProgramExecutable> program_;
-    std::unique_ptr<vernon::runtime::ProgramInstance> instance_;
+    std::optional<vernon::runtime::ProgramInstance> instance_;
     VernonRhiImage presentImage_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     std::vector<float> pixels_;
     std::vector<uint8_t> rgba_;

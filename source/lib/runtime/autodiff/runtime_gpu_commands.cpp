@@ -230,19 +230,21 @@ VernonRhiStatus encodeNoopCommand(void *, VernonRhiCommandEncoder) { return VERN
 
 class WaitFailureCompletion final : public execution::detail::RhiCommandCompletion {
 public:
-    explicit WaitFailureCompletion(VernonRuntimeContext &context) : context_(context) {}
+    explicit WaitFailureCompletion(VernonRuntimeContext &context)
+        : context_(context), failureDiagnostic_("injected GPU command DAG wait failure") {}
 
     bool validationPhase() const override { return true; }
 
-    void complete(bool succeeded, const execution::detail::RhiCommandDagExecutionStats &) override {
+    VernonRhiStatus complete(bool succeeded, const execution::detail::RhiCommandDagExecutionStats &) noexcept override {
         if (!succeeded || !injectFailure(FailureBoundary::Completion))
-            return;
-        invocationDiagnostic(context_) = "injected GPU command DAG wait failure";
-        throw std::runtime_error("injected GPU command DAG wait failure");
+            return VERNON_RHI_STATUS_OK;
+        invocationDiagnostic(context_).swap(failureDiagnostic_);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
 
 private:
     VernonRuntimeContext &context_;
+    std::string failureDiagnostic_;
 };
 
 struct EncodeFailureContext {
@@ -264,8 +266,8 @@ VernonRhiStatus encodeWithFailureBoundary(void *opaque, VernonRhiCommandEncoder 
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                    VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                    VernonLaunchSize grid) {
-    VernonRuntimeProviderObject provider{};
-    if (referenceBackendCommandEncoder(context, encoder, provider) != VERNON_STATUS_OK)
+    auto provider = referenceBackendCommandEncoder(context, encoder);
+    if (provider.isErr())
         return fail(context, "cannot reference GPU autodiff command encoder", VERNON_STATUS_INTERNAL_ERROR);
     VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
@@ -273,7 +275,7 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return encodeResolvedStage(provider, &pipeline, &invocation);
+    return encodeResolvedStage(provider.value(), &pipeline, &invocation);
 }
 
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,

@@ -26,9 +26,9 @@ TEST(TensorBridgeTest, KeepsContiguousHostTensorAsSingleLogicalRange) {
 
     EXPECT_TRUE(vernon::runtime::isRowMajorContiguous(tensor));
     const auto packed = vernon::runtime::packTensorRowMajor(tensor);
-    ASSERT_TRUE(packed);
-    ASSERT_EQ(packed->size(), sizeof(values));
-    EXPECT_EQ(std::memcmp(packed->data(), values.data(), sizeof(values)), 0);
+    ASSERT_TRUE(packed.isOk());
+    ASSERT_EQ(packed.value().size(), sizeof(values));
+    EXPECT_EQ(std::memcmp(packed.value().data(), values.data(), sizeof(values)), 0);
 }
 
 TEST(TensorBridgeTest, PacksMaximalContiguousInnerRows) {
@@ -49,9 +49,9 @@ TEST(TensorBridgeTest, PacksMaximalContiguousInnerRows) {
 
     EXPECT_FALSE(vernon::runtime::isRowMajorContiguous(tensor));
     const auto packed = vernon::runtime::packTensorRowMajor(tensor);
-    ASSERT_TRUE(packed);
-    ASSERT_EQ(packed->size(), sizeof(expected));
-    EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
+    ASSERT_TRUE(packed.isOk());
+    ASSERT_EQ(packed.value().size(), sizeof(expected));
+    EXPECT_EQ(std::memcmp(packed.value().data(), expected.data(), sizeof(expected)), 0);
 }
 
 TEST(TensorBridgeTest, PacksFullyStridedTensorByLogicalIndex) {
@@ -71,9 +71,9 @@ TEST(TensorBridgeTest, PacksFullyStridedTensorByLogicalIndex) {
                             sizeof(source)};
 
     const auto packed = vernon::runtime::packTensorRowMajor(tensor);
-    ASSERT_TRUE(packed);
-    ASSERT_EQ(packed->size(), sizeof(expected));
-    EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
+    ASSERT_TRUE(packed.isOk());
+    ASSERT_EQ(packed.value().size(), sizeof(expected));
+    EXPECT_EQ(std::memcmp(packed.value().data(), expected.data(), sizeof(expected)), 0);
 }
 
 TEST(TensorBridgeTest, RejectsLogicalByteSizeOverflow) {
@@ -83,15 +83,16 @@ TEST(TensorBridgeTest, RejectsLogicalByteSizeOverflow) {
     tensor.rank = 1;
     tensor.shape = shape.data();
 
-    EXPECT_FALSE(vernon::runtime::tensorLogicalByteSize(tensor));
+    EXPECT_TRUE(vernon::runtime::tensorLogicalByteSize(tensor).isErr());
 }
 
 TEST(TensorBridgeTest, RejectsBitIncompatibleTransportRepresentation) {
     vernon::runtime::TransportNode scalar{vernon::runtime::TransportNodeKind::Scalar, "i32", 0, 4, 4};
     vernon::runtime::TransportNode array{
         vernon::runtime::TransportNodeKind::Array, "", 0, 4, 4, {1}, {4}, {std::move(scalar)}};
-    EXPECT_FALSE(
-        vernon::runtime::compileElementStreamCopyPlan(vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32), {1}, array));
+    EXPECT_TRUE(
+        vernon::runtime::compileElementStreamCopyPlan(vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32), {1}, array)
+            .isErr());
 }
 
 TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
@@ -113,8 +114,8 @@ TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
     EXPECT_TRUE(vernon::runtime::tensorFitsAllocation(tensor));
     EXPECT_FALSE(vernon::runtime::isRowMajorContiguous(tensor));
     const auto packed = vernon::runtime::packTensorRowMajor(tensor);
-    ASSERT_TRUE(packed);
-    EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
+    ASSERT_TRUE(packed.isOk());
+    EXPECT_EQ(std::memcmp(packed.value().data(), expected.data(), sizeof(expected)), 0);
 }
 
 TEST(TensorBridgeTest, AcceptsInjectiveNegativeContiguousStride) {
@@ -164,7 +165,9 @@ TEST(TensorBridgeTest, RejectsSignedStrideBoundsOverflowAndOutOfBounds) {
                            VERNON_ACCESS_WRITE,      2,
                            emptyShape.data(),        emptyStrides.data(),
                            allocation.size(),        allocation.size()};
-    EXPECT_EQ(vernon::runtime::tensorElementCount(empty), 0);
+    auto emptyCount = vernon::runtime::tensorElementCount(empty);
+    ASSERT_TRUE(emptyCount.isOk());
+    EXPECT_EQ(emptyCount.value(), 0);
     EXPECT_TRUE(vernon::runtime::tensorFitsAllocation(empty));
 
     const std::array<uint64_t, 1> overflowingShape{std::numeric_limits<uint64_t>::max()};
@@ -179,9 +182,7 @@ TEST(TensorBridgeTest, RejectsSignedStrideBoundsOverflowAndOutOfBounds) {
                                  minimumStride.data(),
                                  0,
                                  allocation.size()};
-    size_t before = 0;
-    size_t after = 0;
-    EXPECT_FALSE(vernon::runtime::tensorRelativeByteBounds(overflowing, before, after));
+    EXPECT_TRUE(vernon::runtime::tensorRelativeByteBounds(overflowing).isErr());
 
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> negativeStride{-static_cast<int64_t>(sizeof(float))};
@@ -317,16 +318,16 @@ TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
     vernon::runtime::TensorCopyPlan layout{sizeof(float), {2, 3}, {sizeof(float), 16}, 48, {{0, 0, sizeof(float)}}};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
-    ASSERT_TRUE(packed);
-    ASSERT_EQ(packed->size(), 48u);
+    ASSERT_TRUE(packed.isOk());
+    ASSERT_EQ(packed.value().size(), 48u);
     for (size_t row = 0; row < 2; ++row)
         for (size_t column = 0; column < 3; ++column) {
             float value = 0;
-            std::memcpy(&value, packed->data() + row * sizeof(float) + column * 16, sizeof(value));
+            std::memcpy(&value, packed.value().data() + row * sizeof(float) + column * 16, sizeof(value));
             EXPECT_EQ(value, source[row * 3 + column]);
         }
     for (size_t offset : {size_t{8}, size_t{12}, size_t{24}, size_t{28}, size_t{40}, size_t{44}})
-        EXPECT_EQ((*packed)[offset], 0);
+        EXPECT_EQ(packed.value()[offset], 0);
 }
 
 TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
@@ -346,13 +347,13 @@ TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
     vernon::runtime::TensorCopyPlan layout{sizeof(float), {2, 2, 2}, {32, 16, 4}, 56, {{0, 0, sizeof(float)}}};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
-    ASSERT_TRUE(packed);
+    ASSERT_TRUE(packed.isOk());
     for (size_t linear = 0; linear < source.size(); ++linear) {
         const size_t outer = linear / 4;
         const size_t middle = (linear / 2) % 2;
         const size_t inner = linear % 2;
         float value = 0;
-        std::memcpy(&value, packed->data() + outer * 32 + middle * 16 + inner * 4, sizeof(value));
+        std::memcpy(&value, packed.value().data() + outer * 32 + middle * 16 + inner * 4, sizeof(value));
         EXPECT_EQ(value, source[linear]);
     }
 }
@@ -388,10 +389,10 @@ TEST(TensorBridgeTest, PacksCompleteAggregateElementsFromPaddedRecords) {
     EXPECT_TRUE(vernon::runtime::tensorFitsAllocation(tensor));
     EXPECT_FALSE(vernon::runtime::isRowMajorContiguous(tensor));
     const auto packed = vernon::runtime::packTensorRowMajor(tensor);
-    ASSERT_TRUE(packed);
-    ASSERT_EQ(packed->size(), 24u);
-    EXPECT_EQ(std::memcmp(packed->data(), source.data(), 12), 0);
-    EXPECT_EQ(std::memcmp(packed->data() + 12, source.data() + 1, 12), 0);
+    ASSERT_TRUE(packed.isOk());
+    ASSERT_EQ(packed.value().size(), 24u);
+    EXPECT_EQ(std::memcmp(packed.value().data(), source.data(), 12), 0);
+    EXPECT_EQ(std::memcmp(packed.value().data() + 12, source.data() + 1, 12), 0);
 }
 
 } // namespace

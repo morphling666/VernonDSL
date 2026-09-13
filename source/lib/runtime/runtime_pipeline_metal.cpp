@@ -129,403 +129,410 @@ bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t text
 #endif
 }
 
-bool resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
-                          VernonStageExecutable &pipeline) {
+BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                           VernonStageExecutable &pipeline) {
+    const auto resolve = [&]() {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    if (plan.compute.empty()) {
-        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
-        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
+        if (plan.compute.empty()) {
+            const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+            const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
+            MetalArgumentBufferUsage argumentBufferUsage;
+            if (!collectMetalArgumentBufferUsage(vertex.nativeSlots, vertex.entry, "vertex", argumentBufferUsage,
+                                                 invocationDiagnostic(*inputs.context)) ||
+                !collectMetalArgumentBufferUsage(fragment.nativeSlots, fragment.entry, "fragment", argumentBufferUsage,
+                                                 invocationDiagnostic(*inputs.context)) ||
+                !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
+                                                  metalState(*inputs.context).argumentBufferEncodingSupported,
+                                                  invocationDiagnostic(*inputs.context)))
+                return false;
+            struct Candidate {
+                VernonRuntimeProviderBindingLayoutEntry layout{};
+                std::vector<VernonRuntimeProviderVertexAttribute> attributes;
+                MetalPipelineState::GraphicsBinding binding;
+            };
+            std::vector<Candidate> candidates;
+            uint32_t nextProviderSlot = 0;
+            uint32_t vertexBinding = 0;
+            const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
+                if (use.stage != "vertex" && use.stage != "fragment")
+                    return false;
+                Candidate candidate;
+                if (nextProviderSlot == UINT32_MAX)
+                    return false;
+                candidate.layout.slot = nextProviderSlot++;
+                candidate.layout.argument_index = use.index;
+                candidate.layout.stage_mask = use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX
+                                                                    : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
+                candidate.layout.array_count = 1;
+                candidate.binding.externalSlot = parameter.slot;
+                candidate.binding.descriptorSet = use.descriptorSet;
+                candidate.binding.descriptorBinding = use.binding;
+                const LoadedStageArtifact &nativeStage = use.stage == "vertex" ? vertex : fragment;
+                const std::vector<NativeResourceSlot> &nativeSlots =
+                    use.stage == "vertex" ? vertex.nativeSlots : fragment.nativeSlots;
+                auto resolveDescriptor = [&](const char *kind) {
+                    MetalResourceLocation location;
+                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), kind,
+                                                      use.descriptorSet, use.binding, location,
+                                                      invocationDiagnostic(*inputs.context)))
+                        return false;
+                    candidate.layout.set = location.argumentBufferIndex;
+                    candidate.layout.binding = location.memberId;
+                    candidate.layout.array_count = location.count;
+                    return true;
+                };
+                if (parameter.kind == "sampler") {
+                    if (use.sampledImageBindings.empty())
+                        return false;
+                    for (size_t index = 0; index < use.sampledImageBindings.size(); ++index) {
+                        const SampledImageBinding &binding = use.sampledImageBindings[index];
+                        Candidate sampler = candidate;
+                        if (index != 0) {
+                            if (nextProviderSlot == UINT32_MAX)
+                                return false;
+                            sampler.layout.slot = nextProviderSlot++;
+                        }
+                        sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                        sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                        sampler.layout.set = binding.descriptorSet;
+                        sampler.layout.binding = binding.binding;
+                        sampler.binding.descriptorSet = binding.descriptorSet;
+                        sampler.binding.descriptorBinding = binding.binding;
+                        MetalResourceLocation location;
+                        if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), "sampler",
+                                                          binding.descriptorSet, binding.binding, location,
+                                                          invocationDiagnostic(*inputs.context)))
+                            return false;
+                        sampler.layout.set = location.argumentBufferIndex;
+                        sampler.layout.binding = location.memberId;
+                        sampler.layout.array_count = location.count;
+                        sampler.binding.source = internal ? MetalPipelineState::GraphicsBinding::IMPLICIT_SAMPLER
+                                                          : MetalPipelineState::GraphicsBinding::EXTERNAL_SAMPLER;
+                        candidates.push_back(std::move(sampler));
+                    }
+                    return true;
+                }
+                if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                    use.interfacePlan->root) {
+                    const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                    const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
+                    if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
+                        !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
+                        return false;
+                    const std::optional<VernonRuntimeProviderBindingKind> providerKind =
+                        providerBindingKindForTransport(use.transport);
+                    if (!providerKind)
+                        return false;
+                    candidate.layout.kind = *providerKind;
+                    candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                    candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.layout.binding = use.binding;
+                    candidate.binding.source = internal ? MetalPipelineState::GraphicsBinding::RESOLUTION
+                                                        : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
+                    const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
+                    const ValueLayout &canonical = *use.valueLayout;
+                    auto packing =
+                        wholeValue ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                                   : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape,
+                                                                  *use.interfacePlan->root);
+                    if (packing.isErr() || packing.value().elementSize != canonical.byteSize)
+                        return false;
+                    candidate.binding.packing = std::move(packing).value();
+                    candidate.binding.storage.resize(candidate.layout.element_size);
+                    if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                        if (!resolveDescriptor("uniform_buffer"))
+                            return false;
+                    } else if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                        if (!resolveDescriptor("storage_buffer"))
+                            return false;
+                    } else {
+                        MetalResourceLocation location;
+                        const std::string inlineName = !use.uniformName.empty() ? use.uniformName : parameter.name;
+                        if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(),
+                                                          "inline_constant", UINT32_MAX, UINT32_MAX, location,
+                                                          invocationDiagnostic(*inputs.context), &inlineName))
+                            return false;
+                        candidate.layout.set = UINT32_MAX;
+                        candidate.layout.binding = location.directBufferIndex;
+                    }
+                } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                           use.location != UINT32_MAX && !use.attributeLeaves.empty() && vertexBinding < 15) {
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+                    candidate.layout.element_size = parameter.elementLayout.byteSize;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
+                    candidate.layout.binding = 16 + vertexBinding++;
+                    candidate.layout.divisor = use.divisor;
+                    for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                        const std::optional<VernonDataType> attributeType = pipelineDataType(leaf.dtype);
+                        if (!attributeType)
+                            return false;
+                        candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                        static_cast<uint32_t>(*attributeType), leaf.componentCount,
+                                                        leaf.byteOffset});
+                    }
+                    candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX;
+                } else if (parameter.kind == "image" && use.interfaceKind == "resource") {
+                    const bool storage = parameter.bindingRole == "storage";
+                    candidate.layout.kind =
+                        storage ? VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE : VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                    if (!configureImageBindingLayout(parameter, candidate.layout))
+                        return false;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.layout.binding = use.binding;
+                    candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
+                    if (!resolveDescriptor(storage ? "storage_image" : "sampled_image"))
+                        return false;
+                } else {
+                    return false;
+                }
+                candidates.push_back(std::move(candidate));
+                return true;
+            };
+            bool supported = true;
+            for (const Parameter &parameter : plan.parameters) {
+                for (const ParameterUse &use : parameter.uses)
+                    if (!addUse(parameter, use, false)) {
+                        supported = false;
+                        break;
+                    }
+                if (!supported)
+                    break;
+            }
+            for (const Parameter &parameter : plan.runtimeParameters)
+                for (const ParameterUse &use : parameter.uses)
+                    if (!supported || !addUse(parameter, use, true)) {
+                        supported = false;
+                        break;
+                    }
+            if (!supported) {
+                if (invocationDiagnostic(*inputs.context).empty())
+                    invocationDiagnostic(*inputs.context) =
+                        "Metal RuntimeCore graphics path does not support this parameter layout";
+                return false;
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
+            auto state = std::make_unique<MetalPipelineState>();
+            for (auto &candidate : candidates) {
+                state->rhiGraphicsLayout.push_back(candidate.layout);
+                state->rhiGraphicsVertexAttributes.insert(state->rhiGraphicsVertexAttributes.end(),
+                                                          candidate.attributes.begin(), candidate.attributes.end());
+                state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
+            }
+            state->rhiGraphicsValues.resize(candidates.size());
+            const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                                    VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
+                                                                    {"msl", 3},
+                                                                    vertex.source.data(),
+                                                                    vertex.source.size(),
+                                                                    {vertex.entry.data(), vertex.entry.size()},
+                                                                    {},
+                                                                    {0, 0, 0, 0}},
+                                                                   {sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                                    VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
+                                                                    {"msl", 3},
+                                                                    fragment.source.data(),
+                                                                    fragment.source.size(),
+                                                                    {fragment.entry.data(), fragment.entry.size()},
+                                                                    {},
+                                                                    {0, 0, 0, 0}}};
+            VernonRuntimeCorePipelineDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
+            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
+            descriptor.shaders = shaders;
+            descriptor.shader_count = 2;
+            descriptor.bindings = state->rhiGraphicsLayout.data();
+            descriptor.binding_count = state->rhiGraphicsLayout.size();
+            descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();
+            descriptor.vertex_attribute_count = state->rhiGraphicsVertexAttributes.size();
+            descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+            descriptor.sample_count = 1;
+            const VernonStatus status = vernonRuntimeCorePreparePipeline(
+                vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter), &descriptor,
+                &state->rhiGraphicsPipeline);
+            if (status != VERNON_STATUS_OK) {
+                const VernonStringView providerError =
+                    vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+                invocationDiagnostic(*inputs.context) = providerError.data
+                                                            ? std::string(providerError.data, providerError.size)
+                                                            : "failed to prepare Metal provider graphics pipeline";
+                return false;
+            }
+            installRuntimeBackendState(pipeline, state.release());
+            return true;
+        }
+        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
+        ReflectedEntry reflection;
+        if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*inputs.context)))
+            return false;
         MetalArgumentBufferUsage argumentBufferUsage;
-        if (!collectMetalArgumentBufferUsage(vertex.nativeSlots, vertex.entry, "vertex", argumentBufferUsage,
-                                             invocationDiagnostic(*inputs.context)) ||
-            !collectMetalArgumentBufferUsage(fragment.nativeSlots, fragment.entry, "fragment", argumentBufferUsage,
+        if (!collectMetalArgumentBufferUsage(stage.nativeSlots, stage.entry, "compute", argumentBufferUsage,
                                              invocationDiagnostic(*inputs.context)) ||
             !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
                                               metalState(*inputs.context).argumentBufferEncodingSupported,
                                               invocationDiagnostic(*inputs.context)))
             return false;
+
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
-            std::vector<VernonRuntimeProviderVertexAttribute> attributes;
-            MetalPipelineState::GraphicsBinding binding;
+            uint64_t resourceOffset{};
+            ComputeBindingSource source;
         };
         std::vector<Candidate> candidates;
-        uint32_t nextProviderSlot = 0;
-        uint32_t vertexBinding = 0;
-        const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
-            if (use.stage != "vertex" && use.stage != "fragment")
-                return false;
-            Candidate candidate;
-            if (nextProviderSlot == UINT32_MAX)
-                return false;
-            candidate.layout.slot = nextProviderSlot++;
-            candidate.layout.argument_index = use.index;
-            candidate.layout.stage_mask =
-                use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
-            candidate.layout.array_count = 1;
-            candidate.binding.externalSlot = parameter.slot;
-            candidate.binding.descriptorSet = use.descriptorSet;
-            candidate.binding.descriptorBinding = use.binding;
-            const LoadedStageArtifact &nativeStage = use.stage == "vertex" ? vertex : fragment;
-            const std::vector<NativeResourceSlot> &nativeSlots =
-                use.stage == "vertex" ? vertex.nativeSlots : fragment.nativeSlots;
-            auto resolveDescriptor = [&](const char *kind) {
-                MetalResourceLocation location;
-                if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), kind,
-                                                  use.descriptorSet, use.binding, location,
-                                                  invocationDiagnostic(*inputs.context)))
-                    return false;
-                candidate.layout.set = location.argumentBufferIndex;
-                candidate.layout.binding = location.memberId;
-                candidate.layout.array_count = location.count;
-                return true;
-            };
-            if (parameter.kind == "sampler") {
-                if (use.sampledImageBindings.empty())
-                    return false;
-                for (size_t index = 0; index < use.sampledImageBindings.size(); ++index) {
-                    const SampledImageBinding &binding = use.sampledImageBindings[index];
-                    Candidate sampler = candidate;
-                    if (index != 0) {
-                        if (nextProviderSlot == UINT32_MAX)
-                            return false;
-                        sampler.layout.slot = nextProviderSlot++;
-                    }
-                    sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-                    sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                    sampler.layout.set = binding.descriptorSet;
-                    sampler.layout.binding = binding.binding;
-                    sampler.binding.descriptorSet = binding.descriptorSet;
-                    sampler.binding.descriptorBinding = binding.binding;
-                    MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), "sampler",
-                                                      binding.descriptorSet, binding.binding, location,
-                                                      invocationDiagnostic(*inputs.context)))
-                        return false;
-                    sampler.layout.set = location.argumentBufferIndex;
-                    sampler.layout.binding = location.memberId;
-                    sampler.layout.array_count = location.count;
-                    sampler.binding.source = internal ? MetalPipelineState::GraphicsBinding::IMPLICIT_SAMPLER
-                                                      : MetalPipelineState::GraphicsBinding::EXTERNAL_SAMPLER;
-                    candidates.push_back(std::move(sampler));
-                }
-                return true;
-            }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                use.interfacePlan->root) {
-                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
-                    !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
-                    return false;
-                const std::optional<VernonRuntimeProviderBindingKind> providerKind =
-                    providerBindingKindForTransport(use.transport);
-                if (!providerKind)
-                    return false;
-                candidate.layout.kind = *providerKind;
-                candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);
-                candidate.layout.set = use.descriptorSet;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = internal ? MetalPipelineState::GraphicsBinding::RESOLUTION
-                                                    : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
-                const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
-                const ValueLayout &canonical = *use.valueLayout;
-                std::optional<TensorCopyPlan> packing =
-                    wholeValue
-                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
-                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
-                if (!packing || packing->elementSize != canonical.byteSize)
-                    return false;
-                candidate.binding.packing = std::move(*packing);
-                candidate.binding.storage.resize(candidate.layout.element_size);
-                if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-                    if (!resolveDescriptor("uniform_buffer"))
-                        return false;
-                } else if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-                    if (!resolveDescriptor("storage_buffer"))
-                        return false;
-                } else {
-                    MetalResourceLocation location;
-                    const std::string inlineName = !use.uniformName.empty() ? use.uniformName : parameter.name;
-                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(),
-                                                      "inline_constant", UINT32_MAX, UINT32_MAX, location,
-                                                      invocationDiagnostic(*inputs.context), &inlineName))
-                        return false;
-                    candidate.layout.set = UINT32_MAX;
-                    candidate.layout.binding = location.directBufferIndex;
-                }
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
-                       use.location != UINT32_MAX && !use.attributeLeaves.empty() && vertexBinding < 15) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.binding = 16 + vertexBinding++;
-                candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves) {
-                    const std::optional<VernonDataType> attributeType = pipelineDataType(leaf.dtype);
-                    if (!attributeType)
-                        return false;
-                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
-                                                    static_cast<uint32_t>(*attributeType), leaf.componentCount,
-                                                    leaf.byteOffset});
-                }
-                candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX;
-            } else if (parameter.kind == "image" && use.interfaceKind == "resource") {
-                const bool storage = parameter.bindingRole == "storage";
-                candidate.layout.kind =
-                    storage ? VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE : VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
-                if (!configureImageBindingLayout(parameter, candidate.layout))
-                    return false;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.set = use.descriptorSet;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
-                if (!resolveDescriptor(storage ? "storage_image" : "sampled_image"))
-                    return false;
-            } else {
-                return false;
-            }
-            candidates.push_back(std::move(candidate));
-            return true;
-        };
-        bool supported = true;
+        uint32_t internalSlot = 0;
+        std::vector<uint32_t> argumentBindings(reflection.arguments.size());
+        uint32_t flattenedBinding = 0;
+        for (size_t index = 0; index < reflection.arguments.size(); ++index) {
+            argumentBindings[index] = flattenedBinding;
+            if (reflection.arguments[index].kind != "builtin")
+                flattenedBinding +=
+                    static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
+        }
+        for (const Parameter &parameter : plan.parameters)
+            internalSlot = std::max(internalSlot, parameter.slot);
         for (const Parameter &parameter : plan.parameters) {
-            for (const ParameterUse &use : parameter.uses)
-                if (!addUse(parameter, use, false)) {
-                    supported = false;
-                    break;
-                }
-            if (!supported)
-                break;
-        }
-        for (const Parameter &parameter : plan.runtimeParameters)
-            for (const ParameterUse &use : parameter.uses)
-                if (!supported || !addUse(parameter, use, true)) {
-                    supported = false;
-                    break;
-                }
-        if (!supported) {
-            if (invocationDiagnostic(*inputs.context).empty())
-                invocationDiagnostic(*inputs.context) =
-                    "Metal RuntimeCore graphics path does not support this parameter layout";
-            return false;
-        }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-        auto state = std::make_unique<MetalPipelineState>();
-        for (auto &candidate : candidates) {
-            state->rhiGraphicsLayout.push_back(candidate.layout);
-            state->rhiGraphicsVertexAttributes.insert(state->rhiGraphicsVertexAttributes.end(),
-                                                      candidate.attributes.begin(), candidate.attributes.end());
-            state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
-        }
-        state->rhiGraphicsValues.resize(candidates.size());
-        const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                {"msl", 3},
-                                                                vertex.source.data(),
-                                                                vertex.source.size(),
-                                                                {vertex.entry.data(), vertex.entry.size()},
-                                                                {},
-                                                                {0, 0, 0, 0}},
-                                                               {sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                                                                {"msl", 3},
-                                                                fragment.source.data(),
-                                                                fragment.source.size(),
-                                                                {fragment.entry.data(), fragment.entry.size()},
-                                                                {},
-                                                                {0, 0, 0, 0}}};
-        VernonRuntimeCorePipelineDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-        descriptor.shaders = shaders;
-        descriptor.shader_count = 2;
-        descriptor.bindings = state->rhiGraphicsLayout.data();
-        descriptor.binding_count = state->rhiGraphicsLayout.size();
-        descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();
-        descriptor.vertex_attribute_count = state->rhiGraphicsVertexAttributes.size();
-        descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-        descriptor.sample_count = 1;
-        const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
-                                             &descriptor, &state->rhiGraphicsPipeline);
-        if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
-            invocationDiagnostic(*inputs.context) = providerError.data
-                                                        ? std::string(providerError.data, providerError.size)
-                                                        : "failed to prepare Metal provider graphics pipeline";
-            return false;
-        }
-        installRuntimeBackendState(pipeline, state.release());
-        return true;
-    }
-    const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-    ReflectedEntry reflection;
-    if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*inputs.context)))
-        return false;
-    MetalArgumentBufferUsage argumentBufferUsage;
-    if (!collectMetalArgumentBufferUsage(stage.nativeSlots, stage.entry, "compute", argumentBufferUsage,
-                                         invocationDiagnostic(*inputs.context)) ||
-        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
-                                          metalState(*inputs.context).argumentBufferEncodingSupported,
-                                          invocationDiagnostic(*inputs.context)))
-        return false;
-
-    struct Candidate {
-        VernonRuntimeProviderBindingLayoutEntry layout{};
-        uint64_t resourceOffset{};
-        ComputeBindingSource source;
-    };
-    std::vector<Candidate> candidates;
-    uint32_t internalSlot = 0;
-    std::vector<uint32_t> argumentBindings(reflection.arguments.size());
-    uint32_t flattenedBinding = 0;
-    for (size_t index = 0; index < reflection.arguments.size(); ++index) {
-        argumentBindings[index] = flattenedBinding;
-        if (reflection.arguments[index].kind != "builtin")
-            flattenedBinding +=
-                static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
-    }
-    for (const Parameter &parameter : plan.parameters)
-        internalSlot = std::max(internalSlot, parameter.slot);
-    for (const Parameter &parameter : plan.parameters) {
-        for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != plan.compute)
-                continue;
-            if (use.index >= reflection.arguments.size()) {
-                invocationDiagnostic(*inputs.context) = "Metal parameter use exceeds reflected argument table";
-                return false;
-            }
-            const ReflectedArgument &argument = reflection.arguments[use.index];
-            const size_t leafCount = std::max(argument.storageLeaves.size(), size_t{1});
-            for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
-                Candidate candidate;
-                candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
-                candidate.layout.set = argument.descriptorSet;
-                candidate.layout.binding = argument.storageLeaves.empty()
-                                               ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
-                                               : argument.storageLeaves[leafIndex].binding;
-                candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
-                                                                           ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
-                                                                           : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
-                                        : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                    : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                configureComputeValueStorage(use, candidate.layout);
-                candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
-                if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+            for (const ParameterUse &use : parameter.uses) {
+                if (use.stage != "compute" && use.stage != plan.compute)
+                    continue;
+                if (use.index >= reflection.arguments.size()) {
+                    invocationDiagnostic(*inputs.context) = "Metal parameter use exceeds reflected argument table";
                     return false;
-                candidate.layout.array_count = 1;
-                candidate.layout.argument_index = use.index;
-                candidate.layout.element_size = static_cast<uint32_t>(
-                    argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
-                                                      : argument.kind == "tensor" ? argument.tensorElementSize
-                                                                                  : argument.physical.size)
-                                                   : argument.storageLeaves[leafIndex].elementSize);
-                candidate.resourceOffset = 0;
-                candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
-                MetalResourceLocation location;
-                const char *resourceKind =
-                    parameter.kind == "image" ? (parameter.bindingRole == "sampled" ? "sampled_image" : "storage_image")
-                                              : "storage_buffer";
-                if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
-                    !resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind,
-                                                  candidate.layout.set, candidate.layout.binding, location,
-                                                  invocationDiagnostic(*inputs.context)))
-                    return false;
-                candidate.layout.set = location.argumentBufferIndex;
-                candidate.layout.binding = location.memberId;
-                candidate.layout.array_count = location.count;
-                candidates.push_back(candidate);
-            }
-            if (use.tensorViewDescriptor) {
-                const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension, uint32_t binding) {
+                }
+                const ReflectedArgument &argument = reflection.arguments[use.index];
+                const size_t leafCount = std::max(argument.storageLeaves.size(), size_t{1});
+                for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
                     Candidate candidate;
-                    candidate.layout.slot = ++internalSlot;
+                    candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
                     candidate.layout.set = argument.descriptorSet;
-                    candidate.layout.binding = binding;
-                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    candidate.layout.binding = argument.storageLeaves.empty()
+                                                   ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
+                                                   : argument.storageLeaves[leafIndex].binding;
+                    candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
+                                                                               ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                               : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    configureComputeValueStorage(use, candidate.layout);
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                    candidate.layout.access = 1;
+                    candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
+                    if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+                        return false;
                     candidate.layout.array_count = 1;
                     candidate.layout.argument_index = use.index;
-                    candidate.layout.element_size = 4;
-                    candidate.source = {kind, use.index, dimension};
+                    candidate.layout.element_size = static_cast<uint32_t>(
+                        argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
+                                                          : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                      : argument.physical.size)
+                                                       : argument.storageLeaves[leafIndex].elementSize);
+                    candidate.resourceOffset = 0;
+                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", "storage_buffer",
-                                                      candidate.layout.set, binding, location,
+                    const char *resourceKind =
+                        parameter.kind == "image"
+                            ? (parameter.bindingRole == "sampled" ? "sampled_image" : "storage_image")
+                            : "storage_buffer";
+                    if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
+                        !resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind,
+                                                      candidate.layout.set, candidate.layout.binding, location,
                                                       invocationDiagnostic(*inputs.context)))
                         return false;
                     candidate.layout.set = location.argumentBufferIndex;
                     candidate.layout.binding = location.memberId;
                     candidate.layout.array_count = location.count;
                     candidates.push_back(candidate);
-                    return true;
-                };
-                if (!addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding))
-                    return false;
-                for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                    if (!addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
-                                       use.tensorViewDescriptor->extentBindings[dimension]))
+                }
+                if (use.tensorViewDescriptor) {
+                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
+                                                   uint32_t binding) {
+                        Candidate candidate;
+                        candidate.layout.slot = ++internalSlot;
+                        candidate.layout.set = argument.descriptorSet;
+                        candidate.layout.binding = binding;
+                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                        candidate.layout.access = 1;
+                        candidate.layout.array_count = 1;
+                        candidate.layout.argument_index = use.index;
+                        candidate.layout.element_size = 4;
+                        candidate.source = {kind, use.index, dimension};
+                        MetalResourceLocation location;
+                        if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", "storage_buffer",
+                                                          candidate.layout.set, binding, location,
+                                                          invocationDiagnostic(*inputs.context)))
+                            return false;
+                        candidate.layout.set = location.argumentBufferIndex;
+                        candidate.layout.binding = location.memberId;
+                        candidate.layout.array_count = location.count;
+                        candidates.push_back(candidate);
+                        return true;
+                    };
+                    if (!addDescriptor(ComputeBindingSourceKind::TensorOffset, 0,
+                                       use.tensorViewDescriptor->offsetBinding))
                         return false;
-                for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                    if (!addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
-                                       use.tensorViewDescriptor->strideBindings[dimension]))
-                        return false;
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        if (!addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
+                                           use.tensorViewDescriptor->extentBindings[dimension]))
+                            return false;
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        if (!addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
+                                           use.tensorViewDescriptor->strideBindings[dimension]))
+                            return false;
+                }
             }
         }
-    }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-    auto state = std::make_unique<MetalPipelineState>();
-    for (const Candidate &candidate : candidates) {
-        state->rhiComputeLayout.push_back(candidate.layout);
-        state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
-        state->rhiComputeBindingSources.push_back(candidate.source);
-    }
-    state->rhiComputeValues.resize(candidates.size());
-    state->rhiComputeDescriptorValues.resize(candidates.size());
-    std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
-    const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                       VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                       {"msl", 3},
-                                                       stage.source.data(),
-                                                       stage.source.size(),
-                                                       {stage.entry.data(), stage.entry.size()},
-                                                       {},
-                                                       {0, 0, 0, 0}};
-    VernonRuntimeCorePipelineDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-    descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-    descriptor.shaders = &shader;
-    descriptor.shader_count = 1;
-    descriptor.bindings = state->rhiComputeLayout.data();
-    descriptor.binding_count = state->rhiComputeLayout.size();
-    std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
-    const VernonStatus status =
-        vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
-                                         &descriptor, &state->rhiComputePipeline);
-    if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
-        invocationDiagnostic(*inputs.context) = providerError.data
-                                                    ? std::string(providerError.data, providerError.size)
-                                                    : "failed to prepare Metal provider compute pipeline";
-        return false;
-    }
-    installRuntimeBackendState(pipeline, state.release());
-    return true;
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
+        auto state = std::make_unique<MetalPipelineState>();
+        for (const Candidate &candidate : candidates) {
+            state->rhiComputeLayout.push_back(candidate.layout);
+            state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
+            state->rhiComputeBindingSources.push_back(candidate.source);
+        }
+        state->rhiComputeValues.resize(candidates.size());
+        state->rhiComputeDescriptorValues.resize(candidates.size());
+        std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
+        const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                           VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
+                                                           {"msl", 3},
+                                                           stage.source.data(),
+                                                           stage.source.size(),
+                                                           {stage.entry.data(), stage.entry.size()},
+                                                           {},
+                                                           {0, 0, 0, 0}};
+        VernonRuntimeCorePipelineDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
+        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
+        descriptor.shaders = &shader;
+        descriptor.shader_count = 1;
+        descriptor.bindings = state->rhiComputeLayout.data();
+        descriptor.binding_count = state->rhiComputeLayout.size();
+        std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
+        const VernonStatus status =
+            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
+                                             &descriptor, &state->rhiComputePipeline);
+        if (status != VERNON_STATUS_OK) {
+            const VernonStringView providerError =
+                vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare Metal provider compute pipeline";
+            return false;
+        }
+        installRuntimeBackendState(pipeline, state.release());
+        return true;
 #else
-    (void)inputs;
-    (void)plan;
-    (void)pipeline;
-    return false;
+        (void)inputs;
+        (void)plan;
+        (void)pipeline;
+        return false;
 #endif
+    };
+    return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
 void destroyMetalPipeline(VernonStageExecutable &pipeline) {
@@ -603,10 +610,10 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "Metal RHI uniform argument is missing");
-            const std::optional<std::vector<uint8_t>> packed = packTensor(found->second->tensor, prepared.packing);
-            if (!packed || packed->size() != prepared.storage.size())
+            auto packed = packTensor(found->second->tensor, prepared.packing);
+            if (packed.isErr() || packed.value().size() != prepared.storage.size())
                 return fail(*pipeline.context, "Metal RHI uniform Tensor is invalid");
-            prepared.storage = *packed;
+            prepared.storage = std::move(packed).value();
             value.payload.inline_value.data = prepared.storage.data();
             value.payload.inline_value.size = prepared.storage.size();
         }

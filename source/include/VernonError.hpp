@@ -205,6 +205,23 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
     return {RuntimeErrorCode::ResourceExhausted, context};
 }
 
+[[nodiscard]] constexpr RuntimeError runtimeErrorFromStatus(VernonStatus status, ErrorContext context = {}) noexcept {
+    switch (status) {
+    case VERNON_STATUS_INVALID_ARGUMENT:
+        return {RuntimeErrorCode::InvalidArgument, context};
+    case VERNON_STATUS_PARSE_ERROR:
+        return {RuntimeErrorCode::ParseFailure, context};
+    case VERNON_STATUS_VERIFICATION_ERROR:
+        return {RuntimeErrorCode::VerificationFailure, context};
+    case VERNON_STATUS_UNSUPPORTED_TARGET:
+        return {RuntimeErrorCode::Unsupported, context};
+    case VERNON_STATUS_INTERNAL_ERROR:
+    case VERNON_STATUS_OK:
+        return {RuntimeErrorCode::InternalFailure, context};
+    }
+    return {RuntimeErrorCode::InternalFailure, context};
+}
+
 [[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(RhiError error) noexcept {
     switch (error.code) {
     case RhiErrorCode::InvalidArgument:

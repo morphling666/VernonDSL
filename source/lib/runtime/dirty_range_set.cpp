@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <stdexcept>
 
 namespace vernon::runtime {
 namespace {
@@ -16,7 +15,7 @@ DirtyRangeSet::DirtyRangeSet(size_t byteSize, bool dirty) : byteSize_(byteSize) 
         markAll();
 }
 
-std::vector<std::pair<size_t, size_t>>
+Result<std::vector<std::pair<size_t, size_t>>, DirtyRangeError>
 DirtyRangeSet::coalescedWith(const std::vector<std::pair<size_t, size_t>> &ranges) const {
     std::vector<std::pair<size_t, size_t>> combined = ranges_;
     combined.insert(combined.end(), ranges.begin(), ranges.end());
@@ -24,7 +23,7 @@ DirtyRangeSet::coalescedWith(const std::vector<std::pair<size_t, size_t>> &range
     std::vector<std::pair<size_t, size_t>> result;
     for (const auto &[begin, end] : combined) {
         if (begin > end || end > byteSize_)
-            throw std::invalid_argument("dirty byte range exceeds its allocation");
+            return Result<std::vector<std::pair<size_t, size_t>>, DirtyRangeError>{err(DirtyRangeError::InvalidRange)};
         if (begin == end)
             continue;
         if (!result.empty() && begin <= result.back().second)
@@ -32,7 +31,7 @@ DirtyRangeSet::coalescedWith(const std::vector<std::pair<size_t, size_t>> &range
         else
             result.emplace_back(begin, end);
     }
-    return result;
+    return Result<std::vector<std::pair<size_t, size_t>>, DirtyRangeError>{ok(std::move(result))};
 }
 
 bool DirtyRangeSet::shouldPromote(const std::vector<std::pair<size_t, size_t>> &ranges) const {
@@ -48,19 +47,27 @@ bool DirtyRangeSet::shouldPromote(const std::vector<std::pair<size_t, size_t>> &
     return dirtyBytes >= (byteSize_ + 1) / 2;
 }
 
-void DirtyRangeSet::mark(const std::vector<std::pair<size_t, size_t>> &ranges, bool allowFull) {
+Result<void, DirtyRangeError> DirtyRangeSet::mark(const std::vector<std::pair<size_t, size_t>> &ranges,
+                                                  bool allowFull) {
     if (ranges.empty())
-        return;
+        return Result<void, DirtyRangeError>{ok()};
     auto dirty = coalescedWith(ranges);
-    if (allowFull && shouldPromote(dirty)) {
+    if (dirty.isErr())
+        return Result<void, DirtyRangeError>{err(dirty.error())};
+    if (allowFull && shouldPromote(dirty.value())) {
         markAll();
-        return;
+        return Result<void, DirtyRangeError>{ok()};
     }
-    ranges_ = std::move(dirty);
+    ranges_ = std::move(dirty).value();
+    return Result<void, DirtyRangeError>{ok()};
 }
 
-bool DirtyRangeSet::shouldPromoteFull(const std::vector<std::pair<size_t, size_t>> &ranges) const {
-    return shouldPromote(coalescedWith(ranges));
+Result<bool, DirtyRangeError>
+DirtyRangeSet::shouldPromoteFull(const std::vector<std::pair<size_t, size_t>> &ranges) const {
+    auto dirty = coalescedWith(ranges);
+    if (dirty.isErr())
+        return Result<bool, DirtyRangeError>{err(dirty.error())};
+    return Result<bool, DirtyRangeError>{ok(shouldPromote(dirty.value()))};
 }
 
 void DirtyRangeSet::markAll() {

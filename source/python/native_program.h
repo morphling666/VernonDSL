@@ -403,12 +403,11 @@ struct ProgramInvocationBuilder {
         layoutProbe.rank = static_cast<uint32_t>(rank);
         layoutProbe.shape = argument.shape.data();
         layoutProbe.byte_strides = argument.strides.data();
-        size_t before = 0;
-        size_t after = 0;
-        size_t span = 0;
-        if (!vernon::runtime::tensorRelativeByteBounds(layoutProbe, before, after) ||
-            !vernon::runtime::tensorRequiredSpan(layoutProbe, span))
+        auto bounds = vernon::runtime::tensorRelativeByteBounds(layoutProbe);
+        auto span = vernon::runtime::tensorRequiredSpan(layoutProbe);
+        if (bounds.isErr() || span.isErr())
             throw std::invalid_argument("NumPy Tensor byte span overflows");
+        const auto relativeBounds = bounds.value();
         if (elementSize == parameter.elementByteSize && array.attr("dtype").attr("fields").is_none() &&
             parameter.elementLeaves.size() == 1 && parameter.elementLeaves[0].scalar_count == 1 &&
             parameter.elementLeaves[0].byte_offset == 0 &&
@@ -416,14 +415,14 @@ struct ProgramInvocationBuilder {
             throw std::invalid_argument("host tensor dtype does not match executable reflection");
         argument.owner = array;
         const uintptr_t data = nb::cast<uintptr_t>(array.attr("ctypes").attr("data"));
-        uintptr_t allocation = data - before;
-        size_t allocationSize = span;
+        uintptr_t allocation = data - relativeBounds.before;
+        size_t allocationSize = span.value();
         nb::object base = array.attr("base");
         while (!base.is_none() && nb::isinstance(base, nb::module_::import_("numpy").attr("ndarray"))) {
             const uintptr_t candidate = nb::cast<uintptr_t>(base.attr("ctypes").attr("data"));
             const size_t candidateSize = nb::cast<size_t>(base.attr("nbytes"));
-            if (candidate > data || data - candidate > candidateSize || before > data - candidate ||
-                after + parameter.elementByteSize > candidateSize - (data - candidate))
+            if (candidate > data || data - candidate > candidateSize || relativeBounds.before > data - candidate ||
+                relativeBounds.after + parameter.elementByteSize > candidateSize - (data - candidate))
                 break;
             allocation = candidate;
             allocationSize = candidateSize;

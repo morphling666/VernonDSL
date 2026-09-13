@@ -1,6 +1,7 @@
 #ifndef VERNON_RUNTIME_AUTODIFF_HOST_TAPE_ALLOCATOR_H
 #define VERNON_RUNTIME_AUTODIFF_HOST_TAPE_ALLOCATOR_H
 
+#include "VernonResult.hpp"
 #include "runtime/autodiff/tape_allocator_abi.h"
 
 #include <atomic>
@@ -18,6 +19,13 @@
 #endif
 
 namespace vernon::runtime::ad {
+
+enum class HostTapeError {
+    InvalidArgument,
+    ArithmeticOverflow,
+    BudgetExceeded,
+    InvalidState,
+};
 
 inline constexpr size_t kDefaultHostTapeInvocationLimit = 64u * 1024u * 1024u;
 inline constexpr size_t kDefaultHostTapeContextLimit = 256u * 1024u * 1024u;
@@ -119,7 +127,8 @@ VernonStatus withHostTapeTraversalMetrics(HostTapeTraversalMetrics *destination,
 class HostTapeDispatchBudget;
 class HostDynamicTapeBatch;
 class HostStaticTapeBatch;
-bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result);
+[[nodiscard]] Result<size_t, HostTapeError> hostStaticTapeBatchPureStaticBytes(size_t laneCount,
+                                                                               size_t payloadStride) noexcept;
 
 class AutodiffMemoryPolicy {
 public:
@@ -154,12 +163,12 @@ using HostTapeMemoryPolicy = AutodiffMemoryPolicy;
 
 class AutodiffMemoryReservation {
 public:
-    static std::shared_ptr<AutodiffMemoryReservation> reserve(std::shared_ptr<AutodiffMemoryPolicy> policy,
-                                                              size_t bytes);
-    ~AutodiffMemoryReservation();
+    [[nodiscard]] static Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>
+    reserve(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes);
+    ~AutodiffMemoryReservation() noexcept;
 
     size_t bytes() const { return bytes_; }
-    bool shrink(size_t bytes);
+    [[nodiscard]] Result<void, HostTapeError> shrink(size_t bytes) noexcept;
 
 private:
     AutodiffMemoryReservation(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes)
@@ -171,9 +180,9 @@ private:
 
 class HostTapeDispatchBudget {
 public:
-    static std::shared_ptr<HostTapeDispatchBudget> reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,
-                                                           size_t capacity);
-    ~HostTapeDispatchBudget();
+    [[nodiscard]] static Result<std::shared_ptr<HostTapeDispatchBudget>, HostTapeError>
+    reserve(std::shared_ptr<HostTapeMemoryPolicy> policy, size_t capacity);
+    ~HostTapeDispatchBudget() noexcept;
 
     size_t capacity() const { return capacity_; }
     size_t usedBytes() const;
@@ -202,9 +211,10 @@ private:
 
 class HostDynamicTapeBatch {
 public:
-    HostDynamicTapeBatch(size_t laneCount, size_t invocationCapacity, std::shared_ptr<HostTapeMemoryPolicy> policy,
-                         std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
-    ~HostDynamicTapeBatch();
+    [[nodiscard]] static Result<std::unique_ptr<HostDynamicTapeBatch>, HostTapeError>
+    create(size_t laneCount, size_t invocationCapacity, std::shared_ptr<HostTapeMemoryPolicy> policy,
+           std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    ~HostDynamicTapeBatch() noexcept;
 
     HostDynamicTapeBatch(const HostDynamicTapeBatch &) = delete;
     HostDynamicTapeBatch &operator=(const HostDynamicTapeBatch &) = delete;
@@ -241,6 +251,9 @@ public:
     bool hasControlHistory() const;
 
 private:
+    HostDynamicTapeBatch(size_t laneCount, size_t invocationCapacity, std::shared_ptr<HostTapeMemoryPolicy> policy,
+                         std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -288,12 +301,11 @@ public:
         size_t laneCount_{};
     };
 
-    static std::shared_ptr<HostStaticTapeBatch> create(size_t laneCount, size_t payloadStride,
-                                                       size_t invocationCapacity,
-                                                       std::shared_ptr<HostTapeMemoryPolicy> policy,
-                                                       std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    [[nodiscard]] static Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>
+    create(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
+           std::shared_ptr<HostTapeMemoryPolicy> policy, std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
     static HostStaticTapeBatch *fromWriteDescriptor(VernonAdTapeAllocator *allocator);
-    ~HostStaticTapeBatch();
+    ~HostStaticTapeBatch() noexcept;
 
     HostStaticTapeBatch(const HostStaticTapeBatch &) = delete;
     HostStaticTapeBatch &operator=(const HostStaticTapeBatch &) = delete;
@@ -315,7 +327,8 @@ public:
     size_t allocatedBytes() const;
 
 private:
-    friend bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result);
+    friend Result<size_t, HostTapeError> hostStaticTapeBatchPureStaticBytes(size_t laneCount,
+                                                                            size_t payloadStride) noexcept;
     enum class LanePhase : uint8_t {
         Empty,
         RegionOpen,
@@ -362,7 +375,7 @@ private:
 
     VernonAdTapeAllocatorStatus fail(size_t lane, VernonAdTapeAllocatorStatus status);
     HostDynamicTapeBatch *dynamicBatch() const { return dynamicBatchAddress_.load(std::memory_order_acquire); }
-    HostDynamicTapeBatch *ensureDynamicBatch();
+    [[nodiscard]] Result<HostDynamicTapeBatch *, HostTapeError> ensureDynamicBatch();
     VernonAdTapeAllocatorStatus promote(size_t lane, size_t payloadSize, size_t payloadAlignment, size_t childCount,
                                         VernonAdRecordHandle *record);
     VernonAdTapeAllocatorStatus syncDynamic(size_t lane, VernonAdTapeAllocatorStatus status);
@@ -374,6 +387,7 @@ private:
     std::unique_ptr<HostDynamicTapeBatch> dynamicBatchOwner_;
     std::atomic<HostDynamicTapeBatch *> dynamicBatchAddress_{};
     std::once_flag dynamicBatchOnce_;
+    HostTapeError dynamicBatchError_{HostTapeError::InvalidState};
     std::vector<std::byte> payload_;
     std::vector<uint8_t> compactedLaneKinds_;
     size_t laneCount_{};

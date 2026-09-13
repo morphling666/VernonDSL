@@ -322,17 +322,17 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
 
 } // namespace
 
-bool resolveCpuPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
-                        VernonStageExecutable &pipeline) {
+BackendPipelineResult resolveCpuPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                         VernonStageExecutable &pipeline) {
     auto state = std::make_unique<CpuPipelineState>();
     CpuKernelState kernel;
     ReflectedEntry reflection;
     if (!loadCpuNativeArtifact(*inputs.context, *inputs.artifacts.at(plan.compute).cpuArtifact, kernel, reflection,
                                invocationDiagnostic(*inputs.context)) ||
         !prepareCpuComputePipeline(*inputs.context, std::move(kernel), std::move(reflection), *state))
-        return false;
+        return backendPipelineResolutionFailure(inputs);
     installRuntimeBackendState(pipeline, state.release());
-    return true;
+    return BackendPipelineResult{vernon::ok()};
 }
 
 void destroyCpuPipeline(VernonStageExecutable &pipeline) {

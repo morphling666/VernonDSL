@@ -17,6 +17,21 @@
 
 namespace {
 
+std::shared_ptr<vernon::runtime::ad::HostTapeDispatchBudget>
+reserveBudget(const std::shared_ptr<vernon::runtime::ad::HostTapeMemoryPolicy> &policy, size_t capacity) {
+    auto reserved = vernon::runtime::ad::HostTapeDispatchBudget::reserve(policy, capacity);
+    return reserved.isOk() ? std::move(reserved).value() : nullptr;
+}
+
+std::shared_ptr<vernon::runtime::ad::HostStaticTapeBatch>
+createStaticBatch(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
+                  const std::shared_ptr<vernon::runtime::ad::HostTapeMemoryPolicy> &policy,
+                  const std::shared_ptr<vernon::runtime::ad::HostTapeDispatchBudget> &budget) {
+    auto created =
+        vernon::runtime::ad::HostStaticTapeBatch::create(laneCount, payloadStride, invocationCapacity, policy, budget);
+    return created.isOk() ? std::move(created).value() : nullptr;
+}
+
 TEST(RuntimeAutodiffTapeAllocator, HasFrozenVersionedAbi) {
     EXPECT_EQ(VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION, 2u);
     EXPECT_EQ(sizeof(VernonAdTapeAllocatorStatus), 4u);
@@ -42,9 +57,9 @@ TEST(RuntimeAutodiffTapeAllocator, HasFrozenVersionedAbi) {
 
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    auto storage = HostStaticTapeBatch::create(1, sizeof(uint32_t), 1024, policy, budget);
+    auto storage = createStaticBatch(1, sizeof(uint32_t), 1024, policy, budget);
     ASSERT_NE(storage, nullptr);
     VernonAdTapeAllocator incompatible = *storage->descriptor(0);
     --incompatible.struct_size;
@@ -67,74 +82,104 @@ TEST(RuntimeAutodiffEffectTransaction, CommitsOrDiscardsExactlyOnce) {
     float storage = 3.0f;
     float output = -1.0f;
     vernon::runtime::ad::HostEffectTransaction transaction(sizeof(output));
-    auto *stagedStorage = reinterpret_cast<float *>(transaction.stageStorage(&storage, sizeof(storage), true));
-    auto *stagedOutput = reinterpret_cast<float *>(transaction.stagedOutput());
+    auto stagedStorageResult = transaction.stageStorage(&storage, sizeof(storage), true);
+    auto stagedOutputResult = transaction.stagedOutput();
+    ASSERT_TRUE(stagedStorageResult.isOk());
+    ASSERT_TRUE(stagedOutputResult.isOk());
+    auto *stagedStorage = reinterpret_cast<float *>(stagedStorageResult.value());
+    auto *stagedOutput = reinterpret_cast<float *>(stagedOutputResult.value());
     ASSERT_NE(stagedStorage, nullptr);
     ASSERT_NE(stagedOutput, nullptr);
     *stagedStorage = 4.0f;
     *stagedOutput = 9.0f;
-    EXPECT_TRUE(transaction.commit(&output));
+    EXPECT_TRUE(transaction.commit(&output).isOk());
     EXPECT_FLOAT_EQ(storage, 4.0f);
     EXPECT_FLOAT_EQ(output, 9.0f);
-    EXPECT_EQ(transaction.stageStorage(&storage, sizeof(storage), true), nullptr);
-    EXPECT_FALSE(transaction.commit(&output));
+    EXPECT_TRUE(transaction.stageStorage(&storage, sizeof(storage), true).isErr());
+    EXPECT_TRUE(transaction.commit(&output).isErr());
 
     vernon::runtime::ad::HostEffectTransaction discarded(sizeof(output));
-    ASSERT_NE(discarded.stageStorage(&storage, sizeof(storage), true), nullptr);
+    ASSERT_TRUE(discarded.stageStorage(&storage, sizeof(storage), true).isOk());
     EXPECT_TRUE(discarded.discard());
-    EXPECT_EQ(discarded.stagedOutput(), nullptr);
-    EXPECT_FALSE(discarded.commit(&output));
+    EXPECT_TRUE(discarded.stagedOutput().isErr());
+    EXPECT_TRUE(discarded.commit(&output).isErr());
+}
+
+TEST(RuntimeAutodiffEffectTransaction, InvalidDestinationPreservesCapturingState) {
+    vernon::runtime::ad::HostEffectTransaction transaction(sizeof(float));
+    auto invalid = transaction.stageStorage(nullptr, sizeof(float), false);
+    ASSERT_TRUE(invalid.isErr());
+    EXPECT_EQ(invalid.error(), vernon::runtime::ad::HostEffectError::InvalidDestination);
+    EXPECT_TRUE(transaction.stagedOutput().isOk());
+}
+
+TEST(RuntimeAutodiffTapeAllocator, ReportsFactoryValidationAndOverflow) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<HostTapeMemoryPolicy>();
+    auto invalidBudget = HostTapeDispatchBudget::reserve(policy, 0);
+    ASSERT_TRUE(invalidBudget.isErr());
+    EXPECT_EQ(invalidBudget.error(), HostTapeError::InvalidArgument);
+
+    auto overflow = hostStaticTapeBatchPureStaticBytes(std::numeric_limits<size_t>::max(), 1);
+    ASSERT_TRUE(overflow.isErr());
+    EXPECT_EQ(overflow.error(), HostTapeError::ArithmeticOverflow);
+
+    auto invalidBatch = HostStaticTapeBatch::create(0, 1, 1024, policy, nullptr);
+    ASSERT_TRUE(invalidBatch.isErr());
+    EXPECT_EQ(invalidBatch.error(), HostTapeError::InvalidArgument);
 }
 
 TEST(RuntimeAutodiffTapeAllocator, PreservesNestedRecordsInCompactedDynamicBatch) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    HostDynamicTapeBatch storage(1, 4096, policy, budget);
+    auto storageResult = HostDynamicTapeBatch::create(1, 4096, policy, budget);
+    ASSERT_TRUE(storageResult.isOk());
+    auto storage = std::move(storageResult).value();
     VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
     VernonAdRegionHandle child = VERNON_AD_INVALID_REGION_HANDLE;
     VernonAdRecordHandle rootRecord = VERNON_AD_INVALID_RECORD_HANDLE;
     VernonAdRecordHandle childRecord = VERNON_AD_INVALID_RECORD_HANDLE;
     VernonAdRecordHandle trailingRootRecord = VERNON_AD_INVALID_RECORD_HANDLE;
-    ASSERT_EQ(storage.beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.reserveRecord(0, root, sizeof(uint32_t), alignof(uint32_t), 1, &rootRecord),
+    ASSERT_EQ(storage->beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->reserveRecord(0, root, sizeof(uint32_t), alignof(uint32_t), 1, &rootRecord),
               VERNON_AD_TAPE_ALLOCATOR_OK);
     const uint32_t rootValue = 0x12345678u;
     const uint32_t childValue = 0xabcdef01u;
     const uint32_t trailingRootValue = 0x87654321u;
-    ASSERT_EQ(storage.writeLeaf(0, rootRecord, 0, &rootValue, sizeof(rootValue)), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.beginRegion(0, root, &child), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.setChild(0, rootRecord, 0, child), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.reserveRecord(0, child, sizeof(uint32_t), alignof(uint32_t), 0, &childRecord),
+    ASSERT_EQ(storage->writeLeaf(0, rootRecord, 0, &rootValue, sizeof(rootValue)), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->beginRegion(0, root, &child), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->setChild(0, rootRecord, 0, child), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->reserveRecord(0, child, sizeof(uint32_t), alignof(uint32_t), 0, &childRecord),
               VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.writeLeaf(0, childRecord, 0, &childValue, sizeof(childValue)), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.endRegion(0, child, 1, 2), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.reserveRecord(0, root, sizeof(uint32_t), alignof(uint32_t), 0, &trailingRootRecord),
+    ASSERT_EQ(storage->writeLeaf(0, childRecord, 0, &childValue, sizeof(childValue)), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->endRegion(0, child, 1, 2), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->reserveRecord(0, root, sizeof(uint32_t), alignof(uint32_t), 0, &trailingRootRecord),
               VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.writeLeaf(0, trailingRootRecord, 0, &trailingRootValue, sizeof(trailingRootValue)),
+    ASSERT_EQ(storage->writeLeaf(0, trailingRootRecord, 0, &trailingRootValue, sizeof(trailingRootValue)),
               VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.endRegion(0, root, 1, 3), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.seal(0), VERNON_AD_TAPE_ALLOCATOR_OK);
-    const size_t constructionBytes = storage.residentBytes();
-    ASSERT_TRUE(storage.compact());
-    EXPECT_EQ(policy->usage().currentBytes, storage.residentBytes());
-    EXPECT_GT(policy->usage().peakBytes, std::max(constructionBytes, storage.residentBytes()));
+    ASSERT_EQ(storage->endRegion(0, root, 1, 3), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->seal(0), VERNON_AD_TAPE_ALLOCATOR_OK);
+    const size_t constructionBytes = storage->residentBytes();
+    ASSERT_TRUE(storage->compact());
+    EXPECT_EQ(policy->usage().currentBytes, storage->residentBytes());
+    EXPECT_GT(policy->usage().peakBytes, std::max(constructionBytes, storage->residentBytes()));
 
-    root = storage.rootRegion(0);
+    root = storage->rootRegion(0);
     uint32_t read = 0;
-    ASSERT_EQ(storage.readLeaf(0, root, 0, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readLeaf(0, root, 0, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(read, rootValue);
     VernonAdRegionHandle readChild = VERNON_AD_INVALID_REGION_HANDLE;
-    ASSERT_EQ(storage.readChild(0, root, 0, 0, &readChild), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.readLeaf(0, readChild, 0, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readChild(0, root, 0, 0, &readChild), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readLeaf(0, readChild, 0, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(read, childValue);
-    ASSERT_EQ(storage.readLeaf(0, root, 1, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readLeaf(0, root, 1, 0, &read, sizeof(read)), VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(read, trailingRootValue);
     size_t count = 0;
     uint32_t exitKind = 0;
-    ASSERT_EQ(storage.readCount(0, root, &count), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.readExit(0, root, &exitKind), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readCount(0, root, &count), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->readExit(0, root, &exitKind), VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(count, 1u);
     EXPECT_EQ(exitKind, 3u);
 }
@@ -143,30 +188,33 @@ TEST(RuntimeAutodiffTapeAllocator, FailedChunkMaterializationDoesNotConsumeRegio
     using namespace vernon::runtime::ad;
     constexpr size_t capacity = 2u * 1024u * 1024u;
     auto policy = std::make_shared<HostTapeMemoryPolicy>(capacity, capacity);
-    auto budget = HostTapeDispatchBudget::reserve(policy, capacity);
+    auto budget = reserveBudget(policy, capacity);
     ASSERT_NE(budget, nullptr);
-    HostDynamicTapeBatch storage(1, capacity, policy, budget);
+    auto storageResult = HostDynamicTapeBatch::create(1, capacity, policy, budget);
+    ASSERT_TRUE(storageResult.isOk());
+    auto storage = std::move(storageResult).value();
     const size_t remaining = capacity - budget->usedBytes();
     ASSERT_GT(remaining, 0u);
     ASSERT_TRUE(budget->reserveTransientBytes(remaining));
     VernonAdRegionHandle region = VERNON_AD_INVALID_REGION_HANDLE;
-    EXPECT_EQ(storage.beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &region),
+    EXPECT_EQ(storage->beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &region),
               VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
     budget->releaseTransientBytes(remaining);
-    ASSERT_EQ(storage.reset(0), VERNON_AD_TAPE_ALLOCATOR_OK);
-    ASSERT_EQ(storage.beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &region), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->reset(0), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(storage->beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &region), VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(region, 1u);
 }
 
 TEST(RuntimeAutodiffTapeAllocator, UsesOneCompactStaticBatchWithoutPerLaneTapes) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    std::shared_ptr<HostTapeDispatchBudget> budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    std::shared_ptr<HostTapeDispatchBudget> budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    std::shared_ptr<HostStaticTapeBatch> batch = HostStaticTapeBatch::create(3, 16, 1024, policy, budget);
+    std::shared_ptr<HostStaticTapeBatch> batch = createStaticBatch(3, 16, 1024, policy, budget);
     ASSERT_NE(batch, nullptr);
-    size_t pureStaticBytes = 0;
-    ASSERT_TRUE(hostStaticTapeBatchPureStaticBytes(3, 16, pureStaticBytes));
+    auto pureStaticBytesResult = hostStaticTapeBatchPureStaticBytes(3, 16);
+    ASSERT_TRUE(pureStaticBytesResult.isOk());
+    const size_t pureStaticBytes = pureStaticBytesResult.value();
     EXPECT_EQ(batch->residentBytes(), pureStaticBytes);
     EXPECT_EQ(batch->residentBytes(), batch->allocatedBytes());
     EXPECT_EQ(policy->usage().currentBytes, batch->residentBytes());
@@ -218,9 +266,9 @@ TEST(RuntimeAutodiffTapeAllocator, UsesOneCompactStaticBatchWithoutPerLaneTapes)
 TEST(RuntimeAutodiffTapeAllocator, ReusesStaticReplayConstructionStorageAcrossSegments) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    auto batch = HostStaticTapeBatch::create(2, 16, 1024, policy, budget);
+    auto batch = createStaticBatch(2, 16, 1024, policy, budget);
     ASSERT_NE(batch, nullptr);
     const size_t constructionBytes = batch->allocatedBytes();
 
@@ -271,9 +319,9 @@ TEST(RuntimeAutodiffTapeAllocator, ReusesStaticReplayConstructionStorageAcrossSe
 TEST(RuntimeAutodiffTapeAllocator, ResetsFailedCompactLaneWithoutLeakingItsBatchCharge) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    std::shared_ptr<HostTapeDispatchBudget> budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    std::shared_ptr<HostTapeDispatchBudget> budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    std::shared_ptr<HostStaticTapeBatch> batch = HostStaticTapeBatch::create(1, 8, 1024, policy, budget);
+    std::shared_ptr<HostStaticTapeBatch> batch = createStaticBatch(1, 8, 1024, policy, budget);
     ASSERT_NE(batch, nullptr);
     const size_t allocated = batch->allocatedBytes();
     VernonAdTapeAllocator *allocator = batch->descriptor(0);
@@ -298,9 +346,9 @@ TEST(RuntimeAutodiffTapeAllocator, ResetsFailedCompactLaneWithoutLeakingItsBatch
 TEST(RuntimeAutodiffTapeAllocator, PromotesDynamicLaneIntoSharedImmutableBatch) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    std::shared_ptr<HostTapeDispatchBudget> budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    std::shared_ptr<HostTapeDispatchBudget> budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    std::shared_ptr<HostStaticTapeBatch> batch = HostStaticTapeBatch::create(2, 4, 1024, policy, budget);
+    std::shared_ptr<HostStaticTapeBatch> batch = createStaticBatch(2, 4, 1024, policy, budget);
     ASSERT_NE(batch, nullptr);
     VernonAdTapeAllocator *allocator = batch->descriptor(0);
     VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
@@ -414,9 +462,12 @@ TEST(RuntimeAutodiffTapeAllocator, SupportsConcurrentDynamicLaneWritersAndReader
     using namespace vernon::runtime::ad;
     constexpr size_t laneCount = 32;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    HostDynamicTapeBatch batch(laneCount, 4096, policy, budget);
+    auto batchResult = HostDynamicTapeBatch::create(laneCount, 4096, policy, budget);
+    ASSERT_TRUE(batchResult.isOk());
+    auto batchOwner = std::move(batchResult).value();
+    HostDynamicTapeBatch &batch = *batchOwner;
     std::vector<std::thread> writers;
     for (size_t lane = 0; lane < laneCount; ++lane) {
         writers.emplace_back([&, lane] {
@@ -469,9 +520,12 @@ TEST(RuntimeAutodiffTapeAllocator, AppendsAcrossConcurrentArenaChunks) {
     constexpr size_t recordsPerLane = 64;
     constexpr size_t payloadSize = 128;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
-    HostDynamicTapeBatch batch(laneCount, 1u << 20, policy, budget);
+    auto batchResult = HostDynamicTapeBatch::create(laneCount, 1u << 20, policy, budget);
+    ASSERT_TRUE(batchResult.isOk());
+    auto batchOwner = std::move(batchResult).value();
+    HostDynamicTapeBatch &batch = *batchOwner;
     std::vector<std::thread> writers;
     for (size_t lane = 0; lane < laneCount; ++lane) {
         writers.emplace_back([&, lane] {
@@ -507,10 +561,13 @@ TEST(RuntimeAutodiffTapeAllocator, AppendsAcrossConcurrentArenaChunks) {
 TEST(RuntimeAutodiffTapeAllocator, DynamicBatchRollbackInvalidatesStaleHandlesAndRetainsArenaCapacity) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
-    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);
     {
-        HostDynamicTapeBatch batch(1, 1024, policy, budget);
+        auto batchResult = HostDynamicTapeBatch::create(1, 1024, policy, budget);
+        ASSERT_TRUE(batchResult.isOk());
+        auto batchOwner = std::move(batchResult).value();
+        HostDynamicTapeBatch &batch = *batchOwner;
         VernonAdRegionHandle staleRegion = VERNON_AD_INVALID_REGION_HANDLE;
         VernonAdRecordHandle staleRecord = VERNON_AD_INVALID_RECORD_HANDLE;
         ASSERT_EQ(batch.beginRegion(0, VERNON_AD_INVALID_REGION_HANDLE, &staleRegion), VERNON_AD_TAPE_ALLOCATOR_OK);
@@ -549,16 +606,16 @@ TEST(RuntimeAutodiffTapeAllocator, DynamicBatchRollbackInvalidatesStaleHandlesAn
 TEST(RuntimeAutodiffTapeAllocator, DispatchReservationsDoNotPessimisticallyChargeContextBudget) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>(16, 16);
-    std::shared_ptr<HostTapeDispatchBudget> first = HostTapeDispatchBudget::reserve(policy, 10);
-    std::shared_ptr<HostTapeDispatchBudget> second = HostTapeDispatchBudget::reserve(policy, 10);
+    std::shared_ptr<HostTapeDispatchBudget> first = reserveBudget(policy, 10);
+    std::shared_ptr<HostTapeDispatchBudget> second = reserveBudget(policy, 10);
     ASSERT_NE(first, nullptr);
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(first->capacity(), 10u);
     EXPECT_EQ(second->capacity(), 10u);
-    EXPECT_NE(HostTapeDispatchBudget::reserve(policy, 1), nullptr);
+    EXPECT_TRUE(HostTapeDispatchBudget::reserve(policy, 1).isOk());
 
     first->commit();
-    std::shared_ptr<HostTapeDispatchBudget> replacement = HostTapeDispatchBudget::reserve(policy, 10);
+    std::shared_ptr<HostTapeDispatchBudget> replacement = reserveBudget(policy, 10);
     ASSERT_NE(replacement, nullptr);
     EXPECT_EQ(replacement->capacity(), 10u);
 }
@@ -566,17 +623,23 @@ TEST(RuntimeAutodiffTapeAllocator, DispatchReservationsDoNotPessimisticallyCharg
 TEST(RuntimeAutodiffTapeAllocator, BackendNeutralReservationsChargeAndReleaseContextBudget) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<AutodiffMemoryPolicy>(64, 64);
-    std::shared_ptr<AutodiffMemoryReservation> retained = AutodiffMemoryReservation::reserve(policy, 24);
+    auto retainedResult = AutodiffMemoryReservation::reserve(policy, 24);
+    ASSERT_TRUE(retainedResult.isOk());
+    std::shared_ptr<AutodiffMemoryReservation> retained = std::move(retainedResult).value();
     ASSERT_NE(retained, nullptr);
     EXPECT_EQ(retained->bytes(), 24u);
     EXPECT_EQ(policy->usage().currentBytes, 24u);
-    EXPECT_FALSE(retained->shrink(25));
-    EXPECT_TRUE(retained->shrink(16));
+    EXPECT_TRUE(retained->shrink(25).isErr());
+    EXPECT_TRUE(retained->shrink(16).isOk());
     EXPECT_EQ(retained->bytes(), 16u);
     EXPECT_EQ(policy->usage().currentBytes, 16u);
-    EXPECT_EQ(AutodiffMemoryReservation::reserve(policy, 49), nullptr);
+    auto exhausted = AutodiffMemoryReservation::reserve(policy, 49);
+    ASSERT_TRUE(exhausted.isErr());
+    EXPECT_EQ(exhausted.error(), HostTapeError::BudgetExceeded);
     {
-        std::shared_ptr<AutodiffMemoryReservation> temporary = AutodiffMemoryReservation::reserve(policy, 48);
+        auto temporaryResult = AutodiffMemoryReservation::reserve(policy, 48);
+        ASSERT_TRUE(temporaryResult.isOk());
+        std::shared_ptr<AutodiffMemoryReservation> temporary = std::move(temporaryResult).value();
         ASSERT_NE(temporary, nullptr);
         EXPECT_EQ(policy->usage().currentBytes, 64u);
     }

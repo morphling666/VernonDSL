@@ -175,9 +175,11 @@ public:
             return fail(*context_, "injected Program pullback allocation failure");
 
         ProgramInvocationState values(*topology_, std::move(storage), std::move(storageBackings));
-        if (!state_->importInto(values, tapeScratch, !replay, error) ||
-            !values.allocateOwnedImageStorages(*context_, execution, error))
+        if (!state_->importInto(values, tapeScratch, !replay, error))
             return fail(*context_, error);
+        auto allocatedImages = values.allocateOwnedImageStorages(*context_, execution);
+        if (allocatedImages.isErr())
+            return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
         if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
             return fail(*context_, "injected Program pullback tape validation failure");
         const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
@@ -185,7 +187,8 @@ public:
             if (binding.semantic == program::CarrierSemantic::Tape)
                 if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
                     return argument;
-            return values.argument(value);
+            auto argument = values.argument(value);
+            return argument ? &argument.value().get() : nullptr;
         };
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
@@ -198,11 +201,11 @@ public:
                     return fail(*context_, error);
                 for (;;) {
                     program_execution::SubmissionState replaySubmission;
-                    const VernonStatus replayStatus = executePipelineProgramGraph(
-                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                    auto replayStatus = executePipelineProgramGraph(*context_, *topology_, *replay, values,
+                                                                    resolvePhysicalEndpoint, replaySubmission);
                     publication.noteSubmission(replaySubmission);
-                    if (replayStatus != VERNON_STATUS_OK)
-                        return replayStatus;
+                    if (replayStatus.isErr())
+                        return vernon::toVernonStatus(std::move(replayStatus).error());
                     bool retry = false;
                     if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                         return fail(*context_, error);
@@ -219,21 +222,21 @@ public:
                 }
             } else {
                 program_execution::SubmissionState replaySubmission;
-                const VernonStatus replayStatus = executePipelineProgramGraph(
-                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                auto replayStatus = executePipelineProgramGraph(*context_, *topology_, *replay, values,
+                                                                resolvePhysicalEndpoint, replaySubmission);
                 publication.noteSubmission(replaySubmission);
-                if (replayStatus != VERNON_STATUS_OK)
-                    return replayStatus;
+                if (replayStatus.isErr())
+                    return vernon::toVernonStatus(std::move(replayStatus).error());
                 if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
                     return fail(*context_, error);
             }
         }
         program_execution::SubmissionState backwardSubmission;
-        const VernonStatus status = executePipelineProgramGraph(*context_, *topology_, *backward, values,
-                                                                resolvePhysicalEndpoint, backwardSubmission);
+        auto status = executePipelineProgramGraph(*context_, *topology_, *backward, values, resolvePhysicalEndpoint,
+                                                  backwardSubmission);
         publication.noteInPlaceSubmission(backwardSubmission);
-        if (status != VERNON_STATUS_OK)
-            return status;
+        if (status.isErr())
+            return vernon::toVernonStatus(std::move(status).error());
 
         if (device) {
             std::vector<char> downloads = publication.hostReadbackValues(execution.values.size());
@@ -459,8 +462,9 @@ public:
                                           tapeScratch, frame, context_->autodiffMemoryPolicy, error))
             return fail(*context_, error);
         ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
-        if (!arena.allocateOwnedImageStorages(*context_, *execution, error))
-            return fail(*context_, error);
+        auto allocatedImages = arena.allocateOwnedImageStorages(*context_, *execution);
+        if (allocatedImages.isErr())
+            return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
         if (const VernonStatus initialization =
                 program_execution::executePublicationInitialization(*context_, publication, error);
             initialization != VERNON_STATUS_OK)
@@ -470,15 +474,17 @@ public:
             if (binding.semantic == program::CarrierSemantic::Tape)
                 if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
                     return argument;
-            return arena.argument(value);
+            auto argument = arena.argument(value);
+            return argument ? &argument.value().get() : nullptr;
         };
         arena.setInvocationContext(target.programContext);
         for (const program::Node &node : forward->nodes)
             if (program::executionKind(node) == program::ExecutionKind::Compute)
                 for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
-                    uint64_t value = 0;
-                    if (!arena.resolveControl(*execution, control, value, error))
-                        return fail(*context_, error);
+                    auto resolvedControl = arena.resolveControl(*execution, control);
+                    if (resolvedControl.isErr())
+                        return fail(*context_,
+                                    program_execution::programInvocationErrorMessage(resolvedControl.error()));
                 }
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
@@ -490,12 +496,12 @@ public:
                 return fail(*context_, error);
             for (;;) {
                 program_execution::SubmissionState submission;
-                const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
-                                                                        resolvePhysicalEndpoint, submission);
+                auto status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
+                                                          resolvePhysicalEndpoint, submission);
                 publication.noteInPlaceSubmission(submission);
                 recordRenderPassMutations(*forward, submission, target.outcome);
-                if (status != VERNON_STATUS_OK)
-                    return status;
+                if (status.isErr())
+                    return vernon::toVernonStatus(std::move(status).error());
                 bool retry = false;
                 if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                     return fail(*context_, error);
@@ -510,12 +516,12 @@ public:
             }
         } else {
             program_execution::SubmissionState submission;
-            const VernonStatus status =
+            auto status =
                 executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint, submission);
             publication.noteInPlaceSubmission(submission);
             recordRenderPassMutations(*forward, submission, target.outcome);
-            if (status != VERNON_STATUS_OK)
-                return status;
+            if (status.isErr())
+                return vernon::toVernonStatus(std::move(status).error());
             if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
                 return fail(*context_, error);
         }
@@ -556,10 +562,13 @@ public:
                     if (config.globalValues[local] >= arena.values().size())
                         return fail(*context_, "ProgramGraph child Value remapping is unavailable");
                     auto snapshot = arena.snapshotValue(config.globalValues[local]);
-                    snapshot.value = local;
-                    if (!childArena.importSnapshot(snapshot, error))
-                        return fail(*context_, error);
-                    childSnapshots.push_back(std::move(snapshot));
+                    if (!snapshot)
+                        return fail(*context_, "ProgramGraph child Value remapping is unavailable");
+                    snapshot.value().value = local;
+                    auto imported = childArena.importSnapshot(snapshot.value());
+                    if (imported.isErr())
+                        return fail(*context_, program_execution::programInvocationErrorMessage(imported.error()));
+                    childSnapshots.push_back(std::move(snapshot).value());
                 }
                 ProgramTapeSnapshot childTape;
                 childTape.hostBatches.resize(childProgram.values.size());
@@ -637,15 +646,17 @@ private:
             retainedSnapshots.reserve(plan.retainedValues.size());
             for (uint32_t value : plan.retainedValues) {
                 auto retainedSnapshot = arena.snapshotValue(value);
+                if (!retainedSnapshot)
+                    return error = "ProgramGraph retained Value snapshot is unavailable", false;
                 const auto source = std::find_if(sourceSnapshots->begin(), sourceSnapshots->end(),
                                                  [&](const auto &candidate) { return candidate.value == value; });
                 if (source == sourceSnapshots->end())
                     return error = "ProgramGraph retained Value snapshot is unavailable", false;
                 if (source->deviceOwner) {
-                    retainedSnapshot.residentArgument = source->residentArgument;
-                    retainedSnapshot.deviceOwner = source->deviceOwner;
+                    retainedSnapshot.value().residentArgument = source->residentArgument;
+                    retainedSnapshot.value().deviceOwner = source->deviceOwner;
                 }
-                retainedSnapshots.push_back(std::move(retainedSnapshot));
+                retainedSnapshots.push_back(std::move(retainedSnapshot).value());
             }
             state = std::make_shared<const RetainedPullbackState>(
                 std::move(plan), *execution, std::move(retainedSnapshots), *sourceStorages, std::move(tapeScratch));

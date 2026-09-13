@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace vernon::runtime {
 
@@ -49,6 +50,11 @@ VERNON_RUNTIME_CAPI size_t getRhiAdapterRecordedCommandCount(const VernonRuntime
 VERNON_RUNTIME_CAPI bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures,
                                                                      uint64_t samplers, bool writableTexture,
                                                                      uint32_t deviceTier);
+VERNON_RUNTIME_CAPI uint64_t diagnosticClockForTesting() noexcept;
+VERNON_RUNTIME_CAPI void setDiagnosticClockForTesting(uint64_t clock) noexcept;
+VERNON_RUNTIME_CAPI void failNextDiagnosticOverflowAllocationForTesting() noexcept;
+VERNON_RUNTIME_CAPI uint64_t diagnosticGenerationCounterForTesting() noexcept;
+VERNON_RUNTIME_CAPI void setDiagnosticGenerationCounterForTesting(uint64_t generation) noexcept;
 
 } // namespace vernon::runtime
 

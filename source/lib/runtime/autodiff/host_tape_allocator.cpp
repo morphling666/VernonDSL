@@ -7,7 +7,6 @@
 #include <cstring>
 #include <functional>
 #include <new>
-#include <stdexcept>
 #include <utility>
 
 namespace vernon::runtime::ad {
@@ -36,6 +35,23 @@ bool checkedMultiply(size_t left, size_t right, size_t &result) {
     result = left * right;
     return true;
 }
+
+class MemoryChargeRollback {
+public:
+    MemoryChargeRollback(void *context, void (*release)(void *, size_t), size_t bytes) noexcept
+        : context_(context), release_(release), bytes_(bytes) {}
+    ~MemoryChargeRollback() noexcept {
+        if (release_ && bytes_)
+            release_(context_, bytes_);
+    }
+
+    void commit() noexcept { bytes_ = 0; }
+
+private:
+    void *context_;
+    void (*release_)(void *, size_t);
+    size_t bytes_;
+};
 
 template <typename T> class ChunkedArena {
 public:
@@ -184,19 +200,14 @@ private:
         if (!directory) {
             if (reserveMemory_ && !reserveMemory_(memoryContext_, sizeof(Directory)))
                 return false;
-            Directory *candidate = new (std::nothrow) Directory;
-            if (!candidate) {
-                if (releaseMemory_)
-                    releaseMemory_(memoryContext_, sizeof(Directory));
-                return false;
-            }
+            MemoryChargeRollback charge(memoryContext_, releaseMemory_, sizeof(Directory));
+            Directory *candidate = new Directory;
             Directory *expected = nullptr;
             if (!directories_[directoryIndex].compare_exchange_strong(expected, candidate, std::memory_order_release,
                                                                       std::memory_order_acquire)) {
                 delete candidate;
-                if (releaseMemory_)
-                    releaseMemory_(memoryContext_, sizeof(Directory));
             } else {
+                charge.commit();
                 dynamicBytes_.fetch_add(sizeof(Directory), std::memory_order_relaxed);
             }
             directory = expected ? expected : candidate;
@@ -207,18 +218,13 @@ private:
         constexpr size_t chunkBytes = kElementsPerChunk * sizeof(T);
         if (reserveMemory_ && !reserveMemory_(memoryContext_, chunkBytes))
             return false;
-        T *candidate = new (std::nothrow) T[kElementsPerChunk]{};
-        if (!candidate) {
-            if (releaseMemory_)
-                releaseMemory_(memoryContext_, chunkBytes);
-            return false;
-        }
+        MemoryChargeRollback charge(memoryContext_, releaseMemory_, chunkBytes);
+        T *candidate = new T[kElementsPerChunk]{};
         T *expected = nullptr;
         if (!slot.compare_exchange_strong(expected, candidate, std::memory_order_release, std::memory_order_acquire)) {
             delete[] candidate;
-            if (releaseMemory_)
-                releaseMemory_(memoryContext_, chunkBytes);
         } else {
+            charge.commit();
             dynamicBytes_.fetch_add(chunkBytes, std::memory_order_relaxed);
         }
         return true;
@@ -288,53 +294,46 @@ HostTapeMemoryUsage AutodiffMemoryPolicy::usage() const {
     return {contextBytes_, peakContextBytes_};
 }
 
-std::shared_ptr<AutodiffMemoryReservation>
+Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>
 AutodiffMemoryReservation::reserve(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes) {
     if (!policy)
-        return {};
+        return Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>{err(HostTapeError::InvalidArgument)};
     if (!bytes)
-        return std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(std::move(policy), 0));
+        return Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>{
+            ok(std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(std::move(policy), 0)))};
+    auto reservation = std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(policy, 0));
     if (!policy->reserveContext(bytes))
-        return {};
-    try {
-        return std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(std::move(policy), bytes));
-    } catch (...) {
-        policy->release(bytes);
-        return {};
-    }
+        return Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>{err(HostTapeError::BudgetExceeded)};
+    reservation->bytes_ = bytes;
+    return Result<std::shared_ptr<AutodiffMemoryReservation>, HostTapeError>{ok(std::move(reservation))};
 }
 
-AutodiffMemoryReservation::~AutodiffMemoryReservation() {
+AutodiffMemoryReservation::~AutodiffMemoryReservation() noexcept {
     if (policy_ && bytes_)
         policy_->release(bytes_);
 }
 
-bool AutodiffMemoryReservation::shrink(size_t bytes) {
+Result<void, HostTapeError> AutodiffMemoryReservation::shrink(size_t bytes) noexcept {
     if (bytes > bytes_)
-        return false;
+        return Result<void, HostTapeError>{err(HostTapeError::InvalidArgument)};
     if (policy_ && bytes < bytes_)
         policy_->release(bytes_ - bytes);
     bytes_ = bytes;
-    return true;
+    return Result<void, HostTapeError>{ok()};
 }
 
-std::shared_ptr<HostTapeDispatchBudget> HostTapeDispatchBudget::reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,
-                                                                        size_t capacity) {
+Result<std::shared_ptr<HostTapeDispatchBudget>, HostTapeError>
+HostTapeDispatchBudget::reserve(std::shared_ptr<HostTapeMemoryPolicy> policy, size_t capacity) {
     if (!policy || !capacity)
-        return {};
+        return Result<std::shared_ptr<HostTapeDispatchBudget>, HostTapeError>{err(HostTapeError::InvalidArgument)};
     capacity = std::min(capacity, policy->contextLimit());
     if (!capacity)
-        return {};
-    std::shared_ptr<HostTapeDispatchBudget> budget;
-    try {
-        budget = std::shared_ptr<HostTapeDispatchBudget>(new HostTapeDispatchBudget(policy, capacity));
-    } catch (const std::bad_alloc &) {
-        return {};
-    }
-    return budget;
+        return Result<std::shared_ptr<HostTapeDispatchBudget>, HostTapeError>{err(HostTapeError::BudgetExceeded)};
+    return Result<std::shared_ptr<HostTapeDispatchBudget>, HostTapeError>{
+        ok(std::shared_ptr<HostTapeDispatchBudget>(new HostTapeDispatchBudget(std::move(policy), capacity)))};
 }
 
-HostTapeDispatchBudget::~HostTapeDispatchBudget() {
+HostTapeDispatchBudget::~HostTapeDispatchBudget() noexcept {
     size_t usedBytes = 0;
     {
         std::lock_guard lock(mutex_);
@@ -461,8 +460,12 @@ public:
         if (!checkedAdd(baseBytes, payload.allocatedBytes(), baseBytes) ||
             !checkedAdd(baseBytes, children.allocatedBytes(), baseBytes) ||
             !checkedAdd(baseBytes, regions.allocatedBytes(), baseBytes) ||
-            !checkedAdd(baseBytes, records.allocatedBytes(), baseBytes) || !reservePhysical(baseBytes))
-            throw std::runtime_error("dynamic tape arena metadata exceeds context budget");
+            !checkedAdd(baseBytes, records.allocatedBytes(), baseBytes))
+            initializationError = HostTapeError::ArithmeticOverflow;
+        else if (!reservePhysical(baseBytes))
+            initializationError = HostTapeError::BudgetExceeded;
+        else
+            initialized = true;
     }
 
     ~Impl() { releasePhysical(totalCharge.load(std::memory_order_relaxed)); }
@@ -564,6 +567,8 @@ public:
     std::atomic<size_t> totalCharge{};
     size_t compactedLogicalBytes{};
     bool compacted{};
+    bool initialized{};
+    HostTapeError initializationError{HostTapeError::InvalidState};
 };
 
 HostDynamicTapeBatch::HostDynamicTapeBatch(size_t laneCount, size_t invocationCapacity,
@@ -571,7 +576,19 @@ HostDynamicTapeBatch::HostDynamicTapeBatch(size_t laneCount, size_t invocationCa
                                            std::shared_ptr<HostTapeDispatchBudget> dispatchBudget)
     : impl_(std::make_unique<Impl>(laneCount, invocationCapacity, std::move(policy), std::move(dispatchBudget))) {}
 
-HostDynamicTapeBatch::~HostDynamicTapeBatch() = default;
+Result<std::unique_ptr<HostDynamicTapeBatch>, HostTapeError>
+HostDynamicTapeBatch::create(size_t laneCount, size_t invocationCapacity, std::shared_ptr<HostTapeMemoryPolicy> policy,
+                             std::shared_ptr<HostTapeDispatchBudget> dispatchBudget) {
+    if (!laneCount || !invocationCapacity || !policy)
+        return Result<std::unique_ptr<HostDynamicTapeBatch>, HostTapeError>{err(HostTapeError::InvalidArgument)};
+    auto batch = std::unique_ptr<HostDynamicTapeBatch>(
+        new HostDynamicTapeBatch(laneCount, invocationCapacity, std::move(policy), std::move(dispatchBudget)));
+    if (!batch->impl_->initialized)
+        return Result<std::unique_ptr<HostDynamicTapeBatch>, HostTapeError>{err(batch->impl_->initializationError)};
+    return Result<std::unique_ptr<HostDynamicTapeBatch>, HostTapeError>{ok(std::move(batch))};
+}
+
+HostDynamicTapeBatch::~HostDynamicTapeBatch() noexcept = default;
 
 VernonAdTapeAllocatorStatus HostDynamicTapeBatch::reset(size_t lane) {
     if (lane >= impl_->lanes.size() || impl_->compacted)
@@ -759,7 +776,7 @@ bool HostDynamicTapeBatch::compact(bool retainConstructionStorage) {
         Impl *impl;
         size_t &pendingCharge;
         bool committed{};
-        ~CompactRollback() {
+        ~CompactRollback() noexcept {
             if (committed)
                 return;
             releaseVectorStorage(impl->snapshotChildren);
@@ -769,168 +786,163 @@ bool HostDynamicTapeBatch::compact(bool retainConstructionStorage) {
             impl->releasePhysical(pendingCharge);
         }
     } rollback{impl_.get(), pendingCompactCharge};
-    try {
-        bool hasDynamicLane = false;
-        for (size_t lane = 0; lane < impl_->lanes.size(); ++lane) {
-            const auto &state = impl_->lanes[lane];
-            if (!state.sealed || state.status != VERNON_AD_TAPE_ALLOCATOR_OK)
-                continue;
-            hasDynamicLane = true;
-            impl_->compactedLogicalBytes += state.payloadBytes;
-        }
-        if (!hasDynamicLane) {
-            if (!retainConstructionStorage) {
-                impl_->releasePhysical(impl_->lanes.capacity() * sizeof(Impl::Lane));
-                releaseVectorStorage(impl_->lanes);
-                impl_->releaseArena(impl_->payload);
-                impl_->releaseArena(impl_->children);
-                impl_->releaseArena(impl_->regions);
-                impl_->releaseArena(impl_->records);
-            }
-            releaseVectorStorage(impl_->snapshotRegions);
-            impl_->compacted = true;
-            return true;
-        }
-        size_t regionCount = 0;
-        size_t recordCount = 0;
-        size_t childCount = 0;
-        for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
-            const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
-            if (!sourceRegion || sourceRegion->lane >= impl_->lanes.size() ||
-                impl_->lanes[sourceRegion->lane].generation != sourceRegion->generation ||
-                !impl_->lanes[sourceRegion->lane].sealed)
-                continue;
-            if (!checkedAdd(regionCount, 1, regionCount) ||
-                !checkedAdd(recordCount, sourceRegion->recordCount, recordCount))
-                return false;
-            size_t recordIndex = sourceRegion->firstRecord;
-            for (size_t ordinal = 0; ordinal < sourceRegion->recordCount; ++ordinal) {
-                if (recordIndex >= impl_->records.size())
-                    return false;
-                const Impl::Record *sourceRecord = impl_->records.at(recordIndex);
-                if (!sourceRecord || !checkedAdd(childCount, sourceRecord->childCount, childCount))
-                    return false;
-                recordIndex = sourceRecord->next;
-            }
-            if (recordIndex != std::numeric_limits<size_t>::max())
-                return false;
-        }
-        size_t compactReservation = 0;
-        size_t bytes = 0;
-        if (!checkedMultiply(regionCount, sizeof(Impl::SnapshotRegion), compactReservation) ||
-            !checkedMultiply(recordCount, sizeof(Impl::SnapshotRecord), bytes) ||
-            !checkedAdd(compactReservation, bytes, compactReservation) ||
-            !checkedMultiply(childCount, sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactReservation, bytes, compactReservation) ||
-            !checkedMultiply(impl_->lanes.size(), sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactReservation, bytes, compactReservation) ||
-            !checkedMultiply(impl_->regions.size(), sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactReservation, bytes, compactReservation) || !impl_->reservePhysical(compactReservation))
-            return false;
-        pendingCompactCharge = compactReservation;
-        impl_->laneRoots.resize(impl_->lanes.size(), VERNON_AD_INVALID_REGION_HANDLE);
-        impl_->snapshotRegions.reserve(regionCount);
-        impl_->snapshotRecords.reserve(recordCount);
-        impl_->snapshotChildren.reserve(childCount);
-        std::vector<VernonAdRegionHandle> compactHandles(impl_->regions.size(), VERNON_AD_INVALID_REGION_HANDLE);
-        for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
-            const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
-            if (!sourceRegion || sourceRegion->lane >= impl_->lanes.size() ||
-                impl_->lanes[sourceRegion->lane].generation != sourceRegion->generation ||
-                !impl_->lanes[sourceRegion->lane].sealed)
-                continue;
-            if (sourceRegion->lane >= std::numeric_limits<uint32_t>::max() ||
-                impl_->snapshotRegions.size() >= std::numeric_limits<uint32_t>::max())
-                return false;
-            const uint64_t encodedLane = static_cast<uint64_t>(sourceRegion->lane + 1) << 32;
-            const uint64_t encodedIndex = static_cast<uint64_t>(impl_->snapshotRegions.size() + 1);
-            compactHandles[sourceRegionIndex] = encodedLane | encodedIndex;
-            impl_->snapshotRegions.emplace_back();
-        }
-        for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
-            const VernonAdRegionHandle compactHandle = compactHandles[sourceRegionIndex];
-            if (!compactHandle)
-                continue;
-            const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
-            if (!sourceRegion)
-                return false;
-            const size_t destinationRegionIndex =
-                static_cast<size_t>((compactHandle & std::numeric_limits<uint32_t>::max()) - 1);
-            auto &destinationRegion = impl_->snapshotRegions[destinationRegionIndex];
-            destinationRegion.recordOffset = impl_->snapshotRecords.size();
-            destinationRegion.recordCount = sourceRegion->recordCount;
-            destinationRegion.executedCount = sourceRegion->executedCount;
-            destinationRegion.exitKind = sourceRegion->exitKind;
-            size_t recordIndex = sourceRegion->firstRecord;
-            for (size_t ordinal = 0; ordinal < sourceRegion->recordCount; ++ordinal) {
-                if (recordIndex >= impl_->records.size())
-                    return false;
-                const Impl::Record *sourceRecord = impl_->records.at(recordIndex);
-                if (!sourceRecord)
-                    return false;
-                const size_t childOffset = impl_->snapshotChildren.size();
-                impl_->snapshotChildren.resize(childOffset + sourceRecord->childCount);
-                if (!impl_->children.read(sourceRecord->childOffset, impl_->snapshotChildren.data() + childOffset,
-                                          sourceRecord->childCount))
-                    return false;
-                impl_->snapshotRecords.push_back(
-                    {sourceRecord->payloadOffset, sourceRecord->payloadSize, childOffset, sourceRecord->childCount});
-                recordIndex = sourceRecord->next;
-            }
-            if (recordIndex != std::numeric_limits<size_t>::max())
-                return false;
-        }
-        for (VernonAdRegionHandle &child : impl_->snapshotChildren) {
-            if (!child || child > compactHandles.size() || !compactHandles[static_cast<size_t>(child - 1)])
-                return false;
-            child = compactHandles[static_cast<size_t>(child - 1)];
-        }
-        for (size_t lane = 0; lane < impl_->lanes.size(); ++lane) {
-            const auto &state = impl_->lanes[lane];
-            if (!state.sealed || state.status != VERNON_AD_TAPE_ALLOCATOR_OK)
-                continue;
-            if (!state.root || state.root > compactHandles.size() ||
-                !compactHandles[static_cast<size_t>(state.root - 1)])
-                return false;
-            impl_->laneRoots[lane] = compactHandles[static_cast<size_t>(state.root - 1)];
-        }
-        size_t compactCharge = 0;
-        bytes = 0;
-        if (!checkedMultiply(impl_->snapshotChildren.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactCharge, bytes, compactCharge) ||
-            !checkedMultiply(impl_->snapshotRegions.capacity(), sizeof(Impl::SnapshotRegion), bytes) ||
-            !checkedAdd(compactCharge, bytes, compactCharge) ||
-            !checkedMultiply(impl_->snapshotRecords.capacity(), sizeof(Impl::SnapshotRecord), bytes) ||
-            !checkedAdd(compactCharge, bytes, compactCharge) ||
-            !checkedMultiply(impl_->laneRoots.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactCharge, bytes, compactCharge) ||
-            !checkedMultiply(compactHandles.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
-            !checkedAdd(compactCharge, bytes, compactCharge))
-            return false;
-        if (compactCharge > compactReservation) {
-            if (!impl_->reservePhysical(compactCharge - compactReservation))
-                return false;
-        } else {
-            impl_->releasePhysical(compactReservation - compactCharge);
-        }
-        pendingCompactCharge = compactCharge;
-        const size_t handleBytes = compactHandles.capacity() * sizeof(VernonAdRegionHandle);
-        releaseVectorStorage(compactHandles);
-        impl_->releasePhysical(handleBytes);
-        pendingCompactCharge -= handleBytes;
+    bool hasDynamicLane = false;
+    for (size_t lane = 0; lane < impl_->lanes.size(); ++lane) {
+        const auto &state = impl_->lanes[lane];
+        if (!state.sealed || state.status != VERNON_AD_TAPE_ALLOCATOR_OK)
+            continue;
+        hasDynamicLane = true;
+        impl_->compactedLogicalBytes += state.payloadBytes;
+    }
+    if (!hasDynamicLane) {
         if (!retainConstructionStorage) {
             impl_->releasePhysical(impl_->lanes.capacity() * sizeof(Impl::Lane));
             releaseVectorStorage(impl_->lanes);
+            impl_->releaseArena(impl_->payload);
             impl_->releaseArena(impl_->children);
             impl_->releaseArena(impl_->regions);
             impl_->releaseArena(impl_->records);
         }
+        releaseVectorStorage(impl_->snapshotRegions);
         impl_->compacted = true;
-        rollback.committed = true;
         return true;
-    } catch (const std::exception &) {
-        return false;
     }
+    size_t regionCount = 0;
+    size_t recordCount = 0;
+    size_t childCount = 0;
+    for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
+        const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
+        if (!sourceRegion || sourceRegion->lane >= impl_->lanes.size() ||
+            impl_->lanes[sourceRegion->lane].generation != sourceRegion->generation ||
+            !impl_->lanes[sourceRegion->lane].sealed)
+            continue;
+        if (!checkedAdd(regionCount, 1, regionCount) ||
+            !checkedAdd(recordCount, sourceRegion->recordCount, recordCount))
+            return false;
+        size_t recordIndex = sourceRegion->firstRecord;
+        for (size_t ordinal = 0; ordinal < sourceRegion->recordCount; ++ordinal) {
+            if (recordIndex >= impl_->records.size())
+                return false;
+            const Impl::Record *sourceRecord = impl_->records.at(recordIndex);
+            if (!sourceRecord || !checkedAdd(childCount, sourceRecord->childCount, childCount))
+                return false;
+            recordIndex = sourceRecord->next;
+        }
+        if (recordIndex != std::numeric_limits<size_t>::max())
+            return false;
+    }
+    size_t compactReservation = 0;
+    size_t bytes = 0;
+    if (!checkedMultiply(regionCount, sizeof(Impl::SnapshotRegion), compactReservation) ||
+        !checkedMultiply(recordCount, sizeof(Impl::SnapshotRecord), bytes) ||
+        !checkedAdd(compactReservation, bytes, compactReservation) ||
+        !checkedMultiply(childCount, sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactReservation, bytes, compactReservation) ||
+        !checkedMultiply(impl_->lanes.size(), sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactReservation, bytes, compactReservation) ||
+        !checkedMultiply(impl_->regions.size(), sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactReservation, bytes, compactReservation) || !impl_->reservePhysical(compactReservation))
+        return false;
+    pendingCompactCharge = compactReservation;
+    impl_->laneRoots.resize(impl_->lanes.size(), VERNON_AD_INVALID_REGION_HANDLE);
+    impl_->snapshotRegions.reserve(regionCount);
+    impl_->snapshotRecords.reserve(recordCount);
+    impl_->snapshotChildren.reserve(childCount);
+    std::vector<VernonAdRegionHandle> compactHandles(impl_->regions.size(), VERNON_AD_INVALID_REGION_HANDLE);
+    for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
+        const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
+        if (!sourceRegion || sourceRegion->lane >= impl_->lanes.size() ||
+            impl_->lanes[sourceRegion->lane].generation != sourceRegion->generation ||
+            !impl_->lanes[sourceRegion->lane].sealed)
+            continue;
+        if (sourceRegion->lane >= std::numeric_limits<uint32_t>::max() ||
+            impl_->snapshotRegions.size() >= std::numeric_limits<uint32_t>::max())
+            return false;
+        const uint64_t encodedLane = static_cast<uint64_t>(sourceRegion->lane + 1) << 32;
+        const uint64_t encodedIndex = static_cast<uint64_t>(impl_->snapshotRegions.size() + 1);
+        compactHandles[sourceRegionIndex] = encodedLane | encodedIndex;
+        impl_->snapshotRegions.emplace_back();
+    }
+    for (size_t sourceRegionIndex = 0; sourceRegionIndex < impl_->regions.size(); ++sourceRegionIndex) {
+        const VernonAdRegionHandle compactHandle = compactHandles[sourceRegionIndex];
+        if (!compactHandle)
+            continue;
+        const Impl::Region *sourceRegion = impl_->regions.at(sourceRegionIndex);
+        if (!sourceRegion)
+            return false;
+        const size_t destinationRegionIndex =
+            static_cast<size_t>((compactHandle & std::numeric_limits<uint32_t>::max()) - 1);
+        auto &destinationRegion = impl_->snapshotRegions[destinationRegionIndex];
+        destinationRegion.recordOffset = impl_->snapshotRecords.size();
+        destinationRegion.recordCount = sourceRegion->recordCount;
+        destinationRegion.executedCount = sourceRegion->executedCount;
+        destinationRegion.exitKind = sourceRegion->exitKind;
+        size_t recordIndex = sourceRegion->firstRecord;
+        for (size_t ordinal = 0; ordinal < sourceRegion->recordCount; ++ordinal) {
+            if (recordIndex >= impl_->records.size())
+                return false;
+            const Impl::Record *sourceRecord = impl_->records.at(recordIndex);
+            if (!sourceRecord)
+                return false;
+            const size_t childOffset = impl_->snapshotChildren.size();
+            impl_->snapshotChildren.resize(childOffset + sourceRecord->childCount);
+            if (!impl_->children.read(sourceRecord->childOffset, impl_->snapshotChildren.data() + childOffset,
+                                      sourceRecord->childCount))
+                return false;
+            impl_->snapshotRecords.push_back(
+                {sourceRecord->payloadOffset, sourceRecord->payloadSize, childOffset, sourceRecord->childCount});
+            recordIndex = sourceRecord->next;
+        }
+        if (recordIndex != std::numeric_limits<size_t>::max())
+            return false;
+    }
+    for (VernonAdRegionHandle &child : impl_->snapshotChildren) {
+        if (!child || child > compactHandles.size() || !compactHandles[static_cast<size_t>(child - 1)])
+            return false;
+        child = compactHandles[static_cast<size_t>(child - 1)];
+    }
+    for (size_t lane = 0; lane < impl_->lanes.size(); ++lane) {
+        const auto &state = impl_->lanes[lane];
+        if (!state.sealed || state.status != VERNON_AD_TAPE_ALLOCATOR_OK)
+            continue;
+        if (!state.root || state.root > compactHandles.size() || !compactHandles[static_cast<size_t>(state.root - 1)])
+            return false;
+        impl_->laneRoots[lane] = compactHandles[static_cast<size_t>(state.root - 1)];
+    }
+    size_t compactCharge = 0;
+    bytes = 0;
+    if (!checkedMultiply(impl_->snapshotChildren.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactCharge, bytes, compactCharge) ||
+        !checkedMultiply(impl_->snapshotRegions.capacity(), sizeof(Impl::SnapshotRegion), bytes) ||
+        !checkedAdd(compactCharge, bytes, compactCharge) ||
+        !checkedMultiply(impl_->snapshotRecords.capacity(), sizeof(Impl::SnapshotRecord), bytes) ||
+        !checkedAdd(compactCharge, bytes, compactCharge) ||
+        !checkedMultiply(impl_->laneRoots.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactCharge, bytes, compactCharge) ||
+        !checkedMultiply(compactHandles.capacity(), sizeof(VernonAdRegionHandle), bytes) ||
+        !checkedAdd(compactCharge, bytes, compactCharge))
+        return false;
+    if (compactCharge > compactReservation) {
+        if (!impl_->reservePhysical(compactCharge - compactReservation))
+            return false;
+    } else {
+        impl_->releasePhysical(compactReservation - compactCharge);
+    }
+    pendingCompactCharge = compactCharge;
+    const size_t handleBytes = compactHandles.capacity() * sizeof(VernonAdRegionHandle);
+    releaseVectorStorage(compactHandles);
+    impl_->releasePhysical(handleBytes);
+    pendingCompactCharge -= handleBytes;
+    if (!retainConstructionStorage) {
+        impl_->releasePhysical(impl_->lanes.capacity() * sizeof(Impl::Lane));
+        releaseVectorStorage(impl_->lanes);
+        impl_->releaseArena(impl_->children);
+        impl_->releaseArena(impl_->regions);
+        impl_->releaseArena(impl_->records);
+    }
+    impl_->compacted = true;
+    rollback.committed = true;
+    return true;
 }
 
 bool HostDynamicTapeBatch::resetCompactedReplay() {
@@ -1209,18 +1221,31 @@ VernonAdTapeAllocatorStatus HostStaticTapeBatch::Reader::readExit(VernonAdTapeAl
     return VERNON_AD_TAPE_ALLOCATOR_OK;
 }
 
-std::shared_ptr<HostStaticTapeBatch>
+Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>
 HostStaticTapeBatch::create(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
                             std::shared_ptr<HostTapeMemoryPolicy> policy,
                             std::shared_ptr<HostTapeDispatchBudget> dispatchBudget) {
     if (!laneCount || !payloadStride || !policy)
-        return {};
-    try {
-        return std::shared_ptr<HostStaticTapeBatch>(new HostStaticTapeBatch(
-            laneCount, payloadStride, invocationCapacity, std::move(policy), std::move(dispatchBudget)));
-    } catch (const std::exception &) {
-        return {};
-    }
+        return Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>{err(HostTapeError::InvalidArgument)};
+    auto payloadBytes = hostStaticTapeBatchPureStaticBytes(laneCount, payloadStride);
+    if (payloadBytes.isErr())
+        return Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>{err(payloadBytes.error())};
+    auto batch = std::shared_ptr<HostStaticTapeBatch>(new HostStaticTapeBatch(
+        laneCount, payloadStride, invocationCapacity, std::move(policy), std::move(dispatchBudget)));
+    size_t policyCharge = 0;
+    size_t bytes = 0;
+    if (!checkedMultiply(batch->descriptors_.capacity(), sizeof(VernonAdTapeAllocator), policyCharge) ||
+        !checkedMultiply(batch->lanes_.capacity(), sizeof(LaneState), bytes) ||
+        !checkedAdd(policyCharge, bytes, policyCharge) ||
+        !checkedMultiply(batch->payload_.capacity(), sizeof(std::byte), bytes) ||
+        !checkedAdd(policyCharge, bytes, policyCharge))
+        return Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>{err(HostTapeError::ArithmeticOverflow)};
+    if (!(batch->dispatchBudget_ ? batch->dispatchBudget_->reserveTransientBytes(policyCharge)
+                                 : batch->policy_->reserveContext(policyCharge)))
+        return Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>{err(HostTapeError::BudgetExceeded)};
+    batch->policyCharge_ = policyCharge;
+    batch->initializeDescriptors();
+    return Result<std::shared_ptr<HostStaticTapeBatch>, HostTapeError>{ok(std::move(batch))};
 }
 
 HostStaticTapeBatch::HostStaticTapeBatch(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
@@ -1229,16 +1254,8 @@ HostStaticTapeBatch::HostStaticTapeBatch(size_t laneCount, size_t payloadStride,
     : descriptors_(laneCount), lanes_(laneCount), laneCount_(laneCount), payloadStride_(payloadStride),
       invocationCapacity_(invocationCapacity), policy_(std::move(policy)), dispatchBudget_(std::move(dispatchBudget)) {
     size_t payloadBytes = 0;
-    if (!checkedMultiply(laneCount, payloadStride, payloadBytes))
-        throw std::length_error("static tape batch payload size overflows");
+    (void)checkedMultiply(laneCount, payloadStride, payloadBytes);
     payload_.resize(payloadBytes);
-    policyCharge_ = descriptors_.capacity() * sizeof(VernonAdTapeAllocator) + lanes_.capacity() * sizeof(LaneState) +
-                    payload_.capacity() * sizeof(std::byte);
-    if (!(dispatchBudget_ ? dispatchBudget_->reserveTransientBytes(policyCharge_)
-                          : policy_->reserveContext(policyCharge_)))
-        throw std::runtime_error("static tape batch exceeds context budget");
-
-    initializeDescriptors();
 }
 
 void HostStaticTapeBatch::initializeDescriptors() {
@@ -1263,7 +1280,7 @@ void HostStaticTapeBatch::initializeDescriptors() {
     }
 }
 
-HostStaticTapeBatch::~HostStaticTapeBatch() {
+HostStaticTapeBatch::~HostStaticTapeBatch() noexcept {
     constructionState_ = ConstructionState::Released;
     if (dispatchBudget_ && policyCharge_)
         dispatchBudget_->releaseTransientBytes(policyCharge_);
@@ -1271,12 +1288,11 @@ HostStaticTapeBatch::~HostStaticTapeBatch() {
         policy_->release(policyCharge_);
 }
 
-bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result) {
+Result<size_t, HostTapeError> hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride) noexcept {
     const size_t fixedBytes = sizeof(VernonAdTapeAllocator) + sizeof(HostStaticTapeBatch::LaneState);
     if (payloadStride > SIZE_MAX - fixedBytes || laneCount > SIZE_MAX / (fixedBytes + payloadStride))
-        return false;
-    result = laneCount * (fixedBytes + payloadStride);
-    return true;
+        return Result<size_t, HostTapeError>{err(HostTapeError::ArithmeticOverflow)};
+    return Result<size_t, HostTapeError>{ok(laneCount * (fixedBytes + payloadStride))};
 }
 
 size_t HostStaticTapeBatch::allocatedBytes() const {
@@ -1316,35 +1332,11 @@ bool HostStaticTapeBatch::compact(bool retainConstructionStorage) {
     if (hasDynamicLane && (!dynamicBatch() || !dynamicBatch()->compact(retainConstructionStorage)))
         return false;
     if (hasDynamicLane) {
-        const size_t reservation = laneCount_ * sizeof(uint8_t);
-        if (!(dispatchBudget_ ? dispatchBudget_->reserveTransientBytes(reservation)
-                              : policy_->reserveContext(reservation)))
+        std::vector<uint8_t> laneKinds(laneCount_);
+        const size_t actual = laneKinds.capacity() * sizeof(uint8_t);
+        if (!(dispatchBudget_ ? dispatchBudget_->reserveTransientBytes(actual) : policy_->reserveContext(actual)))
             return false;
-        try {
-            compactedLaneKinds_.resize(laneCount_);
-        } catch (...) {
-            if (dispatchBudget_)
-                dispatchBudget_->releaseTransientBytes(reservation);
-            else
-                policy_->release(reservation);
-            throw;
-        }
-        const size_t actual = compactedLaneKinds_.capacity() * sizeof(uint8_t);
-        if (actual > reservation && !(dispatchBudget_ ? dispatchBudget_->reserveTransientBytes(actual - reservation)
-                                                      : policy_->reserveContext(actual - reservation))) {
-            releaseVectorStorage(compactedLaneKinds_);
-            if (dispatchBudget_)
-                dispatchBudget_->releaseTransientBytes(reservation);
-            else
-                policy_->release(reservation);
-            return false;
-        }
-        if (actual < reservation) {
-            if (dispatchBudget_)
-                dispatchBudget_->releaseTransientBytes(reservation - actual);
-            else
-                policy_->release(reservation - actual);
-        }
+        compactedLaneKinds_.swap(laneKinds);
         policyCharge_ += actual;
     }
     for (size_t lane = 0; lane < laneCount_; ++lane) {
@@ -1537,13 +1529,19 @@ VernonAdTapeAllocatorStatus HostStaticTapeBatch::fail(size_t lane, VernonAdTapeA
     return descriptor.status;
 }
 
-HostDynamicTapeBatch *HostStaticTapeBatch::ensureDynamicBatch() {
+Result<HostDynamicTapeBatch *, HostTapeError> HostStaticTapeBatch::ensureDynamicBatch() {
     std::call_once(dynamicBatchOnce_, [this] {
-        dynamicBatchOwner_ =
-            std::make_unique<HostDynamicTapeBatch>(laneCount_, invocationCapacity_, policy_, dispatchBudget_);
+        auto created = HostDynamicTapeBatch::create(laneCount_, invocationCapacity_, policy_, dispatchBudget_);
+        if (created.isErr()) {
+            dynamicBatchError_ = created.error();
+            return;
+        }
+        dynamicBatchOwner_ = std::move(created).value();
         dynamicBatchAddress_.store(dynamicBatchOwner_.get(), std::memory_order_release);
     });
-    return dynamicBatch();
+    if (HostDynamicTapeBatch *batch = dynamicBatch())
+        return Result<HostDynamicTapeBatch *, HostTapeError>{ok(batch)};
+    return Result<HostDynamicTapeBatch *, HostTapeError>{err(dynamicBatchError_)};
 }
 
 VernonAdTapeAllocatorStatus HostStaticTapeBatch::syncDynamic(size_t lane, VernonAdTapeAllocatorStatus status) {
@@ -1556,12 +1554,10 @@ VernonAdTapeAllocatorStatus HostStaticTapeBatch::syncDynamic(size_t lane, Vernon
 VernonAdTapeAllocatorStatus HostStaticTapeBatch::promote(size_t lane, size_t payloadSize, size_t payloadAlignment,
                                                          size_t childCount, VernonAdRecordHandle *record) {
     VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
-    HostDynamicTapeBatch *dynamic = nullptr;
-    try {
-        dynamic = ensureDynamicBatch();
-    } catch (const std::exception &) {
+    auto dynamicResult = ensureDynamicBatch();
+    if (dynamicResult.isErr())
         return fail(lane, VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
-    }
+    HostDynamicTapeBatch *dynamic = dynamicResult.value();
     VernonAdTapeAllocatorStatus status = dynamic->beginRegion(lane, VERNON_AD_INVALID_REGION_HANDLE, &root);
     if (status == VERNON_AD_TAPE_ALLOCATOR_OK)
         status = dynamic->reserveRecord(lane, root, payloadSize, payloadAlignment, childCount, record);

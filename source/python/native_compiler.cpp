@@ -262,8 +262,23 @@ void bindNativeCompiler(nb::module_ &module) {
     nb::class_<vernon::runtime::DirtyRangeSet>(module, "_DirtyRangeSet")
         .def(nb::init<size_t, bool>(), nb::arg("byte_size"), nb::arg("dirty") = false)
         .def_prop_ro("ranges", &vernon::runtime::DirtyRangeSet::ranges)
-        .def("mark", &vernon::runtime::DirtyRangeSet::mark, nb::arg("ranges"), nb::arg("allow_full"))
-        .def("should_promote_full", &vernon::runtime::DirtyRangeSet::shouldPromoteFull, nb::arg("ranges"))
+        .def(
+            "mark",
+            [](vernon::runtime::DirtyRangeSet &dirty, const std::vector<std::pair<size_t, size_t>> &ranges,
+               bool allowFull) {
+                if (dirty.mark(ranges, allowFull).isErr())
+                    throw nb::value_error("dirty byte range exceeds its allocation");
+            },
+            nb::arg("ranges"), nb::arg("allow_full"))
+        .def(
+            "should_promote_full",
+            [](const vernon::runtime::DirtyRangeSet &dirty, const std::vector<std::pair<size_t, size_t>> &ranges) {
+                auto promoted = dirty.shouldPromoteFull(ranges);
+                if (promoted.isErr())
+                    throw nb::value_error("dirty byte range exceeds its allocation");
+                return promoted.value();
+            },
+            nb::arg("ranges"))
         .def("mark_all", &vernon::runtime::DirtyRangeSet::markAll)
         .def("clear", &vernon::runtime::DirtyRangeSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyRangeSet &ranges) { return !ranges.empty(); });

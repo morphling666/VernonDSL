@@ -104,7 +104,7 @@ const std::vector<uint32_t> &ResolvedExecutionPlan::predecessors(GraphDirection 
     return found == hazards.predecessors.end() ? empty : found->second;
 }
 
-bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
+static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
     diagnostic = {};
     if (!plan.resolvedProgram)
         return reject(diagnostic, "", "execution plan has no resolved Program");
@@ -375,14 +375,14 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
     return true;
 }
 
-bool validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
+static bool validateResolvedExecutionPlanImpl(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
     diagnostic = {};
     if (!plan.resolvedProgram)
         return reject(diagnostic, "", "execution plan has no Program");
     const Program &program = plan.resolvedProgram->program;
     ResolvedExecutionPlan expected = plan;
     Diagnostic expectedDiagnostic;
-    if (!buildResolvedExecutionPolicies(expected, expectedDiagnostic))
+    if (!buildResolvedExecutionPoliciesImpl(expected, expectedDiagnostic))
         return reject(diagnostic, expectedDiagnostic.path, expectedDiagnostic.message);
     for (const ResolvedDependencyEdge &required : expected.hazards.edges) {
         const auto found = std::find_if(
@@ -473,6 +473,18 @@ bool validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic
         }
     }
     return true;
+}
+
+ExecutionPlanResult buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
+    if (!buildResolvedExecutionPoliciesImpl(plan, diagnostic))
+        return ExecutionPlanResult{vernon::err(ExecutionPlanError::PolicyResolutionFailed)};
+    return ExecutionPlanResult{vernon::ok()};
+}
+
+ExecutionPlanResult validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic) {
+    if (!validateResolvedExecutionPlanImpl(plan, diagnostic))
+        return ExecutionPlanResult{vernon::err(ExecutionPlanError::ValidationFailed)};
+    return ExecutionPlanResult{vernon::ok()};
 }
 
 } // namespace vernon::runtime::program

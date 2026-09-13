@@ -259,6 +259,42 @@ VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
     return status;
 }
 
+template <typename Callback>
+VernonStatus runtimeAutodiffBoundary(VernonRuntimeContext *context, Callback &&callback) noexcept {
+    try {
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
+        return std::forward<Callback>(callback)();
+    } catch (const std::bad_alloc &) {
+        return fail(context, "Runtime autodiff boundary allocation failed", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(context, "Runtime autodiff boundary exception", VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
+template <typename Value, typename Callback>
+Value runtimeAutodiffValueBoundary(VernonRuntimeContext *context, Value fallback, Callback &&callback) noexcept {
+    try {
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
+        return std::forward<Callback>(callback)();
+    } catch (const std::bad_alloc &) {
+        (void)fail(context, "Runtime autodiff boundary allocation failed", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        (void)fail(context, "Runtime autodiff boundary exception", VERNON_STATUS_INTERNAL_ERROR);
+    }
+    return fallback;
+}
+
+template <typename Callback>
+void runtimeAutodiffVoidBoundary(VernonRuntimeContext *context, Callback &&callback) noexcept {
+    try {
+        std::forward<Callback>(callback)();
+    } catch (const std::bad_alloc &) {
+        (void)fail(context, "Runtime autodiff boundary allocation failed", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        (void)fail(context, "Runtime autodiff boundary exception", VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
 } // namespace
 
 namespace {
@@ -333,67 +369,68 @@ VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *c
 extern "C" {
 
 uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline)
-        return 0;
-    auto pin = pipeline->lifecycle.pin();
-    if (pin.isErr())
-        return 0;
-    return programExecution(pipeline) ? 1 : 0;
+    return runtimeAutodiffValueBoundary<uint8_t>(pipeline ? pipeline->context : nullptr, 0, [&] {
+        if (!pipeline)
+            return uint8_t{0};
+        auto pin = pipeline->lifecycle.pin();
+        return static_cast<uint8_t>(pin.isOk() && programExecution(pipeline));
+    });
 }
 
 size_t vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline)
-        return 0;
-    auto pin = pipeline->lifecycle.pin();
-    if (pin.isErr())
-        return 0;
-    const auto *autodiff = canonicalProgramAutodiff(pipeline);
-    return autodiff ? autodiff->derivativeGroups.size() : 0;
+    return runtimeAutodiffValueBoundary<size_t>(pipeline ? pipeline->context : nullptr, 0, [&] {
+        if (!pipeline)
+            return size_t{0};
+        auto pin = pipeline->lifecycle.pin();
+        if (pin.isErr())
+            return size_t{0};
+        const auto *autodiff = canonicalProgramAutodiff(pipeline);
+        return autodiff ? autodiff->derivativeGroups.size() : size_t{0};
+    });
 }
 
 VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(const VernonProgramExecutable *pipeline,
                                                                        size_t groupIndex,
                                                                        VernonAdDerivativeGroupView *view) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto pin = pipeline->lifecycle.pin();
-    if (pin.isErr())
-        return vernon::toVernonStatus(pin.error());
-    const auto *autodiff = canonicalProgramAutodiff(pipeline);
-    if (!autodiff || !view || view->struct_size < sizeof(*view) || groupIndex >= autodiff->derivativeGroups.size())
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group query");
-    const vernon::runtime::AutodiffDerivativeGroup &group = autodiff->derivativeGroups[groupIndex];
-    *view = {sizeof(*view),
-             group.role == vernon::runtime::AutodiffDerivativeRole::Gradient ? VERNON_AD_DERIVATIVE_GRADIENT
-                                                                             : VERNON_AD_DERIVATIVE_COTANGENT,
-             {group.declaredPath.data(), group.declaredPath.size()},
-             group.leafPaths.size(),
-             {}};
-    return VERNON_STATUS_OK;
+    return runtimeAutodiffBoundary(pipeline ? pipeline->context : nullptr, [&] {
+        if (!pipeline)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto pin = pipeline->lifecycle.pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
+        const auto *autodiff = canonicalProgramAutodiff(pipeline);
+        if (!autodiff || !view || view->struct_size < sizeof(*view) || groupIndex >= autodiff->derivativeGroups.size())
+            return fail(pipeline->context, "invalid autodiff derivative group query");
+        const vernon::runtime::AutodiffDerivativeGroup &group = autodiff->derivativeGroups[groupIndex];
+        *view = {sizeof(*view),
+                 group.role == vernon::runtime::AutodiffDerivativeRole::Gradient ? VERNON_AD_DERIVATIVE_GRADIENT
+                                                                                 : VERNON_AD_DERIVATIVE_COTANGENT,
+                 {group.declaredPath.data(), group.declaredPath.size()},
+                 group.leafPaths.size(),
+                 {}};
+        return VERNON_STATUS_OK;
+    });
 }
 
 VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const VernonProgramExecutable *pipeline,
                                                                     size_t groupIndex, size_t leafIndex,
                                                                     VernonStringView *leafPath) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto pin = pipeline->lifecycle.pin();
-    if (pin.isErr())
-        return vernon::toVernonStatus(pin.error());
-    const auto *autodiff = canonicalProgramAutodiff(pipeline);
-    if (!autodiff || !leafPath || groupIndex >= autodiff->derivativeGroups.size()) {
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group leaf query");
-    }
-    const vernon::runtime::AutodiffDerivativeGroup &group = autodiff->derivativeGroups[groupIndex];
-    if (leafIndex >= group.leafPaths.size())
-        return fail(pipeline->context, "invalid autodiff derivative group leaf query");
-    const std::string &path = group.leafPaths[leafIndex];
-    *leafPath = {path.data(), path.size()};
-    return VERNON_STATUS_OK;
+    return runtimeAutodiffBoundary(pipeline ? pipeline->context : nullptr, [&] {
+        if (!pipeline)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto pin = pipeline->lifecycle.pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
+        const auto *autodiff = canonicalProgramAutodiff(pipeline);
+        if (!autodiff || !leafPath || groupIndex >= autodiff->derivativeGroups.size())
+            return fail(pipeline->context, "invalid autodiff derivative group leaf query");
+        const vernon::runtime::AutodiffDerivativeGroup &group = autodiff->derivativeGroups[groupIndex];
+        if (leafIndex >= group.leafPaths.size())
+            return fail(pipeline->context, "invalid autodiff derivative group leaf query");
+        const std::string &path = group.leafPaths[leafIndex];
+        *leafPath = {path.data(), path.size()};
+        return VERNON_STATUS_OK;
+    });
 }
 
 extern "C++" {
@@ -404,31 +441,22 @@ VernonStatus applyPullback(VernonPullback *pullback, const VernonProgramArgument
                            program_execution::InvocationMutationOutcome &outcome) {
     outcome = {};
     VernonRuntimeContext *context = pullback ? pullback->context : nullptr;
-    try {
-        using namespace vernon::runtime::ad;
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        if (!pullback || !pullback->lifecycle || !pullback->execution || (argumentCount && !arguments) || !options ||
-            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
-            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
-            std::any_of(std::begin(options->reserved), std::end(options->reserved),
-                        [](uint32_t value) { return value != 0; }))
-            return fail(context, "invalid pullback invocation");
-        auto pin = pullback->lifecycle.value().pin();
-        if (pin.isErr())
-            return vernon::toVernonStatus(pin.error());
-        const auto boundedSize = [](uint64_t value) {
-            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
-                                                              : static_cast<size_t>(value);
-        };
-        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes)};
-        return pullback->execution->apply(arguments, argumentCount, runtimeOptions, outcome);
-    } catch (const std::bad_alloc &) {
-        return fail(context, "cannot allocate pullback state", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (const std::length_error &) {
-        return fail(context, "pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (...) {
-        return fail(context, "unexpected pullback failure", VERNON_STATUS_INTERNAL_ERROR);
-    }
+    using namespace vernon::runtime::ad;
+    if (!pullback || !pullback->lifecycle || !pullback->execution || (argumentCount && !arguments) || !options ||
+        options->struct_size != sizeof(VernonPullbackApplyOptions) ||
+        options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
+        std::any_of(std::begin(options->reserved), std::end(options->reserved),
+                    [](uint32_t value) { return value != 0; }))
+        return fail(context, "invalid pullback invocation");
+    auto pin = pullback->lifecycle.value().pin();
+    if (pin.isErr())
+        return vernon::toVernonStatus(pin.error());
+    const auto boundedSize = [](uint64_t value) {
+        return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
+                                                          : static_cast<size_t>(value);
+    };
+    const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes)};
+    return pullback->execution->apply(arguments, argumentCount, runtimeOptions, outcome);
 }
 
 } // namespace vernon::runtime::ad
@@ -437,38 +465,52 @@ VernonStatus applyPullback(VernonPullback *pullback, const VernonProgramArgument
 VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, const VernonProgramArgument *arguments,
                                                    size_t argumentCount, const VernonPullbackApplyOptions *options,
                                                    VernonInvocationMutationOutcome *publicOutcome) {
-    using namespace vernon::runtime::program_execution;
-    const size_t capacity = pullback && pullback->execution ? pullback->execution->mutationCapacity() : 0;
-    if (!preparePublicOutcome(publicOutcome, capacity))
-        return fail(pullback ? pullback->context : nullptr, "invalid pullback mutation outcome storage");
-    InvocationMutationOutcome outcome;
-    const VernonStatus status =
-        vernon::runtime::ad::applyPullback(pullback, arguments, argumentCount, options, outcome);
-    publishPublicOutcome(outcome, publicOutcome);
-    return status;
+    VernonRuntimeContext *context = pullback ? pullback->context : nullptr;
+    return runtimeAutodiffBoundary(context, [&] {
+        using namespace vernon::runtime::program_execution;
+        const size_t capacity = pullback && pullback->execution ? pullback->execution->mutationCapacity() : 0;
+        if (!preparePublicOutcome(publicOutcome, capacity))
+            return fail(context, "invalid pullback mutation outcome storage");
+        InvocationMutationOutcome outcome;
+        const VernonStatus status =
+            vernon::runtime::ad::applyPullback(pullback, arguments, argumentCount, options, outcome);
+        publishPublicOutcome(outcome, publicOutcome);
+        return status;
+    });
 }
 
 VernonStatus vernonProgramPullbackApply(VernonPullback *pullback, const VernonProgramArgument *arguments,
                                         size_t argumentCount, VernonInvocationMutationOutcome *outcome) {
-    const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
-                                             VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
-                                             std::numeric_limits<uint64_t>::max(),
-                                             {}};
-    return vernonProgramPullbackApplyWithOptions(pullback, arguments, argumentCount, &options, outcome);
+    return runtimeAutodiffBoundary(pullback ? pullback->context : nullptr, [&] {
+        const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
+                                                 VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                 std::numeric_limits<uint64_t>::max(),
+                                                 {}};
+        using namespace vernon::runtime::program_execution;
+        const size_t capacity = pullback && pullback->execution ? pullback->execution->mutationCapacity() : 0;
+        if (!preparePublicOutcome(outcome, capacity))
+            return fail(pullback ? pullback->context : nullptr, "invalid pullback mutation outcome storage");
+        InvocationMutationOutcome internalOutcome;
+        const VernonStatus status =
+            vernon::runtime::ad::applyPullback(pullback, arguments, argumentCount, &options, internalOutcome);
+        publishPublicOutcome(internalOutcome, outcome);
+        return status;
+    });
 }
 
 void vernonProgramPullbackDestroy(VernonPullback *pullback) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pullback ? pullback->context : nullptr);
-    if (!pullback)
-        return;
-    if (!pullback->lifecycle)
-        vernon::resultContractViolation();
-    auto destruction = pullback->lifecycle.value().beginDestroy();
-    if (destruction.isErr())
-        return;
-    if (destruction.value().commit().isErr())
-        vernon::resultContractViolation();
-    delete pullback;
+    runtimeAutodiffVoidBoundary(pullback ? pullback->context : nullptr, [&] {
+        if (!pullback)
+            return;
+        if (!pullback->lifecycle)
+            vernon::resultContractViolation();
+        auto destruction = pullback->lifecycle.value().beginDestroy();
+        if (destruction.isErr())
+            return;
+        if (destruction.value().commit().isErr())
+            vernon::resultContractViolation();
+        delete pullback;
+    });
 }
 
 } // extern "C"

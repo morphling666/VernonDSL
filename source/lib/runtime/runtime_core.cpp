@@ -12,7 +12,63 @@
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+namespace {
+
+template <typename Callback> VernonStatus runtimeCoreBoundary(Callback &&callback) noexcept {
+    try {
+        return std::forward<Callback>(callback)();
+    } catch (const std::bad_alloc &) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+template <typename Value, typename Callback>
+Value runtimeCoreValueBoundary(Value fallback, Callback &&callback) noexcept {
+    try {
+        return std::forward<Callback>(callback)();
+    } catch (...) {
+        return fallback;
+    }
+}
+
+template <typename Callback> void runtimeCoreVoidBoundary(Callback &&callback) noexcept {
+    try {
+        std::forward<Callback>(callback)();
+    } catch (...) {
+    }
+}
+
+template <typename Callback> VernonStatus providerStatusBoundary(Callback &&callback) noexcept {
+    try {
+        return std::forward<Callback>(callback)();
+    } catch (...) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+template <typename Value, typename Callback>
+VernonStatus providerValueBoundary(Value &output, Callback &&callback) noexcept {
+    try {
+        output = std::forward<Callback>(callback)();
+        return VERNON_STATUS_OK;
+    } catch (...) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+template <typename Callback> void providerVoidBoundary(Callback &&callback) noexcept {
+    try {
+        std::forward<Callback>(callback)();
+    } catch (...) {
+    }
+}
+
+} // namespace
 
 struct VernonRuntimeCorePipeline {
     VernonRuntimeDeviceProvider provider{};
@@ -43,9 +99,9 @@ struct RuntimeCoreBindingRevision : vernon::CheckedIntrusiveControl<RuntimeCoreB
 
     ~RuntimeCoreBindingRevision() noexcept {
         if (handle.value != 0)
-            provider.destroy_binding_set(provider.user_data, handle);
+            providerVoidBoundary([&] { provider.destroy_binding_set(provider.user_data, handle); });
         for (auto resource = resources.rbegin(); resource != resources.rend(); ++resource)
-            provider.release_resource(provider.user_data, *resource);
+            providerVoidBoundary([&] { provider.release_resource(provider.user_data, *resource); });
     }
 
     VernonRuntimeDeviceProvider provider{};
@@ -104,19 +160,24 @@ bool providerIsValid(const VernonRuntimeDeviceProvider &provider, VernonRuntimeP
                                                             : provider.encode_draw != nullptr;
 }
 
-void releasePipeline(VernonRuntimeCorePipeline *pipeline) {
+void releasePipeline(VernonRuntimeCorePipeline *pipeline) noexcept {
     if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
     for (auto &entry : pipeline->graphicsCache)
         if (present(entry.second))
-            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, entry.second);
+            providerVoidBoundary(
+                [&] { pipeline->provider.destroy_pipeline(pipeline->provider.user_data, entry.second); });
     if (present(pipeline->pipeline))
-        pipeline->provider.destroy_pipeline(pipeline->provider.user_data, pipeline->pipeline);
+        providerVoidBoundary(
+            [&] { pipeline->provider.destroy_pipeline(pipeline->provider.user_data, pipeline->pipeline); });
     if (present(pipeline->layout))
-        pipeline->provider.destroy_pipeline_layout(pipeline->provider.user_data, pipeline->layout);
+        providerVoidBoundary(
+            [&] { pipeline->provider.destroy_pipeline_layout(pipeline->provider.user_data, pipeline->layout); });
     while (pipeline->shaderCount != 0) {
         --pipeline->shaderCount;
-        pipeline->provider.destroy_shader(pipeline->provider.user_data, pipeline->shaders[pipeline->shaderCount]);
+        providerVoidBoundary([&] {
+            pipeline->provider.destroy_shader(pipeline->provider.user_data, pipeline->shaders[pipeline->shaderCount]);
+        });
     }
     delete pipeline;
 }
@@ -178,9 +239,9 @@ bool shaderStagesAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor)
 }
 
 void releaseResources(const VernonRuntimeDeviceProvider &provider,
-                      const std::vector<VernonRuntimeProviderResourceReference> &resources) {
+                      const std::vector<VernonRuntimeProviderResourceReference> &resources) noexcept {
     for (auto resource = resources.rbegin(); resource != resources.rend(); ++resource)
-        provider.release_resource(provider.user_data, *resource);
+        providerVoidBoundary([&] { provider.release_resource(provider.user_data, *resource); });
 }
 
 VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const VernonRuntimeProviderBindingValue *values,
@@ -194,11 +255,7 @@ VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const Ve
         resourceCount += !packedUniformBytes(layout) &&
                          (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0;
     }
-    try {
-        resources.reserve(resourceCount);
-    } catch (const std::bad_alloc &) {
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
+    resources.reserve(resourceCount);
     for (size_t index = 0; index < valueCount; ++index) {
         const auto &layout = pipeline.bindings[index];
         if (layout.slot != values[index].slot)
@@ -219,7 +276,8 @@ VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const Ve
             resources.clear();
             return VERNON_STATUS_INVALID_ARGUMENT;
         }
-        const VernonStatus status = provider.retain_resource(provider.user_data, *resource);
+        const VernonStatus status =
+            providerStatusBoundary([&] { return provider.retain_resource(provider.user_data, *resource); });
         if (status != VERNON_STATUS_OK) {
             releaseResources(provider, resources);
             resources.clear();
@@ -251,8 +309,10 @@ VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
             return VERNON_STATUS_INVALID_ARGUMENT;
         VernonRuntimeProviderImageDescription description{};
         description.struct_size = sizeof(description);
-        const VernonStatus status = pipeline.provider.describe_image(pipeline.provider.user_data,
-                                                                     values[index].payload.image.view, &description);
+        const VernonStatus status = providerStatusBoundary([&] {
+            return pipeline.provider.describe_image(pipeline.provider.user_data, values[index].payload.image.view,
+                                                    &description);
+        });
         if (status != VERNON_STATUS_OK)
             return status;
         const uint32_t requiredUsage =
@@ -306,32 +366,28 @@ bool bindingSnapshotMatches(const VernonRuntimeCorePipeline &pipeline,
 VernonStatus captureBindingSnapshot(const VernonRuntimeCorePipeline &pipeline,
                                     const VernonRuntimeProviderBindingValue *values, size_t valueCount,
                                     std::vector<RuntimeCoreBindingRevision::SnapshotEntry> &output) {
-    try {
-        std::vector<RuntimeCoreBindingRevision::SnapshotEntry> candidate;
-        candidate.reserve(valueCount);
-        for (size_t index = 0; index < valueCount; ++index) {
-            const auto &value = values[index];
-            const auto &layout = pipeline.bindings[index];
-            RuntimeCoreBindingRevision::SnapshotEntry entry;
-            entry.slot = value.slot;
-            entry.kind = value.kind;
-            entry.flags = value.flags;
-            if (packedUniformBytes(layout)) {
-                const auto *begin = static_cast<const uint8_t *>(value.payload.inline_value.data);
-                entry.inlineBytes.assign(begin, begin + value.payload.inline_value.size);
-            } else if ((value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
-                entry.resource = *bindingResource(value);
-                if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-                    value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-                    entry.stride = value.payload.buffer.stride;
-            }
-            candidate.push_back(std::move(entry));
+    std::vector<RuntimeCoreBindingRevision::SnapshotEntry> candidate;
+    candidate.reserve(valueCount);
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto &value = values[index];
+        const auto &layout = pipeline.bindings[index];
+        RuntimeCoreBindingRevision::SnapshotEntry entry;
+        entry.slot = value.slot;
+        entry.kind = value.kind;
+        entry.flags = value.flags;
+        if (packedUniformBytes(layout)) {
+            const auto *begin = static_cast<const uint8_t *>(value.payload.inline_value.data);
+            entry.inlineBytes.assign(begin, begin + value.payload.inline_value.size);
+        } else if ((value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
+            entry.resource = *bindingResource(value);
+            if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+                entry.stride = value.payload.buffer.stride;
         }
-        output = std::move(candidate);
-        return VERNON_STATUS_OK;
-    } catch (const std::bad_alloc &) {
-        return VERNON_STATUS_INTERNAL_ERROR;
+        candidate.push_back(std::move(entry));
     }
+    output = std::move(candidate);
+    return VERNON_STATUS_OK;
 }
 
 bool drawInvocationIsValid(const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
@@ -376,8 +432,9 @@ VernonStatus validateDrawAttachments(const VernonRuntimeCorePipeline &pipeline,
             return VERNON_STATUS_INVALID_ARGUMENT;
         Attachment attachment;
         attachment.description.struct_size = sizeof(attachment.description);
-        const VernonStatus status =
-            pipeline.provider.describe_image(pipeline.provider.user_data, view, &attachment.description);
+        const VernonStatus status = providerStatusBoundary([&] {
+            return pipeline.provider.describe_image(pipeline.provider.user_data, view, &attachment.description);
+        });
         if (status != VERNON_STATUS_OK)
             return status;
         const auto &description = attachment.description;
@@ -422,9 +479,9 @@ VernonStatus validateDrawAttachments(const VernonRuntimeCorePipeline &pipeline,
 
 } // namespace
 
-extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDeviceProvider *provider,
-                                                         const VernonRuntimeCorePipelineDescriptor *descriptor,
-                                                         VernonRuntimeCorePipeline **output) {
+VernonStatus preparePipelineImpl(const VernonRuntimeDeviceProvider *provider,
+                                 const VernonRuntimeCorePipelineDescriptor *descriptor,
+                                 VernonRuntimeCorePipeline **output) {
     if (output)
         *output = nullptr;
     if (!provider || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
@@ -445,9 +502,12 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
     const uint32_t requiredFacet = descriptor->kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE
                                        ? VERNON_RUNTIME_PROVIDER_COMPUTE
                                        : VERNON_RUNTIME_PROVIDER_GRAPHICS;
+    uint32_t capabilities{};
+    if (providerValueBoundary(capabilities, [&] { return provider->get_capabilities(provider->user_data); }) !=
+        VERNON_STATUS_OK)
+        return VERNON_STATUS_INTERNAL_ERROR;
     if ((descriptor->required_capabilities & requiredFacet) == 0 ||
-        (provider->get_capabilities(provider->user_data) & descriptor->required_capabilities) !=
-            descriptor->required_capabilities) {
+        (capabilities & descriptor->required_capabilities) != descriptor->required_capabilities) {
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     }
 
@@ -455,18 +515,17 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
     if (!pipeline)
         return VERNON_STATUS_INTERNAL_ERROR;
     pipeline->provider = *provider;
-    pipeline->identity = provider->get_device_identity(provider->user_data);
+    if (providerValueBoundary(pipeline->identity, [&] { return provider->get_device_identity(provider->user_data); }) !=
+        VERNON_STATUS_OK)
+        return VERNON_STATUS_INTERNAL_ERROR;
     pipeline->kind = descriptor->kind;
     pipeline->pushConstantSize = descriptor->push_constant_size;
-    try {
-        pipeline->bindings.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
-    } catch (const std::bad_alloc &) {
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
+    pipeline->bindings.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
 
     for (size_t index = 0; index < descriptor->shader_count; ++index) {
         VernonRuntimeProviderObject shader{};
-        const VernonStatus status = provider->prepare_shader(provider->user_data, &descriptor->shaders[index], &shader);
+        const VernonStatus status = providerStatusBoundary(
+            [&] { return provider->prepare_shader(provider->user_data, &descriptor->shaders[index], &shader); });
         if (status != VERNON_STATUS_OK || !present(shader)) {
             releasePipeline(pipeline.release());
             return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
@@ -482,7 +541,8 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
         descriptor->vertex_attribute_count,
         descriptor->push_constant_size,
         {0, 0, 0, 0}};
-    VernonStatus status = provider->prepare_pipeline_layout(provider->user_data, &layoutDescriptor, &pipeline->layout);
+    VernonStatus status = providerStatusBoundary(
+        [&] { return provider->prepare_pipeline_layout(provider->user_data, &layoutDescriptor, &pipeline->layout); });
     if (status != VERNON_STATUS_OK || !present(pipeline->layout)) {
         releasePipeline(pipeline.release());
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
@@ -508,7 +568,8 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
         descriptor->color_blends,
         descriptor->color_blend_count,
         {0, 0, 0, 0}};
-    status = provider->prepare_pipeline(provider->user_data, &providerDescriptor, &pipeline->pipeline);
+    status = providerStatusBoundary(
+        [&] { return provider->prepare_pipeline(provider->user_data, &providerDescriptor, &pipeline->pipeline); });
     if (status != VERNON_STATUS_OK || !present(pipeline->pipeline)) {
         releasePipeline(pipeline.release());
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
@@ -518,16 +579,19 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
     return VERNON_STATUS_OK;
 }
 
-extern "C" void vernonRuntimeCorePipelineDestroy(VernonRuntimeCorePipeline *pipeline) { releasePipeline(pipeline); }
+extern "C" void vernonRuntimeCorePipelineDestroy(VernonRuntimeCorePipeline *pipeline) {
+    runtimeCoreVoidBoundary([&] { releasePipeline(pipeline); });
+}
 
 extern "C" VernonRuntimeProviderDeviceIdentity
 vernonRuntimeCorePipelineGetDeviceIdentity(const VernonRuntimeCorePipeline *pipeline) {
-    return pipeline ? pipeline->identity : VernonRuntimeProviderDeviceIdentity{};
+    return runtimeCoreValueBoundary(VernonRuntimeProviderDeviceIdentity{}, [&] {
+        return pipeline ? pipeline->identity : VernonRuntimeProviderDeviceIdentity{};
+    });
 }
 
-extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipeline *pipeline,
-                                                        const VernonRuntimeProviderBindingValue *values,
-                                                        size_t valueCount, VernonRuntimeCoreBindings **output) {
+VernonStatus createBindingsImpl(VernonRuntimeCorePipeline *pipeline, const VernonRuntimeProviderBindingValue *values,
+                                size_t valueCount, VernonRuntimeCoreBindings **output) {
     if (output)
         *output = nullptr;
     if (!pipeline || !output)
@@ -552,7 +616,9 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
         return status;
     const VernonRuntimeProviderBindingSetDescriptor descriptor{
         sizeof(VernonRuntimeProviderBindingSetDescriptor), pipeline->layout, values, valueCount, {0, 0, 0, 0}};
-    status = pipeline->provider.create_binding_set(pipeline->provider.user_data, &descriptor, &revision->handle);
+    status = providerStatusBoundary([&] {
+        return pipeline->provider.create_binding_set(pipeline->provider.user_data, &descriptor, &revision->handle);
+    });
     if (status != VERNON_STATUS_OK || !present(revision->handle)) {
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
     }
@@ -562,9 +628,8 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     return VERNON_STATUS_OK;
 }
 
-extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBindings *bindings,
-                                                        const VernonRuntimeProviderBindingValue *values,
-                                                        size_t valueCount) {
+VernonStatus updateBindingsImpl(VernonRuntimeCoreBindings *bindings, const VernonRuntimeProviderBindingValue *values,
+                                size_t valueCount) {
     if (!bindings)
         return VERNON_STATUS_INVALID_ARGUMENT;
     VernonStatus status = validateImageBindings(*bindings->pipeline, values, valueCount);
@@ -596,8 +661,10 @@ extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBinding
                                                                values,
                                                                valueCount,
                                                                {0, 0, 0, 0}};
-    status = bindings->pipeline->provider.create_binding_set(bindings->pipeline->provider.user_data, &descriptor,
-                                                             &candidate->handle);
+    status = providerStatusBoundary([&] {
+        return bindings->pipeline->provider.create_binding_set(bindings->pipeline->provider.user_data, &descriptor,
+                                                               &candidate->handle);
+    });
     if (status != VERNON_STATUS_OK || !present(candidate->handle)) {
         if (status == VERNON_STATUS_OK)
             status = VERNON_STATUS_INTERNAL_ERROR;
@@ -615,21 +682,22 @@ extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBinding
 }
 
 extern "C" void vernonRuntimeCoreBindingsDestroy(VernonRuntimeCoreBindings *bindings) {
-    if (!bindings)
-        return;
-    VernonRuntimeCorePipeline *pipeline = bindings->pipeline;
-    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
-    {
-        std::lock_guard<std::mutex> guard(bindings->mutex);
-        revision = bindings->revision.take();
-    }
-    delete bindings;
-    revision.reset();
-    releasePipeline(pipeline);
+    runtimeCoreVoidBoundary([&] {
+        if (!bindings)
+            return;
+        VernonRuntimeCorePipeline *pipeline = bindings->pipeline;
+        vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+        {
+            std::lock_guard<std::mutex> guard(bindings->mutex);
+            revision = bindings->revision.take();
+        }
+        delete bindings;
+        revision.reset();
+        releasePipeline(pipeline);
+    });
 }
 
-extern "C" VernonStatus
-vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
+VernonStatus prepareGraphicsVariantImpl(VernonRuntimeCorePipeline *pipeline,
                                         const VernonRuntimeCoreGraphicsCompatibility *compatibility,
                                         VernonRuntimeCoreGraphicsVariant **output) {
     if (output)
@@ -647,24 +715,20 @@ vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
     if (!variant)
         return VERNON_STATUS_INTERNAL_ERROR;
     vernon::runtime::GraphicsVariantKey key;
-    try {
-        key.topology = compatibility->topology;
-        if (compatibility->color_format_count)
-            key.colorFormats.assign(compatibility->color_formats,
-                                    compatibility->color_formats + compatibility->color_format_count);
-        key.depthStencilFormat = compatibility->depth_stencil_format;
-        key.sampleCount = compatibility->sample_count;
-        if (compatibility->vertex_stride_count)
-            key.vertexStrides.assign(compatibility->vertex_strides,
-                                     compatibility->vertex_strides + compatibility->vertex_stride_count);
-        key.rasterization = compatibility->rasterization;
-        key.depthStencil = compatibility->depth_stencil;
-        if (compatibility->color_blend_count)
-            key.colorBlends.assign(compatibility->color_blends,
-                                   compatibility->color_blends + compatibility->color_blend_count);
-    } catch (const std::bad_alloc &) {
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
+    key.topology = compatibility->topology;
+    if (compatibility->color_format_count)
+        key.colorFormats.assign(compatibility->color_formats,
+                                compatibility->color_formats + compatibility->color_format_count);
+    key.depthStencilFormat = compatibility->depth_stencil_format;
+    key.sampleCount = compatibility->sample_count;
+    if (compatibility->vertex_stride_count)
+        key.vertexStrides.assign(compatibility->vertex_strides,
+                                 compatibility->vertex_strides + compatibility->vertex_stride_count);
+    key.rasterization = compatibility->rasterization;
+    key.depthStencil = compatibility->depth_stencil;
+    if (compatibility->color_blend_count)
+        key.colorBlends.assign(compatibility->color_blends,
+                               compatibility->color_blends + compatibility->color_blend_count);
     {
         std::lock_guard<std::mutex> guard(pipeline->graphicsCacheMutex);
         const auto cached = pipeline->graphicsCache.find(key);
@@ -697,24 +761,19 @@ vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
                                                              compatibility->color_blend_count,
                                                              {0, 0, 0, 0}};
     VernonRuntimeProviderObject prepared{};
-    const VernonStatus status =
-        pipeline->provider.prepare_pipeline(pipeline->provider.user_data, &descriptor, &prepared);
+    const VernonStatus status = providerStatusBoundary(
+        [&] { return pipeline->provider.prepare_pipeline(pipeline->provider.user_data, &descriptor, &prepared); });
     if (status != VERNON_STATUS_OK || !present(prepared)) {
         if (present(prepared))
-            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
+            providerVoidBoundary([&] { pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared); });
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
     }
     {
         std::lock_guard<std::mutex> guard(pipeline->graphicsCacheMutex);
-        try {
-            const auto [cached, inserted] = pipeline->graphicsCache.emplace(std::move(key), prepared);
-            if (!inserted) {
-                pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
-                prepared = cached->second;
-            }
-        } catch (const std::bad_alloc &) {
-            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
-            return VERNON_STATUS_INTERNAL_ERROR;
+        const auto [cached, inserted] = pipeline->graphicsCache.emplace(std::move(key), prepared);
+        if (!inserted) {
+            providerVoidBoundary([&] { pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared); });
+            prepared = cached->second;
         }
     }
     variant->pipeline = pipeline;
@@ -725,18 +784,18 @@ vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
 }
 
 extern "C" void vernonRuntimeCoreGraphicsVariantDestroy(VernonRuntimeCoreGraphicsVariant *variant) {
-    if (!variant)
-        return;
-    VernonRuntimeCorePipeline *pipeline = variant->pipeline;
-    delete variant;
-    releasePipeline(pipeline);
+    runtimeCoreVoidBoundary([&] {
+        if (!variant)
+            return;
+        VernonRuntimeCorePipeline *pipeline = variant->pipeline;
+        delete variant;
+        releasePipeline(pipeline);
+    });
 }
 
-extern "C" VernonStatus vernonRuntimeCoreEncodeDispatch(const VernonRuntimeCorePipeline *pipeline,
-                                                        const VernonRuntimeCoreBindings *bindings,
-                                                        VernonRuntimeProviderObject commandEncoder,
-                                                        const uint32_t groupCount[3], const void *pushConstants,
-                                                        size_t pushConstantSize) {
+VernonStatus encodeDispatchImpl(const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
+                                VernonRuntimeProviderObject commandEncoder, const uint32_t groupCount[3],
+                                const void *pushConstants, size_t pushConstantSize) {
     if (!pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE || !groupCount || groupCount[0] == 0 ||
         groupCount[1] == 0 || groupCount[2] == 0 || (bindings && bindings->pipeline != pipeline) ||
         pushConstantSize > pipeline->pushConstantSize || (pushConstantSize != 0 && !pushConstants))
@@ -757,12 +816,13 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDispatch(const VernonRuntimeCoreP
                                                              pushConstants,
                                                              pushConstantSize,
                                                              {0, 0, 0, 0}};
-    return pipeline->provider.encode_dispatch(pipeline->provider.user_data, commandEncoder, &descriptor);
+    return providerStatusBoundary(
+        [&] { return pipeline->provider.encode_dispatch(pipeline->provider.user_data, commandEncoder, &descriptor); });
 }
 
-extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntimeCorePipeline *pipeline,
-                                                              const VernonRuntimeCoreBindings *bindings,
-                                                              const VernonRuntimeCoreDrawInvocation *invocation) {
+VernonStatus encodeDrawInvocationImpl(const VernonRuntimeCorePipeline *pipeline,
+                                      const VernonRuntimeCoreBindings *bindings,
+                                      const VernonRuntimeCoreDrawInvocation *invocation) {
     if (!drawInvocationIsValid(pipeline, bindings, invocation))
         return VERNON_STATUS_INVALID_ARGUMENT;
     const VernonStatus attachmentStatus = validateDrawAttachments(*pipeline, *invocation);
@@ -802,11 +862,12 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->stencil_reference,
         {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
          invocation->render_area[3]}};
-    return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
+    return providerStatusBoundary([&] {
+        return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
+    });
 }
 
-extern "C" VernonStatus
-vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGraphicsVariant *variant,
+VernonStatus encodeGraphicsVariantDrawInvocationImpl(const VernonRuntimeCoreGraphicsVariant *variant,
                                                      const VernonRuntimeCoreBindings *bindings,
                                                      const VernonRuntimeCoreDrawInvocation *invocation) {
     const VernonRuntimeCorePipeline *pipeline = variant ? variant->pipeline : nullptr;
@@ -849,5 +910,55 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->stencil_reference,
         {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
          invocation->render_area[3]}};
-    return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
+    return providerStatusBoundary([&] {
+        return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
+    });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDeviceProvider *provider,
+                                                         const VernonRuntimeCorePipelineDescriptor *descriptor,
+                                                         VernonRuntimeCorePipeline **output) {
+    return runtimeCoreBoundary([&] { return preparePipelineImpl(provider, descriptor, output); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipeline *pipeline,
+                                                        const VernonRuntimeProviderBindingValue *values,
+                                                        size_t valueCount, VernonRuntimeCoreBindings **output) {
+    return runtimeCoreBoundary([&] { return createBindingsImpl(pipeline, values, valueCount, output); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBindings *bindings,
+                                                        const VernonRuntimeProviderBindingValue *values,
+                                                        size_t valueCount) {
+    return runtimeCoreBoundary([&] { return updateBindingsImpl(bindings, values, valueCount); });
+}
+
+extern "C" VernonStatus
+vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
+                                        const VernonRuntimeCoreGraphicsCompatibility *compatibility,
+                                        VernonRuntimeCoreGraphicsVariant **output) {
+    return runtimeCoreBoundary([&] { return prepareGraphicsVariantImpl(pipeline, compatibility, output); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreEncodeDispatch(const VernonRuntimeCorePipeline *pipeline,
+                                                        const VernonRuntimeCoreBindings *bindings,
+                                                        VernonRuntimeProviderObject commandEncoder,
+                                                        const uint32_t groupCount[3], const void *pushConstants,
+                                                        size_t pushConstantSize) {
+    return runtimeCoreBoundary([&] {
+        return encodeDispatchImpl(pipeline, bindings, commandEncoder, groupCount, pushConstants, pushConstantSize);
+    });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntimeCorePipeline *pipeline,
+                                                              const VernonRuntimeCoreBindings *bindings,
+                                                              const VernonRuntimeCoreDrawInvocation *invocation) {
+    return runtimeCoreBoundary([&] { return encodeDrawInvocationImpl(pipeline, bindings, invocation); });
+}
+
+extern "C" VernonStatus
+vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGraphicsVariant *variant,
+                                                     const VernonRuntimeCoreBindings *bindings,
+                                                     const VernonRuntimeCoreDrawInvocation *invocation) {
+    return runtimeCoreBoundary([&] { return encodeGraphicsVariantDrawInvocationImpl(variant, bindings, invocation); });
 }

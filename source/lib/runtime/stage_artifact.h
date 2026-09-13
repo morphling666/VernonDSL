@@ -1,6 +1,7 @@
 #ifndef VERNON_RUNTIME_STAGE_ARTIFACT_H
 #define VERNON_RUNTIME_STAGE_ARTIFACT_H
 
+#include "VernonResult.hpp"
 #include "VernonRuntime.h"
 #include "pipeline_metadata.h"
 
@@ -55,12 +56,30 @@ struct LoadedStageArtifact {
     std::vector<TensorViewWriteFootprint> writeFootprints;
 };
 
-bool validateProgramBundleHash(const nlohmann::json &root, bool required, std::string &error);
-bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
-                                    std::string &error);
+enum class StageArtifactError : uint8_t {
+    MissingContentHash,
+    InvalidContentHash,
+    ContentHashMismatch,
+    UnsupportedCpuTarget,
+    InvalidCpuArtifact,
+    InvalidCpuArtifactPath,
+    InvalidReflection,
+    InvalidBundleDirectory,
+    CpuArtifactIntegrityMismatch,
+};
 
-bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem::path &libraryPath,
-                              ReflectedEntry *reflection, std::string &error);
+template <typename T> using StageArtifactResult = vernon::Result<T, StageArtifactError>;
+
+struct ResolvedCpuNativeArtifact {
+    std::filesystem::path libraryPath;
+    ReflectedEntry reflection;
+};
+
+StageArtifactResult<void> validateProgramBundleHash(const nlohmann::json &root, bool required);
+StageArtifactResult<void> validateCpuRuntimeRequirements(const std::string &targetTriple,
+                                                         const std::string &objectFormat);
+StageArtifactResult<ResolvedCpuNativeArtifact> resolveCpuNativeArtifact(const CpuNativeArtifact &artifact);
+std::string renderStageArtifactError(StageArtifactError error, const CpuNativeArtifact *artifact = nullptr);
 
 } // namespace vernon::runtime
 

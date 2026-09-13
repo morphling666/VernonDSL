@@ -27,7 +27,7 @@ struct Sampler {
 
 struct VERNON_RHI_CAPI DeviceState {
     bool initialize(const VernonOpenGLContextCallbacks &callbacks, bool embeddedProfile, std::string &error);
-    void makeCurrent() const;
+    bool makeCurrent() const noexcept;
     bool supportsCompute() const;
 
     bool createBuffer(Buffer &buffer, size_t size, std::string &error);

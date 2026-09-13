@@ -137,10 +137,14 @@ bool tapeLaneCount(const program::Program &execution, const program::ResolvedExe
                 continue;
             const program::ComputeOperation &compute = program::computeOperation(node);
             for (int axis = 0; axis < 3; ++axis) {
-                uint64_t resolvedGroups = 0;
-                if (!resolveProgramControl(execution, hosts, compute.workgroups[axis], resolvedGroups, error) ||
-                    !resolvedGroups || resolvedGroups > std::numeric_limits<size_t>::max())
-                    return error = error.empty() ? "Program autodiff tape dispatch control is invalid" : error, false;
+                auto resolved = resolveProgramControl(execution, hosts, compute.workgroups[axis]);
+                if (resolved.isErr()) {
+                    error = programInvocationErrorMessage(resolved.error());
+                    return false;
+                }
+                const uint64_t resolvedGroups = resolved.value();
+                if (!resolvedGroups || resolvedGroups > std::numeric_limits<size_t>::max())
+                    return error = "Program autodiff tape dispatch control is invalid", false;
                 const size_t groups = static_cast<size_t>(resolvedGroups);
                 const size_t wg = workgroup[axis] ? workgroup[axis] : 1;
                 if (groups > std::numeric_limits<size_t>::max() / wg ||
@@ -170,7 +174,25 @@ bool attachTape(const program::Program &execution, const program::ResolvedExecut
         if (!tapeLaneCount(execution, topology, hosts, slot.id, lanes, error) ||
             !tapePayloadStride(slot.type, stride, error))
             return false;
-        batch = HostStaticTapeBatch::create(lanes, stride, policy->invocationLimit(), policy, nullptr);
+        auto created = HostStaticTapeBatch::create(lanes, stride, policy->invocationLimit(), policy, nullptr);
+        if (created.isErr()) {
+            switch (created.error()) {
+            case HostTapeError::InvalidArgument:
+                error = "Program autodiff tape configuration is invalid";
+                break;
+            case HostTapeError::ArithmeticOverflow:
+                error = "Program autodiff tape allocation size overflows";
+                break;
+            case HostTapeError::BudgetExceeded:
+                error = "Program autodiff tape exceeds its memory budget";
+                break;
+            case HostTapeError::InvalidState:
+                error = "Program autodiff tape is in an invalid state";
+                break;
+            }
+            return false;
+        }
+        batch = std::move(created).value();
     }
     return fillProgramTapeHostValue(value, std::move(batch), tapeScratch, slot.id, error);
 }

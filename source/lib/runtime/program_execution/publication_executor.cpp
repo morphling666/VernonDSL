@@ -40,15 +40,17 @@ VernonStatus executePublicationCommit(VernonRuntimeContext &context, Publication
                                       const ProgramInvocationState &state, std::string &error) {
     std::vector<DeviceBufferCopy> buffers;
     std::vector<DeviceImageCopy> images;
-    VernonStatus status = transaction.prepareCommit(state, buffers, images, error);
-    if (status != VERNON_STATUS_OK)
-        return status;
+    auto prepared = transaction.prepareCommit(state, buffers, images);
+    if (prepared.isErr()) {
+        error = publicationErrorMessage(prepared.error());
+        return publicationErrorStatus(prepared.error());
+    }
     if (injectFailure(FailureBoundary::Submission)) {
         transaction.rollback();
         return fail(context, "publication submission failed before destination mutation");
     }
     SubmissionState submission;
-    status = executeCopies(context, buffers, images, error, submission);
+    VernonStatus status = executeCopies(context, buffers, images, error, submission);
     transaction.noteSubmission(submission);
     if (status != VERNON_STATUS_OK) {
         if (submission == SubmissionState::Indeterminate)
@@ -59,7 +61,12 @@ VernonStatus executePublicationCommit(VernonRuntimeContext &context, Publication
             error = invocationDiagnostic(context);
         return status;
     }
-    return transaction.completeCommit(error);
+    auto committed = transaction.completeCommit();
+    if (committed.isErr()) {
+        error = publicationErrorMessage(committed.error());
+        return publicationErrorStatus(committed.error());
+    }
+    return VERNON_STATUS_OK;
 }
 
 } // namespace vernon::runtime::program_execution

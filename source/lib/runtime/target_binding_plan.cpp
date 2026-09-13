@@ -102,7 +102,10 @@ std::optional<VernonDataType> dataType(const std::string &dtype) { return pipeli
 
 uint64_t scalarByteSize(const std::string &dtype) {
     const std::optional<VernonDataType> type = dataType(dtype);
-    return type ? dataTypeSize(*type) : 0;
+    if (!type)
+        return 0;
+    auto size = dataTypeSize(*type);
+    return size.isOk() ? size.value() : 0;
 }
 
 std::optional<program::ValueLayout> elementValueLayout(const Value &value, const ReflectedEndpoint &endpoint,

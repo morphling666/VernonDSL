@@ -3,6 +3,7 @@
 
 #include "VernonProgramPlanTypes.h"
 #include "VernonProgramSemanticTypes.h"
+#include "VernonResult.hpp"
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
@@ -542,10 +543,18 @@ struct ResolvedProgram {
     std::vector<ResolvedGraph> graphs;
 };
 
-bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic);
-bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs, const nlohmann::json &value,
-                         ArtifactSystem &artifacts, Diagnostic &diagnostic);
-bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &resolved, Diagnostic &diagnostic);
+enum class ManifestError : uint8_t {
+    InvalidProgram,
+    InvalidArtifactSystem,
+    ResolutionFailed,
+};
+
+template <typename T> using ManifestResult = vernon::Result<T, ManifestError>;
+
+ManifestResult<Program> parse(const nlohmann::json &value, Diagnostic &diagnostic);
+ManifestResult<ArtifactSystem> parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs,
+                                                   const nlohmann::json &value, Diagnostic &diagnostic);
+ManifestResult<ResolvedProgram> resolve(Program program, const ArtifactSystem &artifacts, Diagnostic &diagnostic);
 const Graph *findGraph(const Program &program, std::string_view direction);
 std::vector<uint32_t> residualCaptures(const Program &program);
 void markGraphValues(const Graph &graph, std::vector<char> &live);

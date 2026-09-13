@@ -310,14 +310,17 @@ TEST(VulkanNativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
     for (VernonRhiBuffer &buffer : buffers)
         ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
 
-    const uint64_t firstResource = vernon::rhi::bufferResource(device, buffers.front());
-    ASSERT_NE(firstResource, 0u);
+    auto firstResourceResult = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_TRUE(firstResourceResult.isOk());
+    const uint64_t firstResource = firstResourceResult.value();
     for (size_t index = 0; index < 64; ++index) {
         VernonRhiBuffer extra{};
         ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &extra), VERNON_RHI_STATUS_OK);
         buffers.push_back(extra);
     }
-    EXPECT_EQ(vernon::rhi::bufferResource(device, buffers.front()), firstResource);
+    auto stableResource = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_TRUE(stableResource.isOk());
+    EXPECT_EQ(stableResource.value(), firstResource);
 
     for (VernonRhiBuffer buffer : buffers)
         EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);

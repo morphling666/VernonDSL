@@ -99,8 +99,12 @@ bool prepareProgramTapeStates(program_execution::ProgramInvocationState &frame, 
             const program::ComputeOperation &compute = program::computeOperation(node);
             uint64_t grid[3]{};
             for (size_t axis = 0; axis < 3; ++axis) {
-                if (!frame.resolveControl(execution, compute.workgroups[axis], grid[axis], error))
+                auto resolved = frame.resolveControl(execution, compute.workgroups[axis]);
+                if (resolved.isErr()) {
+                    error = program_execution::programInvocationErrorMessage(resolved.error());
                     return false;
+                }
+                grid[axis] = resolved.value();
                 if (!grid[axis] || grid[axis] > std::numeric_limits<uint32_t>::max())
                     return error = "Program tape dispatch control resolved outside the launch range", false;
             }

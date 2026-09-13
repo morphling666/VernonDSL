@@ -30,6 +30,18 @@ typedef struct VernonSubmission VernonSubmission;
 typedef struct VernonProgramInstance VernonProgramInstance;
 typedef struct VernonProgramInvocation VernonProgramInvocation;
 
+typedef enum VernonRuntimeOperationStatus {
+    VERNON_RUNTIME_OPERATION_OK = 0,
+    VERNON_RUNTIME_OPERATION_INVALID_ARGUMENT = 1,
+    VERNON_RUNTIME_OPERATION_PARSE_FAILURE = 2,
+    VERNON_RUNTIME_OPERATION_VERIFICATION_FAILURE = 3,
+    VERNON_RUNTIME_OPERATION_UNSUPPORTED = 4,
+    VERNON_RUNTIME_OPERATION_RESOURCE_EXHAUSTED = 5,
+    VERNON_RUNTIME_OPERATION_RHI_FAILURE = 6,
+    VERNON_RUNTIME_OPERATION_LIFECYCLE_FAILURE = 7,
+    VERNON_RUNTIME_OPERATION_INTERNAL_FAILURE = 8
+} VernonRuntimeOperationStatus;
+
 typedef enum VernonSubmissionState {
     VERNON_SUBMISSION_PENDING = 0,
     VERNON_SUBMISSION_SUCCEEDED = 1,
@@ -463,9 +475,14 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramBundleInspectTarget(const v
 VERNON_RUNTIME_CAPI VernonProgramBundle *
 vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
                                           const VernonProgramBundleLoadOptions *options);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeLoadProgramBundleWithOptionsResult(
+    VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
+    const VernonProgramBundleLoadOptions *options, VernonProgramBundle **output);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramBundleGetId(const VernonProgramBundle *bundle);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramBundleDestroy(VernonProgramBundle *bundle);
 VERNON_RUNTIME_CAPI VernonProgramGraph *vernonRuntimeProgramGraphCreate(VernonRuntimeContext *context);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeProgramGraphCreateResult(VernonRuntimeContext *context,
+                                                                                       VernonProgramGraph **output);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph,
                                                                      const VernonProgramBundle *bundle,
@@ -496,8 +513,12 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphExportStorage(VernonPr
                                                                         const VernonProgramGraphStorage *storage,
                                                                         VernonStringView graph_name);
 VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus
+vernonRuntimeResolveProgramGraphResult(VernonProgramGraph *graph, VernonProgramExecutable **output);
 VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
                                                                          const VernonProgramVariantSelector *selector);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeResolveProgramResult(
+    VernonProgramBundle *bundle, const VernonProgramVariantSelector *selector, VernonProgramExecutable **output);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);
@@ -549,9 +570,13 @@ VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetGraphicsNodeCount(co
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramGraphicsControlsView *output);
 VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus
+vernonRuntimeProgramInstanceCreateResult(VernonProgramExecutable *pipeline, VernonProgramInstance **output);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
 VERNON_RUNTIME_CAPI VernonProgramInvocation *
 vernonRuntimeProgramInstanceBeginInvocation(VernonProgramInstance *instance);
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus
+vernonRuntimeProgramInstanceBeginInvocationResult(VernonProgramInstance *instance, VernonProgramInvocation **output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationSetAutodiffOptions(
     VernonProgramInvocation *invocation, const VernonProgramAutodiffInvocationOptions *options);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationTryReuse(VernonProgramInvocation *invocation,

@@ -20,7 +20,7 @@ ProgramInvocationState::ProgramInvocationState(const program::ResolvedExecutionP
     }
 }
 
-ProgramInvocationState::~ProgramInvocationState() {
+ProgramInvocationState::~ProgramInvocationState() noexcept {
     if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         return;
     for (auto image = ownedImages_.rbegin(); image != ownedImages_.rend(); ++image) {
@@ -42,11 +42,11 @@ ProgramInvocationState::ProgramInvocationState(ProgramInvocationState &&other) n
         rebindDescriptor(static_cast<uint32_t>(value));
 }
 
-CanonicalValueSnapshot ProgramInvocationState::snapshotValue(uint32_t value) const {
+vernon::Option<CanonicalValueSnapshot> ProgramInvocationState::snapshotValue(uint32_t value) const {
+    if (value >= values_.size())
+        return {};
     CanonicalValueSnapshot snapshot;
     snapshot.value = value;
-    if (value >= values_.size())
-        return snapshot;
     snapshot.logical = values_[value];
     if (!snapshot.logical.ownedHostBytes.empty() && snapshot.logical.argument.kind == VERNON_PROGRAM_TENSOR)
         snapshot.logical.argument.tensor.host_data = snapshot.logical.ownedHostBytes.data();
@@ -69,12 +69,12 @@ CanonicalValueSnapshot ProgramInvocationState::snapshotValue(uint32_t value) con
             snapshot.logical.stagedDeviceInitial = std::move(initial);
         }
     }
-    return snapshot;
+    return vernon::Option<CanonicalValueSnapshot>{vernon::some(std::move(snapshot))};
 }
 
-bool ProgramInvocationState::importSnapshot(const CanonicalValueSnapshot &snapshot, std::string &error) {
+ProgramInvocationResult<void> ProgramInvocationState::importSnapshot(const CanonicalValueSnapshot &snapshot) {
     if (snapshot.value >= values_.size())
-        return error = "retained Value snapshot exceeds invocation state", false;
+        return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::SnapshotValueUnavailable)};
     const uint32_t value = snapshot.value;
     values_[value] = snapshot.logical;
     if (!values_[value].ownedHostBytes.empty() && values_[value].argument.kind == VERNON_PROGRAM_TENSOR)
@@ -86,33 +86,18 @@ bool ProgramInvocationState::importSnapshot(const CanonicalValueSnapshot &snapsh
         arguments_[value] = snapshot.residentArgument;
     }
     rebindDescriptor(value);
-    return true;
+    return ProgramInvocationResult<void>{vernon::ok()};
 }
 
-bool ProgramInvocationState::importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots,
-                                                    std::string &error) {
+ProgramInvocationResult<void>
+ProgramInvocationState::importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots) {
     for (const auto &[storage, snapshot] : snapshots) {
         const auto current = storageBackings_.find(storage);
         if (current == storageBackings_.end())
-            return error = "retained Storage snapshot is absent from apply invocation", false;
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::SnapshotStorageUnavailable)};
         current->second = snapshot;
     }
-    return true;
-}
-
-bool ProgramInvocationState::restoreDeviceValuesFromHost(program::GraphDirection graph, std::string &error) {
-    std::vector<const DeviceBuffer *> restored;
-    for (size_t value = 0; value < arguments_.size(); ++value) {
-        if (!plan_->requiresDevice(graph, static_cast<uint32_t>(value)) || !deviceValues_[value] ||
-            std::find(restored.begin(), restored.end(), deviceValues_[value].get()) != restored.end())
-            continue;
-        const VernonTensorView &host = values_[value].argument.tensor;
-        if (!host.host_data || host.byte_offset || host.byte_size != deviceValues_[value]->size() ||
-            !deviceValues_[value]->upload(host.host_data, host.byte_size))
-            return error = "Program invocation cannot restore planned device Storage", false;
-        restored.push_back(deviceValues_[value].get());
-    }
-    return true;
+    return ProgramInvocationResult<void>{vernon::ok()};
 }
 
 void ProgramInvocationState::retainOnly(const std::vector<char> &retained) {
@@ -158,21 +143,28 @@ void ProgramInvocationState::rebindDescriptor(uint32_t value) {
     }
 }
 
-bool resolveProgramControl(const program::Program &program, const std::vector<ProgramValueState> &values,
-                           const program::ControlComponent &control, uint64_t &value, std::string &error) {
-    if (control.kind == program::ControlKind::Static) {
-        value = control.value;
-        return true;
-    }
+ProgramInvocationResult<uint64_t> resolveProgramControl(const program::Program &program,
+                                                        const std::vector<ProgramValueState> &values,
+                                                        const program::ControlComponent &control) {
+    if (control.kind == program::ControlKind::Static)
+        return ProgramInvocationResult<uint64_t>{vernon::ok(control.value)};
     const uint32_t valueId = control.reference;
-    if (valueId >= values.size())
-        return error = "Program dispatch control references an unavailable Value", false;
+    if (valueId >= values.size() || valueId >= program.values.size())
+        return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueUnavailable)};
     const VernonProgramArgument &argument = values[valueId].argument;
     if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
         !argument.tensor.host_data || argument.tensor.byte_offset > argument.tensor.byte_size)
-        return error = "Program dispatch control is not a retained host scalar", false;
-    const uint8_t *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
+        return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueUnavailable)};
     const std::string &dtype = program.values[valueId].canonicalType.dtype;
+    const bool scalar32 = dtype == "u32" || dtype == "ui32" || dtype == "i32" || dtype == "si32";
+    const bool scalar64 = dtype == "u64" || dtype == "ui64" || dtype == "i64" || dtype == "si64" || dtype == "index";
+    if (!scalar32 && !scalar64)
+        return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueInvalid)};
+    const size_t scalarSize = scalar32 ? sizeof(uint32_t) : sizeof(uint64_t);
+    if (scalarSize > argument.tensor.byte_size - argument.tensor.byte_offset)
+        return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueUnavailable)};
+    const uint8_t *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
+    uint64_t value{};
     if (dtype == "u32" || dtype == "ui32") {
         uint32_t scalar{};
         std::memcpy(&scalar, data, sizeof(scalar));
@@ -181,7 +173,7 @@ bool resolveProgramControl(const program::Program &program, const std::vector<Pr
         int32_t scalar{};
         std::memcpy(&scalar, data, sizeof(scalar));
         if (scalar < 0)
-            return error = "Program dispatch control must be non-negative", false;
+            return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueInvalid)};
         value = static_cast<uint64_t>(scalar);
     } else if (dtype == "u64" || dtype == "ui64" || dtype == "index") {
         std::memcpy(&value, data, sizeof(value));
@@ -189,50 +181,54 @@ bool resolveProgramControl(const program::Program &program, const std::vector<Pr
         int64_t scalar{};
         std::memcpy(&scalar, data, sizeof(scalar));
         if (scalar < 0)
-            return error = "Program dispatch control must be non-negative", false;
+            return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueInvalid)};
         value = static_cast<uint64_t>(scalar);
     } else {
-        return error = "Program dispatch control must be an integer scalar", false;
+        return ProgramInvocationResult<uint64_t>{vernon::err(ProgramInvocationError::ControlValueInvalid)};
     }
-    return true;
+    return ProgramInvocationResult<uint64_t>{vernon::ok(value)};
 }
 
-bool ProgramInvocationState::resolveControl(const program::Program &program, const program::ControlComponent &control,
-                                            uint64_t &value, std::string &error) const {
-    return resolveProgramControl(program, values_, control, value, error);
+ProgramInvocationResult<uint64_t>
+ProgramInvocationState::resolveControl(const program::Program &program,
+                                       const program::ControlComponent &control) const {
+    return resolveProgramControl(program, values_, control);
 }
 
-bool ProgramInvocationState::bindControlImageStorage(VernonRuntimeContext &context, const program::Program &program,
-                                                     uint32_t storage, VernonRuntimeProviderResourceReference view,
-                                                     std::string &error) {
+ProgramInvocationResult<void>
+ProgramInvocationState::bindControlImageStorage(VernonRuntimeContext &context, const program::Program &program,
+                                                uint32_t storage, VernonRuntimeProviderResourceReference view) {
     if (!view.identity || !view.resource.value)
-        return error = "Program attachment Storage has no runtime image view", false;
+        return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageInvalid)};
     if (storage >= program.storages.size())
-        return error = "Program attachment references unknown Storage", false;
+        return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageInvalid)};
     const auto [binding, inserted] = controlImages_.emplace(storage, view);
     if (!inserted && binding->second.identity != view.identity)
-        return error = "Program Storage has multiple runtime image views", false;
+        return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageConflict)};
     if (!inserted)
-        return true;
+        return ProgramInvocationResult<void>{vernon::ok()};
     BoundProgramImage descriptor;
+    std::string error;
     if (!resolveBorrowedProgramImage(context, program.storages[storage], view, descriptor, error)) {
         controlImages_.erase(storage);
-        return false;
+        return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageResolutionFailed)};
     }
     controlImageDescriptors_.emplace(storage, std::move(descriptor));
-    return true;
+    return ProgramInvocationResult<void>{vernon::ok()};
 }
 
-bool ProgramInvocationState::allocateOwnedImageStorages(VernonRuntimeContext &context, const program::Program &program,
-                                                        std::string &error) {
+ProgramInvocationResult<void> ProgramInvocationState::allocateOwnedImageStorages(VernonRuntimeContext &context,
+                                                                                 const program::Program &program) {
     imageDevice_ = context.rhiDevice;
-    if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX)
-        return std::none_of(program.storages.begin(), program.storages.end(),
-                            [](const program::Storage &storage) {
-                                return storage.ownership == program::StorageOwnership::Owned &&
-                                       storage.descriptorKind == program::StorageDescriptorKind::Image;
-                            }) ||
-               (error = "owned Program image Storage requires an RHI device", false);
+    if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
+        if (std::any_of(program.storages.begin(), program.storages.end(), [](const program::Storage &storage) {
+                return storage.ownership == program::StorageOwnership::Owned &&
+                       storage.descriptorKind == program::StorageDescriptorKind::Image;
+            }))
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageInvalid)};
+        else
+            return ProgramInvocationResult<void>{vernon::ok()};
+    }
     for (const program::Storage &storage : program.storages) {
         if (storage.ownership != program::StorageOwnership::Owned ||
             storage.descriptorKind != program::StorageDescriptorKind::Image)
@@ -240,22 +236,24 @@ bool ProgramInvocationState::allocateOwnedImageStorages(VernonRuntimeContext &co
         std::array<uint32_t, 3> extent{};
         for (size_t axis = 0; axis < extent.size(); ++axis) {
             uint64_t component = axis < storage.image.extent.size() ? storage.image.extent[axis] : 0;
-            if (!storage.image.extentControls.empty() &&
-                !resolveControl(program, storage.image.extentControls[axis], component, error))
-                return error = "owned Program image extent axis " + std::to_string(axis) + " failed: " + error, false;
+            if (!storage.image.extentControls.empty()) {
+                auto resolved = resolveControl(program, storage.image.extentControls[axis]);
+                if (resolved.isErr())
+                    return ProgramInvocationResult<void>{vernon::err(resolved.error())};
+                component = resolved.value();
+            }
             if (!component || component > std::numeric_limits<uint32_t>::max())
-                return error =
-                           "owned Program image extent axis " + std::to_string(axis) + " must be in [1, UINT32_MAX]",
-                       false;
+                return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ControlValueInvalid)};
             extent[axis] = static_cast<uint32_t>(component);
         }
         VernonRhiImageDescriptor imageDescriptor{};
+        std::string error;
         if (!materializeOwnedProgramImageDescriptor(storage, extent, imageDescriptor, error))
-            return false;
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageResolutionFailed)};
         OwnedImageStorage owned{{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0},
                                 {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}};
         if (vernonRhiDeviceCreateImage(imageDevice_, &imageDescriptor, &owned.image) != VERNON_RHI_STATUS_OK)
-            return error = "cannot allocate owned Program image Storage", false;
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageAllocationFailed)};
         VernonRhiImageViewDescriptor viewDescriptor{};
         viewDescriptor.struct_size = sizeof(viewDescriptor);
         viewDescriptor.image = owned.image;
@@ -270,42 +268,80 @@ bool ProgramInvocationState::allocateOwnedImageStorages(VernonRuntimeContext &co
                                                             : 0;
         if (vernonRhiDeviceCreateImageView(imageDevice_, &viewDescriptor, &owned.view) != VERNON_RHI_STATUS_OK) {
             vernonRhiDeviceDestroyImage(imageDevice_, owned.image);
-            return error = "cannot create owned Program image view", false;
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageAllocationFailed)};
         }
         VernonRuntimeProviderResourceReference reference{};
         if (vernonRuntimeReferenceRhiImageView(&context, owned.view, &reference) != VERNON_STATUS_OK) {
             vernonRhiDeviceDestroyImageView(imageDevice_, owned.view);
             vernonRhiDeviceDestroyImage(imageDevice_, owned.image);
-            return error = "cannot reference owned Program image view", false;
+            return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageResolutionFailed)};
         }
         ownedImages_.push_back(owned);
         controlImages_.emplace(storage.id, reference);
     }
-    return true;
+    return ProgramInvocationResult<void>{vernon::ok()};
 }
 
-const VernonRuntimeProviderResourceReference *ProgramInvocationState::controlImage(uint32_t storage) const {
+const char *programInvocationErrorMessage(ProgramInvocationError error) noexcept {
+    switch (error) {
+    case ProgramInvocationError::SnapshotValueUnavailable:
+        return "retained Value snapshot exceeds invocation state";
+    case ProgramInvocationError::SnapshotStorageUnavailable:
+        return "retained Storage snapshot is absent from apply invocation";
+    case ProgramInvocationError::DeviceRestoreFailed:
+        return "Program invocation cannot restore planned device Storage";
+    case ProgramInvocationError::ControlValueUnavailable:
+        return "Program dispatch control is not an available retained host scalar";
+    case ProgramInvocationError::ControlValueInvalid:
+        return "Program dispatch control must be a non-negative integer scalar";
+    case ProgramInvocationError::ImageStorageInvalid:
+        return "Program image Storage is invalid for this invocation";
+    case ProgramInvocationError::ImageStorageConflict:
+        return "Program Storage has multiple runtime image views";
+    case ProgramInvocationError::ImageStorageResolutionFailed:
+        return "Program image Storage cannot be resolved";
+    case ProgramInvocationError::ImageStorageAllocationFailed:
+        return "Program image Storage allocation failed";
+    }
+    return "unknown Program invocation error";
+}
+
+vernon::Option<std::reference_wrapper<const VernonRuntimeProviderResourceReference>>
+ProgramInvocationState::controlImage(uint32_t storage) const {
     const auto found = controlImages_.find(storage);
-    return found == controlImages_.end() ? nullptr : &found->second;
+    if (found == controlImages_.end())
+        return {};
+    return vernon::Option<std::reference_wrapper<const VernonRuntimeProviderResourceReference>>{
+        vernon::some(std::cref(found->second))};
 }
 
-const VernonProgramArgument *ProgramInvocationState::externalStorage(uint32_t storage) const {
+vernon::Option<std::reference_wrapper<const VernonProgramArgument>>
+ProgramInvocationState::externalStorage(uint32_t storage) const {
     const auto found = storageBackings_.find(storage);
-    return found != storageBackings_.end() && found->second.external ? &*found->second.external : nullptr;
+    if (found == storageBackings_.end() || !found->second.external)
+        return {};
+    return vernon::Option<std::reference_wrapper<const VernonProgramArgument>>{
+        vernon::some(std::cref(*found->second.external))};
 }
 
-const VernonProgramArgument *ProgramInvocationState::argument(uint32_t value) const {
-    return value < arguments_.size() ? &arguments_[value] : nullptr;
+vernon::Option<std::reference_wrapper<const VernonProgramArgument>>
+ProgramInvocationState::argument(uint32_t value) const {
+    if (value >= arguments_.size())
+        return {};
+    return vernon::Option<std::reference_wrapper<const VernonProgramArgument>>{
+        vernon::some(std::cref(arguments_[value]))};
 }
 
-VernonProgramArgument *ProgramInvocationState::argument(uint32_t value) {
-    return const_cast<VernonProgramArgument *>(static_cast<const ProgramInvocationState &>(*this).argument(value));
+vernon::Option<std::reference_wrapper<VernonProgramArgument>> ProgramInvocationState::argument(uint32_t value) {
+    if (value >= arguments_.size())
+        return {};
+    return vernon::Option<std::reference_wrapper<VernonProgramArgument>>{vernon::some(std::ref(arguments_[value]))};
 }
 
-VernonRhiBuffer ProgramInvocationState::buffer(uint32_t value) const {
+vernon::Option<VernonRhiBuffer> ProgramInvocationState::buffer(uint32_t value) const {
     if (value < deviceValues_.size() && deviceValues_[value])
-        return deviceValues_[value]->handle();
-    return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        return vernon::Option<VernonRhiBuffer>{vernon::some(deviceValues_[value]->handle())};
+    return {};
 }
 
 } // namespace vernon::runtime::program_execution

@@ -119,12 +119,12 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
                     if (use.interfacePlan->root->size > std::numeric_limits<size_t>::max())
                         return fail(error, "compute Tensor physical size exceeds the host size range");
                     const std::vector<uint64_t> &logicalShape = use.shape.empty() ? parameter.shape : use.shape;
-                    std::optional<TensorCopyPlan> layout =
+                    auto layout =
                         use.tensorPacking == TensorRepresentation::WholeValue
                             ? compileWholeValueCopyPlan(pipelineValueLayout(*use.valueLayout), *use.interfacePlan->root)
                             : compileElementStreamCopyPlan(pipelineValueLayout(*use.valueLayout), logicalShape,
                                                            *use.interfacePlan->root);
-                    if (!layout) {
+                    if (layout.isErr()) {
                         const ValueLayout &canonical = *use.valueLayout;
                         error = "compute Tensor interface plan for parameter '" + parameter.name +
                                 "' does not match its canonical layout (type " + canonical.logicalType + ", bytes " +
@@ -134,21 +134,21 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
                         return false;
                     }
                     VernonTensorView packedTensor = supplied.tensor;
-                    if (packedTensor.rank == layout->shape.size() + 1 && packedTensor.shape &&
+                    if (packedTensor.rank == layout.value().shape.size() + 1 && packedTensor.shape &&
                         packedTensor.byte_strides && packedTensor.shape[0] == 1) {
                         --packedTensor.rank;
                         ++packedTensor.shape;
                         ++packedTensor.byte_strides;
                     }
-                    auto packed = packTensor(packedTensor, *layout);
-                    if (!packed)
-                        return fail(error, "failed to pack reflected compute Tensor layout");
-                    plan.hostTensorStorage.push_back(std::move(*packed));
+                    auto packed = packTensor(packedTensor, layout.value());
+                    if (packed.isErr())
+                        return fail(error, tensorBridgeErrorMessage(packed.error()));
+                    plan.hostTensorStorage.push_back(std::move(packed).value());
                     argument = ComputeScalarArgument{plan.hostTensorStorage.back().data(),
                                                      plan.hostTensorStorage.back().size()};
                     if (use.interfaceKind == "result")
                         plan.resultCommits.push_back(
-                            {plan.hostTensorStorage.size() - 1, supplied.tensor, std::move(*layout)});
+                            {plan.hostTensorStorage.size() - 1, supplied.tensor, std::move(layout).value()});
                 }
             }
             if (use.tensorViewDescriptor) {
@@ -262,11 +262,11 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         if (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
             return fail(error, "pipeline Tensor argument storage kind is invalid");
         if (!tensorFitsAllocation(tensor)) {
-            size_t requiredSpan = 0;
-            if (!tensorRequiredSpan(tensor, requiredSpan))
+            auto requiredSpan = tensorRequiredSpan(tensor);
+            if (requiredSpan.isErr())
                 return fail(error, "pipeline Tensor argument byte layout is invalid");
             error = "pipeline Tensor argument '" + parameter.name + "' at byte offset " +
-                    std::to_string(tensor.byte_offset) + " requires " + std::to_string(requiredSpan) +
+                    std::to_string(tensor.byte_offset) + " requires " + std::to_string(requiredSpan.value()) +
                     " bytes but its allocation has " + std::to_string(tensor.byte_size);
             return false;
         }
@@ -328,12 +328,14 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
 
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error) {
     for (const ResultCommitPlan &publication : plan.resultCommits) {
-        if (publication.storageIndex >= plan.hostTensorStorage.size() ||
-            !unpackTensor(plan.hostTensorStorage[publication.storageIndex], publication.destination,
-                          publication.layout)) {
+        if (publication.storageIndex >= plan.hostTensorStorage.size()) {
             error = "compute Value result does not match its canonical host destination";
             return false;
         }
+        auto unpacked =
+            unpackTensor(plan.hostTensorStorage[publication.storageIndex], publication.destination, publication.layout);
+        if (unpacked.isErr())
+            return error = tensorBridgeErrorMessage(unpacked.error()), false;
     }
     return true;
 }

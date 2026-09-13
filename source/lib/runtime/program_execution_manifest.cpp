@@ -597,7 +597,7 @@ bool isTapeValueType(std::string_view type) {
                vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::AdTape)->contract;
 }
 
-bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
+static bool parseProgram(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
     program = {};
     diagnostic = {};
     if (!exactObject(value, {"stages", "parameters", "storages", "values", "graphs", "abi"}, {"residual_contract"},
@@ -1492,8 +1492,8 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     return true;
 }
 
-bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs, const nlohmann::json &value,
-                         ArtifactSystem &artifacts, Diagnostic &diagnostic) {
+static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann::json &blobs,
+                                    const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic) {
     artifacts = {};
     diagnostic = {};
     if (!exactObject(value, {"runtime_requirements", "artifacts"}, {}, diagnostic, "/artifact_system"))
@@ -2193,7 +2193,8 @@ bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blo
     return true;
 }
 
-bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &resolved, Diagnostic &diagnostic) {
+static bool resolveProgram(Program program, const ArtifactSystem &artifacts, ResolvedProgram &resolved,
+                           Diagnostic &diagnostic) {
     resolved = {};
     diagnostic = {};
     if (program.graphs.empty() || program.graphs.front().direction != "forward" ||
@@ -2549,6 +2550,28 @@ bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &
 
     resolved.program = std::move(program);
     return true;
+}
+
+ManifestResult<Program> parse(const nlohmann::json &value, Diagnostic &diagnostic) {
+    Program program;
+    if (!parseProgram(value, program, diagnostic))
+        return ManifestResult<Program>{vernon::err(ManifestError::InvalidProgram)};
+    return ManifestResult<Program>{vernon::ok(std::move(program))};
+}
+
+ManifestResult<ArtifactSystem> parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs,
+                                                   const nlohmann::json &value, Diagnostic &diagnostic) {
+    ArtifactSystem artifacts;
+    if (!parseArtifactSystemImpl(target, blobs, value, artifacts, diagnostic))
+        return ManifestResult<ArtifactSystem>{vernon::err(ManifestError::InvalidArtifactSystem)};
+    return ManifestResult<ArtifactSystem>{vernon::ok(std::move(artifacts))};
+}
+
+ManifestResult<ResolvedProgram> resolve(Program program, const ArtifactSystem &artifacts, Diagnostic &diagnostic) {
+    ResolvedProgram resolved;
+    if (!resolveProgram(std::move(program), artifacts, resolved, diagnostic))
+        return ManifestResult<ResolvedProgram>{vernon::err(ManifestError::ResolutionFailed)};
+    return ManifestResult<ResolvedProgram>{vernon::ok(std::move(resolved))};
 }
 
 bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,

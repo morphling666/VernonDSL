@@ -7,18 +7,22 @@
 
 namespace vernon::runtime {
 
-VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
-    return registerStaticCpuEntry(symbol, entryPoint);
+RuntimeResult<void> registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
+    const VernonStatus status = registerStaticCpuEntry(symbol, entryPoint);
+    return status == VERNON_STATUS_OK
+               ? RuntimeResult<void>{vernon::ok()}
+               : RuntimeResult<void>{
+                     vernon::err(vernon::runtimeErrorFromStatus(status, {"register_static_cpu_entry", 0, 0}))};
 }
 
-VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
+BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,
                                                        size_t artifactSize, const std::string &entry,
                                                        VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots) {
     auto child = RuntimeChildLifecycle::reserve(context.owner);
     if (child.isErr())
-        return nullptr;
+        return BackendStageLoadResult{vernon::err(BackendPipelineError::LifecycleUnavailable)};
     auto pipeline = std::make_unique<VernonStageExecutable>();
     pipeline->lifecycle.emplace(std::move(child).value());
     pipeline->context = &context;
@@ -32,14 +36,14 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
         kernel.entry = cpuEntry;
         auto state = std::make_unique<CpuPipelineState>();
         if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(reflection), *state))
-            return nullptr;
+            return BackendStageLoadResult{vernon::err(BackendPipelineError::CpuPreparationFailed)};
         installRuntimeBackendState(*pipeline, state.release());
         if (pipeline->lifecycle.value().publish().isErr())
-            return nullptr;
-        return pipeline.release();
+            return BackendStageLoadResult{vernon::err(BackendPipelineError::LifecycleUnavailable)};
+        return BackendStageLoadResult{vernon::ok(std::move(pipeline))};
     }
     if (!artifact || !artifactSize)
-        return nullptr;
+        return BackendStageLoadResult{vernon::err(BackendPipelineError::InvalidArtifact)};
     LoadedStageArtifact stage;
     stage.entry = entry;
     stage.reflected = std::move(reflection);
@@ -59,11 +63,12 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
     BackendStageBuildInputs inputs;
     inputs.context = &context;
     inputs.artifacts.emplace(stage.entry, std::move(stage));
-    if (!resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline))
-        return nullptr;
+    auto resolved = resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline);
+    if (resolved.isErr())
+        return BackendStageLoadResult{vernon::err(resolved.error())};
     if (pipeline->lifecycle.value().publish().isErr())
-        return nullptr;
-    return pipeline.release();
+        return BackendStageLoadResult{vernon::err(BackendPipelineError::LifecycleUnavailable)};
+    return BackendStageLoadResult{vernon::ok(std::move(pipeline))};
 }
 
 } // namespace vernon::runtime

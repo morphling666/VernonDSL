@@ -87,9 +87,12 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
     uint64_t dispatchInvocations = 1;
     if (program::executionKind(node) == program::ExecutionKind::Compute) {
         for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
-            uint64_t extent{};
-            if (!invocation.resolveControl(program, control, extent, error))
+            auto resolved = invocation.resolveControl(program, control);
+            if (resolved.isErr()) {
+                error = programInvocationErrorMessage(resolved.error());
                 return false;
+            }
+            const uint64_t extent = resolved.value();
             if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent)
                 return error = "Program dispatch invocation count overflows", false;
             dispatchInvocations *= extent;
@@ -117,19 +120,24 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                         use.interfaceKind == "result" ||
                         (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform));
             });
-        const VernonRuntimeProviderResourceReference *image =
-            programValue.storage ? invocation.controlImage(*programValue.storage) : nullptr;
+        auto image = programValue.storage
+                         ? invocation.controlImage(*programValue.storage)
+                         : vernon::Option<std::reference_wrapper<const VernonRuntimeProviderResourceReference>>{};
         if (image) {
             controlImage.slot = binding.value;
             controlImage.kind = VERNON_PROGRAM_IMAGE;
-            controlImage.image.view = *image;
+            controlImage.image.view = image.value().get();
             source = &controlImage;
         } else if (requiresHostProjection && binding.value < invocation.values().size() &&
                    invocation.values()[binding.value].ownership == ProgramValueOwnership::BorrowedHost) {
             source = &invocation.values()[binding.value].argument;
         } else {
-            source = resolvePhysicalEndpoint ? resolvePhysicalEndpoint(binding.value, binding.target)
-                                             : invocation.argument(binding.value);
+            if (resolvePhysicalEndpoint) {
+                source = resolvePhysicalEndpoint(binding.value, binding.target);
+            } else {
+                auto argument = invocation.argument(binding.value);
+                source = argument ? &argument.value().get() : nullptr;
+            }
         }
         if (!source)
             return error = "resolved Program endpoint has no physical carrier", false;
@@ -218,9 +226,9 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         if (binding.target.carrier == program::TargetCarrier::UniformBuffer && !binding.target.endpointProjection &&
             materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.storage == VERNON_TENSOR_RHI_RESOURCE &&
             materialized.tensor.byte_size && nodePlan.stage->context) {
-            VernonRhiBuffer canonicalBuffer{};
-            if (!resolveBackendRhiBufferReference(*nodePlan.stage->context, materialized.tensor.resource,
-                                                  canonicalBuffer))
+            auto canonicalBuffer =
+                resolveBackendRhiBufferReference(*nodePlan.stage->context, materialized.tensor.resource);
+            if (canonicalBuffer.isErr())
                 return error = "uniform endpoint has no canonical RHI backing", false;
             auto carrier = std::make_shared<DeviceBuffer>(*nodePlan.stage->context, materialized.tensor.byte_size);
             if (!carrier->valid() || !carrier->reference(materialized.tensor.resource))
@@ -230,7 +238,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                                            canonicalOffset))
                 return error = "uniform endpoint resource offset exceeds the host address space", false;
             output.deviceCopiesBefore.push_back(
-                {canonicalBuffer, carrier->handle(), canonicalOffset, 0, materialized.tensor.byte_size});
+                {canonicalBuffer.value(), carrier->handle(), canonicalOffset, 0, materialized.tensor.byte_size});
             output.deviceEndpointCarriers.push_back(std::move(carrier));
             materialized.tensor.byte_offset = 0;
         }
@@ -277,9 +285,11 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             const ValueLayout logicalLayout = program::materializeValueLayout(*slot.layout, slot.type);
             const ValueLeaf &logicalLeaf = logicalLayout.leaves[*binding.logicalLeaf];
             const auto logicalDtype = pipelineDataType(logicalLeaf.dtype);
-            const size_t logicalLeafSize =
-                logicalDtype ? dataTypeSize(*logicalDtype) * static_cast<size_t>(logicalLeaf.scalarCount) : 0;
-            if (!logicalDtype || logicalLeafSize != projection.leafByteSize)
+            auto logicalScalarSize = logicalDtype
+                                         ? dataTypeSize(*logicalDtype)
+                                         : TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::InvalidDataType)};
+            if (logicalScalarSize.isErr() ||
+                logicalScalarSize.value() * static_cast<size_t>(logicalLeaf.scalarCount) != projection.leafByteSize)
                 return error = "resolved endpoint leaf size disagrees with "
                                "the logical Value",
                        false;
@@ -330,17 +340,17 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 if (!carrier->valid() || !carrier->reference(materialized.tensor.resource))
                     return error = "physical endpoint carrier allocation failed", false;
                 output.deviceEndpointCarriers.push_back(carrier);
-                VernonRhiBuffer canonicalBuffer{};
-                if (!resolveBackendRhiBufferReference(*nodePlan.stage->context, canonical.resource, canonicalBuffer))
+                auto canonicalBuffer = resolveBackendRhiBufferReference(*nodePlan.stage->context, canonical.resource);
+                if (canonicalBuffer.isErr())
                     return error = "logical endpoint has no RHI Storage backing", false;
                 for (const ProgramTensorCopyRegion &region : regions) {
                     size_t canonicalOffset = 0;
                     if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
                         return error = "logical endpoint resource offset exceeds the host address space", false;
-                    output.deviceCopiesBefore.push_back(
-                        {canonicalBuffer, carrier->handle(), canonicalOffset, region.destinationOffset, region.size});
+                    output.deviceCopiesBefore.push_back({canonicalBuffer.value(), carrier->handle(), canonicalOffset,
+                                                         region.destinationOffset, region.size});
                     if (writes)
-                        output.deviceCopiesAfter.push_back({carrier->handle(), canonicalBuffer,
+                        output.deviceCopiesAfter.push_back({carrier->handle(), canonicalBuffer.value(),
                                                             region.destinationOffset, canonicalOffset, region.size});
                 }
             } else {
@@ -417,9 +427,9 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                     VernonTensorView compact = materialized.tensor;
                     if (!planProgramTensorCopy(canonical, compact, regions, error))
                         return false;
-                    VernonRhiBuffer canonicalBuffer{};
-                    if (!resolveBackendRhiBufferReference(*nodePlan.stage->context, canonical.resource,
-                                                          canonicalBuffer))
+                    auto canonicalBuffer =
+                        resolveBackendRhiBufferReference(*nodePlan.stage->context, canonical.resource);
+                    if (canonicalBuffer.isErr())
                         return error = "aggregate leaf endpoint has no RHI "
                                        "backing",
                                false;
@@ -427,10 +437,10 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                         size_t canonicalOffset = 0;
                         if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
                             return error = "aggregate leaf resource offset exceeds the host address space", false;
-                        output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(), canonicalOffset,
-                                                             region.destinationOffset, region.size});
+                        output.deviceCopiesBefore.push_back({canonicalBuffer.value(), storage->handle(),
+                                                             canonicalOffset, region.destinationOffset, region.size});
                         if (writes)
-                            output.deviceCopiesAfter.push_back({storage->handle(), canonicalBuffer,
+                            output.deviceCopiesAfter.push_back({storage->handle(), canonicalBuffer.value(),
                                                                 region.destinationOffset, canonicalOffset,
                                                                 region.size});
                     }

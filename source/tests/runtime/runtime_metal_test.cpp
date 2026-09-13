@@ -30,8 +30,8 @@ VernonRhiDevice createMetalDevice() {
 }
 
 const vernon::rhi::metal::DeviceState *metalDeviceState(VernonRhiDevice device) {
-    return static_cast<const vernon::rhi::metal::DeviceState *>(
-        vernon::rhi::deviceState(device, VERNON_RHI_BACKEND_METAL));
+    auto state = vernon::rhi::deviceState(device, VERNON_RHI_BACKEND_METAL);
+    return state.isOk() ? static_cast<const vernon::rhi::metal::DeviceState *>(state.value()) : nullptr;
 }
 
 bool supportsMetalArgumentBufferEncoding(VernonRhiDevice device) {
@@ -743,8 +743,9 @@ TEST(RuntimeMetal, RetainedBufferDelaysSlotReuse) {
     descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
     VernonRhiBuffer first{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &first), VERNON_RHI_STATUS_OK);
-    const uint64_t resource = vernon::rhi::bufferResource(device, first);
-    ASSERT_NE(resource, 0u);
+    auto resourceResult = vernon::rhi::bufferResource(device, first);
+    ASSERT_TRUE(resourceResult.isOk());
+    const uint64_t resource = resourceResult.value();
     auto retained = vernon::rhi::retainResource(device, vernon::rhi::ResourceKind::Buffer, resource);
     ASSERT_TRUE(retained.isOk());
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, first), VERNON_RHI_STATUS_OK);

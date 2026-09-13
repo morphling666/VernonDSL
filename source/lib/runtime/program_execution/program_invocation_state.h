@@ -6,6 +6,7 @@
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -19,6 +20,20 @@ struct ProgramInvocationContext;
 } // namespace vernon::runtime
 
 namespace vernon::runtime::program_execution {
+
+enum class ProgramInvocationError : uint8_t {
+    SnapshotValueUnavailable,
+    SnapshotStorageUnavailable,
+    DeviceRestoreFailed,
+    ControlValueUnavailable,
+    ControlValueInvalid,
+    ImageStorageInvalid,
+    ImageStorageConflict,
+    ImageStorageResolutionFailed,
+    ImageStorageAllocationFailed,
+};
+
+template <typename T> using ProgramInvocationResult = vernon::Result<T, ProgramInvocationError>;
 
 enum class ProgramValueOwnership {
     OwnedInvocation,
@@ -75,33 +90,36 @@ struct CanonicalValueSnapshot {
     std::shared_ptr<DeviceBuffer> deviceOwner;
 };
 
-bool resolveProgramControl(const program::Program &program, const std::vector<ProgramValueState> &values,
-                           const program::ControlComponent &control, uint64_t &value, std::string &error);
+ProgramInvocationResult<uint64_t> resolveProgramControl(const program::Program &program,
+                                                        const std::vector<ProgramValueState> &values,
+                                                        const program::ControlComponent &control);
+const char *programInvocationErrorMessage(ProgramInvocationError error) noexcept;
 
 class ProgramInvocationState {
 public:
     ProgramInvocationState(const program::ResolvedExecutionPlan &plan, std::vector<ProgramValueState> values,
                            std::map<uint32_t, ProgramStorageBacking> storageBackings);
-    ~ProgramInvocationState();
+    ~ProgramInvocationState() noexcept;
     ProgramInvocationState(const ProgramInvocationState &) = delete;
     ProgramInvocationState &operator=(const ProgramInvocationState &) = delete;
     ProgramInvocationState(ProgramInvocationState &&other) noexcept;
     ProgramInvocationState &operator=(ProgramInvocationState &&) = delete;
 
-    CanonicalValueSnapshot snapshotValue(uint32_t value) const;
-    bool importSnapshot(const CanonicalValueSnapshot &snapshot, std::string &error);
-    bool importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots, std::string &error);
+    vernon::Option<CanonicalValueSnapshot> snapshotValue(uint32_t value) const;
+    ProgramInvocationResult<void> importSnapshot(const CanonicalValueSnapshot &snapshot);
+    ProgramInvocationResult<void> importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots);
     void retainOnly(const std::vector<char> &retained);
-    bool restoreDeviceValuesFromHost(program::GraphDirection graph, std::string &error);
-    bool bindControlImageStorage(VernonRuntimeContext &context, const program::Program &program, uint32_t storage,
-                                 VernonRuntimeProviderResourceReference view, std::string &error);
-    bool allocateOwnedImageStorages(VernonRuntimeContext &context, const program::Program &program, std::string &error);
-    bool resolveControl(const program::Program &program, const program::ControlComponent &control, uint64_t &value,
-                        std::string &error) const;
+    ProgramInvocationResult<void> bindControlImageStorage(VernonRuntimeContext &context,
+                                                          const program::Program &program, uint32_t storage,
+                                                          VernonRuntimeProviderResourceReference view);
+    ProgramInvocationResult<void> allocateOwnedImageStorages(VernonRuntimeContext &context,
+                                                             const program::Program &program);
+    ProgramInvocationResult<uint64_t> resolveControl(const program::Program &program,
+                                                     const program::ControlComponent &control) const;
 
-    const VernonProgramArgument *argument(uint32_t value) const;
-    VernonProgramArgument *argument(uint32_t value);
-    VernonRhiBuffer buffer(uint32_t value) const;
+    vernon::Option<std::reference_wrapper<const VernonProgramArgument>> argument(uint32_t value) const;
+    vernon::Option<std::reference_wrapper<VernonProgramArgument>> argument(uint32_t value);
+    vernon::Option<VernonRhiBuffer> buffer(uint32_t value) const;
 
     const program::ResolvedExecutionPlan &plan() const { return *plan_; }
     const std::vector<VernonProgramArgument> &arguments() const { return arguments_; }
@@ -112,8 +130,9 @@ public:
     const std::vector<ProgramDeviceUpload> &deviceUploads() const { return deviceUploads_; }
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
     const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
-    const VernonRuntimeProviderResourceReference *controlImage(uint32_t storage) const;
-    const VernonProgramArgument *externalStorage(uint32_t storage) const;
+    vernon::Option<std::reference_wrapper<const VernonRuntimeProviderResourceReference>>
+    controlImage(uint32_t storage) const;
+    vernon::Option<std::reference_wrapper<const VernonProgramArgument>> externalStorage(uint32_t storage) const;
 
 private:
     struct OwnedImageStorage {

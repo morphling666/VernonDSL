@@ -6,6 +6,7 @@
 #include "program_execution_manifest.h"
 #include "runtime_lifecycle.h"
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,6 +55,7 @@ struct VernonRuntimeContext {
 
     vernon::OwnerRef owner;
     vernon::OperationRef operations;
+    uint64_t diagnosticGeneration{};
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
     std::atomic<uint64_t> nextProgramGraphId{1};
     void *backendState{};
@@ -71,7 +74,8 @@ namespace vernon::runtime {
 
 std::string &invocationDiagnostic(VernonRuntimeContext &context);
 const std::string *currentInvocationDiagnostic(const VernonRuntimeContext &context);
-void clearInvocationDiagnostic(const VernonRuntimeContext &context);
+VernonStringView currentInvocationDiagnosticView(const VernonRuntimeContext &context) noexcept;
+void clearInvocationDiagnostic(const VernonRuntimeContext &context) noexcept;
 
 class RuntimeDiagnosticScope {
 public:
@@ -82,6 +86,8 @@ public:
 
 private:
     const VernonRuntimeContext *context_;
+    uint64_t generation_{};
+    void *state_{};
 };
 
 } // namespace vernon::runtime

@@ -10,6 +10,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct VernonRuntimeContext;
@@ -22,6 +23,26 @@ struct BackendStageBuildInputs {
     VernonRuntimeContext *context{};
     std::unordered_map<std::string, LoadedStageArtifact> artifacts;
 };
+
+enum class BackendPipelineError : uint8_t {
+    InvalidBindingPlan,
+    UnsupportedBackend,
+    BackendResolutionFailed,
+    LifecycleUnavailable,
+    InvalidArtifact,
+    CpuPreparationFailed,
+};
+
+struct BackendPipelineFailure {
+    BackendPipelineError code;
+    std::string diagnostic;
+
+    BackendPipelineFailure(BackendPipelineError value, std::string detail = {})
+        : code(value), diagnostic(std::move(detail)) {}
+};
+
+using BackendPipelineResult = vernon::Result<void, BackendPipelineFailure>;
+std::string renderBackendPipelineError(const BackendPipelineFailure &error);
 
 } // namespace vernon::runtime
 

@@ -135,9 +135,10 @@ TEST_P(RhiCommandBenchmark, BarrierCopyAndDispatchBookkeepingHotPath) {
     ASSERT_EQ(vernonRhiCommandEncoderBarrier(testDevice, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderCopyBuffer(testDevice, encoder, source, 0, destination, 0, 256),
               VERNON_RHI_STATUS_OK);
-    const std::uint64_t encoderKey = vernon::rhi::commandEncoderKey(testDevice, encoder);
-    ASSERT_NE(encoderKey, 0u);
-    ASSERT_TRUE(vernon::rhi::recordProviderCommand(testDevice, encoderKey, false));
+    auto encoderKeyResult = vernon::rhi::commandEncoderKey(testDevice, encoder);
+    ASSERT_TRUE(encoderKeyResult.isOk());
+    const std::uint64_t encoderKey = encoderKeyResult.value();
+    ASSERT_TRUE(vernon::rhi::recordProviderCommand(testDevice, encoderKey, false).isOk());
 
     std::vector<std::uint64_t> barrierSamples;
     std::vector<std::uint64_t> copySamples;
@@ -157,8 +158,9 @@ TEST_P(RhiCommandBenchmark, BarrierCopyAndDispatchBookkeepingHotPath) {
                 [&] { return vernonRhiCommandEncoderCopyBuffer(testDevice, encoder, source, 0, destination, 0, 256); },
                 copySamples, copyAllocations),
             VERNON_RHI_STATUS_OK);
-        ASSERT_TRUE(sampleBookkeeping([&] { return vernon::rhi::recordProviderCommand(testDevice, encoderKey, false); },
-                                      dispatchSamples, dispatchAllocations));
+        ASSERT_TRUE(
+            sampleBookkeeping([&] { return vernon::rhi::recordProviderCommand(testDevice, encoderKey, false).isOk(); },
+                              dispatchSamples, dispatchAllocations));
     }
 
     recordSamples("barrier", barrierSamples, barrierAllocations);
@@ -252,8 +254,9 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     ASSERT_EQ(viewStatus, VERNON_RHI_STATUS_OK);
     const VernonRhiCommandEncoder encoder = createEncoder(testDevice, VERNON_RHI_QUEUE_GRAPHICS);
     ASSERT_NE(encoder.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const std::uint64_t encoderKey = vernon::rhi::commandEncoderKey(testDevice, encoder);
-    ASSERT_NE(encoderKey, 0u);
+    auto encoderKeyResult = vernon::rhi::commandEncoderKey(testDevice, encoder);
+    ASSERT_TRUE(encoderKeyResult.isOk());
+    const std::uint64_t encoderKey = encoderKeyResult.value();
 
     VernonRhiColorAttachment color{};
     color.view = view;
@@ -268,7 +271,7 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     rendering.width = rendering.height = rendering.layers = 1;
 
     ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(testDevice, encoder, &rendering), VERNON_RHI_STATUS_OK);
-    ASSERT_TRUE(vernon::rhi::recordProviderCommand(testDevice, encoderKey, true));
+    ASSERT_TRUE(vernon::rhi::recordProviderCommand(testDevice, encoderKey, true).isOk());
     ASSERT_EQ(vernonRhiCommandEncoderEndRendering(testDevice, encoder), VERNON_RHI_STATUS_OK);
 
     std::vector<std::uint64_t> beginSamples;
@@ -285,8 +288,9 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
             sampleOperation([&] { return vernonRhiCommandEncoderBeginRendering(testDevice, encoder, &rendering); },
                             beginSamples, beginAllocations),
             VERNON_RHI_STATUS_OK);
-        ASSERT_TRUE(sampleBookkeeping([&] { return vernon::rhi::recordProviderCommand(testDevice, encoderKey, true); },
-                                      drawSamples, drawAllocations));
+        ASSERT_TRUE(
+            sampleBookkeeping([&] { return vernon::rhi::recordProviderCommand(testDevice, encoderKey, true).isOk(); },
+                              drawSamples, drawAllocations));
         ASSERT_EQ(sampleOperation([&] { return vernonRhiCommandEncoderEndRendering(testDevice, encoder); }, endSamples,
                                   endAllocations),
                   VERNON_RHI_STATUS_OK);

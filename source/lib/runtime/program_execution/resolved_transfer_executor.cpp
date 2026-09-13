@@ -9,6 +9,56 @@
 #include <unordered_map>
 
 namespace vernon::runtime::program_execution {
+namespace {
+
+bool appendStagedDeviceInitialCopies(VernonRuntimeContext &context, uint32_t value, const ProgramValueState &valueState,
+                                     const DeviceBuffer &destination, std::vector<DeviceBufferCopy> &copies,
+                                     std::string &error) {
+    const auto &initial = valueState.stagedDeviceInitial;
+    if (!initial)
+        return true;
+    VernonRhiBuffer source{};
+    if (initial->retainedSourceBuffer)
+        source = *initial->retainedSourceBuffer;
+    else {
+        auto resolved = resolveBackendRhiBufferReference(context, initial->source);
+        if (resolved.isErr())
+            return error = "staged device input source for Value " + std::to_string(value) + " is no longer retained",
+                   false;
+        source = resolved.value();
+    }
+    if (initial->byteSize > destination.size())
+        return error = "staged device input exceeds fresh apply Storage", false;
+    VernonTensorView sourceView{};
+    sourceView.struct_size = sizeof(VernonTensorView);
+    sourceView.storage = VERNON_TENSOR_RHI_RESOURCE;
+    sourceView.resource = initial->source;
+    sourceView.byte_offset = initial->byteOffset;
+    sourceView.byte_size = initial->byteSize;
+    sourceView.element_layout = initial->elementLayout;
+    sourceView.rank = static_cast<uint32_t>(initial->shape.size());
+    sourceView.shape = initial->shape.empty() ? nullptr : initial->shape.data();
+    sourceView.byte_strides = initial->strides.empty() ? nullptr : initial->strides.data();
+    std::vector<ProgramTensorCopyRegion> regions;
+    std::string copyError;
+    const VernonTensorView &destinationView = valueState.argument.tensor;
+    if (!planProgramTensorCopy(sourceView, destinationView, regions, copyError)) {
+        error = "staged device input Value " + std::to_string(value) + ": " + copyError + " (source rank " +
+                std::to_string(sourceView.rank) + ", destination rank " + std::to_string(destinationView.rank) +
+                ", source element bytes " + std::to_string(sourceView.element_layout.byte_size) +
+                ", destination element bytes " + std::to_string(destinationView.element_layout.byte_size) + ")";
+        return false;
+    }
+    for (const ProgramTensorCopyRegion &region : regions) {
+        size_t sourceOffset = 0;
+        if (!checkedDeviceBufferOffset(initial->source.offset, region.sourceOffset, sourceOffset))
+            return error = "staged device input offset exceeds the host address space", false;
+        copies.push_back({source, destination.handle(), sourceOffset, region.destinationOffset, region.size});
+    }
+    return true;
+}
+
+} // namespace
 
 bool ResolvedTransferExecutor::prepareGraph(program::GraphDirection graph, std::string &error) {
     preparedGraph_ = graph;
@@ -65,41 +115,9 @@ bool ResolvedTransferExecutor::prepareGraph(program::GraphDirection graph, std::
         const auto &initial = state_.values_[value].stagedDeviceInitial;
         if (!initial || value >= state_.deviceValues_.size() || !state_.deviceValues_[value])
             continue;
-        VernonRhiBuffer source{};
-        if (initial->retainedSourceBuffer)
-            source = *initial->retainedSourceBuffer;
-        else if (!resolveBackendRhiBufferReference(context_, initial->source, source))
-            return error = "staged device input source for Value " + std::to_string(value) + " is no longer retained",
-                   false;
-        if (initial->byteSize > state_.deviceValues_[value]->size())
-            return error = "staged device input exceeds fresh apply Storage", false;
-        VernonTensorView sourceView{};
-        sourceView.struct_size = sizeof(VernonTensorView);
-        sourceView.storage = VERNON_TENSOR_RHI_RESOURCE;
-        sourceView.resource = initial->source;
-        sourceView.byte_offset = initial->byteOffset;
-        sourceView.byte_size = initial->byteSize;
-        sourceView.element_layout = initial->elementLayout;
-        sourceView.rank = static_cast<uint32_t>(initial->shape.size());
-        sourceView.shape = initial->shape.empty() ? nullptr : initial->shape.data();
-        sourceView.byte_strides = initial->strides.empty() ? nullptr : initial->strides.data();
-        std::vector<ProgramTensorCopyRegion> regions;
-        std::string copyError;
-        const VernonTensorView &destinationView = state_.values_[value].argument.tensor;
-        if (!planProgramTensorCopy(sourceView, destinationView, regions, copyError)) {
-            error = "staged device input Value " + std::to_string(value) + ": " + copyError + " (source rank " +
-                    std::to_string(sourceView.rank) + ", destination rank " + std::to_string(destinationView.rank) +
-                    ", source element bytes " + std::to_string(sourceView.element_layout.byte_size) +
-                    ", destination element bytes " + std::to_string(destinationView.element_layout.byte_size) + ")";
+        if (!appendStagedDeviceInitialCopies(context_, static_cast<uint32_t>(value), state_.values_[value],
+                                             *state_.deviceValues_[value], initialCopies_, error))
             return false;
-        }
-        for (const ProgramTensorCopyRegion &region : regions) {
-            size_t sourceOffset = 0;
-            if (!checkedDeviceBufferOffset(initial->source.offset, region.sourceOffset, sourceOffset))
-                return error = "staged device input offset exceeds the host address space", false;
-            initialCopies_.push_back(
-                {source, state_.deviceValues_[value]->handle(), sourceOffset, region.destinationOffset, region.size});
-        }
     }
     initialCopiesPending_ = !state_.deviceUploads_.empty() || !initialCopies_.empty();
     return true;
@@ -159,7 +177,52 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
 }
 
 bool ResolvedTransferExecutor::restoreForRetry(program::GraphDirection graph, std::string &error) {
-    return state_.restoreDeviceValuesFromHost(graph, error);
+    const auto &graphs = state_.plan_->resolvedProgram->program.graphs;
+    const auto selected = std::find_if(graphs.begin(), graphs.end(), [&](const program::Graph &candidate) {
+        return program::graphDirection(candidate.direction) == std::optional<program::GraphDirection>{graph};
+    });
+    if (selected == graphs.end())
+        return error = "Program retry graph is absent from the resolved invocation", false;
+
+    std::vector<const DeviceBuffer *> restored;
+    std::vector<DeviceBufferCopy> copies;
+    std::vector<DeviceBufferUpload> uploads;
+    for (const program::GraphInput &input : selected->inputs) {
+        const uint32_t value = input.value;
+        if (value >= state_.values_.size() || value >= state_.deviceValues_.size())
+            return error = "Program retry input exceeds invocation state", false;
+        const std::shared_ptr<DeviceBuffer> &destination = state_.deviceValues_[value];
+        if (!destination || std::find(restored.begin(), restored.end(), destination.get()) != restored.end())
+            continue;
+        const ProgramValueState *staged = nullptr;
+        uint32_t stagedValue = 0;
+        for (size_t candidate = 0; candidate < state_.deviceValues_.size(); ++candidate)
+            if (state_.deviceValues_[candidate] == destination && state_.values_[candidate].stagedDeviceInitial) {
+                staged = &state_.values_[candidate];
+                stagedValue = static_cast<uint32_t>(candidate);
+                break;
+            }
+        if (staged) {
+            if (!appendStagedDeviceInitialCopies(context_, stagedValue, *staged, *destination, copies, error))
+                return false;
+        } else {
+            const VernonProgramArgument &initial = state_.values_[value].argument;
+            if (initial.kind != VERNON_PROGRAM_TENSOR || !initial.tensor.host_data || initial.tensor.byte_offset ||
+                initial.tensor.byte_size != destination->size())
+                return error = "Program invocation cannot restore planned device Storage", false;
+            uploads.push_back({destination->handle(), 0, initial.tensor.host_data, initial.tensor.byte_size});
+        }
+        restored.push_back(destination.get());
+    }
+    vernon::execution::detail::RhiCommandExecutionPlan plan;
+    const VernonStatus built = buildBufferTransferCommandPlan(context_, copies, uploads, plan);
+    if (built != VERNON_STATUS_OK)
+        return error = "Program invocation cannot build retry restoration", false;
+    if (plan.commands.nodes.empty())
+        return true;
+    if (!vernon::execution::detail::validateRhiCommandExecutionPlan(plan, error))
+        return false;
+    return executeCommandPlanAndWait(context_, plan) == VERNON_STATUS_OK;
 }
 
 bool ResolvedTransferExecutor::readbackBoundaryValues(const std::vector<char> &required, std::string &error) const {

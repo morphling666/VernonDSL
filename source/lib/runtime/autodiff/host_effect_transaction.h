@@ -1,6 +1,8 @@
 #ifndef VERNON_RUNTIME_AUTODIFF_HOST_EFFECT_TRANSACTION_H
 #define VERNON_RUNTIME_AUTODIFF_HOST_EFFECT_TRANSACTION_H
 
+#include "VernonResult.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -9,56 +11,52 @@
 
 namespace vernon::runtime::ad {
 
+enum class HostEffectError {
+    InvalidState,
+    InvalidDestination,
+};
+
 class HostEffectTransaction {
 public:
     explicit HostEffectTransaction(size_t outputSize) : outputSize_(outputSize) {}
-    ~HostEffectTransaction() { discard(); }
+    ~HostEffectTransaction() noexcept { discard(); }
 
-    uint8_t *stageStorage(void *destination, size_t size, bool preserve, bool commit = true) {
+    [[nodiscard]] Result<uint8_t *, HostEffectError> stageStorage(void *destination, size_t size, bool preserve,
+                                                                  bool commit = true) {
         if (state_ != State::Capturing)
-            return nullptr;
-        try {
-            StorageShadow shadow{destination, std::vector<uint8_t>(size), commit};
-            if (preserve && size)
-                std::memcpy(shadow.bytes.data(), destination, size);
-            storage_.push_back(std::move(shadow));
-            return storage_.back().bytes.data();
-        } catch (...) {
-            discard();
-            return nullptr;
-        }
+            return Result<uint8_t *, HostEffectError>{err(HostEffectError::InvalidState)};
+        if (size && !destination)
+            return Result<uint8_t *, HostEffectError>{err(HostEffectError::InvalidDestination)};
+        StorageShadow shadow{destination, std::vector<uint8_t>(size), commit};
+        if (preserve && size)
+            std::memcpy(shadow.bytes.data(), destination, size);
+        storage_.push_back(std::move(shadow));
+        return Result<uint8_t *, HostEffectError>{ok(storage_.back().bytes.data())};
     }
 
-    uint8_t *stagedOutput() {
+    [[nodiscard]] Result<uint8_t *, HostEffectError> stagedOutput() {
         if (state_ != State::Capturing)
-            return nullptr;
-        try {
-            if (output_.empty() && outputSize_)
-                output_.resize(outputSize_);
-            return output_.data();
-        } catch (...) {
-            discard();
-            return nullptr;
-        }
+            return Result<uint8_t *, HostEffectError>{err(HostEffectError::InvalidState)};
+        if (output_.empty() && outputSize_)
+            output_.resize(outputSize_);
+        return Result<uint8_t *, HostEffectError>{ok(output_.data())};
     }
 
-    bool commit(void *outputDestination) {
+    [[nodiscard]] Result<void, HostEffectError> commit(void *outputDestination) noexcept {
         if (state_ != State::Capturing)
-            return false;
-        if (outputSize_ && !outputDestination) {
-            discard();
-            return false;
-        }
+            return Result<void, HostEffectError>{err(HostEffectError::InvalidState)};
+        if (outputSize_ && !outputDestination)
+            return Result<void, HostEffectError>{err(HostEffectError::InvalidDestination)};
         for (const StorageShadow &shadow : storage_)
             if (shadow.commit && !shadow.bytes.empty())
                 std::memcpy(shadow.destination, shadow.bytes.data(), shadow.bytes.size());
         if (!output_.empty())
             std::memcpy(outputDestination, output_.data(), output_.size());
         state_ = State::Committed;
-        return true;
+        return Result<void, HostEffectError>{ok()};
     }
 
-    bool discard() {
+    bool discard() noexcept {
         if (state_ != State::Capturing)
             return false;
         storage_.clear();

@@ -127,6 +127,13 @@ claim in stable owner order, then materializes and executes. Device and
 packed-host publication must both succeed before gradient write claims are
 released.
 
+If runtime tape validation requires a larger carrier, forward replay restores
+only the resolved graph inputs before executing again, using each input's
+authoritative host snapshot or retained device source. Intermediate Values are
+outputs of the replay and are never restored from host allocation bytes; this
+keeps retry semantics independent of uninitialized transient storage and
+allocator history.
+
 Mutable resources retain one residency per session identity, allowing
 authority to migrate without discarding live native owners. Samplers remain
 immutable session-local residencies and need no mutable access claims.
@@ -346,6 +353,14 @@ Backend inclusion at build time does not imply runtime availability. Runtime
 availability requires a loadable API, usable device/context, and all artifact
 requirements.
 
+The internal backend dispatch table separates its required core from optional
+capabilities. Required callbacks are ordinary function pointers and must be
+present for every included backend. A callback is wrapped in `Option` only when
+a valid backend can lack that operation, such as image, sampler, rendering, or
+timeline support. Absence maps to `Unsupported`; failure after invoking a
+present callback is a typed `Result` error. Dispatch registration names each
+field explicitly and does not use positional null sentinels.
+
 ### CUDA
 
 CUDA is compute-only. It loads PTX through the Driver API and validates
@@ -476,10 +491,16 @@ Backend and built-in provider implementation boundaries return allocation-free
 `Result` errors. Public C ABI and provider-vtable callbacks are the only layers
 that map those errors to status values and cold diagnostics.
 
-Public C entry points contain exceptions. Backend, provider, allocation,
-validation, and execution failures become stable status codes and diagnostics.
-No failure silently changes backend, narrows dtype, serializes an invalid
-dispatch, or falls back to a compatibility path.
+Authored Runtime/RHI expected control flow does not throw. Standard-library and
+third-party operations may still throw; each public C entry point contains
+those exceptions in one shared cold boundary around an internal
+`Result`-returning operation. Fallible handle construction additionally exposes
+a status-bearing out-handle form so the C++ wrapper can return `Result` without
+discarding parse, verification, unsupported-target, resource, lifecycle, or
+internal failure identity. The C++ wrapper is `noexcept`; Python raises only
+after the native result reaches the binding boundary. No failure silently
+changes backend, narrows dtype, serializes an invalid dispatch, or falls back
+to a compatibility path.
 
 The native Runtime/RHI support layer provides move-aware, non-sentinel
 `Option<T>`, `Result<T, E>`, and `Result<void, E>` values. Inactive-alternative
@@ -489,6 +510,28 @@ with stable codes and bounded numeric/static context; explicit adapters map
 them to the existing C statuses. Checked arithmetic, checked atomic
 retain/release, and non-throwing allocation helpers use these results.
 Emergency diagnostic rendering is bounded and does not allocate.
+
+Runtime diagnostics are thread-local and keyed by both context address and a
+monotonic context generation, so context-address reuse cannot expose stale
+errors. A bounded table avoids allocation and process-global lookup during
+diagnostic admission. Nested boundaries publish only the completed primary
+operation: successful cleanup does not erase its failure, while the next
+primary operation replaces it. If rich diagnostic storage fails, the original
+typed error is rendered into bounded emergency storage without allocating.
+
+Foreign provider lease callbacks and backend deferred actions catch exceptions
+at the immediate callback boundary. Deferred drains preserve the first typed
+failure, continue required cleanup, and retain failed resource-release work for
+retry. A command-recording allocation failure makes pending-write state
+conservatively unknown rather than losing a required synchronization.
+The source policy rejects authored Runtime/RHI `throw` expressions and requires
+each remaining `catch` site to have an exact reviewed fingerprint, category,
+and reason; moving or substituting a catch invalidates that review.
+
+The Python package declares its public surface for static analysis but resolves
+native-backed exports lazily. Importing shader-contract helpers during
+configuration therefore does not load `_native`; direct import, star import,
+and `dir()` still expose the canonical public names.
 
 The shared lifecycle support layer uses one owner-local atomic word for
 `Open`, `Closing`, or `Closed` together with its admitted child count. Child

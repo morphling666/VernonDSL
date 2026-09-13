@@ -1,6 +1,7 @@
 #ifndef VERNON_RUNTIME_RESOLVED_EXECUTION_PLAN_H
 #define VERNON_RUNTIME_RESOLVED_EXECUTION_PLAN_H
 
+#include "VernonResult.hpp"
 #include "backend_stage_pipeline.h"
 #include "program_execution_manifest.h"
 #include "target_binding_plan.h"
@@ -221,9 +222,16 @@ struct ResolvedExecutionPlan {
     const std::vector<uint32_t> &predecessors(GraphDirection graph, uint32_t nodeId) const;
 };
 
+enum class ExecutionPlanError : uint8_t {
+    PolicyResolutionFailed,
+    ValidationFailed,
+};
+
+using ExecutionPlanResult = vernon::Result<void, ExecutionPlanError>;
+
 std::optional<GraphDirection> graphDirection(std::string_view direction);
-bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
-bool validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
+ExecutionPlanResult buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
+ExecutionPlanResult validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
 
 } // namespace vernon::runtime::program
 

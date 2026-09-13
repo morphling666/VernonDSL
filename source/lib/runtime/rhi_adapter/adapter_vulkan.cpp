@@ -1275,7 +1275,10 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
     const VkCommandBuffer command =
         reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(std::move(nativeCommand).value()));
-    if (commandEncoderRendering(adapter, commandEncoder))
+    auto rendering = commandEncoderRendering(adapter, commandEncoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (std::move(rendering).value())
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"vulkan_dispatch_command_encoder_is_invalid", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -1347,8 +1350,8 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                                                                  : vernon::rhi::CommandRenderingRenderPass);
     if (!renderingClaimResult)
         return RhiAdapterResult<void>{vernon::err(std::move(renderingClaimResult).error())};
-    const int renderingClaim = std::move(renderingClaimResult).value();
-    const bool beginRendering = renderingClaim != 0;
+    const vernon::rhi::CommandRenderingClaim renderingClaim = std::move(renderingClaimResult).value();
+    const bool beginRendering = renderingClaim == vernon::rhi::CommandRenderingClaim::Acquired;
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"vulkan_draw_could_not_retain_provider_objects", 0, 0}})};
@@ -1891,9 +1894,10 @@ namespace vernon::runtime {
 VernonRuntimeRhiAdapter *createVulkanRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
     if (backend != VERNON_RHI_BACKEND_VULKAN)
         return nullptr;
-    auto *deviceState = static_cast<rhi::vulkan::DeviceState *>(rhi::deviceState(device, backend));
-    if (!deviceState)
+    auto resolvedDeviceState = rhi::deviceState(device, backend);
+    if (resolvedDeviceState.isErr())
         return nullptr;
+    auto *deviceState = static_cast<rhi::vulkan::DeviceState *>(resolvedDeviceState.value());
     auto state = std::unique_ptr<rhi_adapter::VulkanAdapterState>(new (std::nothrow) rhi_adapter::VulkanAdapterState());
     auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
     if (!state || !adapter)

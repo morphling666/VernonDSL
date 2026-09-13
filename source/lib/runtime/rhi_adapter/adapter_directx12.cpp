@@ -932,7 +932,10 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
     auto *commands =
         reinterpret_cast<ID3D12GraphicsCommandList *>(static_cast<uintptr_t>(std::move(nativeCommand).value()));
-    if (commandEncoderRendering(adapter, commandEncoder))
+    auto rendering = commandEncoderRendering(adapter, commandEncoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (std::move(rendering).value())
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"d3d12_dispatch_command_encoder_is_invalid", 0, 0}})};
     commands->SetPipelineState(pipeline->pipeline);
@@ -1039,13 +1042,16 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     auto renderingClaim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
     if (!renderingClaim)
         return RhiAdapterResult<void>{vernon::err(std::move(renderingClaim).error())};
-    const int claim = std::move(renderingClaim).value();
+    const vernon::rhi::CommandRenderingClaim claim = std::move(renderingClaim).value();
     commands->SetPipelineState(pipeline->pipeline);
     commands->OMSetStencilRef(descriptor->stencil_reference);
     adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
     adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
-    const bool firstDraw = claim != 0;
-    const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+    const bool firstDraw = claim == vernon::rhi::CommandRenderingClaim::Acquired;
+    auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+    if (!hasRenderingDescriptor)
+        return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
+    const bool standaloneRendering = !std::move(hasRenderingDescriptor).value();
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"d3d12_draw_could_not_retain_provider_objects", 0, 0}})};
@@ -1625,9 +1631,10 @@ getDirectX12AdapterDepthStencilStats(const VernonRuntimeRhiAdapter &adapter) noe
 VernonRuntimeRhiAdapter *createDirectX12RhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
     if (backend != VERNON_RHI_BACKEND_DIRECTX12)
         return nullptr;
-    auto *deviceState = static_cast<rhi::directx12::DeviceState *>(rhi::deviceState(device, backend));
-    if (!deviceState)
+    auto resolvedDeviceState = rhi::deviceState(device, backend);
+    if (resolvedDeviceState.isErr())
         return nullptr;
+    auto *deviceState = static_cast<rhi::directx12::DeviceState *>(resolvedDeviceState.value());
     auto state =
         std::unique_ptr<rhi_adapter::DirectX12AdapterState>(new (std::nothrow) rhi_adapter::DirectX12AdapterState());
     auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());

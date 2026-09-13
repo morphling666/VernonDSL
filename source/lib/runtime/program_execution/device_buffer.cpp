@@ -83,12 +83,23 @@ bool DeviceBuffer::download(size_t offset, void *destination, size_t size) const
 }
 
 bool DeviceBuffer::reference(VernonRuntimeProviderResourceReference &output) const {
-    return valid() && referenceBackendRhiBuffer(*context_, handle_, 0, size_, output) == VERNON_STATUS_OK;
+    if (!valid())
+        return false;
+    auto referenced = referenceBackendRhiBuffer(*context_, handle_, 0, size_);
+    if (referenced.isErr())
+        return false;
+    output = referenced.value();
+    return true;
 }
 
 bool DeviceBuffer::reference(size_t offset, size_t size, VernonRuntimeProviderResourceReference &output) const {
-    return valid() && offset <= size_ && size <= size_ - offset &&
-           referenceBackendRhiBuffer(*context_, handle_, offset, size, output) == VERNON_STATUS_OK;
+    if (!valid() || offset > size_ || size > size_ - offset)
+        return false;
+    auto referenced = referenceBackendRhiBuffer(*context_, handle_, offset, size);
+    if (referenced.isErr())
+        return false;
+    output = referenced.value();
+    return true;
 }
 
 void DeviceBuffer::reset() {

@@ -143,7 +143,7 @@ class RhiCommandCompletion {
 public:
     virtual ~RhiCommandCompletion() = default;
     virtual bool validationPhase() const { return false; }
-    virtual void complete(bool succeeded, const RhiCommandDagExecutionStats &stats) = 0;
+    virtual VernonRhiStatus complete(bool succeeded, const RhiCommandDagExecutionStats &stats) noexcept = 0;
 };
 
 class RhiCommandPlanSink {

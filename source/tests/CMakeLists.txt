@@ -203,6 +203,27 @@ if(TARGET VernonRuntime)
         target_compile_options(VernonRhiLifecycleCoreTests PRIVATE -fno-exceptions)
     endif()
     vernon_discover_gtests(VernonRhiLifecycleCoreTests)
+    add_executable(VernonRhiDeferredActionTests rhi/rhi_deferred_action_test.cpp)
+    target_include_directories(VernonRhiDeferredActionTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
+                                                                    "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonRhiDeferredActionTests PRIVATE GTest::gtest_main Vernon::RHI)
+    vernon_discover_gtests(VernonRhiDeferredActionTests)
+    vernon_stage_target_files(VernonRhiDeferredActionTests VernonRHI)
+    add_executable(VernonRhiStrictBoundaryTests rhi/rhi_strict_boundary_test.cpp)
+    target_include_directories(VernonRhiStrictBoundaryTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
+                                                                    "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonRhiStrictBoundaryTests PRIVATE GTest::gtest_main Vernon::RHI)
+    vernon_discover_gtests(VernonRhiStrictBoundaryTests)
+    vernon_stage_target_files(VernonRhiStrictBoundaryTests VernonRHI)
+    add_executable(VernonRhiCommandLifecycleTests rhi/rhi_command_lifecycle_test.cpp)
+    set_target_properties(VernonRhiCommandLifecycleTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                    "${CMAKE_BINARY_DIR}/source")
+    target_include_directories(VernonRhiCommandLifecycleTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                      "${VERNON_TEST_ROOT}/support")
+    target_link_libraries(VernonRhiCommandLifecycleTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
+    vernon_enable_glfw_context_owner_for_test(VernonRhiCommandLifecycleTests)
+    vernon_discover_gtests(VernonRhiCommandLifecycleTests)
+    vernon_stage_target_files(VernonRhiCommandLifecycleTests VernonRuntime VernonRHI)
     add_library(VernonRuntimeSupportNoExceptionsCheck OBJECT runtime/runtime_support_no_exceptions_compile.cpp)
     target_link_libraries(VernonRuntimeSupportNoExceptionsCheck PRIVATE Vernon::Runtime)
     if(MSVC)
@@ -771,6 +792,7 @@ if(TARGET VernonRuntime)
             VernonModuleProgramRuntimeTests
             PRIVATE GTest::gtest_main
                     Vernon::Runtime
+                    nlohmann_json::nlohmann_json
                     ${module_program_cpu_fixture_targets}
                     ${typed_specialization_fixture_target})
         target_include_directories(

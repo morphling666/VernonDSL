@@ -304,7 +304,8 @@ TEST(RuntimeStructuredStorageAutodiff, ZeroTapeBudgetRejectsForwardWithoutPublis
     EXPECT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(pullback, nullptr);
-    EXPECT_NE(lastError(context).find("tape has no allocator batch"), std::string::npos);
+    const std::string rejectionError = lastError(context);
+    EXPECT_EQ(rejectionError, "Program autodiff tape exceeds its memory budget");
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
     EXPECT_FLOAT_EQ(loss[0], -17.0f);
     EXPECT_FLOAT_EQ(loss[1], -31.0f);

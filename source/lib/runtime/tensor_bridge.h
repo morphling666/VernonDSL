@@ -1,30 +1,48 @@
 #ifndef VERNON_RUNTIME_TENSOR_BRIDGE_H
 #define VERNON_RUNTIME_TENSOR_BRIDGE_H
 
+#include "VernonResult.hpp"
 #include "VernonRuntime.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 namespace vernon::runtime {
 
 struct TransportNode;
 
-size_t dataTypeSize(VernonDataType dtype);
+enum class TensorBridgeError : uint8_t {
+    InvalidDataType,
+    InvalidShape,
+    InvalidLayout,
+    InvalidStorage,
+    InvalidCopyPlan,
+    IncompatibleRepresentation,
+    OutOfBounds,
+    Overflow,
+};
+
+template <typename T> using TensorBridgeResult = vernon::Result<T, TensorBridgeError>;
+
+struct TensorRelativeByteBounds {
+    size_t before{};
+    size_t after{};
+};
+
+TensorBridgeResult<size_t> dataTypeSize(VernonDataType dtype);
 
 bool valueLayoutValid(const VernonValueLayoutView &layout);
 bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayoutView &right);
 
-const uint8_t *hostTensorData(const VernonTensorView &tensor);
+vernon::Option<const uint8_t *> hostTensorData(const VernonTensorView &tensor);
 
-std::optional<size_t> tensorElementCount(const VernonTensorView &tensor);
-std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
+TensorBridgeResult<size_t> tensorElementCount(const VernonTensorView &tensor);
+TensorBridgeResult<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
 
-bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span);
+TensorBridgeResult<size_t> tensorRequiredSpan(const VernonTensorView &tensor);
 bool tensorFitsAllocation(const VernonTensorView &tensor);
-bool tensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after);
+TensorBridgeResult<TensorRelativeByteBounds> tensorRelativeByteBounds(const VernonTensorView &tensor);
 bool tensorByteLayoutInjective(const VernonTensorView &tensor);
 
 enum class TensorPhysicalOverlap {
@@ -54,16 +72,18 @@ struct TensorCopyPlan {
     std::vector<CopyOperation> operations;
 };
 
-std::optional<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
-                                                        const TransportNode &physicalValue);
-std::optional<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
-                                                           std::vector<uint64_t> logicalShape,
-                                                           const TransportNode &physicalStream);
+TensorBridgeResult<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
+                                                             const TransportNode &physicalValue);
+TensorBridgeResult<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
+                                                                std::vector<uint64_t> logicalShape,
+                                                                const TransportNode &physicalStream);
 
-std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &plan);
-bool unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor, const TensorCopyPlan &plan);
+TensorBridgeResult<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &plan);
+TensorBridgeResult<void> unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor,
+                                      const TensorCopyPlan &plan);
 
-std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
+TensorBridgeResult<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
+const char *tensorBridgeErrorMessage(TensorBridgeError error) noexcept;
 
 } // namespace vernon::runtime
 

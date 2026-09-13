@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -240,6 +241,113 @@ TEST(RuntimeForeignProvider, RejectsProvidersWithoutLifecycleCallbacks) {
     provider.release_resource = nullptr;
     EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(pipeline, nullptr);
+}
+
+TEST(RuntimeForeignProvider, ContainsProviderExceptionsAtTheCAbiBoundary) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+
+    provider.prepare_shader = [](void *, const VernonRuntimeProviderShaderDescriptor *,
+                                 VernonRuntimeProviderObject *) -> VernonStatus {
+        throw std::runtime_error("foreign provider failure");
+    };
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(pipeline, nullptr);
+
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.destroy_shader = [](void *, VernonRuntimeProviderObject) { throw std::runtime_error("cleanup failure"); };
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    EXPECT_NO_THROW(vernonRuntimeCorePipelineDestroy(pipeline));
+}
+
+TEST(RuntimeForeignProvider, ContainsEveryFallibleProviderCallbackClass) {
+    MockProvider mock;
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.get_capabilities = [](void *) -> uint32_t { throw std::runtime_error("capabilities"); };
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(pipeline, nullptr);
+
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.get_device_identity = [](void *) -> VernonRuntimeProviderDeviceIdentity {
+        throw std::runtime_error("identity");
+    };
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(pipeline, nullptr);
+
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.retain_resource = [](void *, VernonRuntimeProviderResourceReference) -> VernonStatus {
+        throw std::runtime_error("retain");
+    };
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    VernonRuntimeProviderBindingValue value{};
+    value.slot = 0;
+    value.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    value.payload.buffer.resource = {99, {100}, 0, 4096};
+    VernonRuntimeCoreBindings *bindings = nullptr;
+
+    EXPECT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(bindings, nullptr);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.create_binding_set = [](void *, const VernonRuntimeProviderBindingSetDescriptor *,
+                                     VernonRuntimeProviderObject *) -> VernonStatus {
+        throw std::runtime_error("create bindings");
+    };
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(bindings, nullptr);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+}
+
+TEST(RuntimeForeignProvider, ContainsEncodeAndDescriptionCallbackExceptions) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.encode_dispatch = [](void *, VernonRuntimeProviderObject,
+                                  const VernonRuntimeProviderDispatchDescriptor *) -> VernonStatus {
+        throw std::runtime_error("dispatch");
+    };
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderBindingValue value{};
+    value.slot = 0;
+    value.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    value.payload.buffer.resource = {99, {100}, 0, 4096};
+    VernonRuntimeCoreBindings *bindings = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
+
+    const uint32_t groups[3]{1, 1, 1};
+    EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {1}, groups, nullptr, 0),
+              VERNON_STATUS_INTERNAL_ERROR);
+
+    vernonRuntimeCoreBindingsDestroy(bindings);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+
+    descriptor = imagePipelineDescriptor();
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.describe_image = [](void *, VernonRuntimeProviderResourceReference,
+                                 VernonRuntimeProviderImageDescription *) -> VernonStatus {
+        throw std::runtime_error("describe");
+    };
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    std::array<VernonRuntimeProviderBindingValue, 2> images{};
+    images[0].slot = 0;
+    images[0].kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+    images[0].payload.image.view = {100, {1}, 0, 0};
+    images[1].slot = 1;
+    images[1].kind = VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+    images[1].payload.image.view = {100, {2}, 0, 0};
+    EXPECT_EQ(vernonRuntimeCoreCreateBindings(pipeline, images.data(), images.size(), &bindings),
+              VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(bindings, nullptr);
+    vernonRuntimeCorePipelineDestroy(pipeline);
 }
 
 TEST(RuntimeForeignProvider, PreparesBindsAndEncodesWithNumericSlots) {

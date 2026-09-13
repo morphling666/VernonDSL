@@ -5,36 +5,65 @@
 #include "invocation_outcome.h"
 #include "program_invocation_state.h"
 
+#include <functional>
 #include <variant>
 
 namespace vernon::runtime::program_execution {
+
+enum class PublicationError : uint8_t {
+    TransactionNotOpen,
+    TransactionNotPrepared,
+    PlanningFailed,
+    UnauthorizedBinding,
+    EndpointMismatch,
+    InvalidHostRegion,
+    IncompleteShape,
+    InvalidStagedValue,
+    AliasedDeviceBacking,
+    TensorCopyInvalid,
+    InvalidImageDestination,
+    InvalidImageParent,
+    ImageAllocationFailed,
+    ImageViewAllocationFailed,
+    ImageReferenceFailed,
+    ReadbackFailed,
+    CommitFailed,
+    ExecutorRequired,
+};
+
+template <typename T> using PublicationResult = vernon::Result<T, PublicationError>;
+
+const char *publicationErrorMessage(PublicationError error) noexcept;
+VernonStatus publicationErrorStatus(PublicationError error) noexcept;
 
 class PublicationTransaction {
 public:
     enum class Status { Open, Prepared, Committed, RolledBack, Poisoned };
 
     explicit PublicationTransaction(const program::ResolvedPublicationPlan &plan) : plan_(&plan) {}
-    ~PublicationTransaction() { rollback(); }
+    ~PublicationTransaction() noexcept { rollback(); }
 
-    bool bindHostCommit(uint32_t slot, const program::PublicationTarget &target,
-                        const VernonProgramArgument &destination, std::string &error);
-    bool bindDeviceCommit(uint32_t slot, const program::PublicationTarget &target,
-                          const VernonProgramArgument &destination, VernonRhiBuffer destinationBuffer,
-                          std::string &error);
-    bool bindImageCommit(VernonRuntimeContext &context, uint32_t slot, const program::PublicationTarget &target,
-                         const VernonProgramArgument &destination, VernonProgramArgument &staging, std::string &error);
-    bool bindInPlace(uint32_t slot, const VernonProgramArgument &destination, std::string &error);
-    bool stageHostRegion(uint32_t slot, void *destination, const void *source, size_t size, std::string &error);
-    bool applyConcreteShapes(const program::Program &program, std::vector<ProgramValueState> &values,
-                             std::string &error) const;
+    PublicationResult<void> bindHostCommit(uint32_t slot, const program::PublicationTarget &target,
+                                           const VernonProgramArgument &destination);
+    PublicationResult<void> bindDeviceCommit(uint32_t slot, const program::PublicationTarget &target,
+                                             const VernonProgramArgument &destination,
+                                             VernonRhiBuffer destinationBuffer);
+    PublicationResult<void> bindImageCommit(VernonRuntimeContext &context, uint32_t slot,
+                                            const program::PublicationTarget &target,
+                                            const VernonProgramArgument &destination, VernonProgramArgument &staging);
+    PublicationResult<void> bindInPlace(uint32_t slot, const VernonProgramArgument &destination);
+    PublicationResult<void> stageHostRegion(uint32_t slot, void *destination, const void *source, size_t size);
+    PublicationResult<void> applyConcreteShapes(const program::Program &program,
+                                                std::vector<ProgramValueState> &values) const;
     std::vector<char> hostReadbackValues(size_t valueCount) const;
     std::vector<DeviceImageCopy> initializationImageCopies() const;
-    VernonStatus prepareCommit(const ProgramInvocationState &state, std::vector<DeviceBufferCopy> &bufferCopies,
-                               std::vector<DeviceImageCopy> &imageCopies, std::string &error);
-    VernonStatus completeCommit(std::string &error);
-    VernonStatus commit(VernonRuntimeContext &context, const ProgramInvocationState &state, std::string &error);
-    void rollback();
-    void poison();
+    PublicationResult<void> prepareCommit(const ProgramInvocationState &state,
+                                          std::vector<DeviceBufferCopy> &bufferCopies,
+                                          std::vector<DeviceImageCopy> &imageCopies);
+    PublicationResult<void> completeCommit();
+    PublicationResult<void> commit(VernonRuntimeContext &context, const ProgramInvocationState &state);
+    void rollback() noexcept;
+    void poison() noexcept;
     void noteSubmission(SubmissionState state);
     void noteInPlaceSubmission(SubmissionState state);
     InvocationMutationOutcome mutationOutcome() const;
@@ -85,10 +114,10 @@ private:
         bool inPlace{};
     };
 
-    const program::ResolvedPublicationTransaction *resolve(uint32_t slot, program::PublicationCommitMode mode,
-                                                           std::string &error) const;
+    PublicationResult<std::reference_wrapper<const program::ResolvedPublicationTransaction>>
+    resolve(uint32_t slot, program::PublicationCommitMode mode) const;
     bool slotIsBound(uint32_t slot) const;
-    void releaseDeviceImages();
+    void releaseDeviceImages() noexcept;
 
     const program::ResolvedPublicationPlan *plan_;
     std::vector<Entry> entries_;

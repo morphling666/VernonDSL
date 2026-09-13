@@ -108,10 +108,11 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             request.boundaries->valueBySlot,
             &request.boundaries->publication,
         };
-        if (!plan ||
-            !bindProgramBoundaries(context, execution, *plan, binding, externalValues, backings, live, error) ||
-            !request.boundaries->publication.applyConcreteShapes(execution, values, error))
+        if (!plan || !bindProgramBoundaries(context, execution, *plan, binding, externalValues, backings, live, error))
             return false;
+        auto applied = request.boundaries->publication.applyConcreteShapes(execution, values);
+        if (applied.isErr())
+            return error = program_execution::publicationErrorMessage(applied.error()), false;
         for (auto &[value, argument] : externalValues) {
             if (value >= execution.values.size() || execution.values[value].storage ||
                 argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||

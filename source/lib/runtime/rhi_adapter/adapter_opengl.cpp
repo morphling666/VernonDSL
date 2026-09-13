@@ -790,8 +790,11 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
-    if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device) ||
-        commandEncoderRendering(adapter, commandEncoder))
+    const uint64_t native = std::move(nativeCommand).value();
+    auto rendering = commandEncoderRendering(adapter, commandEncoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (native != reinterpret_cast<uintptr_t>(&device) || std::move(rendering).value())
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"opengl_dispatch_command_encoder_is_invalid", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -863,19 +866,27 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     auto renderingClaim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
     if (!renderingClaim)
         return RhiAdapterResult<void>{vernon::err(std::move(renderingClaim).error())};
-    const int claim = std::move(renderingClaim).value();
+    const vernon::rhi::CommandRenderingClaim claim = std::move(renderingClaim).value();
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
-    if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device) || claim < 0)
+    if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"opengl_draw_command_encoder_is_invalid", 0, 0}})};
-    const bool firstDraw = claim != 0;
-    const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-    auto renderingObject = commandRenderingObject(adapter, commandEncoder, pipeline->native->framebuffer);
+    const bool firstDraw = claim == vernon::rhi::CommandRenderingClaim::Acquired;
+    auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+    if (!hasRenderingDescriptor)
+        return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
+    const bool standaloneRendering = !std::move(hasRenderingDescriptor).value();
+    auto renderingObject = commandRenderingObject(
+        adapter, commandEncoder, vernon::Option<uint64_t>{vernon::some(pipeline->native->framebuffer)});
     if (!renderingObject)
         return RhiAdapterResult<void>{vernon::err(std::move(renderingObject).error())};
-    const uint64_t renderingFramebuffer = std::move(renderingObject).value();
+    auto renderingFramebufferOption = std::move(renderingObject).value();
+    if (!renderingFramebufferOption)
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::LifecycleFailure, {"opengl_rendering_object_is_unavailable", 0, 0}})};
+    const uint64_t renderingFramebuffer = std::move(renderingFramebufferOption).value();
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_provider_objects", 0, 0}})};
@@ -1415,9 +1426,10 @@ namespace vernon::runtime {
 VernonRuntimeRhiAdapter *createOpenGLRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
     if (backend != VERNON_RHI_BACKEND_OPENGL && backend != VERNON_RHI_BACKEND_OPENGL_ES)
         return nullptr;
-    auto *deviceState = static_cast<rhi::opengl::DeviceState *>(rhi::deviceState(device, backend));
-    if (!deviceState)
+    auto resolvedDeviceState = rhi::deviceState(device, backend);
+    if (resolvedDeviceState.isErr())
         return nullptr;
+    auto *deviceState = static_cast<rhi::opengl::DeviceState *>(resolvedDeviceState.value());
     auto state = std::unique_ptr<rhi_adapter::OpenGLAdapterState>(new (std::nothrow) rhi_adapter::OpenGLAdapterState());
     auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
     if (!state || !adapter)

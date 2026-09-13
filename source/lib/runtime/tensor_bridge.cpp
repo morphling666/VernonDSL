@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <string_view>
 
 namespace vernon::runtime {
 namespace {
@@ -13,26 +14,25 @@ uint64_t strideMagnitude(int64_t stride) {
     return stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
 }
 
-bool computeTensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
+TensorBridgeResult<TensorRelativeByteBounds> computeTensorRelativeByteBounds(const VernonTensorView &tensor) {
     if (tensor.rank && (!tensor.shape || !tensor.byte_strides))
-        return false;
-    before = 0;
-    after = 0;
+        return TensorBridgeResult<TensorRelativeByteBounds>{vernon::err(TensorBridgeError::InvalidShape)};
+    TensorRelativeByteBounds bounds;
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
         if (!tensor.shape[dimension])
-            return true;
+            return TensorBridgeResult<TensorRelativeByteBounds>{vernon::ok(bounds)};
         const uint64_t steps = tensor.shape[dimension] - 1;
         const uint64_t magnitude = strideMagnitude(tensor.byte_strides[dimension]);
         if (magnitude > std::numeric_limits<size_t>::max() ||
             (steps && magnitude > std::numeric_limits<size_t>::max() / steps))
-            return false;
+            return TensorBridgeResult<TensorRelativeByteBounds>{vernon::err(TensorBridgeError::Overflow)};
         const size_t extent = static_cast<size_t>(steps * magnitude);
-        size_t &bound = tensor.byte_strides[dimension] < 0 ? before : after;
+        size_t &bound = tensor.byte_strides[dimension] < 0 ? bounds.before : bounds.after;
         if (extent > std::numeric_limits<size_t>::max() - bound)
-            return false;
+            return TensorBridgeResult<TensorRelativeByteBounds>{vernon::err(TensorBridgeError::Overflow)};
         bound += extent;
     }
-    return true;
+    return TensorBridgeResult<TensorRelativeByteBounds>{vernon::ok(bounds)};
 }
 
 struct TransportScalar {
@@ -98,22 +98,22 @@ bool addPhysicalOffset(uint64_t base, size_t offset, uint64_t &result) {
 }
 
 bool tensorPhysicalRange(const VernonTensorView &tensor, TensorPhysicalRange &range) {
-    const std::optional<size_t> count = tensorElementCount(tensor);
-    if (!count || !tensorFitsAllocation(tensor))
+    auto count = tensorElementCount(tensor);
+    if (count.isErr() || !tensorFitsAllocation(tensor))
         return false;
-    if (!*count) {
+    if (!count.value()) {
         range.empty = true;
         return true;
     }
 
-    size_t before = 0;
-    size_t after = 0;
-    if (!tensorRelativeByteBounds(tensor, before, after))
+    auto bounds = tensorRelativeByteBounds(tensor);
+    if (bounds.isErr())
         return false;
-    const size_t localBegin = tensor.byte_offset - before;
-    if (tensor.element_layout.byte_size > std::numeric_limits<size_t>::max() - tensor.byte_offset - after)
+    const size_t localBegin = tensor.byte_offset - bounds.value().before;
+    if (tensor.element_layout.byte_size >
+        std::numeric_limits<size_t>::max() - tensor.byte_offset - bounds.value().after)
         return false;
-    const size_t localEnd = tensor.byte_offset + after + tensor.element_layout.byte_size;
+    const size_t localEnd = tensor.byte_offset + bounds.value().after + tensor.element_layout.byte_size;
 
     if (tensor.storage == VERNON_TENSOR_HOST) {
         if (!tensor.host_data)
@@ -214,43 +214,43 @@ bool periodicSpansProveDisjoint(const VernonTensorView &left, uint64_t leftAddre
 
 } // namespace
 
-size_t dataTypeSize(VernonDataType dtype) {
+TensorBridgeResult<size_t> dataTypeSize(VernonDataType dtype) {
     switch (dtype) {
     case VERNON_DATA_BOOL:
     case VERNON_DATA_U8:
-        return 1;
+        return TensorBridgeResult<size_t>{vernon::ok(size_t{1})};
     case VERNON_DATA_F16:
-        return 2;
+        return TensorBridgeResult<size_t>{vernon::ok(size_t{2})};
     case VERNON_DATA_I32:
     case VERNON_DATA_U32:
     case VERNON_DATA_F32:
-        return 4;
+        return TensorBridgeResult<size_t>{vernon::ok(size_t{4})};
     case VERNON_DATA_F64:
-        return 8;
+        return TensorBridgeResult<size_t>{vernon::ok(size_t{8})};
     }
-    return 0;
+    return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::InvalidDataType)};
 }
 
 namespace {
 
-const char *dataTypeRepresentation(VernonDataType dtype) {
+vernon::Option<std::string_view> dataTypeRepresentation(VernonDataType dtype) {
     switch (dtype) {
     case VERNON_DATA_BOOL:
-        return "bool";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"bool"})};
     case VERNON_DATA_U8:
-        return "u8";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"u8"})};
     case VERNON_DATA_F16:
-        return "f16";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"f16"})};
     case VERNON_DATA_I32:
-        return "i32";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"i32"})};
     case VERNON_DATA_U32:
-        return "u32";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"u32"})};
     case VERNON_DATA_F32:
-        return "f32";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"f32"})};
     case VERNON_DATA_F64:
-        return "f64";
+        return vernon::Option<std::string_view>{vernon::some(std::string_view{"f64"})};
     }
-    return "";
+    return {};
 }
 
 } // namespace
@@ -262,9 +262,9 @@ bool valueLayoutValid(const VernonValueLayoutView &layout) {
         return false;
     for (size_t index = 0; index < layout.leaf_count; ++index) {
         const VernonValueLeafView &leaf = layout.leaves[index];
-        const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
-        if (!scalarSize || !leaf.scalar_count || leaf.byte_offset >= layout.byte_size ||
-            leaf.scalar_count > (layout.byte_size - leaf.byte_offset) / scalarSize)
+        auto scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
+        if (scalarSize.isErr() || !leaf.scalar_count || leaf.byte_offset >= layout.byte_size ||
+            leaf.scalar_count > (layout.byte_size - leaf.byte_offset) / scalarSize.value())
             return false;
     }
     return true;
@@ -284,78 +284,82 @@ bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayou
     return true;
 }
 
-const uint8_t *hostTensorData(const VernonTensorView &tensor) {
+vernon::Option<const uint8_t *> hostTensorData(const VernonTensorView &tensor) {
     if (!tensor.host_data)
-        return nullptr;
-    return static_cast<const uint8_t *>(tensor.host_data) + tensor.byte_offset;
+        return {};
+    return vernon::Option<const uint8_t *>{
+        vernon::some(static_cast<const uint8_t *>(tensor.host_data) + tensor.byte_offset)};
 }
 
-std::optional<size_t> tensorElementCount(const VernonTensorView &tensor) {
+TensorBridgeResult<size_t> tensorElementCount(const VernonTensorView &tensor) {
     if (tensor.rank && !tensor.shape)
-        return std::nullopt;
+        return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::InvalidShape)};
     size_t count = 1;
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
         if (!count)
-            return 0;
+            return TensorBridgeResult<size_t>{vernon::ok(size_t{0})};
         if (tensor.shape[dimension] > std::numeric_limits<size_t>::max() / count)
-            return std::nullopt;
+            return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::Overflow)};
         count *= static_cast<size_t>(tensor.shape[dimension]);
     }
-    return count;
+    return TensorBridgeResult<size_t>{vernon::ok(count)};
 }
 
-std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
+TensorBridgeResult<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
-    const std::optional<size_t> elementCount = tensorElementCount(tensor);
-    if (!elementSize || !elementCount || *elementCount > std::numeric_limits<size_t>::max() / elementSize)
-        return std::nullopt;
-    return *elementCount * elementSize;
+    if (!elementSize)
+        return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::InvalidLayout)};
+    auto elementCount = tensorElementCount(tensor);
+    if (elementCount.isErr())
+        return TensorBridgeResult<size_t>{vernon::err(elementCount.error())};
+    if (elementCount.value() > std::numeric_limits<size_t>::max() / elementSize)
+        return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::Overflow)};
+    return TensorBridgeResult<size_t>{vernon::ok(elementCount.value() * elementSize)};
 }
 
-bool tensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
-    return computeTensorRelativeByteBounds(tensor, before, after);
+TensorBridgeResult<TensorRelativeByteBounds> tensorRelativeByteBounds(const VernonTensorView &tensor) {
+    return computeTensorRelativeByteBounds(tensor);
 }
 
-bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span) {
+TensorBridgeResult<size_t> tensorRequiredSpan(const VernonTensorView &tensor) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
-    const std::optional<size_t> elementCount = tensorElementCount(tensor);
-    if (!elementSize || !elementCount)
-        return false;
-    if (!*elementCount) {
-        span = 0;
-        return true;
-    }
-    size_t before = 0;
-    size_t after = 0;
-    if (!tensorRelativeByteBounds(tensor, before, after) || after > std::numeric_limits<size_t>::max() - before ||
-        elementSize > std::numeric_limits<size_t>::max() - before - after)
-        return false;
-    span = before + after + elementSize;
-    return true;
+    if (!elementSize)
+        return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::InvalidLayout)};
+    auto elementCount = tensorElementCount(tensor);
+    if (elementCount.isErr())
+        return TensorBridgeResult<size_t>{vernon::err(elementCount.error())};
+    if (!elementCount.value())
+        return TensorBridgeResult<size_t>{vernon::ok(size_t{0})};
+    auto bounds = tensorRelativeByteBounds(tensor);
+    if (bounds.isErr())
+        return TensorBridgeResult<size_t>{vernon::err(bounds.error())};
+    if (bounds.value().after > std::numeric_limits<size_t>::max() - bounds.value().before ||
+        elementSize > std::numeric_limits<size_t>::max() - bounds.value().before - bounds.value().after)
+        return TensorBridgeResult<size_t>{vernon::err(TensorBridgeError::Overflow)};
+    return TensorBridgeResult<size_t>{vernon::ok(bounds.value().before + bounds.value().after + elementSize)};
 }
 
 bool tensorFitsAllocation(const VernonTensorView &tensor) {
-    size_t span = 0;
-    const std::optional<size_t> elementCount = tensorElementCount(tensor);
-    if (!elementCount || !tensorRequiredSpan(tensor, span) || tensor.byte_offset > tensor.byte_size)
+    auto elementCount = tensorElementCount(tensor);
+    auto span = tensorRequiredSpan(tensor);
+    if (elementCount.isErr() || span.isErr() || tensor.byte_offset > tensor.byte_size)
         return false;
-    if (!*elementCount)
+    if (!elementCount.value())
         return true;
-    size_t before = 0;
-    size_t after = 0;
-    if (!tensorRelativeByteBounds(tensor, before, after) || before > tensor.byte_offset)
+    auto bounds = tensorRelativeByteBounds(tensor);
+    if (bounds.isErr() || bounds.value().before > tensor.byte_offset)
         return false;
     const size_t availableAfter = tensor.byte_size - tensor.byte_offset;
     const size_t elementSize = tensor.element_layout.byte_size;
-    return after <= availableAfter && elementSize <= availableAfter - after;
+    return bounds.value().after <= availableAfter && elementSize <= availableAfter - bounds.value().after;
 }
 
 bool tensorByteLayoutInjective(const VernonTensorView &tensor) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
-    const std::optional<size_t> elementCount = tensorElementCount(tensor);
-    if (!elementSize || !elementCount || !tensorFitsAllocation(tensor))
+    auto elementCount = tensorElementCount(tensor);
+    if (!elementSize || elementCount.isErr() || !tensorFitsAllocation(tensor))
         return false;
-    if (*elementCount < 2)
+    if (elementCount.value() < 2)
         return true;
 
     if (elementSize - 1 > std::numeric_limits<uint64_t>::max())
@@ -462,13 +466,13 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
 
 namespace {
 
-std::optional<TensorCopyPlan> compileValueCopyPlan(const VernonValueLayoutView &canonical,
-                                                   const TransportNode &physicalValue, size_t byteSize) {
-    if (!valueLayoutValid(canonical) || byteSize > std::numeric_limits<size_t>::max())
-        return std::nullopt;
+TensorBridgeResult<TensorCopyPlan> compileValueCopyPlan(const VernonValueLayoutView &canonical,
+                                                        const TransportNode &physicalValue, size_t byteSize) {
+    if (!valueLayoutValid(canonical))
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::InvalidLayout)};
     std::vector<TransportScalar> physicalScalars;
     if (!collectTransportScalars(physicalValue, 0, physicalScalars))
-        return std::nullopt;
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
 
     TensorCopyPlan plan;
     plan.elementSize = canonical.byte_size;
@@ -476,19 +480,20 @@ std::optional<TensorCopyPlan> compileValueCopyPlan(const VernonValueLayoutView &
     size_t scalarIndex = 0;
     for (size_t leafIndex = 0; leafIndex < canonical.leaf_count; ++leafIndex) {
         const VernonValueLeafView &leaf = canonical.leaves[leafIndex];
-        const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
-        if (!scalarSize || leaf.scalar_count > std::numeric_limits<size_t>::max() / scalarSize ||
+        auto scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
+        if (scalarSize.isErr() || leaf.scalar_count > std::numeric_limits<size_t>::max() / scalarSize.value() ||
             scalarIndex > physicalScalars.size() || leaf.scalar_count > physicalScalars.size() - scalarIndex)
-            return std::nullopt;
+            return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
         for (size_t lane = 0; lane < leaf.scalar_count; ++lane) {
             const TransportScalar &physical = physicalScalars[scalarIndex++];
+            auto representation = dataTypeRepresentation(static_cast<VernonDataType>(leaf.dtype));
             const bool compatibleRepresentation =
-                physical.representation == dataTypeRepresentation(static_cast<VernonDataType>(leaf.dtype)) ||
+                (representation && physical.representation == representation.value()) ||
                 (leaf.dtype == VERNON_DATA_U32 &&
                  (physical.representation == "i32" || physical.representation == "u32"));
-            if (physical.size != scalarSize || !compatibleRepresentation)
-                return std::nullopt;
-            CopyOperation operation{leaf.byte_offset + lane * scalarSize, physical.offset, scalarSize};
+            if (physical.size != scalarSize.value() || !compatibleRepresentation)
+                return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::IncompatibleRepresentation)};
+            CopyOperation operation{leaf.byte_offset + lane * scalarSize.value(), physical.offset, scalarSize.value()};
             if (!plan.operations.empty()) {
                 CopyOperation &previous = plan.operations.back();
                 if (previous.sourceOffset + previous.size == operation.sourceOffset &&
@@ -501,101 +506,104 @@ std::optional<TensorCopyPlan> compileValueCopyPlan(const VernonValueLayoutView &
         }
     }
     if (scalarIndex != physicalScalars.size())
-        return std::nullopt;
-    return plan;
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
+    return TensorBridgeResult<TensorCopyPlan>{vernon::ok(std::move(plan))};
 }
 
 } // namespace
 
-std::optional<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
-                                                        const TransportNode &physicalValue) {
+TensorBridgeResult<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
+                                                             const TransportNode &physicalValue) {
     if (physicalValue.size > std::numeric_limits<size_t>::max())
-        return std::nullopt;
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::Overflow)};
     return compileValueCopyPlan(canonicalValue, physicalValue, static_cast<size_t>(physicalValue.size));
 }
 
-std::optional<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
-                                                           std::vector<uint64_t> logicalShape,
-                                                           const TransportNode &physicalStream) {
+TensorBridgeResult<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
+                                                                std::vector<uint64_t> logicalShape,
+                                                                const TransportNode &physicalStream) {
     if (physicalStream.kind != TransportNodeKind::Array || physicalStream.children.size() != 1 ||
         physicalStream.byteStrides.size() != logicalShape.size() ||
         physicalStream.size > std::numeric_limits<size_t>::max())
-        return std::nullopt;
-    std::optional<TensorCopyPlan> plan =
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
+    auto plan =
         compileValueCopyPlan(elementLayout, physicalStream.children.front(), static_cast<size_t>(physicalStream.size));
-    if (!plan)
-        return std::nullopt;
-    plan->shape = std::move(logicalShape);
+    if (plan.isErr())
+        return TensorBridgeResult<TensorCopyPlan>{vernon::err(plan.error())};
+    plan.value().shape = std::move(logicalShape);
     for (uint64_t stride : physicalStream.byteStrides) {
         if (stride > std::numeric_limits<size_t>::max())
-            return std::nullopt;
-        plan->byteStrides.push_back(static_cast<size_t>(stride));
+            return TensorBridgeResult<TensorCopyPlan>{vernon::err(TensorBridgeError::Overflow)};
+        plan.value().byteStrides.push_back(static_cast<size_t>(stride));
     }
     return plan;
 }
 
-std::optional<std::vector<uint8_t>> packWholeValue(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+TensorBridgeResult<std::vector<uint8_t>> packWholeValue(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
     if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) || layout.operations.empty() ||
         !layout.shape.empty() || !layout.byteStrides.empty() || layout.byteSize < layout.elementSize)
-        return std::nullopt;
-    std::optional<std::vector<uint8_t>> logical;
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
+    std::vector<uint8_t> logical;
     if (tensor.rank == 0 && tensor.element_layout.byte_size == layout.elementSize) {
-        const uint8_t *source = hostTensorData(tensor);
+        auto source = hostTensorData(tensor);
         if (!source || !tensorFitsAllocation(tensor))
-            return std::nullopt;
-        logical = std::vector<uint8_t>(source, source + layout.elementSize);
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::OutOfBounds)};
+        logical.assign(source.value(), source.value() + layout.elementSize);
     } else {
-        logical = packTensorRowMajor(tensor);
-        if (!logical || logical->size() != layout.elementSize)
-            return std::nullopt;
+        auto packed = packTensorRowMajor(tensor);
+        if (packed.isErr())
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(packed.error())};
+        logical = std::move(packed).value();
+        if (logical.size() != layout.elementSize)
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidLayout)};
     }
     std::vector<uint8_t> packed(layout.byteSize);
     for (const CopyOperation &operation : layout.operations) {
-        if (operation.sourceOffset > logical->size() || operation.size > logical->size() - operation.sourceOffset ||
+        if (operation.sourceOffset > logical.size() || operation.size > logical.size() - operation.sourceOffset ||
             operation.destinationOffset > packed.size() || operation.size > packed.size() - operation.destinationOffset)
-            return std::nullopt;
-        std::memcpy(packed.data() + operation.destinationOffset, logical->data() + operation.sourceOffset,
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::OutOfBounds)};
+        std::memcpy(packed.data() + operation.destinationOffset, logical.data() + operation.sourceOffset,
                     operation.size);
     }
-    return packed;
+    return TensorBridgeResult<std::vector<uint8_t>>{vernon::ok(std::move(packed))};
 }
 
-std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+TensorBridgeResult<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
     if (layout.shape.empty() && layout.byteStrides.empty())
         return packWholeValue(tensor, layout);
     if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) ||
         tensor.element_layout.byte_size != layout.elementSize || tensor.rank != layout.shape.size() ||
         layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape) || layout.operations.empty())
-        return std::nullopt;
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
     const size_t elementSize = tensor.element_layout.byte_size;
     if (!elementSize || !tensorFitsAllocation(tensor))
-        return std::nullopt;
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::OutOfBounds)};
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
         if (tensor.shape[dimension] != layout.shape[dimension])
-            return std::nullopt;
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidShape)};
 
-    const std::optional<size_t> elementCount = tensorElementCount(tensor);
-    if (!elementCount)
-        return std::nullopt;
-    size_t requiredSize = *elementCount ? elementSize : 0;
-    if (*elementCount)
+    auto elementCount = tensorElementCount(tensor);
+    if (elementCount.isErr())
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(elementCount.error())};
+    size_t requiredSize = elementCount.value() ? elementSize : 0;
+    if (elementCount.value())
         for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
             const uint64_t steps = layout.shape[dimension] - 1;
             if (steps && layout.byteStrides[dimension] > (std::numeric_limits<size_t>::max() - requiredSize) / steps)
-                return std::nullopt;
+                return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::Overflow)};
             requiredSize += static_cast<size_t>(steps) * layout.byteStrides[dimension];
         }
     if (requiredSize > layout.byteSize)
-        return std::nullopt;
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::OutOfBounds)};
 
     std::vector<uint8_t> packed(layout.byteSize);
-    if (!*elementCount)
-        return packed;
-    const uint8_t *source = hostTensorData(tensor);
+    if (!elementCount.value())
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::ok(std::move(packed))};
+    auto source = hostTensorData(tensor);
     if (!source)
-        return std::nullopt;
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidStorage)};
 
-    for (size_t linear = 0; linear < *elementCount; ++linear) {
+    for (size_t linear = 0; linear < elementCount.value(); ++linear) {
         size_t remainder = linear;
         size_t positiveOffset = 0;
         size_t negativeOffset = 0;
@@ -608,42 +616,47 @@ std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, c
             (tensor.byte_strides[dimension] < 0 ? negativeOffset : positiveOffset) += offset;
             destinationOffset += index * layout.byteStrides[dimension];
         }
-        const uint8_t *sourceElement = source + positiveOffset - negativeOffset;
+        const uint8_t *sourceElement = source.value() + positiveOffset - negativeOffset;
         for (const CopyOperation &operation : layout.operations) {
             if (destinationOffset > packed.size() || operation.destinationOffset > packed.size() - destinationOffset ||
                 operation.size > packed.size() - destinationOffset - operation.destinationOffset ||
                 operation.sourceOffset > elementSize || operation.size > elementSize - operation.sourceOffset)
-                return std::nullopt;
+                return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::OutOfBounds)};
             std::memcpy(packed.data() + destinationOffset + operation.destinationOffset,
                         sourceElement + operation.sourceOffset, operation.size);
         }
     }
-    return packed;
+    return TensorBridgeResult<std::vector<uint8_t>>{vernon::ok(std::move(packed))};
 }
 
-bool unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+TensorBridgeResult<void> unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor,
+                                      const TensorCopyPlan &layout) {
     if (tensor.storage != VERNON_TENSOR_HOST || tensor.rank != 0 || !layout.shape.empty() ||
         !layout.byteStrides.empty() || packed.size() != layout.byteSize ||
         tensor.element_layout.byte_size != layout.elementSize || !tensorFitsAllocation(tensor))
-        return false;
+        return TensorBridgeResult<void>{vernon::err(TensorBridgeError::InvalidCopyPlan)};
     if (!tensor.host_data)
-        return false;
+        return TensorBridgeResult<void>{vernon::err(TensorBridgeError::InvalidStorage)};
     uint8_t *destination = static_cast<uint8_t *>(const_cast<void *>(tensor.host_data)) + tensor.byte_offset;
     for (const CopyOperation &operation : layout.operations) {
         if (operation.destinationOffset > packed.size() ||
             operation.size > packed.size() - operation.destinationOffset ||
             operation.sourceOffset > layout.elementSize || operation.size > layout.elementSize - operation.sourceOffset)
-            return false;
+            return TensorBridgeResult<void>{vernon::err(TensorBridgeError::OutOfBounds)};
         std::memcpy(destination + operation.sourceOffset, packed.data() + operation.destinationOffset, operation.size);
     }
-    return true;
+    return TensorBridgeResult<void>{vernon::ok()};
 }
 
-std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
+TensorBridgeResult<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
-    const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);
-    if (!elementSize || !packedSize || (tensor.rank && !tensor.shape))
-        return std::nullopt;
+    auto packedSize = tensorLogicalByteSize(tensor);
+    if (!elementSize)
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidLayout)};
+    if (packedSize.isErr())
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(packedSize.error())};
+    if (tensor.rank && !tensor.shape)
+        return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::InvalidShape)};
     TensorCopyPlan layout;
     layout.elementSize = elementSize;
     if (tensor.rank)
@@ -653,12 +666,34 @@ std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &t
     for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
         layout.byteStrides[dimension] = stride;
         if (layout.shape[dimension] && stride > std::numeric_limits<size_t>::max() / layout.shape[dimension])
-            return std::nullopt;
+            return TensorBridgeResult<std::vector<uint8_t>>{vernon::err(TensorBridgeError::Overflow)};
         stride *= static_cast<size_t>(layout.shape[dimension]);
     }
-    layout.byteSize = *packedSize;
+    layout.byteSize = packedSize.value();
     layout.operations.push_back({0, 0, elementSize});
     return packTensor(tensor, layout);
+}
+
+const char *tensorBridgeErrorMessage(TensorBridgeError error) noexcept {
+    switch (error) {
+    case TensorBridgeError::InvalidDataType:
+        return "Tensor data type is invalid";
+    case TensorBridgeError::InvalidShape:
+        return "Tensor shape metadata is invalid";
+    case TensorBridgeError::InvalidLayout:
+        return "Tensor value layout is invalid";
+    case TensorBridgeError::InvalidStorage:
+        return "Tensor storage is invalid";
+    case TensorBridgeError::InvalidCopyPlan:
+        return "Tensor copy plan is invalid";
+    case TensorBridgeError::IncompatibleRepresentation:
+        return "Tensor physical representation is incompatible";
+    case TensorBridgeError::OutOfBounds:
+        return "Tensor byte range is out of bounds";
+    case TensorBridgeError::Overflow:
+        return "Tensor byte arithmetic overflowed";
+    }
+    return "unknown Tensor bridge error";
 }
 
 } // namespace vernon::runtime

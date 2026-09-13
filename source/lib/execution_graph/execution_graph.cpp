@@ -360,9 +360,10 @@ GraphBuffer CommandGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
         result.handle = buffer;
         return result;
     }
-    const uint64_t resourceKey = vernon::rhi::bufferResource(device_, buffer);
-    if (!resourceKey)
+    auto resourceKeyResult = vernon::rhi::bufferResource(device_, buffer);
+    if (!resourceKeyResult)
         return {};
+    const uint64_t resourceKey = std::move(resourceKeyResult).value();
     auto retained = vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
     if (retained.isErr())
         return {};
@@ -397,13 +398,17 @@ GraphBuffer CommandGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
 GraphImage CommandGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
     if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
-    const uint64_t imageKey = vernon::rhi::imageResource(device_, image);
-    const uint64_t viewKey = vernon::rhi::imageViewResource(device_, view);
+    auto imageKeyResult = vernon::rhi::imageResource(device_, image);
+    if (!imageKeyResult)
+        return {};
+    const uint64_t imageKey = std::move(imageKeyResult).value();
+    auto viewKeyResult = vernon::rhi::imageViewResource(device_, view);
+    if (!viewKeyResult)
+        return {};
+    const uint64_t viewKey = std::move(viewKeyResult).value();
     VernonRhiImageDescriptor imageDescriptor{};
     VernonRhiImageViewDescriptor viewDescriptor{};
     uint64_t parentKey{};
-    if (!imageKey || !viewKey)
-        return {};
     auto described =
         vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey);
     if (described.isErr() || parentKey != imageKey)

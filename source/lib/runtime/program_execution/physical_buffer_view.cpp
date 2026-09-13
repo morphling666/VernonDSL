@@ -24,10 +24,12 @@ bool materializePhysicalBufferView(const shape::DeclaredShape &declaredShape, co
         return false;
     const ValueLeaf &leaf = layout.leaves.front();
     const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
-    const size_t scalarBytes = dtype ? dataTypeSize(*dtype) : 0;
+    if (!dtype)
+        return false;
+    auto scalarBytes = dataTypeSize(*dtype);
     size_t elementBytes = 0;
-    if (!scalarBytes || !leaf.scalarCount ||
-        !checkedMultiply(scalarBytes, static_cast<size_t>(leaf.scalarCount), elementBytes) || !elementBytes)
+    if (scalarBytes.isErr() || !leaf.scalarCount ||
+        !checkedMultiply(scalarBytes.value(), static_cast<size_t>(leaf.scalarCount), elementBytes) || !elementBytes)
         return false;
     size_t elements = 0;
     return shape::resolveSingleDynamicExtent(declaredShape, elementBytes, logicalBytes, view.shape) &&

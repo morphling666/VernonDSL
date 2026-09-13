@@ -338,20 +338,22 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     program_execution::ProgramInvocationState invocation(plan, std::move(storage), {});
     program_execution::PublicationTransaction invalid(plan.publications);
     std::string error;
-    ASSERT_TRUE(invalid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
+    ASSERT_TRUE(invalid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination))).isOk());
     ASSERT_TRUE(
-        invalid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2), error));
+        invalid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2)).isOk());
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
-    EXPECT_EQ(invalid.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    auto invalidCommit = invalid.commit(*context, invocation);
+    ASSERT_TRUE(invalidCommit.isErr());
+    EXPECT_EQ(program_execution::publicationErrorStatus(invalidCommit.error()), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(firstDestination, -1.0f);
     EXPECT_EQ(secondDestination, -2.0f);
 
     program_execution::PublicationTransaction valid(plan.publications);
-    ASSERT_TRUE(valid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
-    ASSERT_TRUE(valid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination)), error));
-    ASSERT_EQ(valid.commit(*context, invocation, error), VERNON_STATUS_OK) << error;
+    ASSERT_TRUE(valid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination))).isOk());
+    ASSERT_TRUE(valid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination))).isOk());
+    ASSERT_TRUE(valid.commit(*context, invocation).isOk());
     EXPECT_EQ(valid.status(), program_execution::PublicationTransaction::Status::Committed);
     EXPECT_EQ(firstDestination, firstSource);
     EXPECT_EQ(secondDestination, secondSource);
@@ -367,7 +369,7 @@ TEST(ProgramPublication, RollbackLeavesDestinationUnchanged) {
     }};
     program_execution::PublicationTransaction transaction(plan);
     std::string error;
-    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination)), error));
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination))).isOk());
     transaction.rollback();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -1.0f);
@@ -388,11 +390,13 @@ TEST(ProgramPublication, CommitInjectionLeavesHostDestinationUnchanged) {
     program_execution::ProgramInvocationState invocation(plan, std::move(values), {});
     program_execution::PublicationTransaction transaction(plan.publications);
     std::string error;
-    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination)), error));
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination))).isOk());
     program_execution::setFailureInjectionForTesting(program_execution::FailureBoundary::Commit);
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
-    EXPECT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_INTERNAL_ERROR);
+    auto failedCommit = transaction.commit(*context, invocation);
+    ASSERT_TRUE(failedCommit.isErr());
+    EXPECT_EQ(program_execution::publicationErrorStatus(failedCommit.error()), VERNON_STATUS_INTERNAL_ERROR);
     program_execution::clearFailureInjectionForTesting();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -3.0f);
@@ -426,10 +430,10 @@ TEST(ProgramPublication, CommitsStridedHostOutputByValidatedRegions) {
     program_execution::ProgramInvocationState invocation(plan, std::move(values), {});
     program_execution::PublicationTransaction transaction(plan.publications);
     std::string error;
-    ASSERT_TRUE(transaction.bindHostCommit(0, target, output, error));
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, output).isOk());
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
-    ASSERT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_OK) << error;
+    ASSERT_TRUE(transaction.commit(*context, invocation).isOk());
     EXPECT_EQ(destination, (std::array<float, 6>{1, 2, -1, 3, 4, -1}));
 }
 
@@ -444,7 +448,7 @@ TEST(ProgramPublication, InPlaceBindingIsExplicitAndNotRollbackStaged) {
     }};
     program_execution::PublicationTransaction transaction(plan);
     std::string error;
-    ASSERT_TRUE(transaction.bindInPlace(3, argument, error)) << error;
+    ASSERT_TRUE(transaction.bindInPlace(3, argument).isOk());
     destination = 11.0f; // Graph execution writes the explicitly mutable backing directly.
     transaction.rollback();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
@@ -469,7 +473,7 @@ TEST(ProgramPublication, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
     }};
     program_execution::PublicationTransaction transaction(plan);
     std::string error;
-    ASSERT_TRUE(transaction.bindInPlace(3, argument, error)) << error;
+    ASSERT_TRUE(transaction.bindInPlace(3, argument).isOk());
 
     const float written = 11.0f; // Graph execution writes the explicitly mutable device backing directly.
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(runtime.device, buffer.handle, 0, &written, sizeof(written)),
@@ -504,10 +508,12 @@ TEST(ProgramPublication, InvalidDeviceCommitRollsBackBeforeSubmission) {
     program_execution::PublicationTransaction transaction(plan.publications);
     std::string error;
     ASSERT_TRUE(
-        transaction.bindDeviceCommit(0, target, deviceTensor(sizeof(destination)), VernonRhiBuffer{1, 1}, error));
+        transaction.bindDeviceCommit(0, target, deviceTensor(sizeof(destination)), VernonRhiBuffer{1, 1}).isOk());
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
-    EXPECT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    auto aliasedCommit = transaction.commit(*context, invocation);
+    ASSERT_TRUE(aliasedCommit.isErr());
+    EXPECT_EQ(program_execution::publicationErrorStatus(aliasedCommit.error()), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -1.0f);
 }
@@ -881,7 +887,9 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     vernon::runtime::program::Program program;
     vernon::runtime::program::ArtifactSystem artifacts;
     vernon::runtime::program::Diagnostic diagnostic;
-    ASSERT_TRUE(vernon::runtime::program::parse(manifest, program, diagnostic)) << diagnostic.message;
+    auto parsedProgram = vernon::runtime::program::parse(manifest, diagnostic);
+    ASSERT_TRUE(parsedProgram.isOk()) << diagnostic.message;
+    program = std::move(parsedProgram).value();
     ASSERT_EQ(program.values.size(), 3u);
     EXPECT_TRUE(program.values[0].canonicalType.rankedValue);
     EXPECT_EQ(program.values[0].canonicalType.dtype, "f32");
@@ -893,16 +901,14 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
         nlohmann::json rejected = manifest;
         rejected["values"][0]["type"] = semanticType;
         rejected["values"][0]["value_layout"]["leaves"][0]["dtype"] = layoutDtype;
-        vernon::runtime::program::Program rejectedProgram;
-        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_TRUE(vernon::runtime::program::parse(rejected, diagnostic).isErr());
         EXPECT_EQ(diagnostic.code, "PROGRAM_LAYOUT_HASH") << diagnostic.message;
         EXPECT_NE(diagnostic.path.find("/dtype"), std::string::npos) << diagnostic.path;
     }
     for (const char *retiredSource : {"parameter", "capture"}) {
         nlohmann::json rejected = manifest;
         rejected["graphs"][0]["nodes"][0]["operation"]["workgroups"][0]["control"] = {{retiredSource, 0}};
-        vernon::runtime::program::Program rejectedProgram;
-        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_TRUE(vernon::runtime::program::parse(rejected, diagnostic).isErr());
         EXPECT_EQ(diagnostic.code, "PROGRAM_CONTROL_UNAVAILABLE") << diagnostic.message;
     }
     ASSERT_EQ(program.abi.boundarySlots.size(), 2u);
@@ -921,8 +927,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     EXPECT_TRUE(vernon::runtime::program::derivePublicationPlan(unpublishedSlots).targets.empty());
 
     const auto expectBoundaryReject = [&](nlohmann::json rejected, std::string_view field) {
-        vernon::runtime::program::Program rejectedProgram;
-        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_TRUE(vernon::runtime::program::parse(rejected, diagnostic).isErr());
         EXPECT_EQ(diagnostic.code, "PROGRAM_UNKNOWN_FIELD") << diagnostic.message;
         EXPECT_NE(diagnostic.path.find(field), std::string::npos) << diagnostic.path;
     };
@@ -934,8 +939,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     expectBoundaryReject(std::move(extraField), "/legacy");
 
     const auto expectBoundaryMismatch = [&](nlohmann::json rejected, std::string_view field) {
-        vernon::runtime::program::Program rejectedProgram;
-        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_TRUE(vernon::runtime::program::parse(rejected, diagnostic).isErr());
         EXPECT_EQ(diagnostic.code, "PROGRAM_ABI_MISMATCH") << diagnostic.message;
         EXPECT_NE(diagnostic.path.find(field), std::string::npos) << diagnostic.path;
     };
@@ -966,8 +970,9 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
 
     nlohmann::json inPlaceManifest = manifest;
     inPlaceManifest["abi"]["boundary_slots"][1]["publication"] = "in_place";
-    vernon::runtime::program::Program inPlaceProgram;
-    ASSERT_TRUE(vernon::runtime::program::parse(inPlaceManifest, inPlaceProgram, diagnostic)) << diagnostic.message;
+    auto parsedInPlace = vernon::runtime::program::parse(inPlaceManifest, diagnostic);
+    ASSERT_TRUE(parsedInPlace.isOk()) << diagnostic.message;
+    vernon::runtime::program::Program inPlaceProgram = std::move(parsedInPlace).value();
     EXPECT_EQ(inPlaceProgram.abi.boundarySlots[1].publication, vernon::runtime::program::BoundaryPublication::InPlace);
     EXPECT_TRUE(inPlaceProgram.abi.publication.targets.empty());
     nlohmann::json immutableInPlace = inPlaceManifest;
@@ -990,19 +995,20 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     };
     expectBoundaryMismatch(std::move(byValueInPlace), "/publication");
 
-    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, artifacts, diagnostic))
-        << diagnostic.message;
-    vernon::runtime::program::ResolvedProgram resolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, resolved, diagnostic))
-        << diagnostic.message;
+    auto parsedArtifacts = vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, diagnostic);
+    ASSERT_TRUE(parsedArtifacts.isOk()) << diagnostic.message;
+    artifacts = std::move(parsedArtifacts).value();
+    auto resolvedResult = vernon::runtime::program::resolve(std::move(program), artifacts, diagnostic);
+    ASSERT_TRUE(resolvedResult.isOk()) << diagnostic.message;
+    vernon::runtime::program::ResolvedProgram resolved = std::move(resolvedResult).value();
     ASSERT_EQ(resolved.stages.size(), 1u);
     EXPECT_EQ(resolved.stages.at("scale").stage.workgroupSize[0], 64u);
     ASSERT_EQ(resolved.graphs.size(), 1u);
     ASSERT_EQ(resolved.graphs[0].predecessors.size(), 1u);
     EXPECT_TRUE(resolved.graphs[0].predecessors[0].empty());
-    vernon::runtime::program::ResolvedProgram inPlaceResolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(inPlaceProgram), artifacts, inPlaceResolved, diagnostic))
-        << diagnostic.message;
+    auto inPlaceResolvedResult = vernon::runtime::program::resolve(std::move(inPlaceProgram), artifacts, diagnostic);
+    ASSERT_TRUE(inPlaceResolvedResult.isOk()) << diagnostic.message;
+    vernon::runtime::program::ResolvedProgram inPlaceResolved = std::move(inPlaceResolvedResult).value();
     EXPECT_TRUE(inPlaceResolved.program.abi.publication.targets.empty());
 
     nlohmann::json multiManifest = manifest;
@@ -1045,31 +1051,31 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     nlohmann::json multiArtifactSystem = artifactSystem;
     multiArtifactSystem["artifacts"]["bias"] = multiArtifactSystem["artifacts"]["scale"];
     multiArtifactSystem["artifacts"]["bias"]["modules"][0]["entry_point"] = "bias";
-    vernon::runtime::program::Program multiProgram;
-    vernon::runtime::program::ArtifactSystem multiArtifacts;
-    ASSERT_TRUE(vernon::runtime::program::parse(multiManifest, multiProgram, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(
-        vernon::runtime::program::parseArtifactSystem(target, blobs, multiArtifactSystem, multiArtifacts, diagnostic))
-        << diagnostic.message;
-    vernon::runtime::program::ResolvedProgram multiResolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(multiProgram), multiArtifacts, multiResolved, diagnostic))
-        << diagnostic.message;
+    auto parsedMultiProgram = vernon::runtime::program::parse(multiManifest, diagnostic);
+    ASSERT_TRUE(parsedMultiProgram.isOk()) << diagnostic.message;
+    auto parsedMultiArtifacts =
+        vernon::runtime::program::parseArtifactSystem(target, blobs, multiArtifactSystem, diagnostic);
+    ASSERT_TRUE(parsedMultiArtifacts.isOk()) << diagnostic.message;
+    auto multiResolvedResult = vernon::runtime::program::resolve(std::move(parsedMultiProgram).value(),
+                                                                 parsedMultiArtifacts.value(), diagnostic);
+    ASSERT_TRUE(multiResolvedResult.isOk()) << diagnostic.message;
+    vernon::runtime::program::ResolvedProgram multiResolved = std::move(multiResolvedResult).value();
     ASSERT_EQ(multiResolved.graphs[0].predecessors.size(), 2u);
     EXPECT_EQ(multiResolved.graphs[0].predecessors[1], std::vector<uint32_t>({0}));
 
     nlohmann::json missingAbi = manifest;
     missingAbi.erase("abi");
-    EXPECT_FALSE(vernon::runtime::program::parse(missingAbi, program, diagnostic));
+    EXPECT_TRUE(vernon::runtime::program::parse(missingAbi, diagnostic).isErr());
     EXPECT_EQ(diagnostic.path, "/abi");
 
     nlohmann::json legacySignature = manifest;
     legacySignature["signature"] = nlohmann::json::object();
-    EXPECT_FALSE(vernon::runtime::program::parse(legacySignature, program, diagnostic));
+    EXPECT_TRUE(vernon::runtime::program::parse(legacySignature, diagnostic).isErr());
     EXPECT_EQ(diagnostic.code, "PROGRAM_UNKNOWN_FIELD");
     EXPECT_EQ(diagnostic.path, "/signature");
 
     manifest["graphs"][0]["nodes"][0]["dependencies"] = nlohmann::json::array();
-    EXPECT_FALSE(vernon::runtime::program::parse(manifest, program, diagnostic));
+    EXPECT_TRUE(vernon::runtime::program::parse(manifest, diagnostic).isErr());
     EXPECT_EQ(diagnostic.code, "PROGRAM_UNKNOWN_FIELD");
     EXPECT_EQ(diagnostic.path, "/graphs/0/nodes/0/dependencies");
 }
@@ -1212,23 +1218,21 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                                                                           {"sha256", codeHash}}})},
                                       {"reflection", reflection}}}}}};
 
-    vernon::runtime::program::Program program;
-    vernon::runtime::program::ArtifactSystem artifacts;
     vernon::runtime::program::Diagnostic diagnostic;
-    ASSERT_TRUE(vernon::runtime::program::parse(manifest, program, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, artifacts, diagnostic))
-        << diagnostic.message;
-    vernon::runtime::program::ResolvedProgram resolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, resolved, diagnostic))
-        << diagnostic.message;
+    auto program = vernon::runtime::program::parse(manifest, diagnostic);
+    ASSERT_TRUE(program.isOk()) << diagnostic.message;
+    auto artifacts = vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, diagnostic);
+    ASSERT_TRUE(artifacts.isOk()) << diagnostic.message;
+    auto resolvedResult = vernon::runtime::program::resolve(std::move(program).value(), artifacts.value(), diagnostic);
+    ASSERT_TRUE(resolvedResult.isOk()) << diagnostic.message;
+    vernon::runtime::program::ResolvedProgram resolved = std::move(resolvedResult).value();
     EXPECT_EQ(vernon::runtime::program::executionKind(resolved.program.graphs.front().nodes.front()),
               vernon::runtime::program::ExecutionKind::Graphics);
     nlohmann::json placeholder = manifest;
     placeholder["storages"][0]["descriptor"]["extent"] = nlohmann::json::array({0, 0, 1});
     placeholder["abi"]["boundary_slots"][0]["storage_descriptor"] = placeholder["storages"][0]["descriptor"];
     placeholder["abi"]["boundary_slots"][1]["storage_descriptor"] = placeholder["storages"][0]["descriptor"];
-    vernon::runtime::program::Program rejected;
-    EXPECT_FALSE(vernon::runtime::program::parse(placeholder, rejected, diagnostic));
+    EXPECT_TRUE(vernon::runtime::program::parse(placeholder, diagnostic).isErr());
     EXPECT_FALSE(diagnostic.code.empty());
     EXPECT_NE(diagnostic.path.find("/descriptor"), std::string::npos);
 }

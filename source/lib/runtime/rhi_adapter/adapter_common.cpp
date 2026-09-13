@@ -4,7 +4,6 @@
 #include "adapter_test_hooks.h"
 #include "rhi/rhi_internal.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <new>
 #include <optional>
@@ -512,28 +511,34 @@ const VernonRuntimeProviderResourceReference *providerBindingResource(const Vern
 
 RhiAdapterResult<uint64_t> nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter,
                                                 VernonRuntimeProviderObject encoder) noexcept {
-    const uint64_t native = vernon::rhi::commandEncoderNative(adapter.rhiDevice, encoder.value, adapter.rhiBackend);
+    auto native = vernon::rhi::commandEncoderNative(adapter.rhiDevice, encoder.value, adapter.rhiBackend);
     if (!native)
-        return RhiAdapterResult<uint64_t>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"native_command_encoder", encoder.value, 0}})};
-    return RhiAdapterResult<uint64_t>{vernon::ok(native)};
+        return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(native).error()))};
+    return RhiAdapterResult<uint64_t>{vernon::ok(std::move(native).value())};
 }
 
-bool commandEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
-    return vernon::rhi::commandEncoderRendering(adapter.rhiDevice, encoder.value);
+RhiAdapterResult<bool> commandEncoderRendering(VernonRuntimeRhiAdapter &adapter,
+                                               VernonRuntimeProviderObject encoder) noexcept {
+    auto rendering = vernon::rhi::commandEncoderRendering(adapter.rhiDevice, encoder.value);
+    if (!rendering)
+        return RhiAdapterResult<bool>{vernon::err(providerError(std::move(rendering).error()))};
+    return RhiAdapterResult<bool>{vernon::ok(std::move(rendering).value())};
 }
 
-bool commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
-    return vernon::rhi::commandEncoderHasRenderingDescriptor(adapter.rhiDevice, encoder.value);
+RhiAdapterResult<bool> commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter,
+                                                            VernonRuntimeProviderObject encoder) noexcept {
+    auto descriptor = vernon::rhi::commandEncoderHasRenderingDescriptor(adapter.rhiDevice, encoder.value);
+    if (!descriptor)
+        return RhiAdapterResult<bool>{vernon::err(providerError(std::move(descriptor).error()))};
+    return RhiAdapterResult<bool>{vernon::ok(std::move(descriptor).value())};
 }
 
 RhiAdapterResult<void> commandColorOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                               size_t index, VernonRhiLoadOperation &load,
                                               VernonRhiStoreOperation &store, float clear[4]) noexcept {
-    if (!vernon::rhi::commandColorOperations(adapter.rhiDevice, encoder.value, index, load, store, clear))
-        return RhiAdapterResult<void>{vernon::err(
-            vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                  {"command_color_operations", encoder.value, static_cast<uint32_t>(index)}})};
+    auto operations = vernon::rhi::commandColorOperations(adapter.rhiDevice, encoder.value, index, load, store, clear);
+    if (!operations)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(operations).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -542,36 +547,37 @@ RhiAdapterResult<void> commandDepthOperations(VernonRuntimeRhiAdapter &adapter, 
                                               VernonRhiLoadOperation &stencilLoad,
                                               VernonRhiStoreOperation &stencilStore, float &clearDepth,
                                               uint32_t &clearStencil) noexcept {
-    if (!vernon::rhi::commandDepthOperations(adapter.rhiDevice, encoder.value, depthLoad, depthStore, stencilLoad,
-                                             stencilStore, clearDepth, clearStencil))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"command_depth_operations", encoder.value, 0}})};
+    auto operations = vernon::rhi::commandDepthOperations(adapter.rhiDevice, encoder.value, depthLoad, depthStore,
+                                                          stencilLoad, stencilStore, clearDepth, clearStencil);
+    if (!operations)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(operations).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<int> claimCommandRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                            uint32_t backendKind) noexcept {
-    const int claim = vernon::rhi::claimCommandRendering(adapter.rhiDevice, encoder.value, backendKind);
-    if (claim < 0)
-        return RhiAdapterResult<int>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"claim_command_rendering", encoder.value, backendKind}})};
-    return RhiAdapterResult<int>{vernon::ok(claim)};
+RhiAdapterResult<vernon::rhi::CommandRenderingClaim> claimCommandRendering(VernonRuntimeRhiAdapter &adapter,
+                                                                           VernonRuntimeProviderObject encoder,
+                                                                           uint32_t backendKind) noexcept {
+    auto claim = vernon::rhi::claimCommandRendering(adapter.rhiDevice, encoder.value, backendKind);
+    if (!claim)
+        return RhiAdapterResult<vernon::rhi::CommandRenderingClaim>{
+            vernon::err(providerError(std::move(claim).error()))};
+    return RhiAdapterResult<vernon::rhi::CommandRenderingClaim>{vernon::ok(std::move(claim).value())};
 }
 
-RhiAdapterResult<uint64_t> commandRenderingObject(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                                  uint64_t candidate) noexcept {
-    const uint64_t object = vernon::rhi::commandRenderingObject(adapter.rhiDevice, encoder.value, candidate);
+RhiAdapterResult<vernon::Option<uint64_t>> commandRenderingObject(VernonRuntimeRhiAdapter &adapter,
+                                                                  VernonRuntimeProviderObject encoder,
+                                                                  vernon::Option<uint64_t> candidate) noexcept {
+    auto object = vernon::rhi::commandRenderingObject(adapter.rhiDevice, encoder.value, std::move(candidate));
     if (!object)
-        return RhiAdapterResult<uint64_t>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"command_rendering_object", encoder.value, 0}})};
-    return RhiAdapterResult<uint64_t>{vernon::ok(object)};
+        return RhiAdapterResult<vernon::Option<uint64_t>>{vernon::err(providerError(std::move(object).error()))};
+    return RhiAdapterResult<vernon::Option<uint64_t>>{vernon::ok(std::move(object).value())};
 }
 
 RhiAdapterResult<void> recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                              bool draw) noexcept {
-    if (!vernon::rhi::recordProviderCommand(adapter.rhiDevice, encoder.value, draw))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"record_provider_command", encoder.value, draw}})};
+    auto recorded = vernon::rhi::recordProviderCommand(adapter.rhiDevice, encoder.value, draw);
+    if (!recorded)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -580,10 +586,10 @@ RhiAdapterResult<void> recordCommandWriteResource(VernonRuntimeRhiAdapter &adapt
     auto kind = resourceKind(adapter, resource);
     if (!kind)
         return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
-    if (!vernon::rhi::recordCommandWriteResource(adapter.rhiDevice, encoder.value, std::move(kind).value(),
-                                                 resource.resource.value))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"record_command_write_resource", encoder.value, 0}})};
+    auto recorded = vernon::rhi::recordCommandWriteResource(adapter.rhiDevice, encoder.value, std::move(kind).value(),
+                                                            resource.resource.value);
+    if (!recorded)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -610,28 +616,28 @@ bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descri
 
 RhiAdapterResult<void> deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                            void *context, uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept {
-    if (!vernon::rhi::deferCommandCleanup(adapter.rhiDevice, encoder.value, context, object, cleanup))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
-                                                                        {"defer_command_cleanup", encoder.value, 0}})};
+    auto deferred = vernon::rhi::deferCommandCleanup(adapter.rhiDevice, encoder.value, context, object, cleanup);
+    if (!deferred)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(deferred).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                             void *context, uint64_t object,
                                             void (*rollback)(void *, uint64_t)) noexcept {
-    if (!vernon::rhi::deferCommandRollback(adapter.rhiDevice, encoder.value, context, object, rollback))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
-                                                                        {"defer_command_rollback", encoder.value, 0}})};
+    auto deferred = vernon::rhi::deferCommandRollback(adapter.rhiDevice, encoder.value, context, object, rollback);
+    if (!deferred)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(deferred).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                                   const uint64_t *colors, const uint64_t *resources, size_t colorCount,
                                                   uint64_t depth, uint64_t depthResource) noexcept {
-    if (!vernon::rhi::setCommandRenderingTargets(adapter.rhiDevice, encoder.value, colors, resources, colorCount, depth,
-                                                 depthResource))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"set_command_rendering_targets", encoder.value, 0}})};
+    auto targets = vernon::rhi::setCommandRenderingTargets(adapter.rhiDevice, encoder.value, colors, resources,
+                                                           colorCount, depth, depthResource);
+    if (!targets)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(targets).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -642,11 +648,12 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRunti
                                                                VernonRuntimeProviderResourceReference *output) {
     if (!adapter || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const uint64_t resource = vernon::rhi::bufferResource(adapter->rhiDevice, buffer);
+    auto resource = vernon::rhi::bufferResource(adapter->rhiDevice, buffer);
     if (!resource)
-        return VERNON_STATUS_INVALID_ARGUMENT;
+        return vernon::toVernonStatus(std::move(resource).error());
+    const uint64_t resourceKey = std::move(resource).value();
     output->identity = resourceIdentity(*adapter, kRhiBufferResource);
-    output->resource = {resource};
+    output->resource = {resourceKey};
     output->offset = offset;
     output->size = size;
     return VERNON_STATUS_OK;
@@ -657,10 +664,10 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImage(const VernonRuntim
                                                               VernonRuntimeProviderResourceReference *output) {
     if (!adapter || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const uint64_t resource = vernon::rhi::imageResource(adapter->rhiDevice, image);
+    auto resource = vernon::rhi::imageResource(adapter->rhiDevice, image);
     if (!resource)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kRhiImageResource), {resource}, 0, 0};
+        return vernon::toVernonStatus(std::move(resource).error());
+    *output = {resourceIdentity(*adapter, kRhiImageResource), {std::move(resource).value()}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -669,10 +676,10 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImageView(const VernonRu
                                                                   VernonRuntimeProviderResourceReference *output) {
     if (!adapter || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const uint64_t resource = vernon::rhi::imageViewResource(adapter->rhiDevice, view);
+    auto resource = vernon::rhi::imageViewResource(adapter->rhiDevice, view);
     if (!resource)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kRhiImageViewResource), {resource}, 0, 0};
+        return vernon::toVernonStatus(std::move(resource).error());
+    *output = {resourceIdentity(*adapter, kRhiImageViewResource), {std::move(resource).value()}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -681,10 +688,10 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceSampler(const VernonRunt
                                                                 VernonRuntimeProviderResourceReference *output) {
     if (!adapter || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const uint64_t resource = vernon::rhi::samplerResource(adapter->rhiDevice, sampler);
+    auto resource = vernon::rhi::samplerResource(adapter->rhiDevice, sampler);
     if (!resource)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kRhiSamplerResource), {resource}, 0, 0};
+        return vernon::toVernonStatus(std::move(resource).error());
+    *output = {resourceIdentity(*adapter, kRhiSamplerResource), {std::move(resource).value()}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -693,8 +700,11 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceCommandEncoder(const Ver
                                                                        VernonRuntimeProviderObject *output) {
     if (!adapter || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    output->value = vernon::rhi::commandEncoderKey(adapter->rhiDevice, encoder);
-    return output->value ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
+    auto key = vernon::rhi::commandEncoderKey(adapter->rhiDevice, encoder);
+    if (!key)
+        return vernon::toVernonStatus(std::move(key).error());
+    output->value = std::move(key).value();
+    return VERNON_STATUS_OK;
 }
 
 namespace vernon::runtime {

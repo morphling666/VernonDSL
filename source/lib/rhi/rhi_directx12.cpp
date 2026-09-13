@@ -4,6 +4,7 @@
 #include "directx12_mipmap_3d.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
+#include "public_c_boundary.h"
 #include "rhi_test_hooks.h"
 #include "sampler_filter.h"
 
@@ -444,8 +445,8 @@ template <typename Object> bool belongsToDirectX12Device(Object *object, ID3D12D
 
 namespace vernon::rhi::directx12_api {
 
-extern "C" VERNON_RHI_CAPI VernonRhiDevice
-vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDescriptor *descriptor) {
+static VernonRhiDevice
+vernonRhiCreateBorrowedDirectX12DeviceBusiness(const VernonRhiDirectX12BorrowedDeviceDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->device || !descriptor->queue ||
         !descriptor->command_list ||
         (descriptor->queue_capabilities &
@@ -472,8 +473,7 @@ vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDes
     return {published.value().index | directX12DeviceBit, published.value().generation};
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQueue(VernonRhiDevice handle,
-                                                                                    void **output) {
+static VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQueueBusiness(VernonRhiDevice handle, void **output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -482,8 +482,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQu
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedCommandList(VernonRhiDevice handle,
-                                                                                          void **output) {
+static VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedCommandListBusiness(VernonRhiDevice handle, void **output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -492,7 +491,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedCo
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedBuffer(
+static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedBufferBusiness(
     VernonRhiDevice handle, const VernonRhiDirectX12BorrowedBufferDescriptor *descriptor, VernonRhiBuffer *output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->resource ||
@@ -527,7 +526,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImage(
+static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImageBusiness(
     VernonRhiDevice handle, const VernonRhiDirectX12BorrowedImageDescriptor *descriptor, VernonRhiImage *output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->resource ||
@@ -565,19 +564,15 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
         native.DepthOrArraySize != expectedDepthOrLayers || native.MipLevels != descriptor->image.mip_levels ||
         native.SampleDesc.Count != descriptor->image.sample_count || !validCube)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const auto state = directX12ResourceState(descriptor->state);
+    const size_t subresourceCount = static_cast<size_t>(descriptor->image.mip_levels) * descriptor->image.array_layers *
+                                    directX12PlaneCount(descriptor->image.format);
+    auto subresourceStates = decltype(slot.image.subresourceStates)(subresourceCount, state);
     slot.image.resource = resource;
     slot.image.format = format;
     slot.image.dimension = descriptor->image.dimension;
-    slot.image.state = directX12ResourceState(descriptor->state);
-    try {
-        slot.image.subresourceStates.assign(static_cast<size_t>(descriptor->image.mip_levels) *
-                                                descriptor->image.array_layers *
-                                                directX12PlaneCount(descriptor->image.format),
-                                            slot.image.state);
-    } catch (const std::bad_alloc &) {
-        slot.image = {};
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
+    slot.image.state = state;
+    slot.image.subresourceStates = std::move(subresourceStates);
     slot.image.owned = false;
     slot.descriptor = *descriptor;
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
@@ -590,7 +585,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedDescriptorRange(
+static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedDescriptorRangeBusiness(
     VernonRhiDevice handle, const VernonRhiDirectX12BorrowedDescriptorRangeDescriptor *descriptor,
     VernonRhiNativeDescriptorRange *output) {
     auto device = lookupDirectX12Device(handle);
@@ -643,8 +638,8 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus
-vernonRhiDeviceDestroyNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeDescriptorRange range) {
+static VernonRhiStatus vernonRhiDeviceDestroyNativeDescriptorRangeBusiness(VernonRhiDevice handle,
+                                                                           VernonRhiNativeDescriptorRange range) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -652,9 +647,9 @@ vernonRhiDeviceDestroyNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNat
     return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus
-vernonRhiDeviceGetNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeDescriptorRange range,
-                                        VernonRhiDirectX12BorrowedDescriptorRangeDescriptor *output) {
+static VernonRhiStatus
+vernonRhiDeviceGetNativeDescriptorRangeBusiness(VernonRhiDevice handle, VernonRhiNativeDescriptorRange range,
+                                                VernonRhiDirectX12BorrowedDescriptorRangeDescriptor *output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !output || output->struct_size < sizeof(*output))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -669,37 +664,90 @@ vernonRhiDeviceGetNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeD
     return VERNON_RHI_STATUS_OK;
 }
 
-VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+static vernon::Result<VernonRhiDevice, vernon::RhiError>
+vernonRhiCreateBorrowedDirectX12DeviceImpl(const VernonRhiDirectX12BorrowedDeviceDescriptor *descriptor) {
+    VernonRhiDevice device = vernonRhiCreateBorrowedDirectX12DeviceBusiness(descriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX || !device.generation)
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"create_borrowed_directx12_device", 0, 0}})};
+    return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::ok(device)};
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiDevice
+vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDescriptor *descriptor) {
+    return vernon::rhi::publicHandleBoundary([&] { return vernonRhiCreateBorrowedDirectX12DeviceImpl(descriptor); },
+                                             invalidDevice());
+}
+
+#define VERNON_DX12_STATUS_BOUNDARY(name, parameters, arguments)                                                       \
+    static vernon::Result<void, vernon::RhiError> name##Impl parameters {                                              \
+        return vernon::rhi::publicStatusResult(name##Business arguments, #name);                                       \
+    }                                                                                                                  \
+    extern "C" VERNON_RHI_CAPI VernonRhiStatus name parameters {                                                       \
+        return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
+    }
+
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDirectX12DeviceGetBorrowedQueue, (VernonRhiDevice handle, void **output),
+                            (handle, output))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDirectX12DeviceGetBorrowedCommandList, (VernonRhiDevice handle, void **output),
+                            (handle, output))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDirectX12DeviceImportBorrowedBuffer,
+                            (VernonRhiDevice handle, const VernonRhiDirectX12BorrowedBufferDescriptor *descriptor,
+                             VernonRhiBuffer *output),
+                            (handle, descriptor, output))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDirectX12DeviceImportBorrowedImage,
+                            (VernonRhiDevice handle, const VernonRhiDirectX12BorrowedImageDescriptor *descriptor,
+                             VernonRhiImage *output),
+                            (handle, descriptor, output))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDirectX12DeviceImportBorrowedDescriptorRange,
+                            (VernonRhiDevice handle,
+                             const VernonRhiDirectX12BorrowedDescriptorRangeDescriptor *descriptor,
+                             VernonRhiNativeDescriptorRange *output),
+                            (handle, descriptor, output))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDeviceDestroyNativeDescriptorRange,
+                            (VernonRhiDevice handle, VernonRhiNativeDescriptorRange range), (handle, range))
+VERNON_DX12_STATUS_BOUNDARY(vernonRhiDeviceGetNativeDescriptorRange,
+                            (VernonRhiDevice handle, VernonRhiNativeDescriptorRange range,
+                             VernonRhiDirectX12BorrowedDescriptorRangeDescriptor *output),
+                            (handle, range, output))
+
+#undef VERNON_DX12_STATUS_BOUNDARY
+
+Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
+        return Result<VernonRhiDevice, RhiError>{err(invalidArgument("create_directx12_device"))};
     auto reserved = directX12Devices.reserve();
     if (reserved.isErr()) {
         setDeviceCreationError("DirectX 12 device registry reservation failed");
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{err(std::move(reserved).error())};
     }
     auto reservation = std::move(reserved).value();
     auto &device = reservation.device();
     auto owner = reservation.retainOwner();
     if (owner.isErr()) {
         setDeviceCreationError("DirectX 12 device owner retention failed");
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{err(std::move(owner).error())};
     }
     auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
     if (commandState.isErr()) {
         setDeviceCreationError("DirectX 12 command state allocation failed");
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{err(std::move(commandState).error())};
     }
     device.commandState = std::move(commandState).value();
     const bool forceSoftware = (descriptor->flags & VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE) != 0;
     if (!device.state.initialize(descriptor->device_index, forceSoftware, device.error)) {
         setDeviceCreationError(device.error);
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{
+            err(backendFailure("create_directx12_device", descriptor->device_index, descriptor->flags))};
     }
     device.queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     auto published = directX12Devices.publish(std::move(reservation));
     if (published.isErr()) {
         setDeviceCreationError("DirectX 12 device registry publish failed");
-        return invalidDevice();
+        return Result<VernonRhiDevice, RhiError>{err(std::move(published).error())};
     }
-    return {published.value().index | directX12DeviceBit, published.value().generation};
+    return Result<VernonRhiDevice, RhiError>{
+        ok(VernonRhiDevice{published.value().index | directX12DeviceBit, published.value().generation})};
 }
 
 Result<void, RhiError> teardownDevice(DirectX12InteropDevice &device) noexcept {
@@ -732,39 +780,44 @@ Result<vernon::rhi::CommandDeviceStateRef, RhiError> commandState(VernonRhiDevic
     return device->commandState.retain();
 }
 
-VernonStringView lastError(VernonRhiDevice handle) {
+Option<VernonStringView> lastError(VernonRhiDevice handle) {
     auto device = lookupDirectX12Device(handle);
-    return device ? VernonStringView{device->error.data(), device->error.size()} : VernonStringView{};
+    if (!device)
+        return Option<VernonStringView>{};
+    return Option<VernonStringView>{some(VernonStringView{device->error.data(), device->error.size()})};
 }
 
-VernonRhiStatus synchronize(VernonRhiDevice handle) {
+Result<void, RhiError> synchronize(VernonRhiDevice handle) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return Result<void, RhiError>{
+            err(invalidArgument("synchronize_directx12_device", handle.index, handle.generation))};
 
     std::lock_guard<std::mutex> guard(device->mutex);
-    return device->state.synchronize(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    return device->state.synchronize(device->error)
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{
+                     err(backendFailure("synchronize_directx12_device", handle.index, handle.generation))};
 }
 
-VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor,
-                             VernonRhiBuffer *output) {
+Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return Result<VernonRhiBuffer, RhiError>{
+            err(invalidArgument("create_directx12_buffer", handle.index, handle.generation))};
 
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
         descriptor->size > (std::numeric_limits<size_t>::max)() ||
         descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiBuffer, RhiError>{
+            err(invalidArgument("create_directx12_buffer", descriptor ? descriptor->size : 0))};
     auto reservation = reserveResource(*device);
     if (reservation.isErr())
-        return vernon::toVernonRhiStatus(reservation.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
     auto available = availableResourceSlot<BufferResourceTag>(device->buffers);
     if (available.isErr())
-        return vernon::toVernonRhiStatus(available.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(available).error())};
     DirectX12BufferSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
     const bool unorderedAccess =
@@ -779,82 +832,84 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
     if (!device->state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), unorderedAccess, heapType,
                                     initialState, device->error)) {
         device->state.destroyBuffer(slot.buffer);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<VernonRhiBuffer, RhiError>{
+            err(backendFailure("create_directx12_buffer", descriptor->size, descriptor->memory_class))};
     }
     slot.ownedDescriptor = *descriptor;
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownBuffer);
     if (published.isErr()) {
         device->state.destroyBuffer(slot.buffer);
         slot.ownedDescriptor = {};
-        return vernon::toVernonRhiStatus(published.error());
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(published).error())};
     }
-    *output = publicHandle<VernonRhiBuffer>(published.value());
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiBuffer, RhiError>{ok(publicHandle<VernonRhiBuffer>(published.value()))};
 }
 
-VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
-                             uint64_t size) {
+Result<void, RhiError> uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
+                                    uint64_t size) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer", handle.index, handle.generation))};
 
     if (!source)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer", offset))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer", offset))};
     if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
         const D3D12_RANGE readRange{0, 0};
         void *mapped = nullptr;
         if (FAILED(slot->buffer.resource->Map(0, &readRange, &mapped))) {
             device->error = "DirectX 12 upload-buffer mapping failed";
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer", offset))};
         }
         std::memcpy(static_cast<uint8_t *>(mapped) + offset, source, static_cast<size_t>(size));
         const D3D12_RANGE writtenRange{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + size)};
         slot->buffer.resource->Unmap(0, &writtenRange);
-        return VERNON_RHI_STATUS_OK;
+        return Result<void, RhiError>{ok()};
     }
     if (vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
         device->error = "device-level DirectX 12 upload cannot submit while a command encoder is recording";
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer", offset))};
     }
     ID3D12Resource *upload = nullptr;
     size_t uploadOffset = 0;
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(true, static_cast<size_t>(size), 256, upload, uploadOffset, mapped,
                                       device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer", size))};
     std::memcpy(mapped, source, static_cast<size_t>(size));
     if (!device->state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer", offset))};
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
     device->state.commandList()->CopyBufferRegion(slot->buffer.resource, offset, upload, uploadOffset, size);
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
-    return device->state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    return device->state.submitCommands(device->error)
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure("upload_directx12_buffer", offset))};
 }
 
-VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
-                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+Result<void, RhiError> uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                          const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return Result<void, RhiError>{
+            err(invalidArgument("upload_directx12_buffer_ranges", handle.index, handle.generation))};
     if (!ranges || rangeCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", rangeCount))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", rangeCount))};
     if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
         uint64_t writtenBegin = slot->ownedDescriptor.size;
         uint64_t writtenEnd = 0;
@@ -862,7 +917,7 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
             const VernonRhiBufferUploadRange &range = ranges[index];
             if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
                 range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+                return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", index))};
             writtenBegin = std::min(writtenBegin, range.offset);
             writtenEnd = std::max(writtenEnd, range.offset + range.size);
         }
@@ -870,18 +925,18 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
         void *mapped = nullptr;
         if (FAILED(slot->buffer.resource->Map(0, &readRange, &mapped))) {
             device->error = "DirectX 12 upload-buffer mapping failed";
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer_ranges", rangeCount))};
         }
         for (size_t index = 0; index < rangeCount; ++index)
             std::memcpy(static_cast<uint8_t *>(mapped) + ranges[index].offset, ranges[index].source,
                         static_cast<size_t>(ranges[index].size));
         const D3D12_RANGE writtenRange{static_cast<SIZE_T>(writtenBegin), static_cast<SIZE_T>(writtenEnd)};
         slot->buffer.resource->Unmap(0, &writtenRange);
-        return VERNON_RHI_STATUS_OK;
+        return Result<void, RhiError>{ok()};
     }
     if (vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
         device->error = "device-level DirectX 12 upload cannot submit while a command encoder is recording";
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", rangeCount))};
     }
     std::vector<size_t> packedOffsets;
     packedOffsets.reserve(rangeCount);
@@ -890,24 +945,24 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
             range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", index))};
         if (packedSize > (std::numeric_limits<size_t>::max)() - 255u)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", index))};
         packedSize = (packedSize + 255u) & ~size_t{255u};
         packedOffsets.push_back(packedSize);
         if (static_cast<size_t>(range.size) > (std::numeric_limits<size_t>::max)() - packedSize)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", index))};
         packedSize += static_cast<size_t>(range.size);
     }
     ID3D12Resource *upload = nullptr;
     size_t uploadOffset = 0;
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(true, packedSize, 256, upload, uploadOffset, mapped, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer_ranges", packedSize))};
     for (size_t index = 0; index < rangeCount; ++index)
         std::memcpy(mapped + packedOffsets[index], ranges[index].source, static_cast<size_t>(ranges[index].size));
     if (!device->state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("upload_directx12_buffer_ranges", rangeCount))};
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
     for (size_t index = 0; index < rangeCount; ++index)
@@ -915,57 +970,60 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
                                                       uploadOffset + packedOffsets[index], ranges[index].size);
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
-    return device->state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    return device->state.submitCommands(device->error)
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure("upload_directx12_buffer_ranges", rangeCount))};
 }
 
-VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
-                               uint64_t size) {
+Result<void, RhiError> downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset,
+                                      void *destination, uint64_t size) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return Result<void, RhiError>{
+            err(invalidArgument("download_directx12_buffer", handle.index, handle.generation))};
 
     if (!destination)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer", offset))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer", offset))};
     ID3D12Resource *readback = nullptr;
     size_t readbackOffset = 0;
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(false, static_cast<size_t>(size), 256, readback, readbackOffset, mapped,
                                       device->error) ||
         !device->state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("download_directx12_buffer", size))};
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
     device->state.commandList()->CopyBufferRegion(readback, readbackOffset, slot->buffer.resource, offset, size);
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
     if (!device->state.submitCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("download_directx12_buffer", offset))};
     std::memcpy(destination, mapped, static_cast<size_t>(size));
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
-                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+Result<void, RhiError> downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                            const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return Result<void, RhiError>{
+            err(invalidArgument("download_directx12_buffer_ranges", handle.index, handle.generation))};
     if (!ranges || rangeCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", rangeCount))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", rangeCount))};
     std::vector<size_t> packedOffsets;
     packedOffsets.reserve(rangeCount);
     size_t packedSize = 0;
@@ -973,13 +1031,13 @@ VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buf
         const VernonRhiBufferDownloadRange &range = ranges[index];
         if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
             range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", index))};
         if (packedSize > (std::numeric_limits<size_t>::max)() - 255u)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", index))};
         packedSize = (packedSize + 255u) & ~size_t{255u};
         packedOffsets.push_back(packedSize);
         if (static_cast<size_t>(range.size) > (std::numeric_limits<size_t>::max)() - packedSize)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", index))};
         packedSize += static_cast<size_t>(range.size);
     }
     ID3D12Resource *readback = nullptr;
@@ -987,7 +1045,7 @@ VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buf
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(false, packedSize, 256, readback, readbackOffset, mapped, device->error) ||
         !device->state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("download_directx12_buffer_ranges", packedSize))};
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (size_t index = 0; index < rangeCount; ++index)
@@ -996,47 +1054,46 @@ VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buf
     vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
     if (!device->state.submitCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<void, RhiError>{err(backendFailure("download_directx12_buffer_ranges", rangeCount))};
     for (size_t index = 0; index < rangeCount; ++index)
         std::memcpy(ranges[index].destination, mapped + packedOffsets[index], static_cast<size_t>(ranges[index].size));
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<bool, RhiError> isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<bool, RhiError>{
+            err(invalidArgument("validate_directx12_buffer", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->buffers, buffer) != nullptr;
+    return Result<bool, RhiError>{ok(lookupPublicResource(device->buffers, buffer) != nullptr)};
 }
 
-VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor,
-                            VernonRhiImage *output) {
+Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    }
+    if (!device)
+        return Result<VernonRhiImage, RhiError>{
+            err(invalidArgument("create_directx12_image", handle.index, handle.generation))};
 
     const DXGI_FORMAT format = descriptor ? directX12Format(descriptor->format) : DXGI_FORMAT_UNKNOWN;
     const bool depthFormat = descriptor && (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ||
                                             descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT);
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || format == DXGI_FORMAT_UNKNOWN ||
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || format == DXGI_FORMAT_UNKNOWN ||
         descriptor->width == 0 || descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
         descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImage, RhiError>{err(invalidArgument("create_directx12_image"))};
     auto reservation = reserveResource(*device);
     if (reservation.isErr())
-        return vernon::toVernonRhiStatus(reservation.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
     auto available = availableResourceSlot<ImageResourceTag>(device->images);
     if (available.isErr())
-        return vernon::toVernonRhiStatus(available.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(available).error())};
     DirectX12ImageSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
     D3D12_RESOURCE_DESC native{};
@@ -1068,56 +1125,50 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
             (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0)
             native.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
+    const size_t subresourceCount = static_cast<size_t>(descriptor->mip_levels) * descriptor->array_layers *
+                                    directX12PlaneCount(descriptor->format);
+    auto subresourceStates = decltype(slot.image.subresourceStates)(subresourceCount, D3D12_RESOURCE_STATE_COMMON);
     if (!device->state.createImage(slot.image, native, format, D3D12_RESOURCE_STATE_COMMON, device->error)) {
         device->state.destroyImage(slot.image);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return Result<VernonRhiImage, RhiError>{
+            err(backendFailure("create_directx12_image", descriptor->format, descriptor->dimension))};
     }
     slot.image.dimension = descriptor->dimension;
-    try {
-        slot.image.subresourceStates.assign(static_cast<size_t>(descriptor->mip_levels) * descriptor->array_layers *
-                                                directX12PlaneCount(descriptor->format),
-                                            slot.image.state);
-    } catch (const std::bad_alloc &) {
-        device->state.destroyImage(slot.image);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
+    slot.image.subresourceStates = std::move(subresourceStates);
     slot.ownedDescriptor = *descriptor;
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
     if (published.isErr()) {
         device->state.destroyImage(slot.image);
         slot.ownedDescriptor = {};
-        return vernon::toVernonRhiStatus(published.error());
+        return Result<VernonRhiImage, RhiError>{err(std::move(published).error())};
     }
-    *output = publicHandle<VernonRhiImage>(published.value());
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiImage, RhiError>{ok(publicHandle<VernonRhiImage>(published.value()))};
 }
 
-VernonRhiStatus setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
-                                const VernonRhiSamplerDescriptor *descriptor) {
-    return VERNON_RHI_STATUS_UNSUPPORTED;
+Result<void, RhiError> setImageSampler(VernonRhiDevice, VernonRhiImage image, const VernonRhiSamplerDescriptor *) {
+    return Result<void, RhiError>{err(unsupported("set_directx12_image_sampler", image.index, image.generation))};
 }
 
-VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const VernonRhiImageUploadDescriptor *uploads,
-                            size_t uploadCount) {
+Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
+                                   const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return invalidResult("upload_directx12_image", handle.index, handle.generation);
 
     if (!uploads || uploadCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("upload_directx12_image", uploadCount);
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("upload_directx12_image", image.index, image.generation);
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
     if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_3D &&
          descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
         (descriptor.dimension != VERNON_RHI_IMAGE_3D && descriptor.depth != 1))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("upload_directx12_image", image.index, image.generation);
     auto &state = device->state;
     const D3D12_RESOURCE_DESC native = slot->image.resource->GetDesc();
     struct UploadFootprint {
@@ -1152,7 +1203,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
             !vernon::rhi::imageTransferAspectMatches(descriptor.format, upload.aspect, upload.source_format,
                                                      upload.source_type) ||
             !upload.data)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return invalidResult("upload_directx12_image", index);
         const std::array<uint32_t, 2> aspects{VERNON_RHI_IMAGE_ASPECT_DEPTH, VERNON_RHI_IMAGE_ASPECT_STENCIL};
         const bool packed = upload.aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
         const size_t planeCount = packed ? 2 : 1;
@@ -1178,7 +1229,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
             const UINT64 footprintSize =
                 static_cast<UINT64>(footprint.placed.Footprint.RowPitch) * upload.height * upload.depth;
             if (footprintSize > (std::numeric_limits<UINT64>::max)() - footprint.placed.Offset)
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+                return invalidResult("upload_directx12_image", index);
             required = footprint.placed.Offset + footprintSize;
             footprints.push_back(footprint);
         }
@@ -1188,7 +1239,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     uint8_t *mapped = nullptr;
     if (!state.acquireStaging(true, static_cast<size_t>(required), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, staging,
                               stagingOffset, mapped, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("upload_directx12_image", required);
     for (UploadFootprint &footprint : footprints) {
         const VernonRhiImageUploadDescriptor &upload = uploads[footprint.upload];
         footprint.placed.Offset += stagingOffset;
@@ -1220,7 +1271,7 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
         }
     }
     if (!state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("upload_directx12_image", image.index, image.generation);
     transitionDirectX12Image(state.commandList(), slot->image, D3D12_RESOURCE_STATE_COPY_DEST);
     for (const UploadFootprint &footprint : footprints) {
         const VernonRhiImageUploadDescriptor &upload = uploads[footprint.upload];
@@ -1240,26 +1291,26 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
                                      descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT
                                  ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                  : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    return state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    return state.submitCommands(device->error) ? Result<void, RhiError>{ok()}
+                                               : backendResult("upload_directx12_image", image.index, image.generation);
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
-                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
+Result<void, RhiError> downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                                     const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return invalidResult("download_directx12_image", handle.index, handle.generation);
 
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned || !download || download->struct_size < sizeof(*download) || !destination)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("download_directx12_image", image.index, image.generation);
     const auto expected = imageDownloadByteSize(slot->ownedDescriptor, *download);
     if (!expected || size != *expected)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("download_directx12_image", size);
     auto &state = device->state;
     const D3D12_RESOURCE_DESC native = slot->image.resource->GetDesc();
     const bool packedDepthStencil =
@@ -1283,7 +1334,7 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
     uint8_t *mapped = nullptr;
     if (!state.acquireStaging(false, static_cast<size_t>(required), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, staging,
                               stagingOffset, mapped, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image", required);
     required = stagingOffset;
     for (UINT plane = 0; plane < planeCount; ++plane) {
         UINT64 planeRequired = 0;
@@ -1292,7 +1343,7 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
         required = planeRequired;
     }
     if (!state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image", image.index, image.generation);
     transitionDirectX12Image(state.commandList(), slot->image, D3D12_RESOURCE_STATE_COPY_SOURCE);
     const D3D12_BOX sourceBox{download->offset_x,
                               download->offset_y,
@@ -1316,7 +1367,7 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
                                  ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                  : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!state.submitCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image", image.index, image.generation);
     if (!packedDepthStencil) {
         const size_t outputRowBytes =
             static_cast<size_t>(download->width) *
@@ -1345,23 +1396,23 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
             }
         }
     }
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
-                                   const VernonRhiImageDownload *downloads, size_t downloadCount) {
+Result<void, RhiError> downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
+                                          const VernonRhiImageDownload *downloads, size_t downloadCount) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return invalidResult("download_directx12_image_batch", handle.index, handle.generation);
     if (!downloads || downloadCount == 0)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("download_directx12_image_batch", downloadCount);
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("download_directx12_image_batch", image.index, image.generation);
     const UINT planeStride = slot->ownedDescriptor.mip_levels * slot->ownedDescriptor.array_layers;
     const D3D12_RESOURCE_DESC native = slot->image.resource->GetDesc();
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(downloadCount * 2);
@@ -1371,7 +1422,7 @@ VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
     for (size_t index = 0; index < downloadCount; ++index) {
         const auto expected = imageDownloadByteSize(slot->ownedDescriptor, downloads[index].descriptor);
         if (!downloads[index].destination || !expected || downloads[index].size != *expected)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            return invalidResult("download_directx12_image_batch", index);
         const auto &download = downloads[index].descriptor;
         planeStarts[index] = download.aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL ? 1u : 0u;
         planeCounts[index] =
@@ -1390,7 +1441,7 @@ VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(false, static_cast<size_t>(required), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
                                       staging, stagingOffset, mapped, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image_batch", required);
     required = stagingOffset;
     for (size_t index = 0; index < downloadCount; ++index) {
         const auto &download = downloads[index].descriptor;
@@ -1404,7 +1455,7 @@ VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
         }
     }
     if (!device->state.beginCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image_batch", downloadCount);
     transitionDirectX12Image(device->state.commandList(), slot->image, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (size_t index = 0; index < downloadCount; ++index) {
         const auto &download = downloads[index].descriptor;
@@ -1432,7 +1483,7 @@ VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
                                  ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                  : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!device->state.submitCommands(device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("download_directx12_image_batch", downloadCount);
     for (size_t index = 0; index < downloadCount; ++index) {
         const auto &download = downloads[index].descriptor;
         const bool packedDepthStencil =
@@ -1466,16 +1517,16 @@ VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
             }
         }
     }
-    return VERNON_RHI_STATUS_OK;
+    return Result<void, RhiError>{ok()};
 }
 
-VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
+Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return invalidResult("generate_directx12_image_mipmaps", handle.index, handle.generation);
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned || slot->ownedDescriptor.mip_levels < 2 ||
@@ -1483,17 +1534,17 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
         slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT ||
         !(slot->ownedDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
         !(slot->ownedDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return invalidResult("generate_directx12_image_mipmaps", image.index, image.generation);
     const D3D12_RESOURCE_DESC resourceDescriptor = slot->image.resource->GetDesc();
     if ((resourceDescriptor.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return unsupportedResult("generate_directx12_image_mipmaps", image.index, image.generation);
     if (!ensureMipmapPipelines(*device))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("generate_directx12_image_mipmaps", image.index, image.generation);
     auto &state = device->state;
     ID3D12PipelineState *pipeline =
         slot->ownedDescriptor.dimension == VERNON_RHI_IMAGE_3D ? device->mipmap3dPipeline : device->mipmap2dPipeline;
     if (!state.beginCommands(device->error, pipeline))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return backendResult("generate_directx12_image_mipmaps", image.index, image.generation);
     ID3D12GraphicsCommandList *commands = state.commandList();
     transitionDirectX12Image(commands, slot->image, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     commands->SetComputeRootSignature(device->mipmapRootSignature);
@@ -1525,7 +1576,7 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
         if (!state.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, 2, heap, cpu, gpu, device->error))
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            return backendResult("generate_directx12_image_mipmaps", level);
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = srvFormat;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1579,56 +1630,54 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
         }
         commands->ResourceBarrier(static_cast<UINT>(transitions.size()), transitions.data());
     }
-    return state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    return state.submitCommands(device->error)
+               ? Result<void, RhiError>{ok()}
+               : backendResult("generate_directx12_image_mipmaps", image.index, image.generation);
 }
 
-VernonRhiStatus bindImage(VernonRhiDevice handle, VernonRhiImage image, uint32_t textureUnit) {
-    return VERNON_RHI_STATUS_UNSUPPORTED;
+Result<void, RhiError> bindImage(VernonRhiDevice, VernonRhiImage image, uint32_t textureUnit) {
+    return unsupportedResult("bind_directx12_image", image.index, textureUnit);
 }
 
-VernonRhiStatus destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
+Result<void, RhiError> destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return invalidResult("destroy_directx12_image", handle.index, handle.generation);
 
-    auto destroyed = destroyPublicResource<ImageResourceTag>(**device, device->images, image);
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
+    return destroyPublicResource<ImageResourceTag>(**device, device->images, image);
 }
 
-uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
+Result<bool, RhiError> isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<bool, RhiError>{
+            err(invalidArgument("validate_directx12_image", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->images, image) != nullptr;
+    return Result<bool, RhiError>{ok(lookupPublicResource(device->images, image) != nullptr)};
 }
 
-VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor,
-                              VernonRhiSampler *output) {
+Result<VernonRhiSampler, RhiError> createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return Result<VernonRhiSampler, RhiError>{
+            err(invalidArgument("create_directx12_sampler", handle.index, handle.generation))};
 
     SamplerFilter filter;
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        !decodeSamplerFilter(*descriptor, filter))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !decodeSamplerFilter(*descriptor, filter))
+        return Result<VernonRhiSampler, RhiError>{err(invalidArgument("create_directx12_sampler"))};
     if (filter.maxAnisotropy > 1.0f)
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+        return Result<VernonRhiSampler, RhiError>{err(unsupported("create_directx12_sampler"))};
     auto reservation = reserveResource(*device);
     if (reservation.isErr())
-        return vernon::toVernonRhiStatus(reservation.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
     auto available = availableResourceSlot<SamplerResourceTag>(device->samplers);
     if (available.isErr())
-        return vernon::toVernonRhiStatus(available.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(available).error())};
     DirectX12SamplerSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
     auto address = [](uint32_t mode) {
@@ -1650,82 +1699,75 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
     auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownSampler);
     if (published.isErr()) {
         slot.sampler = {};
-        return vernon::toVernonRhiStatus(published.error());
+        return Result<VernonRhiSampler, RhiError>{err(std::move(published).error())};
     }
-    *output = publicHandle<VernonRhiSampler>(published.value());
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiSampler, RhiError>{ok(publicHandle<VernonRhiSampler>(published.value()))};
 }
 
-VernonRhiStatus destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
+Result<void, RhiError> destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return invalidResult("destroy_directx12_sampler", handle.index, handle.generation);
 
-    auto destroyed = destroyPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
+    return destroyPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
 }
 
-uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
+Result<bool, RhiError> isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<bool, RhiError>{
+            err(invalidArgument("validate_directx12_sampler", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
     if (operation.isErr())
-        return 0;
+        return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->samplers, sampler) != nullptr;
+    return Result<bool, RhiError>{ok(lookupPublicResource(device->samplers, sampler) != nullptr)};
 }
 
-VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image, uint64_t *output) {
+Result<uint64_t, RhiError> getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    if (!output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("get_directx12_image_native_handle", handle.index, handle.generation))};
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = reinterpret_cast<uint64_t>(slot->image.resource);
-    return VERNON_RHI_STATUS_OK;
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("get_directx12_image_native_handle", image.index, image.generation))};
+    return Result<uint64_t, RhiError>{ok(reinterpret_cast<uint64_t>(slot->image.resource))};
 }
 
-VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
-                                VernonRhiImageView *output) {
+Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
+                                                     const VernonRhiImageViewDescriptor *descriptor) {
     auto device = lookupDirectX12Device(handle);
-    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
-        !descriptor->mip_level_count || !descriptor->array_layer_count || !descriptor->aspects)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->mip_level_count ||
+        !descriptor->array_layer_count || !descriptor->aspects)
+        return Result<VernonRhiImageView, RhiError>{err(invalidArgument("create_directx12_image_view"))};
     auto reservation = reserveResource(*device);
     if (reservation.isErr())
-        return vernon::toVernonRhiStatus(reservation.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
     auto available = availableResourceSlot<ImageViewResourceTag>(device->imageViews);
     if (available.isErr())
-        return vernon::toVernonRhiStatus(available.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(available).error())};
     auto parentPin = pinPublicResource<ImageResourceTag>(**device, device->images, descriptor->image);
     if (parentPin.isErr())
-        return vernon::toVernonRhiStatus(parentPin.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(parentPin).error())};
     std::unique_lock<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *parent = lookupPublicResource(device->images, descriptor->image);
     if (!parent)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImageView, RhiError>{err(invalidArgument("create_directx12_image_view"))};
     const VernonRhiImageDescriptor &imageDescriptor =
         parent->image.owned ? parent->ownedDescriptor : parent->descriptor.image;
     if (!vernon::rhi::validImageViewDescriptor(imageDescriptor, *descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        return Result<VernonRhiImageView, RhiError>{err(invalidArgument("create_directx12_image_view"))};
     auto retained = parent->lifecycle.retain(typedHandle<VernonRhiImage, ImageResourceTag>(descriptor->image));
     if (retained.isErr())
-        return vernon::toVernonRhiStatus(retained.error());
+        return Result<VernonRhiImageView, RhiError>{err(std::move(retained).error())};
     DirectX12ImageViewSlot &slot = *available.value();
     slot.image.resource = parent->image.resource;
     slot.image.state = parent->image.state;
@@ -1743,115 +1785,71 @@ VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageView
         slot.imageResource = 0;
         auto parentLease = slot.imageLease.take();
         guard.unlock();
-        if (parentLease)
-            (void)parentLease.value().release();
-        return vernon::toVernonRhiStatus(published.error());
+        if (parentLease && parentLease.value().release().isErr())
+            vernon::resultContractViolation();
+        return Result<VernonRhiImageView, RhiError>{err(std::move(published).error())};
     }
-    *output = publicHandle<VernonRhiImageView>(published.value());
-    return VERNON_RHI_STATUS_OK;
+    return Result<VernonRhiImageView, RhiError>{ok(publicHandle<VernonRhiImageView>(published.value()))};
 }
 
-VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
+Result<void, RhiError> destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = destroyPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
+        return invalidResult("destroy_directx12_image_view", handle.index, handle.generation);
+    return destroyPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
 }
 
-VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view, uint64_t *output) {
+Result<uint64_t, RhiError> getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view) {
     auto device = lookupDirectX12Device(handle);
-    if (!device || !output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("get_directx12_image_view_native_handle", handle.index, handle.generation))};
     auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageViewSlot *slot = lookupPublicResource(device->imageViews, view);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = reinterpret_cast<uint64_t>(slot->image.resource);
-    return VERNON_RHI_STATUS_OK;
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("get_directx12_image_view_native_handle", view.index, view.generation))};
+    return Result<uint64_t, RhiError>{ok(reinterpret_cast<uint64_t>(slot->image.resource))};
 }
 
-VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<void, RhiError> destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    if (!device)
+        return invalidResult("destroy_directx12_buffer", handle.index, handle.generation);
 
-    auto destroyed = destroyPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
-    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
+    return destroyPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
 }
 
-VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer, void **output) {
+Result<void *, RhiError> getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    if (!output)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!device)
+        return Result<void *, RhiError>{
+            err(invalidArgument("get_directx12_buffer_native_handle", handle.index, handle.generation))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return vernon::toVernonRhiStatus(operation.error());
+        return Result<void *, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = slot->buffer.resource;
-    return VERNON_RHI_STATUS_OK;
+        return Result<void *, RhiError>{
+            err(invalidArgument("get_directx12_buffer_native_handle", buffer.index, buffer.generation))};
+    return Result<void *, RhiError>{ok(static_cast<void *>(slot->buffer.resource))};
 }
 
 bool ownsDevice(VernonRhiDevice handle) { return static_cast<bool>(lookupDirectX12Device(handle)); }
 
-void *deviceStateForBackend(VernonRhiDevice handle) {
-    auto device = lookupDirectX12Device(handle);
-    return device ? &device->state : nullptr;
-}
-
-bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
-    auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (!device->state.beginCommands(device->error))
-        return false;
-    backend = VERNON_RHI_BACKEND_DIRECTX12;
-    native = reinterpret_cast<uintptr_t>(device->state.commandList());
-    return true;
-}
-
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
-                    bool &externalCompletion) {
-    auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (native != reinterpret_cast<uintptr_t>(device->state.commandList()))
-        return false;
-    const bool submitted = device->state.submitCommands(device->error);
-    completed = submitted && !device->state.nativeObjectsBorrowed;
-    externalCompletion = submitted && device->state.nativeObjectsBorrowed;
-    return submitted;
-}
-
-bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+Result<void *, RhiError> deviceStateForBackend(VernonRhiDevice handle) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return false;
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (device->state.nativeObjectsBorrowed && native == reinterpret_cast<uintptr_t>(device->state.commandList()))
-        device->state.recycleCommandStorage();
-    return true;
+        return Result<void *, RhiError>{
+            err(invalidArgument("get_directx12_device_state", handle.index, handle.generation))};
+    return Result<void *, RhiError>{ok(static_cast<void *>(&device->state))};
 }
 
-void abandonCommands(VernonRhiDevice handle, uint64_t native) {
+void abandonCommands(VernonRhiDevice handle, uint64_t native) noexcept {
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return;
@@ -1865,17 +1863,19 @@ void abandonCommands(VernonRhiDevice handle, uint64_t native) {
     return;
 }
 
-bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, const VernonRhiBarrier *barriers,
-                    size_t barrierCount) {
+Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                      const VernonRhiBarrier *barriers, size_t barrierCount) noexcept {
     auto device = lookupDirectX12Device(handle);
     if (!device) {
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_directx12", native, 0}})};
     }
 
     std::lock_guard<std::mutex> guard(device->mutex);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!commands || commands != device->state.commandList())
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_directx12", native, 0}})};
     try {
         std::vector<D3D12_RESOURCE_BARRIER> nativeBarriers;
         nativeBarriers.reserve(barrierCount);
@@ -1889,14 +1889,16 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
             if (barriers[index].is_image) {
                 auto *slot = lookupRetainedResource(device->images, resourceKey(barriers[index].image));
                 if (!slot)
-                    return false;
+                    return Result<void, RhiError>{
+                        err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_directx12_resource", native, 0}})};
                 imageDescriptor = slot->ownedDescriptor.struct_size ? &slot->ownedDescriptor : &slot->descriptor.image;
                 resource = slot->image.resource;
                 rollbackContext = &slot->image;
             } else {
                 auto *slot = lookupRetainedResource(device->buffers, resourceKey(barriers[index].buffer));
                 if (!slot)
-                    return false;
+                    return Result<void, RhiError>{
+                        err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_directx12_resource", native, 0}})};
                 current = &slot->buffer.state;
                 resource = slot->buffer.resource;
                 restore = restoreDirectX12BufferState;
@@ -1917,10 +1919,14 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
                 (range.base_mip_level >= imageDescriptor->mip_levels || mipEnd > imageDescriptor->mip_levels ||
                  range.base_array_layer >= imageLayers || layerEnd > imageLayers ||
                  (range.aspects & ~vernon::rhi::imageFormatAspects(imageDescriptor->format)) != 0))
-                return false;
-            if (!imageDescriptor &&
-                !deferCommandRollback(handle, encoderKey, rollbackContext, static_cast<uint64_t>(*current), restore))
-                return false;
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"recordBarriers_directx12_range", native, 0}})};
+            if (!imageDescriptor) {
+                auto rollback =
+                    deferCommandRollback(handle, encoderKey, rollbackContext, static_cast<uint64_t>(*current), restore);
+                if (rollback.isErr())
+                    return rollback;
+            }
             if (imageDescriptor) {
                 auto *image = static_cast<vernon::rhi::directx12::Image *>(rollbackContext);
                 const size_t planeStride = static_cast<size_t>(imageDescriptor->mip_levels) * imageLayers;
@@ -1937,11 +1943,19 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
                     journal = result.first;
                     inserted = result.second;
                 }
-                if (inserted &&
-                    (!deferCommandCleanup(handle, encoderKey, image, encoderKey, clearDirectX12ImageStateJournal) ||
-                     !deferCommandRollback(handle, encoderKey, image, encoderKey, restoreDirectX12ImageState))) {
-                    image->stateJournals.erase(journal);
-                    return false;
+                if (inserted) {
+                    auto cleanup =
+                        deferCommandCleanup(handle, encoderKey, image, encoderKey, clearDirectX12ImageStateJournal);
+                    if (cleanup.isErr()) {
+                        image->stateJournals.erase(journal);
+                        return cleanup;
+                    }
+                    auto rollback =
+                        deferCommandRollback(handle, encoderKey, image, encoderKey, restoreDirectX12ImageState);
+                    if (rollback.isErr()) {
+                        image->stateJournals.erase(journal);
+                        return rollback;
+                    }
                 }
                 bool needsUavBarrier = false;
                 const uint32_t availableAspects = vernon::rhi::imageFormatAspects(imageDescriptor->format);
@@ -2003,18 +2017,21 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
         }
         if (!nativeBarriers.empty())
             commands->ResourceBarrier(static_cast<UINT>(nativeBarriers.size()), nativeBarriers.data());
-        return true;
+        return Result<void, RhiError>{ok()};
     } catch (const std::bad_alloc &) {
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"recordBarriers_directx12", native, 0}})};
     }
 }
 
-bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
-                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source,
+                                        uint64_t sourceOffset, VernonRhiBuffer destination, uint64_t destinationOffset,
+                                        uint64_t size) noexcept {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || commands != device->state.commandList() || !size)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBufferCopy_directx12", native, 0}})};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot *sourceSlot = lookupRetainedResource(device->buffers, resourceKey(source));
     DirectX12BufferSlot *destinationSlot = lookupRetainedResource(device->buffers, resourceKey(destination));
@@ -2022,7 +2039,8 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
         size > sourceSlot->ownedDescriptor.size - sourceOffset ||
         destinationOffset > destinationSlot->ownedDescriptor.size ||
         size > destinationSlot->ownedDescriptor.size - destinationOffset)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordBufferCopy_directx12", native, 0}})};
     if (sourceSlot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_DEVICE)
         vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2035,44 +2053,61 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
                                            D3D12_RESOURCE_STATE_COMMON);
     vernon::rhi::directx12::transition(commands, destinationSlot->buffer.resource, destinationSlot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool supportsImageCopy(VernonRhiDevice handle) { return lookupDirectX12Device(handle) != nullptr; }
-
-bool recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, VernonRhiImage source,
-                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                       VernonRhiImage source, VernonRhiImage destination,
+                                       const VernonRhiImageCopyRegion *regions, size_t regionCount) noexcept {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || commands != device->state.commandList() || !regions || !regionCount)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordImageCopy_directx12", native, 0}})};
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *sourceSlot = lookupRetainedResource(device->images, resourceKey(source));
     DirectX12ImageSlot *destinationSlot = lookupRetainedResource(device->images, resourceKey(destination));
     if (!sourceSlot || !destinationSlot)
-        return false;
-    const auto prepare = [&](DirectX12ImageSlot &slot, D3D12_RESOURCE_STATES target) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"recordImageCopy_directx12", native, 0}})};
+    const auto prepare = [&](DirectX12ImageSlot &slot, D3D12_RESOURCE_STATES target) -> Result<void, RhiError> {
         auto journal = slot.image.stateJournals.find(encoderKey);
         bool inserted = false;
         if (journal == slot.image.stateJournals.end()) {
-            const auto result = slot.image.stateJournals.emplace(
-                encoderKey,
-                vernon::rhi::directx12::Image::StateJournal{slot.image.state, slot.image.subresourceStates});
-            journal = result.first;
-            inserted = result.second;
+            try {
+                const auto result = slot.image.stateJournals.emplace(
+                    encoderKey,
+                    vernon::rhi::directx12::Image::StateJournal{slot.image.state, slot.image.subresourceStates});
+                journal = result.first;
+                inserted = result.second;
+            } catch (const std::bad_alloc &) {
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::ResourceExhausted, {"recordImageCopy_directx12", native, 0}})};
+            }
         }
-        if (inserted &&
-            (!deferCommandCleanup(handle, encoderKey, &slot.image, encoderKey, clearDirectX12ImageStateJournal) ||
-             !deferCommandRollback(handle, encoderKey, &slot.image, encoderKey, restoreDirectX12ImageState))) {
-            slot.image.stateJournals.erase(journal);
-            return false;
+        if (inserted) {
+            auto cleanup =
+                deferCommandCleanup(handle, encoderKey, &slot.image, encoderKey, clearDirectX12ImageStateJournal);
+            if (cleanup.isErr()) {
+                slot.image.stateJournals.erase(journal);
+                return cleanup;
+            }
+            auto rollback =
+                deferCommandRollback(handle, encoderKey, &slot.image, encoderKey, restoreDirectX12ImageState);
+            if (rollback.isErr()) {
+                slot.image.stateJournals.erase(journal);
+                return rollback;
+            }
         }
         transitionDirectX12Image(commands, slot.image, target);
-        return true;
+        return Result<void, RhiError>{ok()};
     };
-    if (!prepare(*sourceSlot, D3D12_RESOURCE_STATE_COPY_SOURCE) ||
-        !prepare(*destinationSlot, D3D12_RESOURCE_STATE_COPY_DEST))
-        return false;
+    auto sourcePrepared = prepare(*sourceSlot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (sourcePrepared.isErr())
+        return sourcePrepared;
+    auto destinationPrepared = prepare(*destinationSlot, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (destinationPrepared.isErr())
+        return destinationPrepared;
     const VernonRhiImageDescriptor &descriptor =
         sourceSlot->image.owned ? sourceSlot->ownedDescriptor : sourceSlot->descriptor.image;
     const uint32_t planeStride = descriptor.mip_levels * descriptor.array_layers;
@@ -2106,47 +2141,52 @@ bool recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t nativ
                                         region.destination_z, &sourceLocation, &sourceBox);
         }
     }
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                  uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
-                  size_t colorCount, uint64_t depthResource, uint64_t) {
+Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                    uint32_t backendKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
+                                    const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,
+                                    uint64_t) noexcept {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || backend != VERNON_RHI_BACKEND_DIRECTX12 || backendKind != CommandRenderingStateless ||
         (colorCount && !colorResources))
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"endRendering_directx12", native, backendKind}})};
     std::lock_guard<std::mutex> guard(device->mutex);
     for (size_t index = 0; index < colorCount; ++index)
         if ((colorDiscardMask & (uint32_t{1} << index)) && colorResources[index])
             commands->DiscardResource(reinterpret_cast<ID3D12Resource *>(colorResources[index]), nullptr);
     if (depthStencilDiscard && depthResource)
         commands->DiscardResource(reinterpret_cast<ID3D12Resource *>(depthResource), nullptr);
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, uint64_t,
-                int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
-                uint32_t location, const float color[4]) {
+Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                  uint32_t backendKind, uint64_t, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                  uint32_t layers, uint64_t target, uint32_t location, const float color[4]) noexcept {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || !target || backend != VERNON_RHI_BACKEND_DIRECTX12 ||
         backendKind != CommandRenderingStateless)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_directx12", native, backendKind}})};
     std::lock_guard<std::mutex> guard(device->mutex);
     commands->ClearRenderTargetView({target}, color, 0, nullptr);
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                       uint64_t, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
-                       uint64_t target, float depth, uint32_t stencil, uint32_t aspects) {
+Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                         uint32_t backendKind, uint64_t, int32_t x, int32_t y, uint32_t width,
+                                         uint32_t height, uint32_t layers, uint64_t target, float depth,
+                                         uint32_t stencil, uint32_t aspects) noexcept {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || !target || backend != VERNON_RHI_BACKEND_DIRECTX12 ||
         backendKind != CommandRenderingStateless)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_directx12", native, backendKind}})};
     D3D12_CLEAR_FLAGS flags = static_cast<D3D12_CLEAR_FLAGS>(0);
     if (aspects & VERNON_RHI_ATTACHMENT_DEPTH)
         flags |= D3D12_CLEAR_FLAG_DEPTH;
@@ -2154,63 +2194,107 @@ bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend
         flags |= D3D12_CLEAR_FLAG_STENCIL;
     std::lock_guard<std::mutex> guard(device->mutex);
     commands->ClearDepthStencilView({target}, flags, depth, static_cast<UINT8>(stencil), 0, nullptr);
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<CommandRecording, RhiError>{
+            err(invalidArgument("begin_directx12_commands", handle.index, handle.generation))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (!device->state.beginCommands(device->error))
+        return Result<CommandRecording, RhiError>{
+            err(backendFailure("begin_directx12_commands", handle.index, handle.generation))};
+    return Result<CommandRecording, RhiError>{
+        ok(CommandRecording{reinterpret_cast<uintptr_t>(device->state.commandList()), VERNON_RHI_BACKEND_DIRECTX12})};
+}
+
+Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint64_t native, bool) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return Result<CommandSubmission, RhiError>{
+            err(invalidArgument("submit_directx12_commands", native, handle.index))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (native != reinterpret_cast<uintptr_t>(device->state.commandList()))
+        return Result<CommandSubmission, RhiError>{err(invalidArgument("submit_directx12_commands", native))};
+    if (!device->state.submitCommands(device->error))
+        return Result<CommandSubmission, RhiError>{err(backendFailure("submit_directx12_commands", native))};
+    return Result<CommandSubmission, RhiError>{
+        ok(CommandSubmission{!device->state.nativeObjectsBorrowed, device->state.nativeObjectsBorrowed})};
+}
+
+Result<void, RhiError> completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return invalidResult("complete_directx12_commands", native, handle.index);
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (device->state.nativeObjectsBorrowed && native == reinterpret_cast<uintptr_t>(device->state.commandList()))
+        device->state.recycleCommandStorage();
+    return Result<void, RhiError>{ok()};
+}
+
+Result<uint64_t, RhiError> bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("bufferResource_directx12", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return 0;
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer))
-        return resourceKey(buffer);
-    return 0;
+    if (!lookupPublicResource(device->buffers, buffer))
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("bufferResource_directx12", buffer.generation, buffer.index))};
+    return Result<uint64_t, RhiError>{ok(resourceKey(buffer))};
 }
 
-uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
+Result<uint64_t, RhiError> imageResource(VernonRhiDevice handle, VernonRhiImage image) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("imageResource_directx12", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
     if (operation.isErr())
-        return 0;
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12ImageSlot *slot = lookupPublicResource(device->images, image))
-        return resourceKey(image);
-    return 0;
+    if (!lookupPublicResource(device->images, image))
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("imageResource_directx12", image.generation, image.index))};
+    return Result<uint64_t, RhiError>{ok(resourceKey(image))};
 }
 
-uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
+Result<uint64_t, RhiError> imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) noexcept {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return 0;
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("imageViewResource_directx12", handle.index, handle.generation))};
     auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
     if (operation.isErr())
-        return 0;
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->imageViews, view) ? resourceKey(view) : 0;
+    if (!lookupPublicResource(device->imageViews, view))
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("imageViewResource_directx12", view.generation, view.index))};
+    return Result<uint64_t, RhiError>{ok(resourceKey(view))};
 }
 
-uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
+Result<uint64_t, RhiError> samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("samplerResource_directx12", handle.index, handle.generation))};
 
     auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
     if (operation.isErr())
-        return 0;
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12SamplerSlot *slot = lookupPublicResource(device->samplers, sampler))
-        return resourceKey(sampler);
-    return 0;
+    if (!lookupPublicResource(device->samplers, sampler))
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("samplerResource_directx12", sampler.generation, sampler.index))};
+    return Result<uint64_t, RhiError>{ok(resourceKey(sampler))};
 }
 
 Result<vernon::rhi::RetainedRhiResourceLease, RhiError> retainResource(VernonRhiDevice handle, ResourceKind kind,
@@ -2326,127 +2410,126 @@ Result<uint64_t, RhiError> resolveResource(VernonRhiDevice handle, ResourceKind 
         err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
 }
 
-Result<void, RhiError> describeImageResource(VernonRhiDevice handle, uint64_t key,
-                                             VernonRhiImageDescriptor *descriptor) noexcept {
+Result<ImageResourceDescription, RhiError> describeImageResource(VernonRhiDevice handle, uint64_t key) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device || !descriptor)
-        return Result<void, RhiError>{
+    if (!device)
+        return Result<ImageResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
     std::unique_lock<std::mutex> guard(device->mutex);
     const DirectX12ImageSlot *slot = lookupRetainedResource(device->images, key);
     if (!slot) {
-        return Result<void, RhiError>{
+        return Result<ImageResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
     }
     guard.unlock();
     if (!matchesRetainedResource(*slot, key))
-        return Result<void, RhiError>{
+        return Result<ImageResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
     guard.lock();
-    *descriptor = slot->image.owned ? slot->ownedDescriptor : slot->descriptor.image;
-    return Result<void, RhiError>{ok()};
+    return Result<ImageResourceDescription, RhiError>{
+        ok(ImageResourceDescription{slot->image.owned ? slot->ownedDescriptor : slot->descriptor.image})};
 }
 
-Result<void, RhiError> describeImageViewResource(VernonRhiDevice handle, uint64_t key,
-                                                 VernonRhiImageViewDescriptor *view, VernonRhiImageDescriptor *image,
-                                                 uint64_t *parentKey) noexcept {
+Result<ImageViewResourceDescription, RhiError> describeImageViewResource(VernonRhiDevice handle,
+                                                                         uint64_t key) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device || !view || !image || !parentKey)
-        return Result<void, RhiError>{
+    if (!device)
+        return Result<ImageViewResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
     std::unique_lock<std::mutex> guard(device->mutex);
     const DirectX12ImageViewSlot *slot = lookupRetainedResource(device->imageViews, key);
     if (!slot) {
-        return Result<void, RhiError>{
+        return Result<ImageViewResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
     }
     guard.unlock();
     if (!matchesRetainedResource(*slot, key))
-        return Result<void, RhiError>{
+        return Result<ImageViewResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
     guard.lock();
     const DirectX12ImageSlot *parent = lookupRetainedResource(device->images, slot->imageResource);
     if (!parent)
-        return Result<void, RhiError>{
+        return Result<ImageViewResourceDescription, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
-    *view = slot->descriptor;
-    *image = parent->image.owned ? parent->ownedDescriptor : parent->descriptor.image;
-    *parentKey = slot->imageResource;
-    return Result<void, RhiError>{ok()};
+    return Result<ImageViewResourceDescription, RhiError>{ok(ImageViewResourceDescription{
+        slot->descriptor, parent->image.owned ? parent->ownedDescriptor : parent->descriptor.image,
+        slot->imageResource})};
 }
 
-uint64_t trackedBufferState(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+Result<uint64_t, RhiError> trackedBufferState(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return UINT64_MAX;
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("tracked_directx12_buffer_state", handle.index, handle.generation))};
     auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
     if (operation.isErr())
-        return UINT64_MAX;
+        return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
     const auto *slot = lookupRetainedResource(device->buffers, resourceKey(buffer));
-    return slot ? static_cast<uint64_t>(slot->buffer.state) : UINT64_MAX;
+    if (!slot)
+        return Result<uint64_t, RhiError>{
+            err(invalidArgument("tracked_directx12_buffer_state", buffer.index, buffer.generation))};
+    return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(slot->buffer.state))};
 }
 
 } // namespace vernon::rhi::directx12_api
 
 const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
     using namespace directx12_api;
-    static const BackendDispatch dispatch{
-        VERNON_RHI_BACKEND_DIRECTX12,
-        0,
-        nullptr,
-        ownsDevice,
-        createOwnedDevice,
-        destroyDevice,
-        lastError,
-        synchronize,
-        deviceStateForBackend,
-        commandState,
-        createBuffer,
-        uploadBuffer,
-        uploadBufferRanges,
-        downloadBufferRanges,
-        downloadBuffer,
-        destroyBuffer,
-        isBufferValid,
-        getBufferNativeHandle,
-        createImage,
-        setImageSampler,
-        uploadImage,
-        downloadImage,
-        downloadImageBatch,
-        generateImageMipmaps,
-        bindImage,
-        destroyImage,
-        isImageValid,
-        getImageNativeHandle,
-        createSampler,
-        destroySampler,
-        isSamplerValid,
-        bufferResource,
-        imageResource,
-        samplerResource,
-        retainResource,
-        resolveResource,
-        describeImageResource,
-        beginCommands,
-        submitCommands,
-        nullptr,
-        completeBorrowedCommands,
-        abandonCommands,
-        recordBarriers,
-        recordBufferCopy,
-        supportsImageCopy,
-        recordImageCopy,
-        endRendering,
-        clearColor,
-        clearDepthStencil,
-        trackedBufferState,
-        createImageView,
-        destroyImageView,
-        getImageViewNativeHandle,
-        imageViewResource,
-        describeImageViewResource,
-    };
+    static const BackendDispatch dispatch = [] {
+        BackendDispatch result{};
+        result.backend = VERNON_RHI_BACKEND_DIRECTX12;
+        result.ownsDevice = ownsDevice;
+        result.createOwnedDevice = createOwnedDevice;
+        result.destroyDevice = destroyDevice;
+        result.lastError = lastError;
+        result.synchronize = synchronize;
+        result.deviceState = deviceStateForBackend;
+        result.commandState = commandState;
+        result.createBuffer = createBuffer;
+        result.uploadBuffer = uploadBuffer;
+        result.uploadBufferRanges = uploadBufferRanges;
+        result.downloadBufferRanges = downloadBufferRanges;
+        result.downloadBuffer = downloadBuffer;
+        result.destroyBuffer = destroyBuffer;
+        result.isBufferValid = isBufferValid;
+        result.getBufferNativeHandle = getBufferNativeHandle;
+        result.createImage.emplace(createImage);
+        result.setImageSampler.emplace(setImageSampler);
+        result.uploadImage.emplace(uploadImage);
+        result.downloadImage.emplace(downloadImage);
+        result.downloadImageBatch.emplace(downloadImageBatch);
+        result.generateImageMipmaps.emplace(generateImageMipmaps);
+        result.bindImage.emplace(bindImage);
+        result.destroyImage.emplace(destroyImage);
+        result.isImageValid.emplace(isImageValid);
+        result.getImageNativeHandle.emplace(getImageNativeHandle);
+        result.createSampler.emplace(createSampler);
+        result.destroySampler.emplace(destroySampler);
+        result.isSamplerValid.emplace(isSamplerValid);
+        result.bufferResource = bufferResource;
+        result.imageResource.emplace(imageResource);
+        result.samplerResource.emplace(samplerResource);
+        result.retainResource = retainResource;
+        result.resolveRetainedResource = resolveResource;
+        result.describeImageResource.emplace(describeImageResource);
+        result.beginCommands = beginCommands;
+        result.submitCommands = submitCommands;
+        result.completeBorrowedCommands.emplace(completeBorrowedCommands);
+        result.abandonCommands.emplace(abandonCommands);
+        result.recordBarriers.emplace(recordBarriers);
+        result.recordBufferCopy.emplace(recordBufferCopy);
+        result.recordImageCopy.emplace(recordImageCopy);
+        result.endRendering.emplace(endRendering);
+        result.clearColor.emplace(clearColor);
+        result.clearDepthStencil.emplace(clearDepthStencil);
+        result.trackedBufferState.emplace(trackedBufferState);
+        result.createImageView.emplace(createImageView);
+        result.destroyImageView.emplace(destroyImageView);
+        result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);
+        result.imageViewResource.emplace(imageViewResource);
+        result.describeImageViewResource.emplace(describeImageViewResource);
+        return result;
+    }();
     return dispatch;
 }

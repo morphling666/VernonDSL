@@ -61,340 +61,348 @@ VkFormat vulkanTextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
-                           VernonStageExecutable &pipeline) {
+BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                            VernonStageExecutable &pipeline) {
+    const auto resolve = [&]() {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    auto *state = new VulkanPipelineState();
-    if (!plan.compute.empty()) {
-        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-        ReflectedEntry reflection;
-        if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection, invocationDiagnostic(*inputs.context))) {
-            delete state;
-            return false;
-        }
-        struct Candidate {
-            VernonRuntimeProviderBindingLayoutEntry layout{};
-            uint64_t resourceOffset{};
-            ComputeBindingSource source;
-        };
-        std::vector<Candidate> candidates;
-        uint32_t internalSlot = 0;
-        std::vector<uint32_t> argumentBindings(reflection.arguments.size());
-        uint32_t flattenedBinding = 0;
-        for (size_t index = 0; index < reflection.arguments.size(); ++index) {
-            argumentBindings[index] = flattenedBinding;
-            if (reflection.arguments[index].kind != "builtin")
-                flattenedBinding +=
-                    static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
-        }
-        for (const Parameter &parameter : plan.parameters)
-            internalSlot = std::max(internalSlot, parameter.slot);
-        for (const Parameter &parameter : plan.parameters)
-            for (const ParameterUse &use : parameter.uses) {
-                if (use.stage != "compute" && use.stage != plan.compute)
-                    continue;
-                if (use.index >= reflection.arguments.size()) {
-                    invocationDiagnostic(*inputs.context) = "Vulkan parameter use exceeds reflected argument table";
-                    delete state;
-                    return false;
-                }
-                const ReflectedArgument &argument = reflection.arguments[use.index];
-                const size_t leafCount = std::max(argument.storageLeaves.size(), size_t{1});
-                for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
-                    Candidate candidate;
-                    candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
-                    candidate.layout.set = argument.descriptorSet;
-                    candidate.layout.binding = argument.storageLeaves.size() <= 1
-                                                   ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
-                                                   : argument.storageLeaves[leafIndex].binding;
-                    candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
-                                                                               ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
-                                                                               : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
-                                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                    configureComputeValueStorage(use, candidate.layout);
-                    candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
-                    if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+        auto *state = new VulkanPipelineState();
+        if (!plan.compute.empty()) {
+            const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
+            ReflectedEntry reflection;
+            if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection,
+                                        invocationDiagnostic(*inputs.context))) {
+                delete state;
+                return false;
+            }
+            struct Candidate {
+                VernonRuntimeProviderBindingLayoutEntry layout{};
+                uint64_t resourceOffset{};
+                ComputeBindingSource source;
+            };
+            std::vector<Candidate> candidates;
+            uint32_t internalSlot = 0;
+            std::vector<uint32_t> argumentBindings(reflection.arguments.size());
+            uint32_t flattenedBinding = 0;
+            for (size_t index = 0; index < reflection.arguments.size(); ++index) {
+                argumentBindings[index] = flattenedBinding;
+                if (reflection.arguments[index].kind != "builtin")
+                    flattenedBinding +=
+                        static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
+            }
+            for (const Parameter &parameter : plan.parameters)
+                internalSlot = std::max(internalSlot, parameter.slot);
+            for (const Parameter &parameter : plan.parameters)
+                for (const ParameterUse &use : parameter.uses) {
+                    if (use.stage != "compute" && use.stage != plan.compute)
+                        continue;
+                    if (use.index >= reflection.arguments.size()) {
+                        invocationDiagnostic(*inputs.context) = "Vulkan parameter use exceeds reflected argument table";
+                        delete state;
                         return false;
-                    candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                    candidate.layout.array_count = 1;
-                    candidate.layout.argument_index = use.index;
-                    candidate.layout.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
-                                                          : argument.kind == "tensor" ? argument.tensorElementSize
-                                                                                      : argument.physical.size)
-                                                       : argument.storageLeaves[leafIndex].elementSize);
-                    // Aggregate lowering already folds each leaf's byte offset into the shader index.
-                    // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
-                    candidate.resourceOffset = 0;
-                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
-                    candidates.push_back(candidate);
-                }
-                if (use.tensorViewDescriptor) {
-                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
-                                                   uint32_t binding) {
+                    }
+                    const ReflectedArgument &argument = reflection.arguments[use.index];
+                    const size_t leafCount = std::max(argument.storageLeaves.size(), size_t{1});
+                    for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
                         Candidate candidate;
-                        candidate.layout.slot = ++internalSlot;
+                        candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
                         candidate.layout.set = argument.descriptorSet;
-                        candidate.layout.binding = binding;
-                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        candidate.layout.binding = argument.storageLeaves.size() <= 1
+                                                       ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
+                                                       : argument.storageLeaves[leafIndex].binding;
+                        candidate.layout.kind =
+                            parameter.kind == "image"
+                                ? (parameter.bindingRole == "sampled" ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                      : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        configureComputeValueStorage(use, candidate.layout);
+                        candidate.layout.access = parameter.access == "read"    ? 1u
+                                                  : parameter.access == "write" ? 2u
+                                                                                : 3u;
+                        if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+                            return false;
                         candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                         candidate.layout.array_count = 1;
                         candidate.layout.argument_index = use.index;
-                        candidate.layout.element_size = 4;
-                        candidate.source = {kind, use.index, dimension};
+                        candidate.layout.element_size = static_cast<uint32_t>(
+                            argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
+                                                              : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                          : argument.physical.size)
+                                                           : argument.storageLeaves[leafIndex].elementSize);
+                        // Aggregate lowering already folds each leaf's byte offset into the shader index.
+                        // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
+                        candidate.resourceOffset = 0;
+                        candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                         candidates.push_back(candidate);
-                    };
-                    addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding);
-                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                        addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
-                                      use.tensorViewDescriptor->extentBindings[dimension]);
-                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                        addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
-                                      use.tensorViewDescriptor->strideBindings[dimension]);
-                }
-            }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-        for (const auto &candidate : candidates) {
-            state->rhiComputeLayout.push_back(candidate.layout);
-            state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
-            state->rhiComputeBindingSources.push_back(candidate.source);
-        }
-        state->rhiComputeValues.resize(candidates.size());
-        state->rhiComputeDescriptorValues.resize(candidates.size());
-        std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
-        const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                           VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                           {"spirv", 5},
-                                                           stage.binary.data(),
-                                                           stage.binary.size(),
-                                                           {stage.entry.data(), stage.entry.size()},
-                                                           {},
-                                                           {0, 0, 0, 0}};
-        VernonRuntimeCorePipelineDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-        descriptor.shaders = &shader;
-        descriptor.shader_count = 1;
-        descriptor.bindings = state->rhiComputeLayout.data();
-        descriptor.binding_count = state->rhiComputeLayout.size();
-        std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
-        const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter),
-                                             &descriptor, &state->rhiComputePipeline);
-        if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
-            invocationDiagnostic(*inputs.context) = providerError.data
-                                                        ? std::string(providerError.data, providerError.size)
-                                                        : "failed to prepare Vulkan provider compute pipeline";
-            delete state;
-            return false;
-        }
-    }
-    if (!plan.vertex.empty()) {
-        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
-        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
-        struct Candidate {
-            VernonRuntimeProviderBindingLayoutEntry layout{};
-            std::vector<VernonRuntimeProviderVertexAttribute> attributes;
-            VulkanPipelineState::Binding binding;
-        };
-        std::vector<Candidate> candidates;
-        uint32_t nextProviderSlot = 0;
-        uint32_t vertexBinding = 0;
-        bool supported = true;
-        const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
-            if (use.stage != "vertex" && use.stage != "fragment")
-                return false;
-            Candidate candidate;
-            if (nextProviderSlot == UINT32_MAX)
-                return false;
-            candidate.layout.slot = nextProviderSlot++;
-            candidate.layout.argument_index = use.index;
-            candidate.layout.stage_mask =
-                use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
-            candidate.layout.array_count = 1;
-            candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "sampler") {
-                if (use.sampledImageBindings.empty())
-                    return false;
-                for (size_t index = 0; index < use.sampledImageBindings.size(); ++index) {
-                    const SampledImageBinding &binding = use.sampledImageBindings[index];
-                    Candidate sampler = candidate;
-                    if (index != 0) {
-                        if (nextProviderSlot == UINT32_MAX)
-                            return false;
-                        sampler.layout.slot = nextProviderSlot++;
                     }
-                    sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-                    sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                    sampler.layout.set = binding.descriptorSet;
-                    sampler.layout.binding = binding.binding;
-                    sampler.binding.source = internal ? VulkanPipelineState::Binding::IMPLICIT_SAMPLER
-                                                      : VulkanPipelineState::Binding::EXTERNAL_SAMPLER;
-                    candidates.push_back(std::move(sampler));
+                    if (use.tensorViewDescriptor) {
+                        const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
+                                                       uint32_t binding) {
+                            Candidate candidate;
+                            candidate.layout.slot = ++internalSlot;
+                            candidate.layout.set = argument.descriptorSet;
+                            candidate.layout.binding = binding;
+                            candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                            candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                            candidate.layout.array_count = 1;
+                            candidate.layout.argument_index = use.index;
+                            candidate.layout.element_size = 4;
+                            candidate.source = {kind, use.index, dimension};
+                            candidates.push_back(candidate);
+                        };
+                        addDescriptor(ComputeBindingSourceKind::TensorOffset, 0,
+                                      use.tensorViewDescriptor->offsetBinding);
+                        for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                            addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
+                                          use.tensorViewDescriptor->extentBindings[dimension]);
+                        for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                            addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
+                                          use.tensorViewDescriptor->strideBindings[dimension]);
+                    }
                 }
-                return true;
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
+            for (const auto &candidate : candidates) {
+                state->rhiComputeLayout.push_back(candidate.layout);
+                state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
+                state->rhiComputeBindingSources.push_back(candidate.source);
             }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
-                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                if (!dtype)
+            state->rhiComputeValues.resize(candidates.size());
+            state->rhiComputeDescriptorValues.resize(candidates.size());
+            std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
+            const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                               VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
+                                                               {"spirv", 5},
+                                                               stage.binary.data(),
+                                                               stage.binary.size(),
+                                                               {stage.entry.data(), stage.entry.size()},
+                                                               {},
+                                                               {0, 0, 0, 0}};
+            VernonRuntimeCorePipelineDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
+            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
+            descriptor.shaders = &shader;
+            descriptor.shader_count = 1;
+            descriptor.bindings = state->rhiComputeLayout.data();
+            descriptor.binding_count = state->rhiComputeLayout.size();
+            std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
+            const VernonStatus status = vernonRuntimeCorePreparePipeline(
+                vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter), &descriptor,
+                &state->rhiComputePipeline);
+            if (status != VERNON_STATUS_OK) {
+                const VernonStringView providerError =
+                    vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
+                invocationDiagnostic(*inputs.context) = providerError.data
+                                                            ? std::string(providerError.data, providerError.size)
+                                                            : "failed to prepare Vulkan provider compute pipeline";
+                delete state;
+                return false;
+            }
+        }
+        if (!plan.vertex.empty()) {
+            const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+            const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
+            struct Candidate {
+                VernonRuntimeProviderBindingLayoutEntry layout{};
+                std::vector<VernonRuntimeProviderVertexAttribute> attributes;
+                VulkanPipelineState::Binding binding;
+            };
+            std::vector<Candidate> candidates;
+            uint32_t nextProviderSlot = 0;
+            uint32_t vertexBinding = 0;
+            bool supported = true;
+            const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
+                if (use.stage != "vertex" && use.stage != "fragment")
                     return false;
-                if (!use.interfacePlan || !use.interfacePlan->root)
+                Candidate candidate;
+                if (nextProviderSlot == UINT32_MAX)
                     return false;
-                const std::optional<VernonRuntimeProviderBindingKind> providerKind =
-                    providerBindingKindForTransport(use.transport);
-                if (!providerKind)
-                    return false;
-                candidate.layout.kind = *providerKind;
-                const uint64_t physicalSize = use.interfacePlan->root->size;
-                if (!physicalSize || physicalSize > UINT32_MAX ||
-                    ((candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
-                      candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) &&
-                     use.binding == UINT32_MAX))
-                    return false;
-                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                const uint64_t physicalAlignment = use.interfacePlan->root->alignment;
-                if (!physicalAlignment || physicalAlignment > UINT32_MAX)
-                    return false;
-                candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
-                candidate.layout.binding = use.binding;
-                candidate.layout.set = use.descriptorSet;
-                candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
-                                                    : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
-                const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
-                const ValueLayout &canonical = *use.valueLayout;
-                std::optional<TensorCopyPlan> packing =
-                    wholeValue
-                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
-                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
-                if (!packing || packing->elementSize != canonical.byteSize) {
-                    invocationDiagnostic(*inputs.context) =
-                        !packing ? "Vulkan graphics value packing is incompatible with the canonical layout"
-                                 : "Vulkan graphics value packing scalar size does not match its dtype";
-                    return false;
+                candidate.layout.slot = nextProviderSlot++;
+                candidate.layout.argument_index = use.index;
+                candidate.layout.stage_mask = use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX
+                                                                    : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
+                candidate.layout.array_count = 1;
+                candidate.binding.externalSlot = parameter.slot;
+                if (parameter.kind == "sampler") {
+                    if (use.sampledImageBindings.empty())
+                        return false;
+                    for (size_t index = 0; index < use.sampledImageBindings.size(); ++index) {
+                        const SampledImageBinding &binding = use.sampledImageBindings[index];
+                        Candidate sampler = candidate;
+                        if (index != 0) {
+                            if (nextProviderSlot == UINT32_MAX)
+                                return false;
+                            sampler.layout.slot = nextProviderSlot++;
+                        }
+                        sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                        sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                        sampler.layout.set = binding.descriptorSet;
+                        sampler.layout.binding = binding.binding;
+                        sampler.binding.source = internal ? VulkanPipelineState::Binding::IMPLICIT_SAMPLER
+                                                          : VulkanPipelineState::Binding::EXTERNAL_SAMPLER;
+                        candidates.push_back(std::move(sampler));
+                    }
+                    return true;
                 }
-                candidate.binding.packing = std::move(*packing);
-                candidate.binding.storage.resize(candidate.layout.element_size);
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
-                       use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.binding = vertexBinding++;
-                candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves) {
-                    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
+                    const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                    const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                     if (!dtype)
                         return false;
-                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
-                                                    static_cast<uint32_t>(*dtype), leaf.componentCount,
-                                                    leaf.byteOffset});
-                }
-                candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_VERTEX;
-            } else if (parameter.kind == "image" && use.interfaceKind == "resource") {
-                candidate.layout.kind = parameter.bindingRole == "sampled" ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
-                                                                           : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
-                if (!configureImageBindingLayout(parameter, candidate.layout))
+                    if (!use.interfacePlan || !use.interfacePlan->root)
+                        return false;
+                    const std::optional<VernonRuntimeProviderBindingKind> providerKind =
+                        providerBindingKindForTransport(use.transport);
+                    if (!providerKind)
+                        return false;
+                    candidate.layout.kind = *providerKind;
+                    const uint64_t physicalSize = use.interfacePlan->root->size;
+                    if (!physicalSize || physicalSize > UINT32_MAX ||
+                        ((candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                          candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) &&
+                         use.binding == UINT32_MAX))
+                        return false;
+                    candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                    const uint64_t physicalAlignment = use.interfacePlan->root->alignment;
+                    if (!physicalAlignment || physicalAlignment > UINT32_MAX)
+                        return false;
+                    candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
+                    candidate.layout.binding = use.binding;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
+                                                        : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
+                    const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
+                    const ValueLayout &canonical = *use.valueLayout;
+                    auto packing =
+                        wholeValue ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                                   : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape,
+                                                                  *use.interfacePlan->root);
+                    if (packing.isErr() || packing.value().elementSize != canonical.byteSize) {
+                        invocationDiagnostic(*inputs.context) =
+                            packing.isErr() ? tensorBridgeErrorMessage(packing.error())
+                                            : "Vulkan graphics value packing scalar size does not match its dtype";
+                        return false;
+                    }
+                    candidate.binding.packing = std::move(packing).value();
+                    candidate.binding.storage.resize(candidate.layout.element_size);
+                } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                           use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+                    candidate.layout.element_size = parameter.elementLayout.byteSize;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
+                    candidate.layout.binding = vertexBinding++;
+                    candidate.layout.divisor = use.divisor;
+                    for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                        const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                        if (!dtype)
+                            return false;
+                        candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                        static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                        leaf.byteOffset});
+                    }
+                    candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_VERTEX;
+                } else if (parameter.kind == "image" && use.interfaceKind == "resource") {
+                    candidate.layout.kind = parameter.bindingRole == "sampled" ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                               : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+                    if (!configureImageBindingLayout(parameter, candidate.layout))
+                        return false;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.layout.binding = use.binding;
+                    candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_TEXTURE;
+                } else {
                     return false;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.set = use.descriptorSet;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_TEXTURE;
-            } else {
+                }
+                candidates.push_back(std::move(candidate));
+                return true;
+            };
+            for (const Parameter &parameter : plan.parameters) {
+                for (const ParameterUse &use : parameter.uses)
+                    if (!addUse(parameter, use, false)) {
+                        supported = false;
+                        break;
+                    }
+                if (!supported)
+                    break;
+            }
+            for (const Parameter &parameter : plan.runtimeParameters)
+                for (const ParameterUse &use : parameter.uses)
+                    if (!supported || !addUse(parameter, use, true)) {
+                        supported = false;
+                        break;
+                    }
+            if (!supported) {
+                std::string &diagnostic = invocationDiagnostic(*inputs.context);
+                if (diagnostic.empty())
+                    diagnostic = "Vulkan RuntimeCore graphics path does not support this parameter layout";
+                for (const Parameter &parameter : plan.parameters)
+                    for (const ParameterUse &use : parameter.uses)
+                        diagnostic += " [" + parameter.name + ": kind=" + parameter.kind +
+                                      ", interface=" + use.interfaceKind + ", stage=" + use.stage +
+                                      ", dtype=" + use.dtype + ", transport=" + use.transport +
+                                      ", plan=" + (use.interfacePlan && use.interfacePlan->root ? "yes" : "no") + "]";
+                delete state;
                 return false;
             }
-            candidates.push_back(std::move(candidate));
-            return true;
-        };
-        for (const Parameter &parameter : plan.parameters) {
-            for (const ParameterUse &use : parameter.uses)
-                if (!addUse(parameter, use, false)) {
-                    supported = false;
-                    break;
-                }
-            if (!supported)
-                break;
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
+            for (auto &candidate : candidates) {
+                state->rhiGraphicsLayout.push_back(candidate.layout);
+                state->rhiGraphicsVertexAttributes.insert(state->rhiGraphicsVertexAttributes.end(),
+                                                          candidate.attributes.begin(), candidate.attributes.end());
+                state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
+            }
+            state->rhiGraphicsValues.resize(candidates.size());
+            std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                                        VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
+                                                                        {"spirv", 5},
+                                                                        vertex.binary.data(),
+                                                                        vertex.binary.size(),
+                                                                        {vertex.entry.data(), vertex.entry.size()},
+                                                                        {},
+                                                                        {0, 0, 0, 0}}};
+            shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
+                               VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
+                               {"spirv", 5},
+                               fragment.binary.data(),
+                               fragment.binary.size(),
+                               {fragment.entry.data(), fragment.entry.size()},
+                               {},
+                               {0, 0, 0, 0}});
+            VernonRuntimeCorePipelineDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
+            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
+            descriptor.shaders = shaders.data();
+            descriptor.shader_count = shaders.size();
+            descriptor.bindings = state->rhiGraphicsLayout.data();
+            descriptor.binding_count = state->rhiGraphicsLayout.size();
+            descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();
+            descriptor.vertex_attribute_count = state->rhiGraphicsVertexAttributes.size();
+            descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+            descriptor.sample_count = 1;
+            const VernonStatus status = vernonRuntimeCorePreparePipeline(
+                vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter), &descriptor,
+                &state->rhiGraphicsPipeline);
+            if (status != VERNON_STATUS_OK) {
+                const VernonStringView providerError =
+                    vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
+                invocationDiagnostic(*inputs.context) = providerError.data
+                                                            ? std::string(providerError.data, providerError.size)
+                                                            : "failed to prepare Vulkan provider graphics pipeline";
+                delete state;
+                return false;
+            }
         }
-        for (const Parameter &parameter : plan.runtimeParameters)
-            for (const ParameterUse &use : parameter.uses)
-                if (!supported || !addUse(parameter, use, true)) {
-                    supported = false;
-                    break;
-                }
-        if (!supported) {
-            std::string &diagnostic = invocationDiagnostic(*inputs.context);
-            if (diagnostic.empty())
-                diagnostic = "Vulkan RuntimeCore graphics path does not support this parameter layout";
-            for (const Parameter &parameter : plan.parameters)
-                for (const ParameterUse &use : parameter.uses)
-                    diagnostic += " [" + parameter.name + ": kind=" + parameter.kind +
-                                  ", interface=" + use.interfaceKind + ", stage=" + use.stage + ", dtype=" + use.dtype +
-                                  ", transport=" + use.transport +
-                                  ", plan=" + (use.interfacePlan && use.interfacePlan->root ? "yes" : "no") + "]";
-            delete state;
-            return false;
-        }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-        for (auto &candidate : candidates) {
-            state->rhiGraphicsLayout.push_back(candidate.layout);
-            state->rhiGraphicsVertexAttributes.insert(state->rhiGraphicsVertexAttributes.end(),
-                                                      candidate.attributes.begin(), candidate.attributes.end());
-            state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
-        }
-        state->rhiGraphicsValues.resize(candidates.size());
-        std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                    VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                    {"spirv", 5},
-                                                                    vertex.binary.data(),
-                                                                    vertex.binary.size(),
-                                                                    {vertex.entry.data(), vertex.entry.size()},
-                                                                    {},
-                                                                    {0, 0, 0, 0}}};
-        shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
-                           VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                           {"spirv", 5},
-                           fragment.binary.data(),
-                           fragment.binary.size(),
-                           {fragment.entry.data(), fragment.entry.size()},
-                           {},
-                           {0, 0, 0, 0}});
-        VernonRuntimeCorePipelineDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-        descriptor.shaders = shaders.data();
-        descriptor.shader_count = shaders.size();
-        descriptor.bindings = state->rhiGraphicsLayout.data();
-        descriptor.binding_count = state->rhiGraphicsLayout.size();
-        descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();
-        descriptor.vertex_attribute_count = state->rhiGraphicsVertexAttributes.size();
-        descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-        descriptor.sample_count = 1;
-        const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter),
-                                             &descriptor, &state->rhiGraphicsPipeline);
-        if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
-            invocationDiagnostic(*inputs.context) = providerError.data
-                                                        ? std::string(providerError.data, providerError.size)
-                                                        : "failed to prepare Vulkan provider graphics pipeline";
-            delete state;
-            return false;
-        }
-    }
-    installRuntimeBackendState(pipeline, state);
-    return true;
+        installRuntimeBackendState(pipeline, state);
+        return true;
 #else
-    return false;
+        return false;
 #endif
+    };
+    return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
 void destroyVulkanPipeline(VernonStageExecutable &pipeline) {
@@ -476,8 +484,8 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
             if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "Vulkan RHI uniform argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
-            const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
-            if (!packed)
+            auto packed = packTensor(tensor, prepared.packing);
+            if (packed.isErr())
                 return fail(*pipeline.context,
                             "Vulkan RHI uniform Tensor at slot " + std::to_string(prepared.externalSlot) +
                                 " does not satisfy its resolved packing plan (rank " + std::to_string(tensor.rank) +
@@ -488,12 +496,12 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
                                 std::to_string(static_cast<uint32_t>(tensor.storage)) + ", host data " +
                                 (tensor.host_data ? "present" : "missing") + ", byte offset " +
                                 std::to_string(tensor.byte_offset) + ")");
-            if (packed->size() != prepared.storage.size())
+            if (packed.value().size() != prepared.storage.size())
                 return fail(*pipeline.context, "Vulkan RHI uniform Tensor at slot " +
                                                    std::to_string(prepared.externalSlot) + " packed to " +
-                                                   std::to_string(packed->size()) + " bytes; expected " +
+                                                   std::to_string(packed.value().size()) + " bytes; expected " +
                                                    std::to_string(prepared.storage.size()));
-            prepared.storage = *packed;
+            prepared.storage = std::move(packed).value();
             value.payload.inline_value.data = prepared.storage.data();
             value.payload.inline_value.size = prepared.storage.size();
         }

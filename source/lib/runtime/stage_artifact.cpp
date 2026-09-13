@@ -41,42 +41,32 @@ const char *hostArchitecture() {
 
 } // namespace
 
-bool validateProgramBundleHash(const nlohmann::json &root, bool required, std::string &error) {
+StageArtifactResult<void> validateProgramBundleHash(const nlohmann::json &root, bool required) {
     if (!root.contains("content_hash")) {
         if (!required)
-            return true;
-        error = "Program bundle content_hash is missing";
-        return false;
+            return StageArtifactResult<void>{vernon::ok()};
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::MissingContentHash)};
     }
-    if (!root["content_hash"].is_string()) {
-        error = "Program bundle content_hash is invalid";
-        return false;
-    }
+    if (!root["content_hash"].is_string())
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::InvalidContentHash)};
     const std::string expected = root["content_hash"].get<std::string>();
-    if (!isSha256(expected)) {
-        error = "Program bundle content_hash is invalid";
-        return false;
-    }
+    if (!isSha256(expected))
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::InvalidContentHash)};
     nlohmann::json canonical = root;
     canonical.erase("content_hash");
     const std::string bytes = canonical.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
-    if (sha256Hex(bytes.data(), bytes.size()) != expected) {
-        error = "Program bundle content_hash does not match canonical content";
-        return false;
-    }
-    return true;
+    if (sha256Hex(bytes.data(), bytes.size()) != expected)
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::ContentHashMismatch)};
+    return StageArtifactResult<void>{vernon::ok()};
 }
 
-bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
-                                    std::string &error) {
+StageArtifactResult<void> validateCpuRuntimeRequirements(const std::string &targetTriple,
+                                                         const std::string &objectFormat) {
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
     if (targetTriple.rfind("wasm32-", 0) != 0 || targetTriple.find("emscripten") == std::string::npos ||
-        objectFormat != "wasm") {
-        error = "Stage artifact requires CPU target " + targetTriple + " / " + objectFormat +
-                ", web runtime provides wasm32-unknown-emscripten / wasm";
-        return false;
-    }
-    return true;
+        objectFormat != "wasm")
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::UnsupportedCpuTarget)};
+    return StageArtifactResult<void>{vernon::ok()};
 #else
 #if defined(_WIN32)
     constexpr const char *hostFormat = "coff";
@@ -92,71 +82,80 @@ bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::
     const bool architectureMatches = targetTriple.rfind(architecture, 0) == 0 ||
                                      (architecture == "x86_64" && targetTriple.rfind("amd64", 0) == 0) ||
                                      (architecture == "aarch64" && targetTriple.rfind("arm64", 0) == 0);
-    if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat) {
-        error = "Stage artifact requires CPU target " + targetTriple + " / " + objectFormat + ", runtime provides " +
-                architecture + "-" + hostOsToken + " / " + hostFormat;
-        return false;
-    }
-    return true;
+    if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat)
+        return StageArtifactResult<void>{vernon::err(StageArtifactError::UnsupportedCpuTarget)};
+    return StageArtifactResult<void>{vernon::ok()};
 #endif
 }
 
-bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem::path &libraryPath,
-                              ReflectedEntry *reflection, std::string &error) {
+StageArtifactResult<ResolvedCpuNativeArtifact> resolveCpuNativeArtifact(const CpuNativeArtifact &artifact) {
     const bool nativeLibrary = artifact.format == "native_library";
     const bool relocatableObject = artifact.format == "relocatable_object";
     if (artifact.entry.empty() || artifact.symbol.empty() || artifact.relativeLibrary.empty() || !artifact.size ||
         !isSha256(artifact.sha256) || (!nativeLibrary && !relocatableObject) ||
         (artifact.staticallyLinked && !relocatableObject) || artifact.targetTriple.empty() ||
         (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" && artifact.objectFormat != "macho" &&
-         artifact.objectFormat != "wasm")) {
-        error = "unsupported or invalid CPU AOT artifact";
-        return false;
-    }
+         artifact.objectFormat != "wasm"))
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidCpuArtifact)};
     if (artifact.relativeLibrary.is_absolute() || artifact.relativeLibrary.has_root_path() ||
         std::find(artifact.relativeLibrary.begin(), artifact.relativeLibrary.end(), std::filesystem::path("..")) !=
-            artifact.relativeLibrary.end()) {
-        error = "CPU AOT artifact path is invalid";
-        return false;
-    }
+            artifact.relativeLibrary.end())
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidCpuArtifactPath)};
 
     ReflectedEntry parsed;
-    if (!parseReflection(artifact.reflection, artifact.entry, parsed, VERNON_RUNTIME_CPU, error))
-        return false;
+    std::string reflectionError;
+    if (!parseReflection(artifact.reflection, artifact.entry, parsed, VERNON_RUNTIME_CPU, reflectionError))
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidReflection)};
+    ResolvedCpuNativeArtifact resolved;
+    resolved.reflection = std::move(parsed);
     if (artifact.staticallyLinked) {
-        libraryPath.clear();
-        if (reflection)
-            *reflection = std::move(parsed);
-        return true;
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::ok(std::move(resolved))};
     }
 
     std::error_code filesystemError;
     const std::filesystem::path canonicalRoot = std::filesystem::canonical(artifact.root, filesystemError);
-    if (filesystemError || !std::filesystem::is_directory(canonicalRoot, filesystemError)) {
-        error = "Program bundle directory is invalid";
-        return false;
-    }
+    if (filesystemError || !std::filesystem::is_directory(canonicalRoot, filesystemError))
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidBundleDirectory)};
     const std::filesystem::path candidate =
         std::filesystem::weakly_canonical(canonicalRoot / artifact.relativeLibrary, filesystemError);
-    if (filesystemError) {
-        error = "CPU AOT artifact path cannot be resolved";
-        return false;
-    }
+    if (filesystemError)
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidCpuArtifactPath)};
     const std::filesystem::path relative = candidate.lexically_relative(canonicalRoot);
-    if (relative.empty() || relative.is_absolute() || *relative.begin() == std::filesystem::path("..")) {
-        error = "CPU AOT artifact escapes the bundle directory";
-        return false;
-    }
+    if (relative.empty() || relative.is_absolute() || *relative.begin() == std::filesystem::path(".."))
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::err(StageArtifactError::InvalidCpuArtifactPath)};
 
     const std::vector<uint8_t> bytes = readFile(candidate);
-    if (bytes.empty() || artifact.size != bytes.size() || sha256Hex(bytes.data(), bytes.size()) != artifact.sha256) {
-        error = "CPU AOT artifact size or SHA-256 mismatch";
-        return false;
+    if (bytes.empty() || artifact.size != bytes.size() || sha256Hex(bytes.data(), bytes.size()) != artifact.sha256)
+        return StageArtifactResult<ResolvedCpuNativeArtifact>{
+            vernon::err(StageArtifactError::CpuArtifactIntegrityMismatch)};
+    resolved.libraryPath = candidate;
+    return StageArtifactResult<ResolvedCpuNativeArtifact>{vernon::ok(std::move(resolved))};
+}
+
+std::string renderStageArtifactError(StageArtifactError error, const CpuNativeArtifact *artifact) {
+    switch (error) {
+    case StageArtifactError::MissingContentHash:
+        return "Program bundle content_hash is missing";
+    case StageArtifactError::InvalidContentHash:
+        return "Program bundle content_hash is invalid";
+    case StageArtifactError::ContentHashMismatch:
+        return "Program bundle content_hash does not match canonical content";
+    case StageArtifactError::UnsupportedCpuTarget:
+        return artifact ? "Stage artifact requires unsupported CPU target " + artifact->targetTriple + " / " +
+                              artifact->objectFormat
+                        : "Stage artifact requires an unsupported CPU target";
+    case StageArtifactError::InvalidCpuArtifact:
+        return "unsupported or invalid CPU AOT artifact";
+    case StageArtifactError::InvalidCpuArtifactPath:
+        return "CPU AOT artifact path is invalid or escapes the bundle directory";
+    case StageArtifactError::InvalidReflection:
+        return "CPU AOT artifact reflection is invalid";
+    case StageArtifactError::InvalidBundleDirectory:
+        return "Program bundle directory is invalid";
+    case StageArtifactError::CpuArtifactIntegrityMismatch:
+        return "CPU AOT artifact size or SHA-256 mismatch";
     }
-    libraryPath = candidate;
-    if (reflection)
-        *reflection = std::move(parsed);
-    return true;
+    return "unknown Stage artifact error";
 }
 
 } // namespace vernon::runtime

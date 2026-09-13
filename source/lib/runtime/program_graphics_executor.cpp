@@ -80,9 +80,9 @@ bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const pr
             return error = "managed graphics fragment outputs must exactly match the color attachments", false;
         const auto bind = [&](const program::ResolvedGraphicsAttachment &attachment) {
             VernonRuntimeProviderResourceReference view{};
-            const VernonProgramArgument *staging = invocation.externalStorage(attachment.storage);
-            if (staging && staging->kind == VERNON_PROGRAM_IMAGE) {
-                view = staging->image.view;
+            auto staging = invocation.externalStorage(attachment.storage);
+            if (staging && staging.value().get().kind == VERNON_PROGRAM_IMAGE) {
+                view = staging.value().get().image.view;
             } else if (attachment.aspects & VERNON_IMAGE_ASPECT_COLOR) {
                 const auto signature = std::find_if(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
                                                     [&](const program::GraphicsAttachmentSignature &candidate) {
@@ -97,7 +97,12 @@ bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const pr
                     return error = "managed graphics node requires a depth-stencil attachment", false;
                 view = renderPass->depth_attachment->view;
             }
-            return invocation.bindControlImageStorage(context, program, attachment.storage, view, error);
+            auto bound = invocation.bindControlImageStorage(context, program, attachment.storage, view);
+            if (bound.isErr()) {
+                error = program_execution::programInvocationErrorMessage(bound.error());
+                return false;
+            }
+            return true;
         };
         for (const program::ResolvedGraphicsAttachment &attachment : controls->colorAttachments)
             if (!bind(attachment))
