@@ -21,6 +21,7 @@ release-artifacts/
 *.exp
 *.exe
 *.npy
+examples/external_engine/web_demo.mp4
 AGENTS.md
 CLAUDE.md
 secret/

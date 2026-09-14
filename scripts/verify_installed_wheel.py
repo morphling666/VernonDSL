@@ -31,7 +31,7 @@ def main() -> int:
     add_one(
         output,
         vd.storage.from_numpy(expected - np.float32(1.0)),
-        grid=(expected.size, 1, 1),
+        grid=((expected.size + 7) // 8, 1, 1),
     )
     np.testing.assert_array_equal(output.to_numpy(), expected)
     with tempfile.TemporaryDirectory(prefix="vernon-wheel-") as directory:
