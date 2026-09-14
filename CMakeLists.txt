@@ -39,6 +39,7 @@ include(CTest)
 option(VERNON_BUILD_RUNTIME "Build the Vernon Runtime subproject" ON)
 option(VERNON_BUILD_COMPILER "Build the Vernon Compiler subproject" ON)
 option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
+option(VERNON_BUILD_BENCHMARKS "Configure opt-in Vernon benchmarks" OFF)
 option(VERNON_INSTALL_GIT_HOOK "Install the staged-file formatting hook" ON)
 option(VERNON_ENABLE_SANITIZERS "Build Vernon targets with AddressSanitizer" OFF)
 
@@ -78,3 +79,7 @@ if(VERNON_INSTALL_GIT_HOOK AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
 endif()
 
 add_subdirectory(source)
+
+if(VERNON_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()

@@ -75,8 +75,8 @@ class SmokeFluidSimulation:
             if differentiable
             else None
         )
-        self._density_states = (self.density,)
-        self._velocity_states = (self.velocity,)
+        self._initial_density = self.density
+        self._initial_velocity = self.velocity
 
     def set_target(self, target: np.ndarray) -> None:
         self.target.copy_from_numpy(np.ascontiguousarray(target, dtype=np.float32))
@@ -86,10 +86,8 @@ class SmokeFluidSimulation:
         velocity_value = np.ascontiguousarray(velocity, dtype=np.float32)
         if density_value.shape != (self.grid, self.grid) or velocity_value.shape != (self.grid, self.grid, 2):
             raise ValueError("smoke state shape does not match the simulation grid")
-        for state in self._density_states:
-            state.copy_from_numpy(density_value)
-        for state in self._velocity_states:
-            state.copy_from_numpy(velocity_value)
+        self.density.copy_from_numpy(density_value)
+        self.velocity.copy_from_numpy(velocity_value)
 
     def step(self, target: np.ndarray | None = None) -> None:
         if target is not None:
@@ -114,13 +112,11 @@ class SmokeFluidSimulation:
     def reset(self) -> None:
         zero_density = np.zeros((self.grid, self.grid), dtype=np.float32)
         zero_velocity = np.zeros((self.grid, self.grid, 2), dtype=np.float32)
-        for density in self._density_states:
-            density.copy_from_numpy(zero_density)
-        for velocity in self._velocity_states:
-            velocity.copy_from_numpy(zero_velocity)
+        self._initial_density.copy_from_numpy(zero_density)
+        self._initial_velocity.copy_from_numpy(zero_velocity)
         self.output_loss.copy_from_numpy(np.zeros((1,), dtype=np.float32))
-        self.density = self._density_states[0]
-        self.velocity = self._velocity_states[0]
+        self.density = self._initial_density
+        self.velocity = self._initial_velocity
 
     def restore(self, density: np.ndarray, velocity: np.ndarray) -> None:
         if density.shape != (self.grid, self.grid):
@@ -128,8 +124,8 @@ class SmokeFluidSimulation:
         if velocity.shape != (self.grid, self.grid, 2):
             raise ValueError(f"velocity checkpoint must have shape ({self.grid}, {self.grid}, 2)")
         self.reset()
-        self._density_states[0].copy_from_numpy(np.ascontiguousarray(density, dtype=np.float32))
-        self._velocity_states[0].copy_from_numpy(np.ascontiguousarray(velocity, dtype=np.float32))
+        self._initial_density.copy_from_numpy(np.ascontiguousarray(density, dtype=np.float32))
+        self._initial_velocity.copy_from_numpy(np.ascontiguousarray(velocity, dtype=np.float32))
 
     def density_numpy(self) -> np.ndarray:
         return self.density.to_numpy()

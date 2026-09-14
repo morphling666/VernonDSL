@@ -105,6 +105,13 @@ Load/store/resolve semantics create Program resource transitions. Runtime
 derives RAW, WAR, and WAW dependencies from concrete image/view identity and
 subresource overlap.
 
+Only the initial attachment Value with no producer is a Program function
+argument. Every attachment Value produced by a graphics or compute Node is that
+Node's SSA result, including intermediate versions of a RenderPass reused by
+multiple draws. A Value cannot be both a boundary argument and a Node result.
+`color_output` and `depth_output` refer to the current version of the projected
+attachment and are valid only after a graphics call using the same RenderPass.
+
 Resolve destination load is implicitly discard. Source and destination store
 availability are independent.
 

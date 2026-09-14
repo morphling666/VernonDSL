@@ -8,7 +8,7 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Protocol, cast
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
@@ -609,11 +609,18 @@ class Kernel:
     def __call__(
         self,
         *arguments: Any,
-        grid: tuple[int, int, int] | None = None,
+        grid: tuple[object, object, object] | None = None,
         specializations: Mapping[Specialization, object] | None = None,
     ) -> None:
+        runtime_grid = None
+        if grid is not None:
+            if len(grid) != 3 or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid
+            ):
+                raise ValueError("grid must contain three positive integers")
+            runtime_grid = cast(tuple[int, int, int], grid)
         with _invocation_context():
-            self._invoke(arguments, grid, specializations)
+            self._invoke(arguments, runtime_grid, specializations)
 
 
 atexit.register(Kernel.clear_cache)

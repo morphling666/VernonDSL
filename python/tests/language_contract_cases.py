@@ -303,7 +303,7 @@ TYPE_PARSER_INVALID_CASES: Final = (
         "LANG-STORAGE-001",
         "storage-arity",
         "TensorStorage[f32, f32]",
-        "TensorStorage requires one",
+        "TensorStorage requires an element type",
     ),
     _invalid_type(
         "LANG-STORAGE-001",

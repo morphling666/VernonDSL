@@ -6,10 +6,8 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -26,8 +24,6 @@
 extern "C" VernonStatus vernonRegisterTypedSpecializationFixture(void);
 
 std::atomic<size_t> runtimeAllocationFailures{};
-thread_local bool trackRuntimeAllocations{};
-std::atomic<size_t> runtimeTrackedAllocations{};
 
 void *operator new(size_t size) {
     size_t remaining = runtimeAllocationFailures.load(std::memory_order_relaxed);
@@ -36,11 +32,8 @@ void *operator new(size_t size) {
     }
     if (remaining)
         throw std::bad_alloc{};
-    if (void *memory = std::malloc(size)) {
-        if (trackRuntimeAllocations)
-            runtimeTrackedAllocations.fetch_add(1, std::memory_order_relaxed);
+    if (void *memory = std::malloc(size))
         return memory;
-    }
     throw std::bad_alloc{};
 }
 
@@ -423,82 +416,6 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
 
     vernonRuntimeProgramInstanceDestroy(instance);
     EXPECT_EQ(controlLeaseCount, 0);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeModuleProgramBenchmark, EmptyPersistentInvocation) {
-    constexpr size_t iterationCount = 4096;
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
-    const std::string manifest = fixtureManifest("module_program");
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
-    ASSERT_NE(instance, nullptr);
-
-    float source = 3.0f;
-    float output = 0.0f;
-    const VernonProgramArgument sourceArgument = tensorArgument(parameter(pipeline, "source"), source);
-    const VernonProgramArgument outputArgument = tensorArgument(parameter(pipeline, "output"), output);
-    const VernonProgramBindingToken sourceToken = bindingToken("benchmark-source");
-    const VernonProgramBindingToken outputToken = bindingToken("benchmark-output");
-    VernonProgramInvocation *warmup = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(warmup, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(warmup, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(warmup, &outputToken, &outputArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(warmup, 1, nullptr), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(warmup, nullptr), VERNON_STATUS_OK);
-    vernonRuntimeProgramInvocationDestroy(warmup);
-
-    std::vector<uint64_t> samples(iterationCount);
-    const size_t allocationsBefore = runtimeTrackedAllocations.load(std::memory_order_relaxed);
-    size_t beginAllocations{};
-    size_t executeAllocations{};
-    size_t commitAllocations{};
-    size_t destroyAllocations{};
-    trackRuntimeAllocations = true;
-    for (size_t iteration = 0; iteration < iterationCount; ++iteration) {
-        const auto begin = std::chrono::steady_clock::now();
-        size_t checkpoint = runtimeTrackedAllocations.load(std::memory_order_relaxed);
-        VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-        beginAllocations += runtimeTrackedAllocations.load(std::memory_order_relaxed) - checkpoint;
-        ASSERT_NE(invocation, nullptr);
-        checkpoint = runtimeTrackedAllocations.load(std::memory_order_relaxed);
-        ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK);
-        executeAllocations += runtimeTrackedAllocations.load(std::memory_order_relaxed) - checkpoint;
-        checkpoint = runtimeTrackedAllocations.load(std::memory_order_relaxed);
-        ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK);
-        commitAllocations += runtimeTrackedAllocations.load(std::memory_order_relaxed) - checkpoint;
-        checkpoint = runtimeTrackedAllocations.load(std::memory_order_relaxed);
-        vernonRuntimeProgramInvocationDestroy(invocation);
-        destroyAllocations += runtimeTrackedAllocations.load(std::memory_order_relaxed) - checkpoint;
-        const auto end = std::chrono::steady_clock::now();
-        samples[iteration] =
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
-    }
-    trackRuntimeAllocations = false;
-    const size_t allocations = runtimeTrackedAllocations.load(std::memory_order_relaxed) - allocationsBefore;
-    std::sort(samples.begin(), samples.end());
-    RecordProperty("empty_invocation_median_ns", samples[iterationCount / 2]);
-    RecordProperty("empty_invocation_p95_ns", samples[iterationCount * 95 / 100]);
-    RecordProperty("empty_invocation_p99_ns", samples[iterationCount * 99 / 100]);
-    RecordProperty("empty_invocation_maximum_ns", samples.back());
-    RecordProperty("empty_invocation_allocation_count", allocations);
-    RecordProperty("empty_invocation_iteration_count", iterationCount);
-    RecordProperty("empty_invocation_begin_allocation_count", beginAllocations);
-    RecordProperty("empty_invocation_execute_allocation_count", executeAllocations);
-    RecordProperty("empty_invocation_commit_allocation_count", commitAllocations);
-    RecordProperty("empty_invocation_destroy_allocation_count", destroyAllocations);
-
-    vernonRuntimeProgramInstanceDestroy(instance);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

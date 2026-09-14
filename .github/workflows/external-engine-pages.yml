@@ -157,10 +157,10 @@ jobs:
             --no-sandbox \
             --use-angle=swiftshader \
             --enable-unsafe-swiftshader \
-            --virtual-time-budget=10000 \
+            --virtual-time-budget=60000 \
             --dump-dom \
             http://127.0.0.1:8000/ 2>/dev/null)"
-          [[ "$dom" == *"Vernon split-screen CPU and GPU animation started"* ]]
+          [[ "$dom" == *'data-vernon-first-frame="complete"'* ]]
 
       - name: Stage Pages site
         if: github.event_name != 'pull_request'

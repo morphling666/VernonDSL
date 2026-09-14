@@ -8,7 +8,7 @@ from typing import Any
 
 from ..host_values import pack_host_value
 from ..types import TypeExpr, _DynamicExtent, _Scalar, dyn
-from .model import ConcreteType, SemanticCategory, semantic_category
+from .model import ConcreteType, SemanticCategory, is_abi_stable_value, semantic_category
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,16 @@ class _StorageParameter:
 class _AnnotatedParameter:
     annotation: Any
     logical: ConcreteType
+
+
+@dataclass(frozen=True)
+class StorageParameterConstraint:
+    """Partial static contract for one Module Storage boundary."""
+
+    dtype: Any | None
+    shape: tuple[int | _DynamicExtent, ...] | None
+    access: str | None
+    as_view: bool
 
 
 @dataclass(frozen=True)
@@ -129,6 +139,26 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
             "Tensor",
             (concrete_type_from_annotation(annotation.arguments[0]), *annotation.arguments[1:]),
         )
+    if annotation.name == "TensorStorage":
+        if len(annotation.arguments) not in {1, 3}:
+            raise TypeError("TensorStorage annotation requires element, or element, shape, and access")
+        element = concrete_type_from_annotation(annotation.arguments[0])
+        if not is_abi_stable_value(element):
+            raise TypeError("TensorStorage element must have an ABI-stable Value type")
+        if len(annotation.arguments) == 1:
+            return ConcreteType("tensor_storage", "TensorStorage", (element,))
+        _, shape, access = annotation.arguments
+        if not isinstance(shape, tuple):
+            raise TypeError("TensorStorage annotation shape must be a tuple")
+        return ConcreteType(
+            "tensor_storage",
+            "TensorStorage",
+            (
+                element,
+                tuple("?" if extent is dyn else extent for extent in shape),
+                _storage_access(access),
+            ),
+        )
     if annotation.name == "TensorView":
         if len(annotation.arguments) != 3 or not isinstance(annotation.arguments[1], tuple):
             raise TypeError("TensorView annotation requires element, shape, and access")
@@ -179,16 +209,62 @@ def runtime_parameter_descriptor(annotation: Any) -> RuntimeParameterDescriptor:
     if category is None:
         raise TypeError(f"{annotation!r} is not a runtime parameter type")
     if category is SemanticCategory.STORAGE:
-        if not isinstance(annotation, TypeExpr) or annotation.name != "TensorView":
+        constraint = storage_parameter_constraint(annotation)
+        if constraint is None or constraint.dtype is None or constraint.shape is None or constraint.access is None:
             raise TypeError(f"{annotation!r} has no concrete Module storage descriptor")
-        dtype, shape, access = annotation.arguments
         return RuntimeParameterDescriptor.storage(
-            dtype,
-            tuple(shape),
-            str(getattr(access, "name", access)),
-            True,
+            constraint.dtype,
+            constraint.shape,
+            constraint.access,
+            constraint.as_view,
         )
     return RuntimeParameterDescriptor.annotated(category, annotation, logical)
+
+
+def _storage_access(value: Any) -> str:
+    access = str(getattr(value, "name", value))
+    if access not in {"read", "write", "read_write"}:
+        raise TypeError("Storage access must be read, write, or read_write")
+    return access
+
+
+def _storage_shape(value: Any) -> tuple[int | _DynamicExtent, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("Storage shape must be a tuple")
+    for extent in value:
+        if extent is dyn:
+            continue
+        if isinstance(extent, bool) or not isinstance(extent, int) or extent <= 0:
+            raise TypeError("Storage shape extents must be positive integers or vd.dyn")
+    return value
+
+
+def storage_parameter_constraint(annotation: Any) -> StorageParameterConstraint | None:
+    """Return the explicit Module Storage contract carried by an annotation."""
+
+    if not isinstance(annotation, TypeExpr) or annotation.name not in {"TensorStorage", "TensorView"}:
+        return None
+    if annotation.name == "TensorView":
+        if len(annotation.arguments) != 3:
+            raise TypeError("TensorView annotation requires element, shape, and access")
+        dtype, shape, access = annotation.arguments
+        concrete = concrete_type_from_annotation(dtype)
+        if not is_abi_stable_value(concrete):
+            raise TypeError("TensorView element must have an ABI-stable Value type")
+        return StorageParameterConstraint(dtype, _storage_shape(shape), _storage_access(access), True)
+    if len(annotation.arguments) == 1:
+        dtype = annotation.arguments[0]
+        concrete = concrete_type_from_annotation(dtype)
+        if not is_abi_stable_value(concrete):
+            raise TypeError("TensorStorage element must have an ABI-stable Value type")
+        return StorageParameterConstraint(dtype, None, None, False)
+    if len(annotation.arguments) == 3:
+        dtype, shape, access = annotation.arguments
+        concrete = concrete_type_from_annotation(dtype)
+        if not is_abi_stable_value(concrete):
+            raise TypeError("TensorStorage element must have an ABI-stable Value type")
+        return StorageParameterConstraint(dtype, _storage_shape(shape), _storage_access(access), False)
+    raise TypeError("TensorStorage annotation requires element, or element, shape, and access")
 
 
 def validate_host_value(annotation: Any, value: Any, name: str) -> None:
@@ -206,9 +282,11 @@ def resolved_annotations(function: Any) -> dict[str, Any]:
 
 __all__ = [
     "RuntimeParameterDescriptor",
+    "StorageParameterConstraint",
     "concrete_type_from_annotation",
     "resolved_annotations",
     "runtime_parameter_category",
     "runtime_parameter_descriptor",
+    "storage_parameter_constraint",
     "validate_host_value",
 ]

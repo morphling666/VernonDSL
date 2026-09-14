@@ -221,6 +221,11 @@ class Pipeline:
         result["__dynamic_state"] = ProgramControlDescriptor("dynamic_state", DynamicState | None, dynamic_state)
         return result
 
+    def _static_parameter_types(self) -> dict[str, Any]:
+        """Return invocation-independent parameter contracts for Module reflection and cooking."""
+
+        return self._parameter_types(None, self._frontends(), None, None, None)
+
     def _identity(
         self,
         render_pass: RenderPass,

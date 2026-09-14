@@ -136,6 +136,27 @@ computation Value.
 representation for interleaved records. Struct field offsets, alignment, and
 record stride are deterministic and reflected for every backend ABI.
 
+At a `Module.forward` boundary, an owner parameter has three canonical
+annotation forms:
+
+```python
+TensorStorage
+TensorStorage[f32]
+TensorStorage[f32, (1024,), read]
+```
+
+The bare form leaves element type, shape, and access to nested typed Program
+calls or an explicit export argument. `TensorStorage[T]` fixes the element type
+and infers shape and access. The three-argument form fixes the complete static
+contract. Explicit constraints must agree with every nested kernel, Module,
+and graphics-pipeline use; read and write uses join to `read_write`, while
+`vd.dyn` unifies with a compatible static extent. Cooking rejects any unresolved
+element type, extent, or access instead of consulting runtime values.
+
+`TensorStorage[...]` denotes an owner boundary and rejects borrowed
+`TensorView` values. A Module parameter intended to accept a full view or
+subview uses `TensorView[T, shape, access]`.
+
 ### 3.2 TensorView
 
 `TensorView[T, shape, access]` is the only non-owning shaped Storage type used

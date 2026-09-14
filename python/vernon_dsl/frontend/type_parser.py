@@ -75,10 +75,21 @@ class TypeParser:
                 raise self.context.error(node, "Tuple elements must be ABI-stable Values")
             return ConcreteType("tuple", "Tuple", elements)
         if constructor == "TensorStorage":
-            if len(items) != 1:
-                raise self.context.error(node, "TensorStorage requires one ABI-stable Value element type")
+            if len(items) not in {1, 3}:
+                raise self.context.error(
+                    node,
+                    "TensorStorage requires an element type, optionally followed by shape and access mode",
+                )
             element = self.parse_type(items[0])
             self._require_storage_element(items[0], element, "TensorStorage")
+            if len(items) == 3:
+                if not isinstance(items[1], ast.Tuple):
+                    raise self.context.error(items[1], "TensorStorage shape must be a tuple")
+                shape = tuple(self._tensor_view_extent(item) for item in items[1].elts)
+                access = self._string_or_name(items[2], "TensorStorage access")
+                if access not in {"read", "write", "read_write"}:
+                    raise self.context.error(items[2], "TensorStorage access must be read, write, or read_write")
+                return ConcreteType("tensor_storage", "TensorStorage", (element, shape, access))
             return ConcreteType("tensor_storage", "TensorStorage", (element,))
         if constructor == "TensorView":
             if len(items) != 3:

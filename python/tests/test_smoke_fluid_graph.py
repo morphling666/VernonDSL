@@ -260,6 +260,18 @@ class SmokeFluidGraphTests(unittest.TestCase):
         np.testing.assert_array_equal(simulation.velocity_numpy(), np.zeros((16, 16, 2), dtype=np.float32))
         np.testing.assert_array_equal(simulation.output_loss.to_numpy(), np.zeros((1,), dtype=np.float32))
 
+    def test_set_state_updates_the_current_step_outputs(self) -> None:
+        vd.init(arch=vd.cpu)
+        simulation = SmokeFluidSimulation(grid=4, pressure_iterations=1)
+        simulation.step()
+        density = np.full((4, 4), 0.25, dtype=np.float32)
+        velocity = np.full((4, 4, 2), -0.5, dtype=np.float32)
+
+        simulation.set_state(density, velocity)
+
+        np.testing.assert_array_equal(simulation.density_numpy(), density)
+        np.testing.assert_array_equal(simulation.velocity_numpy(), velocity)
+
     def test_single_step_velocity_gradient_matches_finite_difference(self) -> None:
         vd.init(arch=vd.cpu)
         size = 4

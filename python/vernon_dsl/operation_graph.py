@@ -234,6 +234,41 @@ def _resource_type(value: Any) -> ResourceType:
     )
 
 
+def _merge_logical_resource_type(current: ConcreteType | None, refined: ConcreteType) -> ConcreteType:
+    if current is None:
+        return refined
+    if current.kind != refined.kind:
+        raise TypeError(f"resource type changed from {current.kind} to {refined.kind}")
+    if current.kind in {"tensor_view", "tensor_view_abi"}:
+        current_element, current_shape, current_access, current_space = current.arguments
+        refined_element, refined_shape, refined_access, refined_space = refined.arguments
+        if current_element != refined_element or len(current_shape) != len(refined_shape):
+            raise TypeError("resource TensorView refinement has an incompatible element type or rank")
+        shape = tuple(
+            right if left == "?" else left if right == "?" or left == right else None
+            for left, right in zip(current_shape, refined_shape, strict=True)
+        )
+        if any(extent is None for extent in shape):
+            raise TypeError("resource TensorView refinement has incompatible static extents")
+        if current_space != refined_space:
+            raise TypeError("resource TensorView refinement changed address space")
+        access = current_access if current_access == refined_access else "read_write"
+        return ConcreteType("tensor_view", "TensorView", (current_element, shape, access, current_space))
+    if current.kind == "texture":
+        current_dimension, current_element, current_format, current_access = current.arguments
+        refined_dimension, refined_element, refined_format, refined_access = refined.arguments
+        if current_dimension != refined_dimension or current_element != refined_element:
+            raise TypeError("resource Texture refinement has an incompatible dimension or element type")
+        if current_format != "unknown" and refined_format != "unknown" and current_format != refined_format:
+            raise TypeError("resource Texture refinement has incompatible formats")
+        texture_format = refined_format if current_format == "unknown" else current_format
+        access = current_access if current_access == refined_access else "read_write"
+        return ConcreteType("texture", "Texture", (current_dimension, current_element, texture_format, access))
+    if current != refined:
+        raise TypeError(f"resource type {current.kind} has incompatible logical refinements")
+    return current
+
+
 class OperationGraph:
     """Primal Module graph with owner-level resource versioning."""
 
@@ -265,6 +300,12 @@ class OperationGraph:
     @property
     def outputs(self) -> Mapping[str, int]:
         return MappingProxyType(dict(self._outputs))
+
+    @property
+    def entry_values(self) -> frozenset[int]:
+        """Resource versions available before the first Program operation."""
+
+        return frozenset(value.id for value in self._values if value.producer is None)
 
     def import_input(self, name: str, value: Any) -> None:
         owner = _resource_owner(value)
@@ -400,7 +441,11 @@ class OperationGraph:
         for index, value in enumerate(self._values):
             if value.owner != owner:
                 continue
-            resource_type = ResourceType(value.type.shape, value.type.dtype, logical)
+            resource_type = ResourceType(
+                value.type.shape,
+                value.type.dtype,
+                _merge_logical_resource_type(value.type.logical, logical),
+            )
             self._values[index] = ResourceVersion(
                 value.id,
                 value.owner,
@@ -455,22 +500,28 @@ class OperationGraph:
         return value_id
 
     def _validate(self) -> None:
-        produced: set[int] = set(self._inputs.values())
+        produced: set[int] = set(self.entry_values)
+        declared_results: set[int] = set()
         for node in self._nodes:
             if isinstance(node, AllocOp):
                 if node.like is not None and node.like not in produced:
                     raise ValueError(f"AllocOp {node.name!r} copies an unavailable resource version")
-                produced.add(node.result)
-                continue
-            control_values = {
-                value
-                for name, value in node.inputs.items()
-                if isinstance(node, GraphicsCallOp) and name in node.attachment_names
-            }
-            produced.update(control_values)
-            if any(value not in produced for value in node.inputs.values()):
-                raise ValueError(f"{type(node).__name__} {node.name!r} consumes an unavailable resource version")
-            produced.update(node.outputs.values())
+                results = (node.result,)
+            else:
+                if any(value not in produced for value in node.inputs.values()):
+                    raise ValueError(f"{type(node).__name__} {node.name!r} consumes an unavailable resource version")
+                results = tuple(node.outputs.values())
+            if any(result in produced or result in declared_results for result in results):
+                raise ValueError(f"{type(node).__name__} {node.name!r} redefines a resource version")
+            if any(self._values[result].producer != node.id for result in results):
+                raise ValueError(f"{type(node).__name__} {node.name!r} has an inconsistent resource producer")
+            declared_results.update(results)
+            produced.update(results)
+        internal_values = {value.id for value in self._values if value.producer is not None}
+        if internal_values != declared_results:
+            raise ValueError("Program graph contains an internal resource version without exactly one defining result")
+        if any(value not in self.entry_values for value in self._inputs.values()):
+            raise ValueError("Module input must refer to an entry resource version")
         if any(value not in produced for value in self._outputs.values()):
             raise ValueError("Module output refers to an unavailable resource version")
 

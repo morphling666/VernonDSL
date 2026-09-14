@@ -159,13 +159,19 @@ public:
         }
         VernonRhiImageUploadDescriptor upload{};
         upload.struct_size = sizeof(upload);
+        upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
         upload.width = kWidth;
         upload.height = kHeight;
         upload.depth = 1;
         upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
         upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
         upload.data = rgba_.data();
-        return vernonRhiDeviceUploadImage(graphics_->device(), presentImage_, &upload, 1) == VERNON_RHI_STATUS_OK;
+        const VernonRhiStatus uploadStatus = vernonRhiDeviceUploadImage(graphics_->device(), presentImage_, &upload, 1);
+        if (uploadStatus != VERNON_RHI_STATUS_OK) {
+            std::cerr << "failed to upload the CPU fractal image: status " << static_cast<int>(uploadStatus) << '\n';
+            return false;
+        }
+        return true;
     }
 
     VernonRhiImage image() const override { return presentImage_; }

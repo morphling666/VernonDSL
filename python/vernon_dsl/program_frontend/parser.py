@@ -142,6 +142,8 @@ def _lower_forward_function(
             continue
         for attachment_name in node.attachment_names:
             value_id = node.inputs[attachment_name]
+            if value_id not in graph.entry_values:
+                continue
             ssa = f"%v{value_id}"
             if all(argument.name != ssa for argument in arguments):
                 arguments.append(

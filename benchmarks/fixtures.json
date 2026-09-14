@@ -1,0 +1,261 @@
+{
+  "catalog_version": 2,
+  "fixtures": [
+    {
+      "id": "binding.tensor",
+      "layer": "binding",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "update": "unchanged"
+        },
+        {
+          "update": "changed"
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "binding.dynamic_shape",
+      "layer": "binding",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "update": "unchanged"
+        },
+        {
+          "update": "changed"
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "binding.control",
+      "layer": "binding",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "update": "unchanged"
+        },
+        {
+          "update": "changed"
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "program.square",
+      "layer": "program",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "node_count": 1
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "program.chain",
+      "layer": "program",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "node_count": 1
+        },
+        {
+          "node_count": 8
+        },
+        {
+          "node_count": 64
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "backend.empty_kernel",
+      "layer": "backend",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {}
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "backend.elementwise",
+      "layer": "backend",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "elements": 1048576
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "backend.reduction",
+      "layer": "backend",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "elements": 1048576
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    },
+    {
+      "id": "graphics.draw",
+      "layer": "graphics",
+      "drivers": {
+        "python": [
+          "{python}",
+          "{repository}/benchmarks/python_driver.py"
+        ],
+        "cpp": [
+          "{build}/benchmarks/VernonBenchmarkDriver"
+        ]
+      },
+      "variants": [
+        {
+          "draw_count": 1,
+          "state_changes": 0
+        },
+        {
+          "draw_count": 64,
+          "state_changes": 0
+        },
+        {
+          "draw_count": 64,
+          "state_changes": 64
+        }
+      ],
+      "measurements": {
+        "python": [
+          "call_ns"
+        ],
+        "cpp": [
+          "call_ns"
+        ]
+      }
+    }
+  ]
+}

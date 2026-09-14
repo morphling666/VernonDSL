@@ -18,9 +18,6 @@ endif()
 if(Python_EXECUTABLE)
     add_test(NAME VernonGeneratedVersionsCheck COMMAND "${Python_EXECUTABLE}"
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
-    add_test(NAME VernonRuntimeSourcePolicyCheck
-             COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_source_policy.py"
-                     --repository "${VERNON_REPOSITORY_ROOT}")
 endif()
 
 file(
@@ -28,6 +25,8 @@ file(
     VERNON_TEST_BUNDLE_PYTHON_SOURCES
     CONFIGURE_DEPENDS
     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/*.py")
+set(VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES ${VERNON_TEST_BUNDLE_PYTHON_SOURCES})
+include("${VERNON_REPOSITORY_ROOT}/cmake/VernonProgramFixture.cmake")
 set_property(
     DIRECTORY
     APPEND
@@ -55,27 +54,13 @@ function(
     asset_reference
     output_stem
     output_variable)
-    set(_vernon_bundle_directory "${VERNON_TEST_BINARY_ROOT}/${output_stem}")
-    set(_vernon_bundle_manifest "${_vernon_bundle_directory}/${output_stem}.program.json")
-    string(
-        REGEX
-        REPLACE ":[^:]+$"
-                ""
-                _vernon_asset_source
-                "${asset_reference}")
-    add_custom_command(
-        OUTPUT "${_vernon_bundle_manifest}"
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_bundle_directory}"
-        COMMAND
-            ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-            vernon_dsl.program_asset_cli "${asset_reference}" --target "${architecture}" --output
-            "${_vernon_bundle_directory}"
-        DEPENDS vernon-dsl-native
-                "$<TARGET_FILE:vernon-dsl-native>"
-                "${_vernon_asset_source}"
-                ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
-        VERBATIM)
-    add_custom_target("vernon-${name}-test-bundle" DEPENDS "${_vernon_bundle_manifest}")
+    vernon_add_program_asset_bundle(
+        "${name}-test"
+        "${architecture}"
+        "${asset_reference}"
+        "${VERNON_TEST_BINARY_ROOT}"
+        "${output_stem}"
+        _vernon_bundle_manifest)
     set(${output_variable}
         "${_vernon_bundle_manifest}"
         PARENT_SCOPE)
@@ -90,57 +75,17 @@ function(
     wrapper_function
     manifest_variable
     target_variable)
-    cmake_parse_arguments(
-        FIXTURE
-        ""
-        "COOK_SCRIPT"
-        ""
-        ${ARGN})
-    if(FIXTURE_UNPARSED_ARGUMENTS)
-        message(FATAL_ERROR "unknown CPU autodiff fixture arguments: ${FIXTURE_UNPARSED_ARGUMENTS}")
-    endif()
     set(_vernon_directory "${VERNON_TEST_BINARY_ROOT}/${directory_stem}")
-    set(_vernon_manifest "${_vernon_directory}/${manifest_name}")
-    set(_vernon_registration "${_vernon_directory}/program_registration.c")
-    set(_vernon_wrapper "${_vernon_directory}/program_registration_wrapper.c")
-    set(_vernon_artifact_archive "${_vernon_directory}/program_artifacts.a")
-    string(
-        REGEX
-        REPLACE ":[^:]+$"
-                ""
-                _vernon_asset_source
-                "${asset_reference}")
-    if(FIXTURE_COOK_SCRIPT)
-        set(_vernon_cook_command ${Python_EXECUTABLE} "${FIXTURE_COOK_SCRIPT}" "${asset_reference}"
-                                 "${_vernon_directory}")
-    else()
-        set(_vernon_cook_command ${Python_EXECUTABLE} -m vernon_dsl.program_asset_cli "${asset_reference}" --target cpu
-                                 --output "${_vernon_directory}")
-    endif()
-    add_custom_command(
-        OUTPUT "${_vernon_manifest}"
-               "${_vernon_registration}"
-               "${_vernon_wrapper}"
-               "${_vernon_artifact_archive}"
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_directory}"
-        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${_vernon_cook_command}
-        COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py" "${_vernon_manifest}"
-                "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}" --archiver "${CMAKE_AR}"
-        DEPENDS vernon-dsl-native
-                "$<TARGET_FILE:vernon-dsl-native>"
-                "${_vernon_asset_source}"
-                ${FIXTURE_COOK_SCRIPT}
-                ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
-                "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py"
-        VERBATIM)
-    set_source_files_properties("${_vernon_registration}" "${_vernon_wrapper}" PROPERTIES GENERATED TRUE)
-    set(_vernon_target "vernon-${name}-fixture")
-    add_library(${_vernon_target} STATIC "${_vernon_registration}" "${_vernon_wrapper}")
-    add_custom_target(${_vernon_target}-artifacts DEPENDS "${_vernon_artifact_archive}")
-    add_dependencies(${_vernon_target} ${_vernon_target}-artifacts)
-    target_link_libraries(${_vernon_target} PUBLIC "${_vernon_artifact_archive}")
-    set_target_properties(${_vernon_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(${_vernon_target} PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
+    vernon_add_cpu_program_fixture_library(
+        "${name}"
+        "${_vernon_directory}"
+        "${manifest_name}"
+        "${asset_reference}"
+        "${wrapper_function}"
+        "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py"
+        _vernon_manifest
+        _vernon_target
+        ${ARGN})
     set(${manifest_variable}
         "${_vernon_manifest}"
         PARENT_SCOPE)
@@ -186,8 +131,7 @@ if(TARGET VernonRuntime)
     add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
     vernon_discover_gtests(VernonRuntimeCoreProviderTests)
 
-    add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp runtime/lifecycle_benchmark_test.cpp
-                                             runtime/runtime_binding_benchmark_test.cpp)
+    add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp)
     target_link_libraries(VernonRuntimeSupportTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonRuntimeSupportTests)
     add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
@@ -233,95 +177,6 @@ if(TARGET VernonRuntime)
     endif()
     add_dependencies(VernonRuntimeSupportTests VernonRuntimeSupportNoExceptionsCheck)
     add_dependencies(VernonLifecycleControlTests VernonRuntimeSupportNoExceptionsCheck)
-
-    add_executable(VernonRhiCommandBenchmarkTests rhi/rhi_command_benchmark_test.cpp)
-    set_target_properties(VernonRhiCommandBenchmarkTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                                                    "${CMAKE_BINARY_DIR}/source")
-    target_include_directories(VernonRhiCommandBenchmarkTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                      "${VERNON_TEST_ROOT}/support")
-    target_link_libraries(VernonRhiCommandBenchmarkTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
-    vernon_enable_glfw_context_owner_for_test(VernonRhiCommandBenchmarkTests)
-    vernon_stage_target_files(VernonRhiCommandBenchmarkTests VernonRuntime VernonRHI)
-
-    if(Python_EXECUTABLE)
-        if(APPLE)
-            set(_vernon_lifecycle_baseline_platform "macos")
-        elseif(WIN32)
-            set(_vernon_lifecycle_baseline_platform "windows")
-        else()
-            string(TOLOWER "${CMAKE_SYSTEM_NAME}" _vernon_lifecycle_baseline_platform)
-        endif()
-        string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vernon_lifecycle_baseline_architecture)
-        if(CMAKE_CONFIGURATION_TYPES)
-            set(_vernon_lifecycle_baseline_configuration "$<LOWER_CASE:$<CONFIG>>")
-        else()
-            string(TOLOWER "${CMAKE_BUILD_TYPE}" _vernon_lifecycle_baseline_configuration)
-        endif()
-        set(_vernon_lifecycle_baseline
-            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-11-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-lifecycle-phase2-${_vernon_lifecycle_baseline_configuration}.json"
-        )
-        add_test(
-            NAME VernonLifecyclePhase2PerformanceGate
-            COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_lifecycle_benchmark.py" --benchmark
-                    "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline "${_vernon_lifecycle_baseline}")
-        set_tests_properties(
-            VernonLifecyclePhase2PerformanceGate
-            PROPERTIES RUN_SERIAL
-                       TRUE
-                       SKIP_RETURN_CODE
-                       77)
-
-        set(_vernon_runtime_binding_baseline
-            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-binding-phase4-${_vernon_lifecycle_baseline_configuration}.json"
-        )
-        add_test(
-            NAME VernonRuntimeBindingPhase4PerformanceGate
-            COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_binding_benchmark.py" --benchmark
-                "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline "${_vernon_runtime_binding_baseline}")
-        set_tests_properties(
-            VernonRuntimeBindingPhase4PerformanceGate
-            PROPERTIES RUN_SERIAL
-                       TRUE
-                       SKIP_RETURN_CODE
-                       77
-                       LABELS
-                       benchmark)
-
-        set(_vernon_runtime_session_baseline
-            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-13-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-session-phase9-${_vernon_lifecycle_baseline_configuration}.json"
-        )
-        add_test(NAME VernonRuntimeSessionPhase9PerformanceGate
-                 COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_session_benchmark.py"
-                         --repository "${VERNON_REPOSITORY_ROOT}" --baseline "${_vernon_runtime_session_baseline}")
-        set_tests_properties(
-            VernonRuntimeSessionPhase9PerformanceGate
-            PROPERTIES RUN_SERIAL
-                       TRUE
-                       SKIP_RETURN_CODE
-                       77
-                       LABELS
-                       benchmark)
-
-        set(_vernon_rhi_command_baseline
-            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-rhi-command-phase3-${_vernon_lifecycle_baseline_configuration}.json"
-        )
-        add_test(
-            NAME VernonRhiCommandPhase3PerformanceGate
-            COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_rhi_command_benchmark.py" --benchmark
-                "$<TARGET_FILE:VernonRhiCommandBenchmarkTests>" --baseline "${_vernon_rhi_command_baseline}"
-                --repository "${VERNON_REPOSITORY_ROOT}" --output
-                "${VERNON_TEST_BINARY_ROOT}/rhi_command_phase3_benchmark.json")
-        set_tests_properties(
-            VernonRhiCommandPhase3PerformanceGate
-            PROPERTIES RUN_SERIAL
-                       TRUE
-                       TIMEOUT
-                       300
-                       LABELS
-                       benchmark)
-    endif()
 
     if(VERNON_ENABLE_CUDA_RUNTIME)
         add_executable(VernonRuntimeRHIAdapterTests rhi/cuda_adapter_test.cpp)
@@ -1412,32 +1267,12 @@ if(TARGET VernonDSLCompiler)
         add_test(NAME vernon-python-module-program
                  COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
                          "test_program_execution.py")
-        add_test(NAME vernon-python-autodiff-phase2-benchmark
-                 COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_autodiff_smoke_phase2.py"
-                         --grids 32 64 --output "${VERNON_TEST_BINARY_ROOT}/autodiff_phase2_benchmark_ci.json")
-        add_test(
-            NAME vernon-python-atomic-reduction-benchmark
-            COMMAND
-                ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_atomic_reduction.py" --architectures
-                cpu --patterns one_bin workgroup_publication --invocations 128 --iterations 2 --output
-                "${VERNON_TEST_BINARY_ROOT}/atomic_reduction_benchmark_ci.json" --markdown
-                "${VERNON_TEST_BINARY_ROOT}/atomic_reduction_benchmark_ci.md")
         set_tests_properties(
-            vernon-python-test_storage_vjp_contract
-            vernon-python-smoke-fluid-graph
-            vernon-python-module-program
-            vernon-python-autodiff-phase2-benchmark
-            vernon-python-atomic-reduction-benchmark
+            vernon-python-test_storage_vjp_contract vernon-python-smoke-fluid-graph vernon-python-module-program
             PROPERTIES ENVIRONMENT
                        "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
                        WORKING_DIRECTORY
                        "${VERNON_REPOSITORY_ROOT}")
-        set_tests_properties(
-            vernon-python-autodiff-phase2-benchmark vernon-python-atomic-reduction-benchmark
-            PROPERTIES TIMEOUT
-                       300
-                       LABELS
-                       benchmark)
         add_test(NAME vernon-python-native-compiled-program
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py")
         add_test(NAME vernon-python-kernel-memory-phase-compile

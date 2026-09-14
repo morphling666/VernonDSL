@@ -40,11 +40,19 @@ public:
             return true;
         }
         const uint32_t rightPanelWidth = framebufferWidth - framebufferWidth / 2;
-        if (!cpu_->renderFrame(elapsedSeconds, framebufferWidth / 2, framebufferHeight) ||
-            !mandelbulb_->renderFrame(elapsedSeconds, rightPanelWidth, framebufferHeight) ||
-            !graphics_.presentSplit(cpu_->image(), cpu_->imageWidth(), cpu_->imageHeight(), mandelbulb_->image(),
-                                    mandelbulb_->imageWidth(), mandelbulb_->imageHeight()))
+        if (!cpu_->renderFrame(elapsedSeconds, framebufferWidth / 2, framebufferHeight)) {
+            std::cerr << "failed to render the CPU fractal panel\n";
             return false;
+        }
+        if (!mandelbulb_->renderFrame(elapsedSeconds, rightPanelWidth, framebufferHeight)) {
+            std::cerr << "failed to render the Mandelbulb panel\n";
+            return false;
+        }
+        if (!graphics_.presentSplit(cpu_->image(), cpu_->imageWidth(), cpu_->imageHeight(), mandelbulb_->image(),
+                                    mandelbulb_->imageWidth(), mandelbulb_->imageHeight())) {
+            std::cerr << "failed to present the split-screen frame\n";
+            return false;
+        }
         graphics_.pollEvents();
         if (frame_++ == 0)
             std::cout << "Vernon split-screen CPU and GPU animation started\n";

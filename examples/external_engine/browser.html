@@ -37,6 +37,9 @@
         canvas: document.getElementById("canvas"),
         print(text) {
           output.textContent += `${text}\n`;
+          if (text === "Vernon split-screen CPU and GPU animation started") {
+            document.documentElement.dataset.vernonFirstFrame = "complete";
+          }
         },
         printErr(text) {
           output.textContent += `error: ${text}\n`;

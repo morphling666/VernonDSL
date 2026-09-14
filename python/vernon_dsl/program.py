@@ -392,6 +392,20 @@ class ProgramCapture:
             )
         )
 
+    def attachment_output(
+        self,
+        render_pass: GraphControlInput,
+        aspect: str,
+        location: int | None,
+    ) -> GraphAttachmentOutput:
+        projection = AttachmentProjection(render_pass.ref, aspect, location)
+        if not any(
+            isinstance(operation, CapturedGraphicsCall) and operation.render_pass_ref == projection.control
+            for operation in self.ops
+        ):
+            raise TypeError("attachment output must follow a graphics call using the same RenderPass")
+        return GraphAttachmentOutput(render_pass, projection)
+
     def capture_allocation(
         self,
         kind: str,
@@ -546,7 +560,7 @@ class ProgramTemplate:
             graph.import_input(name, value)
         operation_bindings: dict[int, tuple[Any, ...]] = {}
 
-        def resolve_attachment_output(value: Any) -> Any:
+        def resolve_resource_reference(value: Any) -> Any:
             if not isinstance(value, GraphAttachmentOutput):
                 return value
             resource = graphics_attachment_cache.get(value.projection)
@@ -574,9 +588,8 @@ class ProgramTemplate:
                 ):
                     raise RuntimeError("Module graphics sequence changed for an existing Program specialization")
                 first_slot = len(slots)
-                arguments = tuple(
-                    resolve_attachment_output(captured.arguments[name]) for name in template.parameter_names
-                )
+                arguments = tuple(captured.arguments[name] for name in template.parameter_names)
+                resolved_arguments = tuple(resolve_resource_reference(value) for value in arguments)
                 slots.extend(arguments)
                 binding_slots = {name: first_slot + index for index, name in enumerate(template.parameter_names)}
                 control_slots = {}
@@ -605,7 +618,7 @@ class ProgramTemplate:
                 operation = graph.append_graphics(
                     name=template.name,
                     pipeline=template.pipeline,
-                    bindings=dict(zip(template.parameter_names, arguments, strict=True)),
+                    bindings=dict(zip(template.parameter_names, resolved_arguments, strict=True)),
                     binding_slots=binding_slots,
                     control_slots=control_slots,
                     parameters=template.parameters,
@@ -630,7 +643,8 @@ class ProgramTemplate:
                 raise RuntimeError("Module kernel sequence changed for an existing Program specialization")
             first_slot = len(slots)
             slots.extend(captured.arguments)
-            bindings = dict(zip(template.parameter_names, captured.arguments, strict=True))
+            resolved_arguments = tuple(resolve_resource_reference(value) for value in captured.arguments)
+            bindings = dict(zip(template.parameter_names, resolved_arguments, strict=True))
             binding_slots = {name: first_slot + index for index, name in enumerate(template.parameter_names)}
             operation = graph.append_kernel(
                 name=template.name,
@@ -643,7 +657,7 @@ class ProgramTemplate:
             )
             operation_bindings[operation.id] = captured.arguments
         graph.set_outputs(
-            {path: resolve_attachment_output(value) for path, value in flatten_program_outputs(outputs).items()}
+            {path: resolve_resource_reference(value) for path, value in flatten_program_outputs(outputs).items()}
         )
         return ProgramInvocation(
             self,
@@ -670,6 +684,14 @@ class ProgramInvocation:
         value = self.slots[slot]
         if isinstance(value, GraphControlInput):
             return self.inputs[value.name]
+        if isinstance(value, GraphAttachmentOutput):
+            from .render import color_output, depth_output
+
+            render_pass = self.inputs[value.render_pass.name]
+            if value.projection.aspect == "color":
+                assert value.projection.location is not None
+                return color_output(render_pass, location=value.projection.location)
+            return depth_output(render_pass)
         return value
 
     @property
@@ -724,11 +746,127 @@ def _access_name(access: Any) -> str:
     return str(getattr(access, "name", access))
 
 
+def _merge_storage_shapes(
+    left: tuple[Any, ...],
+    right: tuple[Any, ...],
+    *,
+    parameter: str,
+) -> tuple[Any, ...]:
+    from .types import dyn
+
+    if len(left) != len(right):
+        raise TypeError(f"conflicting ranks for Module parameter {parameter!r}")
+    merged = []
+    for left_extent, right_extent in zip(left, right, strict=True):
+        if left_extent is dyn:
+            merged.append(right_extent)
+        elif right_extent is dyn:
+            merged.append(left_extent)
+        elif left_extent == right_extent:
+            merged.append(left_extent)
+        else:
+            raise TypeError(f"conflicting shapes for Module parameter {parameter!r}")
+    return tuple(merged)
+
+
+def _access_capabilities(access: str) -> frozenset[str]:
+    if access == "read":
+        return frozenset({"read"})
+    if access == "write":
+        return frozenset({"write"})
+    if access == "read_write":
+        return frozenset({"read", "write"})
+    raise TypeError(f"invalid Storage access {access!r}")
+
+
+def _join_storage_access(left: str, right: str) -> str:
+    capabilities = _access_capabilities(left) | _access_capabilities(right)
+    return "read_write" if len(capabilities) == 2 else next(iter(capabilities))
+
+
+def _module_storage_constraint(annotation: Any) -> Any:
+    from .frontend.runtime_types import StorageParameterConstraint, storage_parameter_constraint
+
+    if annotation is TensorStorage:
+        return StorageParameterConstraint(None, None, None, False)
+    return storage_parameter_constraint(annotation)
+
+
+def _resolve_storage_parameter(
+    name: str,
+    annotation: Any,
+    inferred: Any,
+    *,
+    value_dtype: Any | None = None,
+    value_shape: tuple[int, ...] | None = None,
+    value_access: str | None = None,
+    require_static: bool,
+) -> Any:
+    from .frontend.runtime_types import (
+        RuntimeParameterDescriptor,
+        StorageParameterConstraint,
+    )
+    from .types import TypeExpr, dyn
+
+    explicit = _module_storage_constraint(annotation)
+    reflected = None
+    if inferred is not None:
+        if not isinstance(inferred, TypeExpr) or inferred.name != "TensorView" or len(inferred.arguments) != 3:
+            raise TypeError(f"invalid reflected Storage type for Module parameter {name!r}")
+        dtype, shape, access = inferred.arguments
+        reflected = StorageParameterConstraint(dtype, tuple(shape), _access_name(access), False)
+    if explicit is None and reflected is None and value_dtype is None:
+        return None
+
+    dtype = explicit.dtype if explicit is not None else None
+    if reflected is not None:
+        if dtype is not None and dtype != reflected.dtype:
+            raise TypeError(f"conflicting element types for Module parameter {name!r}")
+        dtype = reflected.dtype if dtype is None else dtype
+    if value_dtype is not None:
+        if dtype is not None and dtype != value_dtype:
+            raise TypeError(f"runtime element type conflicts with Module parameter {name!r}")
+        dtype = value_dtype if dtype is None else dtype
+
+    shape = explicit.shape if explicit is not None else None
+    if reflected is not None and reflected.shape is not None:
+        shape = reflected.shape if shape is None else _merge_storage_shapes(shape, reflected.shape, parameter=name)
+    if shape is None and value_shape is not None:
+        shape = value_shape
+    elif shape is not None and value_shape is not None:
+        _merge_storage_shapes(shape, value_shape, parameter=name)
+
+    declared_access = explicit.access if explicit is not None else None
+    reflected_access = reflected.access if reflected is not None else None
+    if declared_access is not None and reflected_access is not None:
+        if not _access_capabilities(reflected_access) <= _access_capabilities(declared_access):
+            raise TypeError(f"declared access does not cover uses of Module parameter {name!r}")
+        access = declared_access
+    else:
+        access = declared_access or reflected_access or value_access
+    if access is not None and value_access is not None:
+        if not _access_capabilities(access) <= _access_capabilities(value_access):
+            raise TypeError(f"runtime view access is insufficient for Module parameter {name!r}")
+
+    if dtype is None or shape is None or access is None:
+        raise TypeError(
+            f"cannot infer Module parameter {name!r} Storage contract; "
+            "provide TensorStorage[element, (shape,), access], "
+            "use it in a typed Program call, or supply an explicit export argument"
+        )
+    if require_static and any(extent is dyn for extent in shape):
+        raise TypeError(f"cannot infer dynamic shape for Module parameter {name!r} without an export argument")
+    as_view = explicit.as_view if explicit is not None else False
+    return RuntimeParameterDescriptor.storage(dtype, tuple(shape), access, as_view)
+
+
 def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
     """Infer public resource types from nested typed Program calls."""
 
+    from ._runtime.pipeline import Pipeline
+    from .frontend.model import SemanticCategory
     from .module import Module
-    from .types import TypeExpr, read_write
+    from .types import TypeExpr, dyn, read_write
 
     cache: dict[int, dict[str, TypeExpr]] = {}
     active: set[int] = set()
@@ -745,12 +883,15 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
             return
         existing_dtype, existing_shape, existing_access = existing.arguments
         dtype, shape, access = candidate.arguments
-        if existing_dtype != dtype or existing_shape != shape:
+        if existing_dtype != dtype:
             raise TypeError(
                 f"conflicting reflected types for Module parameter {name!r} in {type(owner).__name__}.forward"
             )
+        merged_shape = _merge_storage_shapes(tuple(existing_shape), tuple(shape), parameter=name)
         if existing_access != access:
-            constraints[name] = TypeExpr("TensorView", (dtype, shape, read_write))
+            constraints[name] = TypeExpr("TensorView", (dtype, merged_shape, read_write))
+        else:
+            constraints[name] = TypeExpr("TensorView", (dtype, merged_shape, access))
 
     def resolve(expression: ast.expr, owner: Any, globals_: Mapping[str, Any]) -> Any:
         if isinstance(expression, ast.Name):
@@ -766,7 +907,41 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
         target: Any,
     ) -> tuple[inspect.Signature, dict[str, TypeExpr]] | None:
         if isinstance(target, Module):
-            return type(target)._module_definition.signature, infer(target)
+            definition = type(target)._module_definition
+            inferred = dict(infer(target))
+            for parameter in definition.signature.parameters.values():
+                annotation = definition.resolved_annotations.get(parameter.name)
+                explicit = _module_storage_constraint(annotation)
+                if explicit is None:
+                    continue
+                candidate = inferred.get(parameter.name)
+                if candidate is None and (explicit.dtype is None or explicit.shape is None or explicit.access is None):
+                    continue
+                descriptor = _resolve_storage_parameter(
+                    parameter.name,
+                    annotation,
+                    candidate,
+                    require_static=False,
+                )
+                metadata = descriptor.storage_metadata
+                shape = tuple(dyn if extent == "?" else extent for extent in metadata.shape)
+                inferred[parameter.name] = TypeExpr(
+                    "TensorView",
+                    (metadata.dtype, shape, metadata.access),
+                )
+            return definition.signature, inferred
+        if isinstance(target, Pipeline):
+            reflected = {}
+            for name, descriptor in target._static_parameter_types().items():
+                if descriptor.kind is not SemanticCategory.STORAGE:
+                    continue
+                metadata = descriptor.storage_metadata
+                shape = tuple(dyn if extent == "?" else extent for extent in metadata.shape)
+                reflected[name] = TypeExpr("TensorView", (metadata.dtype, shape, metadata.access))
+            signature = inspect.Signature(
+                inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD) for name in reflected
+            )
+            return signature, reflected
         function = getattr(target, "_function", None)
         if function is None:
             return None
@@ -828,12 +1003,8 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
 
 def _module_parameter_types(module: Any) -> dict[str, Any]:
     from .frontend.model import SemanticCategory
-    from .frontend.runtime_types import (
-        RuntimeParameterDescriptor,
-        runtime_parameter_descriptor,
-    )
+    from .frontend.runtime_types import runtime_parameter_descriptor
     from .operation_graph import ProgramControlDescriptor
-    from .types import TypeExpr, dyn
 
     definition = type(module)._module_definition
     annotations = definition.resolved_annotations
@@ -847,36 +1018,27 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
             continue
         if parameter.default is not inspect.Parameter.empty:
             continue
-        try:
-            descriptor = runtime_parameter_descriptor(annotation)
-        except TypeError:
-            descriptor = None
-        if descriptor is not None and descriptor.kind is not SemanticCategory.STORAGE:
-            types[parameter.name] = descriptor
+        inferred = reflected.get(parameter.name)
+        explicit_storage = _module_storage_constraint(annotation)
+        if explicit_storage is not None or inferred is not None:
+            types[parameter.name] = _resolve_storage_parameter(
+                parameter.name,
+                annotation,
+                inferred,
+                require_static=True,
+            )
             continue
-        inferred = annotation if isinstance(annotation, TypeExpr) and annotation.name == "TensorView" else None
-        if inferred is None:
-            inferred = reflected.get(parameter.name)
-        if inferred is None:
+        if annotation is None:
             raise TypeError(
                 f"cannot infer Module parameter {parameter.name!r}; annotate it as "
-                "TensorView[element, (shape,), access], use it in a typed Program call, "
+                "TensorStorage[element, (shape,), access] or TensorView[element, (shape,), access], "
+                "use it in a typed Program call, "
                 "or supply an explicit export argument"
             )
-        if len(inferred.arguments) != 3:
-            raise TypeError(f"invalid TensorView annotation for Module parameter {parameter.name!r}")
-        dtype, shape, access = inferred.arguments
-        if not isinstance(shape, tuple) or any(extent is dyn for extent in shape):
-            raise TypeError(
-                f"cannot infer dynamic shape for Module parameter {parameter.name!r} without an export argument"
-            )
-        as_view = isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
-        types[parameter.name] = RuntimeParameterDescriptor.storage(
-            dtype,
-            tuple(shape),
-            _access_name(access) if as_view else "read_write",
-            as_view,
-        )
+        descriptor = runtime_parameter_descriptor(annotation)
+        if descriptor.kind is SemanticCategory.STORAGE:
+            raise RuntimeError("Storage annotation bypassed canonical Module constraint resolution")
+        types[parameter.name] = descriptor
     return types
 
 
@@ -888,12 +1050,10 @@ def _parameter_types_from_values(
     from ._dtypes import scalar_name
     from .frontend.model import SemanticCategory
     from .frontend.runtime_types import (
-        RuntimeParameterDescriptor,
         runtime_parameter_descriptor,
         validate_host_value,
     )
     from .operation_graph import ProgramControlDescriptor
-    from .types import TypeExpr
 
     def tensor_dtype(value: TensorStorage) -> Any:
         if value._element_type is not None:
@@ -903,6 +1063,8 @@ def _parameter_types_from_values(
             raise TypeError(f"cannot allocate a Module transient for dtype {value.dtype}")
         types = __import__("vernon_dsl.types", fromlist=[name])
         return getattr(types, name)
+
+    reflected = _reflect_module_parameter_types(module)
 
     def descriptor(annotation: Any, value: Any, name: str) -> Any:
         control_kind = _program_control_kind(annotation)
@@ -921,20 +1083,33 @@ def _parameter_types_from_values(
             if control_kind == "render_pass" and value is None:
                 raise TypeError(f"Module.forward() RenderPass control {name!r} cannot be None")
             return ProgramControlDescriptor(control_kind, annotation, value)
-        as_view = isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
+        explicit_storage = _module_storage_constraint(annotation)
         if isinstance(value, TensorView):
             owner = value.owner
             if not isinstance(owner, TensorStorage):
                 raise TypeError("Module.forward() TensorView parameters must borrow TensorStorage")
-            if as_view:
-                return runtime_parameter_descriptor(annotation)
+            if explicit_storage is not None and not explicit_storage.as_view:
+                raise TypeError(f"Module.forward() owner parameter {name!r} requires TensorStorage, not TensorView")
             dtype = value.element_type if value.element_type is not None else tensor_dtype(owner)
-            return RuntimeParameterDescriptor.storage(dtype, tuple(value.shape), str(value.access), True)
+            return _resolve_storage_parameter(
+                name,
+                annotation,
+                reflected.get(name),
+                value_dtype=dtype,
+                value_shape=tuple(value.shape),
+                value_access=str(value.access),
+                require_static=False,
+            )
         if isinstance(value, TensorStorage):
-            if as_view:
-                return runtime_parameter_descriptor(annotation)
-            access = "read_write"
-            return RuntimeParameterDescriptor.storage(tensor_dtype(value), tuple(value.shape), access, as_view)
+            return _resolve_storage_parameter(
+                name,
+                annotation,
+                reflected.get(name),
+                value_dtype=tensor_dtype(value),
+                value_shape=tuple(value.shape),
+                value_access="read_write",
+                require_static=False,
+            )
         if annotation is None:
             raise TypeError(
                 f"Module.forward() argument {name!r} is a runtime Value or Resource and requires a DSL annotation"

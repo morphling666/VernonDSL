@@ -74,9 +74,6 @@ Architecture and tutorials link to the contract instead of redefining fields.
 
 ## Active plans and future designs
 
-- [`runtime/runtime_session_lifecycle_plan.md`](runtime/runtime_session_lifecycle_plan.md)
-  tracks the phased Runtime/RHI/Python ownership convergence; Phases 1–8 are
-  complete and later phases remain active.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)
   tracks contract-driven, capability-based language test normalization.
 - [`testing/language_feature_inventory.md`](testing/language_feature_inventory.md)

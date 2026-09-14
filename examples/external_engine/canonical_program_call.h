@@ -115,10 +115,6 @@ invokeProgram(vernon::runtime::ProgramExecutable &executable, vernon::runtime::P
         return vernon::Result<void, vernon::RuntimeError>{vernon::err(commitResult.error())};
     vernon::runtime::Pullback pullback = std::move(commitResult).value();
     (void)pullback;
-    auto telemetryResult = instance.telemetry();
-    if (telemetryResult.isErr())
-        return vernon::Result<void, vernon::RuntimeError>{vernon::err(telemetryResult.error())};
-    (void)telemetryResult.value();
     return vernon::Result<void, vernon::RuntimeError>{vernon::ok()};
 }
 

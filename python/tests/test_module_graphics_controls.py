@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import sys
 import unittest
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -77,6 +78,17 @@ def generate_vertices(
     index = gid[0]
     vertices[index, 0] = vd.f32(index) - 1.0
     vertices[index, 1] = -0.5 if index < 2 else 0.5
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def touch_color_attachment(
+    image: vd.Texture["2d", vd.rgba8_unorm, vd.read_write],  # noqa: F722
+    marker: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    coordinate = vd.Vector([vd.i32(0), vd.i32(0)])
+    value = vd.texture_load(image, coordinate)
+    marker[0] = value.x
+    vd.texture_store(image, coordinate, value)
 
 
 culled_pipeline = vd.pipeline(
@@ -164,7 +176,7 @@ class ManagedGraphicsSamePass(vd.Module):
         render_pass: vd.RenderPass,
         draw: vd.DrawCommand,
         dynamic_state: vd.DynamicState,
-    ) -> None:
+    ) -> Any:
         managed_pipeline(
             vertices=vertices,
             render_pass=render_pass,
@@ -177,6 +189,7 @@ class ManagedGraphicsSamePass(vd.Module):
             draw=draw,
             dynamic_state=dynamic_state,
         )
+        return vd.color_output(render_pass)
 
 
 class ShadowPbrProgram(vd.Module):
@@ -225,6 +238,38 @@ class ComputeGeneratedVertices(vd.Module):
             dynamic_state=dynamic_state,
         )
         return vd.color_output(render_pass)
+
+
+@dataclass
+class MixedGraphicsOutputs:
+    color: Any
+    marker: vd.TensorStorage
+
+
+class GraphicsComputeGraphics(vd.Module):
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> MixedGraphicsOutputs:
+        managed_pipeline(
+            vertices=vertices,
+            render_pass=render_pass,
+            draw=draw,
+            dynamic_state=dynamic_state,
+        )
+        color = vd.color_output(render_pass)
+        marker = vd.zeros(dtype=vd.f32, shape=(1,))
+        touch_color_attachment(color, marker, grid=(1, 1, 1))
+        managed_pipeline(
+            vertices=vertices,
+            render_pass=render_pass,
+            draw=draw,
+            dynamic_state=dynamic_state,
+        )
+        return MixedGraphicsOutputs(vd.color_output(render_pass), marker)
 
 
 class CulledManagedGraphics(vd.Module):
@@ -426,6 +471,54 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             first.outputs["render_pass.color.0"],
             second.inputs["render_pass.color.0"],
         )
+        self.assertEqual(invocation.graph.outputs["output"], second.outputs["render_pass.color.0"])
+        parsed = parse_program(invocation)
+        signature = next(line for line in parsed.mlir.splitlines() if "func.func @forward" in line)
+        self.assertIn(f"%v{first.inputs['render_pass.color.0']}:", signature)
+        self.assertNotIn(f"%v{second.inputs['render_pass.color.0']}:", signature)
+        canonical = self._cook(parsed, "tests/reused-render-pass")
+        accesses = [
+            access
+            for node in canonical["graphs"][0]["nodes"]
+            for access in node["accesses"]
+            if access["tag"] == "attachment"
+        ]
+        self.assertEqual(len(accesses), 2)
+        self.assertEqual(accesses[0]["after"], accesses[1]["before"])
+
+    def test_attachment_versions_flow_through_compute_and_back_to_graphics(self) -> None:
+        render_pass = vd.RenderPass(cast(vd.RenderTarget, _Target()), ((0, vd.preserve()),))
+        parameter_types = {
+            "vertices": RuntimeParameterDescriptor.storage(vd.f32, (3, 2), "read", True),
+            "render_pass": ProgramControlDescriptor("render_pass", vd.RenderPass, render_pass),
+            "draw": ProgramControlDescriptor("draw", vd.DrawCommand, vd.draw(vertex_count=3)),
+            "dynamic_state": ProgramControlDescriptor("dynamic_state", vd.DynamicState, vd.dynamic_state()),
+        }
+        capture, outputs = interpret_module_forward(GraphicsComputeGraphics(), parameter_types)
+        invocation = ProgramTemplate.compile(capture).bind(capture, outputs)
+        first_draw, compute, second_draw = invocation.graph.operations
+        attachment = "render_pass.color.0"
+
+        self.assertEqual(first_draw.outputs[attachment], compute.inputs["image"])
+        self.assertEqual(compute.outputs["image"], second_draw.inputs[attachment])
+        self.assertEqual(invocation.graph.outputs["color"], second_draw.outputs[attachment])
+
+        parsed = parse_program(invocation)
+        signature = next(line for line in parsed.mlir.splitlines() if "func.func @forward" in line)
+        self.assertIn(f"%v{first_draw.inputs[attachment]}:", signature)
+        self.assertNotIn(f"%v{first_draw.outputs[attachment]}:", signature)
+        self.assertNotIn(f"%v{compute.outputs['image']}:", signature)
+        canonical = self._cook(parsed, "tests/graphics-compute-graphics")
+        nodes = canonical["graphs"][0]["nodes"]
+        first_attachment = next(access for access in nodes[0]["accesses"] if access["tag"] == "attachment")
+        compute_write = next(
+            access
+            for access in nodes[1]["accesses"]
+            if access["tag"] == "write" and access["before"] == first_attachment["after"]
+        )
+        second_attachment = next(access for access in nodes[2]["accesses"] if access["tag"] == "attachment")
+        self.assertEqual(first_attachment["after"], compute_write["before"])
+        self.assertEqual(compute_write["after"], second_attachment["before"])
 
     def test_shadow_depth_output_is_the_pbr_sampled_input(self) -> None:
         shadow_pass = vd.RenderPass(cast(vd.RenderTarget, _DepthTarget()), (), vd.preserve())
@@ -594,6 +687,26 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             vd.dynamic_state(viewport=(0, 0, 16, 16)),
         )
         self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(
+        BackendRequirements(gpu=True, compute=True, graphics=True, storage_buffers=True, storage_texture=True)
+    )
+    def test_attachment_flows_graphics_compute_graphics(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(
+            shape=(16, 16),
+            usage=("color_attachment", "storage", "transfer_source", "transfer_destination"),
+        )
+        outputs = GraphicsComputeGraphics()(
+            self._triangle_vertices(),
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: texture}),
+                color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+            ),
+            vd.draw(vertex_count=3),
+            vd.dynamic_state(viewport=(0, 0, 16, 16)),
+        )
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+        self.assertEqual(outputs.marker.to_numpy().shape, (1,))
 
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
     def test_managed_module_uses_static_pipeline_state(self, backend: BackendRow) -> None:

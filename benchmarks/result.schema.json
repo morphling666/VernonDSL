@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vernon.dev/schemas/benchmark-result-v2.json",
+  "title": "Vernon benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture",
+    "layer",
+    "status",
+    "environment",
+    "parameters",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "fixture": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z0-9_]+)+$"
+    },
+    "layer": {
+      "enum": [
+        "binding",
+        "program",
+        "backend",
+        "autodiff",
+        "graphics",
+        "application"
+      ]
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "skipped"
+      ]
+    },
+    "skip_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timestamp_utc",
+        "revision",
+        "dirty",
+        "platform",
+        "architecture",
+        "configuration",
+        "backend",
+        "surface"
+      ],
+      "properties": {
+        "timestamp_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configuration": {
+          "type": "string",
+          "minLength": 1
+        },
+        "backend": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surface": {
+          "enum": [
+            "python",
+            "cpp"
+          ]
+        },
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "driver": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "parameters": {
+      "type": "object"
+    },
+    "measurements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "unit",
+          "sample_count",
+          "median",
+          "p95",
+          "p99",
+          "minimum",
+          "maximum"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "unit": {
+            "enum": [
+              "ns",
+              "bytes",
+              "count",
+              "frames_per_second"
+            ]
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "median": {
+            "type": "number"
+          },
+          "p95": {
+            "type": "number"
+          },
+          "p99": {
+            "type": "number"
+          },
+          "minimum": {
+            "type": "number"
+          },
+          "maximum": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "skipped"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "skip_reason"
+        ],
+        "properties": {
+          "measurements": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "measurements": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

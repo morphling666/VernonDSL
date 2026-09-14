@@ -246,7 +246,7 @@ class ValueParameters(vd.Module):
 
 
 class StridedSquareSum(vd.Module):
-    def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
+    def forward(self, source: vd.TensorView[vd.f32, (vd.dyn,), vd.read]) -> vd.TensorStorage:
         output = vd.zeros(dtype=vd.f32, shape=(1,))
         program_strided_square_sum(source, output, grid=(1, 1, 1))
         return output

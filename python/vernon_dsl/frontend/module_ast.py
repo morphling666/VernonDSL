@@ -10,8 +10,6 @@ from typing import Any
 
 from ..module import Module
 from ..operation_graph import (
-    AttachmentProjection,
-    GraphAttachmentOutput,
     GraphBuffer,
     GraphControlInput,
     GraphResourceInput,
@@ -462,10 +460,10 @@ class _ForwardInterpreter:
                 location = keywords.pop("location", 0)
                 if keywords or not isinstance(location, int) or isinstance(location, bool) or location < 0:
                     raise TypeError("color_output location must be a non-negative compile-time integer")
-                return GraphAttachmentOutput(args[0], AttachmentProjection(args[0].ref, "color", location))
+                return self.capture.attachment_output(args[0], "color", location)
             if keywords:
                 raise TypeError("depth_output does not accept keyword arguments")
-            return GraphAttachmentOutput(args[0], AttachmentProjection(args[0].ref, "depth", None))
+            return self.capture.attachment_output(args[0], "depth", None)
         if dataclasses.is_dataclass(callee) and isinstance(callee, type):
             return callee(*args, **keywords)
         if any(_contains_graph(value) for value in (*args, *keywords.values())):

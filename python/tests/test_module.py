@@ -50,6 +50,14 @@ def module_scale(
     output[0] = source[0] * vd.f32(factor)
 
 
+@vd.kernel(workgroup_size=(1, 1, 1))
+def module_copy_dynamic(
+    source: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+) -> None:
+    output[0] = source[0]
+
+
 class PowerBranch(vd.Module):
     def __init__(self, *, power: int, grid: tuple[int, int, int]):
         super().__init__()
@@ -95,6 +103,29 @@ class AnnotatedSquare(vd.Module):
         output = vd.empty_like(source)
         module_square(source, output)
         return output
+
+
+class ElementTypedStorage(vd.Module):
+    def forward(self, source: vd.TensorStorage[vd.f32]) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        module_square(source, output)
+        return output
+
+
+class FullyTypedStorage(vd.Module):
+    def forward(
+        self,
+        source: vd.TensorStorage[vd.f32, (1,), vd.read],
+    ) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        module_copy_dynamic(source, output)
+        return output
+
+
+class ReadWriteTypedStorage(vd.Module):
+    def forward(self, value: vd.TensorStorage[vd.f32]) -> vd.TensorStorage:
+        module_square(value, value)
+        return value
 
 
 class AggregateCopy(vd.Module):
@@ -459,6 +490,55 @@ class ModuleTests(unittest.TestCase):
                 ("FanIn.square.module_square", "module_square"),
             ),
         )
+
+    def test_typed_storage_constraints_are_completed_and_validated(self) -> None:
+        from vernon_dsl.program import _module_parameter_types, _parse_module_program
+
+        element_only = _module_parameter_types(ElementTypedStorage())["source"].storage_metadata
+        self.assertEqual(element_only.dtype, vd.f32)
+        self.assertEqual(element_only.shape, (1,))
+        self.assertEqual(element_only.access, "read")
+        self.assertFalse(element_only.as_view)
+
+        fully_typed = _module_parameter_types(FullyTypedStorage())["source"].storage_metadata
+        self.assertEqual(fully_typed.dtype, vd.f32)
+        self.assertEqual(fully_typed.shape, (1,))
+        self.assertEqual(fully_typed.access, "read")
+        self.assertFalse(fully_typed.as_view)
+        self.assertIn('tensor_view<f32, [1], "read_write"', _parse_module_program(FullyTypedStorage()).mlir)
+
+        read_write = _module_parameter_types(ReadWriteTypedStorage())["value"].storage_metadata
+        self.assertEqual(read_write.access, "read_write")
+
+    def test_typed_storage_rejects_conflicting_contracts(self) -> None:
+        from vernon_dsl.program import _parse_module_program
+
+        class WrongShape(vd.Module):
+            def forward(
+                self,
+                source: vd.TensorStorage[vd.f32, (2,), vd.read],
+            ) -> vd.TensorStorage:
+                output = vd.empty_like(source)
+                module_square(source, output)
+                return output
+
+        class InsufficientAccess(vd.Module):
+            def forward(
+                self,
+                value: vd.TensorStorage[vd.f32, (1,), vd.read],
+            ) -> vd.TensorStorage:
+                module_square(value, value)
+                return value
+
+        with self.assertRaisesRegex(TypeError, "conflicting shapes"):
+            _parse_module_program(WrongShape())
+        with self.assertRaisesRegex(TypeError, "declared access does not cover"):
+            _parse_module_program(InsufficientAccess())
+
+    def test_explicit_owner_contract_rejects_borrowed_view(self) -> None:
+        owner = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        with self.assertRaisesRegex(TypeError, "requires TensorStorage, not TensorView"):
+            ElementTypedStorage()(owner.view(access="read"))
 
     def test_host_static_kernel_scalars_are_implementation_constants(self) -> None:
         from vernon_dsl.program import _parse_module_program
