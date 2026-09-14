@@ -251,13 +251,13 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
     if (!descriptor || !pipeline || !bindings || bindings->pipeline != pipeline)
         return fail(context.error, "invalid CPU provider dispatch");
     const VernonStatus status =
-        context.scheduler->dispatch(descriptor->group_count, pipeline->workgroup, [&](VernonCpuRangeV1 &range) {
+        context.scheduler->dispatch(descriptor->group_count, pipeline->workgroup, [&](VernonCpuRange &range) {
             range.arguments = bindings->packed.data();
             range.arguments_size = bindings->packed.size();
             range.results = bindings->results.empty() ? nullptr : bindings->results.data();
             range.results_size = bindings->results.size();
             range.textures = nullptr;
-            const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+            const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
             return pipeline->shader->kernel.entry(&invocation);
         });
     if (status != VERNON_STATUS_OK)

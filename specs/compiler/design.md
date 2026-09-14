@@ -422,7 +422,7 @@ The external `__vernon_cpu_<module-hash>_<entry>` ABI remains a dedicated
 LLVM-only component. The module hash prevents symbol collisions when many
 objects are statically linked into one game. Every exported CPU entry accepts a
 `VernonCpuInvocation` whose argument is exactly one checked
-`VernonCpuRangeV1`; scalar-entry compatibility dispatch is not supported. The
+`VernonCpuRange`; scalar-entry compatibility dispatch is not supported. The
 wrapper rejects a stale descriptor size, empty or out-of-bounds lane interval,
 zero or overflowing grid/workgroup extent, out-of-range group coordinate, and
 undersized or null common/per-invocation frames before entering the lane loop.
@@ -443,7 +443,7 @@ validated workgroup barrier, the ABI wrapper clones its lowered function into
 an LLVM coroutine before the standard `-O2` pipeline. Barrier calls become
 suspension points, and values live across a barrier are spilled by coroutine
 lowering into lane-owned frame storage obtained from
-`vernonCpuLaneAddressV1`. A final suspend distinguishes lane completion from a
+`vernonCpuLaneAddress`. A final suspend distinguishes lane completion from a
 barrier yield. Coroutine handles and frames use reserved lane-allocation sites;
 allocation overflow or failure returns an internal error rather than
 dereferencing a null frame. The runtime advances a workgroup only when every

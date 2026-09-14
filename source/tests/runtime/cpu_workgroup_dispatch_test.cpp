@@ -16,7 +16,7 @@
 
 namespace {
 
-template <typename Callback> VernonStatus forEachLane(VernonCpuRangeV1 &range, Callback &&callback) {
+template <typename Callback> VernonStatus forEachLane(VernonCpuRange &range, Callback &&callback) {
     for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
         range.active_lane = localLinear;
         const VernonStatus status = callback(vernon::runtime::cpuRangeCoordinates(range, localLinear));
@@ -37,9 +37,9 @@ protected:
         ASSERT_NE(scheduler_, nullptr) << error_;
     }
 
-    static void yield(VernonCpuRangeV1 &range, uint64_t site) {
+    static void yield(VernonCpuRange &range, uint64_t site) {
         range.yielded_site = site;
-        range.outcome = VERNON_CPU_RANGE_YIELDED_V1;
+        range.outcome = VERNON_CPU_RANGE_YIELDED;
     }
 
     std::string error_;
@@ -57,7 +57,7 @@ TEST_F(CpuWorkgroupDispatchTest, ExecutesEachInvocationInContiguousGroupRangesAn
         std::mutex threadsMutex;
         ASSERT_EQ(
             scheduler_->dispatch(grid, workgroup,
-                                 [&](VernonCpuRangeV1 &range) {
+                                 [&](VernonCpuRange &range) {
                                      {
                                          std::lock_guard lock(threadsMutex);
                                          launchThreads[launch].insert(std::this_thread::get_id());
@@ -92,7 +92,7 @@ TEST_F(CpuWorkgroupDispatchTest, DispatchesOneOriginalVirtualGroup) {
     constexpr size_t selectedGroup = 17;
     size_t visits = 0;
     ASSERT_EQ(scheduler_->dispatchGroupInline(grid, workgroup, selectedGroup,
-                                              [&](VernonCpuRangeV1 &range) {
+                                              [&](VernonCpuRange &range) {
                                                   EXPECT_EQ(range.group[0], 1u);
                                                   EXPECT_EQ(range.group[1], 1u);
                                                   EXPECT_EQ(range.group[2], 1u);
@@ -121,7 +121,7 @@ TEST_F(CpuWorkgroupDispatchTest, CallingThreadPolicyReusesRangePhaseEngineWithou
     const std::thread::id callingThread = std::this_thread::get_id();
 
     ASSERT_EQ(scheduler->dispatch(grid, workgroup,
-                                  [&](VernonCpuRangeV1 &range) {
+                                  [&](VernonCpuRange &range) {
                                       EXPECT_EQ(std::this_thread::get_id(), callingThread);
                                       if (range.phase == 0) {
                                           yield(range, 7);
@@ -144,7 +144,7 @@ TEST_F(CpuWorkgroupDispatchTest, InlineDispatchBypassesWorkerPoolForMultipleLarg
     std::atomic<size_t> visits{};
 
     ASSERT_EQ(scheduler_->dispatchInline(grid, workgroup,
-                                         [&](VernonCpuRangeV1 &range) {
+                                         [&](VernonCpuRange &range) {
                                              EXPECT_EQ(std::this_thread::get_id(), callingThread);
                                              visits.fetch_add(range.lane_end - range.lane_begin,
                                                               std::memory_order_relaxed);
@@ -161,8 +161,8 @@ TEST_F(CpuWorkgroupDispatchTest, PersistsSharedStorageAcrossNonblockingPhases) {
     std::array<int32_t, 10> result{};
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
-                                       const uint64_t address = vernonCpuWorkgroupAddressV1(
+                                   [&](VernonCpuRange &range) {
+                                       const uint64_t address = vernonCpuWorkgroupAddress(
                                            0, sizeof(std::atomic<int32_t>), alignof(std::atomic<int32_t>), 0);
                                        if (!address)
                                            return VERNON_STATUS_INTERNAL_ERROR;
@@ -207,7 +207,7 @@ TEST_F(CpuWorkgroupDispatchTest, SupportsRepeatedPhaseGenerations) {
     std::array<std::atomic<uint32_t>, 2> generations{};
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        if (range.phase == 64)
                                            return VERNON_STATUS_OK;
                                        if ((range.phase & 1) == 0 && range.lane_begin == 0)
@@ -230,11 +230,11 @@ TEST_F(CpuWorkgroupDispatchTest, PersistsLanePrivateScratchAcrossPhases) {
     constexpr uint32_t workgroup[3]{16, 1, 1};
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        VernonStatus status =
                                            forEachLane(range, [&](const vernon::runtime::CpuLaneCoordinates &lane) {
                                                const uint64_t address =
-                                                   vernonCpuLaneAddressV1(7, sizeof(uint32_t), alignof(uint32_t), 0);
+                                                   vernonCpuLaneAddress(7, sizeof(uint32_t), alignof(uint32_t), 0);
                                                if (!address)
                                                    return VERNON_STATUS_INTERNAL_ERROR;
                                                auto *value = reinterpret_cast<uint32_t *>(address);
@@ -266,7 +266,7 @@ TEST_F(CpuWorkgroupDispatchTest, RunsConcurrentDispatchesWithinOneWorkerBudget) 
 
     for (size_t dispatch = 0; dispatch < callers.size(); ++dispatch) {
         callers[dispatch] = std::thread([&, dispatch] {
-            statuses[dispatch] = scheduler_->dispatch(grid, workgroup, [&](VernonCpuRangeV1 &) {
+            statuses[dispatch] = scheduler_->dispatch(grid, workgroup, [&](VernonCpuRange &) {
                 std::unique_lock lock(mutex);
                 ++arrived;
                 if (arrived == 8) {
@@ -296,14 +296,14 @@ TEST_F(CpuWorkgroupDispatchTest, ContainsRangeFailuresAndInvalidOutcomes) {
     constexpr uint32_t workgroup[3]{4, 1, 1};
 
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [](VernonCpuRangeV1 &range) {
+                                   [](VernonCpuRange &range) {
                                        return range.group[0] == 0 ? VERNON_STATUS_INTERNAL_ERROR : VERNON_STATUS_OK;
                                    }),
               VERNON_STATUS_INTERNAL_ERROR);
     EXPECT_NE(scheduler_->lastDiagnostic().find("CPU range returned an error"), std::string::npos);
 
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [](VernonCpuRangeV1 &range) {
+                                   [](VernonCpuRange &range) {
                                        range.outcome = UINT32_MAX;
                                        return VERNON_STATUS_OK;
                                    }),
@@ -316,26 +316,26 @@ TEST_F(CpuWorkgroupDispatchTest, ReportsArenaOverflowAndSealsAtFirstYield) {
     constexpr uint32_t workgroup[3]{4, 1, 1};
 
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &) {
-                                       EXPECT_EQ(vernonCpuWorkgroupAddressV1(0, 16 * 1024 + 1, 4, 0), 0u);
+                                   [&](VernonCpuRange &) {
+                                       EXPECT_EQ(vernonCpuWorkgroupAddress(0, 16 * 1024 + 1, 4, 0), 0u);
                                        return VERNON_STATUS_OK;
                                    }),
               VERNON_STATUS_INTERNAL_ERROR);
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &) {
-                                       EXPECT_EQ(vernonCpuLaneAddressV1(0, uint64_t{1} << 63, 1, 0), 0u);
+                                   [&](VernonCpuRange &) {
+                                       EXPECT_EQ(vernonCpuLaneAddress(0, uint64_t{1} << 63, 1, 0), 0u);
                                        return VERNON_STATUS_OK;
                                    }),
               VERNON_STATUS_INTERNAL_ERROR);
 
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        if (range.phase == 0) {
-                                           EXPECT_NE(vernonCpuWorkgroupAddressV1(0, 4, 4, 0), 0u);
+                                           EXPECT_NE(vernonCpuWorkgroupAddress(0, 4, 4, 0), 0u);
                                            yield(range, 0);
                                            return VERNON_STATUS_OK;
                                        }
-                                       EXPECT_EQ(vernonCpuWorkgroupAddressV1(1, 4, 4, 0), 0u);
+                                       EXPECT_EQ(vernonCpuWorkgroupAddress(1, 4, 4, 0), 0u);
                                        return VERNON_STATUS_OK;
                                    }),
               VERNON_STATUS_INTERNAL_ERROR);
@@ -351,7 +351,7 @@ TEST_F(CpuWorkgroupDispatchTest, KeepsWorkerCountBoundedForLargeWorkgroups) {
     std::set<std::thread::id> threads;
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        {
                                            std::lock_guard lock(threadsMutex);
                                            threads.insert(std::this_thread::get_id());
@@ -374,7 +374,7 @@ TEST_F(CpuWorkgroupDispatchTest, PartitionsUnevenLaneChunksWithoutEmptyRanges) {
     std::array<std::atomic<uint32_t>, 12> visits{};
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        if (range.lane_begin >= range.lane_end)
                                            return VERNON_STATUS_INTERNAL_ERROR;
                                        return forEachLane(
@@ -395,7 +395,7 @@ TEST_F(CpuWorkgroupDispatchTest, ExecutesTinyDispatchInline) {
     const std::thread::id caller = std::this_thread::get_id();
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        EXPECT_EQ(std::this_thread::get_id(), caller);
                                        EXPECT_EQ(range.lane_begin, 0u);
                                        EXPECT_EQ(range.lane_end, 8u);
@@ -410,10 +410,10 @@ TEST_F(CpuWorkgroupDispatchTest, AllocatesLaneStateAsOneContiguousGroupSlab) {
     std::vector<uint64_t> addresses(256);
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &range) {
+                                   [&](VernonCpuRange &range) {
                                        return forEachLane(range, [&](const vernon::runtime::CpuLaneCoordinates &lane) {
                                            addresses[lane.local[0]] =
-                                               vernonCpuLaneAddressV1(42, sizeof(uint64_t), alignof(uint64_t), 0);
+                                               vernonCpuLaneAddress(42, sizeof(uint64_t), alignof(uint64_t), 0);
                                            return addresses[lane.local[0]] ? VERNON_STATUS_OK
                                                                            : VERNON_STATUS_INTERNAL_ERROR;
                                        });
@@ -431,7 +431,7 @@ TEST_F(CpuWorkgroupDispatchTest, StreamsLargeGridThroughBoundedActiveGroups) {
     std::atomic<size_t> completed{};
 
     ASSERT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &) {
+                                   [&](VernonCpuRange &) {
                                        completed.fetch_add(1, std::memory_order_relaxed);
                                        return VERNON_STATUS_OK;
                                    }),
@@ -446,7 +446,7 @@ TEST_F(CpuWorkgroupDispatchTest, RejectsWorkgroupsAboveConfiguredVolumeBeforeExe
     std::atomic<bool> executed{};
 
     EXPECT_EQ(scheduler_->dispatch(grid, workgroup,
-                                   [&](VernonCpuRangeV1 &) {
+                                   [&](VernonCpuRange &) {
                                        executed.store(true, std::memory_order_relaxed);
                                        return VERNON_STATUS_OK;
                                    }),
@@ -464,11 +464,10 @@ TEST(CpuWorkgroupSchedulerConfig, RejectsInvalidLimits) {
 }
 
 TEST(CpuWorkgroupHelpers, FailHardOutsideActiveWorkgroup) {
-    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuWorkgroupAddressV1(0, 4, 4, 0),
-                              "vernonCpuWorkgroupAddressV1 called outside");
-    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuLaneAddressV1(0, 4, 4, 0), "vernonCpuLaneAddressV1 called outside");
-    EXPECT_DEATH_IF_SUPPORTED(vernonCpuWorkgroupBarrierV1(0), "vernonCpuWorkgroupBarrierV1 called outside");
-    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuWorkgroupIsLeaderV1(), "vernonCpuWorkgroupIsLeaderV1 called outside");
+    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuWorkgroupAddress(0, 4, 4, 0), "vernonCpuWorkgroupAddress called outside");
+    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuLaneAddress(0, 4, 4, 0), "vernonCpuLaneAddress called outside");
+    EXPECT_DEATH_IF_SUPPORTED(vernonCpuWorkgroupBarrier(0), "vernonCpuWorkgroupBarrier called outside");
+    EXPECT_DEATH_IF_SUPPORTED((void)vernonCpuWorkgroupIsLeader(), "vernonCpuWorkgroupIsLeader called outside");
 }
 
 } // namespace

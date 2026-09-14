@@ -252,10 +252,10 @@ struct LowerCpuSynchronizationPass final : PassWrapper<LowerCpuSynchronizationPa
         ModuleOp module = getOperation();
         IRRewriter rewriter(module.getContext());
         Type i64 = rewriter.getI64Type();
-        func::FuncOp addressHelper = declareCpuHelper(module, VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL,
+        func::FuncOp addressHelper = declareCpuHelper(module, VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL,
                                                       rewriter.getFunctionType({i64, i64, i64, i64}, {i64}));
         func::FuncOp barrierHelper =
-            declareCpuHelper(module, VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL, rewriter.getFunctionType({i64}, {}));
+            declareCpuHelper(module, VERNON_CPU_WORKGROUP_BARRIER_SYMBOL, rewriter.getFunctionType({i64}, {}));
         if (!addressHelper || !barrierHelper) {
             module.emitError("CPU workgroup helper declaration conflicts with an existing symbol");
             return signalPassFailure();

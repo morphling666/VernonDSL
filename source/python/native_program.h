@@ -35,10 +35,10 @@ struct Compiler {
     Compiler() : context(vernonCompilerCreate()) {
         if (!context)
             throw std::runtime_error("cannot create Vernon compiler");
-        const VernonCpuRuntimeHelpersV1 cpuHelpers{sizeof(VernonCpuRuntimeHelpersV1), &vernonCpuWorkgroupAddressV1,
-                                                   &vernonCpuLaneAddressV1, &vernonCpuWorkgroupBarrierV1,
-                                                   &vernonCpuWorkgroupIsLeaderV1};
-        if (vernonCompilerRegisterCpuRuntimeHelpersV1(context, &cpuHelpers) != VERNON_STATUS_OK) {
+        const VernonCpuRuntimeHelpers cpuHelpers{sizeof(VernonCpuRuntimeHelpers), &vernonCpuWorkgroupAddress,
+                                                 &vernonCpuLaneAddress, &vernonCpuWorkgroupBarrier,
+                                                 &vernonCpuWorkgroupIsLeader};
+        if (vernonCompilerRegisterCpuRuntimeHelpers(context, &cpuHelpers) != VERNON_STATUS_OK) {
             vernonCompilerDestroy(context);
             context = nullptr;
             throw std::runtime_error("cannot register CPU workgroup helpers with the Vernon compiler");

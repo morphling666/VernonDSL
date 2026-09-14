@@ -18,10 +18,10 @@ TEST(ProgramInstance, CommitsAndReusesPreparedBindings) {
     auto firstResult = instance.beginInvocation();
     ASSERT_TRUE(firstResult.isOk());
     auto first = std::move(firstResult).value();
-    auto firstMatch = first->matches(3, "value-v1");
+    auto firstMatch = first->matches(3, "value-main");
     ASSERT_TRUE(firstMatch.isOk());
     EXPECT_FALSE(firstMatch.value());
-    EXPECT_TRUE(first->stage(3, "value-v1", payload, 16, 1).isOk());
+    EXPECT_TRUE(first->stage(3, "value-main", payload, 16, 1).isOk());
     auto firstCommit = first->commit();
     ASSERT_TRUE(firstCommit.isOk());
     const auto firstSnapshot = std::move(firstCommit).value();
@@ -31,7 +31,7 @@ TEST(ProgramInstance, CommitsAndReusesPreparedBindings) {
     auto secondResult = instance.beginInvocation();
     ASSERT_TRUE(secondResult.isOk());
     auto second = std::move(secondResult).value();
-    auto reused = second->matches(3, "value-v1");
+    auto reused = second->matches(3, "value-main");
     ASSERT_TRUE(reused.isOk());
     EXPECT_TRUE(reused.value());
     EXPECT_TRUE(second->observeReuses(1).isOk());

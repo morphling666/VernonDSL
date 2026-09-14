@@ -45,16 +45,16 @@
 
 namespace {
 
-void *registeredCpuHelperAddress(const VernonCpuRuntimeHelpersV1 *helpers, llvm::StringRef name) {
+void *registeredCpuHelperAddress(const VernonCpuRuntimeHelpers *helpers, llvm::StringRef name) {
     if (!helpers)
         return nullptr;
-    if (name == VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL)
+    if (name == VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL)
         return reinterpret_cast<void *>(helpers->workgroup_address);
-    if (name == VERNON_CPU_LANE_ADDRESS_V1_SYMBOL)
+    if (name == VERNON_CPU_LANE_ADDRESS_SYMBOL)
         return reinterpret_cast<void *>(helpers->lane_address);
-    if (name == VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL)
+    if (name == VERNON_CPU_WORKGROUP_BARRIER_SYMBOL)
         return reinterpret_cast<void *>(helpers->workgroup_barrier);
-    if (name == VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL)
+    if (name == VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL)
         return reinterpret_cast<void *>(helpers->workgroup_is_leader);
     return nullptr;
 }
@@ -251,7 +251,7 @@ bool emitCpuObject(llvm::Module &module, llvm::TargetMachine &targetMachine, std
 
 CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options,
                             std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
-                            const VernonCpuRuntimeHelpersV1 *runtimeHelpers, CpuExecutionStatePtr &execution) {
+                            const VernonCpuRuntimeHelpers *runtimeHelpers, CpuExecutionStatePtr &execution) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
@@ -370,8 +370,8 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     CpuExecutionStatePtr nextExecution;
     bool runtimeHelpersAvailable = true;
     if (hostTarget)
-        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL, VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
-                                   VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL}) {
+        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL, VERNON_CPU_LANE_ADDRESS_SYMBOL,
+                                   VERNON_CPU_WORKGROUP_BARRIER_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL}) {
             llvm::Function *declaration = llvmModule->getFunction(helper);
             if (declaration && !declaration->use_empty() && !registeredCpuHelperAddress(runtimeHelpers, helper)) {
                 runtimeHelpersAvailable = false;
@@ -395,8 +395,8 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
         llvm::orc::SymbolMap helperSymbols;
-        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL, VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
-                                   VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL}) {
+        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL, VERNON_CPU_LANE_ADDRESS_SYMBOL,
+                                   VERNON_CPU_WORKGROUP_BARRIER_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL}) {
             llvm::Function *declaration = llvmModule->getFunction(helper);
             if (!declaration || declaration->use_empty())
                 continue;

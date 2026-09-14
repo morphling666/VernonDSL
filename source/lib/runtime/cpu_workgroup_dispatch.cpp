@@ -343,7 +343,7 @@ private:
 };
 
 thread_local CpuWorkgroupContext *activeWorkgroup;
-thread_local VernonCpuRangeV1 *activeRange;
+thread_local VernonCpuRange *activeRange;
 thread_local CpuLaneArena *activeLaneArena;
 
 [[noreturn]] void failInactiveWorkgroupHelper(const char *helper) noexcept {
@@ -356,7 +356,7 @@ thread_local CpuLaneArena *activeLaneArena;
 
 class ActiveWorkgroupScope {
 public:
-    ActiveWorkgroupScope(CpuWorkgroupContext &context, VernonCpuRangeV1 &range, CpuLaneArena &laneArena) noexcept
+    ActiveWorkgroupScope(CpuWorkgroupContext &context, VernonCpuRange &range, CpuLaneArena &laneArena) noexcept
         : previous_(std::exchange(activeWorkgroup, &context)), previousRange_(std::exchange(activeRange, &range)),
           previousLaneArena_(std::exchange(activeLaneArena, &laneArena)) {}
     ~ActiveWorkgroupScope() {
@@ -367,7 +367,7 @@ public:
 
 private:
     CpuWorkgroupContext *previous_{};
-    VernonCpuRangeV1 *previousRange_{};
+    VernonCpuRange *previousRange_{};
     CpuLaneArena *previousLaneArena_{};
 };
 
@@ -413,7 +413,7 @@ protected:
         CompletedJob &job_;
     };
 
-    bool recordFailure(VernonStatus failureStatus, const VernonCpuRangeV1 &range, const std::string &detail) noexcept {
+    bool recordFailure(VernonStatus failureStatus, const VernonCpuRange &range, const std::string &detail) noexcept {
         int expected = VERNON_STATUS_OK;
         if (!status_.compare_exchange_strong(expected, failureStatus, std::memory_order_acq_rel,
                                              std::memory_order_relaxed))
@@ -549,13 +549,13 @@ private:
         }
     }
 
-    void failRange(GroupState &group, VernonCpuRangeV1 &range, VernonStatus failureStatus, const char *message) {
+    void failRange(GroupState &group, VernonCpuRange &range, VernonStatus failureStatus, const char *message) {
         group.context.fail(failureStatus, message);
         recordFailure(group.context.status(), range, group.context.diagnostic());
     }
 
     bool invokeRange(GroupState &groupState, size_t laneBegin, size_t laneEnd, uint64_t phase,
-                     VernonCpuRangeV1 &range) noexcept {
+                     VernonCpuRange &range) noexcept {
         range.struct_size = sizeof(range);
         std::copy_n(grid_, 3, range.grid);
         std::copy_n(workgroup_, 3, range.workgroup);
@@ -566,7 +566,7 @@ private:
         range.lane_end = laneEnd;
         range.active_lane = laneBegin;
         range.phase = phase;
-        range.outcome = VERNON_CPU_RANGE_COMPLETE_V1;
+        range.outcome = VERNON_CPU_RANGE_COMPLETE;
         VernonStatus rangeStatus = VERNON_STATUS_INTERNAL_ERROR;
         std::string exceptionDiagnostic;
         {
@@ -598,7 +598,7 @@ private:
             recordFailure(groupState.context.status(), range, groupState.context.diagnostic());
             return false;
         }
-        if (range.outcome != VERNON_CPU_RANGE_COMPLETE_V1 && range.outcome != VERNON_CPU_RANGE_YIELDED_V1) {
+        if (range.outcome != VERNON_CPU_RANGE_COMPLETE && range.outcome != VERNON_CPU_RANGE_YIELDED) {
             failRange(groupState, range, VERNON_STATUS_INTERNAL_ERROR, "CPU range returned an invalid phase outcome");
             return false;
         }
@@ -608,10 +608,10 @@ private:
     bool runWholeGroup(size_t groupLinear) noexcept {
         GroupState group(workgroupVolume_, 1, groupLinear, 0);
         for (uint64_t phase = 0;; ++phase) {
-            VernonCpuRangeV1 range{};
+            VernonCpuRange range{};
             if (!invokeRange(group, 0, workgroupVolume_, phase, range))
                 return false;
-            if (range.outcome == VERNON_CPU_RANGE_COMPLETE_V1)
+            if (range.outcome == VERNON_CPU_RANGE_COMPLETE)
                 return true;
             group.context.seal(range.yielded_site);
         }
@@ -634,7 +634,7 @@ private:
 
     void runRange(const Task &task) noexcept {
         GroupState &groupState = *groups_[task.group];
-        VernonCpuRangeV1 range{};
+        VernonCpuRange range{};
         if (!invokeRange(groupState, task.laneBegin, task.laneEnd, task.phase, range))
             return;
 
@@ -647,7 +647,7 @@ private:
                 groupState.outcome = range.outcome;
                 groupState.yieldedSite = range.yielded_site;
             } else if (groupState.outcome != range.outcome ||
-                       (range.outcome == VERNON_CPU_RANGE_YIELDED_V1 && groupState.yieldedSite != range.yielded_site)) {
+                       (range.outcome == VERNON_CPU_RANGE_YIELDED && groupState.yieldedSite != range.yielded_site)) {
                 failRange(groupState, range, VERNON_STATUS_INTERNAL_ERROR,
                           "CPU lane ranges disagreed on phase completion or barrier site");
                 taskAvailable_.notify_all();
@@ -655,7 +655,7 @@ private:
             }
             if (--groupState.outstanding)
                 return;
-            if (groupState.outcome == VERNON_CPU_RANGE_COMPLETE_V1) {
+            if (groupState.outcome == VERNON_CPU_RANGE_COMPLETE) {
                 --groupsRemaining_;
             } else {
                 groupState.context.seal(groupState.yieldedSite);
@@ -872,7 +872,7 @@ private:
 #endif
 };
 
-CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t localLinear) noexcept {
+CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRange &range, size_t localLinear) noexcept {
     CpuLaneCoordinates coordinates{};
     std::copy_n(range.group, 3, coordinates.group);
     coordinates.local[0] = static_cast<uint32_t>(localLinear % range.workgroup[0]);
@@ -956,11 +956,11 @@ const std::string &CpuWorkgroupScheduler::lastDiagnostic() const noexcept { retu
 
 } // namespace vernon::runtime
 
-extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuWorkgroupAddressV1(uint64_t site, uint64_t size, uint64_t alignment,
-                                                                    uint64_t offset) {
+extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuWorkgroupAddress(uint64_t site, uint64_t size, uint64_t alignment,
+                                                                  uint64_t offset) {
     using namespace vernon::runtime;
     if (!activeWorkgroup)
-        failInactiveWorkgroupHelper("vernonCpuWorkgroupAddressV1");
+        failInactiveWorkgroupHelper("vernonCpuWorkgroupAddress");
     if (size > std::numeric_limits<size_t>::max() || alignment > std::numeric_limits<size_t>::max() ||
         offset > std::numeric_limits<size_t>::max()) {
         activeWorkgroup->fail(VERNON_STATUS_INTERNAL_ERROR, "workgroup allocation request exceeds host size limits");
@@ -970,12 +970,12 @@ extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuWorkgroupAddressV1(uint64_t sit
                                     static_cast<size_t>(offset));
 }
 
-extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuLaneAddressV1(uint64_t site, uint64_t size, uint64_t alignment,
-                                                               uint64_t offset) {
+extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuLaneAddress(uint64_t site, uint64_t size, uint64_t alignment,
+                                                             uint64_t offset) {
     using namespace vernon::runtime;
     if (!activeWorkgroup || !activeRange || !activeLaneArena || activeRange->active_lane < activeRange->lane_begin ||
         activeRange->active_lane >= activeRange->lane_end)
-        failInactiveWorkgroupHelper("vernonCpuLaneAddressV1");
+        failInactiveWorkgroupHelper("vernonCpuLaneAddress");
     if (size > std::numeric_limits<size_t>::max() || alignment > std::numeric_limits<size_t>::max() ||
         offset > std::numeric_limits<size_t>::max()) {
         activeWorkgroup->fail(VERNON_STATUS_INTERNAL_ERROR, "lane allocation request exceeds host size limits");
@@ -985,28 +985,28 @@ extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuLaneAddressV1(uint64_t site, ui
                                     static_cast<size_t>(offset), activeRange->active_lane);
 }
 
-extern "C" VERNON_RUNTIME_CAPI void vernonCpuWorkgroupBarrierV1(uint64_t site) {
+extern "C" VERNON_RUNTIME_CAPI void vernonCpuWorkgroupBarrier(uint64_t site) {
     using namespace vernon::runtime;
     if (!activeWorkgroup || !activeRange)
-        failInactiveWorkgroupHelper("vernonCpuWorkgroupBarrierV1");
+        failInactiveWorkgroupHelper("vernonCpuWorkgroupBarrier");
     if (activeRange->completed_lanes) {
         activeWorkgroup->fail(VERNON_STATUS_INTERNAL_ERROR, "lane completed while peer lanes yielded at a barrier");
         activeRange->outcome = UINT32_MAX;
         return;
     }
-    if (activeRange->outcome == VERNON_CPU_RANGE_COMPLETE_V1) {
+    if (activeRange->outcome == VERNON_CPU_RANGE_COMPLETE) {
         activeRange->yielded_site = site;
-        activeRange->outcome = VERNON_CPU_RANGE_YIELDED_V1;
+        activeRange->outcome = VERNON_CPU_RANGE_YIELDED;
         return;
     }
-    if (activeRange->outcome != VERNON_CPU_RANGE_YIELDED_V1 || activeRange->yielded_site != site) {
+    if (activeRange->outcome != VERNON_CPU_RANGE_YIELDED || activeRange->yielded_site != site) {
         activeWorkgroup->fail(VERNON_STATUS_INTERNAL_ERROR, "barrier site mismatch within one workgroup phase");
         activeRange->outcome = UINT32_MAX;
     }
 }
 
-extern "C" VERNON_RUNTIME_CAPI bool vernonCpuWorkgroupIsLeaderV1() {
+extern "C" VERNON_RUNTIME_CAPI bool vernonCpuWorkgroupIsLeader() {
     if (!vernon::runtime::activeWorkgroup || !vernon::runtime::activeRange)
-        vernon::runtime::failInactiveWorkgroupHelper("vernonCpuWorkgroupIsLeaderV1");
+        vernon::runtime::failInactiveWorkgroupHelper("vernonCpuWorkgroupIsLeader");
     return vernon::runtime::activeRange->active_lane == 0;
 }

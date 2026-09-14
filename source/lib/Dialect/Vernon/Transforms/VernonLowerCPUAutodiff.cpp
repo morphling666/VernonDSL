@@ -296,35 +296,34 @@ private:
         ModuleOp module = function->getParentOfType<ModuleOp>();
         if (!module)
             return function.emitError("CPU autodiff lowering requires a module");
-        func::FuncOp addressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL);
+        func::FuncOp addressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL);
         if (!addressHelper) {
             OpBuilder moduleBuilder(module.getBodyRegion());
             moduleBuilder.setInsertionPointToStart(module.getBody());
             Type i64 = moduleBuilder.getI64Type();
-            addressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL,
+            addressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL,
                                                  moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
             addressHelper.setPrivate();
             addressHelper->setAttr("llvm.linkage",
                                    LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
         }
-        func::FuncOp laneAddressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_LANE_ADDRESS_V1_SYMBOL);
+        func::FuncOp laneAddressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_LANE_ADDRESS_SYMBOL);
         if (!laneAddressHelper) {
             OpBuilder moduleBuilder(module.getBodyRegion());
             moduleBuilder.setInsertionPointToStart(module.getBody());
             Type i64 = moduleBuilder.getI64Type();
-            laneAddressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+            laneAddressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_LANE_ADDRESS_SYMBOL,
                                                      moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
             laneAddressHelper.setPrivate();
             laneAddressHelper->setAttr("llvm.linkage",
                                        LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
         }
-        func::FuncOp leaderHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL);
+        func::FuncOp leaderHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL);
         if (!leaderHelper) {
             OpBuilder moduleBuilder(module.getBodyRegion());
             moduleBuilder.setInsertionPointToStart(module.getBody());
-            leaderHelper =
-                func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL,
-                                     moduleBuilder.getFunctionType({}, {moduleBuilder.getI1Type()}));
+            leaderHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL,
+                                                moduleBuilder.getFunctionType({}, {moduleBuilder.getI1Type()}));
             leaderHelper.setPrivate();
             leaderHelper->setAttr("llvm.linkage",
                                   LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));

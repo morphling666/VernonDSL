@@ -48,7 +48,7 @@ TargetProfile resolveTargetProfile(const CompileOptions &options);
 
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
                            std::string &reflection, std::string &diagnostics,
-                           const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution);
+                           const VernonCpuRuntimeHelpers *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution);
 
 VernonCpuEntryPoint findCompiledCpuEntry(const CpuExecutionState *execution, std::string_view entry);
 

@@ -22,7 +22,7 @@
 
 struct VernonCompilerContext {
     vernon::compiler::CompilerFrontend *frontend{};
-    VernonCpuRuntimeHelpersV1 cpuRuntimeHelpers{};
+    VernonCpuRuntimeHelpers cpuRuntimeHelpers{};
 };
 
 struct VernonCompileResult {
@@ -61,9 +61,9 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, co
 
 extern "C" {
 
-VernonStatus vernonCompilerRegisterCpuRuntimeHelpersV1(VernonCompilerContext *context,
-                                                       const VernonCpuRuntimeHelpersV1 *helpers) {
-    if (!context || !helpers || helpers->struct_size != sizeof(VernonCpuRuntimeHelpersV1) ||
+VernonStatus vernonCompilerRegisterCpuRuntimeHelpers(VernonCompilerContext *context,
+                                                     const VernonCpuRuntimeHelpers *helpers) {
+    if (!context || !helpers || helpers->struct_size != sizeof(VernonCpuRuntimeHelpers) ||
         !helpers->workgroup_address || !helpers->lane_address || !helpers->workgroup_barrier ||
         !helpers->workgroup_is_leader)
         return VERNON_STATUS_INVALID_ARGUMENT;

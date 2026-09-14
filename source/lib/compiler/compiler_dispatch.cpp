@@ -256,7 +256,7 @@ VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOpti
 
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
                            std::string &reflection, std::string &diagnostics,
-                           const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
+                           const VernonCpuRuntimeHelpers *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
     const TargetProfile profile = resolveTargetProfile(options);
     const VernonTarget target = profile.target;
     diagnostics.clear();

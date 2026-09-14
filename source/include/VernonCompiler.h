@@ -19,16 +19,16 @@ extern "C" {
 typedef struct VernonCompilerContext VernonCompilerContext;
 typedef struct VernonCompileResult VernonCompileResult;
 
-typedef struct VernonCpuRuntimeHelpersV1 {
+typedef struct VernonCpuRuntimeHelpers {
     size_t struct_size;
     uint64_t (*workgroup_address)(uint64_t, uint64_t, uint64_t, uint64_t);
     uint64_t (*lane_address)(uint64_t, uint64_t, uint64_t, uint64_t);
     void (*workgroup_barrier)(uint64_t);
     bool (*workgroup_is_leader)(void);
-} VernonCpuRuntimeHelpersV1;
+} VernonCpuRuntimeHelpers;
 
-VERNON_DSL_CAPI VernonStatus vernonCompilerRegisterCpuRuntimeHelpersV1(VernonCompilerContext *context,
-                                                                       const VernonCpuRuntimeHelpersV1 *helpers);
+VERNON_DSL_CAPI VernonStatus vernonCompilerRegisterCpuRuntimeHelpers(VernonCompilerContext *context,
+                                                                     const VernonCpuRuntimeHelpers *helpers);
 
 typedef enum VernonTarget {
     VERNON_TARGET_CPU = 0,

@@ -177,9 +177,6 @@ FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef
 /// and must not be compared to host or Program language ABI hashes.
 FailureOr<ValueAbiLayout> getValueStorageLayout(Type type, ModuleOp module);
 
-LogicalResult rebaseValueAbiLayout(ValueAbiLayout &layout, const ValueAbiLayout &sourcePaths,
-                                   StringRef logicalIdentity);
-
 /// Validate a logical Value with the same canonical planner used by reflection
 /// and every physical ABI lowering.  This is intentionally available to IR
 /// verifiers so malformed textual IR cannot bypass frontend validation.

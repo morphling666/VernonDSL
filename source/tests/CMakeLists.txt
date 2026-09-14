@@ -584,61 +584,61 @@ if(TARGET VernonRuntime)
             structured_storage_workgroup_autodiff_manifest
             structured_storage_workgroup_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-signed-stride
-            autodiff_dynamic_v2_signed_stride_fixture
-            autodiff_dynamic_v2_signed_stride_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:signed_stride_asset"
-            vernonRegisterDynamicV2SignedStrideFixture
-            dynamic_v2_signed_stride_manifest
-            dynamic_v2_signed_stride_fixture_target)
+            dynamic-parity-signed-stride
+            autodiff_dynamic_parity_signed_stride_fixture
+            autodiff_dynamic_parity_signed_stride_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:signed_stride_asset"
+            vernonRegisterDynamicParitySignedStrideFixture
+            dynamic_parity_signed_stride_manifest
+            dynamic_parity_signed_stride_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-field-path
-            autodiff_dynamic_v2_field_path_fixture
-            autodiff_dynamic_v2_field_path_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:field_path_asset"
-            vernonRegisterDynamicV2FieldPathFixture
-            dynamic_v2_field_path_manifest
-            dynamic_v2_field_path_fixture_target)
+            dynamic-parity-field-path
+            autodiff_dynamic_parity_field_path_fixture
+            autodiff_dynamic_parity_field_path_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:field_path_asset"
+            vernonRegisterDynamicParityFieldPathFixture
+            dynamic_parity_field_path_manifest
+            dynamic_parity_field_path_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-strided-scatter
-            autodiff_dynamic_v2_strided_scatter_fixture
-            autodiff_dynamic_v2_strided_scatter_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:strided_scatter_asset"
-            vernonRegisterDynamicV2StridedScatterFixture
-            dynamic_v2_strided_scatter_manifest
-            dynamic_v2_strided_scatter_fixture_target)
+            dynamic-parity-strided-scatter
+            autodiff_dynamic_parity_strided_scatter_fixture
+            autodiff_dynamic_parity_strided_scatter_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:strided_scatter_asset"
+            vernonRegisterDynamicParityStridedScatterFixture
+            dynamic_parity_strided_scatter_manifest
+            dynamic_parity_strided_scatter_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-gather
-            autodiff_dynamic_v2_gather_fixture
-            autodiff_dynamic_v2_gather_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:gather_asset"
-            vernonRegisterDynamicV2GatherFixture
-            dynamic_v2_gather_manifest
-            dynamic_v2_gather_fixture_target)
+            dynamic-parity-gather
+            autodiff_dynamic_parity_gather_fixture
+            autodiff_dynamic_parity_gather_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:gather_asset"
+            vernonRegisterDynamicParityGatherFixture
+            dynamic_parity_gather_manifest
+            dynamic_parity_gather_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-multi-output
-            autodiff_dynamic_v2_multi_output_fixture
-            autodiff_dynamic_v2_multi_output_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:multi_output_asset"
-            vernonRegisterDynamicV2MultiOutputFixture
-            dynamic_v2_multi_output_manifest
-            dynamic_v2_multi_output_fixture_target)
+            dynamic-parity-multi-output
+            autodiff_dynamic_parity_multi_output_fixture
+            autodiff_dynamic_parity_multi_output_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:multi_output_asset"
+            vernonRegisterDynamicParityMultiOutputFixture
+            dynamic_parity_multi_output_manifest
+            dynamic_parity_multi_output_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-partially-dynamic
-            autodiff_dynamic_v2_partially_dynamic_fixture
-            autodiff_dynamic_v2_partially_dynamic_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:partially_dynamic_asset"
-            vernonRegisterDynamicV2PartiallyDynamicFixture
-            dynamic_v2_partially_dynamic_manifest
-            dynamic_v2_partially_dynamic_fixture_target)
+            dynamic-parity-partially-dynamic
+            autodiff_dynamic_parity_partially_dynamic_fixture
+            autodiff_dynamic_parity_partially_dynamic_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:partially_dynamic_asset"
+            vernonRegisterDynamicParityPartiallyDynamicFixture
+            dynamic_parity_partially_dynamic_manifest
+            dynamic_parity_partially_dynamic_fixture_target)
         vernon_add_cpu_program_fixture(
-            dynamic-v2-mixed-alias
-            autodiff_dynamic_v2_mixed_alias_fixture
-            autodiff_dynamic_v2_mixed_alias_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:mixed_alias_asset"
-            vernonRegisterDynamicV2MixedAliasFixture
-            dynamic_v2_mixed_alias_manifest
-            dynamic_v2_mixed_alias_fixture_target)
+            dynamic-parity-mixed-alias
+            autodiff_dynamic_parity_mixed_alias_fixture
+            autodiff_dynamic_parity_mixed_alias_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:mixed_alias_asset"
+            vernonRegisterDynamicParityMixedAliasFixture
+            dynamic_parity_mixed_alias_manifest
+            dynamic_parity_mixed_alias_fixture_target)
         add_executable(VernonModuleProgramRuntimeTests runtime/runtime_module_program_c_api_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE ${module_program_cpu_fixture_targets})
         target_compile_definitions(
@@ -837,40 +837,40 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             ${structured_storage_aggregate_autodiff_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2SignedStridePythonFixture
-            vernon_dynamic_v2_signed_stride_fixture
-            vernonRegisterDynamicV2SignedStrideFixture
-            ${dynamic_v2_signed_stride_fixture_target})
+            VernonDynamicParitySignedStridePythonFixture
+            vernon_dynamic_parity_signed_stride_fixture
+            vernonRegisterDynamicParitySignedStrideFixture
+            ${dynamic_parity_signed_stride_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2FieldPathPythonFixture
-            vernon_dynamic_v2_field_path_fixture
-            vernonRegisterDynamicV2FieldPathFixture
-            ${dynamic_v2_field_path_fixture_target})
+            VernonDynamicParityFieldPathPythonFixture
+            vernon_dynamic_parity_field_path_fixture
+            vernonRegisterDynamicParityFieldPathFixture
+            ${dynamic_parity_field_path_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2StridedScatterPythonFixture
-            vernon_dynamic_v2_strided_scatter_fixture
-            vernonRegisterDynamicV2StridedScatterFixture
-            ${dynamic_v2_strided_scatter_fixture_target})
+            VernonDynamicParityStridedScatterPythonFixture
+            vernon_dynamic_parity_strided_scatter_fixture
+            vernonRegisterDynamicParityStridedScatterFixture
+            ${dynamic_parity_strided_scatter_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2GatherPythonFixture
-            vernon_dynamic_v2_gather_fixture
-            vernonRegisterDynamicV2GatherFixture
-            ${dynamic_v2_gather_fixture_target})
+            VernonDynamicParityGatherPythonFixture
+            vernon_dynamic_parity_gather_fixture
+            vernonRegisterDynamicParityGatherFixture
+            ${dynamic_parity_gather_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2MultiOutputPythonFixture
-            vernon_dynamic_v2_multi_output_fixture
-            vernonRegisterDynamicV2MultiOutputFixture
-            ${dynamic_v2_multi_output_fixture_target})
+            VernonDynamicParityMultiOutputPythonFixture
+            vernon_dynamic_parity_multi_output_fixture
+            vernonRegisterDynamicParityMultiOutputFixture
+            ${dynamic_parity_multi_output_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2PartiallyDynamicPythonFixture
-            vernon_dynamic_v2_partially_dynamic_fixture
-            vernonRegisterDynamicV2PartiallyDynamicFixture
-            ${dynamic_v2_partially_dynamic_fixture_target})
+            VernonDynamicParityPartiallyDynamicPythonFixture
+            vernon_dynamic_parity_partially_dynamic_fixture
+            vernonRegisterDynamicParityPartiallyDynamicFixture
+            ${dynamic_parity_partially_dynamic_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicV2MixedAliasPythonFixture
-            vernon_dynamic_v2_mixed_alias_fixture
-            vernonRegisterDynamicV2MixedAliasFixture
-            ${dynamic_v2_mixed_alias_fixture_target})
+            VernonDynamicParityMixedAliasPythonFixture
+            vernon_dynamic_parity_mixed_alias_fixture
+            vernonRegisterDynamicParityMixedAliasFixture
+            ${dynamic_parity_mixed_alias_fixture_target})
         add_test(
             NAME VernonPythonCookedAutodiffTest
             COMMAND
@@ -909,14 +909,15 @@ if(TARGET VernonRuntime)
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_structured_scalar_direct_runtime_test.py"
                 "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
         add_test(
-            NAME VernonPythonDynamicV2ParityTest
+            NAME VernonPythonDynamicParityTest
             COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_dynamic_v2_parity_runtime_test.py"
-                "${dynamic_v2_signed_stride_manifest}" "${dynamic_v2_field_path_manifest}"
-                "${dynamic_v2_strided_scatter_manifest}" "${dynamic_v2_gather_manifest}"
-                "${dynamic_v2_multi_output_manifest}" "${dynamic_v2_partially_dynamic_manifest}"
-                "${dynamic_v2_mixed_alias_manifest}" "$<TARGET_FILE_DIR:VernonDynamicV2SignedStridePythonFixture>"
-                "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
+                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_dynamic_parity_runtime_test.py"
+                "${dynamic_parity_signed_stride_manifest}" "${dynamic_parity_field_path_manifest}"
+                "${dynamic_parity_strided_scatter_manifest}" "${dynamic_parity_gather_manifest}"
+                "${dynamic_parity_multi_output_manifest}" "${dynamic_parity_partially_dynamic_manifest}"
+                "${dynamic_parity_mixed_alias_manifest}"
+                "$<TARGET_FILE_DIR:VernonDynamicParitySignedStridePythonFixture>" "${VERNON_REPOSITORY_ROOT}/python"
+                "${VERNON_TEST_ROOT}/fixtures")
     endif()
 
     if(VERNON_ENABLE_VULKAN_RUNTIME AND TARGET VernonDSLCompiler)

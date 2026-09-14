@@ -84,13 +84,13 @@ llvm::Expected<llvm::Function *> createPhaseCoroutine(llvm::Module &module, llvm
         llvm::Intrinsic::getOrInsertDeclaration(&module, llvm::Intrinsic::coro_align, {builder.getInt64Ty()});
     llvm::Value *frameAlignment = builder.CreateCall(coroAlign, {}, "coro.align");
     llvm::FunctionCallee laneAddress = module.getOrInsertFunction(
-        VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+        VERNON_CPU_LANE_ADDRESS_SYMBOL,
         llvm::FunctionType::get(
             builder.getInt64Ty(),
             {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty()}, false));
     llvm::Value *frameInteger = builder.CreateCall(
         laneAddress,
-        {builder.getInt64(VERNON_CPU_LANE_COROUTINE_FRAME_SITE_V1), frameSize, frameAlignment, builder.getInt64(0)},
+        {builder.getInt64(VERNON_CPU_LANE_COROUTINE_FRAME_SITE), frameSize, frameAlignment, builder.getInt64(0)},
         "coro.frame.address");
     llvm::BasicBlock *frameReady = llvm::BasicBlock::Create(context, "coro.frame.ready", coroutine, originalEntry);
     llvm::BasicBlock *frameFailed = llvm::BasicBlock::Create(context, "coro.frame.failed", coroutine, originalEntry);
@@ -108,7 +108,7 @@ llvm::Expected<llvm::Function *> createPhaseCoroutine(llvm::Module &module, llvm
         for (llvm::Instruction &instruction : block)
             if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction))
                 if (llvm::Function *callee = call->getCalledFunction();
-                    callee && callee->getName() == VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL)
+                    callee && callee->getName() == VERNON_CPU_WORKGROUP_BARRIER_SYMBOL)
                     barriers.push_back(call);
 
     llvm::Function *coroSuspend = llvm::Intrinsic::getOrInsertDeclaration(&module, llvm::Intrinsic::coro_suspend);
@@ -382,12 +382,12 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     if (metadata.requiresPhases) {
         argumentsToCall.push_back(results);
         llvm::FunctionCallee laneAddress = module.getOrInsertFunction(
-            VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+            VERNON_CPU_LANE_ADDRESS_SYMBOL,
             llvm::FunctionType::get(
                 builder.getInt64Ty(),
                 {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty()}, false));
         llvm::Value *slotInteger =
-            builder.CreateCall(laneAddress, {builder.getInt64(VERNON_CPU_LANE_COROUTINE_HANDLE_SITE_V1),
+            builder.CreateCall(laneAddress, {builder.getInt64(VERNON_CPU_LANE_COROUTINE_HANDLE_SITE),
                                              builder.getInt64(module.getDataLayout().getPointerSize()),
                                              builder.getInt64(module.getDataLayout().getPointerABIAlignment(0).value()),
                                              builder.getInt64(0)});
@@ -491,11 +491,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                   sizeType, i32, pointerType, pointerType, sizeType});
     const llvm::StructLayout *rangeLayout = module.getDataLayout().getStructLayout(rangeType);
     if (pointerBits == sizeof(void *) * 8 &&
-        (rangeLayout->getSizeInBytes() != sizeof(VernonCpuRangeV1) ||
-         rangeLayout->getElementOffset(6) != offsetof(VernonCpuRangeV1, grid) ||
-         rangeLayout->getElementOffset(9) != offsetof(VernonCpuRangeV1, lane_begin) ||
-         rangeLayout->getElementOffset(16) != offsetof(VernonCpuRangeV1, lane_arguments) ||
-         rangeLayout->getElementOffset(18) != offsetof(VernonCpuRangeV1, lane_table_count)))
+        (rangeLayout->getSizeInBytes() != sizeof(VernonCpuRange) ||
+         rangeLayout->getElementOffset(6) != offsetof(VernonCpuRange, grid) ||
+         rangeLayout->getElementOffset(9) != offsetof(VernonCpuRange, lane_begin) ||
+         rangeLayout->getElementOffset(16) != offsetof(VernonCpuRange, lane_arguments) ||
+         rangeLayout->getElementOffset(18) != offsetof(VernonCpuRange, lane_table_count)))
         return invalidAbi("CPU range descriptor layout does not match the host ABI");
     const uint64_t targetRangeSize = rangeLayout->getSizeInBytes();
 
@@ -776,7 +776,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.SetInsertPoint(phaseCompleted);
         llvm::LoadInst *phaseOutcome = builder.CreateLoad(i32, builder.CreateStructGEP(rangeType, rangePointer, 15));
         llvm::BasicBlock *recordCompletion = llvm::BasicBlock::Create(context, "record_completion", wrapper);
-        builder.CreateCondBr(builder.CreateICmpEQ(phaseOutcome, builder.getInt32(VERNON_CPU_RANGE_COMPLETE_V1)),
+        builder.CreateCondBr(builder.CreateICmpEQ(phaseOutcome, builder.getInt32(VERNON_CPU_RANGE_COMPLETE)),
                              recordCompletion, rangeInvalid);
 
         builder.SetInsertPoint(recordCompletion);

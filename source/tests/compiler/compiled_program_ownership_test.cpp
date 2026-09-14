@@ -28,7 +28,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
 VernonStatus invokeRange(VernonCpuEntryPoint entry, const void *arguments, size_t argumentsSize, void *results,
                          size_t resultsSize) {
-    VernonCpuRangeV1 range{};
+    VernonCpuRange range{};
     range.struct_size = sizeof(range);
     range.arguments = arguments;
     range.arguments_size = argumentsSize;
@@ -37,7 +37,7 @@ VernonStatus invokeRange(VernonCpuEntryPoint entry, const void *arguments, size_
     range.grid[0] = range.grid[1] = range.grid[2] = 1;
     range.workgroup[0] = range.workgroup[1] = range.workgroup[2] = 1;
     range.lane_end = 1;
-    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
     return entry(&invocation);
 }
 
@@ -77,7 +77,7 @@ TEST(CompiledProgramOwnership, OutlivesCompilerContext) {
     float secondResults[4]{};
     const void *laneArguments[2]{arguments, secondArguments};
     void *laneResults[2]{results, secondResults};
-    VernonCpuRangeV1 range{};
+    VernonCpuRange range{};
     range.struct_size = sizeof(range);
     range.arguments = arguments;
     range.arguments_size = sizeof(arguments);
@@ -90,14 +90,14 @@ TEST(CompiledProgramOwnership, OutlivesCompilerContext) {
     range.lane_arguments = laneArguments;
     range.lane_results = laneResults;
     range.lane_table_count = 2;
-    const VernonCpuInvocation rangeInvocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+    const VernonCpuInvocation rangeInvocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
     ASSERT_EQ(entry(&rangeInvocation), VERNON_STATUS_OK);
     EXPECT_EQ(secondResults[0], 3.0f);
     EXPECT_EQ(secondResults[3], 15.0f);
 
-    VernonCpuRangeV1 invalidRange = range;
+    VernonCpuRange invalidRange = range;
     invalidRange.workgroup[0] = 0;
-    VernonCpuInvocation invalidInvocation{&invalidRange, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+    VernonCpuInvocation invalidInvocation{&invalidRange, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
     EXPECT_EQ(entry(&invalidInvocation), VERNON_STATUS_INVALID_ARGUMENT);
     invalidRange = range;
     invalidRange.lane_end = 3;

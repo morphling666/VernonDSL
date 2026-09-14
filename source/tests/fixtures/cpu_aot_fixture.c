@@ -11,9 +11,9 @@
 #endif
 
 VERNON_TEST_EXPORT VernonStatus vernon_test_fill(const VernonCpuInvocation *invocation) {
-    if (!invocation || invocation->arguments_size != VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1)
+    if (!invocation || invocation->arguments_size != VERNON_CPU_RANGE_ARGUMENTS_SIZE)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    VernonCpuRangeV1 *range = (VernonCpuRangeV1 *)(uintptr_t)invocation->arguments;
+    VernonCpuRange *range = (VernonCpuRange *)(uintptr_t)invocation->arguments;
     if (!range || range->struct_size != sizeof(*range))
         return VERNON_STATUS_INVALID_ARGUMENT;
     uintptr_t address = 0;

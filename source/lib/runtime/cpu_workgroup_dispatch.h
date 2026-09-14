@@ -19,9 +19,9 @@ struct CpuLaneCoordinates {
     size_t linearIndex{};
 };
 
-CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t localLinear) noexcept;
+CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRange &range, size_t localLinear) noexcept;
 
-using CpuRangeCallback = std::function<VernonStatus(VernonCpuRangeV1 &)>;
+using CpuRangeCallback = std::function<VernonStatus(VernonCpuRange &)>;
 
 enum class CpuSchedulerExecutionPolicy {
     WorkerPool,

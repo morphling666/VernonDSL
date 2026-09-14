@@ -25,7 +25,7 @@ def signed_stride_objective(
 
 
 signed_stride_asset = vd.program_asset(
-    id="compute/dynamic_v2_signed_stride_vjp",
+    id="compute/dynamic_parity_signed_stride_vjp",
     program=vd.ad.vjp(signed_stride_objective, wrt=("particles",), outputs=("output",)),
 )
 
@@ -45,7 +45,7 @@ def field_path_objective(
 
 
 field_path_asset = vd.program_asset(
-    id="compute/dynamic_v2_field_path_vjp",
+    id="compute/dynamic_parity_field_path_vjp",
     program=vd.ad.vjp(field_path_objective, wrt=("particles.velocity",), outputs=("output",)),
 )
 
@@ -59,7 +59,7 @@ def strided_scatter_objective(
 
 
 strided_scatter_asset = vd.program_asset(
-    id="compute/dynamic_v2_strided_scatter_vjp",
+    id="compute/dynamic_parity_strided_scatter_vjp",
     program=vd.ad.vjp(strided_scatter_objective, wrt=("values",), outputs=("loss",)),
 )
 
@@ -78,7 +78,7 @@ def gather_objective(
 
 
 gather_asset = vd.program_asset(
-    id="compute/dynamic_v2_gather_vjp",
+    id="compute/dynamic_parity_gather_vjp",
     program=vd.ad.vjp(gather_objective, wrt=("values",), outputs=("output",)),
 )
 
@@ -103,7 +103,7 @@ def multi_output_objective(
 
 
 multi_output_asset = vd.program_asset(
-    id="compute/dynamic_v2_multi_output_vjp",
+    id="compute/dynamic_parity_multi_output_vjp",
     program=vd.ad.vjp(multi_output_objective, wrt=("particles",), outputs=("first", "second")),
 )
 
@@ -121,7 +121,7 @@ def partially_dynamic_objective(
 
 
 partially_dynamic_asset = vd.program_asset(
-    id="compute/dynamic_v2_partially_dynamic_vjp",
+    id="compute/dynamic_parity_partially_dynamic_vjp",
     program=vd.ad.vjp(partially_dynamic_objective, wrt=("values",), outputs=("loss",)),
 )
 
@@ -138,7 +138,7 @@ def mixed_alias_objective(
 
 
 mixed_alias_asset = vd.program_asset(
-    id="compute/dynamic_v2_mixed_alias_vjp",
+    id="compute/dynamic_parity_mixed_alias_vjp",
     program=vd.ad.vjp(
         mixed_alias_objective,
         wrt=("left", "right", "scale"),

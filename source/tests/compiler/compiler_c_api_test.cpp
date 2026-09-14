@@ -63,7 +63,7 @@ static int view_contains(VernonStringView value, const char *needle) {
 
 static VernonStatus invoke_cpu_range(VernonCpuEntryPoint entry, const VernonCpuInvocation &lane,
                                      size_t localLinear = 0) {
-    VernonCpuRangeV1 range{};
+    VernonCpuRange range{};
     range.struct_size = sizeof(range);
     range.arguments = lane.arguments;
     range.arguments_size = lane.arguments_size;
@@ -75,7 +75,7 @@ static VernonStatus invoke_cpu_range(VernonCpuEntryPoint entry, const VernonCpuI
     range.workgroup[1] = range.workgroup[2] = 1;
     range.lane_begin = localLinear;
     range.lane_end = localLinear + 1;
-    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
     return entry(&invocation);
 }
 
@@ -1643,7 +1643,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %result = arith.truncf %value : f64 to f16
     return %result : f16
   }
-  func.func private @extend_v2(%value: vector<2xf16>) -> vector<2xf32> {
+  func.func private @extend_vector2(%value: vector<2xf16>) -> vector<2xf32> {
     %result = arith.extf %value : vector<2xf16> to vector<2xf32>
     return %result : vector<2xf32>
   }

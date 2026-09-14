@@ -115,7 +115,7 @@ version, and source API identity:
 
 ```python
 @vd.extern(
-    symbol="vernon_demo_get_position_v1",
+    symbol="vernon_demo_get_position",
     effects="read",
 )
 def get_position(world: WorldHandle, entity: EntityHandle) -> Vec2: ...

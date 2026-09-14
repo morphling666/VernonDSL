@@ -390,45 +390,6 @@ FailureOr<ValueAbiLayout> getValueStorageLayout(Type type, ModuleOp module) {
     return finishLayout(std::move(*planned), /*requireLanguageIntegers=*/false);
 }
 
-LogicalResult rebaseValueAbiLayout(ValueAbiLayout &layout, const ValueAbiLayout &sourcePaths,
-                                   StringRef logicalIdentity) {
-    if (logicalIdentity.empty() || layout.leaves.size() != sourcePaths.leaves.size())
-        return failure();
-    llvm::SHA256 hash;
-    hash.update("value-abi-v1|");
-    hash.update(logicalIdentity);
-    hash.update("|size=");
-    hash.update(std::to_string(layout.size));
-    hash.update("|alignment=");
-    hash.update(std::to_string(layout.alignment));
-    for (auto [leaf, source] : llvm::zip_equal(layout.leaves, sourcePaths.leaves)) {
-        leaf.path = source.path;
-        hash.update("|leaf=");
-        for (const ValueAbiPathComponent &component : leaf.path) {
-            if (component.field) {
-                hash.update(".");
-                hash.update(*component.field);
-            } else {
-                hash.update("[");
-                hash.update(std::to_string(component.index));
-                hash.update("]");
-            }
-        }
-        hash.update(":");
-        hash.update(leaf.dtype);
-        hash.update(":");
-        hash.update(std::to_string(leaf.byteOffset));
-        hash.update(":");
-        hash.update(std::to_string(leaf.scalarCount));
-        for (uint64_t extent : leaf.shape) {
-            hash.update("x");
-            hash.update(std::to_string(extent));
-        }
-    }
-    layout.layoutHash = llvm::toHex(hash.final(), true);
-    return success();
-}
-
 FailureOr<CpuCallPlan> getCpuCallPlan(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes) {
     FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module, logicalLeafDtypes);
     if (failed(layout))

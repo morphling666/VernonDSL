@@ -296,7 +296,7 @@ The generated wrapper invokes the lowered program for every lane in the
 contiguous interval without a Runtime callback per lane. Frame storage persists
 while a lane is yielded; completion clears its pointer-table entries without a
 per-lane heap allocation. Pointer-table bounds are explicit in
-`VernonCpuRangeV1`.
+`VernonCpuRange`.
 
 One `HostStaticTapeBatch` owns either an admitted complete static dispatch or one
 complete-workgroup replay segment. Straight-line lanes write compiler-assigned

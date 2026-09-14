@@ -630,7 +630,7 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         identity += ':';
         identity.append(value.data(), value.size());
     };
-    appendIdentity("vernon.program_graph.v2");
+    appendIdentity("vernon.program_graph");
     for (const ProgramGraphNodeSource &node : nodes) {
         appendIdentity(std::to_string(node.id));
         appendIdentity(node.bundleId);

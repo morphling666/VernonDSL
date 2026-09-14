@@ -274,10 +274,10 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
     float output = 0.0f;
     VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
     VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-    const VernonProgramBindingToken sourceToken = bindingToken("source-v1");
-    const VernonProgramBindingToken outputToken = bindingToken("output-v1");
-    const VernonProgramBindingToken renderPassToken = bindingToken("render-pass-v1");
-    const VernonProgramBindingToken dynamicStateToken = bindingToken("dynamic-state-v1");
+    const VernonProgramBindingToken sourceToken = bindingToken("source-main");
+    const VernonProgramBindingToken outputToken = bindingToken("output-main");
+    const VernonProgramBindingToken renderPassToken = bindingToken("render-pass-main");
+    const VernonProgramBindingToken dynamicStateToken = bindingToken("dynamic-state-main");
     int controlLeaseCount = 0;
     VernonProgramResourceLease controlLease{
         sizeof(VernonProgramResourceLease),
@@ -591,8 +591,8 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
     float output = 0.0f;
     VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
     VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-    const VernonProgramBindingToken sourceToken = bindingToken("resolve-source-v1");
-    const VernonProgramBindingToken outputToken = bindingToken("resolve-output-v1");
+    const VernonProgramBindingToken sourceToken = bindingToken("resolve-source-main");
+    const VernonProgramBindingToken outputToken = bindingToken("resolve-output-main");
 
     VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
     ASSERT_NE(instance, nullptr);
@@ -685,8 +685,8 @@ TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
         float output = 0.0f;
         const VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
         const VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-        const VernonProgramBindingToken sourceToken = bindingToken("cpp-source-v1");
-        const VernonProgramBindingToken outputToken = bindingToken("cpp-output-v1");
+        const VernonProgramBindingToken sourceToken = bindingToken("cpp-source-main");
+        const VernonProgramBindingToken outputToken = bindingToken("cpp-output-main");
         auto invocationResult = instance.begin();
         ASSERT_TRUE(invocationResult);
         auto invocation = std::move(invocationResult).value();

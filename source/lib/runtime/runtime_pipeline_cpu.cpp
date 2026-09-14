@@ -194,7 +194,7 @@ VernonStatus dispatchCpuReducedCompute(VernonRuntimeContext &context, CpuPipelin
     for (size_t lane = 0; lane < volume; ++lane)
         laneResults[lane] = laneStorage[lane].data();
     CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context);
-    const VernonStatus dispatch = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRangeV1 &range) {
+    const VernonStatus dispatch = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRange &range) {
         range.arguments = packed.data();
         range.arguments_size = packed.size();
         range.results = results.data();
@@ -202,7 +202,7 @@ VernonStatus dispatchCpuReducedCompute(VernonRuntimeContext &context, CpuPipelin
         range.lane_arguments = laneArguments.data();
         range.lane_results = laneResults.data();
         range.lane_table_count = volume;
-        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
         return state.entry(&invocation);
     });
     if (dispatch != VERNON_STATUS_OK)
@@ -292,7 +292,7 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
             laneResults[lane] = laneResultStorage[lane].data();
     }
     CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context);
-    const VernonStatus status = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRangeV1 &range) {
+    const VernonStatus status = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRange &range) {
         range.arguments = laneArguments.front();
         range.arguments_size = packed.size();
         range.results = results.empty() ? nullptr : results.data();
@@ -301,7 +301,7 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
         range.textures = nullptr;
         range.lane_arguments = laneArguments.data();
         range.lane_table_count = laneArguments.size();
-        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
         return state.entry(&invocation);
     });
     if (status != VERNON_STATUS_OK)

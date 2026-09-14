@@ -107,8 +107,8 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
     VernonProgramArgument sourceArgument = tensorArgument(context, sourceBuffer, sourceParameter);
     VernonProgramArgument outputArgument = tensorArgument(context, outputBuffer, outputParameter);
-    const VernonProgramBindingToken sourceToken = bindingToken("gpu-source-v1");
-    const VernonProgramBindingToken outputToken = bindingToken("gpu-output-v1");
+    const VernonProgramBindingToken sourceToken = bindingToken("gpu-source-main");
+    const VernonProgramBindingToken outputToken = bindingToken("gpu-output-main");
     std::array<VernonBoundaryMutation, 8> mutationRecords{};
     VernonInvocationMutationOutcome mutationOutcome{
         sizeof(VernonInvocationMutationOutcome),

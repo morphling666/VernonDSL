@@ -18,14 +18,14 @@ def main() -> None:
 
     import numpy as np
     import vernon_dsl as vd
-    import vernon_dynamic_v2_field_path_fixture  # noqa: F401
-    import vernon_dynamic_v2_gather_fixture  # noqa: F401
-    import vernon_dynamic_v2_mixed_alias_fixture  # noqa: F401
-    import vernon_dynamic_v2_multi_output_fixture  # noqa: F401
-    import vernon_dynamic_v2_partially_dynamic_fixture  # noqa: F401
-    import vernon_dynamic_v2_signed_stride_fixture  # noqa: F401
-    import vernon_dynamic_v2_strided_scatter_fixture  # noqa: F401
-    from autodiff_dynamic_v2_parity_asset import (
+    import vernon_dynamic_parity_field_path_fixture  # noqa: F401
+    import vernon_dynamic_parity_gather_fixture  # noqa: F401
+    import vernon_dynamic_parity_mixed_alias_fixture  # noqa: F401
+    import vernon_dynamic_parity_multi_output_fixture  # noqa: F401
+    import vernon_dynamic_parity_partially_dynamic_fixture  # noqa: F401
+    import vernon_dynamic_parity_signed_stride_fixture  # noqa: F401
+    import vernon_dynamic_parity_strided_scatter_fixture  # noqa: F401
+    from autodiff_dynamic_parity_asset import (
         Particle,
         field_path_objective,
         gather_objective,
