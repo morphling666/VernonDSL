@@ -25,7 +25,7 @@ env:
 jobs:
   style:
     name: Style
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 20
 
     steps:
@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -92,17 +92,15 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 45
-    env:
-      VERNON_TEST_DIRECTX_ADAPTER: warp
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -130,17 +128,15 @@ jobs:
 
   asan-runtime:
     name: Runtime (AddressSanitizer)
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 45
-    env:
-      VERNON_TEST_DIRECTX_ADAPTER: warp
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -188,7 +184,7 @@ jobs:
 
   compiler-wheel:
     name: Compiler and wheel (Python ${{ matrix.python-version }})
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -208,7 +204,7 @@ jobs:
         run: git submodule update --init --depth 1 llvm-project
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
