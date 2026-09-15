@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -38,10 +40,22 @@ struct RhiRuntime {
     VernonRuntimeContext *runtime{};
 };
 
+enum class RhiTestDevicePreference { Hardware, Software };
+
+inline RhiTestDevicePreference configuredDirectXTestDevicePreference() {
+    const char *value = std::getenv("VERNON_TEST_DIRECTX_ADAPTER");
+    if (!value || std::strcmp(value, "hardware") == 0)
+        return RhiTestDevicePreference::Hardware;
+    if (std::strcmp(value, "warp") == 0)
+        return RhiTestDevicePreference::Software;
+    throw std::runtime_error("VERNON_TEST_DIRECTX_ADAPTER must be 'hardware' or 'warp'");
+}
+
 class OwnedRhiRuntime {
 public:
     explicit OwnedRhiRuntime(VernonRuntimeBackend backend,
-                             const VernonOpenGLContextCallbacks *openglCallbacks = nullptr, bool forceSoftware = false);
+                             const VernonOpenGLContextCallbacks *openglCallbacks = nullptr,
+                             RhiTestDevicePreference devicePreference = RhiTestDevicePreference::Hardware);
     ~OwnedRhiRuntime();
 
     OwnedRhiRuntime(const OwnedRhiRuntime &) = delete;
@@ -399,7 +413,7 @@ inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
 
 inline RhiRuntime createRhiRuntime(VernonRuntimeBackend backend,
                                    const VernonOpenGLContextCallbacks *openglCallbacks = nullptr,
-                                   bool forceSoftware = false) {
+                                   RhiTestDevicePreference devicePreference = RhiTestDevicePreference::Hardware) {
     RhiRuntime result;
     if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES)
         result.device = vernonRhiCreateOpenGLDevice(openglCallbacks, backend == VERNON_RUNTIME_OPENGL_ES);
@@ -407,7 +421,9 @@ inline RhiRuntime createRhiRuntime(VernonRuntimeBackend backend,
         VernonRhiOwnedDeviceDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.backend = rhiBackend(backend);
-        descriptor.flags = forceSoftware ? VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE : 0;
+        descriptor.flags = devicePreference == RhiTestDevicePreference::Software
+                               ? static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)
+                               : 0;
         result.device = vernonRhiCreateDevice(&descriptor);
     }
     if (result.device.index != VERNON_RHI_INVALID_HANDLE_INDEX)
@@ -424,8 +440,9 @@ inline void destroyRhiRuntime(RhiRuntime &context) {
 }
 
 inline OwnedRhiRuntime::OwnedRhiRuntime(VernonRuntimeBackend backend,
-                                        const VernonOpenGLContextCallbacks *openglCallbacks, bool forceSoftware)
-    : context_(createRhiRuntime(backend, openglCallbacks, forceSoftware)) {}
+                                        const VernonOpenGLContextCallbacks *openglCallbacks,
+                                        RhiTestDevicePreference devicePreference)
+    : context_(createRhiRuntime(backend, openglCallbacks, devicePreference)) {}
 
 inline OwnedRhiRuntime::~OwnedRhiRuntime() { destroyRhiRuntime(context_); }
 

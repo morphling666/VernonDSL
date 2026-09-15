@@ -38,8 +38,10 @@ public:
             return {BackendProbeKind::PlatformNotBuilt, std::string(backend.name) + " GLFW context owner is not built"};
 #endif
         } else {
-            runtime_ = std::make_unique<OwnedRhiRuntime>(backend.runtime, nullptr,
-                                                         backend.runtime == VERNON_RUNTIME_DIRECTX12);
+            const RhiTestDevicePreference devicePreference = backend.runtime == VERNON_RUNTIME_DIRECTX12
+                                                                 ? configuredDirectXTestDevicePreference()
+                                                                 : RhiTestDevicePreference::Hardware;
+            runtime_ = std::make_unique<OwnedRhiRuntime>(backend.runtime, nullptr, devicePreference);
         }
         return probeRuntimeBackend(backend, requirements, runtime_->runtime());
     }

@@ -25,7 +25,7 @@ env:
 jobs:
   style:
     name: Style
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 20
 
     steps:
@@ -92,8 +92,10 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 45
+    env:
+      VERNON_TEST_DIRECTX_ADAPTER: warp
 
     steps:
       - name: Check out code
@@ -112,10 +114,7 @@ jobs:
           -DBUILD_TESTING=ON
 
       - name: Build Runtime tests
-        run: >
-          cmake --build runtime-build --config Release
-          --target VernonRuntimeTests VernonRuntimeCoreProviderTests VernonRuntimeRHIAdapterTests
-          --parallel 4
+        run: cmake --build runtime-build --config Release --parallel 4
 
       - name: Run Runtime tests
         run: ctest --test-dir runtime-build -C Release --output-on-failure
@@ -131,8 +130,10 @@ jobs:
 
   asan-runtime:
     name: Runtime (AddressSanitizer)
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 45
+    env:
+      VERNON_TEST_DIRECTX_ADAPTER: warp
 
     steps:
       - name: Check out code
@@ -187,7 +188,7 @@ jobs:
 
   compiler-wheel:
     name: Compiler and wheel (Python ${{ matrix.python-version }})
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 360
     strategy:
       fail-fast: false

@@ -61,7 +61,8 @@ TEST(RuntimeDirectX12Pipeline, MapsEveryGraphicsStateEnumerationExplicitly) {
 }
 
 TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
+                                                   vernon::tests::configuredDirectXTestDevicePreference());
     ASSERT_NE(context.runtime, nullptr);
     VernonRhiImageDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
@@ -117,13 +118,14 @@ TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
     vernon::tests::destroyRhiRuntime(context);
 }
 
-TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
+TEST(RuntimeDirectX12Pipeline, RendersSampledTriangle) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
 
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
+                                                   vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
@@ -257,13 +259,14 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     vernonRhiDestroyDevice(context.device);
 }
 
-TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
+TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolution) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
 
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
+                                                   vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
@@ -354,7 +357,8 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
 
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
+                                                   vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
