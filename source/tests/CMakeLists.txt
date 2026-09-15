@@ -214,7 +214,6 @@ if(TARGET VernonRuntime)
         runtime/runtime_autodiff_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
-        runtime/runtime_cpu_pipeline_test.cpp
         runtime/runtime_external_gl_test.cpp
         runtime/shape_layout_test.cpp
         runtime/stage_artifact_contract_test.cpp
@@ -256,6 +255,7 @@ if(TARGET VernonRuntime)
         vernon_discover_gtests(VernonCompilerRuntimeIntegrationTests)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cpu_pipeline_test.cpp)
         set(gpu_autodiff_fixture_targets)
         set(module_program_fixture_targets)
         set(module_graphics_fixture_targets)
