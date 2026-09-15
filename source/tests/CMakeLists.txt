@@ -109,7 +109,9 @@ function(
     target_compile_definitions(${target} PRIVATE VERNON_AUTODIFF_FIXTURE_MODULE=${module}
                                                  VERNON_AUTODIFF_FIXTURE_REGISTRATION=${registration_function})
     target_include_directories(${target} PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
-    target_link_libraries(${target} PRIVATE Vernon::Runtime ${fixture_target})
+    # GNU linkers process static archives from left to right and may discard shared libraries under --as-needed before
+    # an archive introduces a use.
+    target_link_libraries(${target} PRIVATE ${fixture_target} Vernon::Runtime)
     vernon_stage_target_files(${target} VernonRuntime)
 endfunction()
 

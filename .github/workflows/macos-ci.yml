@@ -64,7 +64,7 @@ jobs:
 
       - name: Restore LLVM installation
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
           key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
@@ -78,6 +78,13 @@ jobs:
           --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
@@ -244,6 +251,13 @@ jobs:
           --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
