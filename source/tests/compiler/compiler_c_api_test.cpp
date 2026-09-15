@@ -1738,11 +1738,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     options.target = VERNON_TARGET_CPU;
     constexpr std::string_view linuxTriple = "x86_64-unknown-linux-gnu";
     options.as.cpu.triple = {linuxTriple.data(), linuxTriple.size()};
-    VernonCompileResult *linux = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
-    ASSERT_TRUE(linux);
-    ASSERT_EQ(vernonCompileResultGetStatus(linux), VERNON_STATUS_OK)
-        << std::string(vernonCompileResultGetDiagnostics(linux).data, vernonCompileResultGetDiagnostics(linux).size);
-    VernonStringView object = vernonCompileResultGetArtifactData(linux, 0);
+    VernonCompileResult *linuxResult = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+    ASSERT_TRUE(linuxResult);
+    ASSERT_EQ(vernonCompileResultGetStatus(linuxResult), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(linuxResult).data, vernonCompileResultGetDiagnostics(linuxResult).size);
+    VernonStringView object = vernonCompileResultGetArtifactData(linuxResult, 0);
     EXPECT_FALSE(view_contains(object, "__extendhfsf2"));
     EXPECT_FALSE(view_contains(object, "__extendhfdf2"));
     EXPECT_FALSE(view_contains(object, "__truncsfhf2"));
@@ -1840,7 +1840,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompileResultDestroy(nativeX86);
     vernonCompileResultDestroy(apple);
     vernonCompileResultDestroy(windows);
-    vernonCompileResultDestroy(linux);
+    vernonCompileResultDestroy(linuxResult);
     vernonCompileResultDestroy(compiled);
     vernonCompilerDestroy(compiler);
 }
