@@ -192,6 +192,7 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
+      VERNON_TEST_SKIP_DIRECTX_WORKGROUP_ATOMIC_CONTENTION: "1"
 
     steps:
       - name: Check out code

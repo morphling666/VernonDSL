@@ -54,6 +54,7 @@ def _verify_runtime_source_build(source: Path, root: Path) -> None:
         os.fspath(source),
         "-B",
         os.fspath(build),
+        "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_TESTING=OFF",
         "-DVERNON_RUNTIME_PROFILE=desktop",
         "-DVERNON_RUNTIME_LIBRARY_TYPE=STATIC",
@@ -113,6 +114,7 @@ def _verify_runtime_source_build(source: Path, root: Path) -> None:
             os.fspath(consumer),
             "-B",
             os.fspath(consumer_build),
+            "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_PREFIX_PATH={install}",
         ]
     )

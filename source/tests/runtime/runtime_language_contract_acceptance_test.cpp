@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -82,6 +83,12 @@ std::string testName(const testing::TestParamInfo<ProgramFixtureManifest> &info)
         if (!std::isalnum(static_cast<unsigned char>(value)))
             value = '_';
     return result;
+}
+
+bool skipDirectXWorkgroupAtomicContention(const ProgramFixtureManifest &fixture) {
+    const char *skip = std::getenv("VERNON_TEST_SKIP_DIRECTX_WORKGROUP_ATOMIC_CONTENTION");
+    return skip && std::strcmp(skip, "1") == 0 && fixture.runtime == VERNON_RUNTIME_DIRECTX12 &&
+           fixture.fixtureId == "floating_contention";
 }
 
 void runFloatBufferOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
@@ -459,6 +466,8 @@ protected:
 
 TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAsset) {
     const ProgramFixtureManifest fixture = GetParam();
+    if (skipDirectXWorkgroupAtomicContention(fixture))
+        GTEST_SKIP() << "GitHub-hosted Windows virtual graphics does not execute groupshared CAS correctly";
     const AcceptanceDescriptor &acceptance = acceptanceFor(fixture.fixtureId);
     vernon::tests::OwnedProgramExecutable program(runtime().runtime, std::string(fixture.manifestPath));
     ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(runtime().runtime));
