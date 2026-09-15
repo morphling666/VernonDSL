@@ -124,7 +124,7 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     EXPECT_EQ(stats.shaderPreparations, 1u);
     EXPECT_EQ(stats.layoutPreparations, 1u);
     EXPECT_EQ(stats.pipelinePreparations, 1u);
-    EXPECT_EQ(stats.bindingCreations, 1u);
+    EXPECT_EQ(stats.bindingCreations, 3u);
     EXPECT_EQ(stats.dispatches, 2u);
 
     vernonRuntimeCoreBindingsDestroy(bindings);

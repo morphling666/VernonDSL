@@ -84,7 +84,8 @@ struct RhiCommandResourceBinding {
 };
 
 inline CommandResourceAccess rhiBufferAccess(VernonRhiBuffer buffer, uint64_t offset, uint64_t size, AccessMode access,
-                                             VernonRhiResourceState state, uint32_t stageMask = 0) {
+                                             VernonRhiResourceState state, uint32_t stageMask = 0,
+                                             uint32_t rhiAccessMask = 0) {
     CommandResourceAccess result;
     result.resource = buffer.index;
     result.aliasDomain = rhi::encodeResourceKey(buffer);
@@ -93,6 +94,7 @@ inline CommandResourceAccess rhiBufferAccess(VernonRhiBuffer buffer, uint64_t of
     result.bufferRange = {offset, size};
     result.state = state;
     result.stageMask = stageMask;
+    result.rhiAccessMask = rhiAccessMask;
     return result;
 }
 

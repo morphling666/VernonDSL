@@ -1,5 +1,5 @@
 #include "tensor_bridge.h"
-#include "stage_binding_plan.h"
+#include "transport_node.h"
 
 #include <algorithm>
 #include <cstring>

@@ -47,21 +47,27 @@ template <typename Tag> struct DirectX12ResourceSlot {
 };
 
 struct DirectX12BufferSlot : DirectX12ResourceSlot<BufferResourceTag> {
-    using DirectX12ResourceSlot::DirectX12ResourceSlot;
+    explicit DirectX12BufferSlot(ResourceLifecycleSlot<BufferResourceTag> value) noexcept
+        : DirectX12ResourceSlot(std::move(value)) {}
+
     vernon::rhi::directx12::Buffer buffer;
     VernonRhiDirectX12BorrowedBufferDescriptor descriptor{};
     VernonRhiBufferDescriptor ownedDescriptor{};
 };
 
 struct DirectX12ImageSlot : DirectX12ResourceSlot<ImageResourceTag> {
-    using DirectX12ResourceSlot::DirectX12ResourceSlot;
+    explicit DirectX12ImageSlot(ResourceLifecycleSlot<ImageResourceTag> value) noexcept
+        : DirectX12ResourceSlot(std::move(value)) {}
+
     vernon::rhi::directx12::Image image;
     VernonRhiDirectX12BorrowedImageDescriptor descriptor{};
     VernonRhiImageDescriptor ownedDescriptor{};
 };
 
 struct DirectX12ImageViewSlot : DirectX12ResourceSlot<ImageViewResourceTag> {
-    using DirectX12ResourceSlot::DirectX12ResourceSlot;
+    explicit DirectX12ImageViewSlot(ResourceLifecycleSlot<ImageViewResourceTag> value) noexcept
+        : DirectX12ResourceSlot(std::move(value)) {}
+
     vernon::rhi::directx12::Image image;
     VernonRhiImageViewDescriptor descriptor{};
     uint64_t imageResource{};
@@ -69,16 +75,24 @@ struct DirectX12ImageViewSlot : DirectX12ResourceSlot<ImageViewResourceTag> {
 };
 
 struct DirectX12DescriptorRangeSlot : DirectX12ResourceSlot<NativeDescriptorRangeResourceTag> {
-    using DirectX12ResourceSlot::DirectX12ResourceSlot;
+    explicit DirectX12DescriptorRangeSlot(ResourceLifecycleSlot<NativeDescriptorRangeResourceTag> value) noexcept
+        : DirectX12ResourceSlot(std::move(value)) {}
+
     VernonRhiDirectX12BorrowedDescriptorRangeDescriptor descriptor{};
 };
 
 struct DirectX12SamplerSlot : DirectX12ResourceSlot<SamplerResourceTag> {
-    using DirectX12ResourceSlot::DirectX12ResourceSlot;
+    explicit DirectX12SamplerSlot(ResourceLifecycleSlot<SamplerResourceTag> value) noexcept
+        : DirectX12ResourceSlot(std::move(value)) {}
+
     vernon::rhi::directx12::Sampler sampler;
 };
 
 struct DirectX12InteropDevice {
+    DirectX12InteropDevice() noexcept = default;
+    DirectX12InteropDevice(const DirectX12InteropDevice &) = delete;
+    DirectX12InteropDevice &operator=(const DirectX12InteropDevice &) = delete;
+
     vernon::rhi::directx12::DeviceState state;
     vernon::rhi::StableResourceSlotContainer<DirectX12BufferSlot> buffers;
     vernon::rhi::StableResourceSlotContainer<DirectX12ImageSlot> images;
@@ -161,23 +175,25 @@ using DirectX12DeviceAnchor = vernon::rhi::DeviceRegistryAnchor<DirectX12Interop
 
 class DirectX12DeviceAccess {
 public:
+    DirectX12DeviceAccess() noexcept = default;
     explicit DirectX12DeviceAccess(DirectX12DeviceAnchor anchor) noexcept : anchor_(std::move(anchor)) {}
-    DirectX12InteropDevice *operator->() noexcept { return &anchor_.device(); }
-    DirectX12InteropDevice &operator*() noexcept { return anchor_.device(); }
-    Result<vernon::OwnerRef, RhiError> retainOwner() const noexcept { return anchor_.retainOwner(); }
+    [[nodiscard]] explicit operator bool() const noexcept { return anchor_.has_value(); }
+    DirectX12InteropDevice *operator->() noexcept { return &anchor_->device(); }
+    DirectX12InteropDevice &operator*() noexcept { return anchor_->device(); }
+    Result<vernon::OwnerRef, RhiError> retainOwner() const noexcept { return anchor_->retainOwner(); }
 
 private:
-    DirectX12DeviceAnchor anchor_;
+    std::optional<DirectX12DeviceAnchor> anchor_;
 };
 
-std::optional<DirectX12DeviceAccess> lookupDirectX12Device(VernonRhiDevice handle) noexcept {
+DirectX12DeviceAccess lookupDirectX12Device(VernonRhiDevice handle) noexcept {
     const uint32_t index = handle.index & ~directX12DeviceBit;
     if ((handle.index & directX12DeviceBit) == 0 || index >= directX12DeviceCapacity)
-        return std::nullopt;
+        return {};
     auto found = directX12Devices.lookup({index, handle.generation});
     if (found.isErr())
-        return std::nullopt;
-    return std::optional<DirectX12DeviceAccess>{std::in_place, std::move(found).value()};
+        return {};
+    return DirectX12DeviceAccess{std::move(found).value()};
 }
 
 Result<ResourceCreationReservation, RhiError> reserveResource(DirectX12DeviceAccess &device) noexcept {
@@ -464,6 +480,13 @@ vernonRhiCreateBorrowedDirectX12DeviceBusiness(const VernonRhiDirectX12BorrowedD
         !belongsToDirectX12Device(commands, nativeDevice))
         return invalidDevice();
     auto &device = reservation.device();
+    auto owner = reservation.retainOwner();
+    if (owner.isErr())
+        return invalidDevice();
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    if (commandState.isErr())
+        return invalidDevice();
+    device.commandState = std::move(commandState).value();
     if (!device.state.initializeBorrowed(nativeDevice, queue, commands, device.error))
         return invalidDevice();
     device.queueCapabilities = descriptor->queue_capabilities;
@@ -497,7 +520,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedBufferBusiness(
     if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->resource ||
         !descriptor->size || descriptor->state == VERNON_RHI_STATE_UNDEFINED || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return vernon::toVernonRhiStatus(reservation.error());
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -516,7 +539,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedBufferBusiness(
     slot.buffer.state = directX12ResourceState(descriptor->state);
     slot.buffer.owned = false;
     slot.descriptor = *descriptor;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownBuffer);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownBuffer);
     if (published.isErr()) {
         slot.buffer = {};
         slot.descriptor = {};
@@ -533,7 +556,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImageBusiness(
         descriptor->image.struct_size < sizeof(descriptor->image) || descriptor->state == VERNON_RHI_STATE_UNDEFINED ||
         !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return vernon::toVernonRhiStatus(reservation.error());
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -575,7 +598,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImageBusiness(
     slot.image.subresourceStates = std::move(subresourceStates);
     slot.image.owned = false;
     slot.descriptor = *descriptor;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownImage);
     if (published.isErr()) {
         slot.image = {};
         slot.descriptor = {};
@@ -593,7 +616,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedDescriptorRangeBusi
         !descriptor->cpu_handle || !descriptor->descriptor_count ||
         descriptor->heap_type > VERNON_RHI_NATIVE_DESCRIPTOR_DEPTH_STENCIL || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return vernon::toVernonRhiStatus(reservation.error());
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -629,7 +652,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedDescriptorRangeBusi
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
     slot.descriptor = *descriptor;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownDescriptorRange);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownDescriptorRange);
     if (published.isErr()) {
         slot.descriptor = {};
         return vernon::toVernonRhiStatus(published.error());
@@ -643,7 +666,7 @@ static VernonRhiStatus vernonRhiDeviceDestroyNativeDescriptorRangeBusiness(Verno
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto destroyed = destroyPublicResource<NativeDescriptorRangeResourceTag>(**device, device->descriptorRanges, range);
+    auto destroyed = destroyPublicResource<NativeDescriptorRangeResourceTag>(*device, device->descriptorRanges, range);
     return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
@@ -653,7 +676,7 @@ vernonRhiDeviceGetNativeDescriptorRangeBusiness(VernonRhiDevice handle, VernonRh
     auto device = lookupDirectX12Device(handle);
     if (!device || !output || output->struct_size < sizeof(*output))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    auto pin = pinPublicResource<NativeDescriptorRangeResourceTag>(**device, device->descriptorRanges, range);
+    auto pin = pinPublicResource<NativeDescriptorRangeResourceTag>(*device, device->descriptorRanges, range);
     if (pin.isErr())
         return vernon::toVernonRhiStatus(pin.error());
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -811,7 +834,7 @@ Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const Ver
         descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return Result<VernonRhiBuffer, RhiError>{
             err(invalidArgument("create_directx12_buffer", descriptor ? descriptor->size : 0))};
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return Result<VernonRhiBuffer, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -836,7 +859,7 @@ Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const Ver
             err(backendFailure("create_directx12_buffer", descriptor->size, descriptor->memory_class))};
     }
     slot.ownedDescriptor = *descriptor;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownBuffer);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownBuffer);
     if (published.isErr()) {
         device->state.destroyBuffer(slot.buffer);
         slot.ownedDescriptor = {};
@@ -853,7 +876,7 @@ Result<void, RhiError> uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buff
 
     if (!source)
         return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer", offset))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -903,7 +926,7 @@ Result<void, RhiError> uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffe
             err(invalidArgument("upload_directx12_buffer_ranges", handle.index, handle.generation))};
     if (!ranges || rangeCount == 0)
         return Result<void, RhiError>{err(invalidArgument("upload_directx12_buffer_ranges", rangeCount))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -984,7 +1007,7 @@ Result<void, RhiError> downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer bu
 
     if (!destination)
         return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer", offset))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1017,7 +1040,7 @@ Result<void, RhiError> downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuf
             err(invalidArgument("download_directx12_buffer_ranges", handle.index, handle.generation))};
     if (!ranges || rangeCount == 0)
         return Result<void, RhiError>{err(invalidArgument("download_directx12_buffer_ranges", rangeCount))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1066,7 +1089,7 @@ Result<bool, RhiError> isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buf
         return Result<bool, RhiError>{
             err(invalidArgument("validate_directx12_buffer", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1087,7 +1110,7 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
         descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return Result<VernonRhiImage, RhiError>{err(invalidArgument("create_directx12_image"))};
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return Result<VernonRhiImage, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -1136,7 +1159,7 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
     slot.image.dimension = descriptor->dimension;
     slot.image.subresourceStates = std::move(subresourceStates);
     slot.ownedDescriptor = *descriptor;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownImage);
     if (published.isErr()) {
         device->state.destroyImage(slot.image);
         slot.ownedDescriptor = {};
@@ -1157,7 +1180,7 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
 
     if (!uploads || uploadCount == 0)
         return invalidResult("upload_directx12_image", uploadCount);
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1301,7 +1324,7 @@ Result<void, RhiError> downloadImage(VernonRhiDevice handle, VernonRhiImage imag
     if (!device)
         return invalidResult("download_directx12_image", handle.index, handle.generation);
 
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1406,7 +1429,7 @@ Result<void, RhiError> downloadImageBatch(VernonRhiDevice handle, VernonRhiImage
         return invalidResult("download_directx12_image_batch", handle.index, handle.generation);
     if (!downloads || downloadCount == 0)
         return invalidResult("download_directx12_image_batch", downloadCount);
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1524,7 +1547,7 @@ Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiIma
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return invalidResult("generate_directx12_image_mipmaps", handle.index, handle.generation);
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<void, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1644,7 +1667,7 @@ Result<void, RhiError> destroyImage(VernonRhiDevice handle, VernonRhiImage image
     if (!device)
         return invalidResult("destroy_directx12_image", handle.index, handle.generation);
 
-    return destroyPublicResource<ImageResourceTag>(**device, device->images, image);
+    return destroyPublicResource<ImageResourceTag>(*device, device->images, image);
 }
 
 Result<bool, RhiError> isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
@@ -1653,7 +1676,7 @@ Result<bool, RhiError> isImageValid(VernonRhiDevice handle, VernonRhiImage image
         return Result<bool, RhiError>{
             err(invalidArgument("validate_directx12_image", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1671,7 +1694,7 @@ Result<VernonRhiSampler, RhiError> createSampler(VernonRhiDevice handle, const V
         return Result<VernonRhiSampler, RhiError>{err(invalidArgument("create_directx12_sampler"))};
     if (filter.maxAnisotropy > 1.0f)
         return Result<VernonRhiSampler, RhiError>{err(unsupported("create_directx12_sampler"))};
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return Result<VernonRhiSampler, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
@@ -1696,7 +1719,7 @@ Result<VernonRhiSampler, RhiError> createSampler(VernonRhiDevice handle, const V
     slot.sampler.descriptor.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     slot.sampler.descriptor.MinLOD = 0;
     slot.sampler.descriptor.MaxLOD = D3D12_FLOAT32_MAX;
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownSampler);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownSampler);
     if (published.isErr()) {
         slot.sampler = {};
         return Result<VernonRhiSampler, RhiError>{err(std::move(published).error())};
@@ -1709,7 +1732,7 @@ Result<void, RhiError> destroySampler(VernonRhiDevice handle, VernonRhiSampler s
     if (!device)
         return invalidResult("destroy_directx12_sampler", handle.index, handle.generation);
 
-    return destroyPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    return destroyPublicResource<SamplerResourceTag>(*device, device->samplers, sampler);
 }
 
 Result<bool, RhiError> isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
@@ -1718,7 +1741,7 @@ Result<bool, RhiError> isSamplerValid(VernonRhiDevice handle, VernonRhiSampler s
         return Result<bool, RhiError>{
             err(invalidArgument("validate_directx12_sampler", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    auto operation = pinPublicResource<SamplerResourceTag>(*device, device->samplers, sampler);
     if (operation.isErr())
         return Result<bool, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1730,7 +1753,7 @@ Result<uint64_t, RhiError> getImageNativeHandle(VernonRhiDevice handle, VernonRh
     if (!device)
         return Result<uint64_t, RhiError>{
             err(invalidArgument("get_directx12_image_native_handle", handle.index, handle.generation))};
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1747,14 +1770,14 @@ Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
     if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->mip_level_count ||
         !descriptor->array_layer_count || !descriptor->aspects)
         return Result<VernonRhiImageView, RhiError>{err(invalidArgument("create_directx12_image_view"))};
-    auto reservation = reserveResource(*device);
+    auto reservation = reserveResource(device);
     if (reservation.isErr())
         return Result<VernonRhiImageView, RhiError>{err(std::move(reservation).error())};
     std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
     auto available = availableResourceSlot<ImageViewResourceTag>(device->imageViews);
     if (available.isErr())
         return Result<VernonRhiImageView, RhiError>{err(std::move(available).error())};
-    auto parentPin = pinPublicResource<ImageResourceTag>(**device, device->images, descriptor->image);
+    auto parentPin = pinPublicResource<ImageResourceTag>(*device, device->images, descriptor->image);
     if (parentPin.isErr())
         return Result<VernonRhiImageView, RhiError>{err(std::move(parentPin).error())};
     std::unique_lock<std::mutex> guard(device->mutex);
@@ -1778,7 +1801,7 @@ Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
     slot.descriptor = *descriptor;
     slot.imageResource = resourceKey(descriptor->image);
     slot.imageLease.emplace(std::move(retained).value());
-    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImageView);
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &*device, teardownImageView);
     if (published.isErr()) {
         slot.image = {};
         slot.descriptor = {};
@@ -1796,7 +1819,7 @@ Result<void, RhiError> destroyImageView(VernonRhiDevice handle, VernonRhiImageVi
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return invalidResult("destroy_directx12_image_view", handle.index, handle.generation);
-    return destroyPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    return destroyPublicResource<ImageViewResourceTag>(*device, device->imageViews, view);
 }
 
 Result<uint64_t, RhiError> getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view) {
@@ -1804,7 +1827,7 @@ Result<uint64_t, RhiError> getImageViewNativeHandle(VernonRhiDevice handle, Vern
     if (!device)
         return Result<uint64_t, RhiError>{
             err(invalidArgument("get_directx12_image_view_native_handle", handle.index, handle.generation))};
-    auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    auto operation = pinPublicResource<ImageViewResourceTag>(*device, device->imageViews, view);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -1820,7 +1843,7 @@ Result<void, RhiError> destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buf
     if (!device)
         return invalidResult("destroy_directx12_buffer", handle.index, handle.generation);
 
-    return destroyPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    return destroyPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
 }
 
 Result<void *, RhiError> getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer) {
@@ -1828,7 +1851,7 @@ Result<void *, RhiError> getBufferNativeHandle(VernonRhiDevice handle, VernonRhi
     if (!device)
         return Result<void *, RhiError>{
             err(invalidArgument("get_directx12_buffer_native_handle", handle.index, handle.generation))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<void *, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -2240,7 +2263,7 @@ Result<uint64_t, RhiError> bufferResource(VernonRhiDevice handle, VernonRhiBuffe
         return Result<uint64_t, RhiError>{
             err(invalidArgument("bufferResource_directx12", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -2256,7 +2279,7 @@ Result<uint64_t, RhiError> imageResource(VernonRhiDevice handle, VernonRhiImage 
         return Result<uint64_t, RhiError>{
             err(invalidArgument("imageResource_directx12", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -2271,7 +2294,7 @@ Result<uint64_t, RhiError> imageViewResource(VernonRhiDevice handle, VernonRhiIm
     if (!device)
         return Result<uint64_t, RhiError>{
             err(invalidArgument("imageViewResource_directx12", handle.index, handle.generation))};
-    auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    auto operation = pinPublicResource<ImageViewResourceTag>(*device, device->imageViews, view);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -2287,7 +2310,7 @@ Result<uint64_t, RhiError> samplerResource(VernonRhiDevice handle, VernonRhiSamp
         return Result<uint64_t, RhiError>{
             err(invalidArgument("samplerResource_directx12", handle.index, handle.generation))};
 
-    auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    auto operation = pinPublicResource<SamplerResourceTag>(*device, device->samplers, sampler);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -2461,7 +2484,7 @@ Result<uint64_t, RhiError> trackedBufferState(VernonRhiDevice handle, VernonRhiB
     if (!device)
         return Result<uint64_t, RhiError>{
             err(invalidArgument("tracked_directx12_buffer_state", handle.index, handle.generation))};
-    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    auto operation = pinPublicResource<BufferResourceTag>(*device, device->buffers, buffer);
     if (operation.isErr())
         return Result<uint64_t, RhiError>{err(std::move(operation).error())};
     std::lock_guard<std::mutex> guard(device->mutex);

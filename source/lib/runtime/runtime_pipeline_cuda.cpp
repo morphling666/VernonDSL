@@ -6,8 +6,6 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_cuda.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -36,91 +34,11 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
         ReflectedEntry reflection;
         if (!resolveStageReflection(stage, VERNON_RUNTIME_CUDA, reflection, invocationDiagnostic(*inputs.context)))
             return false;
-        uint32_t internalSlot = 0;
-        for (const Parameter &parameter : plan.parameters)
-            internalSlot = std::max(internalSlot, parameter.slot);
-        std::vector<uint32_t> argumentBindings(reflection.arguments.size());
-        uint32_t flattenedBinding = 0;
-        for (size_t index = 0; index < reflection.arguments.size(); ++index) {
-            argumentBindings[index] = flattenedBinding;
-            if (reflection.arguments[index].kind != "builtin")
-                flattenedBinding +=
-                    static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
-        }
-        std::vector<uint32_t> descriptorBindings(reflection.arguments.size(), UINT32_MAX);
-        for (size_t index = 0; index < reflection.arguments.size(); ++index)
-            if (reflection.arguments[index].tensorViewDescriptor) {
-                descriptorBindings[index] = flattenedBinding;
-                flattenedBinding += 1 + 2 * reflection.arguments[index].tensorViewDescriptor->rank;
-            }
-        struct Candidate {
-            VernonRuntimeProviderBindingLayoutEntry layout{};
-            ComputeBindingSource source;
-        };
-        std::vector<Candidate> candidates;
-        for (const Parameter &parameter : plan.parameters)
-            for (const ParameterUse &use : parameter.uses) {
-                if (use.stage != "compute" && use.stage != plan.compute)
-                    continue;
-                if (use.index >= reflection.arguments.size()) {
-                    invocationDiagnostic(*inputs.context) = "CUDA parameter use exceeds reflected argument table";
-                    return false;
-                }
-                const ReflectedArgument &argument = reflection.arguments[use.index];
-                const size_t leafCount = std::max(argument.storageLeaves.size(), size_t{1});
-                for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
-                    Candidate candidate;
-                    auto &binding = candidate.layout;
-                    binding.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
-                    binding.binding = argumentBindings[use.index] + static_cast<uint32_t>(leafIndex);
-                    binding.kind = use.interfaceKind == "storage" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                  : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                    binding.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                    binding.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
-                    binding.array_count = 1;
-                    binding.argument_index = use.index;
-                    binding.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty()
-                            ? (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? argument.tensorElementSize
-                                                                                      : argument.physical.size)
-                            : argument.storageLeaves[leafIndex].elementSize);
-                    if (!binding.element_size) {
-                        invocationDiagnostic(*inputs.context) = "CUDA reflected argument has zero element size";
-                        return false;
-                    }
-                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
-                    candidates.push_back(candidate);
-                }
-                if (use.tensorViewDescriptor) {
-                    uint32_t descriptorBinding = descriptorBindings[use.index];
-                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
-                                                   uint32_t binding) {
-                        Candidate candidate;
-                        candidate.layout.slot = ++internalSlot;
-                        candidate.layout.binding = binding;
-                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                        candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                        candidate.layout.array_count = 1;
-                        candidate.layout.argument_index = use.index;
-                        candidate.layout.element_size = 8;
-                        candidate.source = {kind, use.index, dimension};
-                        candidates.push_back(candidate);
-                    };
-                    addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, descriptorBinding++);
-                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                        addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension, descriptorBinding++);
-                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                        addDescriptor(ComputeBindingSourceKind::TensorStride, dimension, descriptorBinding++);
-                }
-            }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-        for (const Candidate &candidate : candidates) {
-            state->layout.push_back(candidate.layout);
-            state->bindingSources.push_back(candidate.source);
-        }
-        state->values.resize(state->layout.size());
-        state->descriptorValues.resize(state->layout.size());
+        if (!buildPreparedComputeBindingPlan(plan, reflection, VERNON_RUNTIME_CUDA, state->bindingPlan,
+                                             invocationDiagnostic(*inputs.context)))
+            return false;
+        state->values.resize(state->bindingPlan.size());
+        state->descriptorValues.resize(state->bindingPlan.size());
         std::copy_n(stage.workgroup, 3, state->workgroup);
         const VernonRuntimeProviderShaderDescriptor shaderDescriptor{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                      VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -136,8 +54,8 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
         descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
         descriptor.shaders = &shaderDescriptor;
         descriptor.shader_count = 1;
-        descriptor.bindings = state->layout.data();
-        descriptor.binding_count = state->layout.size();
+        descriptor.bindings = state->bindingPlan.layouts.data();
+        descriptor.binding_count = state->bindingPlan.layouts.size();
         std::copy_n(state->workgroup, 3, descriptor.workgroup_size);
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
             vernonRuntimeRhiAdapterGetProvider(cudaState(*inputs.context).adapter), &descriptor, &state->pipeline);
@@ -172,8 +90,8 @@ void destroyCudaPipeline(VernonStageExecutable &pipeline) {
 VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
-    for (size_t index = 0; index < state.layout.size(); ++index) {
-        const auto &layout = state.layout[index];
+    for (size_t index = 0; index < state.bindingPlan.size(); ++index) {
+        const auto &layout = state.bindingPlan.layouts[index];
         if (layout.argument_index >= launch.arguments.size())
             return fail(*pipeline.context, "CUDA prepared argument index is invalid");
         const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
@@ -181,7 +99,8 @@ VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const Pl
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        const ComputeBindingSource &source = state.bindingSources[index];
+        const PreparedBindingSource &preparedSource = state.bindingPlan.sources[index];
+        const ComputeBindingSource &source = preparedSource.source;
         if (source.kind != ComputeBindingSourceKind::Argument) {
             std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
             if (!descriptor)
@@ -193,9 +112,22 @@ VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const Pl
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->resource.resource.value)
-                return fail(*pipeline.context, "CUDA prepared storage binding requires an RHI Tensor");
-            value.payload.buffer.resource = tensor->resource;
+            const auto *packed = std::get_if<ComputeScalarArgument>(&argument);
+            if (tensor && tensor->resource.resource.value) {
+                value.payload.buffer.resource = tensor->resource;
+                if (preparedSource.resourceOffset > value.payload.buffer.resource.size)
+                    return fail(*pipeline.context, "CUDA aggregate storage leaf exceeds its Tensor resource");
+                value.payload.buffer.resource.offset += preparedSource.resourceOffset;
+                value.payload.buffer.resource.size -= preparedSource.resourceOffset;
+            } else if (packed && packed->data && packed->size) {
+                value.flags = VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE;
+                value.payload.inline_value.data = packed->data;
+                value.payload.inline_value.size = packed->size;
+            } else {
+                return fail(*pipeline.context, "CUDA prepared storage binding for argument #" +
+                                                   std::to_string(layout.argument_index) +
+                                                   " requires an RHI Tensor or packed host value");
+            }
         } else {
             const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
             if (!scalar)

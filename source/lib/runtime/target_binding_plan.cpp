@@ -161,7 +161,7 @@ std::optional<program::ValueLayout> elementValueLayout(const Value &value, const
     return element;
 }
 
-TransportNode leafTransport(const LayoutLeaf &leaf) {
+template <typename Leaf> TransportNode leafTransport(const Leaf &leaf) {
     const uint64_t scalarSize = scalarByteSize(leaf.dtype);
     TransportNode scalar;
     scalar.kind = TransportNodeKind::Scalar;
@@ -185,35 +185,18 @@ TransportNode leafTransport(const LayoutLeaf &leaf) {
     return array;
 }
 
-TransportNode valueTransport(const program::ValueLayout &layout) {
+template <typename Layout> TransportNode valueTransport(const Layout &layout) {
     if (layout.leaves.size() == 1 && layout.leaves.front().byteOffset == 0)
         return leafTransport(layout.leaves.front());
     TransportNode root;
     root.kind = TransportNodeKind::Product;
     root.size = layout.byteSize;
     root.alignment = layout.alignment;
-    for (const LayoutLeaf &leaf : layout.leaves) {
+    for (const auto &leaf : layout.leaves) {
         TransportNode child = leafTransport(leaf);
         child.offset = leaf.byteOffset;
         root.children.push_back(std::move(child));
     }
-    return root;
-}
-
-TransportNode shapedValueTransport(const program::ValueLayout &elementLayout, const std::vector<uint64_t> &shape,
-                                   uint64_t byteSize) {
-    TransportNode root;
-    root.kind = TransportNodeKind::Array;
-    root.size = byteSize;
-    root.alignment = elementLayout.alignment;
-    root.shape = shape;
-    root.byteStrides.resize(shape.size());
-    uint64_t stride = elementLayout.byteSize;
-    for (size_t dimension = shape.size(); dimension-- > 0;) {
-        root.byteStrides[dimension] = stride;
-        stride *= shape[dimension];
-    }
-    root.children.push_back(valueTransport(elementLayout));
     return root;
 }
 
@@ -388,7 +371,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.source = SourceRepresentation::SystemValue;
             target.semantic = CarrierSemantic::Value;
             target.name = endpoint.builtin;
-            target.sourceName = target.name;
+            target.logicalSourceName = target.name;
             target.kind = "tensor";
             target.reflectedKind = "builtin";
             target.builtin = endpoint.builtin;
@@ -497,7 +480,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 }
                 projected.valueType = logical.canonicalType;
                 projected.name = valueName(program, projection.value);
-                projected.sourceName = projected.name;
+                projected.logicalSourceName = projected.name;
                 projected.kind = "tensor";
                 projected.reflectedKind = logical.canonicalType.rankedValue ? "tensor_value" : "scalar";
                 projected.source = SourceRepresentation::WholeValueBytes;
@@ -539,7 +522,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         target.valueType = value.canonicalType;
         target.name = valueName(program, valueId);
-        target.sourceName = target.name;
+        target.logicalSourceName = target.name;
         if (target.projection.leaf) {
             if (!value.layout || *target.projection.leaf >= value.layout->leaves.size())
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
@@ -576,6 +559,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                           "cotangent physical rank requires an explicit autodiff carrier");
         }
         target.kind = endpoint.role == "sampler" ? "sampler" : !endpoint.imageDimension.empty() ? "image" : "tensor";
+        target.stageSourceName = endpoint.sourceName;
         const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
         if (binding->tag == BindingTag::Value && target.projection.leaf && compiled && compiled->interfacePlan &&
             compiled->interfacePlan->root && value.layout && *target.projection.leaf < value.layout->leaves.size()) {
@@ -918,7 +902,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.builtin = compiled.builtin;
             target.access = "read";
             target.endpoint = {"compute", "system_value", compiled.index, UINT32_MAX, "read"};
-            target.sourceName = target.name;
+            target.logicalSourceName = target.name;
             if (!assignCpuPhysical(cpuFrameOffset(target), &compiled, alignof(uintptr_t), sizeof(uintptr_t),
                                    target.physical, nullptr, diagnostic, "tape packed field"))
                 return false;
@@ -1030,7 +1014,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         parameter.dimension = binding.dimension;
         parameter.bindingRole = binding.role;
         parameter.autodiffRole = autodiffResourceRole(binding.role);
-        parameter.autodiffSource = binding.sourceName;
+        parameter.autodiffSource = binding.logicalSourceName;
         parameter.invocationCarrier =
             binding.viewTransform && !binding.viewTransform->axes.empty() &&
             binding.viewTransform->axes.front().source == ViewAxisSource::InvocationLinearCarrier;
@@ -1041,6 +1025,10 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         use.index = runtimeArgumentIndex;
         use.interfaceKind = binding.endpoint.interfaceKind == "result"             ? "result"
                             : binding.kind == "image" || binding.kind == "sampler" ? "resource"
+                            : plan.backend != VERNON_RUNTIME_CPU && binding.carrier == TargetCarrier::StorageBuffer &&
+                                    (binding.source == SourceRepresentation::ElementStream ||
+                                     !binding.storageLeaves.empty() || binding.tensorViewDescriptor)
+                                ? "storage"
                             : binding.source == SourceRepresentation::WholeValueBytes ||
                                     (binding.source == SourceRepresentation::ElementStream && binding.transport)
                                 ? "value"
@@ -1050,10 +1038,8 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                         : binding.elementLayout.logicalType;
         use.tensorPacking =
             usesWholeValuePacking(binding) ? TensorRepresentation::WholeValue : TensorRepresentation::ElementStream;
-        use.shape = binding.source == SourceRepresentation::WholeValueBytes && binding.valueType &&
-                            binding.valueType->rankedValue
-                        ? binding.valueType->innerShape
-                        : parameter.shape;
+        use.shape =
+            binding.valueType && binding.valueType->rankedValue ? binding.valueType->innerShape : parameter.shape;
         use.transport = plan.backend == VERNON_RUNTIME_CPU                ? "host_value"
                         : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
                         : binding.carrier == TargetCarrier::InlineValue   ? "push_constant"
@@ -1294,8 +1280,8 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             use.valueLayout = binding.elementLayout;
         }
         use.sampledImageBindings = binding.sampledImageBindings;
-        if (use.interfaceKind != "input" && !binding.name.empty())
-            use.uniformName = binding.name;
+        if (use.interfaceKind != "input")
+            use.uniformName = binding.stageSourceName.empty() ? binding.name : binding.stageSourceName;
         parameter.uses.push_back(std::move(use));
     }
     for (const TargetOutput &output : plan.outputs) {

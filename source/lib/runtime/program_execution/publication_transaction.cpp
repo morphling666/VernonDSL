@@ -95,8 +95,8 @@ PublicationResult<void> PublicationTransaction::bindImageCommit(VernonRuntimeCon
     if (!destinationImage)
         return PublicationResult<void>{vernon::err(PublicationError::InvalidImageParent)};
     image.usage |= VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
-    VernonRhiImage stagingImage{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-    VernonRhiImageView stagingView{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiImage stagingImage{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiImageView stagingView{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     if (injectFailure(FailureBoundary::Allocation) ||
         vernonRhiDeviceCreateImage(context.rhiDevice, &image, &stagingImage) != VERNON_RHI_STATUS_OK)
         return PublicationResult<void>{vernon::err(PublicationError::ImageAllocationFailed)};
@@ -484,8 +484,8 @@ void PublicationTransaction::releaseDeviceImages() noexcept {
                 (void)vernonRhiDeviceDestroyImageView(publication->device, publication->stagingView);
             if (publication->stagingImage.index != VERNON_RHI_INVALID_HANDLE_INDEX)
                 (void)vernonRhiDeviceDestroyImage(publication->device, publication->stagingImage);
-            publication->stagingView = {VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-            publication->stagingImage = {VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+            publication->stagingView = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+            publication->stagingImage = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         }
 }
 

@@ -1,5 +1,14 @@
 include_guard(GLOBAL)
 
+set(_VERNON_PROGRAM_FIXTURE_COMPILER_DEPENDENCIES)
+if(TARGET VernonDSLCompiler)
+    list(
+        APPEND
+        _VERNON_PROGRAM_FIXTURE_COMPILER_DEPENDENCIES
+        VernonDSLCompiler
+        "$<TARGET_FILE:VernonDSLCompiler>")
+endif()
+
 function(
     vernon_add_program_asset_bundle
     name
@@ -25,6 +34,7 @@ function(
             "${_vernon_bundle_directory}"
         DEPENDS vernon-dsl-native
                 "$<TARGET_FILE:vernon-dsl-native>"
+                ${_VERNON_PROGRAM_FIXTURE_COMPILER_DEPENDENCIES}
                 "${_vernon_asset_source}"
                 ${VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES}
         VERBATIM)
@@ -70,6 +80,19 @@ function(
         set(_vernon_cook_command ${Python_EXECUTABLE} -m vernon_dsl.program_asset_cli "${asset_reference}" --target cpu
                                  --output "${output_directory}")
     endif()
+    set(_vernon_fixture_archiver "${CMAKE_AR}")
+    if(MSVC)
+        get_filename_component(_vernon_fixture_llvm_prefix "${MLIR_DIR}/../../.." ABSOLUTE)
+        find_program(
+            _vernon_fixture_llvm_ar
+            NAMES llvm-ar
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "${_vernon_fixture_llvm_prefix}/bin"
+            NO_DEFAULT_PATH)
+        if(NOT _vernon_fixture_llvm_ar)
+            message(FATAL_ERROR "CPU Program fixtures on MSVC require llvm-ar from the configured LLVM installation")
+        endif()
+        set(_vernon_fixture_archiver "${_vernon_fixture_llvm_ar}")
+    endif()
     add_custom_command(
         OUTPUT "${_vernon_manifest}"
                "${_vernon_registration}"
@@ -78,9 +101,10 @@ function(
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${output_directory}"
         COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${_vernon_cook_command}
         COMMAND ${Python_EXECUTABLE} "${prepare_script}" "${_vernon_manifest}" "${CMAKE_C_OUTPUT_EXTENSION}"
-                --wrapper-function "${wrapper_function}" --archiver "${CMAKE_AR}"
+                --wrapper-function "${wrapper_function}" --archiver "${_vernon_fixture_archiver}"
         DEPENDS vernon-dsl-native
                 "$<TARGET_FILE:vernon-dsl-native>"
+                ${_VERNON_PROGRAM_FIXTURE_COMPILER_DEPENDENCIES}
                 "${_vernon_asset_source}"
                 ${FIXTURE_COOK_SCRIPT}
                 ${VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES}

@@ -73,7 +73,7 @@ func::FuncOp declareCpuHelper(ModuleOp module, StringRef name, FunctionType type
     builder.setInsertionPointToStart(module.getBody());
     func::FuncOp function = func::FuncOp::create(builder, module.getLoc(), name, type);
     function.setPrivate();
-    function->setAttr("llvm.linkage", LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+    function->setAttr("llvm.linkage", LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::External));
     return function;
 }
 

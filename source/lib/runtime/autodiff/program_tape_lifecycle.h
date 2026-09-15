@@ -15,7 +15,7 @@ struct ProgramTapeState {
     const program::TargetBinding *segment{};
     const program::TargetBinding *status{};
     const program::TargetBinding *launch{};
-    size_t stride{16};
+    size_t stride{};
 };
 
 bool allocateProgramTapeState(ProgramTapeScratch &scratch, VernonRuntimeContext &context, ProgramTapeState &state,

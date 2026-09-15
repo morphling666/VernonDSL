@@ -2397,6 +2397,47 @@ struct ManagedGraphicsCommandBatch {
     std::optional<VernonDepthAttachment> scopeDepth;
 };
 
+bool decodeRhiBufferReference(uint64_t value, VernonRhiBuffer &buffer) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(value);
+    const uint32_t generation = static_cast<uint32_t>(value >> 32);
+    if (!encodedIndex || !generation)
+        return false;
+    buffer = {encodedIndex - 1, generation};
+    return true;
+}
+
+bool appendGraphicsVertexResources(const PlannedGraphicsInvocation &graphics,
+                                   vernon::execution::detail::CommandNode &command,
+                                   std::vector<vernon::execution::detail::RhiCommandResourceBinding> &bindings) {
+    for (const PlannedVertexInput &input : graphics.vertexInputs) {
+        if (!input.tensor)
+            return false;
+        const VernonTensorView &tensor = *input.tensor;
+        VernonRhiBuffer buffer{};
+        if (!decodeRhiBufferReference(tensor.resource.resource.value, buffer) ||
+            tensor.resource.offset > UINT64_MAX - tensor.byte_offset)
+            return false;
+        command.accesses.push_back(vernon::execution::detail::rhiBufferAccess(
+            buffer, tensor.resource.offset + tensor.byte_offset, tensor.byte_size, vernon::execution::AccessMode::Read,
+            VERNON_RHI_STATE_SHADER_READ, VERNON_RHI_STAGE_VERTEX, VERNON_RHI_ACCESS_VERTEX_READ));
+        vernon::execution::detail::appendRhiBufferBinding(bindings, buffer);
+    }
+    if (graphics.indexBinding) {
+        VernonRhiBuffer buffer{};
+        const VernonRuntimeProviderResourceReference &resource = graphics.indexBinding->resource;
+        const uint64_t indexSize = sizeof(uint32_t);
+        if (!decodeRhiBufferReference(resource.resource.value, buffer) ||
+            resource.offset > UINT64_MAX - graphics.indexBinding->offset)
+            return false;
+        command.accesses.push_back(vernon::execution::detail::rhiBufferAccess(
+            buffer, resource.offset + graphics.indexBinding->offset, graphics.indexBinding->index_count * indexSize,
+            vernon::execution::AccessMode::Read, VERNON_RHI_STATE_SHADER_READ, VERNON_RHI_STAGE_VERTEX,
+            VERNON_RHI_ACCESS_INDEX_READ));
+        vernon::execution::detail::appendRhiBufferBinding(bindings, buffer);
+    }
+    return true;
+}
+
 bool materializeManagedGraphicsScope(ManagedGraphicsCommandBatch &batch) {
     if (batch.draws.empty())
         return false;
@@ -2553,10 +2594,23 @@ VernonStatus executePipelineProgramGraphImpl(
             return fail(&context, std::move(transferError));
         std::shared_ptr<ManagedGraphicsCommandBatch> graphicsBatch;
         GraphicsScopeMaterializer graphicsScopeMaterializer;
+        vernon::execution::detail::RhiCommandExecutionPlan graphicsNodePlan;
+        const auto appendGraphicsBatch = [&]() {
+            if (!graphicsBatch)
+                return VERNON_STATUS_OK;
+            std::string compositionError;
+            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(graphicsNodePlan),
+                                                                          true, compositionError))
+                return fail(&context, std::move(compositionError));
+            graphicsNodePlan = {};
+            graphicsBatch.reset();
+            return VERNON_STATUS_OK;
+        };
         const auto flushCommands = [&]() {
+            if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
+                return pending;
             if (commandPlan.commands.nodes.empty())
                 return VERNON_STATUS_OK;
-            graphicsBatch.reset();
             graphicsScopeMaterializer.reset();
             const VernonStatus status = vernon::runtime::program_execution::executeCommandPlanAndWait(
                 context, commandPlan, nullptr, nullptr, false, &submission);
@@ -2616,6 +2670,9 @@ VernonStatus executePipelineProgramGraphImpl(
                         materializationError))
                     return fail(&context, std::move(materializationError));
                 bool transferCommandsAppended = false;
+                if (!materializedNodes.back().deviceCopiesBefore.empty())
+                    if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
+                        return pending;
                 if (const VernonStatus status = transfers.appendBeforeConsumer(
                         {*direction, node.id}, materializedNodes.back().deviceCopiesBefore, commandPlan,
                         transferCommandsAppended, transferError);
@@ -2666,25 +2723,25 @@ VernonStatus executePipelineProgramGraphImpl(
                 const GraphicsScopeMaterialization materialization = graphicsScopeMaterializer.materialize(
                     candidate->region, graphicsContext->plan, transferCommandsAppended);
                 if (materialization != GraphicsScopeMaterialization::Fuse)
-                    graphicsBatch.reset();
+                    if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
+                        return pending;
                 if (!graphicsBatch) {
                     graphicsBatch = std::make_shared<ManagedGraphicsCommandBatch>();
-                    vernon::execution::detail::RhiCommandExecutionPlan nodePlan;
                     vernon::execution::detail::CommandNode drawCommand;
                     drawCommand.kind = vernon::execution::detail::CommandNodeKind::Derivative;
                     drawCommand.queue = vernon::execution::detail::CommandQueueClass::Graphics;
-                    nodePlan.commands.nodes.push_back(std::move(drawCommand));
-                    nodePlan.encoders.push_back({encodeManagedGraphicsBatch, graphicsBatch.get()});
-                    nodePlan.retainedContexts.push_back(graphicsBatch);
-                    std::string compositionError;
-                    if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(nodePlan),
-                                                                                  true, compositionError))
-                        return fail(&context, std::move(compositionError));
+                    graphicsNodePlan.commands.nodes.push_back(std::move(drawCommand));
+                    graphicsNodePlan.encoders.push_back({encodeManagedGraphicsBatch, graphicsBatch.get()});
+                    graphicsNodePlan.retainedContexts.push_back(graphicsBatch);
                 }
+                if (!appendGraphicsVertexResources(graphicsContext->plan, graphicsNodePlan.commands.nodes.back(),
+                                                   graphicsNodePlan.bindings))
+                    return fail(&context, "managed graphics node contains an invalid vertex or index resource");
                 graphicsBatch->draws.push_back(std::move(graphicsContext));
                 continue;
             }
-            graphicsBatch.reset();
+            if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
+                return pending;
             graphicsScopeMaterializer.reset();
             materializedNodes.emplace_back();
             std::string materializationError;

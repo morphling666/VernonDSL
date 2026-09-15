@@ -689,7 +689,14 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
 
     @backend_matrix_test(
-        BackendRequirements(gpu=True, compute=True, graphics=True, storage_buffers=True, storage_texture=True)
+        BackendRequirements(
+            gpu=True,
+            compute=True,
+            graphics=True,
+            storage_buffers=True,
+            storage_texture=True,
+            non_r32_read_write_storage_images=True,
+        )
     )
     def test_attachment_flows_graphics_compute_graphics(self, backend: BackendRow) -> None:
         texture = vd.Texture.zeros(

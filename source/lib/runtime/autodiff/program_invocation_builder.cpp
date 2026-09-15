@@ -88,10 +88,10 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
         }
     if (request.captures)
         for (size_t value = 0; value < request.captures->size() && value < live.size(); ++value)
-            live[value] |= !(*request.captures)[value].empty();
+            live[value] = live[value] || !(*request.captures)[value].empty();
     if (request.tapeCaptures)
         for (size_t value = 0; value < request.tapeCaptures->size() && value < live.size(); ++value)
-            live[value] |= static_cast<bool>((*request.tapeCaptures)[value]);
+            live[value] = live[value] || static_cast<bool>((*request.tapeCaptures)[value]);
     for (const program::Value &slot : execution.values)
         if (slot.storage && *slot.storage < preparation.typedControlStorages.size() &&
             preparation.typedControlStorages[*slot.storage])

@@ -25,6 +25,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
 #define LOAD(member, name)                                                                                             \
     if (!loadProc(callbacks, driver.member, name, error))                                                              \
     return false
+        driver.getError =
+            reinterpret_cast<decltype(driver.getError)>(callbacks.get_proc_address(callbacks.user_data, "glGetError"));
         LOAD(createShader, "glCreateShader");
         LOAD(shaderSource, "glShaderSource");
         LOAD(compileShader, "glCompileShader");
@@ -68,6 +70,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
         LOAD(drawBuffers, "glDrawBuffers");
         LOAD(readBuffer, "glReadBuffer");
+        driver.blitFramebuffer = reinterpret_cast<decltype(driver.blitFramebuffer)>(
+            callbacks.get_proc_address(callbacks.user_data, "glBlitFramebuffer"));
         driver.invalidateFramebuffer = reinterpret_cast<decltype(driver.invalidateFramebuffer)>(
             callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
         LOAD(clearBufferfv, "glClearBufferfv");
@@ -135,6 +139,10 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
             callbacks.get_proc_address(callbacks.user_data, "glBindImageTexture"));
         LOAD(texImage2D, "glTexImage2D");
         LOAD(texImage3D, "glTexImage3D");
+        driver.texStorage2D = reinterpret_cast<decltype(driver.texStorage2D)>(
+            callbacks.get_proc_address(callbacks.user_data, "glTexStorage2D"));
+        driver.texStorage3D = reinterpret_cast<decltype(driver.texStorage3D)>(
+            callbacks.get_proc_address(callbacks.user_data, "glTexStorage3D"));
         LOAD(texSubImage2D, "glTexSubImage2D");
         LOAD(texSubImage3D, "glTexSubImage3D");
         LOAD(texParameteri, "glTexParameteri");

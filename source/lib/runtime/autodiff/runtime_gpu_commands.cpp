@@ -1,6 +1,7 @@
 #include "runtime/program_execution/device_commands.h"
 
 #include "execution_graph/execution_graph_internal.h"
+#include "rhi/rhi_internal.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
@@ -92,10 +93,47 @@ bool decodeBuffer(uint64_t key, VernonRhiBuffer &buffer) {
     return true;
 }
 
-bool appendPipelineResources(execution::detail::CommandNode &node,
+bool decodeImage(uint64_t key, VernonRhiImage &image) {
+    const uint32_t encodedIndex = static_cast<uint32_t>(key);
+    const uint32_t generation = static_cast<uint32_t>(key >> 32);
+    if (!encodedIndex || !generation)
+        return false;
+    image = {encodedIndex - 1, generation};
+    return true;
+}
+
+bool appendPipelineResources(VernonRuntimeContext &context, const VernonStageExecutable &pipeline,
+                             execution::detail::CommandNode &node,
                              std::vector<execution::detail::RhiCommandResourceBinding> &bindings,
                              const std::vector<VernonProgramArgument> &arguments) {
     for (const VernonProgramArgument &argument : arguments) {
+        if (argument.kind == VERNON_PROGRAM_IMAGE) {
+            const auto parameter =
+                std::find_if(pipeline.bindingProjection.parameters.begin(), pipeline.bindingProjection.parameters.end(),
+                             [&](const Parameter &candidate) { return candidate.slot == argument.slot; });
+            if (parameter == pipeline.bindingProjection.parameters.end() || !argument.image.view.resource.value)
+                return false;
+            VernonRhiImageViewDescriptor view{};
+            VernonRhiImageDescriptor image{};
+            uint64_t parentKey = 0;
+            auto described = rhi::describeImageViewResource(context.rhiDevice, argument.image.view.resource.value, view,
+                                                            image, parentKey);
+            VernonRhiImage parent{};
+            if (described.isErr() || !decodeImage(parentKey, parent))
+                return false;
+            const execution::AccessMode access = parameter->access == "read"    ? execution::AccessMode::Read
+                                                 : parameter->access == "write" ? execution::AccessMode::Write
+                                                                                : execution::AccessMode::ReadWrite;
+            node.accesses.push_back(execution::detail::rhiImageAccess(
+                parent,
+                {view.base_mip_level, view.mip_level_count, view.base_array_layer, view.array_layer_count,
+                 view.aspects},
+                access,
+                access == execution::AccessMode::Read ? VERNON_RHI_STATE_SHADER_READ : VERNON_RHI_STATE_SHADER_WRITE,
+                VERNON_RHI_STAGE_COMPUTE));
+            execution::detail::appendRhiImageBinding(bindings, parent);
+            continue;
+        }
         if (argument.kind != VERNON_PROGRAM_TENSOR)
             continue;
         const VernonTensorView &tensor = argument.tensor;
@@ -190,6 +228,9 @@ bool encodeImageCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder en
             vernonRhiCommandEncoderCopyImage(context.rhiDevice, encoder, copy.source, copy.destination,
                                              copy.regions.data(), copy.regions.size()) != VERNON_RHI_STATUS_OK) {
             invocationDiagnostic(context) = "GPU image copy " + std::to_string(index) + " failed";
+            const VernonStringView backendError = vernonRhiDeviceGetLastError(context.rhiDevice);
+            if (backendError.data && backendError.size)
+                invocationDiagnostic(context) += ": " + std::string(backendError.data, backendError.size);
             return false;
         }
     }
@@ -336,7 +377,12 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
     }
     if (submission && stats.submissions)
         *submission = SubmissionState::Indeterminate;
-    const std::string detail = invocationDiagnostic(context);
+    std::string detail = invocationDiagnostic(context);
+    if (detail.empty()) {
+        const VernonStringView backendError = vernonRhiDeviceGetLastError(context.rhiDevice);
+        if (backendError.data && backendError.size)
+            detail.assign(backendError.data, backendError.size);
+    }
     return fail(context, detail.empty() ? "GPU autodiff command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
 }
 
@@ -432,7 +478,7 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
     execution::detail::CommandNode derivative;
     derivative.kind = kind;
     derivative.queue = execution::detail::CommandQueueClass::Compute;
-    if (!appendPipelineResources(derivative, plan.bindings, pipelineContext->arguments))
+    if (!appendPipelineResources(context, pipeline, derivative, plan.bindings, pipelineContext->arguments))
         return fail(context, "GPU autodiff pipeline has an invalid RHI resource argument");
     if (!plan.commands.nodes.empty())
         derivative.predecessors.push_back(static_cast<uint32_t>(plan.commands.nodes.size() - 1));

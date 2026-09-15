@@ -26,7 +26,10 @@ bool buildCanonicalProgramAbi(const llvm::json::Object &signature, const llvm::j
     if (!planProgramDerivativeProjections(slots, projectionPlan, error))
         return false;
     llvm::json::Array projections = serializeProgramDerivativeProjections(projectionPlan);
-    llvm::json::Array tapePlans = serializeProgramTapePlans(planProgramTapes(values, graphs));
+    std::vector<ProgramTapePlan> tapePlan;
+    if (!planProgramTapes(values, graphs, tapePlan, error))
+        return false;
+    llvm::json::Array tapePlans = serializeProgramTapePlans(tapePlan);
     abi = llvm::json::Object{{"boundary_slots", std::move(boundarySlots)},
                              {"derivative_projections", std::move(projections)},
                              {"tape_plans", std::move(tapePlans)}};

@@ -62,7 +62,10 @@ Architecture and tutorials link to the contract instead of redefining fields.
    backend behavior.
 6. [`runtime/image_resources.md`](runtime/image_resources.md) defines current
    image owner/view/provider/RHI behavior.
-7. [`autodiff/program_adjoint_ssa.md`](autodiff/program_adjoint_ssa.md) defines
+7. [`runtime/reflection_binding_architecture.md`](runtime/reflection_binding_architecture.md)
+   records the current compiler-reflection-to-provider mapping, its
+   cross-backend invariants, and the assessed `PreparedBindingPlan` end state.
+8. [`autodiff/program_adjoint_ssa.md`](autodiff/program_adjoint_ssa.md) defines
    interior Program cotangent SSA and destination-passing accumulation.
 
 ## Guides and platform documents
@@ -74,6 +77,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
 
 ## Active plans and future designs
 
+- [`runtime/binding_and_tape_contract_plan.md`](runtime/binding_and_tape_contract_plan.md)
+  defines the active PreparedBindingPlan migration, compiler-owned autodiff
+  tape sizing contract, and remaining cross-platform investigation gates.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)
   tracks contract-driven, capability-based language test normalization.
 - [`testing/language_feature_inventory.md`](testing/language_feature_inventory.md)

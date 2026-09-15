@@ -66,6 +66,10 @@ struct VulkanSamplerSlot {
 };
 
 struct VulkanInteropDevice {
+    VulkanInteropDevice() noexcept = default;
+    VulkanInteropDevice(const VulkanInteropDevice &) = delete;
+    VulkanInteropDevice &operator=(const VulkanInteropDevice &) = delete;
+
     vernon::rhi::vulkan::DeviceState state;
     vernon::rhi::StableResourceSlotContainer<VulkanBufferSlot> buffers;
     vernon::rhi::StableResourceSlotContainer<VulkanImageSlot> images;

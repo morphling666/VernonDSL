@@ -788,8 +788,8 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
         const auto &row = value["values"][index];
         const std::string path = "/values/" + std::to_string(index);
         Value parsed;
-        if (!exactObject(row, {"id", "type", "origin"}, {"name", "shape", "storage", "value_layout"}, diagnostic,
-                         path) ||
+        if (!exactObject(row, {"id", "type", "origin"},
+                         {"name", "shape", "storage", "value_layout", "minimum_tape_stride_bytes"}, diagnostic, path) ||
             !uint32Value(row["id"], parsed.id) || parsed.id != index || !row["type"].is_string() ||
             row["type"].get_ref<const std::string &>().empty() ||
             !parseOrigin(row["origin"], parsed.origin, diagnostic, path + "/origin"))
@@ -799,6 +799,13 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
         if (!parseCanonicalValueType(parsed.type, parsed.canonicalType))
             return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/type",
                         "Value has an invalid canonical tensor type");
+        const bool tapeValue = parsed.canonicalType.semantic.isAdTape();
+        uint64_t minimumTapeStrideBytes = 0;
+        if (tapeValue != row.contains("minimum_tape_stride_bytes") ||
+            (tapeValue &&
+             (!uint64Value(row["minimum_tape_stride_bytes"], minimumTapeStrideBytes) || !minimumTapeStrideBytes)))
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/minimum_tape_stride_bytes",
+                        "autodiff tape Values require exactly one positive minimum stride contract");
         if (row.contains("shape") && !parseShape(row["shape"], parsed.shape, diagnostic, path + "/shape", true, true))
             return false;
         if (row.contains("storage")) {
@@ -1435,17 +1442,24 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
         const std::string path = "/abi/tape_plans/" + std::to_string(index);
         TapePlan plan;
         if (!exactObject(row,
-                         {"value", "forward_producer", "backward_consumer", "required_carriers", "optional_carriers"},
+                         {"value", "forward_producer", "backward_consumer", "minimum_tape_stride_bytes",
+                          "required_carriers", "optional_carriers"},
                          {}, diagnostic, path) ||
             !uint32Value(row["value"], plan.value) || plan.value != tapeValues[index] ||
             !row["forward_producer"].is_boolean() || !row["backward_consumer"].is_boolean() ||
-            !parseTapeCarriers(row["required_carriers"], plan.requiredCarriers) ||
+            !uint64Value(row["minimum_tape_stride_bytes"], plan.minimumTapeStrideBytes) ||
+            !plan.minimumTapeStrideBytes || !parseTapeCarriers(row["required_carriers"], plan.requiredCarriers) ||
             !parseTapeCarriers(row["optional_carriers"], plan.optionalCarriers) ||
             plan.requiredCarriers != std::vector<program_plan::TapeCarrier>{program_plan::TapeCarrier::TapeData,
                                                                             program_plan::TapeCarrier::ReplaySegment} ||
             plan.optionalCarriers != std::vector<program_plan::TapeCarrier>{program_plan::TapeCarrier::LaunchMetadata,
                                                                             program_plan::TapeCarrier::ReplayStatus})
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "invalid typed tape plan");
+        uint64_t valueMinimumStride = 0;
+        if (!uint64Value(value["values"][plan.value]["minimum_tape_stride_bytes"], valueMinimumStride) ||
+            valueMinimumStride != plan.minimumTapeStrideBytes)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/minimum_tape_stride_bytes",
+                        "TapePlan minimum stride disagrees with its tape Value contract");
         plan.forwardProducer = row["forward_producer"].get<bool>();
         plan.backwardConsumer = row["backward_consumer"].get<bool>();
         program.abi.tapePlans.push_back(std::move(plan));
@@ -1722,8 +1736,8 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                                                                   "abi"}
                         : std::initializer_list<std::string_view>{"tag", "module", "interface", "index", "type",
                                                                   "layout_hash", "transport", "access", "abi"},
-                    resource ? std::initializer_list<std::string_view>{"write_footprint"}
-                             : std::initializer_list<std::string_view>{"element_layout_hash", "role"},
+                    resource ? std::initializer_list<std::string_view>{"write_footprint", "source_name"}
+                             : std::initializer_list<std::string_view>{"element_layout_hash", "role", "source_name"},
                     diagnostic, endpointPath) ||
                 (!resource && endpoint.tag != "value") || !endpointValue["module"].is_string() ||
                 (operation == "compute" ? endpointModule != "compute"
@@ -1738,6 +1752,13 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
             endpoint.type = endpointValue["type"].get<std::string>();
             endpoint.transport = endpointValue["transport"].get<std::string>();
             endpoint.access = endpointValue["access"].get<std::string>();
+            if (endpointValue.contains("source_name")) {
+                if (!endpointValue["source_name"].is_string() ||
+                    endpointValue["source_name"].get_ref<const std::string &>().empty())
+                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/source_name",
+                                "invalid endpoint source name");
+                endpoint.sourceName = endpointValue["source_name"].get<std::string>();
+            }
             if (!resource && endpointValue.contains("role")) {
                 if (!endpointValue["role"].is_string())
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/role",

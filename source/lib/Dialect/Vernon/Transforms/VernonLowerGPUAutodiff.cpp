@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 
+#include "VernonGpuAutodiffAbi.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -19,7 +20,7 @@
 namespace mlir::vernon {
 namespace {
 
-constexpr uint32_t kInvocationHeaderBytes = 16;
+constexpr uint32_t kInvocationHeaderBytes = static_cast<uint32_t>(::vernon::autodiff_abi::kInvocationHeaderBytes);
 constexpr uint32_t kRegionHeaderBytes = 20;
 constexpr unsigned kSegmentVirtualWorkgroup = 0;
 constexpr unsigned kSegmentVirtualGlobalBase = 3;
@@ -697,6 +698,13 @@ private:
         Value valid = arith::AndIOp::create(
             builder, operation.getLoc(), arith::AndIOp::create(builder, operation.getLoc(), nextValid, withinStride),
             arith::AndIOp::create(builder, operation.getLoc(), absoluteValid, withinCapacity));
+        Value parentRecord;
+        if (!operation.getParentLink().empty()) {
+            parentRecord = asI32(builder, operation.getLoc(), operation.getParentLink()[1]);
+            Value parentValid =
+                arith::CmpIOp::create(builder, operation.getLoc(), arith::CmpIPredicate::ne, parentRecord, zero);
+            valid = arith::AndIOp::create(builder, operation.getLoc(), valid, parentValid);
+        }
         Value region = arith::SelectOp::create(builder, operation.getLoc(), valid, cursor, zero);
         storeRelativeI32(builder, operation.getLoc(), zero, 0,
                          arith::SelectOp::create(builder, operation.getLoc(), valid, next, cursor));
@@ -718,14 +726,13 @@ private:
             storeRelativeI32(builder, operation.getLoc(), zero, 4,
                              arith::SelectOp::create(builder, operation.getLoc(), valid, region, previous));
         } else {
-            Value parentRecord = asI32(builder, operation.getLoc(), operation.getParentLink()[1]);
             uint64_t ordinal = static_cast<uint64_t>(operation.getChildOrdinalAttr().getInt());
-            Value childAddress = absoluteAddress(builder, operation.getLoc(), parentRecord);
-            childAddress = arith::SubIOp::create(builder, operation.getLoc(), childAddress,
-                                                 i32Constant(builder, operation.getLoc(), 12 + 4 * ordinal));
-            Value previous = loadI32(builder, operation.getLoc(), childAddress);
-            storeI32(builder, operation.getLoc(), childAddress,
-                     arith::SelectOp::create(builder, operation.getLoc(), valid, region, previous));
+            scf::IfOp link = scf::IfOp::create(builder, operation.getLoc(), valid, false);
+            OpBuilder linkBuilder(link.getThenRegion().front().getTerminator());
+            Value childAddress = absoluteAddress(linkBuilder, operation.getLoc(), parentRecord);
+            childAddress = arith::SubIOp::create(linkBuilder, operation.getLoc(), childAddress,
+                                                 i32Constant(linkBuilder, operation.getLoc(), 12 + 4 * ordinal));
+            storeI32(linkBuilder, operation.getLoc(), childAddress, region);
         }
         Value old = operation.getRegion();
         old.setType(builder.getI32Type());

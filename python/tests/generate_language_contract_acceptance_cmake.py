@@ -40,7 +40,9 @@ def main() -> None:
         asset = (arguments.repository / source).resolve()
         if not asset.is_file():
             raise FileNotFoundError(asset)
-        rows.append(f'    "{acceptance.suite.value}|{acceptance.id}|{asset}:{symbol}|{_requirements(acceptance)}"')
+        rows.append(
+            f'    "{acceptance.suite.value}|{acceptance.id}|{asset.as_posix()}:{symbol}|{_requirements(acceptance)}"'
+        )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(

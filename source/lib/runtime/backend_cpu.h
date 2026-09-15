@@ -7,14 +7,13 @@
 #include "cpu_workgroup_dispatch.h"
 #include "pipeline_metadata.h"
 #include "platform/platform_library.h"
+#include "prepared_binding_plan.h"
 #include "resolved_stage_types.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "stage_artifact.h"
 
 #include <cstddef>
-#include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,17 +36,8 @@ struct CpuPipelineState {
     VernonRuntimeCorePipeline *pipeline{};
     VernonRuntimeCoreBindings *bindings{};
     VernonCpuEntryPoint entry{};
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> layout;
+    PreparedComputeBindingPlan bindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> values;
-    std::vector<std::string> layoutBuiltins;
-    std::vector<size_t> packedOffsets;
-    std::vector<size_t> packedFieldSizes;
-    std::vector<bool> packedResults;
-    std::vector<std::optional<VernonDataType>> packedResultReductions;
-    size_t packedSize{};
-    size_t packedResultSize{};
-    size_t tapeAllocatorOffset{std::numeric_limits<size_t>::max()};
-    size_t tapeRootOffset{std::numeric_limits<size_t>::max()};
     VernonAdTapeAllocator *tapeAllocator{};
     VernonAdRegionHandle tapeRoot{};
     uint32_t workgroup[3]{1, 1, 1};

@@ -238,6 +238,7 @@ TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
       {
         "id": 4,
         "type": "opaque<vernon.ad_tape>",
+        "minimum_tape_stride_bytes": 64,
         "origin": {"tag": "node_result", "graph": "forward", "node": 0}
       }
     ])");
@@ -245,10 +246,13 @@ TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
       {"direction": "forward"},
       {"direction": "backward"}
     ])");
-    const std::vector<ProgramTapePlan> plans = planProgramTapes(*values.getAsArray(), *graphs.getAsArray());
+    std::vector<ProgramTapePlan> plans;
+    std::string error;
+    ASSERT_TRUE(planProgramTapes(*values.getAsArray(), *graphs.getAsArray(), plans, error)) << error;
     ASSERT_EQ(plans.size(), 1u);
     EXPECT_TRUE(plans[0].forwardProducer);
     EXPECT_TRUE(plans[0].backwardConsumer);
+    EXPECT_EQ(plans[0].minimumTapeStrideBytes, 64u);
     EXPECT_EQ(plans[0].requiredCarriers,
               std::vector<ProgramTapeCarrier>({ProgramTapeCarrier::TapeData, ProgramTapeCarrier::ReplaySegment}));
 }

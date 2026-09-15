@@ -623,8 +623,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     requirements.compute = true;
     for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
         const VernonTarget target = backend.compiler;
-        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX &&
-            target != VERNON_TARGET_METAL)
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_OPENGL_ES &&
+            target != VERNON_TARGET_DIRECTX && target != VERNON_TARGET_METAL)
             continue;
         const vernon::tests::BackendProbeResult probe =
             vernon::tests::probeCompilerBackend(compiler, backend, requirements);
@@ -635,6 +635,15 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, storageModule.data(), storageModule.size(), target);
         ASSERT_TRUE(result);
+        if (target == VERNON_TARGET_OPENGL_ES) {
+            EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_UNSUPPORTED_TARGET);
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size)
+                          .find("target capability rejects non-R32 read_write storage images"),
+                      std::string_view::npos);
+            vernonCompileResultDestroy(result);
+            continue;
+        }
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
             std::fprintf(stderr, "storage texture compile failed: %.*s\n", static_cast<int>(diagnostics.size),

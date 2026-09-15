@@ -3,10 +3,10 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
-#include "compute_launch_planner.h"
+#include "graphics_invocation_planner.h"
 #include "metal_runtime_capabilities.h"
+#include "prepared_binding_plan.h"
 #include "runtime_state.h"
-#include "tensor_bridge.h"
 
 #include <cstdint>
 #include <vector>
@@ -33,39 +33,17 @@ inline const MetalContextState &metalState(const VernonRuntimeContext &context) 
 }
 
 struct MetalPipelineState {
-    struct GraphicsBinding {
-        enum Source {
-            EXTERNAL_UNIFORM,
-            EXTERNAL_VERTEX,
-            EXTERNAL_TEXTURE,
-            EXTERNAL_SAMPLER,
-            EXTERNAL_STORAGE,
-            IMPLICIT_SAMPLER,
-            RESOLUTION
-        };
-        Source source{};
-        uint32_t externalSlot{};
-        uint32_t descriptorSet{UINT32_MAX};
-        uint32_t descriptorBinding{UINT32_MAX};
-        TensorCopyPlan packing;
-        std::vector<uint8_t> storage;
-    };
-
     VernonRuntimeCorePipeline *rhiComputePipeline{};
     VernonRuntimeCoreBindings *rhiComputeBindings{};
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiComputeLayout;
+    PreparedComputeBindingPlan rhiComputeBindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
-    std::vector<uint64_t> rhiComputeResourceOffsets;
-    std::vector<ComputeBindingSource> rhiComputeBindingSources;
     std::vector<int64_t> rhiComputeDescriptorValues;
     uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
     VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};
     PreparedGraphicsVariant rhiGraphicsVariant;
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
-    std::vector<VernonRuntimeProviderVertexAttribute> rhiGraphicsVertexAttributes;
+    PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
-    std::vector<GraphicsBinding> rhiGraphicsBindingPlan;
 };
 
 } // namespace vernon::runtime

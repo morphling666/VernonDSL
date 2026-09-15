@@ -230,6 +230,10 @@ jobs:
           uv pip install --python "$venv/bin/python" --no-cache "$wheel"
           "$venv/bin/python" scripts/verify_installed_wheel.py
 
+      - name: Test external engine against wheel Runtime sources
+        if: matrix.python-version == '3.11'
+        run: "$RUNNER_TEMP/vernon-wheel/bin/python scripts/verify_external_engine.py"
+
       - name: Upload wheel
         uses: actions/upload-artifact@v6
         with:

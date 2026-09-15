@@ -4,6 +4,7 @@
 #include "compiler_program_graph.h"
 #include "compiler_program_lowering.h"
 #include "compiler_program_storage.h"
+#include "compiler_program_tape.h"
 
 #include <set>
 #include <string>
@@ -43,6 +44,8 @@ bool finalizeCanonicalProgram(const llvm::json::Object &execution,
 
     CanonicalProgramLoweringPlan lowering;
     if (!lowerCanonicalProgramStages(*rawValues, selectedGraphs, resourceIndex, storages, lowering, error))
+        return false;
+    if (!applyProgramTapeSizingContracts(values, selectedGraphs, resourceIndex, error))
         return false;
     stageContracts = std::move(lowering.stageContracts);
     targetImplementations = std::move(lowering.targetImplementations);

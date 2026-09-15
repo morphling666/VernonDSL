@@ -214,10 +214,6 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 error = "argument reflection has an invalid physical alignment";
                 return false;
             }
-            const bool cudaStaticTensorValue =
-                backend == VERNON_RUNTIME_CUDA && argument.kind == "tensor" && argument.physical.size != 0;
-            if (cudaStaticTensorValue)
-                argument.kind = "scalar";
             argument.descriptorSet = value.value("vernon.set", uint32_t{0});
             argument.binding = value.value("vernon.binding", UINT32_MAX);
             if (value.contains("storage_leaves") && value["storage_leaves"].is_array()) {
@@ -231,8 +227,6 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                                                       leaf["binding"].get<uint32_t>()});
                 }
             }
-            if (cudaStaticTensorValue)
-                argument.storageLeaves.clear();
             if (value.contains("tensor_view_descriptor")) {
                 const auto &descriptor = value["tensor_view_descriptor"];
                 if (!descriptor.is_object() || !descriptor.contains("rank") ||
@@ -305,6 +299,15 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 return false;
             }
             output.arguments.push_back(std::move(argument));
+        }
+        std::sort(
+            output.arguments.begin(), output.arguments.end(),
+            [](const ReflectedArgument &left, const ReflectedArgument &right) { return left.index < right.index; });
+        for (size_t index = 0; index < output.arguments.size(); ++index) {
+            if (output.arguments[index].index != index) {
+                error = "entry argument reflection indices are not unique and contiguous";
+                return false;
+            }
         }
         const auto footprintArgument = [&](const std::string &owner) {
             return std::find_if(output.arguments.begin(), output.arguments.end(),

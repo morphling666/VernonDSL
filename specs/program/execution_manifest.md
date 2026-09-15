@@ -986,6 +986,11 @@ Endpoint `module` must name an actual CodeModule role. The tuple
 fragment modules has two reflected endpoints and two Program bindings, which
 may select the same Value or ResourceAccess.
 
+Value and resource endpoints may carry `source_name`, the stage-local symbol
+identity retained from `vernon.source_name`. It is distinct from the bound
+Program Value name: an internal Value produced by one node may bind an endpoint
+with a different stage-local name in a later node.
+
 `transport` is `by_value`, `resource_handle`, or `device_address`; `access` is
 `read`, `write`, or `read_write`. Reflection
 layout includes every physical scalar/vector width, stride, alignment, and

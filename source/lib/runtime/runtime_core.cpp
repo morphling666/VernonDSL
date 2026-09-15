@@ -252,15 +252,16 @@ VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const Ve
     size_t resourceCount = 0;
     for (size_t index = 0; index < valueCount; ++index) {
         const auto &layout = pipeline.bindings[index];
-        resourceCount += !packedUniformBytes(layout) &&
-                         (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0;
+        resourceCount +=
+            !packedUniformBytes(layout) && (values[index].flags & (VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE |
+                                                                   VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE)) == 0;
     }
     resources.reserve(resourceCount);
     for (size_t index = 0; index < valueCount; ++index) {
         const auto &layout = pipeline.bindings[index];
         if (layout.slot != values[index].slot)
             return VERNON_STATUS_INVALID_ARGUMENT;
-        if (packedUniformBytes(layout)) {
+        if (packedUniformBytes(layout) || (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0) {
             if (!values[index].payload.inline_value.data || values[index].payload.inline_value.size == 0) {
                 releaseResources(provider, resources);
                 resources.clear();
@@ -342,7 +343,7 @@ bool bindingSnapshotMatches(const VernonRuntimeCorePipeline &pipeline,
         const auto &layout = pipeline.bindings[index];
         if (saved.slot != value.slot || saved.kind != value.kind || saved.flags != value.flags)
             return false;
-        if (packedUniformBytes(layout)) {
+        if (packedUniformBytes(layout) || (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0) {
             if (saved.inlineBytes.size() != value.payload.inline_value.size ||
                 (saved.inlineBytes.size() &&
                  std::memcmp(saved.inlineBytes.data(), value.payload.inline_value.data, saved.inlineBytes.size()) != 0))
@@ -375,7 +376,7 @@ VernonStatus captureBindingSnapshot(const VernonRuntimeCorePipeline &pipeline,
         entry.slot = value.slot;
         entry.kind = value.kind;
         entry.flags = value.flags;
-        if (packedUniformBytes(layout)) {
+        if (packedUniformBytes(layout) || (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0) {
             const auto *begin = static_cast<const uint8_t *>(value.payload.inline_value.data);
             entry.inlineBytes.assign(begin, begin + value.payload.inline_value.size);
         } else if ((value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {

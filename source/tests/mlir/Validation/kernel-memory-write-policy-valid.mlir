@@ -2,6 +2,8 @@
 //
 // CHECK-LABEL: func.func @rank_one_global_x
 // CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 1, 2>}
+// CHECK-LABEL: func.func @rank_one_workgroup_radix_xy
+// CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 0, 2>}
 // CHECK-LABEL: func.func @rank_two_linearized_global_x
 // CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 1, 2>}
 // CHECK-LABEL: func.func @valid_write_policies
@@ -25,6 +27,30 @@ module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_ve
     %gx = arith.index_castui %gx_i32 : i32 to index
     %value = arith.constant 1.0 : f32
     "vernon.store"(%value, %output, %gx)
+        : (f32, !vernon.tensor_view<f32, [-1], "write", "device">, index) -> ()
+    return
+  }
+
+  func.func @rank_one_workgroup_radix_xy(
+      %output: !vernon.tensor_view<f32, [-1], "write", "device"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64
+      },
+      %gid: tensor<3xi32> {
+        vernon.interface = "input", vernon.builtin = "global_invocation_id"
+      }) attributes {
+        vernon.entry, vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 8, 4, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %eight = arith.constant 8 : i32
+    %gx = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gy = tensor.extract %gid[%one] : tensor<3xi32>
+    %row = arith.muli %gy, %eight : i32
+    %linear_i32 = arith.addi %gx, %row : i32
+    %linear = arith.index_castui %linear_i32 : i32 to index
+    %value = arith.constant 1.0 : f32
+    "vernon.store"(%value, %output, %linear)
         : (f32, !vernon.tensor_view<f32, [-1], "write", "device">, index) -> ()
     return
   }

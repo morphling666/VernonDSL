@@ -18,8 +18,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -347,10 +345,6 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         llvm::ModulePassManager optimization = passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
         optimization.run(*llvmModule, moduleAnalyses);
     }
-    if (parsedTriple.isOSWindows() && !llvmModule->getNamedGlobal("_fltused"))
-        new llvm::GlobalVariable(*llvmModule, llvm::Type::getInt32Ty(*llvmContext), true,
-                                 llvm::GlobalValue::WeakAnyLinkage,
-                                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llvmContext), 0), "_fltused");
     if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
         diagnostics = "generated CPU LLVM IR failed verification";
         return CpuCompileResult::CodegenFailure;
@@ -395,6 +389,11 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
         llvm::orc::SymbolMap helperSymbols;
+        if (parsedTriple.isOSWindows()) {
+            static int windowsFltused;
+            helperSymbols[nextExecution->jit->mangleAndIntern("_fltused")] = {
+                llvm::orc::ExecutorAddr::fromPtr(&windowsFltused), llvm::JITSymbolFlags::Exported};
+        }
         for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL, VERNON_CPU_LANE_ADDRESS_SYMBOL,
                                    VERNON_CPU_WORKGROUP_BARRIER_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL}) {
             llvm::Function *declaration = llvmModule->getFunction(helper);

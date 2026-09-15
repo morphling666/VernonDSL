@@ -38,23 +38,21 @@ struct DirectX12DepthStencilStateStats {
     uint32_t backStencilPassOperation{};
 };
 
-VERNON_RUNTIME_CAPI VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
-                                                                         const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI DirectX12DepthStencilStateStats
-getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures,
-                                                                     uint64_t samplers, bool writableTexture,
-                                                                     uint32_t deviceTier);
-VERNON_RUNTIME_CAPI uint64_t diagnosticClockForTesting() noexcept;
-VERNON_RUNTIME_CAPI void setDiagnosticClockForTesting(uint64_t clock) noexcept;
-VERNON_RUNTIME_CAPI void failNextDiagnosticOverflowAllocationForTesting() noexcept;
-VERNON_RUNTIME_CAPI uint64_t diagnosticGenerationCounterForTesting() noexcept;
-VERNON_RUNTIME_CAPI void setDiagnosticGenerationCounterForTesting(uint64_t generation) noexcept;
+VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
+                                                     const VernonProgramExecutable *pipeline);
+size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *pipeline);
+size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline);
+uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
+DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context);
+size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context);
+size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
+bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures, uint64_t samplers,
+                                                 bool writableTexture, uint32_t deviceTier);
+uint64_t diagnosticClockForTesting() noexcept;
+void setDiagnosticClockForTesting(uint64_t clock) noexcept;
+void failNextDiagnosticOverflowAllocationForTesting() noexcept;
+uint64_t diagnosticGenerationCounterForTesting() noexcept;
+void setDiagnosticGenerationCounterForTesting(uint64_t generation) noexcept;
 
 } // namespace vernon::runtime
 

@@ -49,6 +49,7 @@ struct BackendTestRequirements {
     bool graphics{};
     bool storageBuffers{};
     bool storageTexture{};
+    bool nonR32ReadWriteStorageImages{};
     bool deviceAtomics{};
     bool f32AtomicAdd{};
     bool f64AtomicAdd{};
@@ -89,7 +90,11 @@ inline BackendProbeResult unsupported(std::string_view backend, std::string_view
 
 inline BackendProbeResult probeCompilerBackend(const VernonCompilerContext *compiler, const BackendTestRow &backend,
                                                const BackendTestRequirements &requirements) {
-    const VernonTargetCapabilities capabilities = vernonCompilerGetTargetCapabilities(compiler, backend.compiler);
+    VernonTargetCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = VERNON_TARGET_CAPABILITIES_VERSION;
+    if (vernonCompilerQueryTargetCapabilities(compiler, backend.compiler, &capabilities) != VERNON_STATUS_OK)
+        return {BackendProbeKind::ProbeFailure, std::string(backend.name) + " compiler capability query failed"};
     if (!capabilities.available)
         return {BackendProbeKind::PlatformNotBuilt,
                 std::string(backend.name) + " compiler target is not built on this platform"};
@@ -110,9 +115,10 @@ inline BackendProbeResult probeCompilerBackend(const VernonCompilerContext *comp
         if (requirements.graphics && !get(Id::GraphicsTextureSampling).supported)
             return unsupported(backend.name, "graphics_texture_sampling");
     }
-    if (requirements.storageTexture &&
-        !vernon::program_capabilities::get(vernon::program_capabilities::Id::ComputeTextureBinding).supported)
-        return unsupported(backend.name, "storage_texture");
+    if (requirements.storageTexture && !capabilities.supports_compute_texture_binding)
+        return unsupported(backend.name, "compute_texture_binding");
+    if (requirements.nonR32ReadWriteStorageImages && !capabilities.supports_non_r32_read_write_storage_images)
+        return unsupported(backend.name, "non_r32_read_write_storage_images");
     if (requirements.programVjp &&
         !vernon::program_capabilities::get(vernon::program_capabilities::Id::ComputeVjp).supported)
         return unsupported(backend.name, "program_vjp");

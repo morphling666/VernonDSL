@@ -58,6 +58,7 @@ from pipeline_shader import (
     u32_attribute_vertex,
     volume_coordinate_fragment,
 )
+from vernon_dsl.diagnostics import ProgramCompileError
 
 
 def render_target(texture: vd.Texture) -> vd.RenderPass:
@@ -428,7 +429,7 @@ def assert_formal_attribute_formats_render(
             target = vd.Texture.zeros(shape=(32, 32))
             render = vd.pipeline(vertex, solid_fragment)
             if name in unsupported:
-                with test.assertRaisesRegex((vd.CompileError, RuntimeError), "support|capabilit|format"):
+                with test.assertRaisesRegex(ProgramCompileError, "support|capabilit|format"):
                     render(position=positions, value=values, render_pass=render_target(target))
                 continue
             render(position=positions, value=values, render_pass=render_target(target))
@@ -1104,22 +1105,24 @@ class OpenGLPipelineTests(unittest.TestCase):
         color = vd.Texture.zeros(shape=(32, 32))
         object_id = vd.Texture.zeros(shape=(32, 32))
         render = vd.pipeline(advanced_vertex, advanced_fragment, specializations={PICKING: True})
-        with self.assertRaisesRegex(ValueError, "exactly match"):
+        with self.assertRaisesRegex(ValueError, "exactly match") as attachment_error:
             render(
                 position=positions,
                 offset=offsets,
                 draw=vd.draw(index_buffer=vd.index_buffer(indices)),
                 render_pass=render_target(color),
             )
+        self.assertIs(type(attachment_error.exception), ValueError)
         with self.assertRaisesRegex(ValueError, "dimensions"):
             vd.RenderTarget.from_attachments(colors={0: color, 1: vd.Texture.zeros(shape=(16, 16))})
-        with self.assertRaisesRegex(RuntimeError, "shape"):
+        with self.assertRaisesRegex(ValueError, "shape") as shape_error:
             render(
                 position=positions,
                 offset=vd.storage.zeros(dtype=vd.f32, shape=(3, 3)),
                 draw=vd.draw(index_buffer=vd.index_buffer(indices)),
                 render_pass=mrt_target(color, object_id),
             )
+        self.assertIs(type(shape_error.exception), ValueError)
         unknown = vd.pipeline(
             advanced_vertex,
             advanced_fragment,

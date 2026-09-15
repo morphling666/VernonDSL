@@ -12,6 +12,9 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -86,11 +89,16 @@ void vernonCompilerDestroy(VernonCompilerContext *context) {
     delete context;
 }
 
-VernonTargetCapabilities vernonCompilerGetTargetCapabilities(const VernonCompilerContext *context,
-                                                             VernonTarget target) {
-    if (!context || target < VERNON_TARGET_CPU || target > VERNON_TARGET_CUDA)
-        return {};
-    return vernon::compiler::targetCapabilities(target);
+VernonStatus vernonCompilerQueryTargetCapabilities(const VernonCompilerContext *context, VernonTarget target,
+                                                   VernonTargetCapabilities *capabilities) {
+    if (!context || target < VERNON_TARGET_CPU || target > VERNON_TARGET_CUDA || !capabilities ||
+        capabilities->struct_size < offsetof(VernonTargetCapabilities, available) ||
+        capabilities->abi_version != VERNON_TARGET_CAPABILITIES_VERSION)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const size_t outputSize = capabilities->struct_size;
+    const VernonTargetCapabilities resolved = vernon::compiler::targetCapabilities(target);
+    std::memcpy(capabilities, &resolved, std::min(outputSize, sizeof(resolved)));
+    return VERNON_STATUS_OK;
 }
 
 VernonCompileResult *vernonCompilerVerifyPythonMlir(VernonCompilerContext *context, const char *source,
@@ -506,7 +514,9 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     if (!layout)
                         layout = parameterRow->getObject("element_layout");
                     llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
-                    llvm::json::Object *leaf = leaves && leaves->size() == 1 ? (*leaves)[0].getAsObject() : nullptr;
+                    const size_t actualLeafIndex = leaves && leaves->size() == 1 ? 0 : *projectedLeafIndex;
+                    llvm::json::Object *leaf =
+                        leaves && actualLeafIndex < leaves->size() ? (*leaves)[actualLeafIndex].getAsObject() : nullptr;
                     llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr;
                     if (leafShape) {
                         for (const llvm::json::Value &extent : *actualShape)
@@ -517,6 +527,8 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     }
                 }
                 llvm::json::Object *expectedLayout = value->getObject("value_layout");
+                const bool compiledCanonicalValue =
+                    parameterRow->getObject("value_layout") != nullptr && !projectedLeafIndex;
                 const vernon::compiler::ProgramEndpointExpectation expectation{
                     expectedDtype,
                     expectedShape,
@@ -525,7 +537,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     role.value_or(""),
                     parameterRow->getString("vernon.autodiff_carrier").value_or(""),
                     false,
-                    parameterKind == "tensor_value" && !projectedLeafIndex,
+                    compiledCanonicalValue,
                 };
                 std::string abiError;
                 if (!vernon::compiler::verifyProgramEndpointAbi(expectation, *parameterRow, abiError)) {

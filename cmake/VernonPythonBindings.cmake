@@ -60,8 +60,15 @@ function(vernon_add_python_bindings package_directory source_directory)
         "${source_directory}/python/native_program_autodiff.cpp"
         "${source_directory}/python/native_rhi.cpp"
         "${source_directory}/python/native_runtime.cpp")
-    _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
-    target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime Vernon::RHI)
+    if(NOT SKBUILD)
+        _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
+    endif()
+    target_link_libraries(
+        vernon-dsl-native
+        PRIVATE VernonRuntimeUtilities
+                VernonDSLCompiler
+                Vernon::Runtime
+                Vernon::RHI)
     target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler" "${source_directory}/lib")
     if(BUILD_TESTING)
         target_compile_definitions(vernon-dsl-native PRIVATE VERNON_ENABLE_LIFECYCLE_TEST_HOOKS=1)

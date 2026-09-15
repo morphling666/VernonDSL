@@ -81,6 +81,18 @@ RhiHostState::RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex) : bac
     descriptor.struct_size = sizeof(descriptor);
     descriptor.backend = backend;
     descriptor.device_index = deviceIndex;
+#if defined(VERNON_HAS_GLFW_CONTEXT_OWNER)
+    VernonOpenGLContextCallbacks callbacks{};
+    if (backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) {
+        const bool embedded = backend == VERNON_RHI_BACKEND_OPENGL_ES;
+        auto owner = std::make_shared<OwnedGlfwContext>(embedded ? vernon::host::GlfwContextApi::OpenGLES
+                                                                 : vernon::host::GlfwContextApi::OpenGL,
+                                                        embedded ? 3 : 4, embedded ? 1 : 3);
+        callbacks = owner->callbacks();
+        contextOwner = std::move(owner);
+        descriptor.opengl_callbacks = &callbacks;
+    }
+#endif
     device = vernonRhiCreateDevice(&descriptor);
     if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         throw std::runtime_error("cannot create Vernon RHI device");

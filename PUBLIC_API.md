@@ -21,6 +21,13 @@ directory as a standalone CMake source project. A prefix installation using
 the `VernonDevelopment` component has a different development layout and is
 not part of the PyPI wheel contract.
 
+Every platform wheel carries the same complete Runtime source payload,
+including CUDA, Vulkan, DirectX, OpenGL/OpenGL ES, and Metal implementation
+sources and their build-time shader/CMake inputs. The selected toolchain and
+Runtime CMake options determine which backends are compiled. Wheel verification
+configures, builds, installs, and consumes this standalone project rather than
+checking only that the directory exists.
+
 `VernonRuntimeCore.h`, `VernonRuntimeProvider.h`, and
 `VernonRuntimeRHIAdapter.h` are shipped embedder SPI used to implement backend
 providers. They are not application-facing stable API and may change when the

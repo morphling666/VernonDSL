@@ -59,6 +59,7 @@ struct ReflectedEndpoint {
     std::string tag;
     std::string module;
     std::string interfaceKind;
+    std::string sourceName;
     uint32_t index{};
     std::string role;
     std::string type;
@@ -498,6 +499,7 @@ struct TapePlan {
     uint32_t value{};
     bool forwardProducer{};
     bool backwardConsumer{};
+    uint64_t minimumTapeStrideBytes{};
     std::vector<vernon::program_plan::TapeCarrier> requiredCarriers;
     std::vector<vernon::program_plan::TapeCarrier> optionalCarriers;
 };

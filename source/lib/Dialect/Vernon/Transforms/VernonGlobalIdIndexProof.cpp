@@ -12,6 +12,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -625,6 +626,65 @@ std::optional<ConditionalIndexProof> proveAffineInvocationOwnedIndex(ValueRange 
     return constrainUnusedGridAxes(std::move(proof), axes, function);
 }
 
+std::optional<ConditionalIndexProof> proveWorkgroupRadixInvocationOwnedIndex(ValueRange indices) {
+    // A rank-one row-major encoding of adjacent global-id axes is injective
+    // when every lower digit is confined to its static workgroup extent.
+    if (indices.size() != 1)
+        return std::nullopt;
+    DenseSet<Value> visiting;
+    NormalizationResult normalized = normalize(indices.front(), visiting);
+    if (!normalized.index || normalized.invalidArithmetic || normalized.index->scalarGlobalId)
+        return std::nullopt;
+    func::FuncOp function = enclosingFunction(indices.front());
+    auto workgroup = function ? function->getAttrOfType<DenseI32ArrayAttr>(kWorkgroupSizeAttrName) : nullptr;
+    if (!workgroup || workgroup.size() != 3)
+        return std::nullopt;
+
+    unsigned firstAxis = 3;
+    unsigned lastAxis = 0;
+    unsigned axisCount = 0;
+    for (unsigned axis = 0; axis < 3; ++axis)
+        if (normalized.index->coefficients[axis]) {
+            firstAxis = std::min(firstAxis, axis);
+            lastAxis = axis;
+            ++axisCount;
+        }
+    if (axisCount < 2)
+        return std::nullopt;
+    for (unsigned axis = firstAxis; axis <= lastAxis; ++axis) {
+        const int64_t coefficient = normalized.index->coefficients[axis];
+        if (!coefficient)
+            return std::nullopt;
+        if (axis == lastAxis)
+            break;
+        const int64_t extent = workgroup[axis];
+        if (extent <= 0 ||
+            (coefficient > 0 ? coefficient > std::numeric_limits<int64_t>::max() / extent
+                             : coefficient < std::numeric_limits<int64_t>::min() / extent) ||
+            normalized.index->coefficients[axis + 1] != coefficient * extent)
+            return std::nullopt;
+    }
+
+    ConditionalIndexProof proof;
+    normalized.index->dimension = 0;
+    proof.normalizedIndices.push_back(*normalized.index);
+    proof.ownership = IndexOwnershipDomain::Invocation;
+    for (unsigned axis = firstAxis; axis <= lastAxis; ++axis) {
+        proof.coveredAxes[axis] = true;
+        if (axis != lastAxis)
+            proof.unitGridAxes.push_back(axis);
+    }
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        if (axis >= firstAxis && axis <= lastAxis)
+            continue;
+        if (workgroup[axis] != 1)
+            return std::nullopt;
+        proof.unitGridAxes.push_back(axis);
+    }
+    llvm::sort(proof.unitGridAxes);
+    return proof;
+}
+
 std::optional<ConditionalIndexProof> proveMixedRadixInvocationOwnedIndex(ValueRange indices) {
     // Unwrapped unsigned mixed radix of a unique-axis linear form:
     // specs/compiler/invocation_index_ownership.md §4
@@ -728,10 +788,12 @@ std::optional<ConditionalIndexProof> proveStrictInvocationOwnedIndex(ValueRange 
 }
 
 std::optional<ConditionalIndexProof> proveInvocationOwnedIndex(ValueRange indices) {
-    // Affine §3, else mixed-radix §4:
+    // Affine §3, workgroup-radix §3.4, else mixed-radix §4:
     // specs/compiler/invocation_index_ownership.md
     if (auto affine = proveAffineInvocationOwnedIndex(indices))
         return affine;
+    if (auto workgroupRadix = proveWorkgroupRadixInvocationOwnedIndex(indices))
+        return workgroupRadix;
     return proveMixedRadixInvocationOwnedIndex(indices);
 }
 

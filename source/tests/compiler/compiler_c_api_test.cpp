@@ -2069,29 +2069,45 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
 
     VernonCompilerContext *context = vernonCompilerCreate();
     ASSERT_TRUE(context != NULL);
-    VernonTargetCapabilities vulkan = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_VULKAN);
+    auto queryCapabilities = [&](VernonTarget target) {
+        VernonTargetCapabilities capabilities{};
+        capabilities.struct_size = sizeof(capabilities);
+        capabilities.abi_version = VERNON_TARGET_CAPABILITIES_VERSION;
+        EXPECT_EQ(vernonCompilerQueryTargetCapabilities(context, target, &capabilities), VERNON_STATUS_OK);
+        return capabilities;
+    };
+    VernonTargetCapabilities vulkan = queryCapabilities(VERNON_TARGET_VULKAN);
     ASSERT_TRUE(vulkan.available && vulkan.supports_graphics);
     ASSERT_TRUE(vulkan.supports_device_storage_atomics && !vulkan.supports_f32_device_atomic_add);
     ASSERT_TRUE(!vulkan.supports_dynamic_range_step && !vulkan.supports_f16 && !vulkan.supports_f64 &&
                 !vulkan.supports_f64_device_atomic_add);
-    VernonTargetCapabilities cuda = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CUDA);
+    EXPECT_TRUE(vulkan.supports_compute_texture_binding);
+    EXPECT_TRUE(vulkan.supports_non_r32_read_write_storage_images);
+    VernonTargetCapabilities invalidCapabilities{};
+    invalidCapabilities.struct_size = sizeof(invalidCapabilities);
+    EXPECT_EQ(vernonCompilerQueryTargetCapabilities(context, VERNON_TARGET_VULKAN, &invalidCapabilities),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    VernonTargetCapabilities cuda = queryCapabilities(VERNON_TARGET_CUDA);
     ASSERT_TRUE(cuda.available && cuda.supports_compute && !cuda.supports_graphics);
     ASSERT_TRUE(cuda.supports_device_storage_atomics && cuda.supports_f32_device_atomic_add);
     ASSERT_TRUE(cuda.supports_dynamic_range_step && !cuda.supports_f16 && cuda.supports_f64 &&
                 !cuda.supports_f64_device_atomic_add);
-    VernonTargetCapabilities cpu = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CPU);
+    VernonTargetCapabilities cpu = queryCapabilities(VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu.available && cpu.supports_graphics && cpu.supports_compute);
     ASSERT_TRUE(cpu.supports_device_storage_atomics && cpu.supports_f32_device_atomic_add);
     ASSERT_TRUE(cpu.supports_dynamic_range_step && cpu.supports_f16 && cpu.supports_f64 &&
                 cpu.supports_f64_device_atomic_add);
-    VernonTargetCapabilities opengl = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
-    VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
-    VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
+    VernonTargetCapabilities opengl = queryCapabilities(VERNON_TARGET_OPENGL);
+    VernonTargetCapabilities opengles = queryCapabilities(VERNON_TARGET_OPENGL_ES);
+    VernonTargetCapabilities metal = queryCapabilities(VERNON_TARGET_METAL);
     ASSERT_TRUE(opengl.supports_device_storage_atomics && opengles.supports_device_storage_atomics &&
                 metal.supports_device_storage_atomics);
     ASSERT_TRUE(!opengl.supports_f32_device_atomic_add && !opengles.supports_f32_device_atomic_add &&
                 !metal.supports_f32_device_atomic_add);
-    VernonTargetCapabilities directx = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_DIRECTX);
+    EXPECT_TRUE(opengl.supports_non_r32_read_write_storage_images);
+    EXPECT_FALSE(opengles.supports_non_r32_read_write_storage_images);
+    EXPECT_TRUE(metal.supports_non_r32_read_write_storage_images);
+    VernonTargetCapabilities directx = queryCapabilities(VERNON_TARGET_DIRECTX);
     if (directx.available)
         ASSERT_TRUE(directx.supports_graphics && directx.supports_compute && directx.supports_device_storage_atomics &&
                     !directx.supports_f32_device_atomic_add);

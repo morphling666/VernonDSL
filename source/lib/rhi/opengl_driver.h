@@ -44,6 +44,10 @@ constexpr Enum kTextureCubeMapPositiveX = 0x8515;
 constexpr Enum kTextureCubeMapSeamless = 0x884F;
 constexpr Enum kTexture0 = 0x84C0;
 constexpr Enum kFramebuffer = 0x8D40;
+constexpr Enum kReadFramebuffer = 0x8CA8;
+constexpr Enum kDrawFramebuffer = 0x8CA9;
+constexpr Enum kDrawFramebufferBinding = 0x8CA6;
+constexpr Enum kReadFramebufferBinding = 0x8CAA;
 constexpr Enum kColorAttachment0 = 0x8CE0;
 constexpr Enum kDepthAttachment = 0x8D00;
 constexpr Enum kStencilAttachment = 0x8D20;
@@ -85,6 +89,7 @@ constexpr Enum kReadWrite = 0x88BA;
 #endif
 
 struct Driver {
+    Enum(VERNON_GL_CALL *getError)() {};
     Uint(VERNON_GL_CALL *createShader)(Enum) {};
     void(VERNON_GL_CALL *shaderSource)(Uint, Size, const char *const *, const Int *){};
     void(VERNON_GL_CALL *compileShader)(Uint){};
@@ -126,6 +131,7 @@ struct Driver {
     Enum(VERNON_GL_CALL *checkFramebufferStatus)(Enum) {};
     void(VERNON_GL_CALL *drawBuffers)(Size, const Enum *){};
     void(VERNON_GL_CALL *readBuffer)(Enum){};
+    void(VERNON_GL_CALL *blitFramebuffer)(Int, Int, Int, Int, Int, Int, Int, Int, Bitfield, Enum){};
     void(VERNON_GL_CALL *invalidateFramebuffer)(Enum, Size, const Enum *){};
     void(VERNON_GL_CALL *clearBufferfv)(Enum, Int, const float *){};
     void(VERNON_GL_CALL *clearBufferiv)(Enum, Int, const Int *){};
@@ -184,6 +190,8 @@ struct Driver {
     void(VERNON_GL_CALL *bindImageTexture)(Uint, Uint, Int, unsigned char, Int, Enum, Enum){};
     void(VERNON_GL_CALL *texImage2D)(Enum, Int, Int, Size, Size, Int, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texImage3D)(Enum, Int, Int, Size, Size, Size, Int, Enum, Enum, const void *){};
+    void(VERNON_GL_CALL *texStorage2D)(Enum, Size, Enum, Size, Size){};
+    void(VERNON_GL_CALL *texStorage3D)(Enum, Size, Enum, Size, Size, Size){};
     void(VERNON_GL_CALL *texSubImage2D)(Enum, Int, Int, Int, Size, Size, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texSubImage3D)(Enum, Int, Int, Int, Int, Size, Size, Size, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texParameteri)(Enum, Enum, Int){};

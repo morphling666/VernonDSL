@@ -3,7 +3,7 @@
 #include "VernonProgramCapabilities.h"
 #include "native_runtime.h"
 #include "runtime/dirty_range_set.h"
-#include "runtime/program_execution/failure_injection.h"
+#include "runtime/runtime_python_bridge.h"
 
 #include <algorithm>
 #include <string>
@@ -408,25 +408,25 @@ void bindNativeCompiler(nb::module_ &module) {
     module.def(
         "_testing_set_program_failure",
         [](const std::string &boundary, size_t occurrence) {
-            using namespace vernon::runtime::program_execution;
-            FailureBoundary selected = FailureBoundary::None;
+            VernonRuntimePrivateFailureBoundary selected = VERNON_RUNTIME_PRIVATE_FAILURE_NONE;
             if (boundary == "planning")
-                selected = FailureBoundary::Planning;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_PLANNING;
             else if (boundary == "allocation")
-                selected = FailureBoundary::Allocation;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_ALLOCATION;
             else if (boundary == "transfer")
-                selected = FailureBoundary::Transfer;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_TRANSFER;
             else if (boundary == "submission")
-                selected = FailureBoundary::Submission;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_SUBMISSION;
             else if (boundary == "completion")
-                selected = FailureBoundary::Completion;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_COMPLETION;
             else if (boundary == "readback")
-                selected = FailureBoundary::Readback;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_READBACK;
             else if (boundary == "commit")
-                selected = FailureBoundary::Commit;
+                selected = VERNON_RUNTIME_PRIVATE_FAILURE_COMMIT;
             else if (!boundary.empty())
                 throw std::invalid_argument("unknown Program failure boundary");
-            setFailureInjectionForTesting(selected, occurrence);
+            if (vernonRuntimePrivateSetFailureInjection(selected, occurrence) != VERNON_STATUS_OK)
+                throw std::invalid_argument("invalid Program failure injection request");
         },
         nb::arg("boundary"), nb::arg("occurrence") = 1);
 }

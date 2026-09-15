@@ -31,6 +31,7 @@ struct CommandResourceAccess {
     VernonRhiImageSubresourceRange imageSubresources{0, UINT32_MAX, 0, UINT32_MAX, VERNON_RHI_IMAGE_ASPECT_COLOR};
     VernonRhiResourceState state{VERNON_RHI_STATE_COMMON};
     uint32_t stageMask{};
+    uint32_t rhiAccessMask{};
 };
 
 struct CommandNode {
@@ -46,6 +47,7 @@ struct CommandDag {
 };
 
 bool normalizeCommandAccess(CommandResourceAccess &access, std::string &error);
+uint32_t commandAccessMask(const CommandResourceAccess &access);
 bool commandAccessesOverlap(const CommandResourceAccess &left, const CommandResourceAccess &right);
 bool commandAccessesConflict(const CommandResourceAccess &left, const CommandResourceAccess &right);
 bool buildCommandDag(const std::vector<ExecutionResourceRecord> &resources,

@@ -158,19 +158,25 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(depth.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto sampledView =
+        vernon::tests::createImageView(context, sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    auto targetView =
+        vernon::tests::createImageView(context, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    auto depthView = vernon::tests::createImageView(context, depth, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT, 1,
+                                                    1, VERNON_RHI_IMAGE_ASPECT_DEPTH);
+    ASSERT_NE(sampledView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_NE(depthView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr std::array<uint8_t, 4> color{64, 200, 100, 255};
-    VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
-                                          0,
-                                          0,
-                                          0,
-                                          0,
-                                          0,
-                                          1,
-                                          1,
-                                          1,
-                                          VERNON_RHI_IMAGE_DATA_RGBA,
-                                          VERNON_RHI_IMAGE_DATA_UINT8,
-                                          color.data()};
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    upload.width = 1;
+    upload.height = 1;
+    upload.depth = 1;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    upload.data = color.data();
     ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK);
     auto sampler = vernon::tests::createSampler(context);
     ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -180,7 +186,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     VernonProgramArgument arguments[3]{};
     arguments[0].slot = imageParameter.slot;
     arguments[0].kind = VERNON_PROGRAM_IMAGE;
-    arguments[0].image = {sampled.reference};
+    arguments[0].image = {sampledView.reference};
     arguments[1].slot = positionParameter.slot;
     arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
@@ -195,14 +201,11 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     arguments[2].slot = samplerParameter.slot;
     arguments[2].kind = VERNON_PROGRAM_SAMPLER;
     arguments[2].resource = sampler.reference;
-    VernonColorAttachment attachment{0, target.reference};
+    VernonColorAttachment attachment{0, targetView.reference};
     VernonDepthAttachment depthAttachment{};
-    depthAttachment.view = depth.reference;
-    depthAttachment.width = 32;
-    depthAttachment.height = 32;
-    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT;
-    depthAttachment.load_operation = VERNON_RHI_LOAD_CLEAR;
-    depthAttachment.store_operation = VERNON_RHI_STORE_PRESERVE;
+    depthAttachment.view = depthView.reference;
+    depthAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depthAttachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     depthAttachment.clear_depth = 1.0f;
     vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
     graphics.renderPass.depth_attachment = &depthAttachment;
@@ -240,6 +243,9 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_NEAR(pixels[center + 2], color[2], 2);
 
     EXPECT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(context.device, depthView.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(context.device, targetView.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(context.device, sampledView.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, depth.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
@@ -278,6 +284,9 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     auto target = createTexture2D(context, 32, 32);
     ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto targetView =
+        vernon::tests::createImageView(context, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     VernonProgramParameterView positionParameter{};
     ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
@@ -296,7 +305,7 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, target.reference};
+    VernonColorAttachment attachment{0, targetView.reference};
     vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1);
     graphics.dynamic.viewport[2] = 8;
     graphics.dynamic.viewport[3] = 16;
@@ -330,6 +339,7 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     EXPECT_NEAR(pixels[attachmentCenter + 1], 255, 2);
     EXPECT_NEAR(pixels[attachmentCenter + 2], 0, 2);
 
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(context.device, targetView.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeProgramExecutableDestroy(pipeline);

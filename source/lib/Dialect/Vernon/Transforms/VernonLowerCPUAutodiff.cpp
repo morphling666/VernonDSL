@@ -305,7 +305,7 @@ private:
                                                  moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
             addressHelper.setPrivate();
             addressHelper->setAttr("llvm.linkage",
-                                   LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+                                   LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::External));
         }
         func::FuncOp laneAddressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_LANE_ADDRESS_SYMBOL);
         if (!laneAddressHelper) {
@@ -316,7 +316,7 @@ private:
                                                      moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
             laneAddressHelper.setPrivate();
             laneAddressHelper->setAttr("llvm.linkage",
-                                       LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+                                       LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::External));
         }
         func::FuncOp leaderHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL);
         if (!leaderHelper) {
@@ -325,8 +325,7 @@ private:
             leaderHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL,
                                                 moduleBuilder.getFunctionType({}, {moduleBuilder.getI1Type()}));
             leaderHelper.setPrivate();
-            leaderHelper->setAttr("llvm.linkage",
-                                  LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+            leaderHelper->setAttr("llvm.linkage", LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::External));
         }
         for (auto [site, create] : llvm::enumerate(creates)) {
             const uint64_t siteId = uint64_t{1} << 63 | static_cast<uint64_t>(site);

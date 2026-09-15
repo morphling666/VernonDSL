@@ -188,7 +188,7 @@ vernon_add_runtime()
 
 option(VERNON_HOST_TAPE_INSTRUMENTATION "Instrument host autodiff tape traversal in test builds" ${BUILD_TESTING})
 if(VERNON_HOST_TAPE_INSTRUMENTATION)
-    target_compile_definitions(VernonRuntime PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
+    target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
 endif()
 
 option(VERNON_BUILD_IOS_METAL_SMOKE_HOST "Build the iOS Metal RHI smoke-test application" OFF)
@@ -235,22 +235,6 @@ install(
     COMPONENT VernonDevelopment)
 
 if(SKBUILD)
-    set(_vernon_apple_private_source_patterns)
-    if(NOT APPLE
-       AND NOT
-           CMAKE_SYSTEM_NAME
-           STREQUAL
-           "iOS")
-        list(
-            APPEND
-            _vernon_apple_private_source_patterns
-            PATTERN
-            "*metal*.mm"
-            EXCLUDE
-            PATTERN
-            "metal_backend.h"
-            EXCLUDE)
-    endif()
     install(
         FILES "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" "${CMAKE_CURRENT_SOURCE_DIR}/VERSION"
               "${CMAKE_CURRENT_SOURCE_DIR}/VernonRuntimeConfig.cmake.in"
@@ -264,6 +248,7 @@ if(SKBUILD)
         FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCpuWorkgroupABI.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGpuAutodiffAbi.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonResult.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonError.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonLifecycle.hpp"
@@ -293,7 +278,7 @@ if(SKBUILD)
         FILES_MATCHING
         PATTERN "*.cpp"
         PATTERN "*.mm"
-        PATTERN "*.h" ${_vernon_apple_private_source_patterns})
+        PATTERN "*.h")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/"
         DESTINATION vernon_dsl/runtime_src/lib/execution_graph
@@ -308,7 +293,8 @@ if(SKBUILD)
         FILES_MATCHING
         PATTERN "*.cpp"
         PATTERN "*.mm"
-        PATTERN "*.h" ${_vernon_apple_private_source_patterns})
+        PATTERN "*.h"
+        PATTERN "*.hlsl")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"
         DESTINATION vernon_dsl/runtime_src/lib/platform
@@ -317,10 +303,9 @@ if(SKBUILD)
         PATTERN "*.cpp"
         PATTERN "*.h")
     install(
-        DIRECTORY "${_vernon_repository_root}/cmake/"
+        FILES "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
+              "${_vernon_repository_root}/cmake/IncludeNlohmannJson.cmake"
+              "${_vernon_repository_root}/cmake/IncludeVulkanHeaders.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake
-        COMPONENT VernonWheel
-        FILES_MATCHING
-        PATTERN "IncludeNlohmannJson.cmake"
-        PATTERN "IncludeVulkanHeaders.cmake")
+        COMPONENT VernonWheel)
 endif()

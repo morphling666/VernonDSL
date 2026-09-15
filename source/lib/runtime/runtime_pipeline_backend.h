@@ -4,6 +4,7 @@
 #include "backend_stage_pipeline.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "prepared_binding_plan.h"
 #include "runtime_state.h"
 
 #include <optional>
@@ -29,14 +30,6 @@ inline std::optional<VernonRuntimeProviderBindingKind> providerBindingKindForTra
         return VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
     return std::nullopt;
 }
-
-struct OpenGLNativeUniformShape {
-    uint32_t scalarCount{};
-    uint32_t matrixColumns{1};
-};
-
-bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
-                                     OpenGLNativeUniformShape &result);
 
 inline void configureComputeValueStorage(const ParameterUse &use, VernonRuntimeProviderBindingLayoutEntry &layout) {
     if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && use.interfaceKind == "value" &&

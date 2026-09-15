@@ -1,7 +1,6 @@
 #include "execution_graph/command_graph.h"
 
 #include "execution_graph_internal.h"
-#include "rhi/rhi_internal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -192,23 +191,6 @@ VernonRhiStatus detail::executeCpuScheduleRange(VernonRhiDevice device, const st
     return VERNON_RHI_STATUS_OK;
 }
 
-static uint32_t commandAccessBits(const detail::CommandResourceAccess &access) {
-    const bool reads = access.access != AccessMode::Write;
-    const bool writesResource = access.access != AccessMode::Read;
-    if (access.state == VERNON_RHI_STATE_COLOR_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_COLOR_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_COLOR_WRITE : 0);
-    if (access.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_DEPTH_STENCIL_READ : 0) |
-               (writesResource ? VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE : 0);
-    if (access.state == VERNON_RHI_STATE_TRANSFER_SOURCE)
-        return VERNON_RHI_ACCESS_TRANSFER_READ;
-    if (access.state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
-        return VERNON_RHI_ACCESS_TRANSFER_WRITE;
-    if (access.state == VERNON_RHI_STATE_SHADER_READ || access.state == VERNON_RHI_STATE_SHADER_WRITE)
-        return (reads ? VERNON_RHI_ACCESS_SHADER_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_SHADER_WRITE : 0);
-    return VERNON_RHI_ACCESS_NONE;
-}
-
 static VernonRhiImageSubresourceRange commandImageIntersection(const VernonRhiImageSubresourceRange &left,
                                                                const VernonRhiImageSubresourceRange &right) {
     const auto interval = [](uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
@@ -267,8 +249,8 @@ buildRhiCommandBarriers(const detail::CommandDag &dag,
                 barrier.struct_size = sizeof(barrier);
                 barrier.source_stage_mask = previous.stageMask;
                 barrier.destination_stage_mask = access.stageMask;
-                barrier.source_access = commandAccessBits(previous);
-                barrier.destination_access = commandAccessBits(access);
+                barrier.source_access = detail::commandAccessMask(previous);
+                barrier.destination_access = detail::commandAccessMask(access);
                 barrier.old_state = previous.state;
                 barrier.new_state = access.state;
                 barrier.is_image = access.kind == ResourceKind::Image;

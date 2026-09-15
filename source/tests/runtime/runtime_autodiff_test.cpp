@@ -543,7 +543,7 @@ TEST(RuntimeAutodiffTapeAllocator, AppendsAcrossConcurrentArenaChunks) {
     using namespace vernon::runtime::ad;
     constexpr size_t laneCount = 16;
     constexpr size_t recordsPerLane = 64;
-    constexpr size_t payloadSize = 128;
+    static constexpr size_t payloadSize = 128;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
     auto budget = reserveBudget(policy, policy->contextLimit());
     ASSERT_NE(budget, nullptr);

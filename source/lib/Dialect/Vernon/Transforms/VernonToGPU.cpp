@@ -328,12 +328,6 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<TensorType>(type)) {
-                        if (!useSpirvStorage) {
-                            unsigned kernelIndex = kernelArgumentTypes.size();
-                            kernelArgumentTypes.push_back(type);
-                            sourceArgumentRanges[index] = {kernelIndex, 1};
-                            continue;
-                        }
                         FailureOr<ValueAbiLayout> layout = getValueStorageLayout(tensor.getElementType(), module);
                         if (failed(layout) || layout->leaves.empty() || layout->size % sizeof(uint32_t) != 0 ||
                             llvm::any_of(layout->leaves, [](const ValueAbiLeaf &leaf) {
@@ -344,7 +338,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                             return signalPassFailure();
                         }
                         unsigned kernelIndex = kernelArgumentTypes.size();
-                        kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), true));
+                        kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), useSpirvStorage));
                         resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
                         sourceArgumentRanges[index] = {kernelIndex, 1};
                         aggregateTensorArguments[index] = tensor;
@@ -361,14 +355,8 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                                                << " must have a positive static shape and scalar element type";
                             return signalPassFailure();
                         }
-                        if (!useSpirvStorage) {
-                            unsigned kernelIndex = kernelArgumentTypes.size();
-                            kernelArgumentTypes.push_back(type);
-                            sourceArgumentRanges[index] = {kernelIndex, 1};
-                            continue;
-                        }
                         unsigned kernelIndex = kernelArgumentTypes.size();
-                        kernelArgumentTypes.push_back(convertStorageLeaf(tensor.getElementType(), true));
+                        kernelArgumentTypes.push_back(convertStorageLeaf(tensor.getElementType(), useSpirvStorage));
                         resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
                         inlineTensorArguments.push_back({static_cast<unsigned>(index), kernelIndex, tensor});
                         continue;
@@ -404,11 +392,15 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             auto functionType = moduleBuilder.getFunctionType(kernelArgumentTypes, TypeRange{});
             auto kernel = gpu::GPUFuncOp::create(moduleBuilder, source.getLoc(), source.getSymName(), functionType);
             kernel->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), moduleBuilder.getUnitAttr());
-            for (const auto &[sourceIndex, range] : sourceArgumentRanges)
+            for (const auto &[sourceIndex, range] : sourceArgumentRanges) {
                 for (StringRef name : {"vernon.autodiff_role", "vernon.autodiff_source", "vernon.autodiff_carrier"})
                     if (Attribute value = source.getArgAttr(sourceIndex, name))
                         for (unsigned offset = 0; offset < range.second; ++offset)
                             kernel.setArgAttr(range.first + offset, name, value);
+                if (auto texture = dyn_cast<TextureType>(source.getArgument(sourceIndex).getType()))
+                    kernel.setArgAttr(range.first, "vernon.texture_access",
+                                      moduleBuilder.getStringAttr(texture.getAccess()));
+            }
             for (unsigned sourceIndex = 0; sourceIndex < source.getNumArguments(); ++sourceIndex) {
                 auto component = source.getArgAttrOfType<StringAttr>(sourceIndex, kTensorDescriptorComponentAttrName);
                 auto range = sourceArgumentRanges.find(sourceIndex);

@@ -1,6 +1,26 @@
 cmake_minimum_required(VERSION 3.20)
 
-file(READ "${CMAKE_CURRENT_LIST_DIR}/../../source/lib/runtime/VERSION" _vernon_runtime_version)
+find_package(
+    Python 3.11...<3.15
+    COMPONENTS Interpreter
+    REQUIRED)
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m vernon_dsl.runtime_source --cmake-dir
+    RESULT_VARIABLE _vernon_runtime_source_result
+    OUTPUT_VARIABLE VERNON_RUNTIME_SOURCE_DIR
+    ERROR_VARIABLE _vernon_runtime_source_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT
+   _vernon_runtime_source_result
+   EQUAL
+   0
+   OR NOT EXISTS "${VERNON_RUNTIME_SOURCE_DIR}/CMakeLists.txt")
+    message(
+        FATAL_ERROR
+            "Python '${Python_EXECUTABLE}' did not provide VernonRuntime sources from an installed vernon-lang wheel: ${_vernon_runtime_source_error}"
+    )
+endif()
+file(READ "${VERNON_RUNTIME_SOURCE_DIR}/VERSION" _vernon_runtime_version)
 string(STRIP "${_vernon_runtime_version}" _vernon_runtime_version)
 project(
     VernonExternalEngine
@@ -154,8 +174,25 @@ else()
         message(FATAL_ERROR "Desktop requires native CPU and OpenGL bundles")
     endif()
     set(_vernon_runtime_profile desktop)
-    include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/IncludeGlfw.cmake")
-    include_glfw()
+    include(FetchContent)
+    set(GLFW_BUILD_DOCS
+        OFF
+        CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES
+        OFF
+        CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS
+        OFF
+        CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL
+        OFF
+        CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY "https://github.com/glfw/glfw.git"
+        GIT_TAG "3.4"
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(glfw)
 endif()
 
 set(VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST "${_vernon_graphics_external_manifest}")
@@ -166,6 +203,47 @@ else()
     set(VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
     set(VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}")
 endif()
+
+function(
+    vernon_chunk_raw_string
+    input_variable
+    delimiter
+    output_variable)
+    set(content "${${input_variable}}")
+    set(literal)
+    set(first_chunk TRUE)
+    string(LENGTH "${content}" remaining)
+    while(remaining GREATER 0)
+        if(remaining GREATER 12000)
+            set(chunk_size 12000)
+        else()
+            set(chunk_size "${remaining}")
+        endif()
+        string(
+            SUBSTRING "${content}"
+                      0
+                      "${chunk_size}"
+                      chunk)
+        if(NOT first_chunk)
+            string(APPEND literal ")${delimiter}\"\n    R\"${delimiter}(")
+        endif()
+        string(APPEND literal "${chunk}")
+        set(first_chunk FALSE)
+        string(
+            SUBSTRING "${content}"
+                      "${chunk_size}"
+                      -1
+                      content)
+        string(LENGTH "${content}" remaining)
+    endwhile()
+    set(${output_variable}
+        "${literal}"
+        PARENT_SCOPE)
+endfunction()
+
+vernon_chunk_raw_string(VERNON_EXTERNAL_ENGINE_CPU_MANIFEST vernon_cpu VERNON_EXTERNAL_ENGINE_CPU_MANIFEST_LITERAL)
+vernon_chunk_raw_string(VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST vernon_graphics
+                        VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST_LITERAL)
 configure_file(embedded_bundles.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_bundles.h" @ONLY)
 
 set(VERNON_RUNTIME_PROFILE
@@ -189,7 +267,8 @@ set(VERNON_ENABLE_DIRECTX12_RUNTIME
 set(BUILD_TESTING
     OFF
     CACHE BOOL "" FORCE)
-add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../source/lib/runtime" "${CMAKE_CURRENT_BINARY_DIR}/vernon-runtime")
+message(STATUS "Using VernonRuntime sources from installed wheel: ${VERNON_RUNTIME_SOURCE_DIR}")
+add_subdirectory("${VERNON_RUNTIME_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vernon-runtime")
 
 add_executable(
     vernon-external-engine
@@ -204,7 +283,7 @@ target_include_directories(vernon-external-engine PRIVATE "${CMAKE_CURRENT_BINAR
                                                           "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
 target_compile_definitions(vernon-external-engine
                            PRIVATE "VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION=${_vernon_registration_function}")
-target_link_libraries(vernon-external-engine PRIVATE VernonRuntime)
+target_link_libraries(vernon-external-engine PRIVATE VernonRuntime Vernon::RHI)
 if(NOT EMSCRIPTEN)
     target_link_libraries(vernon-external-engine PRIVATE glfw)
 endif()
@@ -228,3 +307,8 @@ if(EMSCRIPTEN)
                 "$<TARGET_FILE_DIR:vernon-external-engine>/index.html"
         VERBATIM)
 endif()
+
+enable_testing()
+add_test(NAME vernon-external-engine-headless COMMAND vernon-external-engine --headless)
+set_tests_properties(vernon-external-engine-headless PROPERTIES PASS_REGULAR_EXPRESSION
+                                                                "Vernon CPU fractal headless checksum: [1-9]")

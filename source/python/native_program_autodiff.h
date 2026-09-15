@@ -2,8 +2,7 @@
 #define VERNON_PYTHON_NATIVE_PROGRAM_AUTODIFF_H
 
 #include "native_program.h"
-#include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime/program_boundary_view.h"
+#include "runtime/runtime_python_bridge.h"
 
 #include <deque>
 #include <limits>
@@ -77,71 +76,88 @@ struct PythonPullback {
                                      const nb::object &cotangentGroups, const nb::object &carrierShape,
                                      const nb::object &context, const nb::callable &admit,
                                      const VernonPullbackApplyOptions *options);
-    size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
-    size_t residentBytes() const { return memoryUsage().residentBytes; }
-    size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
-    size_t retainedAllocationBytes() const { return memoryUsage().retainedAllocationBytes; }
-    size_t peakTemporaryBytes() const { return memoryUsage().peakTemporaryBytes; }
+    size_t logicalResidualBytes() const { return memoryUsage().logical_residual_bytes; }
+    size_t residentBytes() const { return memoryUsage().resident_bytes; }
+    size_t allocatedBytes() const { return memoryUsage().allocated_bytes; }
+    size_t retainedAllocationBytes() const { return memoryUsage().retained_allocation_bytes; }
+    size_t peakTemporaryBytes() const { return memoryUsage().peak_temporary_bytes; }
     uint64_t submissionCount() const { return controlPlaneUsage().submissions; }
     uint64_t waitCount() const { return controlPlaneUsage().waits; }
     uint64_t readbackCount() const { return controlPlaneUsage().readbacks; }
-    uint64_t atomicPublicationCount() const { return controlPlaneUsage().atomicPublications; }
-    uint64_t temporaryAllocationTrafficBytes() const { return controlPlaneUsage().temporaryAllocationBytes; }
-    uint64_t deviceWaitNanoseconds() const { return controlPlaneUsage().deviceWaitNanoseconds; }
-    size_t tapeContextLimitBytes() const { return vernon::runtime::autodiffHostTapeContextLimit(runtime); }
-    uint64_t peakRuntimeManagedBytes() const {
-        return vernon::runtime::autodiffPullbackPeakRuntimeManagedBytes(handle);
-    }
+    uint64_t atomicPublicationCount() const { return controlPlaneUsage().atomic_publications; }
+    uint64_t temporaryAllocationTrafficBytes() const { return controlPlaneUsage().temporary_allocation_bytes; }
+    uint64_t deviceWaitNanoseconds() const { return controlPlaneUsage().device_wait_nanoseconds; }
+    size_t tapeContextLimitBytes() const { return vernonRuntimePrivateGetAutodiffHostTapeContextLimit(runtime); }
+    uint64_t peakRuntimeManagedBytes() const { return vernonRuntimePrivateGetAutodiffPeakRuntimeManagedBytes(handle); }
     nb::object checkpointPlan() const {
-        const vernon::runtime::AutodiffPullbackCheckpointPlan plan =
-            vernon::runtime::autodiffPullbackCheckpointPlan(handle);
-        if (!plan.present)
-            return nb::none();
-        nb::dict result;
-        result["peak_bytes"] = plan.peakBytes;
-        result["memory_budget"] = plan.memoryBudget;
-        result["logical_residual_bytes"] = plan.logicalResidualBytes;
-        result["retained_allocation_bytes"] = plan.retainedAllocationBytes;
-        result["initial_state_bytes"] = plan.initialStateBytes;
-        result["restoration_bytes"] = plan.restorationBytes;
-        result["transaction_bytes"] = plan.transactionBytes;
-        result["persistent_checkpoint_bytes"] = plan.persistentCheckpointBytes;
-        result["backward_value_bytes"] = plan.backwardValueBytes;
-        result["replay_cost"] = plan.replayCost;
-        result["recomputation_cost"] = plan.recomputationCost;
-        result["selected_policy"] = plan.selectedPolicy;
+        nb::object result = nb::none();
+        const VernonStatus status = vernonRuntimePrivateVisitAutodiffCheckpointPlan(
+            handle,
+            [](void *userData, const VernonRuntimePrivateAutodiffCheckpointPlan *plan) {
+                if (!plan->present)
+                    return;
+                nb::dict value;
+                value["peak_bytes"] = plan->peak_bytes;
+                value["memory_budget"] = plan->memory_budget;
+                value["logical_residual_bytes"] = plan->logical_residual_bytes;
+                value["retained_allocation_bytes"] = plan->retained_allocation_bytes;
+                value["initial_state_bytes"] = plan->initial_state_bytes;
+                value["restoration_bytes"] = plan->restoration_bytes;
+                value["transaction_bytes"] = plan->transaction_bytes;
+                value["persistent_checkpoint_bytes"] = plan->persistent_checkpoint_bytes;
+                value["backward_value_bytes"] = plan->backward_value_bytes;
+                value["replay_cost"] = plan->replay_cost;
+                value["recomputation_cost"] = plan->recomputation_cost;
+                value["selected_policy"] = nativeStringView(plan->selected_policy);
+                *static_cast<nb::object *>(userData) = std::move(value);
+            },
+            &result);
+        if (status != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query pullback checkpoint plan");
         return result;
     }
     nb::list passTelemetry() const {
         nb::list result;
-        for (const vernon::runtime::AutodiffPullbackPassTelemetry &item :
-             vernon::runtime::autodiffPullbackPassTelemetry(handle)) {
-            nb::dict telemetry;
-            telemetry["schedule_offset"] = item.scheduleOffset;
-            telemetry["pass_name"] = item.passName;
-            telemetry["residual_source_kind"] = item.residualSourceKind;
-            telemetry["control_history_kind"] = item.controlHistoryKind;
-            telemetry["estimated_tape_bytes"] = item.estimatedTapeBytes;
-            telemetry["logical_residual_bytes"] = item.logicalResidualBytes;
-            telemetry["resident_tape_bytes"] = item.residentTapeBytes;
-            telemetry["allocated_tape_bytes"] = item.allocatedTapeBytes;
-            telemetry["retained_allocation_bytes"] = item.retainedAllocationBytes;
-            telemetry["peak_temporary_tape_bytes"] = item.peakTemporaryTapeBytes;
-            telemetry["checkpoint_bytes"] = item.checkpointBytes;
-            telemetry["active_operation_count"] = item.activeOperationCount;
-            telemetry["recomputation_cost"] = item.recomputationCost;
-            result.append(std::move(telemetry));
-        }
+        const VernonStatus status = vernonRuntimePrivateVisitAutodiffPassTelemetry(
+            handle,
+            [](void *userData, const VernonRuntimePrivateAutodiffPassTelemetry *item) {
+                nb::dict telemetry;
+                telemetry["schedule_offset"] = item->schedule_offset;
+                telemetry["pass_name"] = nativeStringView(item->pass_name);
+                telemetry["residual_source_kind"] = nativeStringView(item->residual_source_kind);
+                telemetry["control_history_kind"] = nativeStringView(item->control_history_kind);
+                telemetry["estimated_tape_bytes"] = item->estimated_tape_bytes;
+                telemetry["logical_residual_bytes"] = item->logical_residual_bytes;
+                telemetry["resident_tape_bytes"] = item->resident_tape_bytes;
+                telemetry["allocated_tape_bytes"] = item->allocated_tape_bytes;
+                telemetry["retained_allocation_bytes"] = item->retained_allocation_bytes;
+                telemetry["peak_temporary_tape_bytes"] = item->peak_temporary_tape_bytes;
+                telemetry["checkpoint_bytes"] = item->checkpoint_bytes;
+                telemetry["active_operation_count"] = item->active_operation_count;
+                telemetry["recomputation_cost"] = item->recomputation_cost;
+                static_cast<nb::list *>(userData)->append(std::move(telemetry));
+            },
+            &result);
+        if (status != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query pullback pass telemetry");
         return result;
     }
     const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
 private:
-    vernon::runtime::AutodiffPullbackMemoryUsage memoryUsage() const {
-        return vernon::runtime::autodiffPullbackMemoryUsage(handle);
+    VernonRuntimePrivateAutodiffMemoryUsage memoryUsage() const {
+        VernonRuntimePrivateAutodiffMemoryUsage result{};
+        result.struct_size = sizeof(result);
+        if (vernonRuntimePrivateGetAutodiffMemoryUsage(handle, &result) != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query pullback memory usage");
+        return result;
     }
-    vernon::runtime::AutodiffPullbackControlPlaneUsage controlPlaneUsage() const {
-        return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
+    VernonRuntimePrivateAutodiffControlPlaneUsage controlPlaneUsage() const {
+        VernonRuntimePrivateAutodiffControlPlaneUsage result{};
+        result.struct_size = sizeof(result);
+        if (vernonRuntimePrivateGetAutodiffControlPlaneUsage(handle, &result) != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query pullback control-plane usage");
+        return result;
     }
 
     nb::dict applyImpl(const nb::object &cotangent, const nb::object &context, const nb::callable &admit,
@@ -292,7 +308,7 @@ private:
             if (parameter.kind != VERNON_PROGRAM_TENSOR)
                 throw std::invalid_argument("Program derivative boundary must be a Tensor");
             if (nb::hasattr(source, "_resident_buffer") && nb::hasattr(source, "layout") &&
-                vernon::runtime::autodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+                vernonRuntimePrivateGetAutodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX) {
                 nb::object bufferObject = source.attr("_resident_buffer")(context);
                 auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
                 nb::object layout = source.attr("layout");
@@ -355,7 +371,8 @@ private:
                 if (!sharedGradient)
                     gradientSources.push_back(source.ptr());
             }
-            bool directDevice = vernon::runtime::autodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX;
+            bool directDevice =
+                vernonRuntimePrivateGetAutodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX;
             nb::object bufferObject = nb::none();
             nb::tuple boundaryLayout;
             if (nb::hasattr(binding, "_gradient_boundary_layout") && directDevice) {
@@ -623,15 +640,20 @@ struct PythonProgramExecutable {
 
     nb::dict programAbi() const {
         nb::list slots;
-        for (const vernon::runtime::ProgramBoundaryView &slot : vernon::runtime::programBoundaryViews(*executable)) {
-            nb::dict row;
-            row["slot"] = slot.slot;
-            row["path"] = slot.path;
-            row["value"] = slot.value;
-            row["role"] = slot.role;
-            row["category"] = slot.category;
-            slots.append(std::move(row));
-        }
+        const VernonStatus status = vernonRuntimePrivateVisitProgramBoundaries(
+            executable,
+            [](void *userData, const VernonRuntimePrivateProgramBoundary *slot) {
+                nb::dict row;
+                row["slot"] = slot->slot;
+                row["path"] = nativeStringView(slot->path);
+                row["value"] = slot->value;
+                row["role"] = nativeStringView(slot->role);
+                row["category"] = nativeStringView(slot->category);
+                static_cast<nb::list *>(userData)->append(std::move(row));
+            },
+            &slots);
+        if (status != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query Program boundary ABI");
         nb::dict result;
         result["boundary_slots"] = std::move(slots);
         return result;

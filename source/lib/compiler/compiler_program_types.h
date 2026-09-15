@@ -3,6 +3,7 @@
 
 #include "llvm/Support/JSON.h"
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -33,6 +34,7 @@ struct CanonicalProgramStage {
     ProgramTargetImplementation targetImplementation;
     std::string targetIdentity;
     std::optional<int64_t> pipelineVersion;
+    std::optional<uint64_t> minimumTapeStrideBytes;
 };
 
 } // namespace vernon::compiler

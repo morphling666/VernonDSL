@@ -131,7 +131,28 @@ coordinate is not a prefix).
 
 This is lemma `proveAffineInvocationOwnedIndex`.
 
-### 3.4 Strict invocation ownership
+### 3.4 Static workgroup-radix linearization
+
+A rank-one index may pack adjacent global-id axes using the static workgroup
+extents:
+
+$$
+L = c + \alpha\left(g_a + W_a g_{a+1}
+  + W_a W_{a+1} g_{a+2}\right), \qquad \alpha \ne 0.
+$$
+
+Every packed axis except the most significant is added to `unit_grid_axes`.
+This constrains its global-id range to exactly its static workgroup extent, so
+the expression is a unique mixed-radix encoding. Axes outside the packed range
+must have unit workgroup size and are also added to `unit_grid_axes`.
+
+This admits multidimensional workgroups writing a flat TensorView without
+weakening the proof for arbitrary grids. For example, with
+`workgroup_size = (8, 4, 1)`, `gid.x + 8 * gid.y` is accepted with residual
+`unit_grid_axes = [0, 2]`; allowing more than one x workgroup would invalidate
+the radix bound and is therefore rejected at dispatch.
+
+### 3.5 Strict invocation ownership
 
 `proveStrictInvocationOwnedIndex` is the same unique-axis matching with no
 unknown dimensions, no unit-axis residual, and $|A| = 3$. It is the

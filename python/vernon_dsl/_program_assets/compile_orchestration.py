@@ -163,6 +163,7 @@ def _specialize_program_implementations(
                 implementation.kind,
                 mlir,
                 implementation.host_constants,
+                implementation.graphics_stages,
             )
         )
     return tuple(specialized)

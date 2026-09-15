@@ -1,6 +1,8 @@
 #ifndef VERNON_RUNTIME_PROGRAM_EXECUTION_FAILURE_INJECTION_H
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_FAILURE_INJECTION_H
 
+#include "VernonRuntime.h"
+
 #include <cstddef>
 
 namespace vernon::runtime::program_execution {

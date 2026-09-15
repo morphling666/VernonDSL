@@ -65,6 +65,19 @@ bool appendCompiledProgramModule(CanonicalProgramStage &stage, const std::string
     if (!appendProgramTargetModuleMetadata(stage, reflection, error) ||
         !appendPortableFeatures(stage.portableReflection, reflection, error))
         return false;
+    const std::optional<int64_t> minimumStride = reflection.getInteger("minimum_tape_stride_bytes");
+    if (minimumStride) {
+        if (*minimumStride <= 0) {
+            error = "compiled Program module has a non-positive minimum autodiff tape stride";
+            return false;
+        }
+        if (stage.minimumTapeStrideBytes && *stage.minimumTapeStrideBytes != static_cast<uint64_t>(*minimumStride)) {
+            error = "compiled Program modules disagree on the minimum autodiff tape stride (" +
+                    std::to_string(*stage.minimumTapeStrideBytes) + " versus " + std::to_string(*minimumStride) + ")";
+            return false;
+        }
+        stage.minimumTapeStrideBytes = static_cast<uint64_t>(*minimumStride);
+    }
     llvm::json::Array *entries = stage.portableReflection.getArray("entries");
     if (!entries)
         return error = "compiled Program aggregation lost its entries", false;

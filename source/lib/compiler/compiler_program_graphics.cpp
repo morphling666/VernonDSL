@@ -267,7 +267,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                             {"descriptor", true},
                             {"element_layout_hash", layout->getString("layout_hash").value_or("").str()},
                             {"minimum_alignment", layout->getInteger("alignment").value_or(0)}};
-                    plan.endpoints.emplace_back(llvm::json::Object{
+                    llvm::json::Object endpoint{
                         {"tag", "resource"},
                         {"module", role.str()},
                         {"interface", interfaceKind.str()},
@@ -282,7 +282,10 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         {"transport", "resource_handle"},
                         {"access", resources.at(valueId).access},
                         {"abi", llvm::json::Object{{"bindings", std::move(abiBindings)}}},
-                    });
+                    };
+                    if (const std::optional<llvm::StringRef> sourceName = row->getString("vernon.source_name"))
+                        endpoint["source_name"] = sourceName->str();
+                    plan.endpoints.emplace_back(std::move(endpoint));
                     plan.endpointBindings.emplace_back(llvm::json::Object{{"module", role.str()},
                                                                           {"interface", interfaceKind.str()},
                                                                           {"index", endpointIndex},
@@ -294,8 +297,10 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         if (!plan.vertexCountValue)
                             plan.vertexCountValue = valueId;
                         const int64_t divisor = row->getInteger("vernon.instance_divisor").value_or(0);
-                        if (divisor < 0) {
-                            error = "compiled graphics vertex input has a negative instance divisor";
+                        const int64_t byteStride = row->getInteger("attribute_byte_stride").value_or(0);
+                        if (divisor < 0 || byteStride <= 0) {
+                            error = divisor < 0 ? "compiled graphics vertex input has a negative instance divisor"
+                                                : "compiled graphics vertex input has no canonical attribute stride";
                             return false;
                         }
                         for (const llvm::json::Value &leafValue : *row->getArray("attribute_leaves"))
@@ -307,7 +312,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                                      programGraphicsVertexFormat(leaf->getString("dtype").value_or("f32"),
                                                                  leaf->getInteger("component_count").value_or(1))},
                                     {"byte_offset", leaf->getInteger("byte_offset").value_or(0)},
-                                    {"byte_stride", layout->getInteger("byte_size").value_or(0)},
+                                    {"byte_stride", byteStride},
                                     {"step", divisor > 0 ? "instance" : "vertex"},
                                     {"divisor", divisor},
                                 });
@@ -320,7 +325,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                     }
                     abiBindings.emplace_back(llvm::json::Object{
                         {"semantic", "value"}, {"carrier", programValueCarrier("value_slot", nextSlot++, *layout)}});
-                    plan.endpoints.emplace_back(llvm::json::Object{
+                    llvm::json::Object endpoint{
                         {"tag", "value"},
                         {"module", role.str()},
                         {"interface", interfaceKind.str()},
@@ -330,7 +335,10 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         {"transport", "by_value"},
                         {"access", "read"},
                         {"abi", llvm::json::Object{{"bindings", std::move(abiBindings)}}},
-                    });
+                    };
+                    if (const std::optional<llvm::StringRef> sourceName = row->getString("vernon.source_name"))
+                        endpoint["source_name"] = sourceName->str();
+                    plan.endpoints.emplace_back(std::move(endpoint));
                     llvm::json::Array projections;
                     projections.emplace_back(
                         llvm::json::Object{{"value", valueId},

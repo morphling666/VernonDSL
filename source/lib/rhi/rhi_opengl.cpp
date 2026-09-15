@@ -26,6 +26,7 @@ using vernon::rhi::opengl::Image;
 using vernon::rhi::opengl::Int;
 using vernon::rhi::opengl::Size;
 using vernon::rhi::opengl::Uint;
+namespace gl = vernon::rhi::opengl;
 
 struct FormatInfo {
     Int internal{};
@@ -326,6 +327,29 @@ vernon::RhiError fail(OpenGLDevice &device, std::string message,
     return {code, {"opengl_backend", 0, 0}};
 }
 
+std::optional<vernon::RhiError> beginErrorScope(OpenGLDevice &device, const char *operation) {
+    if (!device.state.driver.getError)
+        return std::nullopt;
+    const Enum error = device.state.driver.getError();
+    if (error == 0)
+        return std::nullopt;
+    return fail(device,
+                std::string("OpenGL context had error ") + std::to_string(error) +
+                    " before entering Vernon operation '" + operation + "'",
+                vernon::RhiErrorCode::BackendFailure);
+}
+
+std::optional<vernon::RhiError> endErrorScope(OpenGLDevice &device, const char *operation,
+                                              vernon::RhiErrorCode code = vernon::RhiErrorCode::BackendFailure) {
+    if (!device.state.driver.getError)
+        return std::nullopt;
+    const Enum error = device.state.driver.getError();
+    if (error == 0)
+        return std::nullopt;
+    return fail(device, std::string("OpenGL operation '") + operation + "' failed with error " + std::to_string(error),
+                code);
+}
+
 vernon::Result<VernonRhiDevice, vernon::RhiError> createOpenGLDeviceImpl(const VernonOpenGLContextCallbacks *callbacks,
                                                                          bool embeddedProfile) {
     if (!callbacks)
@@ -374,8 +398,8 @@ Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDe
     if (descriptor->backend == VERNON_RHI_BACKEND_OPENGL || descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES)
         return createOpenGLDeviceImpl(descriptor->opengl_callbacks,
                                       descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES);
-    return Result<VernonRhiDevice, RhiError>{
-        err(RhiError{RhiErrorCode::Unsupported, {"create_owned_opengl_device", descriptor->backend, 0}})};
+    return Result<VernonRhiDevice, RhiError>{err(RhiError{
+        RhiErrorCode::Unsupported, {"create_owned_opengl_device", static_cast<uint64_t>(descriptor->backend), 0}})};
 }
 
 vernon::Result<void, vernon::RhiError> destroyDevice(VernonRhiDevice handle) noexcept {
@@ -614,6 +638,7 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
         (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers == 1) ||
         descriptor->dimension == VERNON_RHI_IMAGE_CUBE;
     OpenGLDevice &state = device.value().device();
+    const bool requiresImmutableStorage = (descriptor->usage & VERNON_RHI_IMAGE_STORAGE) != 0;
     if (!target || !formatInfo(descriptor->format, format) || descriptor->width == 0 || descriptor->height == 0 ||
         descriptor->depth == 0 || descriptor->mip_levels == 0 || descriptor->sample_count != 1 || !validCube ||
         !validDimension || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
@@ -640,21 +665,40 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
     {
         auto &driver = state.state.driver;
         driver.bindTexture(target, slot.image.name);
-        for (uint32_t mip = 0; mip < descriptor->mip_levels; ++mip) {
-            const Size mipWidth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->width, mip));
-            const Size mipHeight = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->height, mip));
-            const Size mipDepth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->depth, mip));
-            if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
-                driver.texImage3D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, mipDepth, 0,
-                                  format.external, format.allocationType, nullptr);
-            } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
-                for (uint32_t face = 0; face < 6; ++face)
-                    driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, static_cast<Int>(mip),
-                                      format.internal, mipWidth, mipHeight, 0, format.external, format.allocationType,
-                                      nullptr);
-            } else {
-                driver.texImage2D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, 0,
-                                  format.external, format.allocationType, nullptr);
+        const bool immutableStorage =
+            driver.texStorage2D && (descriptor->dimension != VERNON_RHI_IMAGE_3D || driver.texStorage3D);
+        if (requiresImmutableStorage && !immutableStorage) {
+            driver.bindTexture(target, 0);
+            state.state.destroyImage(slot.image);
+            return Result<VernonRhiImage, RhiError>{
+                err(fail(state, "OpenGL storage images require immutable texture storage", RhiErrorCode::Unsupported))};
+        }
+        if (immutableStorage) {
+            if (descriptor->dimension == VERNON_RHI_IMAGE_3D)
+                driver.texStorage3D(target, static_cast<Size>(descriptor->mip_levels),
+                                    static_cast<Enum>(format.internal), static_cast<Size>(descriptor->width),
+                                    static_cast<Size>(descriptor->height), static_cast<Size>(descriptor->depth));
+            else
+                driver.texStorage2D(target, static_cast<Size>(descriptor->mip_levels),
+                                    static_cast<Enum>(format.internal), static_cast<Size>(descriptor->width),
+                                    static_cast<Size>(descriptor->height));
+        } else {
+            for (uint32_t mip = 0; mip < descriptor->mip_levels; ++mip) {
+                const Size mipWidth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->width, mip));
+                const Size mipHeight = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->height, mip));
+                const Size mipDepth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->depth, mip));
+                if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
+                    driver.texImage3D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, mipDepth, 0,
+                                      format.external, format.allocationType, nullptr);
+                } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
+                    for (uint32_t face = 0; face < 6; ++face)
+                        driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, static_cast<Int>(mip),
+                                          format.internal, mipWidth, mipHeight, 0, format.external,
+                                          format.allocationType, nullptr);
+                } else {
+                    driver.texImage2D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, 0,
+                                      format.external, format.allocationType, nullptr);
+                }
             }
         }
         driver.bindTexture(target, 0);
@@ -905,9 +949,22 @@ Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiIma
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"generate_opengl_mipmaps", image.generation, image.index}})};
     state.state.makeCurrent();
+    if (auto scopeError = beginErrorScope(state, "generate image mipmaps"))
+        return Result<void, RhiError>{err(std::move(*scopeError))};
     state.state.driver.bindTexture(slot->target, slot->image.name);
     state.state.driver.generateMipmap(slot->target);
     state.state.driver.bindTexture(slot->target, 0);
+    constexpr Enum invalidOperation = 0x0502;
+    if (state.state.driver.getError) {
+        const Enum error = state.state.driver.getError();
+        if (error != 0)
+            return Result<void, RhiError>{err(fail(
+                state,
+                error == invalidOperation
+                    ? "OpenGL image format does not support mipmap generation (error " + std::to_string(error) + ")"
+                    : "OpenGL mipmap generation failed with error " + std::to_string(error),
+                error == invalidOperation ? RhiErrorCode::Unsupported : RhiErrorCode::BackendFailure))};
+    }
     return Result<void, RhiError>{ok()};
 }
 
@@ -1215,7 +1272,9 @@ Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint6
         if (state.state.driver.memoryBarrier)
             state.state.driver.memoryBarrier(
                 vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
-                vernon::rhi::opengl::kTextureFetchBarrierBit | vernon::rhi::opengl::kBufferUpdateBarrierBit);
+                vernon::rhi::opengl::kShaderImageAccessBarrierBit | vernon::rhi::opengl::kTextureFetchBarrierBit |
+                vernon::rhi::opengl::kTextureUpdateBarrierBit | vernon::rhi::opengl::kFramebufferBarrierBit |
+                vernon::rhi::opengl::kBufferUpdateBarrierBit);
         else
             state.state.driver.finish();
     }
@@ -1265,7 +1324,11 @@ Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKe
                 if (access & (VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE |
                               VERNON_RHI_ACCESS_DEPTH_STENCIL_READ | VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE))
                     bits |= vernon::rhi::opengl::kFramebufferBarrierBit;
-                if (access & (VERNON_RHI_ACCESS_TRANSFER_READ | VERNON_RHI_ACCESS_TRANSFER_WRITE))
+                if (access & VERNON_RHI_ACCESS_TRANSFER_READ)
+                    bits |= barriers[index].is_image ? vernon::rhi::opengl::kTextureUpdateBarrierBit |
+                                                           vernon::rhi::opengl::kFramebufferBarrierBit
+                                                     : vernon::rhi::opengl::kBufferUpdateBarrierBit;
+                if (access & VERNON_RHI_ACCESS_TRANSFER_WRITE)
                     bits |= barriers[index].is_image ? vernon::rhi::opengl::kTextureUpdateBarrierBit
                                                      : vernon::rhi::opengl::kBufferUpdateBarrierBit;
                 continue;
@@ -1276,7 +1339,9 @@ Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKe
                     bits |= vernon::rhi::opengl::kTextureFetchBarrierBit;
                 else if (state == VERNON_RHI_STATE_SHADER_WRITE)
                     bits |= vernon::rhi::opengl::kShaderImageAccessBarrierBit;
-                else if (state == VERNON_RHI_STATE_TRANSFER_SOURCE || state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
+                else if (state == VERNON_RHI_STATE_TRANSFER_SOURCE)
+                    bits |= vernon::rhi::opengl::kTextureUpdateBarrierBit | vernon::rhi::opengl::kFramebufferBarrierBit;
+                else if (state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
                     bits |= vernon::rhi::opengl::kTextureUpdateBarrierBit;
                 else if (state == VERNON_RHI_STATE_COLOR_ATTACHMENT ||
                          state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
@@ -1361,10 +1426,84 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
                                  : Result<void, RhiError>{err(std::move(destinationPin).error())};
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
-    if (!state.state.driver.copyImageSubData)
+    const bool framebufferCopy = sourceSlot->descriptor.dimension == VERNON_RHI_IMAGE_2D &&
+                                 destinationSlot->descriptor.dimension == VERNON_RHI_IMAGE_2D;
+    if (!framebufferCopy && !state.state.driver.copyImageSubData)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"recordImageCopy_opengl", native, 0}})};
+    if (auto scopeError = beginErrorScope(state, "copy image"))
+        return Result<void, RhiError>{err(std::move(*scopeError))};
+    Uint copyFramebuffers[2]{};
+    Int previousReadFramebuffer = 0;
+    Int previousDrawFramebuffer = 0;
+    if (framebufferCopy) {
+        if (!state.state.driver.blitFramebuffer)
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::Unsupported, {"recordImageCopy_opengl", native, 0}})};
+        state.state.driver.getIntegerv(gl::kReadFramebufferBinding, &previousReadFramebuffer);
+        state.state.driver.getIntegerv(gl::kDrawFramebufferBinding, &previousDrawFramebuffer);
+        state.state.driver.genFramebuffers(2, copyFramebuffers);
+        if (!copyFramebuffers[0] || !copyFramebuffers[1]) {
+            if (copyFramebuffers[0] || copyFramebuffers[1])
+                state.state.driver.deleteFramebuffers(2, copyFramebuffers);
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"recordImageCopy_opengl", native, 0}})};
+        }
+    }
+    const auto releaseCopyFramebuffers = [&] {
+        if (!framebufferCopy)
+            return;
+        state.state.driver.bindFramebuffer(gl::kReadFramebuffer, static_cast<Uint>(previousReadFramebuffer));
+        state.state.driver.bindFramebuffer(gl::kDrawFramebuffer, static_cast<Uint>(previousDrawFramebuffer));
+        state.state.driver.deleteFramebuffers(2, copyFramebuffers);
+    };
     for (size_t index = 0; index < regionCount; ++index) {
         const VernonRhiImageCopyRegion &region = regions[index];
+        if (framebufferCopy) {
+            const bool color = (region.aspects & VERNON_RHI_IMAGE_ASPECT_COLOR) != 0;
+            const bool depth = (region.aspects & VERNON_RHI_IMAGE_ASPECT_DEPTH) != 0;
+            const bool stencil = (region.aspects & VERNON_RHI_IMAGE_ASPECT_STENCIL) != 0;
+            const Enum attachment = color              ? gl::kColorAttachment0
+                                    : depth && stencil ? gl::kDepthStencilAttachment
+                                    : depth            ? gl::kDepthAttachment
+                                                       : gl::kStencilAttachment;
+            const gl::Bitfield mask =
+                (color ? 0x00004000u : 0u) | (depth ? 0x00000100u : 0u) | (stencil ? 0x00000400u : 0u);
+            if (!mask) {
+                releaseCopyFramebuffers();
+                return Result<void, RhiError>{err(RhiError{
+                    RhiErrorCode::InvalidArgument, {"recordImageCopy_opengl", native, static_cast<uint32_t>(index)}})};
+            }
+            state.state.driver.bindFramebuffer(gl::kReadFramebuffer, copyFramebuffers[0]);
+            state.state.driver.framebufferTexture2D(gl::kReadFramebuffer, attachment, sourceSlot->target,
+                                                    sourceSlot->image.name, static_cast<Int>(region.source_mip_level));
+            state.state.driver.readBuffer(color ? gl::kColorAttachment0 : gl::kNone);
+            state.state.driver.bindFramebuffer(gl::kDrawFramebuffer, copyFramebuffers[1]);
+            state.state.driver.framebufferTexture2D(gl::kDrawFramebuffer, attachment, destinationSlot->target,
+                                                    destinationSlot->image.name,
+                                                    static_cast<Int>(region.destination_mip_level));
+            const Enum drawBuffer = color ? gl::kColorAttachment0 : gl::kNone;
+            state.state.driver.drawBuffers(1, &drawBuffer);
+            const Enum readStatus = state.state.driver.checkFramebufferStatus(gl::kReadFramebuffer);
+            const Enum drawStatus = state.state.driver.checkFramebufferStatus(gl::kDrawFramebuffer);
+            if (readStatus != gl::kFramebufferComplete || drawStatus != gl::kFramebufferComplete) {
+                state.error = "OpenGL image copy framebuffer is incomplete (read=" + std::to_string(readStatus) +
+                              ", draw=" + std::to_string(drawStatus) + ")";
+                releaseCopyFramebuffers();
+                return Result<void, RhiError>{err(RhiError{
+                    RhiErrorCode::BackendFailure, {"recordImageCopy_opengl", native, static_cast<uint32_t>(index)}})};
+            }
+            state.state.driver.blitFramebuffer(
+                static_cast<Int>(region.source_x), static_cast<Int>(region.source_y),
+                static_cast<Int>(region.source_x + region.width), static_cast<Int>(region.source_y + region.height),
+                static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y),
+                static_cast<Int>(region.destination_x + region.width),
+                static_cast<Int>(region.destination_y + region.height), mask, 0x2600);
+            if (auto scopeError = endErrorScope(state, "copy image with framebuffer")) {
+                releaseCopyFramebuffers();
+                return Result<void, RhiError>{err(std::move(*scopeError))};
+            }
+            continue;
+        }
         const Int sourceZ = sourceSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
                                 ? static_cast<Int>(region.source_z)
                                 : static_cast<Int>(region.source_array_layer);
@@ -1377,7 +1516,12 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
             destinationSlot->target, static_cast<Int>(region.destination_mip_level),
             static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y), destinationZ,
             static_cast<Size>(region.width), static_cast<Size>(region.height), static_cast<Size>(region.depth));
+        if (auto scopeError = endErrorScope(state, "copy image"))
+            return Result<void, RhiError>{err(std::move(*scopeError))};
     }
+    releaseCopyFramebuffers();
+    if (auto scopeError = endErrorScope(state, "finish image copy"))
+        return Result<void, RhiError>{err(std::move(*scopeError))};
     return Result<void, RhiError>{ok()};
 }
 
@@ -1434,7 +1578,8 @@ Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, Verno
         state.state.driver.clearBufferfv(vernon::rhi::opengl::kColor, static_cast<Int>(location), color);
         return Result<void, RhiError>{ok()};
     }
-    return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_opengl", native, backend}})};
+    return Result<void, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_opengl", native, static_cast<uint32_t>(backend)}})};
 }
 
 Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
@@ -1465,8 +1610,8 @@ Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native
         }
         return Result<void, RhiError>{ok()};
     }
-    return Result<void, RhiError>{
-        err(RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_opengl", native, backend}})};
+    return Result<void, RhiError>{err(
+        RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_opengl", native, static_cast<uint32_t>(backend)}})};
 }
 
 #define VERNON_OPENGL_RESOURCE_RESULT(name, Handle, slots)                                                             \

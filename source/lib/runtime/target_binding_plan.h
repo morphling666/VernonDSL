@@ -108,7 +108,8 @@ struct TargetBinding {
     CarrierSemantic semantic{CarrierSemantic::Resource};
     std::optional<vernon::program_plan::TapeCarrier> tapeCarrier;
     std::string name;
-    std::string sourceName;
+    std::string logicalSourceName;
+    std::string stageSourceName;
     std::string kind;
     std::string reflectedKind;
     std::string role;

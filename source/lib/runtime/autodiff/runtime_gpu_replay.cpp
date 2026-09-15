@@ -1,5 +1,7 @@
 #include "runtime_gpu_replay.h"
 
+#include "VernonGpuAutodiffAbi.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -99,7 +101,7 @@ bool planBatchBudget(PlanningPolicy policy, size_t fixedBytes, size_t maximumByt
 }
 
 bool normalizeTapeStride(size_t requestedBytes, size_t &stride) {
-    requestedBytes = std::max(requestedBytes, size_t{16});
+    requestedBytes = std::max(requestedBytes, ::vernon::autodiff_abi::kInvocationHeaderBytes);
     if (requestedBytes > std::numeric_limits<size_t>::max() - 3)
         return false;
     stride = (requestedBytes + 3) & ~size_t{3};

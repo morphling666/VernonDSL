@@ -12,8 +12,8 @@
 
 namespace vernon::compiler_detail {
 
-VERNON_DSL_CAPI bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words,
-                                                  size_t expectedReplacementCount, std::string &diagnostics);
+bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words, size_t expectedReplacementCount,
+                                  std::string &diagnostics);
 
 } // namespace vernon::compiler_detail
 

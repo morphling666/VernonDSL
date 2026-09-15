@@ -28,22 +28,24 @@ function(vernon_stage_target_files destination_target)
         if(_vernon_runtime_files)
             list(APPEND _vernon_stage_files ${_vernon_runtime_files})
         endif()
+        set(_vernon_stage_commands)
+        foreach(_vernon_stage_file IN LISTS _vernon_stage_files)
+            list(
+                APPEND
+                _vernon_stage_commands
+                COMMAND
+                ${CMAKE_COMMAND}
+                "-DVERNON_STAGE_SOURCE=${_vernon_stage_file}"
+                "-DVERNON_STAGE_DESTINATION=$<TARGET_FILE_DIR:${destination_target}>"
+                "-DVERNON_STAGE_LOCK_ROOT=${CMAKE_BINARY_DIR}/CMakeFiles/vernon-runtime-stage-locks"
+                -P
+                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VernonStageRuntimeFile.cmake")
+        endforeach()
         add_custom_target(
             ${_vernon_stage_target} ALL
-            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${destination_target}>
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_vernon_stage_files}
-                    $<TARGET_FILE_DIR:${destination_target}>
+            ${_vernon_stage_commands}
             DEPENDS ${_vernon_stage_files}
             VERBATIM)
         add_dependencies(${destination_target} ${_vernon_stage_target})
-
-        # Retain the post-build copy for generators that build only the destination target and do not revisit already
-        # up-to-date ALL targets.
-        add_custom_command(
-            TARGET ${destination_target}
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_vernon_stage_files}
-                    $<TARGET_FILE_DIR:${destination_target}>
-            VERBATIM)
     endforeach()
 endfunction()

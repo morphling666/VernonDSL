@@ -123,6 +123,7 @@ struct PlanFixture {
         program.abi.tapePlans.push_back({2,
                                          true,
                                          true,
+                                         16,
                                          {vernon::program_plan::TapeCarrier::TapeData},
                                          {vernon::program_plan::TapeCarrier::ReplayStatus}});
         BoundarySlot commit;

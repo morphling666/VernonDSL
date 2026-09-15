@@ -271,9 +271,14 @@ LogicalResult materializeStorageImageInterfaceVariables(ModuleOp module) {
                 return function.emitError() << "storage image argument #" << index << " has no interface ABI";
             OpBuilder moduleBuilder(function);
             const std::string name = (function.getName() + "_storage_image_" + Twine(index)).str();
+            auto access = function.getArgAttrOfType<StringAttr>(index, "vernon.texture_access");
+            OpBuilder bodyBuilder = OpBuilder::atBlockBegin(&function.front());
             auto global = spirv::GlobalVariableOp::create(moduleBuilder, function.getLoc(), pointer, name,
                                                           abi.getDescriptorSet(), abi.getBinding());
-            OpBuilder bodyBuilder = OpBuilder::atBlockBegin(&function.front());
+            if (access && access.getValue() == "read")
+                global->setAttr("non_writable", moduleBuilder.getUnitAttr());
+            else if (access && access.getValue() == "write")
+                global->setAttr("non_readable", moduleBuilder.getUnitAttr());
             Value address = spirv::AddressOfOp::create(bodyBuilder, function.getLoc(), global);
             function.getArgument(index).replaceAllUsesWith(address);
             erase.set(index);

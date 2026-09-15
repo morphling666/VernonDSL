@@ -145,9 +145,21 @@ std::vector<unsigned char> textureStorage;
 std::vector<GlInt> framebufferTextureLayers;
 std::array<GlInt, 4> signedUniformUpload{};
 std::array<GlUint, 4> unsignedUniformUpload{};
+GlEnum pendingError = 0;
+GlEnum generatedMipmapError = 0;
+uint32_t generatedMipmapCount = 0;
 
 void makeCurrent(void *) { ++makeCurrentCount; }
 void GL_CALL objectNoop(GlUint) {}
+GlEnum GL_CALL getError() {
+    const GlEnum result = pendingError;
+    pendingError = 0;
+    return result;
+}
+void GL_CALL generateMipmap(GlEnum) {
+    ++generatedMipmapCount;
+    pendingError = generatedMipmapError;
+}
 void GL_CALL noArgsNoop() {}
 void GL_CALL objectPairNoop(GlUint, GlUint) {}
 void GL_CALL infoLogNoop(GlUint, GlSize, GlSize *length, char *) {
@@ -161,6 +173,7 @@ void GL_CALL framebufferTexture2DNoop(GlEnum, GlEnum, GlEnum, GlUint, GlInt) {}
 void GL_CALL framebufferTextureLayer(GlEnum, GlEnum, GlUint, GlInt, GlInt layer) {
     framebufferTextureLayers.push_back(layer);
 }
+void GL_CALL blitFramebufferNoop(GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, unsigned, GlEnum) {}
 void GL_CALL drawBuffersNoop(GlSize, const GlEnum *) {}
 void GL_CALL drawArraysInstanced(GlEnum, GlInt, GlSize, GlSize) { ++drawCount; }
 void GL_CALL uniformFvNoop(GlInt, GlSize, const float *) {}
@@ -250,15 +263,24 @@ void *GL_CALL mapBufferRange(GlEnum, std::intptr_t offset, std::intptr_t, unsign
     return bufferStorage.data() + offset;
 }
 GlBoolean GL_CALL unmapBuffer(GlEnum) { return 1; }
-void GL_CALL texImage2D(GlEnum, GlInt, GlInt, GlSize width, GlSize height, GlInt, GlEnum, GlEnum type, const void *) {
-    textureStorage.resize(static_cast<size_t>(width) * height * (type == 0x8DAD ? 8 : 4));
-    if (type == 0x8DAD)
+void initializeTextureStorage(GlSize width, GlSize height, bool depthStencil) {
+    textureStorage.resize(static_cast<size_t>(width) * height * (depthStencil ? 8 : 4));
+    if (depthStencil)
         for (size_t offset = 0; offset < textureStorage.size(); offset += 8) {
             constexpr float depth = 0.25f;
             constexpr uint32_t stencil = 7;
             std::memcpy(textureStorage.data() + offset, &depth, sizeof(depth));
             std::memcpy(textureStorage.data() + offset + sizeof(depth), &stencil, sizeof(stencil));
         }
+}
+void GL_CALL texImage2D(GlEnum, GlInt, GlInt, GlSize width, GlSize height, GlInt, GlEnum, GlEnum type, const void *) {
+    initializeTextureStorage(width, height, type == 0x8DAD);
+}
+void GL_CALL texStorage2D(GlEnum, GlSize, GlEnum internalFormat, GlSize width, GlSize height) {
+    initializeTextureStorage(width, height, internalFormat == 0x8CAD);
+}
+void GL_CALL texStorage3D(GlEnum, GlSize, GlEnum, GlSize width, GlSize height, GlSize depth) {
+    textureStorage.resize(static_cast<size_t>(width) * height * depth * 4);
 }
 void GL_CALL texSubImage2D(GlEnum, GlInt, GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnum,
                            const void *source) {
@@ -335,6 +357,7 @@ void *getProcAddress(void *, const char *name) {
     if (std::strcmp(name, glName) == 0)                                                                                \
     return reinterpret_cast<void *>(&function)
     PROC("glCreateShader", createName);
+    PROC("glGetError", getError);
     PROC("glShaderSource", shaderSource);
     PROC("glCompileShader", objectNoop);
     PROC("glGetShaderiv", getShaderiv);
@@ -370,10 +393,12 @@ void *getProcAddress(void *, const char *name) {
     PROC("glTextureView", textureView);
     PROC("glTexImage2D", texImage2D);
     PROC("glTexImage3D", texImage3DNoop);
+    PROC("glTexStorage2D", texStorage2D);
+    PROC("glTexStorage3D", texStorage3D);
     PROC("glTexSubImage2D", texSubImage2D);
     PROC("glTexSubImage3D", texSubImage3DNoop);
     PROC("glTexParameteri", enumIntNoop);
-    PROC("glGenerateMipmap", enumNoop);
+    PROC("glGenerateMipmap", generateMipmap);
     PROC("glPixelStorei", enumIntNoop);
     PROC("glReadPixels", readPixels);
     PROC("glGenSamplers", genNames);
@@ -383,6 +408,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glBindFramebuffer", bindFramebuffer);
     PROC("glFramebufferTexture2D", framebufferTexture2DNoop);
     PROC("glFramebufferTextureLayer", framebufferTextureLayer);
+    PROC("glBlitFramebuffer", blitFramebufferNoop);
     PROC("glDrawBuffers", drawBuffersNoop);
     PROC("glDrawArrays", drawArrays);
     PROC("glDrawArraysInstanced", drawArraysInstanced);
@@ -572,6 +598,53 @@ void expectIntegerUniformUpload(const char *manifest, const char *name, VernonDa
 }
 
 } // namespace
+
+TEST(RuntimeExternalGl, ScopesMipmapErrorsAndProbesFloatFormatSupport) {
+    pendingError = 0;
+    generatedMipmapError = 0;
+    generatedMipmapCount = 0;
+    VernonOpenGLContextCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.make_current = &makeCurrent;
+    callbacks.get_proc_address = &getProcAddress;
+    callbacks.api_version_major = 3;
+    callbacks.api_version_minor = 1;
+    vernon::tests::RhiRuntime context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_OPENGL_ES, &callbacks);
+    ASSERT_NE(context.runtime, nullptr);
+
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.width = 2;
+    descriptor.height = 2;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 2;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.format = VERNON_RHI_FORMAT_RGBA32_FLOAT;
+    descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(context.device, &descriptor, &image), VERNON_RHI_STATUS_OK);
+
+    pendingError = 0x0500;
+    EXPECT_NE(vernonRhiDeviceGenerateImageMipmaps(context.device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(generatedMipmapCount, 0U);
+    const VernonStringView dirtyContextError = vernonRhiDeviceGetLastError(context.device);
+    EXPECT_NE(std::string(dirtyContextError.data, dirtyContextError.size).find("before entering Vernon"),
+              std::string::npos);
+
+    EXPECT_EQ(vernonRhiDeviceGenerateImageMipmaps(context.device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(generatedMipmapCount, 1U);
+
+    generatedMipmapError = 0x0502;
+    EXPECT_EQ(vernonRhiDeviceGenerateImageMipmaps(context.device, image), VERNON_RHI_STATUS_UNSUPPORTED);
+    EXPECT_EQ(generatedMipmapCount, 2U);
+    generatedMipmapError = 0;
+
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
 
 TEST(RuntimeExternalGl, CreatesAndReadsBackD32S8Image) {
     VernonOpenGLContextCallbacks callbacks{};

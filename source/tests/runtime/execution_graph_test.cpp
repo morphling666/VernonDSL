@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 namespace vernon::execution::detail {
 
 struct CommandGraphTestAccess {

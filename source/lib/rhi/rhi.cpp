@@ -62,7 +62,7 @@ vernon::rhi::createDeviceImpl(const VernonRhiOwnedDeviceDescriptor *descriptor) 
     if (!backend) {
         setDeviceCreationError("requested RHI backend is unavailable in this build");
         return Result<VernonRhiDevice, RhiError>{
-            err(RhiError{RhiErrorCode::Unsupported, {"create_device", descriptor->backend, 0}})};
+            err(RhiError{RhiErrorCode::Unsupported, {"create_device", static_cast<uint64_t>(descriptor->backend), 0}})};
     }
     return backend->createOwnedDevice(descriptor);
 }

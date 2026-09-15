@@ -28,10 +28,10 @@ struct AutodiffPullbackControlPlaneUsage {
     uint64_t deviceWaitNanoseconds{};
 };
 
-VERNON_RUNTIME_CAPI AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
-VERNON_RUNTIME_CAPI AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
-VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI VernonRhiDevice autodiffRhiDevice(const VernonRuntimeContext *context);
+AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
+AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
+size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);
+VernonRhiDevice autodiffRhiDevice(const VernonRuntimeContext *context);
 
 struct AutodiffPullbackCheckpointPlan {
     bool present{};

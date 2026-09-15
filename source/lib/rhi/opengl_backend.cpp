@@ -243,9 +243,11 @@ bool DeviceState::downloadImage3D(const Image &image, Int mipLevel, Int x, Int y
     auto *output = static_cast<unsigned char *>(destination);
     for (Int layer = 0; layer < depth; ++layer) {
         driver.framebufferTextureLayer(kFramebuffer, kColorAttachment0, image.name, mipLevel, z + layer);
-        if (driver.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
+        const Enum framebufferStatus = driver.checkFramebufferStatus(kFramebuffer);
+        if (framebufferStatus != kFramebufferComplete) {
             driver.deleteFramebuffers(1, &framebuffer);
-            error = "OpenGL 3D image layer is not readable as an attachment";
+            error = "OpenGL 3D image layer is not readable as an attachment (framebuffer status " +
+                    std::to_string(framebufferStatus) + ")";
             return false;
         }
         driver.readPixels(x, y, width, height, externalFormat, type, output + static_cast<size_t>(layer) * layerSize);

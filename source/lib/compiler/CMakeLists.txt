@@ -83,6 +83,7 @@ target_link_directories(VernonCompilerTestSupport INTERFACE ${LLVM_LIBRARY_DIRS}
 target_link_libraries(
     VernonCompilerTestSupport
     INTERFACE VernonCompilerBuildHeaders
+              LLVMCore
               MLIRArithDialect
               MLIRControlFlowDialect
               MLIRFuncDialect

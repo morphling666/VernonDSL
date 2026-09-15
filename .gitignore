@@ -2,6 +2,9 @@
 .DS_Store
 *build/
 *-cooked/
+/win_runtime_*/
+/win_static_review/
+/win_wheel_*/
 benchmark-results*/
 .venv/
 __pycache__/
@@ -14,6 +17,7 @@ htmlcov/
 release-artifacts/
 *.dll
 *.so
+*.pyd
 *.dylib
 *.o
 *.obj

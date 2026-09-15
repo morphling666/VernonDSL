@@ -300,7 +300,8 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                                         (entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
                                          entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) &&
                                         entry.element_size != 0 && entry.element_size % sizeof(uint32_t) == 0;
-            const bool graphicsUniformBuffer = entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+            const bool graphicsUniformBuffer = (entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                                                entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) &&
                                                entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
                                                (entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
                                                 entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) &&
@@ -310,8 +311,10 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                                 entry.binding < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT && entry.element_size != 0;
             if ((!compute && !graphicsResource && !graphicsInline && !graphicsUniformBuffer && !vertex) ||
                 entry.array_count != 1)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::Unsupported, {"d3d12_layout_contains_an_unsupported_binding", 0, 0}})};
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::Unsupported,
+                                                      {"d3d12_layout_contains_an_unsupported_binding",
+                                                       static_cast<uint32_t>(entry.kind), entry.array_count}})};
         }
         for (size_t index = 0; index < descriptor->vertex_attribute_count; ++index) {
             const auto &attribute = descriptor->vertex_attributes[index];
@@ -368,11 +371,6 @@ RhiAdapterResult<void> prepareGraphicsPipelineImplResult(VernonRuntimeRhiAdapter
     adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
     pipeline->device = &directX12Device(adapter);
     pipeline->graphics = true;
-    if (descriptor.color_format_count == 0) {
-        *output = toHandle(pipeline.release());
-        adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
-        return RhiAdapterResult<void>{vernon::ok()};
-    }
     if (descriptor.color_format_count > 8 || descriptor.sample_count != 1 ||
         (descriptor.depth_stencil_format && descriptor.depth_stencil_format != DXGI_FORMAT_D32_FLOAT &&
          descriptor.depth_stencil_format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
@@ -962,7 +960,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                 vernon::ProviderErrorCode::BackendFailure, {"d3d12_dispatch_could_not_retain_its_resources", 0, 0}})};
         if (!reuseDescriptors) {
             for (auto &slot : bindings->slots) {
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                     ID3D12Resource *upload = nullptr;
                     size_t uploadOffset = 0;
                     uint8_t *mapped = nullptr;
@@ -984,14 +982,57 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                         return RhiAdapterResult<void>{vernon::err(
                             vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                   {"d3d12_dispatch_could_not_track_inline_resource_state", 0, 0}})};
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    view.Format = DXGI_FORMAT_R32_TYPELESS;
+                    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                    device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view, cpu);
+                } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                    auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
+                    if (!buffer || !buffer->resource ||
+                        !transition(adapter, commandEncoder, commands, *buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                        return RhiAdapterResult<void>{vernon::err(
+                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"d3d12_dispatch_could_not_track_storage_buffer_state", 0, 0}})};
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    view.Format = DXGI_FORMAT_R32_TYPELESS;
+                    view.Buffer.FirstElement = slot.offset / 4;
+                    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                    device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, cpu);
+                } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+                    auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);
+                    if (!image || !image->resource ||
+                        !transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                        return RhiAdapterResult<void>{vernon::err(
+                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"d3d12_dispatch_could_not_track_storage_image_state", 0, 0}})};
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.Format = image->format;
+                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
+                    const uint32_t mip = selected ? image->view.base_mip_level : 0;
+                    if (image->dimension == VERNON_RHI_IMAGE_3D) {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                        view.Texture3D.MipSlice = mip;
+                        view.Texture3D.WSize = UINT_MAX;
+                    } else if (selected && image->view.array_layer_count > 1) {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                        view.Texture2DArray.MipSlice = mip;
+                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
+                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
+                    } else {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                        view.Texture2D.MipSlice = mip;
+                    }
+                    device.device->CreateUnorderedAccessView(image->resource, nullptr, &view, cpu);
+                } else {
+                    return RhiAdapterResult<void>{vernon::err(
+                        vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"d3d12_dispatch_contains_an_unsupported_binding", slot.layout.slot,
+                                               static_cast<uint32_t>(slot.layout.kind)}})};
                 }
-                D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                view.Format = DXGI_FORMAT_R32_TYPELESS;
-                view.Buffer.FirstElement = slot.offset / 4;
-                view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-                view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                device.device->CreateUnorderedAccessView(slot.resource, nullptr, &view, cpu);
                 cpu.ptr += increment;
             }
             bindings->computeDescriptorEncoder = commandEncoder.value;
@@ -1018,10 +1059,14 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics || !pipeline->pipeline ||
-        (descriptor->bindings.value != 0 && !bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"d3d12_adapter_received_an_invalid_draw_descriptor", 0, 0}})};
+    const uint64_t invalidDescriptor =
+        (!validCommonDrawDescriptor(descriptor) ? uint64_t{1} : 0) | (!pipeline ? uint64_t{2} : 0) |
+        (pipeline && !pipeline->graphics ? uint64_t{4} : 0) | (pipeline && !pipeline->pipeline ? uint64_t{8} : 0) |
+        (descriptor && descriptor->bindings.value != 0 && !bindings ? uint64_t{16} : 0);
+    if (invalidDescriptor)
+        return RhiAdapterResult<void>{vernon::err(
+            vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                  {"d3d12_adapter_received_an_invalid_draw_descriptor", invalidDescriptor, 0}})};
     auto &device = *pipeline->device;
     ID3D12DescriptorHeap *rtvHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
@@ -1101,9 +1146,10 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                                                   stencilStore, clearDepth, clearStencil);
     if (!depthOperations)
         return RhiAdapterResult<void>{vernon::err(std::move(depthOperations).error())};
-    if (firstDraw && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
-                                                static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv,
-                                                ignoredGpu, backendDiagnostic))
+    if (firstDraw && descriptor->color_attachment_count != 0 &&
+        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
+                                   static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv, ignoredGpu,
+                                   backendDiagnostic))
         return RhiAdapterResult<void>{vernon::err(
             vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                   {"d3d12_acquire_render_target_descriptors", descriptor->color_attachment_count, 0}})};

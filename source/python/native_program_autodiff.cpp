@@ -97,7 +97,8 @@ nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &le
     std::string root;
     nb::list keys(inputs.attr("keys")());
     for (size_t index = 0; index < keys.size(); ++index) {
-        const std::string key = nb::cast<std::string>(nb::str(keys[index]));
+        const nb::handle keyHandle = keys[index];
+        const std::string key = nb::cast<std::string>(nb::str(keyHandle));
         if (leafPath == key || (leafPath.size() > key.size() && leafPath.compare(0, key.size(), key) == 0 &&
                                 leafPath[key.size()] == '.')) {
             if (key.size() > root.size())

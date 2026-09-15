@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "autodiff/autodiff_metadata.h"
+#include "transport_node.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -25,23 +26,6 @@ enum class InterfacePlanKind {
     KernelParameter,
     ByteTransport,
     NativeUniform,
-};
-
-enum class TransportNodeKind {
-    Scalar,
-    Product,
-    Array,
-};
-
-struct TransportNode {
-    TransportNodeKind kind{TransportNodeKind::Scalar};
-    std::string representation;
-    uint64_t offset{};
-    uint64_t size{};
-    uint64_t alignment{1};
-    std::vector<uint64_t> shape;
-    std::vector<uint64_t> byteStrides;
-    std::vector<TransportNode> children;
 };
 
 struct InterfacePlan {

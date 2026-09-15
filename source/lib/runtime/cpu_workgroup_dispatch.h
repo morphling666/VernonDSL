@@ -3,6 +3,7 @@
 
 #include "VernonCommon.h"
 #include "VernonCpuWorkgroupABI.h"
+#include "VernonRuntime.h"
 
 #include <cstddef>
 #include <cstdint>

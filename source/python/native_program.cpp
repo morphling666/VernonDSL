@@ -6,14 +6,20 @@ std::string nativeStringView(VernonStringView view) {
     return view.data ? std::string(view.data, view.size) : std::string();
 }
 
-bool targetAvailable(VernonTarget target) {
+VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
     Compiler compiler;
-    return vernonCompilerGetTargetCapabilities(compiler.context, target).available != 0;
+    VernonTargetCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = VERNON_TARGET_CAPABILITIES_VERSION;
+    if (vernonCompilerQueryTargetCapabilities(compiler.context, target, &capabilities) != VERNON_STATUS_OK)
+        throw std::runtime_error("cannot query compiler target capabilities");
+    return capabilities;
 }
 
+bool targetAvailable(VernonTarget target) { return queryTargetCapabilities(target).available != 0; }
+
 nb::dict targetCapabilities(VernonTarget target) {
-    Compiler compiler;
-    const VernonTargetCapabilities capabilities = vernonCompilerGetTargetCapabilities(compiler.context, target);
+    const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
     nb::dict result;
     result["available"] = capabilities.available != 0;
     result["graphics"] = capabilities.supports_graphics != 0;
@@ -24,6 +30,8 @@ nb::dict targetCapabilities(VernonTarget target) {
     result["f16"] = capabilities.supports_f16 != 0;
     result["f64"] = capabilities.supports_f64 != 0;
     result["f64_device_atomic_add"] = capabilities.supports_f64_device_atomic_add != 0;
+    result["compute_texture_binding"] = capabilities.supports_compute_texture_binding != 0;
+    result["non_r32_read_write_storage_images"] = capabilities.supports_non_r32_read_write_storage_images != 0;
     return result;
 }
 

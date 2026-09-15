@@ -136,6 +136,9 @@ bool prepareProgramTapeStates(program_execution::ProgramInvocationState &frame, 
                          [tapeValue](const program::TapePlan &candidate) { return candidate.value == tapeValue; });
         if (plan == execution.abi.tapePlans.end() || !plan->forwardProducer)
             return error = "Program tape producer is absent from the compiler TapePlan", false;
+        if (plan->minimumTapeStrideBytes > std::numeric_limits<size_t>::max())
+            return error = "Program tape minimum stride exceeds the host address range", false;
+        state.stride = static_cast<size_t>(plan->minimumTapeStrideBytes);
         for (program_plan::TapeCarrier carrier : plan->requiredCarriers) {
             const bool missing = (carrier == program_plan::TapeCarrier::TapeData && !state.tape) ||
                                  (carrier == program_plan::TapeCarrier::ReplaySegment && !state.segment) ||

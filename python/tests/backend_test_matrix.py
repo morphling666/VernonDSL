@@ -49,6 +49,7 @@ class BackendRequirements:
     graphics: bool = False
     storage_buffers: bool = False
     storage_texture: bool = False
+    non_r32_read_write_storage_images: bool = False
     device_atomics: bool = False
     f32_atomic_add: bool = False
     f64_atomic_add: bool = False
@@ -143,12 +144,12 @@ def probe_compiler(row: BackendRow, requirements: BackendRequirements) -> ProbeR
         program_capability = dict(_native._program_capability(capability))
         if not program_capability["supported"]:
             return _unsupported(row, capability)
-    for required, capability in (
-        (requirements.storage_texture, "compute_texture_binding"),
-        (requirements.program_vjp, "compute_vjp"),
-    ):
-        if required and not dict(_native._program_capability(capability))["supported"]:
-            return _unsupported(row, capability)
+    if requirements.storage_texture and not capabilities["compute_texture_binding"]:
+        return _unsupported(row, "compute_texture_binding")
+    if requirements.non_r32_read_write_storage_images and not capabilities["non_r32_read_write_storage_images"]:
+        return _unsupported(row, "non_r32_read_write_storage_images")
+    if requirements.program_vjp and not dict(_native._program_capability("compute_vjp"))["supported"]:
+        return _unsupported(row, "compute_vjp")
     if requirements.native_interop_backend is not None and requirements.native_interop_backend != row.name:
         return _unsupported(row, f"{requirements.native_interop_backend}_native_interop")
     return ProbeResult(ProbeKind.AVAILABLE)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,111 @@ from vernon_dsl.runtime_source import cmake_source_dir, version
 from wheel_smoke_kernel import add_one
 
 
+def _run(command: list[str], *, cwd: Path | None = None) -> None:
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def _verify_runtime_source_contents(source: Path) -> None:
+    required = (
+        "CMakeLists.txt",
+        "VERSION",
+        "VernonRuntimeConfig.cmake.in",
+        "cmake/EmbedBinary.cmake",
+        "cmake/IncludeNlohmannJson.cmake",
+        "cmake/IncludeVulkanHeaders.cmake",
+        "cmake/VernonRuntimeTarget.cmake",
+        "cmake/VernonVersions.cmake",
+        "include/VernonRuntime.h",
+        "include/VernonGpuAutodiffAbi.h",
+        "lib/rhi/cuda_backend.cpp",
+        "lib/rhi/directx12_backend.cpp",
+        "lib/rhi/directx12_mipmap.hlsl",
+        "lib/rhi/metal_backend.mm",
+        "lib/rhi/rhi_metal.mm",
+        "lib/rhi/vulkan_backend.cpp",
+        "lib/runtime/rhi_adapter/adapter_metal.mm",
+    )
+    missing = [relative for relative in required if not (source / relative).is_file()]
+    if missing:
+        raise RuntimeError(f"bundled VernonRuntime source is incomplete: {', '.join(missing)}")
+
+
+def _verify_runtime_source_build(source: Path, root: Path) -> None:
+    build = root / "runtime-build"
+    install = root / "runtime-install"
+    system = platform.system()
+    configure = [
+        "cmake",
+        "-S",
+        os.fspath(source),
+        "-B",
+        os.fspath(build),
+        "-DBUILD_TESTING=OFF",
+        "-DVERNON_RUNTIME_PROFILE=desktop",
+        "-DVERNON_RUNTIME_LIBRARY_TYPE=STATIC",
+        "-DVERNON_ENABLE_CUDA_RUNTIME=OFF",
+        f"-DVERNON_ENABLE_VULKAN_RUNTIME={'ON' if system == 'Linux' else 'OFF'}",
+        f"-DVERNON_ENABLE_DIRECTX12_RUNTIME={'ON' if system == 'Windows' else 'OFF'}",
+        f"-DVERNON_ENABLE_METAL_RUNTIME={'ON' if system == 'Darwin' else 'OFF'}",
+    ]
+    packaged_dxc = source.parent / ("dxc.exe" if system == "Windows" else "dxc")
+    if packaged_dxc.is_file():
+        configure.append(f"-DVERNON_DXC_EXECUTABLE={packaged_dxc}")
+    _run(configure)
+    _run(["cmake", "--build", os.fspath(build), "--config", "Release", "--target", "VernonRuntime"])
+    _run(
+        [
+            "cmake",
+            "--install",
+            os.fspath(build),
+            "--config",
+            "Release",
+            "--prefix",
+            os.fspath(install),
+            "--component",
+            "VernonDevelopment",
+        ]
+    )
+
+    consumer = root / "runtime-consumer"
+    consumer.mkdir()
+    (consumer / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(VernonRuntimeWheelSmoke LANGUAGES C)\n"
+        "find_package(VernonRuntime CONFIG REQUIRED)\n"
+        "get_target_property(runtime_type Vernon::Runtime TYPE)\n"
+        'if(runtime_type STREQUAL "STATIC_LIBRARY")\n'
+        "  enable_language(CXX)\n"
+        "endif()\n"
+        "enable_testing()\n"
+        "add_executable(vernon-runtime-wheel-smoke main.c)\n"
+        "target_link_libraries(vernon-runtime-wheel-smoke PRIVATE Vernon::Runtime)\n"
+        "add_test(NAME runtime-source-consumer COMMAND vernon-runtime-wheel-smoke)\n",
+        encoding="utf-8",
+    )
+    (consumer / "main.c").write_text(
+        "#include <vernon-c/Runtime.h>\n"
+        "int main(void) {\n"
+        "  VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_CPU);\n"
+        "  return capabilities.available ? 0 : 1;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    consumer_build = root / "runtime-consumer-build"
+    _run(
+        [
+            "cmake",
+            "-S",
+            os.fspath(consumer),
+            "-B",
+            os.fspath(consumer_build),
+            f"-DCMAKE_PREFIX_PATH={install}",
+        ]
+    )
+    _run(["cmake", "--build", os.fspath(consumer_build), "--config", "Release"])
+    _run(["ctest", "--test-dir", os.fspath(consumer_build), "-C", "Release", "--output-on-failure"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify an installed VernonDSL wheel.")
     parser.add_argument(
@@ -22,8 +129,11 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     if not arguments.skip_package_layout:
-        assert cmake_source_dir().is_dir()
+        runtime_source = cmake_source_dir()
         assert version() == RELEASE_VERSION
+        _verify_runtime_source_contents(runtime_source)
+    else:
+        runtime_source = None
 
     vd.init(arch=vd.cpu)
     expected = np.arange(16, dtype=np.float32) + np.float32(1.0)
@@ -74,7 +184,12 @@ def main() -> int:
             check=True,
         )
         assert (cooked / "cooked.program.json").stat().st_size > 0
-    print(f"Installed VernonDSL {RELEASE_VERSION} CPU dispatch, frontend, cooker, and package checks passed.")
+        if runtime_source is not None:
+            _verify_runtime_source_build(runtime_source, root)
+    print(
+        f"Installed VernonDSL {RELEASE_VERSION} CPU dispatch, frontend, cooker, "
+        "and standalone Runtime source checks passed."
+    )
     return 0
 
 

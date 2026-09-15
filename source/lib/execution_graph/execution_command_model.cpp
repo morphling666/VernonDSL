@@ -20,7 +20,11 @@ bool imageIntervalOverlaps(uint32_t leftBase, uint32_t leftCount, uint32_t right
     return uint64_t{leftBase} < rightEnd && uint64_t{rightBase} < leftEnd;
 }
 
-uint32_t accessBits(const CommandResourceAccess &access) {
+} // namespace
+
+uint32_t commandAccessMask(const CommandResourceAccess &access) {
+    if (access.rhiAccessMask)
+        return access.rhiAccessMask;
     const bool reads = access.access != AccessMode::Write;
     const bool writesResource = access.access != AccessMode::Read;
     if (access.state == VERNON_RHI_STATE_COLOR_ATTACHMENT)
@@ -36,6 +40,8 @@ uint32_t accessBits(const CommandResourceAccess &access) {
         return (reads ? VERNON_RHI_ACCESS_SHADER_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_SHADER_WRITE : 0);
     return VERNON_RHI_ACCESS_NONE;
 }
+
+namespace {
 
 VernonRhiImageSubresourceRange intersection(const VernonRhiImageSubresourceRange &left,
                                             const VernonRhiImageSubresourceRange &right) {
@@ -224,8 +230,8 @@ bool buildCommandBarriers(const std::vector<ExecutionResourceRecord> &resources,
                 barrier.struct_size = sizeof(barrier);
                 barrier.source_stage_mask = previous.stageMask;
                 barrier.destination_stage_mask = access.stageMask;
-                barrier.source_access = accessBits(previous);
-                barrier.destination_access = accessBits(access);
+                barrier.source_access = commandAccessMask(previous);
+                barrier.destination_access = commandAccessMask(access);
                 barrier.old_state = previous.state;
                 barrier.new_state = access.state;
                 barrier.is_image = access.kind == ResourceKind::Image;

@@ -129,12 +129,13 @@ private:
                     return 0;
                 }
                 if (!storage) {
-                    storage.reset(new (std::nothrow) Storage);
+                    storage.reset(static_cast<unsigned char *>(
+                        ::operator new(kArenaSize, std::align_val_t(kArenaSize), std::nothrow)));
                     if (!storage) {
                         workgroup.fail(VERNON_STATUS_INTERNAL_ERROR, "cannot allocate workgroup storage");
                         return 0;
                     }
-                    addressBase = storage->bytes;
+                    addressBase = storage.get();
                     std::memset(addressBase, 0, kArenaSize);
                 }
                 if (nextOffset > kArenaSize - (alignment - 1)) {
@@ -165,12 +166,14 @@ private:
         }
 
     private:
-        struct alignas(kArenaSize) Storage {
-            unsigned char bytes[kArenaSize];
+        struct StorageDeleter {
+            void operator()(unsigned char *pointer) const noexcept {
+                ::operator delete(pointer, std::align_val_t(kArenaSize));
+            }
         };
 
         std::mutex mutex;
-        std::unique_ptr<Storage> storage;
+        std::unique_ptr<unsigned char, StorageDeleter> storage;
         unsigned char *addressBase{};
         size_t nextOffset{};
         std::vector<SharedAllocation> allocations;
@@ -956,8 +959,8 @@ const std::string &CpuWorkgroupScheduler::lastDiagnostic() const noexcept { retu
 
 } // namespace vernon::runtime
 
-extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuWorkgroupAddress(uint64_t site, uint64_t size, uint64_t alignment,
-                                                                  uint64_t offset) {
+extern "C" VERNON_CPU_WORKGROUP_CAPI uint64_t vernonCpuWorkgroupAddress(uint64_t site, uint64_t size,
+                                                                        uint64_t alignment, uint64_t offset) {
     using namespace vernon::runtime;
     if (!activeWorkgroup)
         failInactiveWorkgroupHelper("vernonCpuWorkgroupAddress");
@@ -970,8 +973,8 @@ extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuWorkgroupAddress(uint64_t site,
                                     static_cast<size_t>(offset));
 }
 
-extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuLaneAddress(uint64_t site, uint64_t size, uint64_t alignment,
-                                                             uint64_t offset) {
+extern "C" VERNON_CPU_WORKGROUP_CAPI uint64_t vernonCpuLaneAddress(uint64_t site, uint64_t size, uint64_t alignment,
+                                                                   uint64_t offset) {
     using namespace vernon::runtime;
     if (!activeWorkgroup || !activeRange || !activeLaneArena || activeRange->active_lane < activeRange->lane_begin ||
         activeRange->active_lane >= activeRange->lane_end)
@@ -985,7 +988,7 @@ extern "C" VERNON_RUNTIME_CAPI uint64_t vernonCpuLaneAddress(uint64_t site, uint
                                     static_cast<size_t>(offset), activeRange->active_lane);
 }
 
-extern "C" VERNON_RUNTIME_CAPI void vernonCpuWorkgroupBarrier(uint64_t site) {
+extern "C" VERNON_CPU_WORKGROUP_CAPI void vernonCpuWorkgroupBarrier(uint64_t site) {
     using namespace vernon::runtime;
     if (!activeWorkgroup || !activeRange)
         failInactiveWorkgroupHelper("vernonCpuWorkgroupBarrier");
@@ -1005,7 +1008,7 @@ extern "C" VERNON_RUNTIME_CAPI void vernonCpuWorkgroupBarrier(uint64_t site) {
     }
 }
 
-extern "C" VERNON_RUNTIME_CAPI bool vernonCpuWorkgroupIsLeader() {
+extern "C" VERNON_CPU_WORKGROUP_CAPI bool vernonCpuWorkgroupIsLeader() {
     if (!vernon::runtime::activeWorkgroup || !vernon::runtime::activeRange)
         vernon::runtime::failInactiveWorkgroupHelper("vernonCpuWorkgroupIsLeader");
     return vernon::runtime::activeRange->active_lane == 0;

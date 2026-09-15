@@ -634,7 +634,14 @@ class ProgramGpuExecutionTests(unittest.TestCase):
             _native._testing_set_program_failure("")
         np.testing.assert_array_equal(output.to_numpy(), np.array([0.0], dtype=np.float32))
 
-    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    @backend_matrix_test(
+        BackendRequirements(
+            gpu=True,
+            compute=True,
+            storage_texture=True,
+            non_r32_read_write_storage_images=True,
+        )
+    )
     def test_failed_in_place_execution_poisons_only_mutated_texture(self, backend: BackendRow) -> None:
         from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -656,7 +663,14 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         image.upload(np.zeros((2, 2, 2, 4), dtype=np.float32))
         np.testing.assert_array_equal(image.to_numpy(), np.zeros((2, 2, 2, 4), dtype=np.float32))
 
-    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    @backend_matrix_test(
+        BackendRequirements(
+            gpu=True,
+            compute=True,
+            storage_texture=True,
+            non_r32_read_write_storage_images=True,
+        )
+    )
     def test_gpu_module_binds_texture_as_forward_resource(self, backend: BackendRow) -> None:
         image = vd.Texture.from_numpy(
             np.zeros((2, 2, 2, 4), dtype=np.float32),

@@ -198,11 +198,28 @@ void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &m
     download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
     ASSERT_EQ(vernonRhiDeviceDownloadImage(runtime.device, target.handle, &download, pixels.data(), pixels.size()),
               VERNON_RHI_STATUS_OK);
-    const size_t center = (extent / 2 * extent + extent / 2) * 4;
     const size_t corner = 4;
-    EXPECT_GT(pixels[center], 240);
-    EXPECT_GT(pixels[center + 1], 40);
-    EXPECT_LT(pixels[center + 2], 10);
+    size_t renderedPixels = 0;
+    size_t clearedPixels = 0;
+    size_t unexpectedPixels = 0;
+    for (size_t pixel = 0; pixel < pixels.size(); pixel += 4) {
+        const bool rendered =
+            pixels[pixel] == 255 && pixels[pixel + 1] == 64 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255;
+        const bool cleared =
+            pixels[pixel] == 0 && pixels[pixel + 1] == 0 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255;
+        if (rendered)
+            ++renderedPixels;
+        else if (cleared)
+            ++clearedPixels;
+        else
+            ++unexpectedPixels;
+    }
+    constexpr size_t externalTriangleCoverage = 338;
+    constexpr size_t generatedTriangleCoverage = 192;
+    const size_t expectedRenderedPixels = externalVertices ? externalTriangleCoverage : generatedTriangleCoverage;
+    EXPECT_EQ(renderedPixels, expectedRenderedPixels);
+    EXPECT_EQ(clearedPixels, extent * extent - expectedRenderedPixels);
+    EXPECT_EQ(unexpectedPixels, 0u);
     EXPECT_EQ(pixels[corner], 0);
     EXPECT_EQ(pixels[corner + 1], 0);
     EXPECT_EQ(pixels[corner + 2], 0);

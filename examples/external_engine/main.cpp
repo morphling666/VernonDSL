@@ -9,6 +9,7 @@ EM_JS(int, hasBrowserEnvironment, (), { return 'window' in globalThis && 'docume
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <string_view>
 
 namespace {
 
@@ -40,13 +41,18 @@ void renderWebFrame(void *userData) {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    const bool requestedHeadless = argc == 2 && std::string_view(argv[1]) == "--headless";
+    if (argc > 1 && !requestedHeadless) {
+        std::cerr << "usage: vernon-external-engine [--headless]\n";
+        return 2;
+    }
     auto application = std::make_unique<Application>();
     application->demo = createExternalEngineDemo();
 #if defined(__EMSCRIPTEN__)
-    const bool headless = !hasBrowserEnvironment();
+    const bool headless = requestedHeadless || !hasBrowserEnvironment();
 #else
-    constexpr bool headless = false;
+    const bool headless = requestedHeadless;
 #endif
     if (!application->demo || !application->demo->initialize(headless)) {
         std::cerr << "failed to initialize the Vernon external-engine demo\n";

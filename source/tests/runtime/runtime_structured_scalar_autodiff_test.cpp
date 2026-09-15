@@ -68,7 +68,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         return (objective(positive[0], positive[1], positive[2]) - objective(negative[0], negative[1], negative[2])) /
                (2.0 * epsilon);
     };
-    auto runCase = [&](float x, float y, float z) {
+    auto runCase = [&, objective](float x, float y, float z) {
         constexpr size_t laneCount = 6;
         const uint64_t outputShape[]{1, 3, 2};
         float outputValues[laneCount]{};

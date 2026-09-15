@@ -155,6 +155,28 @@ Runtime availability therefore depends on the selected backend:
 - Metal: compute and offscreen graphics through the system framework on
   supported Apple Silicon Macs, with no additional loader.
 
+Every wheel also contains the same complete, platform-independent
+`VernonRuntime` source project for C and C++ deployment. Locate it with:
+
+```powershell
+py -m vernon_dsl.runtime_source --cmake-dir
+```
+
+Configure that directory directly with CMake and select the deployment profile:
+
+```powershell
+cmake -S <runtime-source-directory> -B runtime-build `
+  -DVERNON_RUNTIME_PROFILE=desktop `
+  -DVERNON_RUNTIME_LIBRARY_TYPE=STATIC
+cmake --build runtime-build --config Release --target VernonRuntime
+```
+
+Use `mobile` for the standalone iOS build described by the Runtime project and
+`web` for the WebAssembly-oriented profile. The source payload contains every
+backend; CMake compiles only backends supported and enabled by the target
+toolchain. GPU SDKs, system frameworks, loaders, drivers, and cross-compilers
+remain deployment prerequisites.
+
 Cooked MSL bundles are consumed by the Runtime on Apple. Metal presentation and
 swapchain management are outside the public Runtime contract. Argument-buffer
 pipelines fail explicitly when the selected device cannot provide the required

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast, get_args, get_origin
 
-from ..bundle import ProgramCompileError, canonical_json, make_target_options
+from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest
 from ..frontend.runtime_types import (
     RuntimeParameterDescriptor,
@@ -31,6 +31,7 @@ from ..render import (
 from ..types import (
     Specialization,
     SpecializationAssignment,
+    dyn,
     specialization_key,
     specialization_key_data,
 )
@@ -49,6 +50,43 @@ def _runtime_annotation_base(annotation: Any) -> Any:
         if len(base.arguments) != 2:
             raise TypeError("When runtime annotation requires a feature and a type")
         base = base.arguments[1]
+
+
+def _fragment_output_count(stages: tuple[Any, ...], frontends: tuple[Any, ...]) -> int:
+    for stage, frontend in zip(stages, frontends, strict=True):
+        if stage.kind != "fragment":
+            continue
+        entry = next(
+            (function for function in frontend.typed_functions if function.source.name == stage.function.__name__),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError(f"compiled graphics stage {stage.function.__name__!r} has no typed entry")
+        result = entry.result_type
+        if result is None or result.kind == "void":
+            return 0
+        if result.kind == "struct":
+            fields = next((fields for name, fields in frontend.structs if name == result.name), None)
+            if fields is None:
+                raise RuntimeError(f"fragment result struct {result.name!r} has no typed definition")
+            return len(fields)
+        if result.kind == "tuple":
+            return len(result.arguments)
+        return 1
+    raise RuntimeError("graphics pipeline has no fragment stage")
+
+
+def _validate_storage_argument_shape(
+    name: str,
+    descriptor: RuntimeParameterDescriptor,
+    value: TensorStorage | TensorView,
+) -> None:
+    declared = descriptor.storage_metadata.shape
+    actual = tuple(value.shape)
+    if len(declared) != len(actual) or any(
+        extent != "?" and extent != actual_extent for extent, actual_extent in zip(declared, actual, strict=True)
+    ):
+        raise ValueError(f"graphics argument {name!r} expects shape {declared}, got {actual}")
 
 
 @dataclass(frozen=True)
@@ -141,6 +179,12 @@ class Pipeline:
         the one case reflection leaves open, an attribute parameter fed something other than a vertex buffer.
         """
 
+        if render_pass is not None:
+            fragment_outputs = _fragment_output_count(self._stages, frontends)
+            color_attachments = len(render_pass.target._color_attachments())
+            if fragment_outputs != color_attachments:
+                raise ValueError("compiled fragment outputs must exactly match the color attachments")
+
         reflected: dict[str, tuple[Any, Any]] = {}
         annotations: dict[str, Any] = {}
         for stage, frontend in zip(self._stages, frontends, strict=True):
@@ -192,7 +236,10 @@ class Pipeline:
                 if parameter.type.kind == "tensor_view":
                     if annotation is None:
                         raise TypeError(f"graphics storage argument {name!r} requires a runtime annotation")
-                    result[name] = runtime_parameter_descriptor(annotation)
+                    descriptor = runtime_parameter_descriptor(annotation)
+                    if arguments is not None:
+                        _validate_storage_argument_shape(name, descriptor, cast(TensorStorage | TensorView, value))
+                    result[name] = descriptor
                     continue
                 base = _runtime_annotation_base(annotation)
                 if getattr(base, "name", None) == "Tensor":
@@ -204,12 +251,15 @@ class Pipeline:
                     dtype, cell_shape = base, ()
                 else:
                     raise TypeError(f"vertex storage argument {name!r} has no canonical cell type")
-                result[name] = RuntimeParameterDescriptor.storage(
+                descriptor = RuntimeParameterDescriptor.storage(
                     dtype,
-                    (("?", *cell_shape) if "attribute" in interface else parameter.type.arguments[1]),
+                    ((dyn, *cell_shape) if "attribute" in interface else parameter.type.arguments[1]),
                     str(parameter.access.value),
                     True,
                 )
+                if arguments is not None:
+                    _validate_storage_argument_shape(name, descriptor, cast(TensorStorage | TensorView, value))
+                result[name] = descriptor
                 continue
             annotation = annotations.get(name)
             if annotation is None:
@@ -308,10 +358,7 @@ class Pipeline:
         )
         from .program_autodiff import compile_program
 
-        try:
-            specialization = compile_program(parsed, template)
-        except ProgramCompileError as error:
-            raise RuntimeError(str(error)) from None
+        specialization = compile_program(parsed, template)
         compiled = _CompiledPipeline(identity, invocation, specialization)
         return compiled
 

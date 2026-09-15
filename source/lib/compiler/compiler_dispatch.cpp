@@ -14,7 +14,6 @@
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "llvm/ADT/STLExtras.h"
 
-#include <cstring>
 #include <string>
 
 namespace vernon::compiler {
@@ -40,16 +39,22 @@ VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
 #endif
     switch (target) {
     case VERNON_TARGET_CPU:
-        return {1, 1, 1, 1, 1, 1, 1, 1, 1};
+        return {
+            sizeof(VernonTargetCapabilities), VERNON_TARGET_CAPABILITIES_VERSION, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, {}};
     case VERNON_TARGET_VULKAN:
-        return {1, 1, 1, 1, 0, 0, 0, 0, 0};
+        return {
+            sizeof(VernonTargetCapabilities), VERNON_TARGET_CAPABILITIES_VERSION, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, {}};
     case VERNON_TARGET_CUDA:
-        return {1, 0, 1, 1, 1, 1, 0, 1, 0};
+        return {
+            sizeof(VernonTargetCapabilities), VERNON_TARGET_CAPABILITIES_VERSION, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, {}};
     case VERNON_TARGET_OPENGL:
-    case VERNON_TARGET_OPENGL_ES:
     case VERNON_TARGET_METAL:
     case VERNON_TARGET_DIRECTX:
-        return {1, 1, 1, 1, 0, 0, 0, 0, 0};
+        return {
+            sizeof(VernonTargetCapabilities), VERNON_TARGET_CAPABILITIES_VERSION, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, {}};
+    case VERNON_TARGET_OPENGL_ES:
+        return {
+            sizeof(VernonTargetCapabilities), VERNON_TARGET_CAPABILITIES_VERSION, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, {}};
     }
     return {};
 }
@@ -62,7 +67,18 @@ bool validateTargetCapabilities(PreparedModule &prepared, const TargetProfile &p
     bool usesFloatDeviceAtomics = false;
     bool cpuSynchronizationUnsupported = false;
     bool cudaDeviceBarrier = false;
+    bool usesNonR32ReadWriteStorageImage = false;
     module.walk([&](mlir::Operation *operation) {
+        if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(operation)) {
+            for (mlir::Type argumentType : function.getArgumentTypes()) {
+                auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(argumentType);
+                if (!texture || texture.getAccess() != "read_write")
+                    continue;
+                const llvm::StringRef format = texture.getFormat();
+                usesNonR32ReadWriteStorageImage |=
+                    format != "r32_float" && format != "r32_sint" && format != "r32_uint";
+            }
+        }
         mlir::Value atomicStorage;
         if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation))
             atomicStorage = atomic.getStorage();
@@ -90,6 +106,10 @@ bool validateTargetCapabilities(PreparedModule &prepared, const TargetProfile &p
     }
     if (usesDeviceAtomics && !capabilities.supports_device_storage_atomics) {
         diagnostics = "device-scope storage TensorView atomics require a target storage-atomic capability";
+        return false;
+    }
+    if (usesNonR32ReadWriteStorageImage && !capabilities.supports_non_r32_read_write_storage_images) {
+        diagnostics = "target capability rejects non-R32 read_write storage images";
         return false;
     }
     if (target == VERNON_TARGET_CPU && cpuSynchronizationUnsupported) {

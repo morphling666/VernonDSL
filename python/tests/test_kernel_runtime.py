@@ -586,7 +586,14 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         rank_zero_round_trip(value)
         self.assertEqual(value.to_numpy()[()], 6.0)
 
-    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    @backend_matrix_test(
+        BackendRequirements(
+            gpu=True,
+            compute=True,
+            storage_texture=True,
+            non_r32_read_write_storage_images=True,
+        )
+    )
     def test_storage_texture_backend_parity(self, backend: BackendRow) -> None:
         source = np.arange(2 * 4 * 4 * 4, dtype=np.float32).reshape(2, 4, 4, 4)
         device_result = source + np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
@@ -610,13 +617,13 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
     def test_three_dimensional_texture_mipmap_backend_parity(self, backend: BackendRow) -> None:
         source = np.broadcast_to(
-            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            np.array([32, 64, 96, 128], dtype=np.uint8),
             (2, 4, 4, 4),
         ).copy()
         image = vd.Texture.from_numpy(
             source,
             dimension="3d",
-            format=vd.rgba32_float,
+            format=vd.rgba8_unorm,
             mip_levels=2,
             usage=("sampled", "transfer_source", "transfer_destination"),
         )

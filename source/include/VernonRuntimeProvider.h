@@ -64,7 +64,8 @@ typedef enum VernonRuntimeProviderNumericType {
 
 typedef enum VernonRuntimeProviderBindingValueFlags {
     VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE = 1u << 0,
-    VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE = 1u << 1
+    VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE = 1u << 1,
+    VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE = 1u << 2
 } VernonRuntimeProviderBindingValueFlags;
 
 typedef enum VernonRuntimeProviderLoadOperation {

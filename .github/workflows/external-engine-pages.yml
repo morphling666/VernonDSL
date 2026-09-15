@@ -91,31 +91,24 @@ jobs:
       - name: Install Python build environment
         run: uv sync --extra build --frozen
 
-      - name: Configure host compiler
-        run: >
-          uv run --frozen cmake -S . -B pages-host-build
-          -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DMLIR_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir"
-          -DPython_EXECUTABLE="$GITHUB_WORKSPACE/.venv/bin/python"
-          -DVERNON_INSTALL_GIT_HOOK=OFF
-          -DVERNON_ENABLE_CUDA_RUNTIME=OFF
-          -DVERNON_ENABLE_VULKAN_RUNTIME=OFF
-          -DBUILD_TESTING=OFF
+      - name: Build wheel
+        run: uv build --wheel --no-cache
 
-      - name: Build host compiler
-        run: cmake --build pages-host-build --target vernon-dsl-native --parallel 3
+      - name: Install wheel
+        run: |
+          venv="$RUNNER_TEMP/vernon-wheel"
+          uv venv "$venv" --python "$PYTHON_VERSION"
+          uv pip install --python "$venv/bin/python" --no-cache dist/*.whl
 
       - name: Cook WebAssembly bundles
-        env:
-          PYTHONPATH: python:${{ github.workspace }}
         run: |
-          uv run --frozen --no-sync python -m vernon_dsl.program_asset_cli \
+          python="$RUNNER_TEMP/vernon-wheel/bin/python"
+          "$python" -m vernon_dsl.program_asset_cli \
             examples/external_engine/fractal_pipeline.py:asset \
             --target cpu \
             --cpu-triple wasm32-unknown-emscripten \
             -o pages-fractal-cooked
-          uv run --frozen --no-sync python -m vernon_dsl.program_asset_cli \
+          "$python" -m vernon_dsl.program_asset_cli \
             examples/shader_lib/mandelbulb.py:mandelbulb_asset \
             --target opengles \
             --opengl-version 300 \
@@ -126,6 +119,7 @@ jobs:
           emcmake cmake -S examples/external_engine -B pages-build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DPython_EXECUTABLE="$RUNNER_TEMP/vernon-wheel/bin/python" \
             -DVERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR="$GITHUB_WORKSPACE/pages-fractal-cooked" \
             -DVERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR="$GITHUB_WORKSPACE/pages-mandelbulb-cooked"
           cmake --build pages-build --parallel 3

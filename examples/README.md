@@ -6,7 +6,10 @@
 CPU compute Program bundle, a graphics Program bundle, and the Vernon Runtime.
 Both panels use the canonical Program lifecycle. The source is shared by
 native desktop and Emscripten builds and has no Python or nanobind dependency
-at runtime.
+at runtime. Its standalone CMake project locates `runtime_src` through the
+active installed `vernon-lang` wheel, so it demonstrates deployment from the
+delivered Runtime sources instead of reaching into this repository's Runtime
+implementation.
 
 ## Visual showcases
 

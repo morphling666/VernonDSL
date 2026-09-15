@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -1111,6 +1112,12 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     invalid = true;
                     return;
                 }
+                if (plan->valueLayout.size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                    function.emitError() << "vertex attribute layout for argument #" << index
+                                         << " exceeds the manifest integer range";
+                    invalid = true;
+                    return;
+                }
                 const int64_t baseLocation = argumentAttrs.getAs<mlir::IntegerAttr>("vernon.location").getInt();
                 llvm::json::Array leaves;
                 for (const mlir::vernon::AttributeAbiLeaf &leaf : plan->leaves) {
@@ -1132,6 +1139,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 }
                 argument["kind"] = "tensor_value";
                 argument["location_span"] = static_cast<int64_t>(plan->getLocationSpan());
+                argument["attribute_byte_stride"] = static_cast<int64_t>(plan->valueLayout.size);
                 argument["attribute_leaves"] = std::move(leaves);
             }
             if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(argumentType)) {
@@ -1216,7 +1224,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 } else if (mlir::isa<mlir::vernon::TextureType, mlir::vernon::SamplerType>(argumentType)) {
                     // Resource kind and binding metadata are emitted above.
                 } else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(argumentType)) {
-                    argument["kind"] = "tensor_value";
+                    argument["kind"] = graphicsStorage == "storage_buffer" ? "tensor" : "tensor_value";
                     argument["access"] = "read";
                     mlir::FailureOr<mlir::vernon::ValueAbiLayout> valueLayout =
                         mlir::vernon::getValueAbiLayout(tensor, module, valueLogicalDtypes);
@@ -1226,6 +1234,18 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         return;
                     }
                     argument["alignment"] = static_cast<int64_t>(valueLayout->alignment);
+                    if (graphicsStorage == "storage_buffer") {
+                        llvm::json::Array sourceShape;
+                        for (int64_t extent : tensor.getShape())
+                            sourceShape.emplace_back(extent);
+                        argument["source_shape"] = std::move(sourceShape);
+                        llvm::json::Array storageLeaves;
+                        storageLeaves.emplace_back(llvm::json::Object{
+                            {"element_size", static_cast<int64_t>(sizeof(uint32_t))},
+                            {"byte_offset", static_cast<int64_t>(0)},
+                            {"binding", static_cast<int64_t>(computeBindings[index].value_or(index))}});
+                        argument["storage_leaves"] = std::move(storageLeaves);
+                    }
                 } else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(argumentType)) {
                     argument["kind"] = "tensor";
                     const std::string dtype = languageDtype(interfaceLogicalDtypes, sourceDtype);
@@ -1596,6 +1616,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
     root["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
     root["program_version"] = int64_t{VERNON_PROGRAM_VERSION};
     root["entries"] = std::move(entries);
+    if (auto minimumTapeStride = module->getAttrOfType<mlir::IntegerAttr>("vernon.minimum_tape_stride_bytes")) {
+        const llvm::APInt &value = minimumTapeStride.getValue();
+        if (!value.isStrictlyPositive() || value.getActiveBits() > 63) {
+            module.emitError("compiler-owned minimum tape stride is outside the manifest integer range");
+            return mlir::failure();
+        }
+        root["minimum_tape_stride_bytes"] = static_cast<int64_t>(value.getZExtValue());
+    }
     mlir::FailureOr<std::optional<ProgramReflection>> programReflection = buildProgramReflection(module);
     if (mlir::failed(programReflection))
         return mlir::failure();

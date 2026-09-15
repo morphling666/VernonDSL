@@ -93,10 +93,21 @@ struct PreparedBindingSet {
         size_t descriptorOffset{};
         std::vector<uint8_t> inlineStorage;
         VernonRuntimeProviderResourceReference resourceReference{};
+        DevicePointer hostStorage{};
+        size_t hostStorageSize{};
     };
+    DeviceState *device{};
     std::vector<Slot> slots;
     std::vector<MemRefDescriptor> descriptors;
     std::vector<void *> parameters;
+
+    ~PreparedBindingSet() {
+        if (!device)
+            return;
+        for (const Slot &slot : slots)
+            if (slot.hostStorage)
+                device->free(slot.hostStorage);
+    }
 };
 
 void releaseCommandBindings(void *context, uint64_t);
@@ -256,15 +267,45 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                       {"cuda_binding_slot_or_kind_does_not_match_the_prepared_layout", 0, 0}})};
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const auto &reference = value->payload.buffer.resource;
-            auto resolved = resolveRhiResource(adapter, reference);
-            if (!resolved)
-                return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-            const DevicePointer resource = std::move(resolved).value();
-            if (reference.size == 0)
+            const bool hostStorage = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
+            if ((value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0)
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_binding_is_invalid", 0, 0}})};
-            resolvedValues[index] = resource + reference.offset;
+                    vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_flags_are_invalid", 0, 0}})};
+            if (hostStorage) {
+                const auto &inlineValue = value->payload.inline_value;
+                if (!inlineValue.data || !inlineValue.size || inlineValue.size % slot.layout.element_size != 0)
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::InvalidArgument,
+                        {"cuda_host_storage_binding_is_invalid", inlineValue.size, slot.layout.element_size}})};
+                if (!slot.hostStorage) {
+                    auto allocated = cudaResult(cudaDevice(adapter).allocate(slot.hostStorage, inlineValue.size),
+                                                "cuMemAlloc host storage binding");
+                    if (!allocated)
+                        return allocated;
+                    slot.hostStorageSize = inlineValue.size;
+                } else if (slot.hostStorageSize != inlineValue.size) {
+                    return RhiAdapterResult<void>{
+                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                          {"cuda_host_storage_binding_size_changed", inlineValue.size,
+                                                           static_cast<uint32_t>(slot.hostStorageSize)}})};
+                }
+                auto uploaded =
+                    cudaResult(cudaDevice(adapter).upload(slot.hostStorage, inlineValue.data, inlineValue.size),
+                               "cuMemcpyHtoD host storage binding");
+                if (!uploaded)
+                    return uploaded;
+                resolvedValues[index] = slot.hostStorage;
+            } else {
+                const auto &reference = value->payload.buffer.resource;
+                auto resolved = resolveRhiResource(adapter, reference);
+                if (!resolved)
+                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+                const DevicePointer resource = std::move(resolved).value();
+                if (reference.size == 0)
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_binding_is_invalid", 0, 0}})};
+                resolvedValues[index] = resource + reference.offset;
+            }
         } else {
             if (!value->payload.inline_value.data || value->payload.inline_value.size == 0)
                 return RhiAdapterResult<void>{
@@ -279,9 +320,18 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
         slot.resourceReference = {};
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const DevicePointer pointer = resolvedValues[index];
-            bindings.descriptors[slot.descriptorOffset] = {
-                pointer, pointer, 0, value->payload.buffer.resource.size / slot.layout.element_size, 1};
-            slot.resourceReference = value->payload.buffer.resource;
+            const bool hostStorage = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
+            const uint64_t byteSize =
+                hostStorage ? value->payload.inline_value.size : value->payload.buffer.resource.size;
+            const uint64_t byteStride =
+                hostStorage || !value->payload.buffer.stride ? slot.layout.element_size : value->payload.buffer.stride;
+            if (byteStride < slot.layout.element_size || byteStride % slot.layout.element_size != 0)
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_stride_is_invalid", 0, 0}})};
+            bindings.descriptors[slot.descriptorOffset] = {pointer, pointer, 0, byteSize / byteStride,
+                                                           byteStride / slot.layout.element_size};
+            if (!hostStorage)
+                slot.resourceReference = value->payload.buffer.resource;
         } else
             std::memcpy(slot.inlineStorage.data(), value->payload.inline_value.data, value->payload.inline_value.size);
     }
@@ -298,6 +348,7 @@ RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimePro
                                               {"cuda_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
     try {
         auto bindings = std::make_unique<PreparedBindingSet>();
+        bindings->device = &cudaDevice(adapter);
         size_t descriptorCount = 0;
         size_t parameterCount = 0;
         bindings->slots.reserve(layout->entries.size());

@@ -554,10 +554,7 @@ class Kernel:
         )
         from .program_autodiff import compile_program
 
-        try:
-            specialization = compile_program(parsed, template)
-        except ProgramCompileError as error:
-            raise RuntimeError(str(error)) from error
+        specialization = compile_program(parsed, template)
         cached = _CompiledKernel(
             frontend,
             lowered.builtins,

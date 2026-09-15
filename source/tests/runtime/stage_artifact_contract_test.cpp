@@ -38,7 +38,7 @@ TEST(StageArtifactContract, ValidatesCanonicalDerivativeGroupsAndRejectsDivergen
     EXPECT_NE(error.find("leaves"), std::string::npos);
 
     invalid = canonical;
-    invalid[1].leafPaths = {"output.a速"};
+    invalid[1].leafPaths = {u8"output.a\u901f"};
     error.clear();
     EXPECT_FALSE(validateAutodiffDerivativeGroups(invalid, error));
     EXPECT_NE(error.find("leaves"), std::string::npos);

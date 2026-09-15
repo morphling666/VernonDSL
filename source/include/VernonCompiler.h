@@ -4,7 +4,9 @@
 #include "VernonCommon.h"
 #include "VernonCpuWorkgroupABI.h"
 
-#if defined(_WIN32) && defined(VERNON_DSL_COMPILER_BUILD)
+#if defined(VERNON_DSL_COMPILER_STATIC)
+#define VERNON_DSL_CAPI
+#elif defined(_WIN32) && defined(VERNON_DSL_COMPILER_BUILD)
 #define VERNON_DSL_CAPI __declspec(dllexport)
 #elif defined(_WIN32)
 #define VERNON_DSL_CAPI __declspec(dllimport)
@@ -40,7 +42,12 @@ typedef enum VernonTarget {
     VERNON_TARGET_CUDA = 6
 } VernonTarget;
 
+#define VERNON_TARGET_CAPABILITIES_VERSION 1
+
 typedef struct VernonTargetCapabilities {
+    /* Set to sizeof(VernonTargetCapabilities). */
+    uint32_t struct_size;
+    uint32_t abi_version;
     uint8_t available;
     uint8_t supports_graphics;
     uint8_t supports_compute;
@@ -50,6 +57,10 @@ typedef struct VernonTargetCapabilities {
     uint8_t supports_f16;
     uint8_t supports_f64;
     uint8_t supports_f64_device_atomic_add;
+    uint8_t supports_compute_texture_binding;
+    uint8_t supports_non_r32_read_write_storage_images;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint8_t reserved[5];
 } VernonTargetCapabilities;
 
 typedef enum VernonMetalPlatform { VERNON_METAL_PLATFORM_MACOS = 0, VERNON_METAL_PLATFORM_IOS = 1 } VernonMetalPlatform;
@@ -116,8 +127,9 @@ typedef struct VernonProgramShapeFact {
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
 VERNON_DSL_CAPI void vernonCompilerDestroy(VernonCompilerContext *context);
 
-VERNON_DSL_CAPI VernonTargetCapabilities vernonCompilerGetTargetCapabilities(const VernonCompilerContext *context,
-                                                                             VernonTarget target);
+VERNON_DSL_CAPI VernonStatus vernonCompilerQueryTargetCapabilities(const VernonCompilerContext *context,
+                                                                   VernonTarget target,
+                                                                   VernonTargetCapabilities *capabilities);
 
 // Parses and verifies textual MLIR and returns deterministic reflection data.
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerValidateMlir(VernonCompilerContext *context, const char *source,

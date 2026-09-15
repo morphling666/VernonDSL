@@ -333,51 +333,10 @@ VernonStringView cpuProviderLastError(const VernonRuntimeContext &context) {
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
                                CpuPipelineState &state) {
     state.entry = kernel.entry;
-    if (reflection.packedArguments)
-        state.packedSize = reflection.packedArguments->size;
-    if (reflection.packedResults)
-        state.packedResultSize = reflection.packedResults->size;
-    for (const ReflectedArgument &argument : reflection.arguments) {
-        const bool tapeBuiltin = argument.kind == "builtin" && (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
-                                                                argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN);
-        if (argument.kind == "builtin" && !tapeBuiltin)
-            continue;
-        if (!tapeBuiltin && argument.index == UINT32_MAX) {
-            invocationDiagnostic(context) = "CPU compute reflection is missing a kernel argument index";
-            return false;
-        }
-        const uint32_t layoutIndex = static_cast<uint32_t>(state.layout.size());
-        VernonRuntimeProviderBindingLayoutEntry binding{};
-        binding.slot = layoutIndex;
-        binding.set = argument.descriptorSet;
-        binding.binding = argument.binding == UINT32_MAX ? layoutIndex : argument.binding;
-        binding.kind = argument.kind == "tensor" && !argument.tensorViewDescriptor
-                           ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                           : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-        binding.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-        binding.access = 3;
-        binding.array_count = 1;
-        binding.argument_index = tapeBuiltin ? UINT32_MAX : argument.index;
-        binding.element_size =
-            static_cast<uint32_t>(binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? argument.tensorElementSize
-                                                                                         : argument.physical.size);
-        if (!binding.element_size) {
-            invocationDiagnostic(context) = "CPU compute reflection contains a zero-sized argument";
-            return false;
-        }
-        state.layout.push_back(binding);
-        state.layoutBuiltins.push_back(tapeBuiltin ? argument.builtin : std::string());
-        state.packedOffsets.push_back(argument.physical.offset);
-        state.packedFieldSizes.push_back(argument.physical.size);
-        state.packedResults.push_back(argument.result);
-        state.packedResultReductions.push_back(argument.result && argument.autodiffRole == "gradient" ? argument.dtype
-                                                                                                      : std::nullopt);
-        if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN)
-            state.tapeAllocatorOffset = argument.physical.offset;
-        if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
-            state.tapeRootOffset = argument.physical.offset;
-    }
-    state.values.resize(state.layout.size());
+    if (!buildPreparedComputeBindingPlan({}, reflection, VERNON_RUNTIME_CPU, state.bindingPlan,
+                                         invocationDiagnostic(context)))
+        return false;
+    state.values.resize(state.bindingPlan.size());
     std::copy_n(reflection.workgroup, 3, state.workgroup);
     CpuProviderShaderPayload payload{&kernel, &reflection};
     const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
@@ -394,8 +353,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
     descriptor.shaders = &shader;
     descriptor.shader_count = 1;
-    descriptor.bindings = state.layout.data();
-    descriptor.binding_count = state.layout.size();
+    descriptor.bindings = state.bindingPlan.layouts.data();
+    descriptor.binding_count = state.bindingPlan.size();
     descriptor.push_constant_size = sizeof(VernonLaunchSize);
     std::copy_n(state.workgroup, 3, descriptor.workgroup_size);
     const VernonStatus status = vernonRuntimeCorePreparePipeline(cpuProvider(context), &descriptor, &state.pipeline);

@@ -183,7 +183,7 @@ struct BackendDispatch {
     Option<DescribeImageViewResourceCallback> describeImageViewResource;
 };
 
-void setDeviceCreationError(std::string_view error) noexcept;
+VERNON_RHI_CAPI void setDeviceCreationError(std::string_view error) noexcept;
 VERNON_RHI_CAPI VernonStringView deviceCreationError() noexcept;
 const BackendDispatch &openGLBackendDispatch();
 VERNON_RHI_CAPI Result<void, RhiError> deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context,

@@ -64,7 +64,44 @@ function(vernon_add_runtime)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_CUDA_RHI=1)
     endif()
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-        find_program(_vernon_hlsl_compiler NAMES dxc fxc REQUIRED)
+        set(_vernon_hlsl_compiler_hints)
+        if(VERNON_DXC_EXECUTABLE)
+            get_filename_component(_vernon_configured_dxc_directory "${VERNON_DXC_EXECUTABLE}" DIRECTORY)
+            list(APPEND _vernon_hlsl_compiler_hints "${_vernon_configured_dxc_directory}")
+        endif()
+        if(WIN32)
+            if(CMAKE_VS_PLATFORM_NAME)
+                set(_vernon_windows_sdk_arch "${CMAKE_VS_PLATFORM_NAME}")
+            elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+                set(_vernon_windows_sdk_arch arm64)
+            elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+                set(_vernon_windows_sdk_arch x86)
+            else()
+                set(_vernon_windows_sdk_arch x64)
+            endif()
+            set(_vernon_windows_sdk_bin "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin")
+            if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+                list(
+                    APPEND _vernon_hlsl_compiler_hints
+                    "${_vernon_windows_sdk_bin}/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/${_vernon_windows_sdk_arch}"
+                )
+            endif()
+            file(
+                GLOB _vernon_windows_sdk_versions
+                LIST_DIRECTORIES TRUE
+                "${_vernon_windows_sdk_bin}/*")
+            list(
+                SORT _vernon_windows_sdk_versions
+                COMPARE NATURAL
+                ORDER DESCENDING)
+            foreach(_vernon_windows_sdk_version IN LISTS _vernon_windows_sdk_versions)
+                list(APPEND _vernon_hlsl_compiler_hints "${_vernon_windows_sdk_version}/${_vernon_windows_sdk_arch}")
+            endforeach()
+        endif()
+        find_program(
+            _vernon_hlsl_compiler
+            NAMES dxc fxc
+            HINTS ${_vernon_hlsl_compiler_hints} REQUIRED)
         get_filename_component(_vernon_hlsl_compiler_name "${_vernon_hlsl_compiler}" NAME_WE)
         set(_vernon_directx12_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/directx12_generated")
         file(MAKE_DIRECTORY "${_vernon_directx12_generated_dir}")
@@ -199,12 +236,20 @@ function(vernon_add_runtime)
         target_compile_options(VernonRuntimeCore PRIVATE /EHsc)
     endif()
 
+    add_library(VernonRuntimeUtilities STATIC ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
+                                              ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp)
+    set_target_properties(VernonRuntimeUtilities PROPERTIES EXPORT_NAME RuntimeUtilities POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(VernonRuntimeUtilities PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
+                                                              $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
+    if(MSVC)
+        target_compile_options(VernonRuntimeUtilities PRIVATE /EHsc)
+    endif()
+
     add_library(
         VernonRuntimeInternals OBJECT
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/autodiff_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_materializer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_implementation_metadata.cpp
@@ -218,13 +263,14 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/resolved_execution_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/shape_layout.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/vertex_attribute_capabilities.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/prepared_binding_plan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp)
     set_target_properties(VernonRuntimeInternals PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(VernonRuntimeInternals PRIVATE VERNON_RUNTIME_STATIC)
     target_include_directories(VernonRuntimeInternals PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
                                                               $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonRuntimeInternals PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+    target_link_libraries(VernonRuntimeInternals PRIVATE VernonRuntimeCore VernonRuntimeUtilities
+                                                         $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
     if(MSVC)
         target_compile_options(VernonRuntimeInternals PRIVATE /EHsc)
     endif()
@@ -235,7 +281,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_cuda.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_directx12.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_opengl.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_vulkan.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_vulkan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/vertex_attribute_capabilities.cpp)
     add_library(Vernon::RuntimeRHIAdapter ALIAS VernonRuntimeRHIAdapter)
     set_target_properties(VernonRuntimeRHIAdapter PROPERTIES EXPORT_NAME RuntimeRHIAdapter POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(VernonRuntimeRHIAdapter PUBLIC VERNON_RUNTIME_RHI_ADAPTER_STATIC)
@@ -264,10 +311,7 @@ function(vernon_add_runtime)
     target_include_directories(VernonRuntimeRHIAdapter PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
     target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RHI)
 
-    add_library(
-        VernonRuntime
-        ${VERNON_RUNTIME_LIBRARY_TYPE}
-        ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
+    set(_vernon_runtime_implementation_sources
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graphics_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_invocation_state.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_image_binding.cpp
@@ -288,8 +332,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_shape_resolver.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_lifecycle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_materializer.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_policy.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_telemetry.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_commands.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_replay.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_program_autodiff.cpp
@@ -306,28 +350,54 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
-    add_library(Vernon::Runtime ALIAS VernonRuntime)
-    target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
-    set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
+
+    add_library(VernonRuntimeImplementation OBJECT ${_vernon_runtime_implementation_sources})
+    set_target_properties(VernonRuntimeImplementation PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_RUNTIME_STATIC)
+    if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_CPU_WORKGROUP_ABI_BUILD)
+    endif()
+    target_include_directories(VernonRuntimeImplementation PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/..
+                                                                   ${_VERNON_RUNTIME_INCLUDE_DIR})
+    target_link_libraries(
+        VernonRuntimeImplementation
+        PRIVATE VernonRuntimeCore
+                VernonRuntimeRHIAdapter
+                VernonRuntimeUtilities
+                VernonPlatform
+                VernonRHI
+                $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+
+    add_library(
+        VernonRuntime
+        ${VERNON_RUNTIME_LIBRARY_TYPE}
+        ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_python_bridge.cpp)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
+    target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
+                                         $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
+    add_library(Vernon::Runtime ALIAS VernonRuntime)
+    set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
     if(VERNON_RUNTIME_PROFILE STREQUAL "web")
         target_compile_definitions(VernonRuntime PUBLIC VERNON_RUNTIME_PROFILE_WEB=1)
         target_compile_definitions(VernonRuntimeInternals PRIVATE VERNON_RUNTIME_PROFILE_WEB=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_RUNTIME_PROFILE_WEB=1)
     endif()
     if(WIN32)
-        target_compile_definitions(VernonRuntime PRIVATE NOMINMAX)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE NOMINMAX)
     endif()
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "STATIC")
         target_compile_definitions(VernonRuntime PUBLIC VERNON_RUNTIME_STATIC)
     endif()
     if(VERNON_ENABLE_CUDA_RUNTIME)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_CUDA_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_CUDA_RUNTIME=1)
     endif()
     if(VERNON_ENABLE_VULKAN_RUNTIME)
-        target_compile_definitions(
-            VernonRuntime
-            PUBLIC VERNON_HAS_VULKAN_RUNTIME=1
-            PRIVATE VK_NO_PROTOTYPES=1)
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_VULKAN_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_VULKAN_RUNTIME=1 VK_NO_PROTOTYPES=1)
+        target_link_libraries(VernonRuntimeImplementation PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
         target_link_libraries(VernonRuntime PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
@@ -335,10 +405,12 @@ function(vernon_add_runtime)
             message(FATAL_ERROR "VERNON_ENABLE_DIRECTX12_RUNTIME is supported only on Windows")
         endif()
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_DIRECTX12_RUNTIME=1)
         target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
     endif()
     if(VERNON_ENABLE_METAL_RUNTIME)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_METAL_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_METAL_RUNTIME=1)
     endif()
     target_include_directories(
         VernonRuntime
@@ -348,6 +420,7 @@ function(vernon_add_runtime)
         VernonRuntime
         PRIVATE VernonRuntimeCore
                 VernonRuntimeRHIAdapter
+                VernonRuntimeUtilities
                 VernonPlatform
                 VernonRHI
                 $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
@@ -366,10 +439,39 @@ function(vernon_add_runtime)
         endif()
     endforeach()
     if(BUILD_TESTING)
-        target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_TESTING=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_RUNTIME_TESTING=1)
+        add_library(VernonRuntimeTestHost STATIC ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
+                                                 ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp)
+        target_sources(
+            VernonRuntimeTestHost PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
+                                          $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
+        add_library(Vernon::RuntimeTesting ALIAS VernonRuntimeTestHost)
+        target_compile_definitions(VernonRuntimeTestHost PUBLIC VERNON_RUNTIME_STATIC VERNON_RUNTIME_TESTING=1)
+        target_include_directories(VernonRuntimeTestHost PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
+                                                                $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
+        target_link_libraries(
+            VernonRuntimeTestHost
+            PUBLIC VernonRuntimeCore
+                   VernonRuntimeRHIAdapter
+                   VernonRuntimeUtilities
+                   VernonPlatform
+                   VernonRHI
+                   $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+        if(NOT
+           VERNON_RUNTIME_PROFILE
+           STREQUAL
+           "web")
+            target_link_libraries(VernonRuntimeTestHost PUBLIC ${CMAKE_DL_LIBS})
+        endif()
+        if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+            target_link_libraries(VernonRuntimeTestHost PUBLIC d3d12 dxgi dxguid)
+        endif()
+        if(VERNON_ENABLE_VULKAN_RUNTIME)
+            target_link_libraries(VernonRuntimeTestHost PUBLIC $<BUILD_INTERFACE:Vulkan::Headers>)
+        endif()
     endif()
     if(MSVC)
-        target_compile_options(VernonRuntime PRIVATE /EHsc)
+        target_compile_options(VernonRuntimeImplementation PRIVATE /EHsc)
     endif()
     if(SKBUILD)
         set(_vernon_runtime_bin_destination vernon_dsl)
@@ -386,6 +488,7 @@ function(vernon_add_runtime)
             _vernon_runtime_install_targets
             VernonRuntimeCore
             VernonRuntimeRHIAdapter
+            VernonRuntimeUtilities
             VernonPlatform)
     endif()
     install(

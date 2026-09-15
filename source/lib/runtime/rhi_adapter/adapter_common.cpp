@@ -42,7 +42,11 @@ void recordProviderError(VernonRuntimeRhiAdapter &adapter, vernon::ProviderError
                          const char *diagnostic) noexcept {
     char rendered[384]{};
     if (error.context.operation) {
-        std::snprintf(rendered, sizeof(rendered), "%s: %s", diagnostic, error.context.operation);
+        if (error.context.value || error.context.detail)
+            std::snprintf(rendered, sizeof(rendered), "%s: %s (%llu, %u)", diagnostic, error.context.operation,
+                          static_cast<unsigned long long>(error.context.value), error.context.detail);
+        else
+            std::snprintf(rendered, sizeof(rendered), "%s: %s", diagnostic, error.context.operation);
         setBackendError(adapter.error, rendered);
         return;
     }
@@ -419,8 +423,9 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
         return described;
     const auto format = providerTextureFormat(source.format);
     if (!format)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::Unsupported, {"describe_provider_image_format", source.format, 0}})};
+        return RhiAdapterResult<void>{vernon::err(
+            vernon::ProviderError{vernon::ProviderErrorCode::Unsupported,
+                                  {"describe_provider_image_format", static_cast<uint64_t>(source.format), 0}})};
     const VernonTextureDimension dimension = source.dimension == VERNON_RHI_IMAGE_3D     ? VERNON_TEXTURE_3D
                                              : source.dimension == VERNON_RHI_IMAGE_CUBE ? VERNON_TEXTURE_CUBE
                                                                                          : VERNON_TEXTURE_2D;
@@ -449,7 +454,8 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
     const auto viewFormat = view ? providerTextureFormat(sourceView.format) : format;
     if (!viewFormat)
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::Unsupported, {"describe_provider_image_view_format", sourceView.format, 0}})};
+            vernon::ProviderErrorCode::Unsupported,
+            {"describe_provider_image_view_format", static_cast<uint64_t>(sourceView.format), 0}})};
     const uint32_t viewAspects =
         !view ? aspects
               : ((sourceView.aspects & VERNON_RHI_IMAGE_ASPECT_COLOR) ? VERNON_IMAGE_ASPECT_COLOR : 0) |

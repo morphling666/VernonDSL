@@ -1,5 +1,6 @@
 #include "compiler_python_bridge.h"
 
+#include "VernonGpuAutodiffAbi.h"
 #include "compiler_frontend.h"
 #include "compiler_internal.h"
 #include "compiler_program_builtin.h"
@@ -14,6 +15,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <memory>
 #include <new>
 #include <optional>
@@ -325,6 +327,11 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
         removed.erase();
         original.erase();
         profile->getOperation()->setAttr("vernon.ad_profile", mlir::StringAttr::get(&context, profileName));
+        const uint64_t minimumTapeStride =
+            std::max<uint64_t>(result->tapeBytes, vernon::autodiff_abi::kInvocationHeaderBytes);
+        profile->getOperation()->setAttr(
+            "vernon.minimum_tape_stride_bytes",
+            mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), minimumTapeStride));
         kept->setAttr("vernon.entry", mlir::UnitAttr::get(&context));
         if (mlir::failed(mlir::verify(*profile)))
             return mlir::failure();

@@ -25,8 +25,9 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 }
 
 bool hasTapeBuiltins(const CpuPipelineState &state) {
-    for (const std::string &builtin : state.layoutBuiltins) {
-        if (builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN || builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
+    for (const PreparedCpuBinding &binding : state.bindingPlan.cpuBindings) {
+        if (binding.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
+            binding.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
             return true;
     }
     return false;
@@ -68,25 +69,25 @@ VernonStatus accumulateCpuResult(VernonDataType dtype, uint8_t *destination, con
 }
 
 VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsigned char> &packed, std::string &error) {
-    if (!state.packedSize || state.packedOffsets.size() != state.layout.size() ||
-        state.packedFieldSizes.size() != state.layout.size() || state.packedResults.size() != state.layout.size() ||
-        state.packedResultReductions.size() != state.layout.size()) {
+    const PreparedComputeBindingPlan &plan = state.bindingPlan;
+    if (!plan.packedArgumentSize || plan.cpuBindings.size() != plan.layouts.size()) {
         error = "CPU tape dispatch packed layout is incomplete";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     try {
-        packed.assign(state.packedSize, 0);
+        packed.assign(plan.packedArgumentSize, 0);
     } catch (const std::bad_alloc &) {
         error = "cannot allocate CPU tape packed arguments";
         return VERNON_STATUS_INTERNAL_ERROR;
     }
-    for (size_t index = 0; index < state.layout.size(); ++index) {
-        if (state.packedResults[index])
+    for (size_t index = 0; index < plan.size(); ++index) {
+        const PreparedCpuBinding &prepared = plan.cpuBindings[index];
+        if (prepared.result)
             continue;
-        const auto &layout = state.layout[index];
+        const auto &layout = plan.layouts[index];
         const auto &value = state.values[index];
-        const size_t offset = state.packedOffsets[index];
-        const size_t size = state.packedFieldSizes[index];
+        const size_t offset = prepared.packedOffset;
+        const size_t size = prepared.packedSize;
         if (offset > packed.size() || size > packed.size() - offset) {
             error = "CPU tape dispatch packed field is out of range";
             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -122,11 +123,13 @@ VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsign
 
 VernonStatus commitCpuResults(const CpuPipelineState &state, const std::vector<unsigned char> &results,
                               std::string &error) {
-    for (size_t index = 0; index < state.layout.size(); ++index) {
-        if (!state.packedResults[index])
+    const PreparedComputeBindingPlan &plan = state.bindingPlan;
+    for (size_t index = 0; index < plan.size(); ++index) {
+        const PreparedCpuBinding &prepared = plan.cpuBindings[index];
+        if (!prepared.result)
             continue;
-        const size_t offset = state.packedOffsets[index];
-        const size_t size = state.packedFieldSizes[index];
+        const size_t offset = prepared.packedOffset;
+        const size_t size = prepared.packedSize;
         if (offset > results.size() || size > results.size() - offset) {
             error = "CPU result field is out of range";
             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -156,21 +159,23 @@ VernonStatus reduceCpuLaneResults(VernonRuntimeContext &context, const CpuPipeli
                                   std::vector<unsigned char> &results) {
     if (lanes.empty())
         return fail(context, "CPU result reduction has no lane values");
-    for (size_t index = 0; index < state.layout.size(); ++index) {
-        if (!state.packedResults[index])
+    const PreparedComputeBindingPlan &plan = state.bindingPlan;
+    for (size_t index = 0; index < plan.size(); ++index) {
+        const PreparedCpuBinding &prepared = plan.cpuBindings[index];
+        if (!prepared.result)
             continue;
-        const size_t offset = state.packedOffsets[index];
-        const size_t size = state.packedFieldSizes[index];
+        const size_t offset = prepared.packedOffset;
+        const size_t size = prepared.packedSize;
         if (offset > results.size() || size > results.size() - offset)
             return fail(context, "CPU reduced result field is out of range");
-        if (!state.packedResultReductions[index]) {
+        if (!prepared.resultReduction) {
             std::memcpy(results.data() + offset, lanes.back().data() + offset, size);
             continue;
         }
         std::vector<uint8_t> reduced(size);
         for (const std::vector<unsigned char> &lane : lanes)
-            if (const VernonStatus status = accumulateCpuResult(*state.packedResultReductions[index], reduced.data(),
-                                                                lane.data() + offset, size);
+            if (const VernonStatus status =
+                    accumulateCpuResult(*prepared.resultReduction, reduced.data(), lane.data() + offset, size);
                 status != VERNON_STATUS_OK)
                 return fail(context, "CPU Stage can only reduce well-formed floating results", status);
         std::memcpy(results.data() + offset, reduced.data(), size);
@@ -184,12 +189,13 @@ VernonStatus dispatchCpuReducedCompute(VernonRuntimeContext &context, CpuPipelin
     if (!state.entry || !cpuDispatchVolume(groups, state.workgroup, volume))
         return fail(context, "CPU reduced dispatch has an invalid entry or volume");
     std::vector<unsigned char> packed;
-    std::vector<unsigned char> results(state.packedResultSize);
+    std::vector<unsigned char> results(state.bindingPlan.packedResultSize);
     std::string error;
     if (const VernonStatus status = packCpuInvocation(state, packed, error); status != VERNON_STATUS_OK)
         return fail(context, std::move(error), status);
     std::vector<const void *> laneArguments(volume, packed.data());
-    std::vector<std::vector<unsigned char>> laneStorage(volume, std::vector<unsigned char>(state.packedResultSize));
+    std::vector<std::vector<unsigned char>> laneStorage(volume,
+                                                        std::vector<unsigned char>(state.bindingPlan.packedResultSize));
     std::vector<void *> laneResults(volume);
     for (size_t lane = 0; lane < volume; ++lane)
         laneResults[lane] = laneStorage[lane].data();
@@ -218,6 +224,7 @@ VernonStatus dispatchCpuReducedCompute(VernonRuntimeContext &context, CpuPipelin
 }
 
 VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineState &state, const uint32_t groups[3]) {
+    const PreparedComputeBindingPlan &plan = state.bindingPlan;
     if (!state.entry)
         return fail(context, "CPU tape dispatch has no entry");
     if (!state.tapeAllocator)
@@ -230,9 +237,9 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
         return fail(context, "CPU tape dispatch volume overflows");
     if (batch->size() < volume)
         return fail(context, "CPU tape dispatch has fewer lanes than the compute grid");
-    if (state.tapeAllocatorOffset == std::numeric_limits<size_t>::max() ||
-        state.tapeAllocatorOffset > state.packedSize ||
-        sizeof(VernonAdTapeAllocator *) > state.packedSize - state.tapeAllocatorOffset)
+    if (plan.tapeAllocatorOffset == std::numeric_limits<size_t>::max() ||
+        plan.tapeAllocatorOffset > plan.packedArgumentSize ||
+        sizeof(VernonAdTapeAllocator *) > plan.packedArgumentSize - plan.tapeAllocatorOffset)
         return fail(context, "CPU tape allocator packed offset is invalid");
     std::vector<unsigned char> packed;
     std::vector<unsigned char> results;
@@ -240,7 +247,7 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
     if (const VernonStatus status = packCpuInvocation(state, packed, packError); status != VERNON_STATUS_OK)
         return fail(context, std::move(packError), status);
     try {
-        results.resize(state.packedResultSize);
+        results.resize(plan.packedResultSize);
     } catch (const std::bad_alloc &) {
         return fail(context, "cannot allocate CPU result frame", VERNON_STATUS_INTERNAL_ERROR);
     }
@@ -250,13 +257,13 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
     std::vector<void *> laneResults;
     std::vector<ad::HostStaticTapeBatch::Reader> readers;
     const bool reduceResults =
-        std::any_of(state.packedResultReductions.begin(), state.packedResultReductions.end(),
-                    [](const std::optional<VernonDataType> &dtype) { return dtype.has_value(); });
+        std::any_of(plan.cpuBindings.begin(), plan.cpuBindings.end(),
+                    [](const PreparedCpuBinding &binding) { return binding.resultReduction.has_value(); });
     try {
         lanePacked.assign(volume, packed);
         laneArguments.resize(volume);
         if (reduceResults) {
-            laneResultStorage.assign(volume, std::vector<unsigned char>(state.packedResultSize));
+            laneResultStorage.assign(volume, std::vector<unsigned char>(plan.packedResultSize));
             laneResults.resize(volume);
         }
         if (batch->isCompacted())
@@ -274,18 +281,18 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
             root = readers[lane].rootRegion();
         } else {
             allocator = batch->descriptor(lane);
-            if (state.tapeRootOffset != std::numeric_limits<size_t>::max())
+            if (plan.tapeRootOffset != std::numeric_limits<size_t>::max())
                 root = batch->rootRegion(lane);
         }
         if (!allocator)
             return fail(context, "CPU tape dispatch is missing a lane allocator");
-        std::memcpy(lanePacked[lane].data() + state.tapeAllocatorOffset, &allocator, sizeof(allocator));
-        if (state.tapeRootOffset != std::numeric_limits<size_t>::max()) {
+        std::memcpy(lanePacked[lane].data() + plan.tapeAllocatorOffset, &allocator, sizeof(allocator));
+        if (plan.tapeRootOffset != std::numeric_limits<size_t>::max()) {
             if (batch->isCompacted() && !root)
                 return fail(context, "CPU tape dispatch has no sealed root region");
-            if (state.tapeRootOffset > packed.size() || sizeof(root) > packed.size() - state.tapeRootOffset)
+            if (plan.tapeRootOffset > packed.size() || sizeof(root) > packed.size() - plan.tapeRootOffset)
                 return fail(context, "CPU tape root packed offset is invalid");
-            std::memcpy(lanePacked[lane].data() + state.tapeRootOffset, &root, sizeof(root));
+            std::memcpy(lanePacked[lane].data() + plan.tapeRootOffset, &root, sizeof(root));
         }
         laneArguments[lane] = lanePacked[lane].data();
         if (reduceResults)
@@ -343,14 +350,16 @@ void destroyCpuPipeline(VernonStageExecutable &pipeline) {
 
 VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
-    for (size_t index = 0; index < state.layout.size(); ++index) {
-        const auto &layout = state.layout[index];
+    const PreparedComputeBindingPlan &plan = state.bindingPlan;
+    for (size_t index = 0; index < plan.size(); ++index) {
+        const auto &layout = plan.layouts[index];
+        const PreparedCpuBinding &prepared = plan.cpuBindings[index];
         auto &value = state.values[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        if (index < state.layoutBuiltins.size() && !state.layoutBuiltins[index].empty()) {
-            const std::string &builtin = state.layoutBuiltins[index];
+        if (!prepared.builtin.empty()) {
+            const std::string &builtin = prepared.builtin;
             if (builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN) {
                 if (!state.tapeAllocator)
                     return fail(*pipeline.context, "CPU tape dispatch has no allocator");
@@ -407,8 +416,8 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     if (hasTapeBuiltins(state))
         return dispatchCpuTapedCompute(*pipeline.context, state, groups);
-    if (std::any_of(state.packedResultReductions.begin(), state.packedResultReductions.end(),
-                    [](const std::optional<VernonDataType> &dtype) { return dtype.has_value(); }))
+    if (std::any_of(plan.cpuBindings.begin(), plan.cpuBindings.end(),
+                    [](const PreparedCpuBinding &binding) { return binding.resultReduction.has_value(); }))
         return dispatchCpuReducedCompute(*pipeline.context, state, groups);
     VernonStatus status =
         state.bindings ? vernonRuntimeCoreUpdateBindings(state.bindings, state.values.data(), state.values.size())
