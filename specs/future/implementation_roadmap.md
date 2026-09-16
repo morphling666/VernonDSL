@@ -17,6 +17,28 @@ dates or change current public contracts.
   planning.
 - Generated IR and artifacts remain cache/deployment outputs.
 
+### 1.1 Vertical delivery strategy
+
+The project validates one complete generation-to-installation loop before
+broadening every domain abstraction:
+
+1. **Single-device region:** elementwise, contraction, and reduction semantics;
+   deterministic fusion; one agent-generated implementation; translation
+   validation, measurement, and cache.
+2. **Attention region:** online-summary refinement; generated fusion and target
+   implementations; multiple shape-qualified variants.
+3. **Two-resource partition:** partial summaries, redistribution, chunk
+   availability, event simulation, and communication-compute fusion.
+4. **Joint numerical planning:** storage, transfer, compute, and accumulator
+   representations feed back into partition, communication, and local
+   implementation.
+5. **LLM stress system:** dense, context, expert, batch, and Program-region
+   partitions are rediscovered and combined without named strategy actions.
+
+Sparse, graphics, heterogeneous, and Host tracks reuse accepted contracts, but
+they do not block proof that the central candidate-generation and acceptance
+loop works end to end.
+
 ## 2. Current implementation entry points
 
 | Future work | Existing entry point |
@@ -59,7 +81,10 @@ recovering partition semantics or running compiler search.
 Deliver:
 
 - final analysis-interface and IR field drafts;
-- `PlanCandidate`, topology, profile, measurement, and insight schemas;
+- `SemanticRegion`, `OptimizationDecisionGraph`, `PlanCandidate`,
+  `ImplementationCandidate`, `EvidenceBundle`, topology, profile, measurement,
+  and insight schemas;
+- common `CandidateGenerator` protocol and deterministic baseline generator;
 - CUDA Tile IR bytecode/toolchain compatibility policy;
 - deterministic reference Programs and benchmark harness.
 
@@ -262,24 +287,41 @@ Tests:
 Exit: selected plans report estimated and measured compute, communication,
 overlap, peak memory, quality, uncertainty, and fallback.
 
-## 13. PR 9: Recipe-free search and agents
+## 13. PR 9: Unified candidate generation and optimization memory
 
 Deliver:
 
+- one `CandidateGenerator` protocol shared by rules, solvers, enumerators,
+  autotuners, retrieval, agents, and external synthesis;
 - hierarchical beam/Pareto search over generic actions;
 - bounded outer feedback;
 - exhaustive small-case oracle;
-- structured Agent proposal import/export;
+- structured Agent graph-plan, fusion-region, physical-IR, and target-lowering
+  proposal import/export;
+- generated implementation contract and target translation validation;
+- candidate-specific cost-feature/model extension protocol with independent
+  calibration and uncertainty;
+- versioned optimization memory containing reusable decision subgraphs,
+  evidence, failures, counterexamples, and exact artifact identities;
+- tiered baseline, rule/retrieval, autotuning, and agentic optimization;
 - sandboxed verify/compile/reference/benchmark loop;
 - failure and insight records.
 
 Exit:
 
 - automatic search receives no TP/EP/DP/CP/PP label;
+- every generator submits the same typed candidates and passes the same
+  acceptance protocol;
 - it rediscovers known Pareto plans on small cases;
 - it exceeds one fixed recipe baseline on held-out workload/topology;
-- Agent value is reported under fixed compile and measurement budgets;
-- only held-out reproduced insights are promoted to deterministic rules.
+- Agent value at graph and kernel-lowering levels is reported separately under
+  fixed compile and measurement budgets;
+- a qualified one-off generated implementation may be installed with narrow
+  preconditions and fallback;
+- only held-out reproduced insights are promoted to deterministic rules,
+  schedule schemas, lowering patterns, or shared cost-model extensions;
+- repeated compilation reuses qualified evidence and failed-search memory
+  without trusting stale target identities.
 
 ## 14. Primary acceptance workloads
 
@@ -402,13 +444,18 @@ Planner/model:
 - selected-plan regret;
 - uncertainty calibration;
 - Pareto-front recall;
-- recipe-free versus seeded result.
+- recipe-free versus seeded result;
+- optimization-memory retrieval hit, adaptation success, and avoided
+  evaluations;
+- global-to-local feedback attribution and reconsideration rate.
 
-Agent:
+Candidate generators:
 
+- valid and Pareto-improving candidates per evaluation budget by generator;
 - Pareto improvement per evaluation budget;
 - reproducible insight count;
-- held-out success and counterexample rate.
+- held-out success and counterexample rate;
+- Tier 0 time-to-baseline and incremental Tier 1–3 compile/measurement cost.
 
 ## 17. Versioned-release gates
 

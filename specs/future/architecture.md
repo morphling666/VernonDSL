@@ -55,8 +55,17 @@ universal operation or one universal kernel:
 > Program IR owns meaning. Analysis interfaces expose structure. Logical plans
 > own partition and placement. The asynchronous task graph owns required
 > physical work and dependencies. Typed physical IR owns target-oriented
-> schedules. Verifiers define legality. Models and measurements select among
+> schedules. Deterministic rules, search procedures, and agents are
+> interchangeable candidate generators at graph and kernel-lowering levels.
+> Verifiers define legality. Explicit models and measurements select among
 > legal candidates.
+
+The analysis interfaces are the common optimization API. Rules, solvers,
+enumerators, retrieval, agents, and external synthesis all implement one
+`CandidateGenerator` protocol over those facts. A generator may grow and cost
+a known fusion region or propose a new partition, algorithm, physical
+schedule, target lowering, or cost-model extension. No generator acquires
+semantic or correctness authority.
 
 Machine learning strategy names such as data, tensor, pipeline, context, and
 expert parallelism are optional source recipes and validation terminology.
@@ -74,15 +83,21 @@ flowchart TB
     Target["6. Target leaf lowering"]
     Resolved["7. Future physical-plan variants"]
     Planner["Joint planner"]
+    Generators["CandidateGenerator set"]
     Verify["Composable verifiers"]
     Measure["Compile, reference, measure"]
     Profiles[("Versioned profiles")]
 
     Program --> Analysis --> Logical --> Tasks --> Physical --> Target
     Target --> Verify --> Measure --> Resolved
+    Analysis --> Generators
+    Generators --> Planner
+    Generators --> Physical
+    Generators --> Target
     Planner --> Logical
     Planner --> Physical
     Profiles --> Planner
+    Profiles --> Generators
     Measure --> Profiles
 ```
 
@@ -94,6 +109,54 @@ There are two kinds of structure:
 
 The joint planner is a service, not another semantic IR. Cost feedback may
 select another candidate but cannot change Program meaning.
+
+### 3.1 Core optimization records
+
+Five records form the narrow contract between semantics, candidate generation,
+acceptance, and deployment:
+
+```text
+SemanticRegion {
+  Program provenance
+  inputs, outputs, and observable effects
+  available analysis interfaces and algebraic laws
+  numerical and reference contract
+}
+
+OptimizationDecisionGraph {
+  candidate decisions and dependencies
+  assumptions and derived consequences
+  parent alternatives and reversible refinements
+  exact provenance for communication, conversion, and fusion
+}
+
+ImplementationCandidate {
+  source SemanticRegion
+  selected decision subgraph
+  physical or target implementation
+  assumptions, resource contract, and fallback
+}
+
+EvidenceBundle {
+  static and translation validation
+  numerical and differential results
+  analytical estimates and uncertainty
+  compilation and measured profiles
+  counterexamples and qualification limits
+}
+
+PhysicalPlanVariant {
+  qualified implementation and evidence
+  shape, topology, phase, and capability bucket
+  immutable execution and fallback
+}
+```
+
+`SemanticRegion` is a referenced view of canonical Program meaning, not a
+second semantic graph. `OptimizationDecisionGraph` is compiler planning state,
+not Runtime state. `PlanCandidate` is a complete evaluable projection of one
+consistent decision subgraph. A `PhysicalPlanVariant` is installed only after
+its candidate and evidence satisfy the versioned acceptance policy.
 
 ## 4. Layer authorities
 
@@ -130,6 +193,10 @@ Operations expose only the analysis interfaces meaningful to them:
 
 The interfaces do not form a second semantic graph. Unknown structure reduces
 optimization opportunities but does not invalidate an opaque Stage.
+They are consumed equally by handwritten passes, bounded search, agents, and
+external synthesizers. An agent may reason beyond existing rewrite rules, but
+the resulting region or implementation must map back to these facts or provide
+a separately checked semantic refinement.
 
 ### 4.3 Logical distribution
 
@@ -226,13 +293,14 @@ The second is not inserted into semantic Program IR. It becomes explicit after
 logical planning and before communication-aware fusion. NCCL, MPI, NVSHMEM, a
 driver API, or a backend remote instruction never defines Program meaning.
 
-## 7. Joint optimization boundary
+## 7. Candidate generation and joint optimization boundary
 
 A complete candidate contains:
 
 ```text
 PlanCandidate {
   semantic_provenance
+  generator_and_transformation_provenance
   numerical_and_representation_plan
   partition_and_placement_plan
   partial_values_and_redistributions
@@ -251,6 +319,56 @@ fusion/tile evaluation. Material differences between estimates and measured
 lower-level costs may trigger bounded reconsideration of representation,
 partition, or placement.
 
+Candidate generation is pluggable across optimization levels:
+
+```text
+CandidateGenerator {
+  accepted_problem_kinds
+  required_semantic_and_analysis_interfaces
+  accepted_constraints_profiles_and_prior_evidence
+  generated_decisions_regions_or_implementations
+  declared assumptions_and_expected_evidence
+  identity_version_and_replay_information
+}
+```
+
+Handwritten rewrites, constraint solvers, equality saturation, schedule
+enumerators, autotuners, retrieval systems, agents, and external synthesis
+services all implement this protocol. There is no privileged rule path and
+separate agent path. A generator may work at graph level, physical-region
+level, target-lowering level, or more than one level, while every concrete
+result enters the same decision, validation, evaluation, and installation
+contracts.
+
+Generated cost extensions may guide exploration of an out-of-distribution
+candidate, but they remain explicit, versioned, uncertain, and independently
+calibrated by measurement.
+
+An implementation generator may target any registered inspectable target IR
+or source adapter. It need not replay Vernon's deterministic lowering passes.
+Skipping intermediate IR increases its translation-validation and fallback
+obligations rather than weakening them.
+
+### 7.1 Coupled global and local loops
+
+Optimization uses two coupled loops:
+
+```text
+global loop:
+  numerical representation, partition, placement, replication,
+  redistribution, checkpointing, fusion boundaries, asynchronous composition
+
+local loop:
+  algorithmic replacement, tile, layout, pipeline, memory hierarchy,
+  target operation selection, and leaf lowering
+```
+
+Neither loop is permanently upstream of the other. Every promising global
+decision receives a local implementation estimate. Resource, compilation, and
+measurement results may invalidate or revise the global decision that created
+the region. The decision graph records this dependency so reconsideration can
+replace the affected subgraph instead of restarting unrelated choices.
+
 ## 8. Domain independence
 
 Shared infrastructure includes:
@@ -261,7 +379,8 @@ Shared infrastructure includes:
 - asynchronous dependencies and completion;
 - resource and capability framework;
 - composable verification;
-- profiles, measurements, explanations, and Pareto selection;
+- profiles, measurements, optimization memory, explanations, and Pareto
+  selection;
 - future immutable physical-plan variants and ordinary fallback.
 
 Domain-specific components include:
@@ -313,9 +432,20 @@ Every selected plan explains how constraints were applied.
 
 ## 11. Kernel provenance
 
-Executable compute originates from user-authored or compiler-generated typed
-Vernon IR. Generated IR and artifacts belong in the compiler cache or
-deployment bundle, not in an expanding committed kernel-template library.
+Executable compute implements a user-authored or compiler-generated semantic
+region. Its physical implementation may originate from deterministic lowering,
+schedule search, an agent lowering pass, or another registered synthesizer.
+Every generated implementation records its semantic mapping, assumptions,
+generator identity, target, validation evidence, and fallback.
+
+An agent may emit Vernon physical IR, an external DSL, a target IR, or a lower
+target representation directly. Vernon does not require all generators to pass
+through one canonical target DSL. The lower the output level, the more
+implementation detail must be recovered by target parsing, resource analysis,
+translation validation, reference comparison, and capability qualification.
+
+Generated source, IR, and artifacts belong in the compiler cache or deployment
+bundle, not in an expanding committed kernel-template library.
 
 External source DSLs may serve as experimental adapters or performance
 references, but deployment does not require an external kernel package unless
@@ -336,7 +466,15 @@ a separately declared target toolchain requires it.
 - Cost and measurement select candidates but never mutate semantics.
 - Under a future versioned selection contract, Runtime selects only installed
   validated `PhysicalPlanVariant` records.
-- Agents propose candidates and insights; they do not own correctness.
+- All candidate generators consume the same operation-analysis contracts and
+  implement one proposal and acceptance protocol; generator type does not
+  create another semantic path.
+- Agents may propose graph plans, fusion algorithms, target implementations,
+  and cost extensions; they do not own semantics, correctness, or performance
+  evidence.
+- Explicit accounting and calibrated models remain the shared evaluation
+  language; agent intuition is a proposal prior and measurement is performance
+  evidence.
 - Current public contracts remain unchanged until a versioned release.
 
 ## 13. Non-goals

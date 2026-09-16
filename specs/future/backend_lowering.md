@@ -29,12 +29,20 @@ A backend owns:
 A backend may not infer missing correctness facts, change numerical behavior,
 add undeclared synchronization, or remove fallback.
 
+Implementation generation is separate from both authorities. Deterministic
+passes, schedule search, agents, and external synthesizers implement the common
+`CandidateGenerator` protocol and may propose how a verified region is
+implemented. The proposal becomes backend input only after it carries the
+required semantic mapping and assumptions; generator identity does not grant
+correctness or performance authority.
+
 ## 2. Leaf lowering
 
 ```mermaid
 flowchart TB
     Plan["Validated physical PlanCandidate"]
     Leaves["Verified target-local leaf regions"]
+    Generate["Rules · search · agent synthesis"]
     CUDA["CUDA Tile IR or native CUDA path"]
     SPIRV["GPU/Vector to SPIR-V"]
     Metal["SPIR-V via SPIRV-Cross to MSL"]
@@ -43,12 +51,12 @@ flowchart TB
     Artifacts["Versioned artifacts"]
     Resolved["Immutable resolved plan"]
 
-    Plan --> Leaves
-    Leaves --> CUDA
-    Leaves --> SPIRV
-    Leaves --> Metal
-    Leaves --> DX
-    Leaves --> CPU
+    Plan --> Leaves --> Generate
+    Generate --> CUDA
+    Generate --> SPIRV
+    Generate --> Metal
+    Generate --> DX
+    Generate --> CPU
     CUDA --> Artifacts
     SPIRV --> Artifacts
     Metal --> Artifacts
@@ -60,6 +68,35 @@ flowchart TB
 Non-compute communication may remain a Runtime task. Device-side
 communication is emitted only for a verified target-local or distributed-team
 region with explicit capability and progress requirements.
+
+### 2.1 Agent lowering
+
+An agent may lower a leaf to Vernon physical IR, a registered external DSL,
+target IR, or a lower target representation directly. CUDA Tile IR and CuTe
+DSL are possible NVIDIA outputs, not canonical intermediates. Other targets
+may use SPIR-V, LLVM-family IRs, target source languages, or future dedicated
+representations.
+
+```text
+verified portable region
+  -> deterministic lowering, search, or agent synthesis
+  -> generated implementation candidate
+  -> target parsing and translation validation
+  -> compile, reference comparison, and measurement
+  -> qualified artifact or rejection
+```
+
+Direct lowering may skip Vernon's normal intermediate pipeline. It may not
+skip source-to-result region mapping, numerical and effect refinement,
+resource/capability qualification, artifact identity, or fallback. Portability
+comes from retaining the verified source region and regenerating independent
+target implementations, not from requiring one low-level kernel to execute on
+all targets.
+
+An exact qualified artifact and its `EvidenceBundle` may be recovered through
+optimization memory. A related schedule or decision subgraph is only a new
+candidate seed and must be adapted and revalidated for changed shapes,
+topology, driver, compiler, or target capabilities.
 
 ## 3. CUDA Tile IR
 
@@ -194,14 +231,19 @@ CuTe DSL and Triton may be used for:
 - manually authored performance baselines;
 - differential correctness checks;
 - importing measured schedule ideas;
-- Agent-generated research candidates.
+- Agent-generated research or qualified implementation candidates.
 
 They are not canonical intermediates. Vernon does not generate source in one
 of these DSLs merely to reach CUDA Tile IR. Production correctness and
-deployment do not depend on their source capture or Python runtime.
+deployment do not require either DSL. A generated implementation may use one
+when its registered toolchain, source/IR capture, validation, artifact
+identity, and deployment requirements are explicit.
 
-Repeatedly successful external schedules should be expressed as Vernon typed
-rules or target leaf lowering patterns with explicit preconditions.
+A successful external schedule may remain a shape- and target-qualified cached
+implementation. Repeated success should be distilled into a Vernon algorithmic
+rewrite, schedule schema, cost feature, or target leaf lowering pattern with
+explicit preconditions. Distillation improves reuse and compile latency but is
+not a prerequisite for evaluating an agent-generated implementation.
 
 ## 7. Communication fallback
 
@@ -228,7 +270,7 @@ Value ownership. It never simulates portability by weakening synchronization.
 Every generated artifact records:
 
 - semantic and physical candidate identity;
-- generator and compiler versions;
+- generator, model or rule, prompt/input, and compiler versions as applicable;
 - target backend and architecture/capabilities;
 - target IR or bytecode version;
 - shape/domain specialization;

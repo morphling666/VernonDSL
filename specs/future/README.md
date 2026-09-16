@@ -15,7 +15,8 @@ release with implementation, compatibility rules, and acceptance coverage.
    interfaces, partition/placement IR, distributed primitives, fusion, physical
    tasks, schedules, and verification.
 3. [`joint_planner.md`](joint_planner.md) — topology, recipe-free search, cost
-   model, profiles, measurement, Pareto selection, and Agent proposals.
+   model, profiles, measurement, optimization memory, the common
+   `CandidateGenerator` protocol, and Pareto selection.
 4. [`numerical_representation.md`](numerical_representation.md) — mixed
    precision, quantization, accumulation, storage/transfer representation, and
    numerical quality.
@@ -23,6 +24,14 @@ release with implementation, compatibility rules, and acceptance coverage.
    paths, artifacts, capability qualification, and fallback.
 6. [`implementation_roadmap.md`](implementation_roadmap.md) — current code
    entry points, PR sequence, validation workloads, metrics, and release gates.
+
+Interactive walkthrough:
+
+- [`llm_joint_optimization_case_study.html`](llm_joint_optimization_case_study.html)
+  — a concrete MoE decoder case study showing how generic partition,
+  placement, partial-value, redistribution, fusion, and representation rules
+  derive attention variants and plans conventionally described as DP, TP, CP,
+  EP, and PP, and how the same interfaces serve every candidate generator.
 
 Each compiler fact has one owner:
 
@@ -44,6 +53,12 @@ Each compiler fact has one owner:
 ## Core vocabulary
 
 - `Program`: sole semantic authority.
+- `SemanticRegion`: referenced, progressively analyzable view of Program
+  meaning presented to candidate generators.
+- `OptimizationDecisionGraph`: compiler provenance graph relating choices,
+  assumptions, consequences, alternatives, and evidence.
+- `CandidateGenerator`: common proposal protocol implemented by rules, solvers,
+  enumerators, autotuners, retrieval, agents, and external synthesis.
 - `Partition`: logical pieces independent of resources.
 - `Placement`: mapping pieces and replicas to topology resources.
 - `PartialValue`: contribution requiring a declared combine.
@@ -53,7 +68,13 @@ Each compiler fact has one owner:
 - `FusionRegion`: semantic group eligible for one implementation.
 - `TileTask` and other typed physical tasks: target-oriented work.
 - `PlanCandidate`: one complete numerical, distributed, fusion, and target
-  alternative.
+  projection of a consistent decision subgraph.
+- `ImplementationCandidate`: generated physical or target implementation of a
+  semantic region with explicit assumptions and fallback.
+- `EvidenceBundle`: independent verification, numerical, compilation, model,
+  measurement, counterexample, and qualification evidence.
+- `OptimizationMemory`: versioned successful and failed decision/evidence
+  records used through retrieval and adaptation.
 - `PhysicalPlanVariant`: future immutable resolved-plan alternative selectable
   by Runtime. It is distinct from the current compile-time Program typed
   specialization variant and requires a versioned installation/selection
@@ -71,7 +92,8 @@ recipes. They are not core IR, automatic-planner actions, or cost features.
 - Program semantics remain separate from physical representation.
 - Compiler-induced communication is explicit before communication fusion.
 - Cost models rank legal plans; they do not own correctness.
-- Agent proposals pass the same verifiers, references, and measurements.
+- Every candidate generator passes the same typed decision, verifier,
+  reference, independent calibration, measurement, and installation contracts.
 - A future versioned Runtime policy may select only installed validated
   `PhysicalPlanVariant` records.
 - Backend fast paths have a valid fallback or explicit unsupported diagnostic.
