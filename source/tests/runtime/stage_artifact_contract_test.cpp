@@ -1,4 +1,5 @@
 #include "runtime/pipeline_metadata.h"
+#include "runtime/prepared_binding_plan.h"
 #include "runtime/stage_artifact.h"
 #include "runtime/stage_binding_plan.h"
 
@@ -238,6 +239,20 @@ TEST(StageArtifactContract, RejectsWrongTypedMetadataFieldsWithoutThrowing) {
         EXPECT_FALSE(vernon::runtime::parseReflection(reflection(std::move(invalid)), "metadata", parsed = {},
                                                       VERNON_RUNTIME_VULKAN, error));
     }
+}
+
+TEST(StageArtifactContract, RejectsMetadataCarrierOutsideProviderBindingWidth) {
+    vernon::runtime::ReflectedEntry reflection;
+    reflection.packedArguments = vernon::runtime::PackedArgumentsLayout{64};
+    vernon::runtime::MetadataCarrier carrier;
+    carrier.size = uint64_t{UINT32_MAX} + 1;
+    carrier.alignment = 8;
+    reflection.metadataCarrier = carrier;
+
+    vernon::runtime::PreparedComputeBindingPlan plan;
+    std::string error;
+    EXPECT_FALSE(vernon::runtime::buildPreparedComputeBindingPlan({}, reflection, VERNON_RUNTIME_CPU, plan, error));
+    EXPECT_EQ(error, "metadata carrier size or alignment exceeds the provider binding ABI");
 }
 
 TEST(StageArtifactContract, ValidatesExternalAndRuntimeParameterOwnership) {

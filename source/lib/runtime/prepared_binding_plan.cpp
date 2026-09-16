@@ -55,6 +55,25 @@ bool isBufferedUniform(VernonRuntimeProviderBindingKind kind) {
     return kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER || kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
 }
 
+bool setMetadataLayoutSize(const MetadataCarrier &carrier, VernonRuntimeProviderBindingLayoutEntry &layout,
+                           std::string &error) {
+    if (!carrier.size || carrier.size > UINT32_MAX || !carrier.alignment || carrier.alignment > UINT32_MAX) {
+        error = "metadata carrier size or alignment exceeds the provider binding ABI";
+        return false;
+    }
+    layout.element_size = static_cast<uint32_t>(carrier.size);
+    layout.element_alignment = static_cast<uint32_t>(carrier.alignment);
+    return true;
+}
+
+bool hostSize(uint64_t value, size_t &result) {
+    if constexpr (sizeof(size_t) < sizeof(uint64_t))
+        if (value > std::numeric_limits<size_t>::max())
+            return false;
+    result = static_cast<size_t>(value);
+    return true;
+}
+
 } // namespace
 
 bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
@@ -124,6 +143,12 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         }
         if (reflection.metadataCarrier) {
             const MetadataCarrier &carrier = *reflection.metadataCarrier;
+            size_t frameOffset = 0;
+            size_t frameSize = 0;
+            if (!hostSize(carrier.interfacePlan.frameOffset, frameOffset) || !hostSize(carrier.size, frameSize)) {
+                error = "CPU metadata carrier exceeds the host address space";
+                return false;
+            }
             VernonRuntimeProviderBindingLayoutEntry layout{};
             layout.slot = static_cast<uint32_t>(output.layouts.size());
             layout.binding = layout.slot;
@@ -132,13 +157,12 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
             layout.access = 1;
             layout.array_count = 1;
             layout.argument_index = UINT32_MAX;
-            layout.element_size = static_cast<uint32_t>(carrier.size);
-            layout.element_alignment = static_cast<uint32_t>(carrier.alignment);
+            if (!setMetadataLayoutSize(carrier, layout, error))
+                return false;
             output.metadataCarrier = PreparedMetadataCarrier{carrier, layout};
             output.layouts.push_back(layout);
             output.sources.push_back({UINT32_MAX, 0, true});
-            output.cpuBindings.push_back(
-                {"", carrier.interfacePlan.frameOffset, static_cast<size_t>(carrier.size), false, std::nullopt});
+            output.cpuBindings.push_back({"", frameOffset, frameSize, false, std::nullopt});
         }
         return validatePreparedComputeBindingPlan(output, error);
     }
@@ -257,8 +281,8 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         layout.access = 1;
         layout.array_count = 1;
         layout.argument_index = UINT32_MAX;
-        layout.element_size = static_cast<uint32_t>(carrier.size);
-        layout.element_alignment = static_cast<uint32_t>(carrier.alignment);
+        if (!setMetadataLayoutSize(carrier, layout, error))
+            return false;
         output.metadataCarrier = PreparedMetadataCarrier{carrier, layout};
         output.layouts.push_back(layout);
         output.sources.push_back({UINT32_MAX, 0, true});
