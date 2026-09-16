@@ -1,18 +1,33 @@
 add_mlir_library(
     MLIRVernonTransforms
+    VernonAutodiffAnalysis.cpp
+    VernonAutodiffRules.cpp
+    VernonAutodiffUtils.cpp
+    VernonAutodiffTapePlanning.cpp
+    VernonStructuredVjp.cpp
     VernonCpuPipeline.cpp
     VernonAttributeAbi.cpp
+    VernonGlobalIdIndexProof.cpp
+    VernonGPUProfileABI.cpp
     VernonConvertGPUToSPIRV.cpp
     VernonInlineHelpers.cpp
+    VernonLowerAccumulation.cpp
+    VernonLowerCPUABI.cpp
+    VernonLowerCPUAutodiff.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
+    VernonLowerCPUSynchronization.cpp
     VernonLowerCUDAMath.cpp
+    VernonLowerGPUAutodiff.cpp
     VernonLowerGPUTensors.cpp
     VernonLowerSynchronization.cpp
     VernonAggregateStorage.cpp
     VernonSharedValuePatterns.cpp
+    VernonSpecializeKernelConstants.cpp
+    VernonSpirvMath.cpp
     VernonTensorShapeSemantics.cpp
     VernonValidation.cpp
+    VernonVerifyCPUAutodiffABI.cpp
     VernonToGPU.cpp
     VernonToSpirv.cpp
     DEPENDS
@@ -50,3 +65,5 @@ add_mlir_library(
     MLIRIR
     MLIRPass
     MLIRSupport)
+
+target_include_directories(MLIRVernonTransforms PRIVATE ${PROJECT_SOURCE_DIR}/source/lib)

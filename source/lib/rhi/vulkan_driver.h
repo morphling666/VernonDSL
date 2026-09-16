@@ -1,8 +1,8 @@
 #ifndef VERNON_RHI_VULKAN_DRIVER_H
 #define VERNON_RHI_VULKAN_DRIVER_H
 
-#include "../platform/platform_library.h"
 #include "VernonRHI.h"
+#include "platform/platform_library.h"
 
 #include <vulkan/vulkan.h>
 
@@ -91,6 +91,8 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier{};
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage{};
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer{};
+    PFN_vkCmdCopyImage cmdCopyImage{};
+    PFN_vkCmdBlitImage cmdBlitImage{};
     PFN_vkCmdBeginRenderPass cmdBeginRenderPass{};
     PFN_vkCmdEndRenderPass cmdEndRenderPass{};
     PFN_vkCmdClearAttachments cmdClearAttachments{};

@@ -12,16 +12,17 @@
 
 namespace vernon::compiler_detail {
 
-VERNON_DSL_CAPI bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words,
-                                                  size_t expectedReplacementCount, std::string &diagnostics);
+bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words, size_t expectedReplacementCount,
+                                  std::string &diagnostics);
 
 } // namespace vernon::compiler_detail
 
 namespace vernon::compiler {
 
 class PreparedModule;
+struct TargetProfile;
 
-bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
-                  std::string &diagnostics);
+bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
+                  std::string &reflection, std::string &diagnostics);
 
 } // namespace vernon::compiler

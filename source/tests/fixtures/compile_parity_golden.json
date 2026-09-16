@@ -11,13 +11,12 @@
       {
         "access": "write",
         "dtype": "f32",
-        "kind": "texture",
+        "kind": "image",
         "location": 0,
         "name": "output_0",
         "shape": [
           4
-        ],
-        "type": "tensor<4xf32>"
+        ]
       }
     ],
     "parameters": [
@@ -30,7 +29,13 @@
     "variants": [
       [],
       [
-        "OFFSET"
+        {
+          "name": "OFFSET",
+          "value": {
+            "tag": "bool",
+            "value": true
+          }
+        }
       ]
     ]
   }

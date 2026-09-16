@@ -1,0 +1,9 @@
+import lit.llvm
+
+config.vernon_opt = lit_config.substitute("$<TARGET_FILE:vernon-opt>")
+config.filecheck = lit_config.substitute("$<TARGET_FILE:FileCheck>")
+config.not_tool = lit_config.substitute("$<TARGET_FILE:not>")
+config.vernon_mlir_test_exec_root = lit_config.substitute("@CMAKE_CURRENT_BINARY_DIR@")
+
+lit.llvm.initialize(lit_config, config)
+lit_config.load_config(config, "@CMAKE_CURRENT_SOURCE_DIR@/lit.cfg.py")

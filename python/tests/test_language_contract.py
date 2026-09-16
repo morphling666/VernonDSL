@@ -8,8 +8,25 @@ from pathlib import Path
 from unittest import mock
 
 import vernon_dsl as vd
+from language_contract_cases import (
+    ENTRY_SIGNATURE_INVALID_CASES,
+    FRONTEND_BOUNDARY_CASES,
+    FRONTEND_IR_SOURCE_CASES,
+    HELPER_SPECIALIZATION_INVALID_CASES,
+    LEGACY_FRONTEND_INVALID_CASES,
+    PAIRWISE_IR_SOURCE_CASES,
+    READONLY_ATOMIC_INVALID_CASES,
+    REMOVED_PUBLIC_NAMES,
+    SCALAR_CONVERSION_INVALID_CASES,
+    STRUCT_FIELD_INVALID_CASES,
+    TENSOR_ELEMENT_INVALID_CASES,
+    TUPLE_INDEX_INVALID_CASES,
+    case_by_id,
+)
+from language_contract_runner import assert_frontend_ir, assert_frontend_rejects, assert_verified_ir
+from language_contract_traceability import covers_case, covers_case_group
 from vernon_dsl import CompileError, Compiler, compile_source
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.abi import attribute_layout, value_leaves
 from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
@@ -39,9 +56,56 @@ from vernon_dsl.language.stage_registry import (
     validate_graphics_topology,
 )
 from vernon_dsl.shader_contracts import ATOMIC_OPERATION_NAMES, DEVICE_ONLY_OPERATION_NAMES
+from vernon_dsl.types import SpecializationAssignment
 
 
 class LanguageVersionTests(unittest.TestCase):
+    @covers_case_group("FRONTEND_IR_SOURCE_CASES", layers="FI")
+    def test_canonical_frontend_ir_contract_cases(self) -> None:
+        for case in FRONTEND_IR_SOURCE_CASES:
+            assert_frontend_ir(self, case)
+
+    @covers_case_group("FRONTEND_BOUNDARY_CASES", layers="F")
+    def test_canonical_frontend_boundaries(self) -> None:
+        for case in FRONTEND_BOUNDARY_CASES:
+            assert_frontend_rejects(self, case)
+
+    @covers_case_group("PAIRWISE_IR_SOURCE_CASES", layers="FI")
+    def test_canonical_pairwise_frontend_ir_cases(self) -> None:
+        for case in PAIRWISE_IR_SOURCE_CASES:
+            assert_frontend_ir(self, case)
+
+    @covers_case("LANG-DISPATCH-001/dynamic-grid", layers="FI")
+    @covers_case("LANG-PAIR-014/injectivity-dynamic-launch", layers="FI")
+    def test_dispatch_contract_ir_preserves_injectivity_without_runtime_layout(self) -> None:
+        dispatch_case = case_by_id("LANG-DISPATCH-001/dynamic-grid")
+        pair_case = case_by_id("LANG-PAIR-014/injectivity-dynamic-launch")
+        for case in (dispatch_case, pair_case):
+            with self.subTest(case=case.id):
+                output = compile_source(case.source, f"{case.name}.py")
+                assert_verified_ir(self, output, case)
+                self.assertIn("vernon.storage_effects", output)
+                self.assertNotIn("tensor_strides", output)
+                self.assertNotIn("tensor_offset", output)
+
+    @covers_case("LANG-SPECIALIZE-001/feature-identity", layers="FI")
+    def test_canonical_feature_specialization_case(self) -> None:
+        case = case_by_id("LANG-SPECIALIZE-001/feature-identity")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "feature_identity.py"
+            path.write_text(case.source, encoding="utf-8")
+            disabled = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+            enabled = Compiler().compile_request(
+                FrontendCompileRequest(path, "main", (SpecializationAssignment("DOUBLE", "bool", True),))
+            )
+        assert_verified_ir(self, disabled.mlir, case)
+        assert_verified_ir(self, enabled.mlir)
+        self.assertNotEqual(disabled.mlir, enabled.mlir)
+        self.assertNotEqual(
+            disabled.semantic_inputs["specializations"],
+            enabled.semantic_inputs["specializations"],
+        )
+
     def test_stage_registry_is_canonical(self) -> None:
         self.assertEqual(
             ENTRY_DECORATOR_STAGES,
@@ -56,9 +120,27 @@ class LanguageVersionTests(unittest.TestCase):
             validate_graphics_topology(reversed(GRAPHICS_STAGE_ORDER))
 
     def test_v3_vector_and_matrix_aliases_are_removed(self) -> None:
-        for name in ("vec", "mat", "vec2", "vec3", "vec4", "mat2", "mat3", "mat4"):
+        for name in REMOVED_PUBLIC_NAMES:
             with self.subTest(name=name):
                 self.assertFalse(hasattr(vd, name))
+
+    def test_callback_execution_graph_api_is_removed(self) -> None:
+        retired = (
+            "CompiledExecutionGraph",
+            "ComputeEncoder",
+            "ComputePass",
+            "ExecutionGraph",
+            "ExecutionPass",
+            "GraphicsEncoder",
+            "PipelineInvocation",
+            "VjpComputePass",
+        )
+        for name in retired:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(vd, name))
+                self.assertFalse(hasattr(vd.runtime, name))
+        self.assertFalse(hasattr(vd.Kernel, "invocation"))
+        self.assertFalse(hasattr(vd.Pipeline, "invocation"))
 
     def test_tensor_values_and_tensor_view_resources_are_distinct(self) -> None:
         element = ConcreteType("scalar", "f32")
@@ -101,13 +183,15 @@ class LanguageVersionTests(unittest.TestCase):
             ),
             ("f32", "f64", "f32", "f64"),
         )
+        rank_zero = value_leaves(ConcreteType("tensor", "Tensor", (f32,)), fields.__getitem__)
+        self.assertEqual([(leaf.dtype, leaf.scalar_count, leaf.shape) for leaf in rank_zero], [("f32", 1, ())])
 
         output = compile_source(
             "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
             "abi_layout.py",
         )
         self.assertIn(f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64", output)
-        self.assertIn(f"vernon.pipeline_version = {PIPELINE_VERSION} : i64", output)
+        self.assertIn(f"vernon.program_version = {PROGRAM_VERSION} : i64", output)
         self.assertIn('abi_leaf_dtypes = ["f32", "f64"]', output)
         self.assertNotIn("abi_alignment", output)
         self.assertNotIn("abi_field_offsets", output)
@@ -123,6 +207,7 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertIn("vernon.shared", shared_output)
         self.assertIn('vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"]', shared_output)
+        self.assertIn('vernon.element_abi_leaf_dtypes = ["f32", "i32"]', shared_output)
         self.assertNotIn("vernon.abi_alignment", shared_output)
         self.assertNotIn("vernon.abi_element_stride", shared_output)
         self.assertNotIn("vernon.abi_size", shared_output)
@@ -195,7 +280,7 @@ class LanguageVersionTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result.semantic_inputs["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-            self.assertEqual(result.semantic_inputs["pipeline_version"], PIPELINE_VERSION)
+            self.assertEqual(result.semantic_inputs["program_version"], PROGRAM_VERSION)
             self.assertEqual(result.semantic_inputs["captured_constants"], [["LIMIT", "int", 3]])
 
     def test_semantic_identity_contains_concrete_helper_specializations(self) -> None:
@@ -377,6 +462,12 @@ class LanguageVersionTests(unittest.TestCase):
             second = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
         function = next(function for function in first.typed_functions if function.symbol == "main")
+        gid = next(parameter for parameter in function.parameters if parameter.name == "gid")
+        self.assertEqual(gid.builtin, "global_invocation_id")
+        self.assertEqual(
+            typed_model_data((function,))[0]["parameters"][2]["interface"],
+            [{"kind": "builtin", "arguments": ["global_invocation_id"]}],
+        )
         read_static, write_dynamic, branch = function.body
         self.assertEqual(
             read_static.effects,
@@ -597,57 +688,56 @@ class LanguageVersionTests(unittest.TestCase):
                     else getattr(vd, name)(*arguments)
                 )
 
+    @covers_case("LANG-PAIR-007/workgroup-atomic-contention", layers="FI")
     def test_workgroup_storage_atomics_and_barriers_have_typed_effects(self) -> None:
-        source = (
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def main(output: TensorView[i32, (dyn,), write]) -> None:\n"
-            "    signed = workgroup_storage(i32, shape=(4,))\n"
-            "    unsigned = workgroup_storage(u32, shape=(2,))\n"
-            "    signed[0] = 4\n"
-            "    unsigned[0] = u32(4)\n"
-            "    workgroup_barrier()\n"
-            "    added = atomic_add(signed, 0, 1)\n"
-            "    minimum = atomic_min(signed, 1, 2)\n"
-            "    maximum = atomic_max(signed, 2, 3)\n"
-            "    exchanged = atomic_exchange(signed, 3, 4)\n"
-            "    unsigned_minimum = atomic_min(unsigned, 0, 2)\n"
-            "    unsigned_maximum = atomic_max(unsigned, 1, 3)\n"
-            "    output[0] = added + minimum + maximum + exchanged\n"
-            "    storage_barrier()\n"
-        )
+        case = case_by_id("LANG-PAIR-007/workgroup-atomic-contention")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "synchronization.py"
-            path.write_text(source, encoding="utf-8")
+            path.write_text(case.source, encoding="utf-8")
             result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
-        self.assertEqual(result.mlir.count('"vernon.workgroup_alloc"'), 2)
-        self.assertEqual(result.mlir.count('"vernon.store"'), 3)
-        self.assertEqual(result.mlir.count('"vernon.atomic"'), 6)
-        for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
-            with self.subTest(atomic_kind=atomic_kind):
-                self.assertEqual(result.mlir.count(f'atomic_kind = "{atomic_kind}"'), 1)
+        assert_verified_ir(self, result.mlir, case)
+        self.assertEqual(result.mlir.count('"vernon.workgroup_alloc"'), 1)
+        self.assertEqual(result.mlir.count('"vernon.store"'), 1)
+        self.assertEqual(result.mlir.count('"vernon.atomic"'), 3)
+        self.assertEqual(result.mlir.count('atomic_kind = "add"'), 3)
+        self.assertIn("vernon.workgroup_size = array<i32: 4, 1, 1>", result.mlir)
         atomic_effects = [effect for effect in result.typed_functions[0].effects if isinstance(effect, AtomicEffect)]
-        self.assertTrue(all(effect.owner.kind is StorageOwnerKind.WORKGROUP_LOCAL for effect in atomic_effects))
         self.assertEqual(
-            Counter((effect.operation, effect.scope) for effect in atomic_effects),
+            Counter((effect.owner.kind, effect.operation, effect.scope) for effect in atomic_effects),
             Counter(
                 {
-                    ("add", EffectScope.WORKGROUP): 1,
-                    ("min", EffectScope.WORKGROUP): 2,
-                    ("max", EffectScope.WORKGROUP): 2,
-                    ("exchange", EffectScope.WORKGROUP): 1,
+                    (StorageOwnerKind.WORKGROUP_LOCAL, "add", EffectScope.WORKGROUP): 1,
+                    (StorageOwnerKind.PARAMETER, "add", EffectScope.DEVICE): 2,
                 }
             ),
         )
         barriers = [effect for effect in result.typed_functions[0].effects if isinstance(effect, BarrierEffect)]
+        self.assertEqual(result.mlir.count('"vernon.barrier"'), 2)
         self.assertEqual(
             barriers,
             [
                 BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.WORKGROUP),
-                BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.DEVICE),
             ],
         )
+
+    @covers_case("LANG-ATOMIC-001/workgroup-operations", layers="FI")
+    def test_all_workgroup_integer_atomic_operations_remain_covered(self) -> None:
+        case = case_by_id("LANG-ATOMIC-001/workgroup-operations")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        self.assertEqual(output.count('"vernon.atomic"'), 6)
+        for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
+            with self.subTest(atomic_kind=atomic_kind):
+                self.assertEqual(output.count(f'atomic_kind = "{atomic_kind}"'), 1)
+        self.assertEqual(output.count('"vernon.barrier"'), 2)
+
+    @covers_case("LANG-WORKGROUP-001/rank-zero", layers="FI")
+    def test_rank_zero_workgroup_storage_models_one_scalar(self) -> None:
+        case = case_by_id("LANG-WORKGROUP-001/rank-zero")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        self.assertIn('!vernon.tensor_view<f32, [], "read_write", "workgroup">', output)
 
     def test_rank_two_aggregate_workgroup_storage_uses_typed_tensor_view_ops(self) -> None:
         output = compile_source(
@@ -669,32 +759,13 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertIn('"vernon.load"', output)
         self.assertNotIn("strides = array", output)
 
+    @covers_case("LANG-WORKGROUP-001/physical-limit", layers="F")
     def test_aggregate_workgroup_limit_includes_physical_leaf_alignment(self) -> None:
-        with self.assertRaisesRegex(CompileError, "16 KiB allocation limit"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@struct\n"
-                "class Tiny:\n"
-                "    first: bool\n"
-                "    second: bool\n"
-                "    third: bool\n"
-                "@kernel\n"
-                "def main() -> None:\n"
-                "    values = workgroup_storage(Tiny, shape=(5458,))\n",
-                "aligned_workgroup_limit.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-WORKGROUP-001/physical-limit"))
 
+    @covers_case("LANG-WORKGROUP-001/combined-physical-limit", layers="F")
     def test_workgroup_limit_accumulates_all_kernel_allocations(self) -> None:
-        with self.assertRaisesRegex(CompileError, "combined workgroup_storage exceeds"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def main(flag: bool) -> None:\n"
-                "    first = workgroup_storage(i32, shape=(2049,))\n"
-                "    if flag:\n"
-                "        second = workgroup_storage(i32, shape=(2049,))\n",
-                "combined_workgroup_limit.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-WORKGROUP-001/combined-physical-limit"))
 
     def test_workgroup_limit_is_scoped_to_each_kernel(self) -> None:
         output = compile_source(
@@ -709,26 +780,16 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertEqual(output.count('"vernon.workgroup_alloc"'), 2)
 
+    @covers_case("LANG-ATOMIC-001/device-storage-operations", layers="FI")
+    @covers_case_group("READONLY_ATOMIC_INVALID_CASES", layers="F")
     def test_all_storage_tensor_view_atomics_use_device_scope(self) -> None:
-        source = (
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def main(\n"
-            "    signed: TensorView[i32, (dyn,), read_write],\n"
-            "    unsigned: TensorView[u32, (dyn,), read_write],\n"
-            ") -> None:\n"
-            "    added = atomic_add(signed, 0, 1)\n"
-            "    minimum = atomic_min(signed, 1, 2)\n"
-            "    maximum = atomic_max(signed, 2, 3)\n"
-            "    exchanged = atomic_exchange(signed, 3, 4)\n"
-            "    unsigned_minimum = atomic_min(unsigned, 0, 2)\n"
-            "    unsigned_maximum = atomic_max(unsigned, 1, 3)\n"
-        )
+        case = case_by_id("LANG-ATOMIC-001/device-storage-operations")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "storage_atomic.py"
-            path.write_text(source, encoding="utf-8")
+            path.write_text(case.source, encoding="utf-8")
             result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
+        assert_verified_ir(self, result.mlir, case)
         self.assertEqual(result.mlir.count('"vernon.atomic"'), 6)
         for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
             with self.subTest(atomic_kind=atomic_kind):
@@ -747,18 +808,8 @@ class LanguageVersionTests(unittest.TestCase):
             ),
         )
 
-        for operation in sorted(ATOMIC_OPERATION_NAMES):
-            with (
-                self.subTest(readonly_operation=operation),
-                self.assertRaisesRegex(CompileError, "requires a writable TensorView"),
-            ):
-                compile_source(
-                    "from vernon_dsl import *\n"
-                    "@kernel\n"
-                    "def bad(values: TensorView[i32, (dyn,), read]) -> None:\n"
-                    f"    {operation}(values, 0, 1)\n",
-                    f"readonly_{operation}.py",
-                )
+        for case in READONLY_ATOMIC_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_atomic_prefix_does_not_reserve_helper_names(self) -> None:
         output = compile_source(
@@ -773,43 +824,32 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertIn("func.call @atomic_decoy(", output)
 
+    @covers_case("LANG-ATOMIC-001/unnamed-owner", layers="F")
     def test_atomic_owner_must_be_a_named_storage_value(self) -> None:
-        with self.assertRaisesRegex(CompileError, "requires a named storage owner"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad(values: TensorView[i32, (dyn,), read_write]) -> None:\n"
-                "    atomic_add(values if True else values, 0, 1)\n",
-                "atomic_owner_expression.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-ATOMIC-001/unnamed-owner"))
 
+    @covers_case("LANG-BARRIER-001/fragment-region", layers="F")
+    @covers_case("LANG-WORKGROUP-001/zero-extent", layers="F")
     def test_workgroup_synchronization_rejects_non_compute_and_invalid_types(self) -> None:
-        with self.assertRaisesRegex(CompileError, "only in compute kernels"):
-            compile_source(
-                "from vernon_dsl import *\n@fragment\ndef bad() -> None:\n    workgroup_barrier()\n",
-                "fragment_barrier.py",
-            )
-        with self.assertRaisesRegex(CompileError, "positive compile-time integers"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad() -> None:\n"
-                "    values = workgroup_storage(f32, shape=(0,))\n",
-                "invalid_workgroup.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-BARRIER-001/fragment-region"))
+        assert_frontend_rejects(self, case_by_id("LANG-WORKGROUP-001/zero-extent"))
 
-    def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
-        with self.assertRaisesRegex(CompileError, "pure helper 'copy' has Storage effects"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@func\n"
-                "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    output[0] = source[0]\n"
-                "@kernel\n"
-                "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    copy(output, source)\n",
-                "effectful_helper.py",
-            )
+    def test_parameter_bound_storage_helper_effects_propagate(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    output[0] = source[0]\n"
+            "@kernel\n"
+            "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    copy(output, source)\n",
+            "effectful_helper.py",
+        )
+        self.assertIn("func.call @copy", output)
+        self.assertIn('"vernon.load"', output)
+        self.assertIn('"vernon.store"', output)
+        self.assertIn('owner = "output"', output)
+        self.assertIn('owner = "source"', output)
 
     def test_helper_call_rejects_known_incompatible_aliases(self) -> None:
         with self.assertRaisesRegex(CompileError, "helper call 'combine' has incompatible aliased Storage effects"):
@@ -827,17 +867,10 @@ class LanguageVersionTests(unittest.TestCase):
                 "aliased_helper.py",
             )
 
-    def test_removed_v2_spelling_and_array_fail_at_the_frontend(self) -> None:
-        with self.assertRaisesRegex(CompileError, "unknown DSL decorator 'compute'"):
-            compile_source(
-                "from vernon_dsl import *\n@compute\ndef main(value: f32) -> f32:\n    return value\n",
-                "compute.py",
-            )
-        with self.assertRaisesRegex(CompileError, "unknown DSL type constructor 'Array'"):
-            compile_source(
-                "from vernon_dsl import *\n@func\ndef main(value: Array[f32, 4]) -> f32:\n    return 0.0\n",
-                "array.py",
-            )
+    @covers_case_group("LEGACY_FRONTEND_INVALID_CASES", layers="F")
+    def test_removed_language_spellings_fail_at_the_frontend(self) -> None:
+        for case in LEGACY_FRONTEND_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_tensor_elements_are_recursively_abi_stable_values(self) -> None:
         output = compile_source(
@@ -875,36 +908,15 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertIn("tensor<8x3xf32>", output)
         self.assertNotIn("tensor<8xtensor", output)
 
+    @covers_case_group("TENSOR_ELEMENT_INVALID_CASES", layers="F")
     def test_tensor_rejects_storage_and_resource_elements(self) -> None:
-        cases = (
-            ("TensorView[f32, (dyn,), read]", "Storage 'TensorView'"),
-            ('Texture["2d", f32]', "Resource 'Texture'"),
-            ("Sampler", "Resource 'Sampler'"),
-        )
-        for index, (element, diagnostic) in enumerate(cases):
-            with self.subTest(element=element), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    f"from vernon_dsl import *\n@func\ndef bad(value: Tensor[{element}, (2,)]) -> None:\n    pass\n",
-                    f"invalid_tensor_element_{index}.py",
-                )
+        for case in TENSOR_ELEMENT_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
+    @covers_case_group("STRUCT_FIELD_INVALID_CASES", layers="F")
     def test_struct_fields_must_be_finite_abi_stable_values(self) -> None:
-        cases = (
-            (
-                "@struct\nclass Bad:\n    data: TensorView[f32, (dyn,), read]\n",
-                "Struct field 'Bad.data' must be an ABI-stable Value",
-            ),
-            (
-                "@struct\nclass Recursive:\n    next: Recursive\n",
-                "Struct field 'Recursive.next' must be an ABI-stable Value",
-            ),
-        )
-        for index, (declaration, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    f"from vernon_dsl import *\n{declaration}",
-                    f"invalid_struct_{index}.py",
-                )
+        for case in STRUCT_FIELD_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_lazy_short_circuit_boolean_expressions_yield_values(self) -> None:
         source = (
@@ -1081,6 +1093,56 @@ class LanguageVersionTests(unittest.TestCase):
                     f"invalid_{keyword}.py",
                 )
 
+    def test_loop_else_lowers_normal_and_break_paths(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def loop_else(limit: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(limit):\n"
+            "        if index >= 3:\n"
+            "            break\n"
+            "        result += 1\n"
+            "    else:\n"
+            "        result += 10\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(limit: i32) -> i32:\n"
+            "    return loop_else(limit)\n",
+            "loop_else.py",
+        )
+        self.assertIn("scf.while", output)
+        self.assertGreaterEqual(output.count("scf.if"), 2)
+        self.assertIn("arith.cmpi ne", output)
+        self.assertIn("vernon.loop_control_index", output)
+
+    def test_nested_continue_and_multiple_loop_returns_lower_to_carried_state(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def nested_control(x: f32, limit: i32) -> f32:\n"
+            "    result = x\n"
+            "    for outer in range(limit):\n"
+            "        for inner in range(4):\n"
+            "            if inner < 2:\n"
+            "                continue\n"
+            "            if result > 8.0:\n"
+            "                return result\n"
+            "            result *= x\n"
+            "        if result < -8.0:\n"
+            "            return -result\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(x: f32, limit: i32) -> f32:\n"
+            "    return nested_control(x, limit)\n",
+            "nested_loop_returns.py",
+        )
+        self.assertGreaterEqual(output.count("scf.while"), 2)
+        self.assertIn("arith.select", output)
+        self.assertGreaterEqual(output.count("arith.cmpi eq"), 2)
+        self.assertGreaterEqual(output.count("vernon.loop_control_index"), 2)
+        self.assertGreaterEqual(output.count("vernon.return_flag_index"), 2)
+
     def test_dynamic_range_contract_and_type_rules(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
@@ -1088,7 +1150,7 @@ class LanguageVersionTests(unittest.TestCase):
             "def total(start: i32, stop: i32, step: i32) -> i32:\n"
             "    result = 0\n"
             "    for index in range(start, stop, step):\n"
-            "        result += i32(index)\n"
+            "        result += index\n"
             "    return result\n",
             "dynamic_range.py",
         )
@@ -1106,9 +1168,24 @@ class LanguageVersionTests(unittest.TestCase):
             "    return result\n",
             "float_range.py",
         )
-        self.assertIn("arith.index_cast", float_output)
+        self.assertIn("scf.for", float_output)
+        self.assertIn("index to i32", float_output)
         self.assertIn("arith.sitofp", float_output)
-        self.assertNotIn("index to f32", float_output)
+
+        natural_output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def natural(width: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for x in range(width):\n"
+            "        if x + 1 == width or 0 == x or x % 2 == 0:\n"
+            "            result += x\n"
+            "    return i32(f32(result))\n",
+            "natural_range.py",
+        )
+        self.assertIn("arith.remsi", natural_output)
+        self.assertIn("arith.sitofp", natural_output)
+        self.assertIn("arith.fptosi", natural_output)
 
         with self.assertRaisesRegex(CompileError, "range step must not be zero"):
             compile_source(
@@ -1117,7 +1194,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def zero_step() -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(0, 4, 0):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "zero_range.py",
             )
@@ -1129,7 +1206,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def unsigned_range(stop: u32) -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(stop):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "unsigned_range.py",
             )
@@ -1164,31 +1241,10 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertIn("arith.sitofp", output)
         self.assertIn("arith.uitofp", output)
 
+    @covers_case_group("SCALAR_CONVERSION_INVALID_CASES", layers="F")
     def test_unsafe_implicit_conversions_are_rejected(self) -> None:
-        cases = (
-            (
-                "def bad(value: f64) -> f32:\n    return value\n",
-                "unsafe implicit conversion from f64 to f32",
-            ),
-            (
-                "def bad(value: f32) -> i32:\n    return value\n",
-                "unsafe implicit conversion from f32 to i32",
-            ),
-            (
-                "def bad(left: i32, right: u32) -> i32:\n    return left + right\n",
-                "no safe common type",
-            ),
-            (
-                "def bad(left: bool, right: bool) -> bool:\n    return left + right\n",
-                "unsupported binary operation",
-            ),
-        )
-        for index, (function, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    f"from vernon_dsl import *\n@func\n{function}",
-                    f"unsafe_{index}.py",
-                )
+        for case in SCALAR_CONVERSION_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_literals_are_contextual_on_both_operand_sides(self) -> None:
         output = compile_source(
@@ -1257,29 +1313,10 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertRegex(output, r"func\.func private @annotated__[a-f0-9]+[^(]*\(%arg0: f64")
         self.assertRegex(output, r"func\.func private @unconstrained__[a-f0-9]+[^(]*\(%arg0: i32")
 
+    @covers_case_group("HELPER_SPECIALIZATION_INVALID_CASES", layers="F")
     def test_partially_annotated_helper_rejects_unsafe_argument_and_result(self) -> None:
-        cases = (
-            (
-                "def helper(value: i32):\n    return value\n",
-                "value: f32",
-                "cannot pass f32 as i32",
-            ),
-            (
-                "def helper(value) -> i32:\n    return value\n",
-                "value: f32",
-                "cannot return f32 as i32",
-            ),
-        )
-        for index, (helper, argument, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    "from vernon_dsl import *\n"
-                    f"@func\n{helper}"
-                    "@fragment\n"
-                    f"def main({argument}) -> i32:\n"
-                    "    return helper(value)\n",
-                    f"partial_annotation_{index}.py",
-                )
+        for case in HELPER_SPECIALIZATION_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_unannotated_helpers_are_monomorphized_deterministically(self) -> None:
         source = (
@@ -1382,7 +1419,9 @@ class NumericInferenceTests(unittest.TestCase):
                 "recursive_generic.py",
             )
 
+    @covers_case("LANG-PAIR-004/helper-feature-identity", layers="FI")
     def test_imported_qualified_helper_specializes_per_feature_variant(self) -> None:
+        case = case_by_id("LANG-PAIR-004/helper-feature-identity")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "helpers.py").write_text(
@@ -1390,23 +1429,14 @@ class NumericInferenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             main = root / "main.py"
-            main.write_text(
-                "from vernon_dsl import *\n"
-                "import helpers\n"
-                'DOUBLE = feature("DOUBLE")\n'
-                "@fragment\n"
-                "def main(value: f32) -> f32:\n"
-                "    selected = value\n"
-                "    if DOUBLE:\n"
-                "        selected = f32(helpers.identity(f64(value)))\n"
-                "    else:\n"
-                "        selected = helpers.identity(value)\n"
-                "    return selected\n",
-                encoding="utf-8",
-            )
+            main.write_text(case.source, encoding="utf-8")
             disabled = Compiler().compile_request(FrontendCompileRequest(main, "main"))
-            enabled = Compiler().compile_request(FrontendCompileRequest(main, "main", ("DOUBLE",)))
+            enabled = Compiler().compile_request(
+                FrontendCompileRequest(main, "main", (SpecializationAssignment("DOUBLE", "bool", True),))
+            )
 
+        assert_verified_ir(self, disabled.mlir, case)
+        assert_verified_ir(self, enabled.mlir)
         disabled_keys = [
             argument_types for name, argument_types, _ in disabled.helper_specializations if name.endswith("identity")
         ]
@@ -1524,6 +1554,16 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertIn("tensor<2x2x1xf64>", output)
         self.assertIn('name = "construct"', output)
 
+        scalar = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def scalar_tensor(value: f64) -> Tensor[f64, ()]:\n"
+            "    return Tensor(value)\n",
+            "rank_zero_tensor_constructor.py",
+        )
+        self.assertIn("tensor<f64>", scalar)
+        self.assertIn('name = "construct"', scalar)
+
         with self.assertRaisesRegex(CompileError, "non-empty rectangular"):
             compile_source(
                 "from vernon_dsl import *\n"
@@ -1574,20 +1614,10 @@ class NumericInferenceTests(unittest.TestCase):
         )
         self.assertIn("!vernon.tensor<tuple<f32, i32>, [2]>", output)
 
+    @covers_case_group("TUPLE_INDEX_INVALID_CASES", layers="F")
     def test_tuple_indexing_requires_an_in_bounds_constant(self) -> None:
-        cases = (
-            ("pair[index]", "Tuple indexing requires an integer literal"),
-            ("pair[2]", "Tuple index is out of bounds"),
-        )
-        for index, (expression, diagnostic) in enumerate(cases):
-            with self.subTest(expression=expression), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    "from vernon_dsl import *\n"
-                    "@func\n"
-                    "def bad(pair: Tuple[f32, i32], index: i32) -> f32:\n"
-                    f"    return {expression}\n",
-                    f"tuple_index_{index}.py",
-                )
+        for case in TUPLE_INDEX_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
     def test_operator_and_intrinsic_power_share_types(self) -> None:
         output = compile_source(
@@ -1689,23 +1719,10 @@ class NumericInferenceTests(unittest.TestCase):
 
 
 class EntryAbiTests(unittest.TestCase):
+    @covers_case_group("ENTRY_SIGNATURE_INVALID_CASES", layers="F")
     def test_entries_require_parameter_and_result_annotations(self) -> None:
-        cases = (
-            (
-                "@kernel\ndef main(value) -> None:\n    pass\n",
-                "entry argument 'value' requires a type annotation",
-            ),
-            (
-                "@kernel\ndef main(value: f32):\n    pass\n",
-                "entry function 'main' requires a result annotation",
-            ),
-        )
-        for index, (function, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(
-                    f"from vernon_dsl import *\n{function}",
-                    f"entry_abi_{index}.py",
-                )
+        for case in ENTRY_SIGNATURE_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
 
 if __name__ == "__main__":

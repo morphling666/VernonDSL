@@ -25,6 +25,8 @@ def lower_buffer_index(emitter: StorageEmitter, node: ast.AST) -> Value:
     index = emitter._expression(node)
     if not index.type.is_integer:
         raise emitter.context.error(node, "buffer index must be an integer")
+    if index.canonical_index is not None:
+        return Value(index.canonical_index, DslType("index", "index"))
     if index.type.mlir == "index":
         return index
     cast = emitter._fresh()
@@ -44,6 +46,25 @@ def lower_tensor_view_indices(
     if len(index_nodes) != rank:
         raise emitter.context.error(node, "TensorView indexing requires one index per dimension")
     return tuple(lower_buffer_index(emitter, index_node) for index_node in index_nodes)
+
+
+def lower_shape_attribute(emitter: StorageEmitter, node: ast.Attribute, value: Value) -> Value:
+    if value.type.kind == "tensor":
+        rank = len(value.type.arguments) - 1
+        source_type = value.type.mlir
+    elif value.type.kind == "tensor_view":
+        shape = value.type.arguments[1]
+        assert isinstance(shape, tuple)
+        rank = len(shape)
+        source_type = value.abi_type.mlir
+    else:
+        raise emitter.context.error(node, "shape requires a Tensor or TensorView")
+    if rank < 1:
+        raise emitter.context.error(node, "shape requires rank >= 1")
+    result_type = DslType("tensor", "Tensor", (DslType("scalar", "u32"), rank))
+    result = emitter._fresh()
+    emitter._line(f'{result} = "vernon.get_shape"({value.name}) : ({source_type}) -> {result_type.mlir}')
+    return Value(result, result_type)
 
 
 def lower_storage_store(emitter: StorageEmitter, target: ast.Subscript, value: Value) -> None:

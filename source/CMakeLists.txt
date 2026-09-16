@@ -4,7 +4,7 @@ if(VERNON_BUILD_RUNTIME
    AND VERNON_ENABLE_PYTHON_BINDINGS)
     set(_vernon_gl_context_default ON)
 endif()
-option(VERNON_ENABLE_GLFW_CONTEXT_OWNER "Build the Python GLFW OpenGL context-owner module"
+option(VERNON_ENABLE_GLFW_CONTEXT_OWNER "Build the GLFW OpenGL context-owner host component"
        ${_vernon_gl_context_default})
 
 set(VERNON_PYTHON_PACKAGE_DIR "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl")
@@ -12,6 +12,11 @@ set(VERNON_PYTHON_PACKAGE_DIR "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl")
 if(VERNON_ENABLE_GLFW_CONTEXT_OWNER)
     include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGlfw.cmake")
     include_glfw()
+    add_library(VernonGlfwContextOwner STATIC host/glfw_context_owner.cpp)
+    add_library(Vernon::GlfwContextOwner ALIAS VernonGlfwContextOwner)
+    target_include_directories(VernonGlfwContextOwner PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/host"
+                                                             "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(VernonGlfwContextOwner PRIVATE glfw)
 endif()
 
 if(VERNON_BUILD_RUNTIME)

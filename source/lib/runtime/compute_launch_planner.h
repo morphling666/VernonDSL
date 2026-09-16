@@ -2,47 +2,69 @@
 #define VERNON_RUNTIME_COMPUTE_LAUNCH_PLANNER_H
 
 #include "VernonRuntime.h"
-#include "pipeline_manifest.h"
+#include "resolved_stage_types.h"
+#include "stage_binding_plan.h"
+#include "tensor_bridge.h"
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace vernon::runtime {
 
-enum class ComputeLaunchArgumentKind { Tensor, Scalar };
-
-struct ComputeLaunchArgument {
-    ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
+struct ComputeTensorArgument {
     VernonRuntimeProviderResourceReference resource{};
     const void *hostData{};
     size_t hostSize{};
-    const void *scalarData{};
-    size_t scalarSize{};
     const VernonTensorView *tensorView{};
 };
 
-enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };
+struct ComputeImageArgument {
+    VernonRuntimeProviderResourceReference view{};
+};
 
-struct ComputeBindingSource {
-    ComputeBindingSourceKind kind{ComputeBindingSourceKind::Argument};
-    uint32_t argumentIndex{};
-    uint32_t dimension{};
+struct ComputeScalarArgument {
+    const void *data{};
+    size_t size{};
+};
+
+struct ComputeSamplerArgument {
+    VernonRuntimeProviderResourceReference resource{};
+};
+
+using ComputeLaunchArgument =
+    std::variant<ComputeTensorArgument, ComputeImageArgument, ComputeScalarArgument, ComputeSamplerArgument>;
+
+struct ResultCommitPlan {
+    size_t storageIndex{};
+    VernonTensorView destination{};
+    TensorCopyPlan layout;
 };
 
 struct PlannedComputeLaunch {
     std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
+    std::vector<ResultCommitPlan> resultCommits;
+    std::vector<const VernonTensorView *> validationTensors;
+    std::vector<uint8_t> metadataPayload;
+    size_t metadataAlignment{};
+    std::vector<uint8_t> assignedArguments;
+    size_t hostTensorStorageCount{};
     VernonLaunchSize grid{};
     VernonRuntimeProviderObject commandEncoder{};
+
+    void reset();
+    std::vector<uint8_t> &appendHostTensorStorage();
 };
 
-std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
-                                                     const ComputeBindingSource &source);
+bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vector<ComputeLaunchArgument> &arguments,
+                                std::vector<uint8_t> &payload, std::string &error);
 
-bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error);
+bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime
 

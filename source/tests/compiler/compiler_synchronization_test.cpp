@@ -1,13 +1,49 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
-#include "compiler_target_test_utils.h"
+#include "backend_test_matrix.h"
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
+
+std::vector<uint32_t> spirvWords(VernonStringView artifact) {
+    if (!artifact.data || artifact.size < 5 * sizeof(uint32_t) || artifact.size % sizeof(uint32_t))
+        return {};
+    std::vector<uint32_t> words(artifact.size / sizeof(uint32_t));
+    std::memcpy(words.data(), artifact.data, artifact.size);
+    return words[0] == 0x07230203u ? words : std::vector<uint32_t>{};
+}
+
+bool spirvContainsOpcode(const std::vector<uint32_t> &words, uint16_t expected) {
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        if (!wordCount || cursor + wordCount > words.size())
+            return false;
+        if (static_cast<uint16_t>(words[cursor]) == expected)
+            return true;
+        cursor += wordCount;
+    }
+    return false;
+}
+
+bool spirvDeclaresCapability(const std::vector<uint32_t> &words, uint32_t expected) {
+    constexpr uint16_t opCapability = 17;
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        if (!wordCount || cursor + wordCount > words.size())
+            return false;
+        if (static_cast<uint16_t>(words[cursor]) == opCapability && wordCount == 2 && words[cursor + 1] == expected)
+            return true;
+        cursor += wordCount;
+    }
+    return false;
+}
 
 constexpr std::string_view synchronizationModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
@@ -15,7 +51,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 0 : i64,
+        vernon.dtype = "i32",
+        vernon.element_abi_leaf_dtypes = ["i32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -33,6 +71,96 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (!vernon.tensor_view<i32, [8], "read_write", "workgroup">, index, i32) -> i32
     "vernon.store"(%previous, %output, %index) :
       (i32, !vernon.tensor_view<i32, [1], "write", "device">, index) -> ()
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view divergentBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @divergent_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %is_leader = arith.cmpi eq, %lane, %zero : index
+    scf.if %is_leader {
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    }
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view divergentWhileBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @divergent_while_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %two = arith.constant 2 : index
+    %result = scf.while (%counter = %zero) : (index) -> index {
+      %condition = arith.cmpi slt, %counter, %two : index
+      scf.condition(%condition) %counter : index
+    } do {
+    ^bb0(%counter: index):
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+      %next = arith.addi %counter, %lane : index
+      scf.yield %next : index
+    }
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view branchInvariantWhileBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @branch_invariant_while_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %two = arith.constant 2 : index
+    %true = arith.constant true
+    %result:3 = scf.while (%counter = %zero, %active = %true, %control = %zero)
+        : (index, i1, index) -> (index, i1, index) {
+      %in_range = arith.cmpi slt, %counter, %two : index
+      %condition = arith.andi %in_range, %active : i1
+      scf.condition(%condition) %counter, %active, %control : index, i1, index
+    } do {
+    ^bb0(%counter: index, %active: i1, %control: index):
+      %is_leader = arith.cmpi eq, %lane, %zero : index
+      %forwarded = scf.if %is_leader -> (index) {
+        %nested = scf.if %is_leader -> (index) {
+          scf.yield %control : index
+        } else {
+          scf.yield %control : index
+        }
+        scf.yield %nested : index
+      } else {
+        scf.yield %control : index
+      }
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+      %one = arith.constant 1 : index
+      %next = arith.addi %counter, %one : index
+      scf.yield %next, %active, %forwarded : index, i1, index
+    }
     return
   }
 }
@@ -86,6 +214,12 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %lane: index {
         vernon.interface = "input",
         vernon.builtin = "local_invocation_id"
+      },
+      %global: tensor<3xi32> {
+        vernon.interface = "input",
+        vernon.builtin = "global_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -113,7 +247,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       field = "vector", index = 1 : i64
     } : (!vernon.struct<"AlignedValue">) -> tensor<2xf32>
     %first = tensor.extract %vector[%zero] : tensor<2xf32>
-    "vernon.store"(%first, %output, %lane) :
+    %global_x_i32 = tensor.extract %global[%zero] : tensor<3xi32>
+    %global_x = arith.index_castui %global_x_i32 : i32 to index
+    "vernon.store"(%first, %output, %global_x) :
       (f32, !vernon.tensor_view<f32, [2], "write", "device">, index) -> ()
     return
   }
@@ -168,7 +304,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 0 : i64,
+        vernon.dtype = "i32",
+        vernon.element_abi_leaf_dtypes = ["i32"]
       })
       attributes {
         vernon.entry,
@@ -180,6 +318,60 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %previous = "vernon.atomic"(%values, %index, %one) {
       atomic_kind = "add", ordering = "relaxed"
     } : (!vernon.tensor_view<i32, [64], "read_write", "device">, index, i32) -> i32
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view floatStorageAtomicModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @storage_atomic(
+      %values: !vernon.tensor_view<f32, [64], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      })
+      attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 64, 1, 1>
+      } {
+    %index = arith.constant 0 : index
+    %one = arith.constant 1.0 : f32
+    %previous = "vernon.atomic"(%values, %index, %one) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [64], "read_write", "device">, index, f32) -> f32
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view floatWorkgroupAtomicModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @workgroup_atomic(
+      %output: !vernon.tensor_view<f32, [1], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      })
+      attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 64, 1, 1>
+      } {
+    %index = arith.constant 0 : index
+    %one = arith.constant 1.0 : f32
+    %shared = "vernon.workgroup_alloc"()
+        : () -> !vernon.tensor_view<f32, [1], "read_write", "workgroup">
+    %previous = "vernon.atomic"(%shared, %index, %one) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index, f32) -> f32
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %sum = "vernon.load"(%shared, %index)
+        : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> f32
+    %published = "vernon.atomic"(%output, %index, %sum) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "write", "device">, index, f32) -> f32
     return
   }
 }
@@ -204,11 +396,15 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @builtin_probe(
       %local_id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "local_invocation_id"
+        vernon.builtin = "local_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %workgroup_id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "workgroup_id"
+        vernon.builtin = "workgroup_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -292,6 +488,29 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 }
 )mlir";
 
+constexpr std::string_view independentEntryWorkgroupModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @first() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<f32, [4096], "read_write", "workgroup">
+    return
+  }
+  func.func @second() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<f32, [4096], "read_write", "workgroup">
+    return
+  }
+}
+)mlir";
+
 constexpr std::string_view noResultConditionalModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @conditional(
@@ -315,17 +534,23 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 TEST(CompilerSynchronization, LowersPortableWorkgroupOperations) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
     for (std::string_view atomicKind : {"add", "min", "max", "umin", "umax", "exchange"}) {
         std::string module(synchronizationModule);
         const size_t position = module.find("atomic_kind = \"add\"");
         ASSERT_NE(position, std::string::npos);
         module.replace(position, sizeof("atomic_kind = \"add\"") - 1,
                        "atomic_kind = \"" + std::string(atomicKind) + "\"");
-        for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
-                                    VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-            if (vernon::tests::unavailableDirectXTarget(compiler, target))
+        for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+            const vernon::tests::BackendProbeResult probe =
+                vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+            if (!probe.available()) {
+                EXPECT_TRUE(probe.skippable()) << probe.reason;
                 continue;
-            VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
+            }
+            VernonCompileResult *result =
+                vernonCompilerCompileMlir(compiler, module.data(), module.size(), backend.compiler);
             ASSERT_TRUE(result);
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
             EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
@@ -344,12 +569,17 @@ TEST(CompilerSynchronization, LowersPortableWorkgroupOperations) {
 TEST(CompilerSynchronization, LowersAggregateRankTwoWorkgroupStorageThroughValueAbiLeaves) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
-                                VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
             continue;
+        }
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateWorkgroupModule.data(),
-                                                                aggregateWorkgroupModule.size(), target);
+                                                                aggregateWorkgroupModule.size(), backend.compiler);
         ASSERT_TRUE(result);
         const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
         EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
@@ -388,6 +618,58 @@ TEST(CompilerSynchronization, RejectsAggregateWorkgroupStorageAboveCanonicalLimi
     EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
     const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
     EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("16 KiB"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, PlansWorkgroupAllocationSitesIndependentlyPerEntry) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerCompileMlir(compiler, independentEntryWorkgroupModule.data(),
+                                                            independentEntryWorkgroupModule.size(), VERNON_TARGET_CPU);
+    ASSERT_TRUE(result);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+        << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsLaneVaryingBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerValidateMlir(compiler, divergentBarrierModule.data(), divergentBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("lane-varying condition"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsLaneVaryingWhileCarriedBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerValidateMlir(compiler, divergentWhileBarrierModule.data(), divergentWhileBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("lane-varying loop"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, AcceptsBranchInvariantWhileCarriedBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, branchInvariantWhileBarrierModule.data(),
+                                                             branchInvariantWhileBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(result).data, vernonCompileResultGetDiagnostics(result).size);
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
@@ -464,12 +746,17 @@ TEST(CompilerSynchronization, RejectsCombinedWorkgroupStorageNestedInControlFlow
 TEST(CompilerSynchronization, LowersNestedAggregateWorkgroupStorageUnderStructuredControlFlow) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
-                                VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
             continue;
-        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, nestedAggregateWorkgroupModule.data(),
-                                                                nestedAggregateWorkgroupModule.size(), target);
+        }
+        VernonCompileResult *result = vernonCompilerCompileMlir(
+            compiler, nestedAggregateWorkgroupModule.data(), nestedAggregateWorkgroupModule.size(), backend.compiler);
         ASSERT_TRUE(result);
         const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
         EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
@@ -482,37 +769,153 @@ TEST(CompilerSynchronization, LowersNestedAggregateWorkgroupStorageUnderStructur
 TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTargets) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    requirements.deviceAtomics = true;
     for (std::string_view atomicKind : {"add", "min", "max", "umin", "umax", "exchange"}) {
         std::string module(storageAtomicModule);
         const size_t position = module.find("atomic_kind = \"add\"");
         ASSERT_NE(position, std::string::npos);
         module.replace(position, sizeof("atomic_kind = \"add\"") - 1,
                        "atomic_kind = \"" + std::string(atomicKind) + "\"");
-        for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN}) {
-            VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
+        for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+            const vernon::tests::BackendProbeResult probe =
+                vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+            if (!probe.available()) {
+                EXPECT_TRUE(probe.skippable()) << probe.reason;
+                continue;
+            }
+            VernonCompileResult *result =
+                vernonCompilerCompileMlir(compiler, module.data(), module.size(), backend.compiler);
             ASSERT_TRUE(result);
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
             EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
                 << atomicKind << ": " << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
             EXPECT_GT(vernonCompileResultGetArtifactCount(result), 0u);
-            if (target == VERNON_TARGET_CUDA) {
+            if (backend.compiler == VERNON_TARGET_CUDA) {
                 const VernonStringView artifact = vernonCompileResultGetArtifactData(result, 0);
                 EXPECT_NE(std::string_view(artifact.data, artifact.size).find("atom"), std::string_view::npos);
             }
             vernonCompileResultDestroy(result);
         }
     }
-    for (VernonTarget target :
-         {VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersF32AtomicAddWithIntegerBackedPortableStorage) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    requirements.deviceAtomics = true;
+    requirements.f32AtomicAdd = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
             continue;
-        VernonCompileResult *result =
-            vernonCompilerCompileMlir(compiler, storageAtomicModule.data(), storageAtomicModule.size(), target);
+        }
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, floatStorageAtomicModule.data(),
+                                                                floatStorageAtomicModule.size(), backend.compiler);
         ASSERT_TRUE(result);
-        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_UNSUPPORTED_TARGET);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        EXPECT_GT(vernonCompileResultGetArtifactCount(result), 0u);
+        if (backend.compiler == VERNON_TARGET_VULKAN) {
+            const std::vector<uint32_t> words = spirvWords(vernonCompileResultGetArtifactData(result, 0));
+            ASSERT_FALSE(words.empty());
+            constexpr uint16_t opAtomicCompareExchange = 230;
+            constexpr uint32_t atomicFloat32AddExt = 6033;
+            EXPECT_TRUE(spirvContainsOpcode(words, opAtomicCompareExchange));
+            EXPECT_FALSE(spirvDeclaresCapability(words, atomicFloat32AddExt));
+        } else if (backend.compiler == VERNON_TARGET_OPENGL || backend.compiler == VERNON_TARGET_OPENGL_ES ||
+                   backend.compiler == VERNON_TARGET_METAL || backend.compiler == VERNON_TARGET_DIRECTX) {
+            const VernonStringView artifact = vernonCompileResultGetArtifactData(result, 0);
+            const std::string_view source(artifact.data, artifact.size);
+            EXPECT_EQ(source.find("vernon_atomic_compare_exchange"), std::string_view::npos);
+            EXPECT_EQ(source.find("reinterpret_cast"), std::string_view::npos);
+            if (backend.compiler == VERNON_TARGET_OPENGL || backend.compiler == VERNON_TARGET_OPENGL_ES) {
+                EXPECT_NE(source.find("atomicCompSwap"), std::string_view::npos);
+                EXPECT_NE(source.find("uintBitsToFloat"), std::string_view::npos);
+                EXPECT_NE(source.find("floatBitsToUint"), std::string_view::npos);
+            } else if (backend.compiler == VERNON_TARGET_METAL) {
+                EXPECT_NE(source.find("atomic_compare_exchange_weak_explicit"), std::string_view::npos);
+                EXPECT_NE(source.find("as_type<float>"), std::string_view::npos);
+            } else if (backend.compiler == VERNON_TARGET_DIRECTX) {
+                EXPECT_NE(source.find("InterlockedCompareExchange"), std::string_view::npos);
+                EXPECT_NE(source.find("asfloat"), std::string_view::npos);
+                EXPECT_NE(source.find("asuint"), std::string_view::npos);
+            }
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersWorkgroupF32AtomicAcrossNativeAndPortableProfiles) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    requirements.f32AtomicAdd = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        if (backend.compiler == VERNON_TARGET_CPU)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, floatWorkgroupAtomicModule.data(),
+                                                                floatWorkgroupAtomicModule.size(), backend.compiler);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        EXPECT_GT(vernonCompileResultGetArtifactCount(result), 0u);
+        if (backend.compiler == VERNON_TARGET_VULKAN) {
+            const std::vector<uint32_t> words = spirvWords(vernonCompileResultGetArtifactData(result, 0));
+            constexpr uint16_t opAtomicCompareExchange = 230;
+            constexpr uint32_t atomicFloat32AddExt = 6033;
+            EXPECT_TRUE(spirvContainsOpcode(words, opAtomicCompareExchange));
+            EXPECT_FALSE(spirvDeclaresCapability(words, atomicFloat32AddExt));
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsUnsupportedF64AtomicBeforeGpuArtifactGeneration) {
+    std::string module(floatStorageAtomicModule);
+    for (size_t position = 0; (position = module.find("f32", position)) != std::string::npos; position += 3)
+        module.replace(position, 3, "f64");
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *cpu = vernonCompilerCompileMlir(compiler, module.data(), module.size(), VERNON_TARGET_CPU);
+    ASSERT_TRUE(cpu);
+    EXPECT_EQ(vernonCompileResultGetStatus(cpu), VERNON_STATUS_OK);
+    vernonCompileResultDestroy(cpu);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        if (backend.compiler == VERNON_TARGET_CPU)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, module.data(), module.size(), backend.compiler);
+        ASSERT_TRUE(result);
+        EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
         EXPECT_EQ(vernonCompileResultGetArtifactCount(result), 0u);
         const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
-        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("supported only by CPU, CUDA, and Vulkan"),
+        EXPECT_NE(std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size).find("unsupported"),
                   std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
@@ -588,12 +991,19 @@ TEST(CompilerSynchronization, ValidatesNoResultConditionalWithoutElse) {
 TEST(CompilerSynchronization, LowersLocalAndWorkgroupBuiltins) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
-                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        if (backend.compiler == VERNON_TARGET_CPU)
             continue;
-        VernonCompileResult *result =
-            vernonCompilerCompileMlir(compiler, workgroupBuiltinModule.data(), workgroupBuiltinModule.size(), target);
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, workgroupBuiltinModule.data(),
+                                                                workgroupBuiltinModule.size(), backend.compiler);
         ASSERT_TRUE(result);
         EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK) << std::string_view(
             vernonCompileResultGetDiagnostics(result).data ? vernonCompileResultGetDiagnostics(result).data : "",

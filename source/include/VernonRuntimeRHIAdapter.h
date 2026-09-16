@@ -20,14 +20,12 @@ extern "C" {
 
 typedef struct VernonRuntimeRhiAdapter VernonRuntimeRhiAdapter;
 
-VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateCuda(uint32_t device_index);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonRuntimeRhiAdapter *
 vernonRuntimeRhiAdapterCreateForDevice(VernonRhiDevice device, VernonRhiBackend backend);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI void vernonRuntimeRhiAdapterDestroy(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI const VernonRuntimeDeviceProvider *
 vernonRuntimeRhiAdapterGetProvider(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapter *adapter);
-VERNON_RUNTIME_RHI_ADAPTER_CAPI void vernonRuntimeRhiAdapterInvalidateState(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStringView
 vernonRuntimeRhiAdapterGetLastError(const VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus
@@ -35,6 +33,8 @@ vernonRuntimeRhiAdapterReferenceBuffer(const VernonRuntimeRhiAdapter *adapter, V
                                        uint64_t size, VernonRuntimeProviderResourceReference *output);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceImage(
     const VernonRuntimeRhiAdapter *adapter, VernonRhiImage image, VernonRuntimeProviderResourceReference *output);
+VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceImageView(
+    const VernonRuntimeRhiAdapter *adapter, VernonRhiImageView view, VernonRuntimeProviderResourceReference *output);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceSampler(
     const VernonRuntimeRhiAdapter *adapter, VernonRhiSampler sampler, VernonRuntimeProviderResourceReference *output);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceCommandEncoder(

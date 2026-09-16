@@ -1,406 +1,558 @@
 #include "backend_dispatch.h"
 #include "cuda_backend.h"
-#include "logical_resource_record.h"
-#include "rhi_test_hooks.h"
 
-#include <algorithm>
-#include <array>
-#include <cassert>
-#include <cstring>
-#include <deque>
+#include <cstdint>
 #include <limits>
-#include <memory>
 #include <mutex>
-#include <new>
-#include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
-#include <vector>
+
+namespace vernon::rhi {
+const BackendDispatch &cudaBackendDispatch();
+}
 
 namespace {
-struct CudaBufferSlot : vernon::rhi::LogicalResourceRecord {
+
+using vernon::rhi::invalidArgument;
+using vernon::rhi::unsupported;
+using BufferHandle = vernon::rhi::ResourceHandle<vernon::rhi::BufferResourceTag>;
+using BufferLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::BufferResourceTag>;
+
+struct CudaBufferSlot {
+    explicit CudaBufferSlot(BufferLifecycle lifecycle) noexcept : lifecycle(std::move(lifecycle)) {}
+
+    BufferLifecycle lifecycle;
     vernon::rhi::cuda::DevicePointer pointer{};
     VernonRhiBufferDescriptor descriptor{};
 };
 
 struct CudaDevice {
+    CudaDevice() noexcept = default;
+    CudaDevice(const CudaDevice &) = delete;
+    CudaDevice &operator=(const CudaDevice &) = delete;
+
     vernon::rhi::cuda::DeviceState state;
-    std::vector<CudaBufferSlot> buffers;
+    vernon::rhi::StableResourceSlotContainer<CudaBufferSlot> buffers;
+    vernon::rhi::CommandDeviceStateRef commandState;
     std::string error;
     std::mutex mutex;
-};
-
-struct CudaDeviceSlot {
-    std::shared_ptr<CudaDevice> device;
-    uint32_t generation{1};
+    std::mutex slotMutex;
+    std::mutex creationMutex;
 };
 
 constexpr uint32_t cudaDeviceBit = uint32_t{1} << 29;
-std::vector<CudaDeviceSlot> cudaDevices;
-std::mutex deviceMutex;
+constexpr size_t cudaDeviceCapacity = 256;
+using CudaDeviceRegistry = vernon::rhi::DeviceRegistry<CudaDevice, cudaDeviceCapacity>;
+using CudaDeviceAnchor = vernon::rhi::DeviceRegistryAnchor<CudaDevice>;
 
-VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+struct CudaRegistryStorage {
+    CudaRegistryStorage() noexcept {
+        // Initialize the loader after the registry member and before this
+        // object's destructor is registered. Devices therefore die first.
+        (void)vernon::rhi::cuda::driver();
+    }
 
-template <typename Handle> uint64_t resourceKey(Handle handle) {
+    CudaDeviceRegistry registry;
+};
+
+CudaDeviceRegistry &cudaDevices() {
+    static CudaRegistryStorage storage;
+    return storage.registry;
+}
+
+VernonRhiDevice invalidDevice() noexcept { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+
+template <typename Handle> uint64_t resourceKey(Handle handle) noexcept {
     return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
 }
 
-bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
+vernon::RhiError backendFailure(CudaDevice &device, vernon::rhi::cuda::Result status, const char *operation) noexcept {
+    device.error = vernon::rhi::cuda::describeResult(status, operation);
+    return {vernon::RhiErrorCode::BackendFailure, {operation, static_cast<uint64_t>(status), 0}};
+}
+
+vernon::Result<BufferHandle, vernon::RhiError> decodeBufferKey(uint64_t key, const char *operation) noexcept {
     const uint64_t encodedIndex = key & UINT32_MAX;
-    generation = static_cast<uint32_t>(key >> 32);
+    const uint32_t generation = static_cast<uint32_t>(key >> 32);
     if (!encodedIndex || !generation)
-        return false;
-    index = static_cast<uint32_t>(encodedIndex - 1);
-    return true;
+        return vernon::Result<BufferHandle, vernon::RhiError>{vernon::err(invalidArgument(operation, key))};
+    return vernon::Result<BufferHandle, vernon::RhiError>{
+        vernon::ok(BufferHandle{static_cast<uint32_t>(encodedIndex - 1), generation})};
 }
 
-template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
-    uint32_t index = 0;
-    uint32_t generation = 0;
-    if (!decodeResourceKey(key, index, generation) || index >= slots.size())
-        return static_cast<typename Slots::value_type *>(nullptr);
-    auto &slot = slots[index];
-    return slot.isRetained(generation) ? &slot : nullptr;
-}
-
-template <typename Slot, typename = void> struct HasPublicAlive : std::false_type {};
-template <typename Slot>
-struct HasPublicAlive<Slot, std::void_t<decltype(std::declval<Slot &>().publicAlive)>> : std::true_type {};
-
-template <typename Slot> bool publicAlive(const Slot &slot) {
-    if constexpr (HasPublicAlive<Slot>::value)
-        return slot.publicAlive;
-    return true;
-}
-std::shared_ptr<CudaDevice> lookupCudaDevice(VernonRhiDevice handle) {
+vernon::Result<CudaDeviceAnchor, vernon::RhiError> lookupCudaDevice(VernonRhiDevice handle) noexcept {
     if ((handle.index & cudaDeviceBit) == 0)
-        return {};
-    const uint32_t index = handle.index & ~cudaDeviceBit;
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    if (index >= cudaDevices.size())
-        return {};
-    CudaDeviceSlot &slot = cudaDevices[index];
-    return slot.device && slot.generation == handle.generation ? slot.device : std::shared_ptr<CudaDevice>{};
+        return vernon::Result<CudaDeviceAnchor, vernon::RhiError>{
+            vernon::err(invalidArgument("lookup_cuda_device", handle.index, handle.generation))};
+    return cudaDevices().lookup({handle.index & ~cudaDeviceBit, handle.generation});
 }
 
-CudaBufferSlot *lookupCudaBuffer(CudaDevice &device, VernonRhiBuffer handle) {
-    if (handle.index >= device.buffers.size())
-        return nullptr;
-    CudaBufferSlot &slot = device.buffers[handle.index];
-    return slot.isPublic(handle.generation) ? &slot : nullptr;
+CudaBufferSlot *findBufferSlot(CudaDevice &device, uint32_t index) noexcept {
+    std::lock_guard<std::mutex> guard(device.slotMutex);
+    return device.buffers.get(index);
 }
+
+struct PinnedCudaBuffer {
+    CudaBufferSlot *slot;
+    vernon::OperationPin pin;
+};
+
+vernon::Result<PinnedCudaBuffer, vernon::RhiError> pinBuffer(CudaDevice &device, BufferHandle handle) noexcept {
+    CudaBufferSlot *slot = findBufferSlot(device, handle.index);
+    if (!slot)
+        return vernon::Result<PinnedCudaBuffer, vernon::RhiError>{
+            vernon::err(invalidArgument("pin_cuda_buffer", handle.generation, handle.index))};
+    auto pin = slot->lifecycle.pin(handle);
+    if (pin.isErr())
+        return vernon::Result<PinnedCudaBuffer, vernon::RhiError>{vernon::err(std::move(pin).error())};
+    return vernon::Result<PinnedCudaBuffer, vernon::RhiError>{
+        vernon::ok(PinnedCudaBuffer{slot, std::move(pin).value()})};
+}
+
+vernon::Result<void, vernon::RhiError> teardownCudaBuffer(void *context, BufferHandle handle) noexcept {
+    auto &device = *static_cast<CudaDevice *>(context);
+    CudaBufferSlot *slot = findBufferSlot(device, handle.index);
+    if (!slot)
+        return vernon::Result<void, vernon::RhiError>{
+            vernon::err(invalidArgument("teardown_cuda_buffer", handle.generation, handle.index))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (!slot->pointer)
+        return vernon::Result<void, vernon::RhiError>{
+            vernon::err(invalidArgument("teardown_cuda_buffer", handle.generation, handle.index))};
+    const auto status = device.state.free(slot->pointer);
+    if (status != vernon::rhi::cuda::kSuccess)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(backendFailure(device, status, "cuMemFree"))};
+    slot->pointer = 0;
+    slot->descriptor = {};
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<void, vernon::RhiError> teardownCudaDevice(CudaDevice &device) noexcept {
+    std::lock_guard<std::mutex> slotGuard(device.slotMutex);
+    std::lock_guard<std::mutex> nativeGuard(device.mutex);
+    for (std::size_t index = 0; index < device.buffers.size(); ++index) {
+        CudaBufferSlot &slot = device.buffers[index];
+        if (!slot.pointer)
+            continue;
+        const auto status = device.state.free(slot.pointer);
+        if (status != vernon::rhi::cuda::kSuccess)
+            return vernon::Result<void, vernon::RhiError>{vernon::err(backendFailure(device, status, "cuMemFree"))};
+        slot.pointer = 0;
+        slot.descriptor = {};
+    }
+    device.state.shutdown();
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<VernonRhiDevice, vernon::RhiError>
+createOwnedDeviceResult(const VernonRhiOwnedDeviceDescriptor *descriptor) noexcept {
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(invalidArgument("create_cuda_device"))};
+    auto reserved = cudaDevices().reserve();
+    if (reserved.isErr())
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(reserved).error())};
+    CudaDevice &device = reserved.value().device();
+    auto owner = reserved.value().retainOwner();
+    if (owner.isErr())
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(owner).error())};
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    if (commandState.isErr())
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(commandState).error())};
+    device.commandState = std::move(commandState).value();
+    const auto status = device.state.initialize(descriptor->device_index);
+    if (status != vernon::rhi::cuda::kSuccess)
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{
+            vernon::err(backendFailure(device, status, "cuDevicePrimaryCtxRetain"))};
+    auto published = cudaDevices().publish(std::move(reserved).value());
+    if (published.isErr())
+        return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(published).error())};
+    const auto registryHandle = published.value();
+    return vernon::Result<VernonRhiDevice, vernon::RhiError>{
+        vernon::ok(VernonRhiDevice{registryHandle.index | cudaDeviceBit, registryHandle.generation})};
+}
+
+vernon::Result<void, vernon::RhiError> destroyDeviceResult(VernonRhiDevice handle) noexcept {
+    if ((handle.index & cudaDeviceBit) == 0)
+        return vernon::Result<void, vernon::RhiError>{
+            vernon::err(invalidArgument("destroy_cuda_device", handle.index, handle.generation))};
+    return cudaDevices().remove({handle.index & ~cudaDeviceBit, handle.generation}, teardownCudaDevice);
+}
+
 } // namespace
 
 namespace vernon::rhi::cuda_api {
 
-VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) noexcept {
+    return createOwnedDeviceResult(descriptor);
+}
 
-    auto device = std::shared_ptr<CudaDevice>(new (std::nothrow) CudaDevice());
-    if (!device)
-        return invalidDevice();
-    const auto status = device->state.initialize(descriptor->device_index);
-    if (status != vernon::rhi::cuda::kSuccess) {
-        device->error = vernon::rhi::cuda::describeResult(status, "cuDevicePrimaryCtxRetain");
-        return invalidDevice();
-    }
-    std::lock_guard<std::mutex> guard(deviceMutex);
+Result<void, RhiError> destroyDevice(VernonRhiDevice handle) noexcept { return destroyDeviceResult(handle); }
+
+Result<vernon::rhi::CommandDeviceStateRef, RhiError> commandState(VernonRhiDevice handle) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<vernon::rhi::CommandDeviceStateRef, RhiError>{err(std::move(anchored).error())};
+    return anchored.value().device().commandState.retain();
+}
+
+Option<VernonStringView> lastError(VernonRhiDevice handle) {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Option<VernonStringView>{};
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return Option<VernonStringView>{some(VernonStringView{device.error.data(), device.error.size()})};
+}
+
+Result<void, RhiError> synchronize(VernonRhiDevice handle) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    const auto status = device.state.synchronize();
+    if (status == vernon::rhi::cuda::kSuccess)
+        return Result<void, RhiError>{ok()};
+    return Result<void, RhiError>{err(backendFailure(device, status, "cuStreamSynchronize"))};
+}
+
+Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor) {
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
+        return Result<VernonRhiBuffer, RhiError>{
+            err(invalidArgument("create_cuda_buffer", descriptor ? descriptor->size : 0))};
+
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto owner = anchored.value().retainOwner();
+    if (owner.isErr())
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(owner).error())};
+    auto creation = ResourceCreationReservation::create(owner.value());
+    if (creation.isErr())
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(creation).error())};
+
+    std::lock_guard<std::mutex> creationGuard(device.creationMutex);
+    CudaBufferSlot *slot = nullptr;
     uint32_t index = 0;
-    while (index < cudaDevices.size() && cudaDevices[index].device)
-        ++index;
-    if (index == cudaDevices.size())
-        cudaDevices.emplace_back();
-    cudaDevices[index].device = std::move(device);
-    return {index | cudaDeviceBit, cudaDevices[index].generation};
-}
-
-void destroyDevice(VernonRhiDevice handle) {
-
-    std::shared_ptr<CudaDevice> device;
-    {
-        const uint32_t index = handle.index & ~cudaDeviceBit;
-        std::lock_guard<std::mutex> guard(deviceMutex);
-        if (index >= cudaDevices.size() || cudaDevices[index].generation != handle.generation)
-            return;
-        CudaDeviceSlot &slot = cudaDevices[index];
-        device = std::move(slot.device);
-        ++slot.generation;
-        if (slot.generation == 0)
-            slot.generation = 1;
-    }
-    if (device) {
-        std::lock_guard<std::mutex> guard(device->mutex);
-        for (CudaBufferSlot &buffer : device->buffers)
-            if (buffer.occupied)
-                device->state.free(buffer.pointer);
-        device->state.shutdown();
-    }
-    return;
-}
-
-VernonStringView lastError(VernonRhiDevice handle) {
-    auto device = lookupCudaDevice(handle);
-    return device ? VernonStringView{device->error.data(), device->error.size()} : VernonStringView{};
-}
-
-VernonRhiStatus synchronize(VernonRhiDevice handle) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const auto status = device->state.synchronize();
-    if (status == vernon::rhi::cuda::kSuccess)
-        return VERNON_RHI_STATUS_OK;
-    device->error = vernon::rhi::cuda::describeResult(status, "cuStreamSynchronize");
-    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-}
-
-VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor,
-                             VernonRhiBuffer *output) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
-        descriptor->size > (std::numeric_limits<size_t>::max)())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    uint32_t index = 0;
-    while (index < device->buffers.size() && device->buffers[index].occupied)
-        ++index;
-    if (index == device->buffers.size())
-        device->buffers.emplace_back();
-    CudaBufferSlot &slot = device->buffers[index];
-    const auto status = device->state.allocate(slot.pointer, static_cast<size_t>(descriptor->size));
-    if (status != vernon::rhi::cuda::kSuccess) {
-        device->error = vernon::rhi::cuda::describeResult(status, "cuMemAlloc");
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-    slot.descriptor = *descriptor;
-    slot.publish();
-    *output = {index, slot.generation};
-    return VERNON_RHI_STATUS_OK;
-}
-
-VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
-                             uint64_t size) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    if (!source || size > (std::numeric_limits<size_t>::max)())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
-    if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto status = device->state.upload(slot->pointer + offset, source, static_cast<size_t>(size));
-    if (status == vernon::rhi::cuda::kSuccess)
-        return VERNON_RHI_STATUS_OK;
-    device->error = vernon::rhi::cuda::describeResult(status, "cuMemcpyHtoDAsync");
-    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-}
-
-VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
-                               uint64_t size) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    if (!destination || size > (std::numeric_limits<size_t>::max)())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
-    if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto status = device->state.download(destination, slot->pointer + offset, static_cast<size_t>(size));
-    if (status == vernon::rhi::cuda::kSuccess)
-        return VERNON_RHI_STATUS_OK;
-    device->error = vernon::rhi::cuda::describeResult(status, "cuMemcpyDtoHAsync");
-    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-}
-
-uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return 0;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupCudaBuffer(*device, buffer) != nullptr;
-}
-
-VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        const auto status = device->state.free(slot->pointer);
-        if (status != vernon::rhi::cuda::kSuccess) {
-            slot->restorePublicOwner();
-            device->error = vernon::rhi::cuda::describeResult(status, "cuMemFree");
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    for (;;) {
+        slot = findBufferSlot(device, index);
+        if (!slot)
+            break;
+        if (!slot->lifecycle.snapshot().occupied) {
+            std::lock_guard<std::mutex> nativeGuard(device.mutex);
+            if (!slot->pointer)
+                break;
         }
+        ++index;
+    }
+    if (!slot) {
+        auto lifecycle = BufferLifecycle::create(index);
+        if (lifecycle.isErr())
+            return Result<VernonRhiBuffer, RhiError>{err(std::move(lifecycle).error())};
+        std::lock_guard<std::mutex> slotGuard(device.slotMutex);
+        auto appended = device.buffers.emplace("allocate_cuda_resource_slot", std::move(lifecycle).value());
+        if (appended.isErr())
+            return Result<VernonRhiBuffer, RhiError>{err(std::move(appended).error())};
+        slot = appended.value();
+    }
+
+    {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        const auto status = device.state.allocate(slot->pointer, static_cast<size_t>(descriptor->size));
+        if (status != vernon::rhi::cuda::kSuccess)
+            return Result<VernonRhiBuffer, RhiError>{err(backendFailure(device, status, "cuMemAlloc"))};
+        slot->descriptor = *descriptor;
+    }
+
+    auto published = slot->lifecycle.publish(std::move(creation).value(), &device, teardownCudaBuffer);
+    if (published.isErr()) {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        const auto status = device.state.free(slot->pointer);
+        if (status != vernon::rhi::cuda::kSuccess)
+            return Result<VernonRhiBuffer, RhiError>{err(backendFailure(device, status, "cuMemFree"))};
         slot->pointer = 0;
-        slot->recycle();
+        slot->descriptor = {};
+        return Result<VernonRhiBuffer, RhiError>{err(std::move(published).error())};
     }
-    return VERNON_RHI_STATUS_OK;
+    const BufferHandle buffer = published.value();
+    return Result<VernonRhiBuffer, RhiError>{ok(VernonRhiBuffer{buffer.index, buffer.generation})};
 }
 
-bool ownsDevice(VernonRhiDevice handle) { return static_cast<bool>(lookupCudaDevice(handle)); }
-
-void *deviceStateForBackend(VernonRhiDevice handle) {
-    auto device = lookupCudaDevice(handle);
-    return device ? &device->state : nullptr;
+Result<void, RhiError> uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
+                                    uint64_t size) noexcept {
+    if (!source || size > (std::numeric_limits<size_t>::max)())
+        return Result<void, RhiError>{err(invalidArgument("upload_cuda_buffer", size))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &slot = *pinned.value().slot;
+    if (offset > slot.descriptor.size || size > slot.descriptor.size - offset)
+        return Result<void, RhiError>{err(invalidArgument("upload_cuda_buffer", offset))};
+    const auto status = device.state.upload(slot.pointer + offset, source, static_cast<size_t>(size));
+    return status == vernon::rhi::cuda::kSuccess
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure(device, status, "cuMemcpyHtoDAsync"))};
 }
 
-bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return false;
+Result<void, RhiError> uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                          const VernonRhiBufferUploadRange *ranges, size_t rangeCount) noexcept {
+    if (!ranges || rangeCount == 0)
+        return Result<void, RhiError>{err(invalidArgument("upload_cuda_buffer_ranges", rangeCount))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &slot = *pinned.value().slot;
+    size_t stagingSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot.descriptor.size || range.size > slot.descriptor.size - range.offset ||
+            static_cast<size_t>(range.size) > (std::numeric_limits<size_t>::max)() - stagingSize)
+            return Result<void, RhiError>{err(invalidArgument("upload_cuda_buffer_ranges", index))};
+        stagingSize += static_cast<size_t>(range.size);
     }
-
-    backend = VERNON_RHI_BACKEND_CUDA;
-    native = reinterpret_cast<uintptr_t>(&device->state);
-    return true;
+    const auto status = device.state.uploadRanges(slot.pointer, ranges, rangeCount);
+    return status == vernon::rhi::cuda::kSuccess
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure(device, status, "batched cuMemcpyHtoDAsync"))};
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return false;
+Result<void, RhiError> downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset,
+                                      void *destination, uint64_t size) noexcept {
+    if (!destination || size > (std::numeric_limits<size_t>::max)())
+        return Result<void, RhiError>{err(invalidArgument("download_cuda_buffer", size))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &slot = *pinned.value().slot;
+    if (offset > slot.descriptor.size || size > slot.descriptor.size - offset)
+        return Result<void, RhiError>{err(invalidArgument("download_cuda_buffer", offset))};
+    const auto status = device.state.download(destination, slot.pointer + offset, static_cast<size_t>(size));
+    return status == vernon::rhi::cuda::kSuccess
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure(device, status, "cuMemcpyDtoHAsync"))};
+}
+
+Result<void, RhiError> downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                            const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    if (!ranges || rangeCount == 0)
+        return Result<void, RhiError>{err(invalidArgument("download_cuda_buffer_ranges", rangeCount))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &slot = *pinned.value().slot;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferDownloadRange &range = ranges[index];
+        if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot.descriptor.size || range.size > slot.descriptor.size - range.offset)
+            return Result<void, RhiError>{err(invalidArgument("download_cuda_buffer_ranges", index))};
     }
-
-    if (!native)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const auto status = device->state.synchronize();
-    completed = status == vernon::rhi::cuda::kSuccess;
-    if (!completed)
-        device->error = vernon::rhi::cuda::describeResult(status, "cuStreamSynchronize");
-    return completed;
+    const auto status = device.state.downloadRanges(slot.pointer, ranges, rangeCount);
+    return status == vernon::rhi::cuda::kSuccess
+               ? Result<void, RhiError>{ok()}
+               : Result<void, RhiError>{err(backendFailure(device, status, "batched cuMemcpyDtoHAsync"))};
 }
 
-bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, const VernonRhiBarrier *barriers,
-                    size_t barrierCount) {
-    return static_cast<bool>(lookupCudaDevice(handle)) && native != 0;
+Result<bool, RhiError> isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<bool, RhiError>{err(std::move(anchored).error())};
+    auto pinned = pinBuffer(anchored.value().device(), {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<bool, RhiError>{err(std::move(pinned).error())};
+    return Result<bool, RhiError>{ok(true)};
 }
 
-uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return 0;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer))
-        return resourceKey(buffer);
-    return 0;
+Result<void, RhiError> destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaBufferSlot *slot = findBufferSlot(anchored.value().device(), buffer.index);
+    if (!slot)
+        return Result<void, RhiError>{err(invalidArgument("destroy_cuda_buffer", buffer.generation, buffer.index))};
+    return slot->lifecycle.destroyPublic({buffer.index, buffer.generation});
 }
 
-bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return false;
-    }
+Result<void *, RhiError> getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void *, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<void *, RhiError>{err(std::move(pinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return Result<void *, RhiError>{ok(reinterpret_cast<void *>(static_cast<uintptr_t>(pinned.value().slot->pointer)))};
+}
 
+bool ownsDevice(VernonRhiDevice handle) { return lookupCudaDevice(handle).isOk(); }
+
+Result<void *, RhiError> deviceStateForBackend(VernonRhiDevice handle) {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void *, RhiError>{err(std::move(anchored).error())};
+    return Result<void *, RhiError>{ok(static_cast<void *>(&anchored.value().device().state))};
+}
+
+Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<CommandRecording, RhiError>{err(std::move(anchored).error())};
+    return Result<CommandRecording, RhiError>{
+        ok(CommandRecording{reinterpret_cast<uintptr_t>(&anchored.value().device().state), VERNON_RHI_BACKEND_CUDA})};
+}
+
+Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint64_t native, bool) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr() || !native)
+        return Result<CommandSubmission, RhiError>{err(invalidArgument("submit_cuda_commands", native, handle.index))};
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    const auto status = device.state.synchronize();
+    if (status != vernon::rhi::cuda::kSuccess)
+        return Result<CommandSubmission, RhiError>{err(backendFailure(device, status, "cuStreamSynchronize"))};
+    return Result<CommandSubmission, RhiError>{ok(CommandSubmission{true, false})};
+}
+
+Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const VernonRhiBarrier *,
+                                      size_t) noexcept {
+    if (lookupCudaDevice(handle).isErr() || !native)
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_barriers", native, handle.index))};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source,
+                                        uint64_t sourceOffset, VernonRhiBuffer destination, uint64_t destinationOffset,
+                                        uint64_t size) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr() || !size)
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_buffer_copy", native, handle.index))};
+    CudaDevice &device = anchored.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&device.state))
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_buffer_copy", native, handle.index))};
+    auto sourcePinned = pinBuffer(device, {source.index, source.generation});
+    if (sourcePinned.isErr())
+        return Result<void, RhiError>{err(std::move(sourcePinned).error())};
+    auto destinationPinned = pinBuffer(device, {destination.index, destination.generation});
+    if (destinationPinned.isErr())
+        return Result<void, RhiError>{err(std::move(destinationPinned).error())};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &sourceSlot = *sourcePinned.value().slot;
+    CudaBufferSlot &destinationSlot = *destinationPinned.value().slot;
+    if (sourceOffset > sourceSlot.descriptor.size || size > sourceSlot.descriptor.size - sourceOffset ||
+        destinationOffset > destinationSlot.descriptor.size ||
+        size > destinationSlot.descriptor.size - destinationOffset)
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_buffer_copy", size, 0))};
+    const auto status =
+        device.state.copy(destinationSlot.pointer + destinationOffset, sourceSlot.pointer + sourceOffset, size);
+    if (status == vernon::rhi::cuda::kSuccess)
+        return Result<void, RhiError>{ok()};
+    return Result<void, RhiError>{err(backendFailure(device, status, "cuMemcpyDtoDAsync"))};
+}
+
+Result<uint64_t, RhiError> bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(anchored).error())};
+    auto pinned = pinBuffer(anchored.value().device(), {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
+    return Result<uint64_t, RhiError>{ok(resourceKey(buffer))};
+}
+
+Result<RetainedRhiResourceLease, RhiError> retainResource(VernonRhiDevice handle, ResourceKind kind,
+                                                          uint64_t key) noexcept {
     if (kind != ResourceKind::Buffer)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = lookupResourceRecord(device->buffers, key);
-    return slot && slot->retain();
+        return Result<RetainedRhiResourceLease, RhiError>{
+            err(unsupported("retain_cuda_resource", key, static_cast<uint32_t>(kind)))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<RetainedRhiResourceLease, RhiError>{err(std::move(anchored).error())};
+    auto decoded = decodeBufferKey(key, "retain_cuda_resource");
+    if (decoded.isErr())
+        return Result<RetainedRhiResourceLease, RhiError>{err(std::move(decoded).error())};
+    CudaBufferSlot *slot = findBufferSlot(anchored.value().device(), decoded.value().index);
+    if (!slot)
+        return Result<RetainedRhiResourceLease, RhiError>{err(invalidArgument("retain_cuda_resource", key))};
+    auto retained = slot->lifecycle.retain(decoded.value());
+    if (retained.isErr())
+        return Result<RetainedRhiResourceLease, RhiError>{err(std::move(retained).error())};
+    return Result<RetainedRhiResourceLease, RhiError>{ok(RetainedRhiResourceLease{std::move(retained).value()})};
 }
 
-uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupCudaDevice(handle);
-    if (!device) {
-        return 0;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = kind == ResourceKind::Buffer ? lookupResourceRecord(device->buffers, key) : nullptr;
-    return slot && slot->occupied ? slot->pointer : 0;
-}
-
-void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupCudaDevice(handle);
-    if (!device)
-        return;
-
+Result<uint64_t, RhiError> resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) noexcept {
     if (kind != ResourceKind::Buffer)
-        return;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    CudaBufferSlot *slot = lookupResourceRecord(device->buffers, key);
-    if (!slot || !slot->release())
-        return;
-    const auto status = device->state.free(slot->pointer);
-    if (status != vernon::rhi::cuda::kSuccess) {
-        slot->retain();
-        device->error = vernon::rhi::cuda::describeResult(status, "cuMemFree");
-        return;
-    }
-    slot->pointer = 0;
-    slot->recycle();
-    return;
+        return Result<uint64_t, RhiError>{err(unsupported("resolve_cuda_resource", key, static_cast<uint32_t>(kind)))};
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(anchored).error())};
+    auto decoded = decodeBufferKey(key, "resolve_cuda_resource");
+    if (decoded.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(decoded).error())};
+    CudaDevice &device = anchored.value().device();
+    CudaBufferSlot *slot = findBufferSlot(device, decoded.value().index);
+    if (!slot)
+        return Result<uint64_t, RhiError>{err(invalidArgument("resolve_cuda_resource", key))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (!slot->pointer)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"resolve_cuda_resource", key, decoded.value().index}})};
+    return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(slot->pointer))};
 }
 
 } // namespace vernon::rhi::cuda_api
 
 const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
     using namespace cuda_api;
-    static const BackendDispatch dispatch{
-        VERNON_RHI_BACKEND_CUDA,
-        ownsDevice,
-        createOwnedDevice,
-        destroyDevice,
-        lastError,
-        synchronize,
-        deviceStateForBackend,
-        createBuffer,
-        uploadBuffer,
-        downloadBuffer,
-        destroyBuffer,
-        isBufferValid,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        bufferResource,
-        nullptr,
-        nullptr,
-        retainResource,
-        resolveResource,
-        releaseResource,
-        beginCommands,
-        submitCommands,
-        nullptr,
-        nullptr,
-        recordBarriers,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-    };
+    static const BackendDispatch dispatch = [] {
+        BackendDispatch result{};
+        result.backend = VERNON_RHI_BACKEND_CUDA;
+        result.ownsDevice = ownsDevice;
+        result.createOwnedDevice = createOwnedDevice;
+        result.destroyDevice = destroyDevice;
+        result.lastError = lastError;
+        result.synchronize = synchronize;
+        result.deviceState = deviceStateForBackend;
+        result.commandState = commandState;
+        result.createBuffer = createBuffer;
+        result.uploadBuffer = uploadBuffer;
+        result.uploadBufferRanges = uploadBufferRanges;
+        result.downloadBufferRanges = downloadBufferRanges;
+        result.downloadBuffer = downloadBuffer;
+        result.destroyBuffer = destroyBuffer;
+        result.isBufferValid = isBufferValid;
+        result.getBufferNativeHandle = getBufferNativeHandle;
+        result.bufferResource = bufferResource;
+        result.retainResource = retainResource;
+        result.resolveRetainedResource = resolveResource;
+        result.beginCommands = beginCommands;
+        result.submitCommands = submitCommands;
+        result.recordBarriers.emplace(recordBarriers);
+        result.recordBufferCopy.emplace(recordBufferCopy);
+        return result;
+    }();
     return dispatch;
 }

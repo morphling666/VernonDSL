@@ -1,15 +1,15 @@
 #ifndef VERNON_RUNTIME_BACKEND_OPENGL_H
 #define VERNON_RUNTIME_BACKEND_OPENGL_H
 
-#include "../rhi/opengl_backend.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
-#include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
+#include "prepared_binding_plan.h"
+#include "rhi/opengl_backend.h"
 #include "runtime_state.h"
-#include "tensor_bridge.h"
+#include "stage_artifact.h"
 
 #include <string>
 #include <unordered_map>
@@ -25,33 +25,13 @@ struct OpenGLContextState {
 };
 
 struct OpenGLPipelineState {
-    struct InlineBinding {
-        enum Source {
-            EXTERNAL_UNIFORM,
-            EXTERNAL_VERTEX,
-            EXTERNAL_TEXTURE,
-            EXTERNAL_SAMPLER,
-            EXTERNAL_STORAGE,
-            COMPUTE_INLINE,
-            IMPLICIT_SAMPLER,
-            RESOLUTION
-        };
-
-        Source source{EXTERNAL_UNIFORM};
-        uint32_t externalSlot{};
-        TensorPackingLayout packing;
-        std::vector<uint8_t> storage;
-    };
-
     VernonRuntimeCorePipeline *rhiPipeline{};
     VernonRuntimeCoreBindings *rhiBindings{};
     PreparedGraphicsVariant rhiGraphicsVariant;
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
-    std::vector<VernonRuntimeProviderVertexAttribute> rhiVertexAttributes;
+    PreparedComputeBindingPlan rhiComputeBindingPlan;
+    PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> rhiValues;
-    std::vector<InlineBinding> rhiInlineBindings;
-    std::vector<ComputeBindingSource> rhiComputeBindingSources;
-    std::vector<int64_t> rhiComputeDescriptorValues;
+    std::vector<std::vector<uint8_t>> rhiComputeBindingStorage;
     uint32_t workgroup[3]{1, 1, 1};
 };
 

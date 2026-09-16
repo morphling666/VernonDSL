@@ -1,5 +1,16 @@
 # VernonDSL examples
 
+## External engine integration
+
+[`external_engine/`](external_engine/) is a minimal C++ host that links a
+CPU compute Program bundle, a graphics Program bundle, and the Vernon Runtime.
+Both panels use the canonical Program lifecycle. The source is shared by
+native desktop and Emscripten builds and has no Python or nanobind dependency
+at runtime. Its standalone CMake project locates `runtime_src` through the
+active installed `vernon-lang` wheel, so it demonstrates deployment from the
+delivered Runtime sources instead of reaching into this repository's Runtime
+implementation.
+
 ## Visual showcases
 
 Install the optional presenter dependency before running either showcase:

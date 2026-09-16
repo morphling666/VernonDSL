@@ -9,9 +9,7 @@ import vernon_dsl as vd
 from shader_lib.fullscreen import fullscreen_vertex
 from shader_lib.mandelbulb import mandelbulb_fragment
 from showcase_common import (
-    BatchRenderPass,
     FramePresenter,
-    InvocationBatch,
     ShowcasePreset,
     architecture_from_name,
     configure_showcase_parser,
@@ -41,18 +39,12 @@ def main() -> None:
     )
     positions = create_fullscreen_triangle()
     output = vd.Texture.zeros(shape=(options.size, options.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
+    target = vd.RenderTarget.from_attachments(colors={0: output})
     render_mandelbulb = vd.pipeline(fullscreen_vertex, mandelbulb_fragment)
-    render_batch = InvocationBatch()
-    graph = vd.ExecutionGraph()
-    graph.add_pass(
-        BatchRenderPass(
-            "mandelbulb-raymarch",
-            target,
-            render_batch,
-            clear_color=(0.0, 0.0, 0.0, 1.0),
-        )
-    )
+    quality = {
+        "smoke": (np.int32(48), np.int32(9), np.int32(12)),
+        "showoff": (np.int32(112), np.int32(18), np.int32(32)),
+    }[options.preset]
     presenter = FramePresenter(
         output,
         architecture=options.architecture,
@@ -60,35 +52,34 @@ def main() -> None:
         headless=options.headless,
         fps=options.fps,
     )
-    quality = {
-        "smoke": (np.int32(48), np.int32(9), np.int32(12)),
-        "showoff": (np.int32(112), np.int32(18), np.int32(32)),
-    }[options.preset]
+
+    def frame_values(phase: float) -> dict[str, object]:
+        angle = phase * 0.22 + 0.55
+        camera = np.array(
+            (3.15 * math.cos(angle), 0.48 + math.sin(phase * 0.17) * 0.12, 3.15 * math.sin(angle)),
+            dtype=np.float32,
+        )
+        return {
+            "camera_position": camera,
+            "time": np.float32(phase),
+            "power": np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
+        }
+
     animation_frames: list[np.ndarray] = []
     frame = 0
     start = time.perf_counter()
     try:
         while options.frames == 0 or frame < options.frames:
             phase = float(time.perf_counter() - start if options.frames == 0 else frame / options.fps)
-            angle = phase * 0.22 + 0.55
-            camera = np.array(
-                (3.15 * math.cos(angle), 0.48 + math.sin(phase * 0.17) * 0.12, 3.15 * math.sin(angle)),
-                dtype=np.float32,
+            render_mandelbulb(
+                position=positions,
+                camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
+                max_steps=quality[0],
+                max_iterations=quality[1],
+                shadow_steps=quality[2],
+                render_pass=vd.render_pass(target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
+                **frame_values(phase),
             )
-            render_batch.values = [
-                render_mandelbulb.invocation(
-                    position=positions,
-                    camera_position=camera,
-                    camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
-                    time=np.float32(phase),
-                    power=np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
-                    max_steps=quality[0],
-                    max_iterations=quality[1],
-                    shadow_steps=quality[2],
-                    topology=vd.triangles,
-                )
-            ]
-            graph.execute()
             frame += 1
             if not presenter.present():
                 break
@@ -102,15 +93,14 @@ def main() -> None:
         write_animation(options.animation_output, animation_frames, options.fps)
     if presenter.image is None:
         raise RuntimeError("Mandelbulb showcase did not render an image")
-    barrier_count = sum(len(scope.barriers) for scope in graph.scopes)
     emit_showcase_result(
         name="mandelbulb",
         options=options,
         image=presenter.image,
         rendered_frames=frame,
         elapsed_seconds=elapsed,
-        passes=len(graph.schedule),
-        barriers=barrier_count,
+        passes=1,
+        barriers=0,
     )
 
 

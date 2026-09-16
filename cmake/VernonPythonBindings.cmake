@@ -52,15 +52,31 @@ function(vernon_add_python_bindings package_directory source_directory)
     endif()
 
     target_sources(VernonDSLCompiler PRIVATE "${source_directory}/lib/compiler/compiler_python_bridge.cpp")
-    nanobind_add_module(vernon-dsl-native "${source_directory}/python/native_module.cpp")
-    _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
+    nanobind_add_module(
+        vernon-dsl-native
+        "${source_directory}/python/native_compiler.cpp"
+        "${source_directory}/python/native_module.cpp"
+        "${source_directory}/python/native_program.cpp"
+        "${source_directory}/python/native_program_autodiff.cpp"
+        "${source_directory}/python/native_rhi.cpp"
+        "${source_directory}/python/native_runtime.cpp")
+    if(NOT SKBUILD)
+        _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
+    endif()
     target_link_libraries(
         vernon-dsl-native
-        PRIVATE VernonDSLCompiler
+        PRIVATE VernonRuntimeUtilities
+                VernonDSLCompiler
                 Vernon::Runtime
-                Vernon::RHI
-                Vernon::ExecutionGraph)
-    target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler")
+                Vernon::RHI)
+    target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler" "${source_directory}/lib")
+    if(BUILD_TESTING)
+        target_compile_definitions(vernon-dsl-native PRIVATE VERNON_ENABLE_LIFECYCLE_TEST_HOOKS=1)
+    endif()
+    if(TARGET VernonGlfwContextOwner)
+        target_link_libraries(vernon-dsl-native PRIVATE Vernon::GlfwContextOwner)
+        target_compile_definitions(vernon-dsl-native PRIVATE VERNON_HAS_GLFW_CONTEXT_OWNER=1)
+    endif()
     if(MSVC)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)
     endif()
@@ -75,17 +91,4 @@ function(vernon_add_python_bindings package_directory source_directory)
         RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
         LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel)
 
-    if(VERNON_ENABLE_GLFW_CONTEXT_OWNER AND TARGET glfw)
-        nanobind_add_module(vernon-dsl-gl-context "${source_directory}/python/gl_context_module.cpp")
-        _vernon_set_python_module_output(vernon-dsl-gl-context "${package_directory}")
-        target_link_libraries(vernon-dsl-gl-context PRIVATE glfw)
-        if(MSVC)
-            target_compile_options(vernon-dsl-gl-context PRIVATE /EHsc)
-        endif()
-        set_target_properties(vernon-dsl-gl-context PROPERTIES OUTPUT_NAME "_gl_context")
-        install(
-            TARGETS vernon-dsl-gl-context
-            RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
-            LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel)
-    endif()
 endfunction()

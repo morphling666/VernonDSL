@@ -1,0 +1,137 @@
+{
+  "cpu_gpu_comparisons": [
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 5.963339108552801,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 32,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": -157476,
+      "speedup_over_cpu": 0.16769128533471622
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 2.0487752985559124,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 64,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 679068,
+      "speedup_over_cpu": 0.48809647436927517
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.6161270512816545,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 128,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 4025244,
+      "speedup_over_cpu": 1.6230418676145142
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.22986125580337868,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 256,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 17409948,
+      "speedup_over_cpu": 4.350450433697236
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.1332795882246648,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 512,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 70948764,
+      "speedup_over_cpu": 7.503024381455431
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.07844805178091302,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 1024,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 133778876,
+      "speedup_over_cpu": 12.747289158853366
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 6.18047823897865,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 32,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": -157476,
+      "speedup_over_cpu": 0.1617997768673083
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 2.0321404401237357,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 64,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 679068,
+      "speedup_over_cpu": 0.49209197369208924
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.5898438582515773,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 128,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 4025244,
+      "speedup_over_cpu": 1.6953639272674854
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.19328802780246507,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 256,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 17409948,
+      "speedup_over_cpu": 5.1736261752433625
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.0926359677340931,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 512,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 70948764,
+      "speedup_over_cpu": 10.794943092411469
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.050458715563237354,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 1024,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 133778876,
+      "speedup_over_cpu": 19.818181831179405
+    }
+  ],
+  "schema_version": 1
+}

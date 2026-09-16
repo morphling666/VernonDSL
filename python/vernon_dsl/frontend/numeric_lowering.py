@@ -66,6 +66,7 @@ def lower_binary(emitter: NumericEmitter, node: ast.BinOp) -> Value:
         ast.Sub: "arith.subf" if floating else "arith.subi",
         ast.Mult: "arith.mulf" if floating else "arith.muli",
         ast.Div: "arith.divf" if floating else ("arith.divui" if left.type.name == "u32" else "arith.divsi"),
+        ast.FloorDiv: None if floating else ("arith.divui" if left.type.name == "u32" else "arith.divsi"),
         ast.Mod: "arith.remf" if floating else ("arith.remui" if left.type.name == "u32" else "arith.remsi"),
     }
     operation = operations.get(type(node.op))

@@ -18,12 +18,12 @@ void destroyTestBackend(void *state) noexcept {
     delete testState;
 }
 
-VernonStatus synchronizeTestBackend(void *, std::string &) noexcept { return VERNON_STATUS_OK; }
+RhiAdapterResult<void> synchronizeTestBackend(void *, std::string &) noexcept {
+    return RhiAdapterResult<void>{vernon::ok()};
+}
 uint64_t testBackendIdentity(const void *state) noexcept { return reinterpret_cast<uintptr_t>(state); }
-void invalidateTestBackend(void *) noexcept {}
 
-const RhiAdapterBackendOps testBackendOps{destroyTestBackend, synchronizeTestBackend, testBackendIdentity,
-                                          invalidateTestBackend};
+const RhiAdapterBackendOps testBackendOps{destroyTestBackend, synchronizeTestBackend, testBackendIdentity};
 
 } // namespace
 

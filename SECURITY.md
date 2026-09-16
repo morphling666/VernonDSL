@@ -2,9 +2,8 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published 0.1 patch release.
-Development branches and older patch releases are not supported security
-channels.
+Security fixes are provided for the latest published stable release.
+Development branches and older releases are not supported security channels.
 
 ## Reporting a vulnerability
 
@@ -18,6 +17,6 @@ acknowledgement within seven days. Disclosure timing is coordinated after the
 issue is reproduced and a fix or mitigation is available.
 
 VernonDSL compiles and loads executable CPU/GPU artifacts. Applications must
-treat untrusted Python DSL source, MLIR, pipeline manifests, native objects,
-shader artifacts, and caches as untrusted executable input and isolate them
-accordingly. The 0.1.1 API does not provide a sandbox.
+treat untrusted Python DSL source, MLIR, Program manifests, native objects,
+Stage artifacts, and caches as untrusted executable input and isolate them
+accordingly. VernonDSL does not provide a sandbox.

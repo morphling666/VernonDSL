@@ -2,7 +2,7 @@
 
 ## Supported installations
 
-VernonDSL 0.1.1 provides wheels for:
+Published VernonDSL releases provide wheels for:
 
 - Windows x64;
 - Linux x64 with the wheel's declared manylinux baseline;
@@ -16,7 +16,7 @@ not claim compatibility with an older baseline than that tag.
 Python 3.11 and 3.12 installations require NumPy 1.26 or newer but below 2.0.
 Python 3.13 and 3.14 installations require NumPy 2.1 or newer but below 3.0.
 Intel macOS, 32-bit platforms, source distributions, PyPy, and unsupported
-Python versions are outside the published 0.1.1 wheel matrix.
+Python versions are outside the published wheel matrix.
 
 ## Runtime backends
 
@@ -31,6 +31,25 @@ GPU availability is discovered at runtime. A compiled backend is not a promise
 that the host has a usable device. Unsupported capabilities fail explicitly;
 they do not silently select a different backend.
 
+## Bundled Runtime deployment profiles
+
+Every wheel includes the complete, platform-independent `VernonRuntime` source
+project with the same release version:
+
+- `desktop` is the supported native embedding profile and builds only
+  backends available to the selected host toolchain;
+- `mobile` currently covers the CI-validated iOS 15 or newer arm64 Runtime
+  source build and smoke application; it is an embedding profile, not an iOS
+  Python wheel or a promise of every desktop backend;
+- `web` is the WebAssembly-oriented Runtime source profile validated by the
+  independent wasm32 build/runtime gate; it is not a browser Python runtime,
+  dynamic loader, or general browser package.
+
+Cross-compilers, SDKs, system frameworks, loaders, GPU drivers, and application
+linking remain deployment prerequisites. A profile being present in the source
+payload does not claim that every backend or capability is available on that
+target.
+
 ## Getting help
 
 Use GitHub Issues for reproducible defects and support questions. Include the
@@ -39,5 +58,5 @@ backend, device/driver information, complete diagnostic text, and a minimal
 reproducer. Security reports must follow [`SECURITY.md`](SECURITY.md), not a
 public issue.
 
-The latest 0.1 patch release receives correctness and security fixes. Older
-0.1 patch releases may be asked to upgrade before investigation.
+The latest published stable release receives correctness and security fixes.
+Users of older releases may be asked to upgrade before investigation.

@@ -1,0 +1,18 @@
+add_mlir_library(
+    MLIRVernonProgramTransforms
+    VernonProgramExecutable.cpp
+    VernonProgramImplementation.cpp
+    VernonProgramVjp.cpp
+    ADDITIONAL_HEADER_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../include/mlir/Dialect/VernonProgram
+    LINK_LIBS
+    PUBLIC
+    MLIRArithDialect
+    MLIRFuncDialect
+    MLIRTensorDialect
+    MLIRVernonDialect
+    MLIRVernonProgramDialect
+    MLIRVernonTransforms
+    MLIRIR
+    MLIRPass
+    MLIRSupport)

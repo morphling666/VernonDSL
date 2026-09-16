@@ -1,5 +1,7 @@
 # Example Design Notes
 
+Status: non-normative example implementation notes.
+
 ## Terrain showcase
 
 The terrain is a full-screen ray-marched graphics workload. A repeat-wrapped
@@ -60,8 +62,9 @@ contributes irregular motion without turning the surface into soft blobs.
 
 A separate compute pass gathers adjacent heights to generate positions,
 analytic normals, and a curvature-gated crest mask. Simulation state remains
-in TensorStorage because writable storage textures are not part of the current
-language contract.
+in TensorStorage so its typed, strided representation is shared by the
+simulation and geometry passes; storage Textures remain available when
+image-format access is the appropriate representation.
 
 The water fragment stage samples one CC0 normal map twice in world space at
 37-degree and 113-degree orientations, different scales, and different

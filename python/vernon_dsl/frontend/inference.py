@@ -16,6 +16,7 @@ from ..shader_contracts import (
     texture_sampling_contract,
 )
 from .abi import workgroup_physical_bytes
+from .activity import analyze_storage_activity
 from .model import (
     AccessMode,
     AtomicEffect,
@@ -23,6 +24,7 @@ from .model import (
     BranchMerge,
     ConcreteType,
     EffectScope,
+    InterfaceMetadata,
     LValue,
     MemoryOrdering,
     ResourceEffect,
@@ -54,6 +56,7 @@ from .type_solver import (
 )
 
 ParseType = Callable[[ast.AST], ConcreteType]
+ParseInterface = Callable[[ast.AST], tuple[InterfaceMetadata, ...]]
 Error = Callable[[ast.AST, str], Exception]
 
 
@@ -69,6 +72,17 @@ def _contract_type(contract: TypeContract) -> ConcreteType:
 
 def _element(value_type: InferenceType) -> InferenceType:
     return element_type(value_type)
+
+
+def _shape_rank(value_type: InferenceType) -> int | None:
+    if not isinstance(value_type, ConcreteType):
+        return None
+    if value_type.kind == "tensor":
+        return len(value_type.arguments) - 1
+    if value_type.kind == "tensor_view":
+        shape = value_type.arguments[1]
+        return len(shape) if isinstance(shape, tuple) else None
+    return None
 
 
 def _common(left: InferenceType, right: InferenceType, *, division: bool = False) -> InferenceType | None:
@@ -122,12 +136,19 @@ def _annotation(value_type: ConcreteType) -> ast.expr:
             ctx=ast.Load(),
         )
     if value_type.kind == "texture":
-        dimension, element = value_type.arguments
+        dimension, element, format_name, access = value_type.arguments
         assert isinstance(element, ConcreteType)
+        elements = [ast.Constant(value=dimension), _annotation(element)]
+        if access != "sampled":
+            elements = [
+                ast.Constant(value=dimension),
+                ast.Name(id=str(format_name), ctx=ast.Load()),
+                ast.Name(id=str(access), ctx=ast.Load()),
+            ]
         return ast.Subscript(
             value=ast.Name(id="Texture", ctx=ast.Load()),
             slice=ast.Tuple(
-                elts=[ast.Constant(value=dimension), _annotation(element)],
+                elts=elements,
                 ctx=ast.Load(),
             ),
             ctx=ast.Load(),
@@ -142,11 +163,13 @@ class _Inference:
         self,
         module: ast.Module,
         parse_type: ParseType,
+        parse_interface: ParseInterface,
         error: Error,
         enabled_features: tuple[str, ...],
     ):
         self.module = module
         self.parse_type = parse_type
+        self.parse_interface = parse_interface
         self.error = error
         self.enabled_features = enabled_features
         self.functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
@@ -298,7 +321,14 @@ class _Inference:
                 if argument_type.kind == "tensor_view":
                     access_name = argument_type.arguments[2]
                     access = AccessMode(str(access_name))
-                parameters.append(TypedParameter(argument.arg, argument_type, access))
+                parameters.append(
+                    TypedParameter(
+                        argument.arg,
+                        argument_type,
+                        access,
+                        self.parse_interface(argument.annotation),
+                    )
+                )
             result_type = (
                 None
                 if function.returns is None
@@ -335,6 +365,7 @@ class _Inference:
             active.pop()
             effects = self._function_effects(body)
             result = replace(function, body=body, effects=effects)
+            result = replace(result, storage_activity=analyze_storage_activity(result))
             resolved[symbol] = result
             return result
 
@@ -441,11 +472,6 @@ class _Inference:
                         invalid_resource.stages,
                         has_lod=invalid_resource.has_lod,
                     ),
-                )
-            if function_kind == "func" and any(isinstance(effect, StorageEffect) for effect in function.effects):
-                raise self.error(
-                    function.source,
-                    f"pure helper '{function.qualified_name}' has Storage effects",
                 )
             if function_kind not in ENTRY_DECORATORS | {"func"} and function.effects:
                 raise self.error(
@@ -730,7 +756,7 @@ class _Inference:
                     MemoryOrdering.RELAXED,
                     scope,
                 )
-                storage_effect = StorageEffect(StorageEffectKind.WRITE, owner, region)
+                storage_effect = StorageEffect(StorageEffectKind.WRITE, owner, region, atomic=True)
                 if scope is EffectScope.DEVICE and storage_effect not in effects:
                     effects.append(storage_effect)
             else:
@@ -935,12 +961,13 @@ class _Inference:
                     loop_environment = merged_environment
                 else:
                     raise self.error(statement, "loop-carried type inference did not converge")
+                else_returns = self._merge_loop_else(statement, before, loop_environment, loop_depth)
                 environment.update(loop_environment)
                 self.statement_merges[id(statement)] = tuple(
                     BranchMerge(name, default_type(loop_environment[name]))
                     for name in sorted(before.keys() & loop_environment.keys() & assigned)
                 )
-                returns.extend(loop_returns)
+                returns.extend((*loop_returns, *else_returns))
             elif isinstance(statement, ast.For):
                 if not isinstance(statement.target, ast.Name):
                     raise self.error(statement.target, "for loop target must be a local name")
@@ -966,8 +993,7 @@ class _Inference:
                 if len(statement.iter.args) == 3 and self._is_literal_zero(statement.iter.args[2]):
                     raise self.error(statement.iter.args[2], "range step must not be zero")
                 before = environment.copy()
-                index_type = ConcreteType("index", "index")
-                loop_environment = {**before, statement.target.id: index_type}
+                loop_environment = {**before, statement.target.id: range_type}
                 loop_returns: list[InferenceType | None] = []
                 assigned = self._assigned_names(statement.body)
                 for _ in range(8):
@@ -979,12 +1005,15 @@ class _Inference:
                         if merged is None:
                             raise self.error(statement, f"loop local '{name}' has incompatible types")
                         merged_environment[name] = merged
-                    next_environment = {**merged_environment, statement.target.id: index_type}
+                    next_environment = {**merged_environment, statement.target.id: range_type}
                     if next_environment == loop_environment:
                         break
                     loop_environment = next_environment
                 else:
                     raise self.error(statement, "loop-carried type inference did not converge")
+                else_returns = self._merge_loop_else(
+                    statement, before, loop_environment, loop_depth, excluded_name=statement.target.id
+                )
                 environment.update(
                     {name: value for name, value in loop_environment.items() if name != statement.target.id}
                 )
@@ -992,8 +1021,26 @@ class _Inference:
                     BranchMerge(name, default_type(loop_environment[name]))
                     for name in sorted(before.keys() & loop_environment.keys() & assigned)
                 )
-                returns.extend(loop_returns)
+                returns.extend((*loop_returns, *else_returns))
         return returns
+
+    def _merge_loop_else(
+        self,
+        statement: ast.While | ast.For,
+        before: dict[str, InferenceType],
+        loop_environment: dict[str, InferenceType],
+        loop_depth: int,
+        *,
+        excluded_name: str | None = None,
+    ) -> list[InferenceType | None]:
+        else_environment = {name: value for name, value in loop_environment.items() if name != excluded_name}
+        else_returns = self._statements(statement.orelse, else_environment, loop_depth)
+        for name in sorted(before.keys() & else_environment.keys() & self._assigned_names(statement.orelse)):
+            merged = _common(loop_environment[name], else_environment[name])
+            if merged is None:
+                raise self.error(statement, f"loop-else local '{name}' has incompatible types")
+            loop_environment[name] = merged
+        return else_returns
 
     @staticmethod
     def _is_literal_zero(node: ast.expr) -> bool:
@@ -1155,6 +1202,13 @@ class _Inference:
                 return element
         if isinstance(node, ast.Attribute):
             value_type = self._expression(node.value, environment)
+            if node.attr == "shape":
+                rank = _shape_rank(value_type)
+                if rank is None:
+                    raise self.error(node, "shape requires a Tensor or TensorView")
+                if rank < 1:
+                    raise self.error(node, "shape requires rank >= 1")
+                return ConcreteType("tensor", "Tensor", (_scalar("u32"), rank))
             if (
                 isinstance(value_type, ConcreteType)
                 and value_type.kind == "tensor"
@@ -1186,6 +1240,7 @@ class _Inference:
                 ast.Sub: "sub",
                 ast.Mult: "mul",
                 ast.Div: "div",
+                ast.FloorDiv: "floordiv",
                 ast.Mod: "mod",
                 ast.Pow: "pow",
             }.get(type(node.op))
@@ -1247,8 +1302,8 @@ class _Inference:
             if not is_abi_stable_value(element, lambda struct: tuple(value for _, value in self.structs[struct])):
                 raise self.error(node.args[0], "workgroup_storage element must be an ABI-stable Value")
             shape_node = node.keywords[0].value
-            if not isinstance(shape_node, ast.Tuple) or not shape_node.elts:
-                raise self.error(shape_node, "workgroup_storage shape must be a non-empty tuple")
+            if not isinstance(shape_node, ast.Tuple):
+                raise self.error(shape_node, "workgroup_storage shape must be a tuple")
             shape: list[int] = []
             for extent in shape_node.elts:
                 if (
@@ -1260,15 +1315,12 @@ class _Inference:
                     raise self.error(extent, "workgroup_storage dimensions must be positive compile-time integers")
                 shape.append(extent.value)
 
-            def struct_fields(struct: str) -> tuple[tuple[str, ConcreteType], ...]:
-                return self.structs[struct]
-
             shape_tuple = tuple(shape)
-            footprint = workgroup_physical_bytes(element, shape_tuple, struct_fields)
+            footprint = workgroup_physical_bytes(element, shape_tuple, self.structs.__getitem__)
             if footprint > 16 * 1024:
-                raise self.error(node, "workgroup_storage exceeds the portable 16 KiB allocation limit")
+                raise self.error(node, "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit")
             if self.workgroup_storage_bytes > 16 * 1024 - footprint:
-                raise self.error(node, "combined workgroup_storage exceeds the portable 16 KiB allocation limit")
+                raise self.error(node, "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit")
             self.workgroup_storage_bytes += footprint
             return ConcreteType("tensor_view", "TensorView", (element, shape_tuple, "read_write", "workgroup"))
         if name in ATOMIC_OPERATION_NAMES:
@@ -1286,8 +1338,10 @@ class _Inference:
             assert isinstance(shape, tuple)
             if storage.arguments[2] == "read":
                 raise self.error(node.args[0], f"{name} requires a writable TensorView")
-            if element.kind != "scalar" or element.name not in {"i32", "u32"}:
-                raise self.error(node.args[0], f"{name} requires i32 or u32 storage elements")
+            supported_elements = {"i32", "u32", "f32", "f64"} if name == "atomic_add" else {"i32", "u32"}
+            if element.kind != "scalar" or element.name not in supported_elements:
+                expected = "i32, u32, f32, or f64" if name == "atomic_add" else "i32 or u32"
+                raise self.error(node.args[0], f"{name} requires {expected} storage elements")
             index_nodes = list(node.args[1].elts) if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
             if len(shape) == 1:
                 if len(index_nodes) != 1 or not index.is_integer:
@@ -1390,11 +1444,48 @@ class _Inference:
             if result_shape:
                 return ConcreteType("tensor", "Tensor", (element, *result_shape))
             return element
+        if name in {"texture_load", "texture_store"}:
+            expected_arguments = 2 if name == "texture_load" else 3
+            if len(arguments) != expected_arguments or not isinstance(arguments[0], ConcreteType):
+                raise self.error(node, f"{name} requires a storage texture and coordinates")
+            texture = arguments[0]
+            if texture.kind != "texture" or texture.arguments[3] == "sampled":
+                raise self.error(node.args[0], f"{name} requires a storage Texture")
+            dimension, element, _, access = texture.arguments
+            rank = 3 if dimension == "3d" else 2
+            coordinates = arguments[1]
+            coordinate_element = (
+                coordinates.arguments[0]
+                if isinstance(coordinates, ConcreteType) and coordinates.kind == "tensor"
+                else None
+            )
+            if (
+                not isinstance(coordinates, ConcreteType)
+                or coordinates.kind != "tensor"
+                or coordinates.arguments[1:] != (rank,)
+                or not isinstance(coordinate_element, ConcreteType)
+                or not coordinate_element.is_integer
+            ):
+                raise self.error(
+                    node.args[1],
+                    f"{name} coordinates for a {dimension} storage texture must be a {rank}-component integer vector",
+                )
+            assert isinstance(element, ConcreteType)
+            texel = ConcreteType("tensor", "Tensor", (element, 4))
+            if name == "texture_load":
+                if access == "write":
+                    raise self.error(node.args[0], "texture_load requires read or read_write access")
+                return texel
+            if access == "read":
+                raise self.error(node.args[0], "texture_store requires write or read_write access")
+            if not can_convert(arguments[2], texel):
+                raise self.error(node.args[2], f"texture_store value must be {texel.mlir}")
+            return ConcreteType("void", "void")
         if name == "texture_sample":
             if len(arguments) not in {2, 3, 4} or not isinstance(arguments[0], ConcreteType):
                 raise self.error(node, "texture_sample requires a texture and coordinates")
             texture = arguments[0]
-            if texture.kind != "texture":
+            if texture.kind != "texture" or texture.arguments[3] != "sampled":
                 raise self.error(node, "texture_sample requires a texture and coordinates")
             coordinate_index = (
                 2
@@ -1491,6 +1582,12 @@ class _Inference:
                 )
                 self._constrain_literal(source, expected)
             return ConcreteType("tensor", "Tensor", (element, count))
+        if name == "Tensor" and not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            element = default_type(self._expression(node.args[0], environment))
+            if not is_abi_stable_value(element):
+                raise self.error(node, "Tensor element has an incompatible type")
+            self._constrain_literal(node.args[0], element)
+            return ConcreteType("tensor", "Tensor", (element,))
         literal = rectangular_literal(node.args[0])
         if literal is None:
             raise self.error(node, f"{name} requires a non-empty rectangular sequence literal")
@@ -1593,7 +1690,8 @@ class _Inference:
 def infer_and_monomorphize_helpers(
     module: ast.Module,
     parse_type: ParseType,
+    parse_interface: ParseInterface,
     error: Error,
     enabled_features: tuple[str, ...],
 ) -> ast.Module:
-    return _Inference(module, parse_type, error, enabled_features).run()
+    return _Inference(module, parse_type, parse_interface, error, enabled_features).run()

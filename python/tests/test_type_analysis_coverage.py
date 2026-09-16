@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import ast
+import re
 import unittest
+from pathlib import Path
 
-from vernon_dsl import CompileError, compile_source
+from language_contract_cases import (
+    INFERENCE_CALL_INVALID_CASES,
+    INFERENCE_STATEMENT_INVALID_CASES,
+    METADATA_INVALID_CASES,
+    METADATA_VALID_CASES,
+    TYPE_PARSER_INVALID_CASES,
+    TYPE_PARSER_VALID_CASES,
+    audit_case_registry,
+)
+from language_contract_runner import assert_frontend_rejects, contract_oracle
+from language_contract_traceability import covers_case_group
+from vernon_dsl import compile_source
 from vernon_dsl.frontend.model import ConcreteType, LiteralType, TypedFunctionInstance
 from vernon_dsl.frontend.type_parser import TypeParser
 from vernon_dsl.frontend.type_solver import (
@@ -27,7 +40,8 @@ class _Context:
     structs = {"Record": object()}
 
     @staticmethod
-    def error(_node: ast.AST, message: str) -> Exception:
+    def error(node: ast.AST, message: str) -> Exception:
+        del node
         return ValueError(message)
 
 
@@ -35,96 +49,48 @@ class TypeParserCoverageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parser = TypeParser(_Context())
 
+    @covers_case_group("TYPE_PARSER_VALID_CASES", layers="F")
     def test_type_constructor_success_paths(self) -> None:
-        expected = {
-            "f32": "f32",
-            "float": "f32",
-            "Record": '!vernon.struct<"Record">',
-            "Sampler": "!vernon.sampler",
-            "Tensor[f32, (2, 4)]": "tensor<2x4xf32>",
-            "Vector[f16, 4]": "tensor<4xf16>",
-            "Matrix[f32, 3, 3]": "tensor<3x3xf32>",
-            "TensorView[f32, (dyn,), read]": '!vernon.tensor_view<f32, [-1], "read", "device">',
-            "TensorView[f32, (4, dyn), read_write]": '!vernon.tensor_view<f32, [4, -1], "read_write", "device">',
-            'Texture["cube", f32]': '!vernon.texture<"cube", f32>',
-        }
-        for source, mlir in expected.items():
-            with self.subTest(source=source):
-                self.assertEqual(self.parser.parse_type(expression(source)).mlir, mlir)
+        for case in TYPE_PARSER_VALID_CASES:
+            with contract_oracle(case), self.subTest(case=case.id):
+                self.assertEqual(self.parser.parse_type(expression(case.source)).mlir, case.expected)
         storage = self.parser.parse_type(expression("TensorStorage[f32]"))
         self.assertEqual((storage.kind, storage.arguments), ("tensor_storage", (ConcreteType("scalar", "f32"),)))
 
+    @covers_case_group("TYPE_PARSER_INVALID_CASES", layers="F")
     def test_type_constructor_diagnostics(self) -> None:
-        cases = {
-            "None": "None is only valid",
-            "Annotated[f32]": "Annotated requires",
-            "Missing": "unknown DSL type",
-            "Tensor[f32]": "Tensor requires",
-            "Tensor[f32, 0]": "positive integer",
-            "Tensor[f32, True]": "positive integer",
-            "Tensor[f32, (None, 4)]": "positive integer",
-            "vec[3, f32]": "unknown DSL type constructor",
-            "mat[2, 3, f64]": "unknown DSL type constructor",
-            "vec2[f32]": "unknown DSL type constructor",
-            "mat4[f32]": "unknown DSL type constructor",
-            "Vector[f32, f64, 2]": "Vector requires",
-            "Tuple[Sampler]": "Tuple elements must be ABI-stable",
-            "Tensor[Sampler, 2]": "Tensor element type must be an ABI-stable",
-            "TensorStorage[f32, f32]": "TensorStorage requires one",
-            "TensorStorage[Sampler]": "TensorStorage element type must be an ABI-stable",
-            "Buffer[f32]": "unknown DSL type constructor 'Buffer'",
-            "TensorView[f32, read]": "TensorView requires",
-            "TensorView[f32, 1, read]": "TensorView shape",
-            "TensorView[f32, (dyn,), missing]": "TensorView access",
-            "Texture[f32]": "Texture requires",
-            'Texture["1d", f32]': "texture dimension",
-            "Texture[value(), f32]": "string literal or name",
-            "Unknown[f32]": "unknown DSL type constructor",
-        }
-        for source, message in cases.items():
-            with self.subTest(source=source):
-                if message == "invalid syntax":
-                    with self.assertRaises(SyntaxError):
-                        expression(source)
-                else:
-                    with self.assertRaisesRegex(ValueError, message):
-                        self.parser.parse(expression(source))
+        for case in TYPE_PARSER_INVALID_CASES:
+            assert case.expected_diagnostic is not None
+            with (
+                contract_oracle(case),
+                self.subTest(case=case.id),
+                self.assertRaisesRegex(ValueError, case.expected_diagnostic),
+            ):
+                self.parser.parse(expression(case.source))
 
+    def test_contract_case_registry_is_well_formed(self) -> None:
+        inventory = (Path(__file__).parents[2] / "specs/testing/language_feature_inventory.md").read_text(
+            encoding="utf-8"
+        )
+        audit_case_registry(frozenset(re.findall(r"\bLANG-[A-Z0-9-]+\b", inventory)))
+
+    @covers_case_group("METADATA_VALID_CASES", layers="F")
     def test_metadata_success_paths(self) -> None:
-        expected = {
-            "Annotated[f32, attribute()]": ("attribute", (-1, 0)),
-            "Annotated[f32, attribute(3)]": ("attribute", (3, 0)),
-            "Annotated[f32, attribute(divisor=2)]": ("attribute", (-1, 2)),
-            "Annotated[f32, attribute(location=3, divisor=2)]": ("attribute", (3, 2)),
-            'Annotated[f32, builtin("position")]': ("builtin", ("position",)),
-            "Annotated[f32, uniform()]": ("uniform", ()),
-            "Annotated[f32, uniform(set=1, binding=2)]": ("uniform", (1, 2)),
-            "Annotated[f32, varying()]": ("varying", ()),
-            "Annotated[f32, resource(set=1, binding=2)]": ("resource", (1, 2)),
-        }
-        for source, metadata in expected.items():
-            with self.subTest(source=source):
-                parsed = self.parser.parse(expression(source))
-                self.assertEqual((parsed.metadata[0].kind, parsed.metadata[0].arguments), metadata)
+        for case in METADATA_VALID_CASES:
+            with contract_oracle(case), self.subTest(case=case.id):
+                parsed = self.parser.parse(expression(case.source))
+                self.assertEqual((parsed.metadata[0].kind, parsed.metadata[0].arguments), case.expected)
 
+    @covers_case_group("METADATA_INVALID_CASES", layers="F")
     def test_metadata_diagnostics(self) -> None:
-        cases = {
-            "Annotated[f32, marker]": "metadata must be a call",
-            "Annotated[f32, unknown()]": "unknown annotation metadata",
-            "Annotated[f32, location(0)]": "unknown annotation metadata",
-            "Annotated[f32, instance(location=0)]": "unknown annotation metadata",
-            "Annotated[f32, varying(1)]": "wrong number",
-            "Annotated[f32, attribute(divisor=-1)]": "integer or string",
-            "Annotated[f32, resource(**opts)]": r"\*\*kwargs",
-            "Annotated[f32, resource(set=1)]": "wrong number",
-            "Annotated[f32, builtin(value=0)]": "does not accept keyword",
-            "Annotated[f32, attribute('position')]": "location must be non-negative",
-            "Annotated[f32, attribute(0, 'instance')]": "divisor must be non-negative",
-        }
-        for source, message in cases.items():
-            with self.subTest(source=source):
-                with self.assertRaisesRegex(ValueError, message):
-                    self.parser.parse(expression(source))
+        for case in METADATA_INVALID_CASES:
+            assert case.expected_diagnostic is not None
+            with (
+                contract_oracle(case),
+                self.subTest(case=case.id),
+                self.assertRaisesRegex(ValueError, case.expected_diagnostic),
+            ):
+                self.parser.parse(expression(case.source))
 
 
 class TypeSolverCoverageTests(unittest.TestCase):
@@ -233,109 +199,15 @@ class TypeSolverCoverageTests(unittest.TestCase):
 
 
 class InferenceDiagnosticCoverageTests(unittest.TestCase):
-    def assert_compile_error(self, body: str, message: str) -> None:
-        with self.assertRaisesRegex(CompileError, message):
-            compile_source("from vernon_dsl import *\n" + body, "coverage_case.py")
-
+    @covers_case_group("INFERENCE_STATEMENT_INVALID_CASES", layers="F")
     def test_return_and_statement_diagnostics(self) -> None:
-        cases = (
-            (
-                "@func\ndef bad(value: f32) -> None:\n    return value\n"
-                "@fragment\ndef main(value: f32) -> f32:\n    bad(value)\n    return value\n",
-                "void function.*returns a value",
-            ),
-            (
-                "@func\ndef bad(value: f32) -> f32:\n    value + 1\n"
-                "@fragment\ndef main(value: f32) -> f32:\n    return bad(value)\n",
-                "requires a return value",
-            ),
-            (
-                "@func\ndef bad(value: f32) -> f32:\n    return\n"
-                "@fragment\ndef main(value: f32) -> f32:\n    return bad(value)\n",
-                "requires a return value",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    left, right = value\n    return value\n",
-                "assignment target",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    value[0] = 1\n    return value\n",
-                "writable Storage",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    result: i32 = value\n    return value\n",
-                "cannot infer assignment",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    value += True\n    return value\n",
-                "augmented assignment",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    result = [value]\n    return value\n",
-                "cannot infer expression syntax",
-            ),
-            (
-                "@fragment\ndef main(value: Vector[f32, 2], index: f32) -> f32:\n    return value[index]\n",
-                "index must be an integer",
-            ),
-        )
-        for body, message in cases:
-            with self.subTest(message=message):
-                self.assert_compile_error(body, message)
+        for case in INFERENCE_STATEMENT_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
+    @covers_case_group("INFERENCE_CALL_INVALID_CASES", layers="F")
     def test_call_diagnostics(self) -> None:
-        cases = (
-            (
-                "@func\ndef helper(value: f32) -> f32:\n    return value\n"
-                "@fragment\ndef main(value: f32) -> f32:\n    return helper()\n",
-                "expects 1 arguments",
-            ),
-            (
-                "@func\ndef helper(value: i32) -> i32:\n    return value\n"
-                "@fragment\ndef main(value: f32) -> i32:\n    return helper(value)\n",
-                "cannot pass",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return resolution(value)[0]\n",
-                "does not accept arguments",
-            ),
-            (
-                "@struct\nclass Pair:\n    x: f32\n    y: f32\n"
-                "@fragment\ndef main(value: f32) -> f32:\n    return Pair(value).x\n",
-                "constructor requires 2",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return Vector([])[0]\n",
-                "requires a non-empty sequence literal",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return Vector([value, True])[0]\n",
-                "elements have incompatible types",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return matmul(value)\n",
-                "matmul requires two",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return matmul(value, value)\n",
-                "left operand must be a non-scalar Tensor",
-            ),
-            (
-                "@fragment\ndef main(value: Matrix[f32, 2, 2]) -> f32:\n    return matmul(value, 1)\n",
-                "right operand must be a non-scalar Tensor",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return unknown(value)\n",
-                "cannot infer call",
-            ),
-            (
-                "@fragment\ndef main(value: f32) -> f32:\n    return vec2(value, value)[0]\n",
-                "cannot infer call to 'vec2'",
-            ),
-        )
-        for body, message in cases:
-            with self.subTest(message=message):
-                self.assert_compile_error(body, message)
+        for case in INFERENCE_CALL_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
 
 if __name__ == "__main__":

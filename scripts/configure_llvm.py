@@ -32,14 +32,19 @@ def host_architecture() -> tuple[str, str]:
         raise RuntimeError(f"unsupported host architecture {machine!r}; known values: {supported}") from error
 
 
-def cached_generator(build_dir: Path) -> str | None:
+def cached_cmake_value(build_dir: Path, name: str) -> str | None:
     cache = build_dir / "CMakeCache.txt"
     if not cache.is_file():
         return None
     for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.startswith("CMAKE_GENERATOR:INTERNAL="):
+        prefix = f"{name}:"
+        if line.startswith(prefix) and "=" in line:
             return line.partition("=")[2]
     return None
+
+
+def cached_generator(build_dir: Path) -> str | None:
+    return cached_cmake_value(build_dir, "CMAKE_GENERATOR")
 
 
 def default_generator(build_dir: Path) -> str:
@@ -68,6 +73,9 @@ def libdevice_candidates(repository_root: Path) -> list[Path]:
         / "nvvm"
         / "libdevice"
         / "libdevice.10.bc"
+    )
+    candidates.append(
+        repository_root / "build" / "nvidia-nvcc" / "nvidia" / "cuda_nvcc" / "nvvm" / "libdevice" / "libdevice.10.bc"
     )
 
     roots: list[Path] = []
@@ -177,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
 
     llvm_host_target, windows_platform = host_architecture()
     generator = args.generator or default_generator(build_dir)
+    cached_platform = cached_cmake_value(build_dir, "CMAKE_GENERATOR_PLATFORM")
+    cached_projects = cached_cmake_value(build_dir, "LLVM_ENABLE_PROJECTS")
+    enabled_projects = cached_projects or "mlir"
     libdevice = None if args.cuda == "off" else find_libdevice(REPOSITORY_ROOT, args.libdevice)
     if args.libdevice is not None and libdevice is None:
         raise FileNotFoundError(f"the requested libdevice file does not exist: {args.libdevice}")
@@ -210,12 +221,15 @@ def main(argv: list[str] | None = None) -> int:
         generator,
     ]
     if generator.startswith("Visual Studio"):
-        command.extend(["-A", windows_platform])
+        if cached_platform is None:
+            command.extend(["-A", windows_platform])
+        elif cached_platform:
+            command.extend(["-A", cached_platform])
     else:
         command.append("-DCMAKE_BUILD_TYPE=Release")
     command.extend(
         [
-            "-DLLVM_ENABLE_PROJECTS=mlir;lld",
+            f"-DLLVM_ENABLE_PROJECTS={enabled_projects}",
             f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
             "-DLLVM_ENABLE_ASSERTIONS=OFF",
             "-DLLVM_INCLUDE_TESTS=OFF",

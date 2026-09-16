@@ -69,6 +69,13 @@ def Vernon_IntrinsicOp : Vernon_Op<"intrinsic"> {
   let hasVerifier = 1;
 }
 
+def Vernon_GetShapeOp : Vernon_Op<"get_shape", [Pure]> {
+  let summary = "Read the ranked extents of a Tensor Value or TensorView";
+  let arguments = (ins AnyTypeOf<[AnyRankedTensor, Vernon_TensorType, Vernon_TensorViewType]>:$source);
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+}
+
 def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
   let summary = "Allocate a statically shaped workgroup TensorView";
   let results = (outs Vernon_TensorViewType:$result);
@@ -77,22 +84,51 @@ def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
 
 def Vernon_LoadOp : Vernon_Op<"load"> {
   let summary = "Load one element through a ranked TensorView index";
-  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices);
+  let arguments = (ins Vernon_TensorViewType:$storage,
+      Variadic<Index>:$indices);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def Vernon_StoreOp : Vernon_Op<"store"> {
   let summary = "Store one element through a ranked TensorView index";
-  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Variadic<Index>:$indices);
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+      Variadic<Index>:$indices);
   let hasVerifier = 1;
 }
 
 def Vernon_AtomicOp : Vernon_Op<"atomic"> {
   let summary = "Atomic read-modify-write with scope inferred from TensorView";
-  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices, AnyType:$value,
-                       StrAttr:$atomic_kind, StrAttr:$ordering);
+  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices,
+      AnyType:$value, StrAttr:$atomic_kind, StrAttr:$ordering);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_ReduceSumOp : Vernon_Op<"reduce_sum"> {
+  let summary = "Grid-independent sum accumulation contribution";
+  let description = [{
+    Adds one logical invocation's contribution to a destination element.
+    Target lowering selects an atomic add when available. Deterministic shared
+    accumulation requires a dedicated reduction implementation and otherwise
+    fails closed.
+  }];
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+      Variadic<Index>:$indices, BoolAttr:$deterministic);
+  let hasVerifier = 1;
+}
+
+def Vernon_ScatterAddOp : Vernon_Op<"scatter_add"> {
+  let summary = "Grid-independent indexed accumulation contribution";
+  let description = [{
+    Adds one logical invocation's contribution at the supplied destination
+    indices. `disjoint` is an optimization hint backed by grid-independent
+    injectivity evidence; when present, lowering may use a direct store instead
+    of a read-modify-write.
+  }];
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+      Variadic<Index>:$indices, BoolAttr:$deterministic,
+      OptionalAttr<UnitAttr>:$disjoint);
   let hasVerifier = 1;
 }
 
@@ -105,14 +141,15 @@ def Vernon_PhysicalLoadOp : Vernon_Op<"physical_load"> {
 
 def Vernon_PhysicalStoreOp : Vernon_Op<"physical_store"> {
   let summary = "Internal store after TensorView index projection";
-  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Index:$index);
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+      Index:$index);
   let hasVerifier = 1;
 }
 
 def Vernon_PhysicalAtomicOp : Vernon_Op<"physical_atomic"> {
   let summary = "Internal atomic after TensorView index projection";
-  let arguments = (ins Vernon_TensorViewType:$storage, Index:$index, AnyType:$value,
-                       StrAttr:$atomic_kind, StrAttr:$ordering);
+  let arguments = (ins Vernon_TensorViewType:$storage, Index:$index,
+      AnyType:$value, StrAttr:$atomic_kind, StrAttr:$ordering);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -121,6 +158,211 @@ def Vernon_BarrierOp : Vernon_Op<"barrier"> {
   let summary = "Memory and execution barrier";
   let arguments = (ins StrAttr:$ordering, StrAttr:$scope);
   let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Internal logical autodiff protocol
+//===----------------------------------------------------------------------===//
+
+def Vernon_AdCaptureYieldOp
+    : Vernon_Op<"ad.capture_yield", [Terminator, HasParent<"AdCaptureOp">]> {
+  let summary = "Yield the successfully captured invocation handles";
+  let arguments = (ins Vernon_AdTapeType:$tape,
+      Vernon_AdRegionHeaderType:$root_region);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdCaptureOp
+    : Vernon_Op<
+          "ad.capture", [SingleBlockImplicitTerminator<"AdCaptureYieldOp">,
+                         RecursiveMemoryEffects]> {
+  let summary = "Capture one side-effect-free autodiff invocation";
+  let description = [{
+    Executes an augmented-forward capture transaction. The body may reserve and
+    write logical tape records but may not perform externally visible writes.
+    The results return the invocation tape, its root region, and the logical
+    capture outcome: success, exact required byte count, and arithmetic
+    overflow. Physical capacity and backend status representation are not part
+    of this operation.
+  }];
+  let results = (outs Vernon_AdTapeType:$tape,
+      Vernon_AdRegionHeaderType:$root_region, I1:$success,
+      Index:$required_bytes, I1:$overflow);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdCommitYieldOp
+    : Vernon_Op<"ad.commit_yield", [Terminator, HasParent<"AdCommitOp">]> {
+  let summary = "Terminate an autodiff commit transaction";
+}
+
+def Vernon_AdCommitOp
+    : Vernon_Op<"ad.commit", [SingleBlockImplicitTerminator<"AdCommitYieldOp">,
+                              RecursiveMemoryEffects]> {
+  let summary = "Conditionally commit visible effects after successful capture";
+  let description = [{
+    Executes the body only when capture_success is true. The tape and success
+    value must be results of the same dominating ad.capture operation.
+  }];
+  let arguments = (ins Vernon_AdTapeType:$tape, I1:$capture_success);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdBeginInvocationOp : Vernon_Op<"ad.begin_invocation"> {
+  let summary = "Create the tape owned by the enclosing capture invocation";
+  let results = (outs Vernon_AdTapeType:$tape);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdBeginRegionOp : Vernon_Op<"ad.begin_region"> {
+  let summary = "Begin a checked dynamic region in an invocation tape";
+  let description = [{
+    A root region has an empty parent_link and no child_ordinal. A nested region
+    has exactly two parent_link operands: its parent region and the checked
+    parent record offset returned by ad.reserve_record, together with a
+    non-negative child_ordinal. This keeps nested identity logical and
+    backend-neutral.
+  }];
+  let arguments = (ins Vernon_AdTapeType:$tape, Variadic<AnyType>:$parent_link,
+      OptionalAttr<I64Attr>:$child_ordinal);
+  let results = (outs Vernon_AdRegionHeaderType:$region);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReserveRecordOp : Vernon_Op<"ad.reserve_record"> {
+  let summary =
+      "Reserve one statically described record with checked arithmetic";
+  let description = [{
+    Reserves record_size bytes at record_alignment in the region. Required-byte
+    accounting, alignment, and offset addition are checked and fail closed into
+    the enclosing capture outcome.
+  }];
+  let arguments = (ins Vernon_AdRegionHeaderType:$region, I64Attr:$record_size,
+      I64Attr:$record_alignment);
+  let results = (outs Index:$record_offset);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdCheckedIncrementOp : Vernon_Op<"ad.checked_increment"> {
+  let summary = "Increment a dynamic execution counter with checked arithmetic";
+  let description = [{
+    Adds one to a non-negative index counter. Overflow fails the enclosing
+    capture transaction instead of wrapping. Backend lowerings own the physical
+    failure representation.
+  }];
+  let arguments = (ins Index:$counter);
+  let results = (outs Index:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdWriteLeafOp : Vernon_Op<"ad.write_leaf"> {
+  let summary = "Write one canonical ABI leaf into a checked record";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region, Index:$record_offset,
+      AnyType:$value, I64Attr:$leaf_offset);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdEndRegionOp : Vernon_Op<"ad.end_region"> {
+  let summary = "Finalize a dynamic region header";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region, Index:$executed_count,
+      I32:$exit_kind);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReadRecordOffsetOp : Vernon_Op<"ad.read_record_offset", [Pure]> {
+  let summary = "Read the checked record offset from a region header";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region);
+  let results = (outs Index:$record_offset);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReadExecutedCountOp : Vernon_Op<"ad.read_executed_count", [Pure]> {
+  let summary = "Read the actual execution count from a region header";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region);
+  let results = (outs Index:$executed_count);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReadExitKindOp : Vernon_Op<"ad.read_exit_kind", [Pure]> {
+  let summary = "Read the dynamic exit kind from a region header";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region);
+  let results = (outs I32:$exit_kind);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReadNestedRegionOp : Vernon_Op<"ad.read_nested_region", [Pure]> {
+  let summary =
+      "Read a nested-region handle by parent record and child ordinal";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region, Index:$record_index,
+      I64Attr:$child_ordinal);
+  let results = (outs Vernon_AdRegionHeaderType:$nested_region);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdReadLeafOp : Vernon_Op<"ad.read_leaf", [Pure]> {
+  let summary =
+      "Read one typed canonical ABI leaf from a checked record layout";
+  let arguments = (ins Vernon_AdRegionHeaderType:$region, Index:$record_index,
+      I64Attr:$record_size, I64Attr:$record_alignment, I64Attr:$leaf_offset);
+  let results = (outs AnyType:$value);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointBufferCreateOp : Vernon_Op<"ad.adjoint_buffer.create"> {
+  let summary = "Create zeroed Storage adjoint state with explicit ownership";
+  let arguments = (ins Optional<Vernon_TensorViewType>:$shape_source,
+      OptionalAttr<StrAttr>:$ownership);
+  let results = (outs Vernon_AdAdjointBufferType:$buffer);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointScatterAddOp : Vernon_Op<"ad.adjoint_buffer.scatter_add"> {
+  let summary = "Accumulate one element cotangent into local Storage adjoint state";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer, AnyType:$value,
+      Variadic<Index>:$indices);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointAccumulateDenseOp : Vernon_Op<"ad.adjoint_buffer.accumulate_dense"> {
+  let summary = "Accumulate a dense ABI cotangent into local Storage adjoint state";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer, AnyType:$value);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointTakeAndClearOp : Vernon_Op<"ad.adjoint_buffer.take_and_clear"> {
+  let summary = "Read and clear one overwritten element cotangent";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer, Variadic<Index>:$indices);
+  let results = (outs AnyType:$value);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointPeekOp : Vernon_Op<"ad.adjoint_buffer.peek"> {
+  let summary = "Read one additive element cotangent without clearing it";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer, Variadic<Index>:$indices);
+  let results = (outs AnyType:$value);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointStoreOp : Vernon_Op<"ad.adjoint_buffer.store"> {
+  let summary = "Store one local Storage adjoint through a writable TensorView ABI argument";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer,
+      Vernon_TensorViewType:$destination);
+  let hasVerifier = 1;
+}
+
+def Vernon_CpuAdCallbackOp : Vernon_Op<"cpu_ad.callback"> {
+  let summary = "Invoke one typed semantic CPU autodiff tape callback";
+  let arguments = (ins Index:$descriptor, I32Attr:$callback,
+      Variadic<AnyType>:$arguments);
+  let results = (outs Variadic<AnyType>:$results);
+}
+
+def Vernon_CpuAdRequiredBytesOp : Vernon_Op<"cpu_ad.required_bytes", [Pure]> {
+  let summary = "Read the exact required-byte count from the CPU tape descriptor";
+  let arguments = (ins Index:$descriptor);
+  let results = (outs Index:$required_bytes);
 }
 
 #endif // VERNON_OPS

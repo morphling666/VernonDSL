@@ -6,15 +6,19 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -113,17 +117,12 @@ LogicalResult SwizzleOp::verify() {
 LogicalResult IntrinsicOp::verify() {
     if (getNameAttr().getValue().empty())
         return emitOpError("requires a non-empty intrinsic name");
-    if (getName() != "texture_sample" && getName() != "texture_size")
+    if (getName() != "texture_sample" && getName() != "texture_size" && getName() != "texture_load" &&
+        getName() != "texture_store")
         return success();
 
-    if (getNumResults() != 1)
-        return emitOpError() << getName() << " requires exactly one result";
     if (getNumOperands() == 0)
         return emitOpError() << getName() << " requires a texture operand";
-
-    auto texture = dyn_cast<TextureType>(getOperand(0).getType());
-    if (!texture)
-        return emitOpError() << getName() << " operand #0 must be a Vernon texture";
 
     auto shapedWidthAndElement = [](Type type) -> std::optional<std::pair<int64_t, Type>> {
         if (auto tensor = dyn_cast<RankedTensorType>(type)) {
@@ -138,6 +137,35 @@ LogicalResult IntrinsicOp::verify() {
         }
         return std::nullopt;
     };
+
+    if (getName() == "texture_load" || getName() == "texture_store") {
+        auto texture = dyn_cast<TextureType>(getOperand(0).getType());
+        if (!texture || texture.getAccess() == "sampled")
+            return emitOpError() << getName() << " operand #0 must be a Vernon storage Texture";
+        const bool load = getName() == "texture_load";
+        if ((load && texture.getAccess() == "write") || (!load && texture.getAccess() == "read"))
+            return emitOpError() << getName() << " is incompatible with " << texture.getAccess() << " access";
+        if (getNumOperands() != (load ? 2u : 3u) || getNumResults() != (load ? 1u : 0u))
+            return emitOpError() << getName() << " has an invalid operand or result count";
+        const int64_t rank = texture.getDimension() == "3d" ? 3 : 2;
+        auto coordinates = shapedWidthAndElement(getOperand(1).getType());
+        if (!coordinates || coordinates->first != rank || !coordinates->second.isSignlessInteger(32))
+            return emitOpError() << getName() << " coordinates must be a " << rank << "-component i32 vector";
+        Type texelType = load ? getResult().getType() : getOperand(2).getType();
+        auto texel = shapedWidthAndElement(texelType);
+        if (!texel || texel->first != 4 || texel->second != texture.getElementType())
+            return emitOpError() << getName() << " texel must be a 4-component " << texture.getElementType()
+                                 << " vector";
+        return success();
+    }
+
+    if (getNumResults() != 1)
+        return emitOpError() << getName() << " requires exactly one result";
+    auto texture = dyn_cast<TextureType>(getOperand(0).getType());
+    if (!texture)
+        return emitOpError() << getName() << " operand #0 must be a Vernon texture";
+    if (texture.getAccess() != "sampled")
+        return emitOpError() << getName() << " requires a sampled Texture";
 
     if (getName() == "texture_size") {
         if (getNumOperands() < 1 || getNumOperands() > 2)
@@ -176,14 +204,36 @@ LogicalResult IntrinsicOp::verify() {
     return success();
 }
 
+LogicalResult GetShapeOp::verify() {
+    Type sourceType = getSource().getType();
+    int64_t rank = -1;
+    if (auto tensor = dyn_cast<RankedTensorType>(sourceType))
+        rank = tensor.getRank();
+    else if (auto tensor = dyn_cast<TensorType>(sourceType))
+        rank = static_cast<int64_t>(tensor.getShape().size());
+    else if (auto view = dyn_cast<TensorViewType>(sourceType))
+        rank = static_cast<int64_t>(view.getShape().size());
+    else
+        return emitOpError("source must be a ranked tensor, !vernon.tensor, or TensorView");
+
+    if (rank < 1)
+        return emitOpError("get_shape requires rank >= 1");
+
+    auto result = dyn_cast<RankedTensorType>(getResult().getType());
+    if (!result || result.getRank() != 1 || result.isDynamicDim(0) || result.getDimSize(0) != rank ||
+        !result.getElementType().isSignlessInteger(32))
+        return emitOpError() << "result must be tensor<" << rank << "xi32>";
+    return success();
+}
+
 LogicalResult WorkgroupAllocOp::verify() {
     TensorViewType type = getResult().getType();
     if (type.getAddressSpace() != "workgroup")
         return emitOpError("result must use the workgroup address space");
     if (type.getAccess() != "read_write")
         return emitOpError("result must be a read_write TensorView");
-    if (type.getShape().empty() || llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
-        return emitOpError("requires a positive static shape");
+    if (llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
+        return emitOpError("requires positive static dimensions");
     ModuleOp module = (*this)->getParentOfType<ModuleOp>();
     if (!module)
         return emitOpError("must be nested in a module");
@@ -219,6 +269,26 @@ LogicalResult StoreOp::verify() {
                                                          : emitOpError("value type must match the element type");
 }
 
+static bool isFloatingAtomicAddPayload(Type type) {
+    if (type.isF16() || type.isF32() || type.isF64())
+        return true;
+    auto shaped = dyn_cast<ShapedType>(type);
+    return shaped && shaped.hasStaticShape() && isFloatingAtomicAddPayload(shaped.getElementType());
+}
+
+static LogicalResult verifyAtomicPayload(Operation *operation, TensorViewType view, Type valueType, Type resultType,
+                                         StringRef kind) {
+    Type elementType = view.getElementType();
+    if (valueType != elementType || resultType != elementType)
+        return operation->emitOpError("value and result types must match the TensorView element type");
+    if (kind == "add" && (elementType.isSignlessInteger(32) || isFloatingAtomicAddPayload(elementType)))
+        return success();
+    if (kind != "add" && elementType.isSignlessInteger(32))
+        return success();
+    return operation->emitOpError(
+        "requires matching i32 types, or f16/f32/f64 scalar or statically shaped tensor types for atomic add");
+}
+
 LogicalResult AtomicOp::verify() {
     auto view = dyn_cast<TensorViewType>(getStorage().getType());
     if (!view)
@@ -229,16 +299,45 @@ LogicalResult AtomicOp::verify() {
         return emitOpError("requires device or workgroup TensorView storage");
     if (getIndices().size() != view.getShape().size())
         return emitOpError("requires one index per TensorView dimension");
-    Type elementType = view.getElementType();
-    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
-        getResult().getType() != elementType)
-        return emitOpError("requires matching 32-bit integer value and result types");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
+    return verifyAtomicPayload(getOperation(), view, getValue().getType(), getResult().getType(), getAtomicKind());
+}
+
+static LogicalResult verifyAccumulationContribution(Operation *operation, Value value, Value storage,
+                                                    ValueRange indices) {
+    auto view = dyn_cast<TensorViewType>(storage.getType());
+    if (!view)
+        return operation->emitOpError("storage must be a TensorView");
+    if (view.getAccess() == "read")
+        return operation->emitOpError("requires writable TensorView storage");
+    if (view.getAddressSpace() != "device")
+        return operation->emitOpError("requires device TensorView storage");
+    if (indices.size() != view.getShape().size())
+        return operation->emitOpError("requires one index per TensorView dimension");
+    Type elementType = view.getElementType();
+    Type scalarType = elementType;
+    if (auto shaped = dyn_cast<ShapedType>(elementType)) {
+        if (!shaped.hasStaticShape())
+            return operation->emitOpError("requires statically shaped gradient elements");
+        scalarType = shaped.getElementType();
+    }
+    if (!scalarType.isF16() && !scalarType.isF32() && !scalarType.isF64())
+        return operation->emitOpError("requires floating scalar or tensor gradient storage");
+    if (value.getType() != elementType)
+        return operation->emitOpError("contribution type must match the storage element type");
     return success();
+}
+
+LogicalResult ReduceSumOp::verify() {
+    return verifyAccumulationContribution(getOperation(), getValue(), getStorage(), getIndices());
+}
+
+LogicalResult ScatterAddOp::verify() {
+    return verifyAccumulationContribution(getOperation(), getValue(), getStorage(), getIndices());
 }
 
 LogicalResult PhysicalLoadOp::verify() {
@@ -269,16 +368,12 @@ LogicalResult PhysicalAtomicOp::verify() {
         return emitOpError("requires writable TensorView storage");
     if (view.getAddressSpace() != "device" && view.getAddressSpace() != "workgroup")
         return emitOpError("requires device or workgroup TensorView storage");
-    Type elementType = view.getElementType();
-    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
-        getResult().getType() != elementType)
-        return emitOpError("requires matching 32-bit integer value and result types");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
-    return success();
+    return verifyAtomicPayload(getOperation(), view, getValue().getType(), getResult().getType(), getAtomicKind());
 }
 
 LogicalResult BarrierOp::verify() {
@@ -288,4 +383,463 @@ LogicalResult BarrierOp::verify() {
     if (getScope() != "workgroup" && getScope() != "device")
         return emitOpError("barrier scope must be workgroup or device");
     return success();
+}
+
+namespace {
+
+AdCaptureOp enclosingCapture(Operation *operation) { return operation->getParentOfType<AdCaptureOp>(); }
+
+bool isInsideCommit(Operation *operation) { return static_cast<bool>(operation->getParentOfType<AdCommitOp>()); }
+
+LogicalResult verifyCaptureMutation(Operation *operation) {
+    if (!enclosingCapture(operation))
+        return operation->emitOpError("is only legal inside vernon.ad.capture");
+    if (isInsideCommit(operation))
+        return operation->emitOpError("cannot be nested in vernon.ad.commit");
+    return success();
+}
+
+LogicalResult verifyReverseRead(Operation *operation, Value region) {
+    if (enclosingCapture(operation) || isInsideCommit(operation))
+        return operation->emitOpError("is only legal in the reverse read phase outside capture and commit");
+    if (Operation *definition = region.getDefiningOp()) {
+        if (!isa<AdCaptureOp, AdReadNestedRegionOp>(definition))
+            return operation->emitOpError("requires a finalized capture or nested-region handle");
+    } else if (!isa<BlockArgument>(region)) {
+        return operation->emitOpError("requires a region block argument or finalized region handle");
+    }
+    return success();
+}
+
+bool isPowerOfTwo(int64_t value) {
+    return value > 0 && (static_cast<uint64_t>(value) & (static_cast<uint64_t>(value) - 1)) == 0;
+}
+
+struct CanonicalLeafLayout {
+    int64_t size;
+    int64_t alignment;
+};
+
+std::optional<CanonicalLeafLayout> getCanonicalLeafLayout(Operation *operation, Type type) {
+    ModuleOp module = operation->getParentOfType<ModuleOp>();
+    if (!module)
+        return std::nullopt;
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
+    if (failed(layout) || !layout->tree.root || layout->tree.root->kind != CanonicalAbiNodeKind::Scalar ||
+        layout->leaves.size() != 1 || layout->leaves.front().scalarCount != 1 ||
+        layout->size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        layout->alignment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        return std::nullopt;
+    return CanonicalLeafLayout{static_cast<int64_t>(layout->size), static_cast<int64_t>(layout->alignment)};
+}
+
+LogicalResult verifyRecordLayout(Operation *operation, int64_t recordSize, int64_t recordAlignment) {
+    if (recordSize <= 0)
+        return operation->emitOpError("requires a positive record_size");
+    if (!isPowerOfTwo(recordAlignment))
+        return operation->emitOpError("requires record_alignment to be a positive power of two");
+    if (recordSize % recordAlignment != 0)
+        return operation->emitOpError("requires record_size to be a multiple of record_alignment");
+    return success();
+}
+
+LogicalResult verifyLeafLayout(Operation *operation, Type leafType, int64_t recordSize, int64_t recordAlignment,
+                               int64_t leafOffset) {
+    if (failed(verifyRecordLayout(operation, recordSize, recordAlignment)))
+        return failure();
+    std::optional<CanonicalLeafLayout> leaf = getCanonicalLeafLayout(operation, leafType);
+    if (!leaf)
+        return operation->emitOpError("requires a canonical scalar ABI leaf type (i1, i32, f16, f32, or f64)");
+    if (recordAlignment < leaf->alignment)
+        return operation->emitOpError("record_alignment is smaller than the canonical leaf alignment");
+    if (leafOffset < 0 || leafOffset % leaf->alignment != 0)
+        return operation->emitOpError("leaf_offset is negative or violates canonical leaf alignment");
+    if (leafOffset > recordSize || leaf->size > recordSize - leafOffset)
+        return operation->emitOpError("canonical leaf extends beyond the checked record layout");
+    return success();
+}
+
+bool isLogicalAdCaptureOperation(Operation *operation) {
+    return isa<AdCaptureYieldOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp, AdCheckedIncrementOp,
+               AdWriteLeafOp, AdEndRegionOp>(operation);
+}
+
+bool isAllowedCaptureOperation(Operation *operation) {
+    if (isLogicalAdCaptureOperation(operation))
+        return true;
+    if (operation->getNumRegions() != 0) {
+        if (!operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+            return false;
+        auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+        if (!effects)
+            return true;
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        return llvm::all_of(instances, [](const MemoryEffects::EffectInstance &effect) {
+            return isa<MemoryEffects::Read, MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect());
+        });
+    }
+    if (isMemoryEffectFree(operation))
+        return true;
+    if (isa<IntrinsicOp>(operation) && operation->getNumResults() == 1)
+        return true;
+    if (isa<LoadOp, PhysicalLoadOp, WorkgroupAllocOp>(operation))
+        return true;
+    if (isa<StoreOp, PhysicalStoreOp, ReduceSumOp, ScatterAddOp>(operation))
+        return operation->hasAttrOfType<UnitAttr>("vernon.ad.functionalized");
+    if (auto atomic = dyn_cast<AtomicOp>(operation))
+        return atomic.getStorage().getType().getAddressSpace() != "device" ||
+               operation->hasAttrOfType<UnitAttr>("vernon.ad.functionalized");
+    if (auto atomic = dyn_cast<PhysicalAtomicOp>(operation))
+        return atomic.getStorage().getType().getAddressSpace() != "device";
+    if (auto barrier = dyn_cast<BarrierOp>(operation))
+        return barrier.getScope() == "workgroup";
+
+    auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+    if (!effects)
+        return false;
+    SmallVector<MemoryEffects::EffectInstance> instances;
+    effects.getEffects(instances);
+    return llvm::all_of(instances, [](const MemoryEffects::EffectInstance &effect) {
+        return isa<MemoryEffects::Read, MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect());
+    });
+}
+
+Operation *getAncestorInBlock(Operation *operation, Block *block) {
+    while (operation && operation->getBlock() != block)
+        operation = operation->getParentOp();
+    return operation;
+}
+
+LogicalResult verifyRegionHandle(AdBeginRegionOp begin) {
+    AdCaptureOp capture = enclosingCapture(begin);
+    unsigned endCount = 0;
+    AdEndRegionOp end;
+    for (Operation *user : begin.getRegion().getUsers()) {
+        if (auto candidate = dyn_cast<AdEndRegionOp>(user)) {
+            ++endCount;
+            end = candidate;
+        } else if (!isa<AdReserveRecordOp, AdWriteLeafOp, AdBeginRegionOp, AdCaptureYieldOp, AdReadRecordOffsetOp,
+                        AdReadExecutedCountOp, AdReadExitKindOp, AdReadNestedRegionOp, AdReadLeafOp>(user)) {
+            return begin.emitOpError() << "region handle has illegal capture-phase user " << user->getName();
+        }
+        if (enclosingCapture(user) != capture)
+            return begin.emitOpError("region handle escapes its owning capture");
+    }
+    if (endCount != 1)
+        return begin.emitOpError() << "region handle must be finalized exactly once; found " << endCount
+                                   << " vernon.ad.end_region users";
+    if (begin->getBlock() != end->getBlock())
+        return begin.emitOpError("region begin and end must be in the same structured block");
+
+    for (Operation *user : begin.getRegion().getUsers()) {
+        if (user == end.getOperation() || isa<AdCaptureYieldOp>(user))
+            continue;
+        Operation *ancestor = getAncestorInBlock(user, end->getBlock());
+        if (!ancestor)
+            return user->emitOpError("uses a region handle outside its structured lifetime block");
+        if (end->isBeforeInBlock(ancestor))
+            return user->emitOpError("uses a region handle after vernon.ad.end_region");
+    }
+    return success();
+}
+
+} // namespace
+
+LogicalResult AdCaptureYieldOp::verify() {
+    auto capture = cast<AdCaptureOp>((*this)->getParentOp());
+    auto invocation = getTape().getDefiningOp<AdBeginInvocationOp>();
+    auto root = getRootRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!invocation || enclosingCapture(invocation) != capture)
+        return emitOpError("tape must be produced by the enclosing capture's begin_invocation");
+    if (!root || enclosingCapture(root) != capture)
+        return emitOpError("root_region must be produced by the enclosing capture's begin_region");
+    if (root.getTape() != getTape() || !root.getParentLink().empty() || root.getChildOrdinalAttr())
+        return emitOpError("must yield the parentless root region owned by the yielded tape");
+    return success();
+}
+
+LogicalResult AdCaptureOp::verify() {
+    if ((*this)->getParentOfType<AdCaptureOp>() || (*this)->getParentOfType<AdCommitOp>())
+        return emitOpError("cannot be nested in another capture or commit transaction");
+    if (!getBody().hasOneBlock())
+        return emitOpError("requires exactly one body block");
+
+    unsigned invocationCount = 0;
+    unsigned rootCount = 0;
+    WalkResult result = getBody().walk([&](Operation *operation) {
+        if (operation == getOperation())
+            return WalkResult::advance();
+        if (isa<AdCaptureOp, AdCommitOp>(operation)) {
+            operation->emitOpError("cannot nest a capture or commit transaction inside capture");
+            return WalkResult::interrupt();
+        }
+        if (isa<AdBeginInvocationOp>(operation))
+            ++invocationCount;
+        if (auto begin = dyn_cast<AdBeginRegionOp>(operation); begin && begin.getParentLink().empty())
+            ++rootCount;
+        if (!isAllowedCaptureOperation(operation)) {
+            operation->emitOpError(
+                "has unclassified or externally visible effects and is illegal during autodiff capture");
+            return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+        return failure();
+    if (invocationCount != 1)
+        return emitOpError() << "requires exactly one ad.begin_invocation; found " << invocationCount;
+    if (rootCount != 1)
+        return emitOpError() << "requires exactly one parentless root region; found " << rootCount;
+    return success();
+}
+
+LogicalResult AdCommitOp::verify() {
+    if ((*this)->getParentOfType<AdCaptureOp>() || (*this)->getParentOfType<AdCommitOp>())
+        return emitOpError("cannot be nested in another capture or commit transaction");
+    if (!getBody().hasOneBlock())
+        return emitOpError("requires exactly one body block");
+    auto capture = getTape().getDefiningOp<AdCaptureOp>();
+    if (!capture || getTape() != capture.getTape() || getCaptureSuccess() != capture.getSuccess())
+        return emitOpError("tape and capture_success must be paired results of the same capture");
+    return success();
+}
+
+LogicalResult AdBeginInvocationOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    AdCaptureOp capture = enclosingCapture(*this);
+    unsigned count = 0;
+    capture.getBody().walk([&](AdBeginInvocationOp) { ++count; });
+    if (count != 1)
+        return emitOpError("the enclosing capture must have exactly one invocation owner");
+    for (Operation *user : getTape().getUsers()) {
+        if (!isa<AdBeginRegionOp, AdCaptureYieldOp>(user) || enclosingCapture(user) != capture)
+            return emitOpError() << "invocation tape has illegal or escaping user " << user->getName();
+    }
+    return success();
+}
+
+static bool areMutuallyExclusiveBranchOperations(Operation *left, Operation *right) {
+    auto contains = [](Region &region, Operation *operation) {
+        Region *owner = operation->getParentRegion();
+        return owner == &region || region.isAncestor(owner);
+    };
+    for (Operation *ancestor = left->getParentOp(); ancestor; ancestor = ancestor->getParentOp()) {
+        auto conditional = dyn_cast<scf::IfOp>(ancestor);
+        if (!conditional || conditional.getElseRegion().empty())
+            continue;
+        const bool leftThen = contains(conditional.getThenRegion(), left);
+        const bool leftElse = contains(conditional.getElseRegion(), left);
+        const bool rightThen = contains(conditional.getThenRegion(), right);
+        const bool rightElse = contains(conditional.getElseRegion(), right);
+        if ((leftThen && rightElse) || (leftElse && rightThen))
+            return true;
+    }
+    return false;
+}
+
+LogicalResult AdBeginRegionOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto invocation = getTape().getDefiningOp<AdBeginInvocationOp>();
+    if (!invocation || enclosingCapture(invocation) != enclosingCapture(*this))
+        return emitOpError("tape must come from the enclosing capture's begin_invocation");
+
+    ValueRange link = getParentLink();
+    if (link.empty()) {
+        if (getChildOrdinalAttr())
+            return emitOpError("root region must not define child_ordinal");
+    } else {
+        if (link.size() != 2 || !isa<AdRegionHeaderType>(link[0].getType()) || !link[1].getType().isIndex())
+            return emitOpError("nested region parent_link must contain parent region and parent record offset");
+        auto parent = link[0].getDefiningOp<AdBeginRegionOp>();
+        auto reservation = link[1].getDefiningOp<AdReserveRecordOp>();
+        if (!parent || !reservation || reservation.getRegion() != link[0])
+            return emitOpError("nested region requires a checked parent record from its direct parent region");
+        if (parent.getTape() != getTape() || enclosingCapture(parent) != enclosingCapture(*this))
+            return emitOpError("nested region and parent must have the same invocation owner");
+        if (!getChildOrdinalAttr() || getChildOrdinalAttr().getInt() < 0)
+            return emitOpError("nested region requires a non-negative child_ordinal");
+        for (Operation *user : parent.getRegion().getUsers()) {
+            auto sibling = dyn_cast<AdBeginRegionOp>(user);
+            if (!sibling || sibling == *this || sibling.getParentLink().size() != 2)
+                continue;
+            if (sibling.getParentLink()[1] == link[1] && sibling.getChildOrdinalAttr() &&
+                sibling.getChildOrdinalAttr().getInt() == getChildOrdinalAttr().getInt() &&
+                !areMutuallyExclusiveBranchOperations(*this, sibling))
+                return emitOpError("duplicates a child_ordinal in the same parent record");
+        }
+    }
+    return verifyRegionHandle(*this);
+}
+
+LogicalResult AdReserveRecordOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto begin = getRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!begin || enclosingCapture(begin) != enclosingCapture(*this))
+        return emitOpError("region must be owned by the enclosing capture");
+    return verifyRecordLayout(getOperation(), getRecordSizeAttr().getInt(), getRecordAlignmentAttr().getInt());
+}
+
+LogicalResult AdCheckedIncrementOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    APInt constant;
+    if (matchPattern(getCounter(), m_ConstantInt(&constant))) {
+        if (constant.isNegative())
+            return emitOpError("counter must not be negative");
+        if (constant.isMaxSignedValue())
+            return emitOpError("constant counter increment overflows index representation");
+    }
+    return success();
+}
+
+LogicalResult AdWriteLeafOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto reservation = getRecordOffset().getDefiningOp<AdReserveRecordOp>();
+    if (!reservation || reservation.getRegion() != getRegion())
+        return emitOpError("record_offset must come directly from checked ad.reserve_record for this region");
+    if (enclosingCapture(reservation) != enclosingCapture(*this))
+        return emitOpError("record reservation belongs to a different capture invocation");
+    return verifyLeafLayout(getOperation(), getValue().getType(), reservation.getRecordSizeAttr().getInt(),
+                            reservation.getRecordAlignmentAttr().getInt(), getLeafOffsetAttr().getInt());
+}
+
+LogicalResult AdEndRegionOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto begin = getRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!begin || enclosingCapture(begin) != enclosingCapture(*this))
+        return emitOpError("region must be owned by the enclosing capture");
+    APInt constant;
+    if (matchPattern(getExecutedCount(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("executed_count must not be negative");
+    if (matchPattern(getExitKind(), m_ConstantInt(&constant)) &&
+        (constant.getSExtValue() < 0 || constant.getSExtValue() > 3))
+        return emitOpError("exit_kind must be fallthrough(0), break(1), continue(2), or return(3)");
+
+    if (!begin.getParentLink().empty()) {
+        auto parent = begin.getParentLink()[0].getDefiningOp<AdBeginRegionOp>();
+        AdEndRegionOp parentEnd;
+        for (Operation *user : parent.getRegion().getUsers())
+            if (auto candidate = dyn_cast<AdEndRegionOp>(user))
+                parentEnd = candidate;
+        if (parentEnd && parentEnd->getBlock() == getOperation()->getBlock() &&
+            parentEnd->isBeforeInBlock(getOperation()))
+            return emitOpError("nested region must be finalized before its parent region");
+    }
+    return success();
+}
+
+LogicalResult AdReadRecordOffsetOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadExecutedCountOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadExitKindOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadNestedRegionOp::verify() {
+    if (failed(verifyReverseRead(getOperation(), getRegion())))
+        return failure();
+    if (getChildOrdinalAttr().getInt() < 0)
+        return emitOpError("requires a non-negative child_ordinal");
+    APInt constant;
+    if (matchPattern(getRecordIndex(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("record_index must not be negative");
+    return success();
+}
+
+LogicalResult AdReadLeafOp::verify() {
+    if (failed(verifyReverseRead(getOperation(), getRegion())))
+        return failure();
+    APInt constant;
+    if (matchPattern(getRecordIndex(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("record_index must not be negative");
+    return verifyLeafLayout(getOperation(), getValue().getType(), getRecordSizeAttr().getInt(),
+                            getRecordAlignmentAttr().getInt(), getLeafOffsetAttr().getInt());
+}
+
+static Type getAdjointBufferValueType(AdAdjointBufferType buffer) {
+    ArrayRef<int64_t> trailing = buffer.getShape().drop_front(buffer.getIndexRank());
+    return trailing.empty() ? buffer.getElementType()
+                            : static_cast<Type>(RankedTensorType::get(trailing, buffer.getElementType()));
+}
+
+static LogicalResult verifyAdjointBufferIndexing(Operation *operation, AdAdjointBufferType buffer, ValueRange indices) {
+    if (indices.size() != buffer.getIndexRank())
+        return operation->emitOpError("index count must match the adjoint buffer index rank");
+    return success();
+}
+
+LogicalResult AdAdjointBufferCreateOp::verify() {
+    StringRef ownership = getOwnershipAttr() ? getOwnershipAttr().getValue() : "lane_private";
+    if (ownership != "lane_private" && ownership != "workgroup_shared")
+        return emitOpError("ownership must be 'lane_private' or 'workgroup_shared'");
+    AdAdjointBufferType buffer = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (Value shapeSource = getShapeSource()) {
+        TensorViewType source = cast<TensorViewType>(shapeSource.getType());
+        if (source.getShape().size() != buffer.getIndexRank() ||
+            !llvm::equal(source.getShape(), buffer.getShape().take_front(buffer.getIndexRank())))
+            return emitOpError("shape source must match the indexed adjoint buffer shape");
+    } else if (llvm::is_contained(buffer.getShape(), int64_t{-1})) {
+        return emitOpError("dynamic adjoint buffer requires a shape source");
+    }
+    return success();
+}
+
+LogicalResult AdAdjointScatterAddOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("contribution type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointAccumulateDenseOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (auto view = dyn_cast<TensorViewType>(getValue().getType())) {
+        if (view.getShape().size() != type.getIndexRank() ||
+            !llvm::equal(view.getShape(), type.getShape().take_front(type.getIndexRank())) ||
+            view.getElementType() != getAdjointBufferValueType(type))
+            return emitOpError("TensorView contribution must match the adjoint buffer shape and element");
+        return success();
+    }
+    Type expected = RankedTensorType::get(type.getShape(), type.getElementType());
+    return getValue().getType() == expected ? success()
+                                            : emitOpError("dense contribution must match the complete adjoint buffer");
+}
+
+LogicalResult AdAdjointTakeAndClearOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("result type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointPeekOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("result type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointStoreOp::verify() {
+    AdAdjointBufferType buffer = cast<AdAdjointBufferType>(getBuffer().getType());
+    TensorViewType destination = getDestination().getType();
+    if (destination.getAccess() == "read")
+        return emitOpError("destination must be writable");
+    if (destination.getShape().size() != buffer.getIndexRank() ||
+        !llvm::equal(destination.getShape(), buffer.getShape().take_front(buffer.getIndexRank())))
+        return emitOpError("destination shape must match the adjoint buffer indexed shape");
+    Type expectedElement = getAdjointBufferValueType(buffer);
+    return destination.getElementType() == expectedElement
+               ? success()
+               : emitOpError("destination element type must match the adjoint buffer element");
 }

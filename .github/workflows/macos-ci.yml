@@ -27,8 +27,6 @@ jobs:
     name: Build and test
     runs-on: macos-15
     timeout-minutes: 240
-    env:
-      MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
 
     steps:
       - name: Check out code
@@ -66,10 +64,10 @@ jobs:
 
       - name: Restore LLVM installation
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-v1
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Build and install LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -77,9 +75,16 @@ jobs:
           python scripts/configure_llvm.py
           --generator Ninja
           --cuda off
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
@@ -90,7 +95,6 @@ jobs:
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DMLIR_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir"
-          -DLLD_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld"
           -DPython_EXECUTABLE="$GITHUB_WORKSPACE/.venv/bin/python"
           -DVERNON_INSTALL_GIT_HOOK=OFF
           -DBUILD_TESTING=ON
@@ -236,7 +240,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-v1
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Build and install LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -244,9 +248,16 @@ jobs:
           python scripts/configure_llvm.py
           --generator Ninja
           --cuda off
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
@@ -277,6 +288,10 @@ jobs:
           uv venv "$venv" --python "${{ matrix.python-version }}"
           uv pip install --python "$venv/bin/python" --no-cache "$wheel"
           "$venv/bin/python" scripts/verify_installed_wheel.py
+
+      - name: Test external engine against wheel Runtime sources
+        if: matrix.python-version == '3.11'
+        run: "$RUNNER_TEMP/vernon-wheel/bin/python scripts/verify_external_engine.py"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v6

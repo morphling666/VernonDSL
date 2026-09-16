@@ -21,6 +21,15 @@ constexpr Enum kArrayBuffer = 0x8892;
 constexpr Enum kElementArrayBuffer = 0x8893;
 constexpr Enum kUniformBuffer = 0x8A11;
 constexpr Enum kShaderStorageBuffer = 0x90D2;
+constexpr Enum kMaxUniformBufferBindings = 0x8A2F;
+constexpr Enum kMaxUniformBlockSize = 0x8A30;
+constexpr Enum kMaxComputeUniformBlocks = 0x91BB;
+constexpr Enum kMaxComputeShaderStorageBlocks = 0x90DB;
+constexpr Enum kMaxShaderStorageBufferBindings = 0x90DD;
+constexpr Enum kUniformBufferOffsetAlignment = 0x8A34;
+constexpr Enum kShaderStorageBufferOffsetAlignment = 0x90DF;
+constexpr Enum kCopyReadBuffer = 0x8F36;
+constexpr Enum kCopyWriteBuffer = 0x8F37;
 constexpr Enum kDynamicCopy = 0x88EA;
 constexpr Bitfield kMapReadBit = 0x0001;
 constexpr Enum kVertexShader = 0x8B31;
@@ -42,6 +51,10 @@ constexpr Enum kTextureCubeMapPositiveX = 0x8515;
 constexpr Enum kTextureCubeMapSeamless = 0x884F;
 constexpr Enum kTexture0 = 0x84C0;
 constexpr Enum kFramebuffer = 0x8D40;
+constexpr Enum kReadFramebuffer = 0x8CA8;
+constexpr Enum kDrawFramebuffer = 0x8CA9;
+constexpr Enum kDrawFramebufferBinding = 0x8CA6;
+constexpr Enum kReadFramebufferBinding = 0x8CAA;
 constexpr Enum kColorAttachment0 = 0x8CE0;
 constexpr Enum kDepthAttachment = 0x8D00;
 constexpr Enum kStencilAttachment = 0x8D20;
@@ -72,6 +85,9 @@ constexpr unsigned kShaderImageAccessBarrierBit = 0x00000020;
 constexpr unsigned kTextureUpdateBarrierBit = 0x00000100;
 constexpr unsigned kBufferUpdateBarrierBit = 0x00000200;
 constexpr unsigned kFramebufferBarrierBit = 0x00000400;
+constexpr Enum kReadOnly = 0x88B8;
+constexpr Enum kWriteOnly = 0x88B9;
+constexpr Enum kReadWrite = 0x88BA;
 
 #if defined(_WIN32)
 #define VERNON_GL_CALL __stdcall
@@ -80,6 +96,7 @@ constexpr unsigned kFramebufferBarrierBit = 0x00000400;
 #endif
 
 struct Driver {
+    Enum(VERNON_GL_CALL *getError)() {};
     Uint(VERNON_GL_CALL *createShader)(Enum) {};
     void(VERNON_GL_CALL *shaderSource)(Uint, Size, const char *const *, const Int *){};
     void(VERNON_GL_CALL *compileShader)(Uint){};
@@ -99,9 +116,13 @@ struct Driver {
     void(VERNON_GL_CALL *bindBuffer)(Enum, Uint){};
     void(VERNON_GL_CALL *bufferData)(Enum, SizePtr, const void *, Enum){};
     void(VERNON_GL_CALL *bufferSubData)(Enum, IntPtr, SizePtr, const void *){};
+    void(VERNON_GL_CALL *copyBufferSubData)(Enum, Enum, IntPtr, IntPtr, SizePtr){};
+    void(VERNON_GL_CALL *copyImageSubData)(Uint, Enum, Int, Int, Int, Int, Uint, Enum, Int, Int, Int, Int, Size, Size,
+                                           Size){};
     void *(VERNON_GL_CALL *mapBufferRange)(Enum, IntPtr, SizePtr, Bitfield){};
     Boolean(VERNON_GL_CALL *unmapBuffer)(Enum) {};
     void(VERNON_GL_CALL *bindBufferBase)(Enum, Uint, Uint){};
+    void(VERNON_GL_CALL *bindBufferRange)(Enum, Uint, Uint, IntPtr, SizePtr){};
     void(VERNON_GL_CALL *genVertexArrays)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteVertexArrays)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindVertexArray)(Uint){};
@@ -114,9 +135,11 @@ struct Driver {
     void(VERNON_GL_CALL *deleteFramebuffers)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindFramebuffer)(Enum, Uint){};
     void(VERNON_GL_CALL *framebufferTexture2D)(Enum, Enum, Enum, Uint, Int){};
+    void(VERNON_GL_CALL *framebufferTextureLayer)(Enum, Enum, Uint, Int, Int){};
     Enum(VERNON_GL_CALL *checkFramebufferStatus)(Enum) {};
     void(VERNON_GL_CALL *drawBuffers)(Size, const Enum *){};
     void(VERNON_GL_CALL *readBuffer)(Enum){};
+    void(VERNON_GL_CALL *blitFramebuffer)(Int, Int, Int, Int, Int, Int, Int, Int, Bitfield, Enum){};
     void(VERNON_GL_CALL *invalidateFramebuffer)(Enum, Size, const Enum *){};
     void(VERNON_GL_CALL *clearBufferfv)(Enum, Int, const float *){};
     void(VERNON_GL_CALL *clearBufferiv)(Enum, Int, const Int *){};
@@ -171,8 +194,12 @@ struct Driver {
     void(VERNON_GL_CALL *genTextures)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteTextures)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindTexture)(Enum, Uint){};
+    void(VERNON_GL_CALL *textureView)(Uint, Enum, Uint, Enum, Uint, Uint, Uint, Uint){};
+    void(VERNON_GL_CALL *bindImageTexture)(Uint, Uint, Int, unsigned char, Int, Enum, Enum){};
     void(VERNON_GL_CALL *texImage2D)(Enum, Int, Int, Size, Size, Int, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texImage3D)(Enum, Int, Int, Size, Size, Size, Int, Enum, Enum, const void *){};
+    void(VERNON_GL_CALL *texStorage2D)(Enum, Size, Enum, Size, Size){};
+    void(VERNON_GL_CALL *texStorage3D)(Enum, Size, Enum, Size, Size, Size){};
     void(VERNON_GL_CALL *texSubImage2D)(Enum, Int, Int, Int, Size, Size, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texSubImage3D)(Enum, Int, Int, Int, Int, Size, Size, Size, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texParameteri)(Enum, Enum, Int){};

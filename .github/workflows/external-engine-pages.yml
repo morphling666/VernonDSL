@@ -1,0 +1,198 @@
+name: External Engine Pages
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: external-engine-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+  PYTHON_VERSION: "3.11.9"
+  UV_VERSION: "0.9.7"
+
+jobs:
+  build:
+    name: Build WebAssembly demo
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out pinned LLVM
+        run: git submodule update --init --depth 1 llvm-project
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.6
+          actions-cache-folder: emsdk-cache
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            ninja-build \
+            pkg-config \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols \
+            xorg-dev
+
+      - name: Read LLVM revision
+        id: llvm-revision
+        run: echo "sha=$(git rev-parse HEAD:llvm-project)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM installation
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm-project/install
+          key: pages-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-webassembly-v1
+
+      - name: Build and install LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: >
+          python scripts/configure_llvm.py
+          --generator Ninja
+          --cuda off
+          --targets X86,WebAssembly
+          --build
+          --parallel 3
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: pages-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-webassembly-v1
+
+      - name: Install Python build environment
+        run: uv sync --extra build --frozen
+
+      - name: Build wheel
+        run: uv build --wheel --no-cache
+
+      - name: Install wheel
+        run: |
+          venv="$RUNNER_TEMP/vernon-wheel"
+          uv venv "$venv" --python "$PYTHON_VERSION"
+          uv pip install --python "$venv/bin/python" --no-cache dist/*.whl
+
+      - name: Cook WebAssembly bundles
+        run: |
+          python="$RUNNER_TEMP/vernon-wheel/bin/python"
+          "$python" -m vernon_dsl.program_asset_cli \
+            examples/external_engine/fractal_pipeline.py:asset \
+            --target cpu \
+            --cpu-triple wasm32-unknown-emscripten \
+            -o pages-fractal-cooked
+          "$python" -m vernon_dsl.program_asset_cli \
+            examples/shader_lib/mandelbulb.py:mandelbulb_asset \
+            --target opengles \
+            --opengl-version 300 \
+            -o pages-mandelbulb-cooked
+
+      - name: Build browser application
+        run: |
+          emcmake cmake -S examples/external_engine -B pages-build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython_EXECUTABLE="$RUNNER_TEMP/vernon-wheel/bin/python" \
+            -DVERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR="$GITHUB_WORKSPACE/pages-fractal-cooked" \
+            -DVERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR="$GITHUB_WORKSPACE/pages-mandelbulb-cooked"
+          cmake --build pages-build --parallel 3
+
+      - name: Run headless Node smoke
+        run: node pages-build/vernon-external-engine.js
+
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+
+      - name: Run browser startup smoke
+        run: |
+          python3 -m http.server 8000 --directory pages-build > "$RUNNER_TEMP/pages-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          ready=false
+          for _ in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8000/ > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 0.25
+          done
+          [[ "$ready" == true ]]
+          chrome="${{ steps.chrome.outputs.chrome-path }}"
+          dom="$("$chrome" \
+            --headless=new \
+            --no-sandbox \
+            --use-angle=swiftshader \
+            --enable-unsafe-swiftshader \
+            --virtual-time-budget=60000 \
+            --dump-dom \
+            http://127.0.0.1:8000/ 2>/dev/null)"
+          [[ "$dom" == *'data-vernon-first-frame="complete"'* ]]
+
+      - name: Stage Pages site
+        if: github.event_name != 'pull_request'
+        run: |
+          cmake -E make_directory pages-site
+          cmake -E copy pages-build/index.html pages-site/index.html
+          cmake -E copy pages-build/vernon-external-engine.js pages-site/vernon-external-engine.js
+          cmake -E copy pages-build/vernon-external-engine.wasm pages-site/vernon-external-engine.wasm
+          touch pages-site/.nojekyll
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages-site
+
+  deploy:
+    name: Deploy demo
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

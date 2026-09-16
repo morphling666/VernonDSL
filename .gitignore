@@ -1,5 +1,11 @@
 *.pyc
+.DS_Store
 *build/
+*-cooked/
+/win_runtime_*/
+/win_static_review/
+/win_wheel_*/
+benchmark-results*/
 .venv/
 __pycache__/
 .pytest_cache/
@@ -11,10 +17,15 @@ htmlcov/
 release-artifacts/
 *.dll
 *.so
+*.pyd
 *.dylib
 *.o
 *.obj
 *.lib
 *.exp
 *.exe
+*.npy
+examples/external_engine/web_demo.mp4
+AGENTS.md
+CLAUDE.md
 secret/

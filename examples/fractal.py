@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import cache
 from pathlib import Path
 from typing import Annotated
 
@@ -9,6 +10,18 @@ import vernon_dsl as vd
 
 WIDTH = 640
 HEIGHT = 320
+
+
+class RenderDefaults:
+    def __init__(self, *, frames: int, time_step: float, fps: int):
+        self.frames = frames
+        self.time_step = time_step
+        self.fps = fps
+
+
+@cache
+def render_defaults() -> RenderDefaults:
+    return RenderDefaults(frames=1_000_000, time_step=0.03, fps=30)
 
 
 @vd.func
@@ -46,11 +59,12 @@ def paint(
 
 def render(time: float = 0.0) -> vd.TensorStorage:
     pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
-    paint(pixels, time, grid=(WIDTH, HEIGHT, 1))
+    paint(pixels, time, grid=(WIDTH // 16, HEIGHT // 16, 1))
     return pixels
 
 
 def main() -> None:
+    defaults = render_defaults()
     parser = argparse.ArgumentParser(description="Render the VernonDSL Julia set")
     parser.add_argument(
         "--arch",
@@ -61,19 +75,12 @@ def main() -> None:
         help=("execution backend; OpenGL profiles require a host context; DirectX requires Windows"),
     )
     parser.add_argument("--time", type=float, default=0.0)
-    parser.add_argument("--frames", type=int, default=1_000_000)
-    parser.add_argument("--time-step", type=float, default=0.03)
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--frames", type=int, default=defaults.frames)
+    parser.add_argument("--time-step", type=float, default=defaults.time_step)
+    parser.add_argument("--fps", type=int, default=defaults.fps)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--animation-output", type=Path)
-    parser.add_argument("--emit-metal", type=Path)
     arguments = parser.parse_args()
-    if arguments.emit_metal is not None:
-        pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
-        source, _ = paint.compile_artifact(pixels, arguments.time, target="metal")
-        arguments.emit_metal.write_bytes(source)
-        print(f"Wrote {arguments.emit_metal}")
-        return
 
     try:
         import cv2  # pyright: ignore[reportMissingImports]
@@ -104,7 +111,7 @@ def main() -> None:
             paint(
                 pixels,
                 arguments.time + frame * arguments.time_step,
-                grid=(WIDTH, HEIGHT, 1),
+                grid=(WIDTH // 16, HEIGHT // 16, 1),
             )
             image = pixels.to_numpy()
             if arguments.animation_output is not None:

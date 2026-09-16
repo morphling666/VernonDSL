@@ -1,6 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
-#include "compiler_target_test_utils.h"
+#include "backend_test_matrix.h"
 
 #include <algorithm>
 #include <array>
@@ -68,7 +68,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.location = 0 : i64,
         vernon.source_name = "tex_coord"
       },
-      %cubeMap: !vernon.texture<"cube", f32> {
+      %cubeMap: !vernon.texture<"cube", f32, "unknown", "sampled"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -92,7 +92,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %color = "vernon.intrinsic"(%cubeMap, %sampler, %texCoord) {
       name = "texture_sample"
-    } : (!vernon.texture<"cube", f32>, !vernon.sampler, tensor<3xf32>)
+    } : (!vernon.texture<"cube", f32, "unknown", "sampled">, !vernon.sampler, tensor<3xf32>)
         -> tensor<4xf32>
     %rgb = "vernon.swizzle"(%color) {
       mask = "rgb"
@@ -133,8 +133,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     }
     return %rgba, %bloom : tensor<4xf32>, tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
 std::string artifacts(const VernonCompileResult *result) {
     std::string output;
@@ -253,10 +252,19 @@ void expectPackedPushConstants(std::string_view artifact) {
 TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
-                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    requirements.textureSamplerOperations = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_CUDA)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -284,8 +292,7 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
         if (target == VERNON_TARGET_METAL) {
             const VernonStringView reflection = vernonCompileResultGetReflection(result);
             const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
-            ASSERT_TRUE(reflected.contains("metal_resource_slots"));
-            const auto &slots = reflected["metal_resource_slots"];
+            const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
             auto hasSlot = [&](std::string_view entry, std::string_view kind, uint32_t set, uint32_t binding,
                                uint32_t argumentBuffer, uint32_t memberId) {
                 return std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
@@ -345,11 +352,13 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
   func.func @multi_set_compute(
       %left: !vernon.tensor_view<f32, [1], "read_write", "device"> {
         vernon.interface = "resource",
+
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       },
       %right: !vernon.tensor_view<f32, [1], "read", "device"> {
         vernon.interface = "resource",
+
         vernon.set = 1 : i64,
         vernon.binding = 0 : i64
       }) attributes {
@@ -387,7 +396,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     EXPECT_NE(output.find("[[buffer(1)]]"), std::string::npos);
     const VernonStringView reflection = vernonCompileResultGetReflection(result);
     const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
-    const auto &slots = reflected.at("metal_resource_slots");
+    const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
     for (uint32_t set = 0; set < 2; ++set) {
         EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
             return slot.value("entry_point", "") == "multi_set_compute" && slot.value("kind", "") == "storage_buffer" &&
@@ -403,15 +412,15 @@ TEST(CompilerGraphicsOutput, LowersSamplingBuiltinsTextureSizeAndMath) {
     constexpr std::string_view samplingModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @sampling_fragment(
-      %texture: !vernon.texture<"2d", f32> {
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 0 : i64, vernon.source_name = "texture"
       },
-      %texture3d: !vernon.texture<"3d", f32> {
+      %texture3d: !vernon.texture<"3d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 2 : i64, vernon.source_name = "texture3d"
       },
-      %textureCube: !vernon.texture<"cube", f32> {
+      %textureCube: !vernon.texture<"cube", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 3 : i64, vernon.source_name = "textureCube"
       },
@@ -434,47 +443,53 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
           vernon.interface = "output", vernon.location = 0 : i64
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 1 : i64
+          vernon.interface = "output", vernon.location = 1 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 2 : i64
+          vernon.interface = "output", vernon.location = 2 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
-          vernon.interface = "output", vernon.location = 3 : i64
+          vernon.interface = "output", vernon.location = 3 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
-          vernon.interface = "output", vernon.location = 4 : i64
+          vernon.interface = "output", vernon.location = 4 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 5 : i64
+          vernon.interface = "output", vernon.location = 5 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 6 : i64
+          vernon.interface = "output", vernon.location = 6 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
         }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %lod = arith.constant 1.0 : f32
     %level = arith.constant 1 : i32
     %implicit = "vernon.intrinsic"(%texture, %sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     %explicit = "vernon.intrinsic"(%texture, %sampler, %uv, %lod)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)
         -> tensor<4xf32>
     %size2d0 = "vernon.intrinsic"(%texture) {name = "texture_size"} :
-        (!vernon.texture<"2d", f32>) -> tensor<2xi32>
+        (!vernon.texture<"2d", f32, "unknown", "sampled">) -> tensor<2xi32>
     %size2d1 = "vernon.intrinsic"(%texture, %level) {name = "texture_size"} :
-        (!vernon.texture<"2d", f32>, i32) -> tensor<2xi32>
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, i32) -> tensor<2xi32>
     %size3d0 = "vernon.intrinsic"(%texture3d) {name = "texture_size"} :
-        (!vernon.texture<"3d", f32>) -> tensor<3xi32>
+        (!vernon.texture<"3d", f32, "unknown", "sampled">) -> tensor<3xi32>
     %size3d1 = "vernon.intrinsic"(%texture3d, %level)
         {name = "texture_size"} :
-        (!vernon.texture<"3d", f32>, i32) -> tensor<3xi32>
+        (!vernon.texture<"3d", f32, "unknown", "sampled">, i32) -> tensor<3xi32>
     %sizeCube0 = "vernon.intrinsic"(%textureCube) {name = "texture_size"} :
-        (!vernon.texture<"cube", f32>) -> tensor<2xi32>
+        (!vernon.texture<"cube", f32, "unknown", "sampled">) -> tensor<2xi32>
     %sizeCube1 = "vernon.intrinsic"(%textureCube, %level)
         {name = "texture_size"} :
-        (!vernon.texture<"cube", f32>, i32) -> tensor<2xi32>
+        (!vernon.texture<"cube", f32, "unknown", "sampled">, i32) -> tensor<2xi32>
     %x = "vernon.swizzle"(%fragCoord) {mask = "x"} :
         (tensor<4xf32>) -> f32
     %sin = math.sin %x : f32
@@ -494,10 +509,12 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
   func.func @builtin_vertex(
       %vertexId: i32 {
-        vernon.interface = "input", vernon.builtin = "vertex_index"
+        vernon.interface = "input", vernon.builtin = "vertex_index",
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %instanceId: i32 {
-        vernon.interface = "input", vernon.builtin = "instance_index"
+        vernon.interface = "input", vernon.builtin = "instance_index",
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -506,12 +523,23 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       }) attributes {vernon.entry, vernon.stage = "vertex"} {
     return %position : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL}) {
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    requirements.textureSamplerOperations = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, samplingModule.data(), samplingModule.size(), target);
         ASSERT_TRUE(result);
@@ -541,8 +569,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             const std::string_view reflectionView(reflection.data, reflection.size);
             EXPECT_NE(reflectionView.find("\"vernon.implicit\":\"sampler\""), std::string_view::npos);
             EXPECT_EQ(reflectionView.find("\"vernon.implicit\":\"texture_size\""), std::string_view::npos);
-            EXPECT_NE(reflectionView.find("\"sampled_texture_bindings\""), std::string_view::npos);
-            EXPECT_EQ(reflectionView.find("\"sampled_texture_binding\":"), std::string_view::npos);
+            EXPECT_NE(reflectionView.find("\"sampled_image_bindings\""), std::string_view::npos);
+            EXPECT_EQ(reflectionView.find("\"sampled_image_binding\":"), std::string_view::npos);
         } else {
             size_t queryCount = 0;
             for (size_t offset = 0; (offset = output.find("textureSize(", offset)) != std::string::npos; offset += 12)
@@ -556,29 +584,100 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerGraphicsOutput, LowersUnifiedStorageTextureForEveryGpuTarget) {
+    constexpr std::string_view storageModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @storage_main(
+      %image: !vernon.texture<"3d", f32, "rgba32_float", "read_write"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64,
+        vernon.source_name = "image"
+      },
+      %coordinate: tensor<3xi32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "coordinate",
+        vernon.abi_leaf_dtypes = ["i32"]
+      },
+      %value: tensor<4xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "value"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %loaded = "vernon.intrinsic"(%image, %coordinate) {
+      name = "texture_load"
+    } : (!vernon.texture<"3d", f32, "rgba32_float", "read_write">, tensor<3xi32>) -> tensor<4xf32>
+    "vernon.intrinsic"(%image, %coordinate, %loaded) {
+      name = "texture_store"
+    } : (!vernon.texture<"3d", f32, "rgba32_float", "read_write">, tensor<3xi32>, tensor<4xf32>) -> ()
+    return
+  }
+})mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_OPENGL_ES &&
+            target != VERNON_TARGET_DIRECTX && target != VERNON_TARGET_METAL)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, storageModule.data(), storageModule.size(), target);
+        ASSERT_TRUE(result);
+        if (target == VERNON_TARGET_OPENGL_ES) {
+            EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_UNSUPPORTED_TARGET);
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size)
+                          .find("target capability rejects non-R32 read_write storage images"),
+                      std::string_view::npos);
+            vernonCompileResultDestroy(result);
+            continue;
+        }
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "storage texture compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                         diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const VernonStringView reflection = vernonCompileResultGetReflection(result);
+        const std::string_view reflectionView(reflection.data, reflection.size);
+        EXPECT_NE(reflectionView.find("\"exact_storage_format\":\"rgba32_float\""), std::string_view::npos);
+        EXPECT_NE(reflectionView.find("\"access\":\"read_write\""), std::string_view::npos);
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerGraphicsOutput, LowersRecursiveStaticTensorValuesAndReflectsPhysicalLayout) {
     constexpr std::string_view tensorModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @static_tensor_fragment(
       %value: tensor<2x3x5xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "value",
-        vernon.dtype = "f32"
+        vernon.source_name = "value"
       },
       %matrix: tensor<3x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix"
       },
       %matrix2: tensor<4x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix2",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix2"
       },
       %matrix3: tensor<4x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix3",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix3"
       }) -> (f32 {
         vernon.interface = "output",
         vernon.location = 0 : i64
@@ -605,8 +704,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %result = arith.addf %partial, %matrix_value : f32
     return %result : f32
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -651,9 +749,18 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     EXPECT_NE(reflected.find("\"shape\":[3,4]"), std::string_view::npos);
 
     vernonCompileResultDestroy(result);
-    for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         result = vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -688,8 +795,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %tail: tensor<2x2x)mlir") + std::to_string(tailWidth) +
                                          R"mlir(xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "tail",
-        vernon.dtype = "f32"
+        vernon.source_name = "tail"
       }) -> (f32 {
         vernon.interface = "output",
         vernon.location = 0 : i64
@@ -701,8 +807,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                                          std::to_string(tailWidth) + R"mlir(xf32>
     return %value : f32
   }
-}
-)mlir";
+})mlir";
 
         SCOPED_TRACE("tail width " + std::to_string(tailWidth));
         VernonCompileResult *result =
@@ -740,8 +845,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
         const nlohmann::json &layout = argument.at("physical_layouts").at("vulkan_std140_uniform_buffer");
         EXPECT_EQ(argument.at("shape"), nlohmann::json::array({2, 2, tailWidth}));
-        EXPECT_EQ(layout.at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
-        EXPECT_EQ(layout.at("size"), tailWidth * 64u);
+        EXPECT_EQ(layout.at("root").at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
+        EXPECT_EQ(layout.at("root").at("size"), tailWidth * 64u);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -753,8 +858,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @static_tensor_compute(
       %value: tensor<2x2x2xf32> {
         vernon.interface = "input",
-        vernon.location = 0 : i64,
-        vernon.dtype = "f32"
+        vernon.location = 0 : i64
       },
       %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
@@ -774,15 +878,23 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
     return
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target :
-         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_CUDA}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX &&
+            target != VERNON_TARGET_CUDA && target != VERNON_TARGET_METAL && target != VERNON_TARGET_OPENGL_ES)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
@@ -814,17 +926,84 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         const std::string_view reflected(reflection.data, reflection.size);
         EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\""), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"profile\":\"cuda_kernel_parameter\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\"") != std::string_view::npos,
+                  target != VERNON_TARGET_CUDA && target != VERNON_TARGET_METAL);
+        EXPECT_EQ(reflected.find("\"profile\":\"cuda_kernel_parameter\"") != std::string_view::npos,
+                  target == VERNON_TARGET_CUDA);
+        EXPECT_EQ(reflected.find("\"profile\":\"host_value\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"metal_constant_buffer\"") != std::string_view::npos,
+                  target == VERNON_TARGET_METAL);
+        EXPECT_EQ(reflected.find("\"profile\":\"directx_constant_buffer\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"opengl_native_uniform\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"size\":32"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"offset_binding\":2"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"extent_bindings\":[3]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"stride_bindings\":[4]"), std::string_view::npos);
+        const nlohmann::json reflectionJson = nlohmann::json::parse(reflected);
+        const nlohmann::json &metadata = reflectionJson.at("entries").at(0).at("metadata_carrier");
+        const char *metadataProfile =
+            target == VERNON_TARGET_CUDA ? "cuda_kernel_metadata_i64" : "portable_shader_metadata_i32";
+        EXPECT_EQ(metadata.at("profile"), metadataProfile);
+        ASSERT_EQ(metadata.at("fields").size(), 3u);
+        EXPECT_EQ(metadata.at("fields").at(0).at("ordinal"), 0);
+        EXPECT_EQ(metadata.at("fields").at(0).at("units"), "logical_elements");
+        EXPECT_EQ(metadata.at("fields").at(0).at("kind"), "offset");
+        EXPECT_EQ(metadata.at("fields").at(1).at("kind"), "extent");
+        EXPECT_EQ(metadata.at("fields").at(2).at("kind"), "stride");
+        EXPECT_EQ(metadata.at("representation"), target == VERNON_TARGET_CUDA ? "i64" : "i32");
+        EXPECT_EQ(metadata.at("carrier"), target == VERNON_TARGET_CUDA ? "kernel_parameter" : "constant_region");
+        EXPECT_EQ(metadata.at(target == VERNON_TARGET_CUDA ? "parameter_ordinal" : "binding"),
+                  target == VERNON_TARGET_CUDA ? 10 : 2);
+        EXPECT_EQ(metadata.at("interface_plan").at("canonical_layout_hash").get<std::string>().size(), 64u);
+        EXPECT_EQ(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"offset_binding\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"extent_bindings\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"stride_bindings\":"), std::string_view::npos);
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, RejectsMetadataCarriersExceedingTargetProfileCeilings) {
+    const auto moduleWithRank = [](unsigned rank) {
+        std::string shape;
+        for (unsigned dimension = 0; dimension < rank; ++dimension) {
+            if (dimension)
+                shape += ", ";
+            shape += "-1";
+        }
+        return std::string("module attributes {") + VERNON_MLIR_VERSION_ATTRIBUTES +
+               R"mlir(} {
+  func.func @oversized(
+      %view: !vernon.tensor_view<f32, [)mlir" +
+               shape +
+               R"mlir(], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+})mlir";
+    };
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (const auto &[target, rank] :
+         std::array{std::pair{VERNON_TARGET_CUDA, 256u}, std::pair{VERNON_TARGET_VULKAN, 2048u}}) {
+        const std::string source = moduleWithRank(rank);
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, source.data(), source.size(), target);
+        ASSERT_TRUE(result);
+        EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size)
+                      .find("TensorView metadata carrier exceeds its compiled profile limit"),
+                  std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -837,7 +1016,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %value: tensor<2x3xf32> {
         vernon.interface = "input",
         vernon.location = 0 : i64,
-        vernon.dtype = "f32",
         vernon.source_name = "value"
       }) -> (tensor<4xf32> {
         vernon.interface = "output",
@@ -846,8 +1024,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %position = arith.constant dense<[0.0, 0.0, 0.0, 1.0]> : tensor<4xf32>
     return %position : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *result =
@@ -873,17 +1050,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @overlap(
       %value: tensor<2x3xf32> {
-        vernon.interface = "input", vernon.location = 0 : i64, vernon.dtype = "f32"
+        vernon.interface = "input", vernon.location = 0 : i64
       },
       %other: tensor<4xf32> {
-        vernon.interface = "input", vernon.location = 1 : i64, vernon.dtype = "f32"
+        vernon.interface = "input", vernon.location = 1 : i64
       }) -> (tensor<4xf32> {
         vernon.interface = "output", vernon.builtin = "position"
       }) attributes {vernon.entry, vernon.stage = "vertex"} {
     return %other : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     result = vernonCompilerCompileMlir(compiler, overlapModule.data(), overlapModule.size(), VERNON_TARGET_VULKAN);
     ASSERT_TRUE(result);
     EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
@@ -905,7 +1081,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %value: !vernon.struct<"Vertex"> {
         vernon.interface = "input",
         vernon.location = 0 : i64,
-        vernon.source_name = "value"
+        vernon.source_name = "value",
+        vernon.abi_leaf_dtypes = ["f32", "u32", "f32"]
       }) -> (tensor<4xf32> {
         vernon.interface = "output",
         vernon.builtin = "position"
@@ -919,8 +1096,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (tensor<3xf32>, f32) -> tensor<4xf32>
     return %result : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -937,8 +1113,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const std::string_view reflected(reflection.data, reflection.size);
     EXPECT_NE(reflected.find("\"compiler_contract_version\":" + std::to_string(VERNON_COMPILER_CONTRACT_VERSION)),
               std::string_view::npos);
-    EXPECT_NE(reflected.find("\"pipeline_version\":" + std::to_string(VERNON_PIPELINE_VERSION)),
-              std::string_view::npos);
+    EXPECT_NE(reflected.find("\"program_version\":" + std::to_string(VERNON_PROGRAM_VERSION)), std::string_view::npos);
     EXPECT_NE(reflected.find("\"struct_name\":\"Vertex\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"location_span\":3"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);
@@ -988,8 +1163,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (!vernon.struct<"State">) -> f32
     return %value : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateLoopModule.data(),
@@ -1021,6 +1195,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @nested(
       %values: !vernon.tensor_view<!vernon.struct<"Nested">, [2], "read", "device"> {
         vernon.interface = "resource",
+        vernon.abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
+        vernon.element_abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       }) attributes {
@@ -1030,8 +1206,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       } {
     return
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -1042,14 +1217,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
     const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
     EXPECT_FALSE(root.contains("backend_abi_routes"));
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "tensor_view_descriptor");
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), 32);
-    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("kind"), "strided_memref_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("kind"),
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "resource_binding");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("resource_kind"), "host_pointer");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), sizeof(void *));
+    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("resource_kind"),
+              "strided_memref_storage_leaves");
+    EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("resource_kind"),
               "descriptor_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("kind"), "descriptor_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("element_layout_hash"),
-              argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("element_layout_hash"));
+    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("resource_kind"),
+              "descriptor_storage_leaves");
+    EXPECT_FALSE(argument.at("physical_layouts").at("cuda_kernel_parameter").contains("element_layout_hash"));
     EXPECT_EQ(argument.at("element_layout").at("byte_size"), 20);
     EXPECT_EQ(argument.at("element_layout").at("alignment"), 4);
     EXPECT_EQ(argument.at("element_layout").at("leaves").at(3).at("dtype"), "u32");

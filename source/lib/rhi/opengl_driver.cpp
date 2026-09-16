@@ -20,128 +20,151 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         error = "external OpenGL context callbacks are missing";
         return false;
     }
-    callbacks.make_current(callbacks.user_data);
+    try {
+        callbacks.make_current(callbacks.user_data);
 #define LOAD(member, name)                                                                                             \
     if (!loadProc(callbacks, driver.member, name, error))                                                              \
     return false
-    LOAD(createShader, "glCreateShader");
-    LOAD(shaderSource, "glShaderSource");
-    LOAD(compileShader, "glCompileShader");
-    LOAD(getShaderiv, "glGetShaderiv");
-    LOAD(getShaderInfoLog, "glGetShaderInfoLog");
-    LOAD(deleteShader, "glDeleteShader");
-    LOAD(createProgram, "glCreateProgram");
-    LOAD(attachShader, "glAttachShader");
-    LOAD(linkProgram, "glLinkProgram");
-    LOAD(getProgramiv, "glGetProgramiv");
-    LOAD(getProgramInfoLog, "glGetProgramInfoLog");
-    LOAD(deleteProgram, "glDeleteProgram");
-    LOAD(useProgram, "glUseProgram");
-    LOAD(getIntegerv, "glGetIntegerv");
-    LOAD(genBuffers, "glGenBuffers");
-    LOAD(deleteBuffers, "glDeleteBuffers");
-    LOAD(bindBuffer, "glBindBuffer");
-    LOAD(bufferData, "glBufferData");
-    LOAD(bufferSubData, "glBufferSubData");
-    LOAD(mapBufferRange, "glMapBufferRange");
-    LOAD(unmapBuffer, "glUnmapBuffer");
-    LOAD(bindBufferBase, "glBindBufferBase");
-    LOAD(genVertexArrays, "glGenVertexArrays");
-    LOAD(deleteVertexArrays, "glDeleteVertexArrays");
-    LOAD(bindVertexArray, "glBindVertexArray");
-    LOAD(enableVertexAttribArray, "glEnableVertexAttribArray");
-    LOAD(vertexAttribPointer, "glVertexAttribPointer");
-    LOAD(vertexAttribIPointer, "glVertexAttribIPointer");
-    driver.vertexAttribLPointer = reinterpret_cast<decltype(driver.vertexAttribLPointer)>(
-        callbacks.get_proc_address(callbacks.user_data, "glVertexAttribLPointer"));
-    LOAD(vertexAttribDivisor, "glVertexAttribDivisor");
-    LOAD(genFramebuffers, "glGenFramebuffers");
-    LOAD(deleteFramebuffers, "glDeleteFramebuffers");
-    LOAD(bindFramebuffer, "glBindFramebuffer");
-    LOAD(framebufferTexture2D, "glFramebufferTexture2D");
-    LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
-    LOAD(drawBuffers, "glDrawBuffers");
-    LOAD(readBuffer, "glReadBuffer");
-    driver.invalidateFramebuffer = reinterpret_cast<decltype(driver.invalidateFramebuffer)>(
-        callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
-    LOAD(clearBufferfv, "glClearBufferfv");
-    LOAD(clearBufferiv, "glClearBufferiv");
-    LOAD(clearBufferfi, "glClearBufferfi");
-    LOAD(enable, "glEnable");
-    LOAD(disable, "glDisable");
-    LOAD(depthFunc, "glDepthFunc");
-    LOAD(depthMask, "glDepthMask");
-    LOAD(cullFace, "glCullFace");
-    LOAD(frontFace, "glFrontFace");
-    LOAD(polygonOffset, "glPolygonOffset");
-    LOAD(stencilFuncSeparate, "glStencilFuncSeparate");
-    LOAD(stencilOpSeparate, "glStencilOpSeparate");
-    LOAD(stencilMaskSeparate, "glStencilMaskSeparate");
-    LOAD(blendFuncSeparate, "glBlendFuncSeparate");
-    LOAD(blendEquationSeparate, "glBlendEquationSeparate");
-    LOAD(colorMask, "glColorMask");
-    driver.enablei =
-        reinterpret_cast<decltype(driver.enablei)>(callbacks.get_proc_address(callbacks.user_data, "glEnablei"));
-    driver.disablei =
-        reinterpret_cast<decltype(driver.disablei)>(callbacks.get_proc_address(callbacks.user_data, "glDisablei"));
-    driver.blendFuncSeparatei = reinterpret_cast<decltype(driver.blendFuncSeparatei)>(
-        callbacks.get_proc_address(callbacks.user_data, "glBlendFuncSeparatei"));
-    driver.blendEquationSeparatei = reinterpret_cast<decltype(driver.blendEquationSeparatei)>(
-        callbacks.get_proc_address(callbacks.user_data, "glBlendEquationSeparatei"));
-    driver.colorMaski =
-        reinterpret_cast<decltype(driver.colorMaski)>(callbacks.get_proc_address(callbacks.user_data, "glColorMaski"));
-    LOAD(viewport, "glViewport");
-    driver.scissor =
-        reinterpret_cast<decltype(driver.scissor)>(callbacks.get_proc_address(callbacks.user_data, "glScissor"));
-    LOAD(drawArrays, "glDrawArrays");
-    LOAD(drawArraysInstanced, "glDrawArraysInstanced");
-    LOAD(drawElementsInstanced, "glDrawElementsInstanced");
-    LOAD(getUniformLocation, "glGetUniformLocation");
-    LOAD(uniform1fv, "glUniform1fv");
-    LOAD(uniform2fv, "glUniform2fv");
-    LOAD(uniform3fv, "glUniform3fv");
-    LOAD(uniform4fv, "glUniform4fv");
-    LOAD(uniform1iv, "glUniform1iv");
-    LOAD(uniform2iv, "glUniform2iv");
-    LOAD(uniform3iv, "glUniform3iv");
-    LOAD(uniform4iv, "glUniform4iv");
-    LOAD(uniform1uiv, "glUniform1uiv");
-    LOAD(uniform2uiv, "glUniform2uiv");
-    LOAD(uniform3uiv, "glUniform3uiv");
-    LOAD(uniform4uiv, "glUniform4uiv");
-    LOAD(uniformMatrix2fv, "glUniformMatrix2fv");
-    LOAD(uniformMatrix2x3fv, "glUniformMatrix2x3fv");
-    LOAD(uniformMatrix2x4fv, "glUniformMatrix2x4fv");
-    LOAD(uniformMatrix3x2fv, "glUniformMatrix3x2fv");
-    LOAD(uniformMatrix3fv, "glUniformMatrix3fv");
-    LOAD(uniformMatrix3x4fv, "glUniformMatrix3x4fv");
-    LOAD(uniformMatrix4x2fv, "glUniformMatrix4x2fv");
-    LOAD(uniformMatrix4x3fv, "glUniformMatrix4x3fv");
-    LOAD(uniformMatrix4fv, "glUniformMatrix4fv");
-    LOAD(uniform1i, "glUniform1i");
-    LOAD(activeTexture, "glActiveTexture");
-    LOAD(genTextures, "glGenTextures");
-    LOAD(deleteTextures, "glDeleteTextures");
-    LOAD(bindTexture, "glBindTexture");
-    LOAD(texImage2D, "glTexImage2D");
-    LOAD(texImage3D, "glTexImage3D");
-    LOAD(texSubImage2D, "glTexSubImage2D");
-    LOAD(texSubImage3D, "glTexSubImage3D");
-    LOAD(texParameteri, "glTexParameteri");
-    LOAD(generateMipmap, "glGenerateMipmap");
-    LOAD(pixelStorei, "glPixelStorei");
-    LOAD(readPixels, "glReadPixels");
-    LOAD(genSamplers, "glGenSamplers");
-    LOAD(deleteSamplers, "glDeleteSamplers");
-    LOAD(samplerParameteri, "glSamplerParameteri");
-    LOAD(bindSampler, "glBindSampler");
-    LOAD(finish, "glFinish");
+        driver.getError =
+            reinterpret_cast<decltype(driver.getError)>(callbacks.get_proc_address(callbacks.user_data, "glGetError"));
+        LOAD(createShader, "glCreateShader");
+        LOAD(shaderSource, "glShaderSource");
+        LOAD(compileShader, "glCompileShader");
+        LOAD(getShaderiv, "glGetShaderiv");
+        LOAD(getShaderInfoLog, "glGetShaderInfoLog");
+        LOAD(deleteShader, "glDeleteShader");
+        LOAD(createProgram, "glCreateProgram");
+        LOAD(attachShader, "glAttachShader");
+        LOAD(linkProgram, "glLinkProgram");
+        LOAD(getProgramiv, "glGetProgramiv");
+        LOAD(getProgramInfoLog, "glGetProgramInfoLog");
+        LOAD(deleteProgram, "glDeleteProgram");
+        LOAD(useProgram, "glUseProgram");
+        LOAD(getIntegerv, "glGetIntegerv");
+        LOAD(genBuffers, "glGenBuffers");
+        LOAD(deleteBuffers, "glDeleteBuffers");
+        LOAD(bindBuffer, "glBindBuffer");
+        LOAD(bufferData, "glBufferData");
+        LOAD(bufferSubData, "glBufferSubData");
+        driver.copyBufferSubData = reinterpret_cast<decltype(driver.copyBufferSubData)>(
+            callbacks.get_proc_address(callbacks.user_data, "glCopyBufferSubData"));
+        driver.copyImageSubData = reinterpret_cast<decltype(driver.copyImageSubData)>(
+            callbacks.get_proc_address(callbacks.user_data, "glCopyImageSubData"));
+        LOAD(mapBufferRange, "glMapBufferRange");
+        LOAD(unmapBuffer, "glUnmapBuffer");
+        LOAD(bindBufferBase, "glBindBufferBase");
+        LOAD(bindBufferRange, "glBindBufferRange");
+        LOAD(genVertexArrays, "glGenVertexArrays");
+        LOAD(deleteVertexArrays, "glDeleteVertexArrays");
+        LOAD(bindVertexArray, "glBindVertexArray");
+        LOAD(enableVertexAttribArray, "glEnableVertexAttribArray");
+        LOAD(vertexAttribPointer, "glVertexAttribPointer");
+        LOAD(vertexAttribIPointer, "glVertexAttribIPointer");
+        driver.vertexAttribLPointer = reinterpret_cast<decltype(driver.vertexAttribLPointer)>(
+            callbacks.get_proc_address(callbacks.user_data, "glVertexAttribLPointer"));
+        LOAD(vertexAttribDivisor, "glVertexAttribDivisor");
+        LOAD(genFramebuffers, "glGenFramebuffers");
+        LOAD(deleteFramebuffers, "glDeleteFramebuffers");
+        LOAD(bindFramebuffer, "glBindFramebuffer");
+        LOAD(framebufferTexture2D, "glFramebufferTexture2D");
+        LOAD(framebufferTextureLayer, "glFramebufferTextureLayer");
+        LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
+        LOAD(drawBuffers, "glDrawBuffers");
+        LOAD(readBuffer, "glReadBuffer");
+        driver.blitFramebuffer = reinterpret_cast<decltype(driver.blitFramebuffer)>(
+            callbacks.get_proc_address(callbacks.user_data, "glBlitFramebuffer"));
+        driver.invalidateFramebuffer = reinterpret_cast<decltype(driver.invalidateFramebuffer)>(
+            callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
+        LOAD(clearBufferfv, "glClearBufferfv");
+        LOAD(clearBufferiv, "glClearBufferiv");
+        LOAD(clearBufferfi, "glClearBufferfi");
+        LOAD(enable, "glEnable");
+        LOAD(disable, "glDisable");
+        LOAD(depthFunc, "glDepthFunc");
+        LOAD(depthMask, "glDepthMask");
+        LOAD(cullFace, "glCullFace");
+        LOAD(frontFace, "glFrontFace");
+        LOAD(polygonOffset, "glPolygonOffset");
+        LOAD(stencilFuncSeparate, "glStencilFuncSeparate");
+        LOAD(stencilOpSeparate, "glStencilOpSeparate");
+        LOAD(stencilMaskSeparate, "glStencilMaskSeparate");
+        LOAD(blendFuncSeparate, "glBlendFuncSeparate");
+        LOAD(blendEquationSeparate, "glBlendEquationSeparate");
+        LOAD(colorMask, "glColorMask");
+        driver.enablei =
+            reinterpret_cast<decltype(driver.enablei)>(callbacks.get_proc_address(callbacks.user_data, "glEnablei"));
+        driver.disablei =
+            reinterpret_cast<decltype(driver.disablei)>(callbacks.get_proc_address(callbacks.user_data, "glDisablei"));
+        driver.blendFuncSeparatei = reinterpret_cast<decltype(driver.blendFuncSeparatei)>(
+            callbacks.get_proc_address(callbacks.user_data, "glBlendFuncSeparatei"));
+        driver.blendEquationSeparatei = reinterpret_cast<decltype(driver.blendEquationSeparatei)>(
+            callbacks.get_proc_address(callbacks.user_data, "glBlendEquationSeparatei"));
+        driver.colorMaski = reinterpret_cast<decltype(driver.colorMaski)>(
+            callbacks.get_proc_address(callbacks.user_data, "glColorMaski"));
+        LOAD(viewport, "glViewport");
+        driver.scissor =
+            reinterpret_cast<decltype(driver.scissor)>(callbacks.get_proc_address(callbacks.user_data, "glScissor"));
+        LOAD(drawArrays, "glDrawArrays");
+        LOAD(drawArraysInstanced, "glDrawArraysInstanced");
+        LOAD(drawElementsInstanced, "glDrawElementsInstanced");
+        LOAD(getUniformLocation, "glGetUniformLocation");
+        LOAD(uniform1fv, "glUniform1fv");
+        LOAD(uniform2fv, "glUniform2fv");
+        LOAD(uniform3fv, "glUniform3fv");
+        LOAD(uniform4fv, "glUniform4fv");
+        LOAD(uniform1iv, "glUniform1iv");
+        LOAD(uniform2iv, "glUniform2iv");
+        LOAD(uniform3iv, "glUniform3iv");
+        LOAD(uniform4iv, "glUniform4iv");
+        LOAD(uniform1uiv, "glUniform1uiv");
+        LOAD(uniform2uiv, "glUniform2uiv");
+        LOAD(uniform3uiv, "glUniform3uiv");
+        LOAD(uniform4uiv, "glUniform4uiv");
+        LOAD(uniformMatrix2fv, "glUniformMatrix2fv");
+        LOAD(uniformMatrix2x3fv, "glUniformMatrix2x3fv");
+        LOAD(uniformMatrix2x4fv, "glUniformMatrix2x4fv");
+        LOAD(uniformMatrix3x2fv, "glUniformMatrix3x2fv");
+        LOAD(uniformMatrix3fv, "glUniformMatrix3fv");
+        LOAD(uniformMatrix3x4fv, "glUniformMatrix3x4fv");
+        LOAD(uniformMatrix4x2fv, "glUniformMatrix4x2fv");
+        LOAD(uniformMatrix4x3fv, "glUniformMatrix4x3fv");
+        LOAD(uniformMatrix4fv, "glUniformMatrix4fv");
+        LOAD(uniform1i, "glUniform1i");
+        LOAD(activeTexture, "glActiveTexture");
+        LOAD(genTextures, "glGenTextures");
+        LOAD(deleteTextures, "glDeleteTextures");
+        LOAD(bindTexture, "glBindTexture");
+        driver.textureView = reinterpret_cast<decltype(driver.textureView)>(
+            callbacks.get_proc_address(callbacks.user_data, "glTextureView"));
+        driver.bindImageTexture = reinterpret_cast<decltype(driver.bindImageTexture)>(
+            callbacks.get_proc_address(callbacks.user_data, "glBindImageTexture"));
+        LOAD(texImage2D, "glTexImage2D");
+        LOAD(texImage3D, "glTexImage3D");
+        driver.texStorage2D = reinterpret_cast<decltype(driver.texStorage2D)>(
+            callbacks.get_proc_address(callbacks.user_data, "glTexStorage2D"));
+        driver.texStorage3D = reinterpret_cast<decltype(driver.texStorage3D)>(
+            callbacks.get_proc_address(callbacks.user_data, "glTexStorage3D"));
+        LOAD(texSubImage2D, "glTexSubImage2D");
+        LOAD(texSubImage3D, "glTexSubImage3D");
+        LOAD(texParameteri, "glTexParameteri");
+        LOAD(generateMipmap, "glGenerateMipmap");
+        LOAD(pixelStorei, "glPixelStorei");
+        LOAD(readPixels, "glReadPixels");
+        LOAD(genSamplers, "glGenSamplers");
+        LOAD(deleteSamplers, "glDeleteSamplers");
+        LOAD(samplerParameteri, "glSamplerParameteri");
+        LOAD(bindSampler, "glBindSampler");
+        LOAD(finish, "glFinish");
 #undef LOAD
-    driver.dispatchCompute = reinterpret_cast<decltype(driver.dispatchCompute)>(
-        callbacks.get_proc_address(callbacks.user_data, "glDispatchCompute"));
-    driver.memoryBarrier = reinterpret_cast<decltype(driver.memoryBarrier)>(
-        callbacks.get_proc_address(callbacks.user_data, "glMemoryBarrier"));
-    return true;
+        driver.dispatchCompute = reinterpret_cast<decltype(driver.dispatchCompute)>(
+            callbacks.get_proc_address(callbacks.user_data, "glDispatchCompute"));
+        driver.memoryBarrier = reinterpret_cast<decltype(driver.memoryBarrier)>(
+            callbacks.get_proc_address(callbacks.user_data, "glMemoryBarrier"));
+        return true;
+    } catch (...) {
+        error = "external OpenGL context callback failed";
+        return false;
+    }
 }
 
 } // namespace vernon::rhi::opengl

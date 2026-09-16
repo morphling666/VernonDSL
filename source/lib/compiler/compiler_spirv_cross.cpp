@@ -397,6 +397,34 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                 } else {
                     spirv_cross::CompilerGLSL compiler(words);
                     compiler.set_entry_point(entry.name, entry.execution_model);
+                    if (entry.execution_model == spv::ExecutionModelGLCompute) {
+                        const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+                        constexpr size_t portableComputeStorageBlockLimit = 16;
+                        if (resources.storage_buffers.size() > portableComputeStorageBlockLimit) {
+                            diagnostics = "OpenGL compute entry '" + entry.name + "' requires " +
+                                          std::to_string(resources.storage_buffers.size()) +
+                                          " genuine storage-buffer blocks; the portable limit is " +
+                                          std::to_string(portableComputeStorageBlockLimit);
+                            return false;
+                        }
+                    }
+                    if (target == VERNON_TARGET_OPENGL_ES) {
+                        const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+                        for (const spirv_cross::Resource &resource : resources.storage_images) {
+                            const auto &type = compiler.get_type(resource.type_id);
+                            const bool coreReadWriteFormat = type.image.format == spv::ImageFormatR32f ||
+                                                             type.image.format == spv::ImageFormatR32i ||
+                                                             type.image.format == spv::ImageFormatR32ui;
+                            const bool singleDirection =
+                                compiler.has_decoration(resource.id, spv::DecorationNonReadable) ||
+                                compiler.has_decoration(resource.id, spv::DecorationNonWritable);
+                            if (!coreReadWriteFormat && !singleDirection) {
+                                diagnostics = "OpenGL ES requires a read_write storage image to use r32_float, "
+                                              "r32_sint, or r32_uint format";
+                                return false;
+                            }
+                        }
+                    }
                     // Canonical location names let GLSL 3.30 link vertex outputs to
                     // fragment inputs. Prefer the source-derived vertex output name;
                     // vertex inputs and fragment outputs retain their own source names.

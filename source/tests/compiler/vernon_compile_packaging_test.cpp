@@ -1,9 +1,6 @@
 #include "vernon_compile_packaging.h"
 
 #include "VernonVersions.h"
-#include "vernon-c/Compiler.h"
-
-#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -25,7 +22,7 @@ std::string readFile(const std::filesystem::path &path) {
 
 } // namespace
 
-TEST(CompilePackaging, WritesBundlesAndArtifacts) {
+TEST(CompilePackaging, WritesArtifactsAndReflection) {
     constexpr std::string_view computeModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @scale() attributes {
@@ -57,28 +54,17 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(cpuResult);
     ASSERT_TRUE(vernonCompileResultGetStatus(cpuResult) == VERNON_STATUS_OK);
 
-    vernon::tools::PackagingOptions computePackaging;
-    computePackaging.computeBundlePath = root / "compute";
-    computePackaging.targetTriple = std::string(triple);
-    ASSERT_TRUE(vernon::tools::packageCompileResult(context, cpuResult, VERNON_TARGET_CPU, computePackaging, output,
-                                                    error) == VERNON_STATUS_OK);
-    nlohmann::json computeManifest = nlohmann::json::parse(readFile(root / "compute" / "compute.json"));
-    ASSERT_TRUE(computeManifest.at("pipeline_version") == VERNON_PIPELINE_VERSION);
-    ASSERT_TRUE(computeManifest.at("target") == "cpu");
-    ASSERT_TRUE(computeManifest.at("artifact_format") == "relocatable_object");
-    ASSERT_TRUE(computeManifest.at("target_triple").get<std::string>() == triple);
-    ASSERT_TRUE(computeManifest.at("object_format") == "coff");
-    ASSERT_TRUE(computeManifest.at("release_version") == VERNON_RELEASE_VERSION);
-    ASSERT_TRUE(std::filesystem::is_regular_file(root / "compute" / computeManifest.at("artifact").get<std::string>()));
-
     vernon::tools::PackagingOptions outputPackaging;
     outputPackaging.outputDirectory = root / "output";
-    ASSERT_TRUE(vernon::tools::packageCompileResult(context, cpuResult, VERNON_TARGET_CPU, outputPackaging, output,
-                                                    error) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tools::packageCompileResult(cpuResult, VERNON_TARGET_CPU, outputPackaging, output, error) ==
+                VERNON_STATUS_OK);
     ASSERT_TRUE(std::filesystem::is_regular_file(root / "output" / "reflection.json"));
     ASSERT_TRUE(std::filesystem::is_regular_file(root / "output" /
                                                  std::string(vernonCompileResultGetArtifactName(cpuResult, 0).data,
                                                              vernonCompileResultGetArtifactName(cpuResult, 0).size)));
+    ASSERT_EQ(readFile(root / "output" / "reflection.json"),
+              std::string(vernonCompileResultGetReflection(cpuResult).data,
+                          vernonCompileResultGetReflection(cpuResult).size));
     vernonCompileResultDestroy(cpuResult);
 
     vernonCompilerDestroy(context);

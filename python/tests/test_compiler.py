@@ -4,8 +4,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from language_contract_cases import (
+    BUILTIN_INVALID_CASES,
+    GENERATED_BUILTIN_VALID_CASES,
+    RAW_BUILTIN_VALID_CASES,
+    case_by_id,
+)
+from language_contract_runner import assert_frontend_rejects, assert_verified_ir, contract_oracle
+from language_contract_traceability import covers_case, covers_case_group
 from vernon_dsl import CompileError, compile_file, compile_source
 from vernon_dsl.cli import main
+from vernon_dsl.types import SpecializationAssignment
 
 
 class TypeSystemTests(unittest.TestCase):
@@ -42,7 +51,7 @@ def resources(
             '!vernon.tensor_view<!vernon.struct<"Vertex">, [-1], "read", "device">',
             output,
         )
-        self.assertIn('!vernon.texture<"2d", f32>', output)
+        self.assertIn('!vernon.texture<"2d", f32, "unknown", "sampled">', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
         self.assertIn("vernon.location = 5 : i64", output)
@@ -51,42 +60,39 @@ def resources(
         self.assertIn(": f16", output)
         self.assertIn(": f64", output)
 
+    @covers_case("LANG-RESOURCE-002/sampled-2d", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-3d", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-cube", layers="FI")
     def test_texture_dimensions_and_coordinate_ranks(self) -> None:
-        for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3)):
-            source = f"""
-from vernon_dsl import *
-
-@fragment
-def sample(
-    image: Annotated[Texture["{dimension}", f32], resource(set=0, binding=0)],
-    sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: Vector[f32, {rank}],
-) -> Vector[f32, 4]:
-    return texture_sample(image, sampler, uv)
-"""
-            output = compile_source(source, f"texture_{dimension}.py")
-            self.assertIn(f'!vernon.texture<"{dimension}", f32>', output)
+        cases = (
+            case_by_id("LANG-RESOURCE-002/sampled-2d"),
+            case_by_id("LANG-RESOURCE-002/sampled-3d"),
+            case_by_id("LANG-RESOURCE-002/sampled-cube"),
+        )
+        for case in cases:
+            output = compile_source(case.source, f"{case.name}.py")
+            assert_verified_ir(self, output, case)
+            assert isinstance(case.expected, str)
+            self.assertIn(case.expected, output)
             self.assertIn('name = "texture_sample"', output)
 
+    @covers_case("LANG-RESOURCE-002/sampled-dimension", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank", layers="F")
     def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
-        invalid_dimension = """
-from vernon_dsl import *
-@fragment
-def sample(image: Texture["1d", f32]) -> f32:
-    return 0.0
-"""
-        with self.assertRaisesRegex(CompileError, "texture dimension must be one of"):
-            compile_source(invalid_dimension, "bad_dimension.py")
+        assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/sampled-dimension"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank"))
 
-        invalid_coordinates = """
-from vernon_dsl import *
-@fragment
-def sample(image: Texture["cube", f32], sampler: Sampler,
-           uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, sampler, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "3-component"):
-            compile_source(invalid_coordinates, "bad_coordinates.py")
+    @covers_case("LANG-TEXTURE-STORAGE/three-dimensional-store", layers="FI")
+    @covers_case("LANG-RESOURCE-002/cube-storage", layers="F")
+    def test_storage_texture_uses_unified_texture_annotation(self) -> None:
+        case = case_by_id("LANG-TEXTURE-STORAGE/three-dimensional-store")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        assert isinstance(case.expected, str)
+        self.assertIn(case.expected, output)
+        self.assertIn('name = "texture_store"', output)
+
+        assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-storage"))
 
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """
@@ -118,7 +124,10 @@ def explicit_sample(
         self.assertEqual(output.count('name = "texture_size"'), 2)
         self.assertEqual(output.count('vernon.implicit = "sampler"'), 1)
         self.assertNotIn('vernon.implicit = "texture_size"', output)
-        self.assertIn('(!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)', output)
+        self.assertIn(
+            '(!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)',
+            output,
+        )
         explicit_only = compile_source(
             """
 from vernon_dsl import *
@@ -131,51 +140,36 @@ def main(image: Texture["2d", f32], sampler: Sampler,
         )
         self.assertNotIn('vernon.implicit = "sampler"', explicit_only)
 
+    @covers_case("LANG-TEXTURE-SAMPLE-IMPLICIT/vertex-without-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-LOD/integer-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SIZE/floating-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/compute-without-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/vertex", layers="FI")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/compute", layers="FI")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/fragment", layers="FI")
     def test_sampling_stage_and_lod_types_are_validated(self) -> None:
-        vertex_implicit_lod = """
-from vernon_dsl import *
-@vertex
-def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "without lod"):
-            compile_source(vertex_implicit_lod, "vertex_implicit_lod.py")
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-IMPLICIT/vertex-without-lod"))
 
-        invalid_sample_lod = """
-from vernon_dsl import *
-@fragment
-def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, uv, 1)
-"""
-        with self.assertRaisesRegex(CompileError, "floating-point scalar"):
-            compile_source(invalid_sample_lod, "invalid_sample_lod.py")
+        vertex_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/vertex")
+        output = compile_source(vertex_case.source, f"{vertex_case.name}.py")
+        assert_verified_ir(self, output, vertex_case)
+        self.assertIn('name = "texture_sample"', output)
 
-        invalid_size_lod = """
-from vernon_dsl import *
-@fragment
-def main(image: Texture["2d", f32]) -> Vector[u32, 2]:
-    return texture_size(image, 1.0)
-"""
-        with self.assertRaisesRegex(CompileError, "integer scalar"):
-            compile_source(invalid_size_lod, "invalid_size_lod.py")
+        for case in (
+            case_by_id("LANG-TEXTURE-SAMPLE-LOD/integer-lod"),
+            case_by_id("LANG-TEXTURE-SIZE/floating-lod"),
+            case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/compute-without-lod"),
+        ):
+            assert_frontend_rejects(self, case)
 
-        compute_implicit_lod = """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(image: Texture["2d", f32], sampler: Sampler,
-         uv: Vector[f32, 2]) -> None:
-    color = texture_sample(image, sampler, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "without lod.*fragment shaders"):
-            compile_source(compute_implicit_lod, "compute_implicit_lod.py")
+        compute_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/compute")
+        output = compile_source(compute_case.source, f"{compute_case.name}.py")
+        assert_verified_ir(self, output, compute_case)
+        self.assertIn('name = "texture_sample"', output)
 
-        compute_explicit_lod = """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(image: Texture["2d", f32], sampler: Sampler) -> None:
-    color = texture_sample(image, sampler, Vector([0.0, 0.0]), 0.0)
-"""
-        output = compile_source(compute_explicit_lod, "compute_explicit_lod.py")
+        fragment_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/fragment")
+        output = compile_source(fragment_case.source, f"{fragment_case.name}.py")
+        assert_verified_ir(self, output, fragment_case)
         self.assertIn('name = "texture_sample"', output)
 
     def test_implicit_sampler_binding_skips_declared_resources(self) -> None:
@@ -226,139 +220,32 @@ def invalid(color: Vector[f32, 3]) -> f32:
 
 
 class StageTests(unittest.TestCase):
+    @covers_case_group("RAW_BUILTIN_VALID_CASES", layers="FI")
     def test_raw_builtin_contracts(self) -> None:
-        source = """
-from vernon_dsl import *
+        output = compile_source(RAW_BUILTIN_VALID_CASES[0].source, "raw_builtins.py")
+        assert_verified_ir(self, output)
+        for case in RAW_BUILTIN_VALID_CASES:
+            with contract_oracle(case):
+                assert isinstance(case.expected, str)
+                self.assertIn(case.expected, output)
 
-@vertex
-def vertex_main(
-    vertex: Annotated[u32, builtin("vertex_index")],
-    instance: Annotated[u32, builtin("instance_index")],
-) -> Annotated[Vector[f32, 4], builtin("position")]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-
-@fragment
-def fragment_main(
-    coordinate: Annotated[Vector[f32, 4], builtin("frag_coord")],
-    facing: Annotated[bool, builtin("front_facing")],
-) -> Vector[f32, 4]:
-    return coordinate
-
-@kernel(workgroup_size=(1, 1, 1))
-def compute_main(
-    global_id: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
-    local_id: Annotated[Vector[u32, 3], builtin("local_invocation_id")],
-    group_id: Annotated[Vector[u32, 3], builtin("workgroup_id")],
-) -> None:
-    pass
-"""
-        output = compile_source(source, "raw_builtins.py")
-        for builtin_name in (
-            "position",
-            "vertex_index",
-            "instance_index",
-            "frag_coord",
-            "front_facing",
-            "global_invocation_id",
-            "local_invocation_id",
-            "workgroup_id",
-        ):
-            self.assertIn(f'vernon.builtin = "{builtin_name}"', output)
-
+    @covers_case_group("BUILTIN_INVALID_CASES", layers="F")
     def test_raw_builtin_contract_diagnostics(self) -> None:
-        cases = (
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main(value: Annotated[u32, builtin("mystery")]) -> Vector[f32, 4]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-""",
-                "unknown builtin 'mystery'",
-            ),
-            (
-                """
-from vernon_dsl import *
-@fragment
-def main(value: Annotated[u32, builtin("vertex_index")]) -> Vector[f32, 4]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-""",
-                "requires a vertex input",
-            ),
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main() -> Annotated[u32, builtin("vertex_index")]:
-    return 0
-""",
-                "requires a vertex input",
-            ),
-            (
-                """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
-    pass
-""",
-                "requires type tensor<3xi32>",
-            ),
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main() -> Vector[f32, 3]:
-    return Vector([0.0, 0.0, 0.0])
-""",
-                "builtin 'position' requires type tensor<4xf32>",
-            ),
-        )
-        for index, (source, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(source, f"bad_builtin_{index}.py")
+        for case in BUILTIN_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode", layers="F")
     def test_texture_cannot_mix_implicit_and_explicit_samplers(self) -> None:
-        source = """
-from vernon_dsl import *
-@fragment
-def main(
-    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
-    sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: Vector[f32, 2],
-) -> Vector[f32, 4]:
-    implicit_value = texture_sample(image, uv)
-    explicit_value = texture_sample(image, sampler, uv)
-    return implicit_value + explicit_value
-"""
-        with self.assertRaisesRegex(CompileError, "both implicit and explicit sampler forms"):
-            compile_source(source, "mixed_sampler_forms.py")
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode"))
 
+    @covers_case_group("GENERATED_BUILTIN_VALID_CASES", layers="FI")
     def test_parameterless_graphics_builtins(self) -> None:
-        source = """
-from vernon_dsl import *
-
-@vertex
-def vertex_main(position: Vector[f32, 4]) -> Vector[f32, 4]:
-    vertex = vertex_id()
-    instance = instance_id()
-    return position
-
-@fragment
-def fragment_main() -> Vector[f32, 4]:
-    size = resolution()
-    coordinate = fragment_coord()
-    facing = front_facing()
-    return coordinate
-"""
-        output = compile_source(source, "graphics_builtins.py")
-        for marker in (
-            'vernon.implicit = "resolution"',
-            'vernon.builtin = "frag_coord"',
-            'vernon.builtin = "front_facing"',
-            'vernon.builtin = "vertex_index"',
-            'vernon.builtin = "instance_index"',
-        ):
-            self.assertIn(marker, output)
+        output = compile_source(GENERATED_BUILTIN_VALID_CASES[0].source, "graphics_builtins.py")
+        assert_verified_ir(self, output)
+        for case in GENERATED_BUILTIN_VALID_CASES:
+            with contract_oracle(case):
+                assert isinstance(case.expected, str)
+                self.assertIn(case.expected, output)
 
     def test_parameterless_graphics_builtins_enforce_stage(self) -> None:
         invalid = """
@@ -472,7 +359,7 @@ def update(
         self.assertIn('"vernon.swizzle"', output)
         self.assertIn('"vernon.load"', output)
         self.assertIn('"vernon.store"', output)
-        self.assertIn("scf.while", output)
+        self.assertIn("scf.for", output)
 
     def test_if_merges_existing_values(self) -> None:
         source = """
@@ -516,6 +403,106 @@ def bad(x: f32) -> f32:
         self.assertIn("scf.while", output)
         self.assertIn("arith.subf", output)
 
+    def test_canonical_ranges_lower_to_scf_for(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def sum_nested(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        for j in range(1, stop, 1):
+            result = result + i + j
+    return result
+"""
+        output = compile_source(source, "canonical_ranges.py")
+        self.assertEqual(output.count("scf.for"), 2)
+        self.assertNotIn("scf.while", output)
+
+    def test_noncanonical_ranges_remain_scf_while(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def dynamic_step(stop: i32, step: i32) -> i32:
+    result = 0
+    for i in range(0, stop, step):
+        result = result + i
+    return result
+
+@func
+def negative_step(stop: i32) -> i32:
+    result = 0
+    for i in range(stop, 0, -1):
+        result = result + i
+    return result
+
+@func
+def static_stride(stop: i32) -> i32:
+    result = 0
+    for i in range(0, stop, 2):
+        result = result + i
+    return result
+
+@func
+def exits(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i > 2:
+            break
+        result = result + i
+    return result
+
+@func
+def continues(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i < 2:
+            continue
+        result = result + i
+    return result
+
+@func
+def early_return(stop: i32) -> i32:
+    for i in range(stop):
+        if i > 2:
+            return i
+    return stop
+"""
+        output = compile_source(source, "noncanonical_ranges.py")
+        self.assertEqual(output.count("scf.while"), 6)
+        self.assertNotIn("scf.for", output)
+
+    def test_canonical_range_else_is_unconditional(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def range_else(stop: i32) -> i32:
+    result = 1
+    for i in range(stop):
+        result = result + i
+    else:
+        result = result + 7
+    return result
+"""
+        output = compile_source(source, "range_else.py")
+        self.assertIn("scf.for", output)
+        self.assertNotIn("vernon.loop_control_index", output)
+
+    def test_canonical_induction_preserves_storage_index(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def fill(values: TensorView[f32, (dyn,), write]) -> None:
+    for i in range(0, 4):
+        values[i] = 1.0
+"""
+        output = compile_source(source, "canonical_storage_index.py")
+        self.assertIn("scf.for", output)
+        self.assertEqual(output.count("arith.index_cast"), 3)
+
     def test_output_is_deterministic(self) -> None:
         source = """
 from vernon_dsl import *
@@ -537,8 +524,74 @@ def main(value: f32) -> f32:
             self.assertEqual(main([str(input_path), "-o", str(output_path)]), 0)
             self.assertIn("func.func @main", output_path.read_text(encoding="utf-8"))
 
+    def test_cli_accepts_typed_specialization_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.py"
+            output_path = Path(directory) / "output.mlir"
+            input_path.write_text(
+                "from vernon_dsl import *\n"
+                'FLAG = feature("FLAG")\n'
+                'RANK = specialization("rank", u32)\n'
+                "@fragment\n"
+                "def main(x: f32) -> f32:\n"
+                "    if FLAG:\n"
+                "        return x + f32(RANK)\n"
+                "    return x\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                main(
+                    [
+                        str(input_path),
+                        "-o",
+                        str(output_path),
+                        "--entry",
+                        "main",
+                        "--specialization",
+                        "FLAG:bool=true",
+                        "--specialization",
+                        "rank:u32=4",
+                        "--specialization-binding",
+                        "RANK=rank",
+                    ]
+                ),
+                0,
+            )
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn('vernon.variant_key = ["FLAG"]', output)
+            self.assertIn("arith.constant 4 : i32", output)
+            self.assertIn("arith.addf", output)
+
 
 class ModuleGraphTests(unittest.TestCase):
+    def test_dsl_entry_can_share_a_module_with_host_program_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "application.py"
+            path.write_text(
+                "from dataclasses import dataclass\n"
+                "from functools import cache\n"
+                "import json\n"
+                "from vernon_dsl import TensorView, dyn, f32, kernel, write\n"
+                "@dataclass\n"
+                "class Options:\n"
+                "    scale: float\n"
+                "@cache\n"
+                "def host_value() -> float:\n"
+                "    def nested() -> float:\n"
+                "        return json.loads('1.0')\n"
+                "    return nested()\n"
+                "@kernel\n"
+                "def main(output: TensorView[f32, (dyn,), write]) -> None:\n"
+                "    output[0] = 2.0\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(path)
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("host_value", output)
+            self.assertNotIn("Options", output)
+
     def test_project_local_helper_is_namespaced_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -568,16 +621,43 @@ class ModuleGraphTests(unittest.TestCase):
             self.assertIn("lighting.py=", output)
             self.assertIn("shader.py=", output)
 
+    def test_unreferenced_project_import_is_not_loaded_or_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unused = root / "unused.py"
+            shader = root / "shader.py"
+            unused.write_text("this is not valid Python !!!\n", encoding="utf-8")
+            shader.write_text(
+                "from unused import missing\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(shader, entry="main")
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("unused.py=", output)
+
     def test_import_cycle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "a.py").write_text("from b import helper\n", encoding="utf-8")
+            (root / "a.py").write_text(
+                "from b import helper\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return helper(value)\n",
+                encoding="utf-8",
+            )
             (root / "b.py").write_text(
                 "from a import main\n"
-                "from vernon_dsl import func\n"
+                "from vernon_dsl import f32, func\n"
                 "@func\n"
                 "def helper(value: f32) -> f32:\n"
-                "    return value\n",
+                "    return main(value)\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(CompileError, "import cycle"):
@@ -665,9 +745,15 @@ def main(
             )
 
             static = compile_file(path)
-            instanced = compile_file(path, features={"INSTANCE"})
-            skinned = compile_file(path, features={"SKIN"})
-            combined = compile_file(path, features={"SKIN", "INSTANCE"})
+            instanced = compile_file(path, specializations=(SpecializationAssignment("INSTANCE", "bool", True),))
+            skinned = compile_file(path, specializations=(SpecializationAssignment("SKIN", "bool", True),))
+            combined = compile_file(
+                path,
+                specializations=(
+                    SpecializationAssignment("SKIN", "bool", True),
+                    SpecializationAssignment("INSTANCE", "bool", True),
+                ),
+            )
 
             for output in (static, instanced, skinned, combined):
                 self.assertNotIn("scf.if", output)
@@ -711,7 +797,7 @@ def main(
             with self.assertRaisesRegex(CompileError, "disabled value"):
                 compile_file(path)
             with self.assertRaisesRegex(CompileError, "undeclared feature"):
-                compile_file(path, features={"SKIN"})
+                compile_file(path, specializations=(SpecializationAssignment("SKIN", "bool", True),))
 
     def test_selected_entry_prunes_unrelated_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

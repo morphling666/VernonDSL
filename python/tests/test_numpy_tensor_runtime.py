@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
-from vernon_dsl import _native as native
-from vernon_dsl._runtime.session import RuntimeUnavailableError
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
@@ -116,42 +114,50 @@ def static_rank_three_tensor_arithmetic(
     output[3] = result[1, 1, 0]
 
 
+@expand_backend_matrix_tests
 class NumpyTensorRuntimeTests(unittest.TestCase):
-    @staticmethod
-    def _initialize_compute_backend(architecture: object) -> bool:
-        target = {
-            vd.cpu: native.Target.CPU,
-            vd.cuda: native.Target.CUDA,
-            vd.vulkan: native.Target.VULKAN,
-            vd.directx: native.Target.DIRECTX,
-            vd.opengl: native.Target.OPENGL,
-            vd.opengles: native.Target.OPENGL_ES,
-        }[architecture]
-        if not native.target_available(target):
-            return False
-        runtime_backend = {
-            vd.cuda: native.RuntimeBackend.CUDA,
-            vd.vulkan: native.RuntimeBackend.VULKAN,
-            vd.directx: native.RuntimeBackend.DIRECTX12,
-        }.get(architecture)
-        if runtime_backend is not None and not native.runtime_available(runtime_backend):
-            return False
-        try:
-            if architecture == vd.opengl:
-                vd.init(arch=architecture, api_version=(4, 3))  # type: ignore[arg-type]
-            else:
-                vd.init(arch=architecture)  # type: ignore[arg-type]
-        except RuntimeUnavailableError:
-            vd.init(arch=vd.cpu)
-            return False
-        return True
+    def test_scalar_symbols_are_types_and_numpy_casts(self) -> None:
+        self.assertIsInstance(vd.i32, type)
+        self.assertIsInstance(vd.f32, type)
+        self.assertIsInstance(vd.i32(7), np.int32)
+        self.assertIsInstance(vd.f32(1.25), np.float32)
 
-    def test_backend_initialization_only_suppresses_unavailable_errors(self) -> None:
-        with mock.patch.object(vd, "init", side_effect=RuntimeError("driver initialization regression")):
-            with self.assertRaisesRegex(RuntimeError, "driver initialization regression"):
-                self._initialize_compute_backend(vd.cpu)
-        with mock.patch.object(vd, "init", side_effect=[RuntimeUnavailableError("unavailable"), None]):
-            self.assertFalse(self._initialize_compute_backend(vd.cpu))
+    def test_vector_host_value_uses_numpy_backed_components_and_operators(self) -> None:
+        vector = vd.Vector([1.0, 2.0, 3.0, 4.0])
+
+        self.assertIsInstance(vector, np.ndarray)
+        self.assertIsInstance(vector, vd.Vector)
+        self.assertEqual((vector.x, vector.y, vector.z, vector.w), (1.0, 2.0, 3.0, 4.0))
+        np.testing.assert_array_equal(vector.xy, np.array((1.0, 2.0), dtype=np.float32))
+        np.testing.assert_array_equal(vector.xyz, np.array((1.0, 2.0, 3.0), dtype=np.float32))
+        np.testing.assert_array_equal(
+            vector + vd.Vector([4.0, 3.0, 2.0, 1.0]),
+            np.full(4, 5.0, dtype=np.float32),
+        )
+        self.assertFalse(vector.flags.writeable)
+
+    def test_vector_and_matrix_are_specialized_tensor_values(self) -> None:
+        tensor = vd.Tensor([[1.0, 2.0], [3.0, 4.0]])
+        matrix = vd.Matrix([[1.0, 2.0], [3.0, 4.0]])
+        vector = vd.Vector([1.0, 2.0])
+
+        self.assertIsInstance(tensor, vd.Tensor)
+        self.assertIsInstance(matrix, vd.Tensor)
+        self.assertIsInstance(matrix, vd.Matrix)
+        self.assertIsInstance(vector, vd.Tensor)
+        np.testing.assert_array_equal(tensor + tensor, np.array(((2.0, 4.0), (6.0, 8.0)), dtype=np.float32))
+        np.testing.assert_array_equal(matrix * 2.0, np.array(((2.0, 4.0), (6.0, 8.0)), dtype=np.float32))
+        self.assertFalse(tensor.flags.writeable)
+        self.assertFalse(matrix.flags.writeable)
+
+    def test_rank_zero_tensor_is_distinct_from_its_scalar_value(self) -> None:
+        tensor = vd.Tensor(3.0)
+
+        self.assertIsInstance(tensor, vd.Tensor)
+        self.assertEqual(tensor.shape, ())
+        self.assertEqual(tensor[()], 3.0)
+        self.assertEqual(tensor.item(), 3.0)
+        self.assertFalse(tensor.flags.writeable)
 
     @staticmethod
     def _inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -243,16 +249,14 @@ class NumpyTensorRuntimeTests(unittest.TestCase):
         )
         np.testing.assert_allclose(output.to_numpy(), expected, rtol=1e-6, atol=1e-6)
 
-    def test_available_graphics_compute_backends_match_numpy(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_backends_match_numpy(self, backend: BackendRow) -> None:
         expected = self._expected()
-        for architecture in (vd.opengl, vd.vulkan, vd.directx):
-            with self.subTest(backend=architecture.name):
-                if not self._initialize_compute_backend(architecture):
-                    continue
-                actual = self._run(architecture)
-                np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        actual = self._run(backend.architecture)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
-    def test_available_backends_match_numpy_matmul_rank_categories(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_backends_match_numpy_matmul_rank_categories(self, backend: BackendRow) -> None:
         values = np.linspace(-1.0, 2.0, 12, dtype=np.float32)
         expected = np.concatenate(
             (
@@ -262,19 +266,16 @@ class NumpyTensorRuntimeTests(unittest.TestCase):
                 np.matmul(values[4:8].reshape(2, 2), values[8:12].reshape(2, 2)).reshape(-1),
             )
         )
-        for architecture in (vd.cuda, vd.opengl, vd.vulkan, vd.directx):
-            with self.subTest(backend=architecture.name):
-                if not self._initialize_compute_backend(architecture):
-                    continue
-                output = vd.storage.zeros(dtype=vd.f32, shape=(9,))
-                cpu_matmul_rank_categories(
-                    output,
-                    vd.storage.from_numpy(values),
-                    grid=(1, 1, 1),
-                )
-                np.testing.assert_allclose(output.to_numpy(), expected, rtol=1e-5, atol=1e-5)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(9,))
+        cpu_matmul_rank_categories(
+            output,
+            vd.storage.from_numpy(values),
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_allclose(output.to_numpy(), expected, rtol=1e-5, atol=1e-5)
 
-    def test_rank_three_add_subtract_multiply_divide_on_all_compute_backends(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_rank_three_add_subtract_multiply_divide(self, backend: BackendRow) -> None:
         left = np.linspace(-3.0, 4.0, 12, dtype=np.float32)
         right = np.linspace(0.5, 2.0, 12, dtype=np.float32)
         projection = np.array(((1.0, 0.25), (-0.5, 1.0), (0.75, -0.25)), dtype=np.float32).reshape(1, 3, 2)
@@ -283,25 +284,19 @@ class NumpyTensorRuntimeTests(unittest.TestCase):
         right_tensor = right.reshape(2, 2, 3)
         product = np.matmul(left_tensor, projection)
         expected = product[(0, 0, 1, 1), (0, 1, 0, 1), (0, 1, 1, 0)]
-        completed: set[str] = set()
-        for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.opengl, vd.opengles, vd.directx):
-            with self.subTest(backend=architecture.name):
-                if not self._initialize_compute_backend(architecture):
-                    continue
-                output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
-                if architecture in (vd.cpu, vd.cuda):
-                    rank_three_tensor_arithmetic(output, values, grid=(1, 1, 1))
-                else:
-                    static_rank_three_tensor_arithmetic(
-                        output,
-                        left_tensor,
-                        right_tensor,
-                        projection,
-                        grid=(1, 1, 1),
-                    )
-                np.testing.assert_allclose(output.to_numpy(), expected, rtol=1e-5, atol=1e-5)
-                completed.add(architecture.name)
-        self.assertIn(vd.cpu.name, completed)
+        dynamic_output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        rank_three_tensor_arithmetic(dynamic_output, values, grid=(1, 1, 1))
+        np.testing.assert_allclose(dynamic_output.to_numpy(), expected, rtol=1e-5, atol=1e-5)
+
+        static_output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        static_rank_three_tensor_arithmetic(
+            static_output,
+            left_tensor,
+            right_tensor,
+            projection,
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_allclose(static_output.to_numpy(), expected, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

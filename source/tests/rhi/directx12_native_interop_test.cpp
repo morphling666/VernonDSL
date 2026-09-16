@@ -144,6 +144,20 @@ TEST(DirectX12NativeInterop, BorrowsObjectsWithoutChangingTheirLifetime) {
     EXPECT_EQ(vernonRhiDeviceGetImageNativeHandle(device, importedImage, &nativeImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(reinterpret_cast<void *>(nativeImage), image.Get());
 
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletionState completionState{};
+    ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_PENDING);
+    ASSERT_EQ(vernonRhiCompletionSignal(device, completion, VERNON_RHI_STATUS_OK), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, importedBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyNativeDescriptorRange(device, importedRange), VERNON_RHI_STATUS_OK);
@@ -186,14 +200,17 @@ TEST(DirectX12NativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
     for (VernonRhiBuffer &buffer : buffers)
         ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
 
-    const uint64_t firstResource = vernon::rhi::bufferResource(device, buffers.front());
-    ASSERT_NE(firstResource, 0u);
+    auto firstResourceResult = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_TRUE(firstResourceResult.isOk());
+    const uint64_t firstResource = firstResourceResult.value();
     for (size_t index = 0; index < 64; ++index) {
         VernonRhiBuffer extra{};
         ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &extra), VERNON_RHI_STATUS_OK);
         buffers.push_back(extra);
     }
-    EXPECT_EQ(vernon::rhi::bufferResource(device, buffers.front()), firstResource);
+    auto stableResource = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_TRUE(stableResource.isOk());
+    EXPECT_EQ(stableResource.value(), firstResource);
 
     for (VernonRhiBuffer buffer : buffers)
         EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);

@@ -2,23 +2,40 @@ from __future__ import annotations
 
 import gc
 import tempfile
+import threading
 import unittest
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Annotated, Any
 from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._native as native
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
+from language_contract_cases import case_by_id
+from language_contract_runner import assert_frontend_rejects, assert_verified_ir, contract_oracle
+from language_contract_traceability import covers_case
 from vernon_dsl import CompileError, Compiler, compile_source
-from vernon_dsl._runtime.resources import (
-    _dispatch_borrow_scope,
-    _logical_collection_shape,
-    _validate_dispatch_borrows,
+from vernon_dsl._runtime.binding import (
+    _DispatchBorrowLease,
+    _PersistentBindingTable,
 )
+from vernon_dsl._runtime.tensor import _logical_collection_shape
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.analysis import typed_model_data
 from vernon_dsl.host_values import host_abi_layout
+
+_TEST_CONTEXT = SimpleNamespace(
+    identity=0,
+    session=SimpleNamespace(arch=vd.cpu, native=native, rhi_host=None),
+)
+
+
+def _context(session: object) -> SimpleNamespace:
+    return SimpleNamespace(identity=session.identity, session=session)
 
 
 @vd.struct(shared=True)
@@ -34,7 +51,70 @@ class NestedRecord:
     pair: vd.Tuple[vd.f32, vd.i32]
 
 
+@expand_backend_matrix_tests
 class TensorStorageRuntimeTests(unittest.TestCase):
+    def test_persistent_binding_table_requires_explicit_commit_for_typed_updates(self) -> None:
+        cache = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
+        builder = mock.Mock()
+        pipeline = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.builder = builder
+        builder.prepare_host_tensor.side_effect = lambda *_: object()
+        parameter = SimpleNamespace(
+            slot=0,
+            name="amount",
+            element_leaves=((native.DATA_F32, 1, 0),),
+            shape=(),
+        )
+
+        with cache.invocation(pipeline, _TEST_CONTEXT) as active:
+            self.assertIs(active, transaction)
+            cache.bind_argument(active.builder, pipeline, parameter, np.float32(2.0), binding_token=11)
+            active.commit()
+
+        pipeline.program_instance.assert_called_once_with()
+        instance.begin_invocation.assert_called_once_with()
+        transaction.bind.assert_called_once()
+        self.assertEqual(transaction.bind.call_args.args[:2], (0, ("execution-value", 11)))
+        transaction.commit.assert_called_once_with()
+        transaction.rollback.assert_not_called()
+
+    def test_persistent_binding_table_rolls_back_failed_invocation(self) -> None:
+        table = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
+        pipeline = mock.Mock()
+        builder = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.builder = builder
+
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            with table.invocation(pipeline, _TEST_CONTEXT):
+                raise RuntimeError("dispatch failed")
+
+        transaction.rollback.assert_called_once_with()
+        transaction.commit.assert_not_called()
+
+    def test_persistent_binding_table_rejects_implicit_completion(self) -> None:
+        table = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
+        pipeline = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.finished = False
+
+        with self.assertRaisesRegex(RuntimeError, "without explicit commit or rollback"):
+            with table.invocation(pipeline, _TEST_CONTEXT):
+                pass
+
+        transaction.rollback.assert_called_once_with()
+        transaction.commit.assert_not_called()
+
     def test_nested_host_layout_uses_one_complete_native_plan(self) -> None:
         with mock.patch.object(native, "_plan_value_abi", wraps=native._plan_value_abi) as planner:
             layout = host_abi_layout(NestedRecord)
@@ -49,7 +129,10 @@ class TensorStorageRuntimeTests(unittest.TestCase):
 
         self.assertEqual(_logical_collection_shape(first, tuple_type), ())
         self.assertEqual(_logical_collection_shape((first, second), tuple_type), (2,))
-        self.assertEqual(_logical_collection_shape(((first, second), (second, first)), tuple_type), (2, 2))
+        self.assertEqual(
+            _logical_collection_shape(((first, second), (second, first)), tuple_type),
+            (2, 2),
+        )
         with self.assertRaisesRegex(ValueError, "rectangular"):
             _logical_collection_shape(((first,), (first, second)), tuple_type)
 
@@ -67,6 +150,177 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(storage.layout.byte_strides, (12, 4))
         self.assertEqual(storage.layout.byte_offset, 0)
 
+    def test_partial_updates_track_only_changed_backing_ranges(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(5, 4))
+        storage.update([1, 3], np.full((2, 4), 2.0, dtype=np.float32))
+
+        one_dimensional = vd.TensorStorage.zeros(dtype=vd.f32, shape=(5,))
+        one_dimensional.update([1, 3], np.array([2.0, 3.0], dtype=np.float32))
+
+        alternating_rows = storage.view(shape=(2, 4), strides=(8, 1), offset=4)
+        alternating_rows.copy_from_numpy(np.full((2, 4), 3.0, dtype=np.float32))
+
+        unchanged = storage.to_numpy()
+        with self.assertRaisesRegex(ValueError, "one-dimensional"):
+            storage.update(np.array([[0]], dtype=np.int32), np.ones((1, 1, 4), dtype=np.float32))
+        with self.assertRaisesRegex(TypeError, "must be integers"):
+            storage.update([True, False], np.ones((2, 4), dtype=np.float32))
+        np.testing.assert_array_equal(storage.to_numpy(), unchanged)
+
+    def test_residency_uploads_only_coalesced_dirty_ranges(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(5, 4))
+        uploads: list[tuple[int, int]] = []
+        native_buffer = mock.Mock()
+        native_buffer.upload_ranges.side_effect = lambda ranges: uploads.extend(
+            (offset, len(data)) for offset, data in ranges
+        )
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        self.assertEqual(uploads, [(0, 80)])
+        uploads.clear()
+        storage.update([1, 3], np.full((2, 4), 2.0, dtype=np.float32))
+        storage._resident_buffer(_context(state))
+
+        self.assertEqual(uploads, [(16, 16), (48, 16)])
+
+    def test_partial_host_update_does_not_read_back_gpu_written_storage(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
+        uploads: list[tuple[int, int]] = []
+        backing = bytearray(8 * np.dtype(np.float32).itemsize)
+        native_buffer = mock.Mock()
+
+        def upload_ranges(ranges: list[tuple[int, bytes]]) -> None:
+            for offset, data in ranges:
+                uploads.append((offset, len(data)))
+                backing[offset : offset + len(data)] = data
+
+        native_buffer.upload_ranges.side_effect = upload_ranges
+        native_buffer.download_ranges.side_effect = lambda ranges: [
+            (begin, bytes(backing[begin:end])) for begin, end in ranges
+        ]
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        uploads.clear()
+        backing[:] = np.full((8,), 2.0, dtype=np.float32).tobytes()
+        storage._publish_device_write(_context(state), (storage._region,))
+        storage.update([1, 6], np.array([3.0, 4.0], dtype=np.float32))
+        native_buffer.download.assert_not_called()
+        result = storage.to_numpy()
+
+        self.assertEqual(uploads, [])
+        np.testing.assert_array_equal(result, np.array([2.0, 3.0, 2.0, 2.0, 2.0, 2.0, 4.0, 2.0], dtype=np.float32))
+        storage._resident_buffer(_context(state))
+        self.assertEqual(uploads, [(4, 4), (24, 4)])
+
+    def test_fragmented_view_update_preserves_gpu_written_gaps(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
+        backing = bytearray(1024 * np.dtype(np.float32).itemsize)
+        native_buffer = mock.Mock()
+
+        def upload_ranges(ranges: list[tuple[int, bytes]]) -> None:
+            for offset, data in ranges:
+                backing[offset : offset + len(data)] = data
+
+        native_buffer.upload_ranges.side_effect = upload_ranges
+        native_buffer.download_ranges.side_effect = lambda ranges: [
+            (begin, bytes(backing[begin:end])) for begin, end in ranges
+        ]
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        backing[:] = np.full((1024,), 2.0, dtype=np.float32).tobytes()
+        storage._publish_device_write(_context(state), (storage._region,))
+        storage.view(shape=(300,), strides=(2,), access="write").copy_from_numpy(np.full((300,), 3.0, dtype=np.float32))
+        result = storage.to_numpy()
+
+        expected = np.full((1024,), 2.0, dtype=np.float32)
+        expected[:600:2] = 3.0
+        np.testing.assert_array_equal(result, expected)
+
+    def test_large_fragmented_view_update_promotes_to_one_preserving_upload(self) -> None:
+        element_count = 10_000
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(element_count,))
+        backing = bytearray(element_count * np.dtype(np.float32).itemsize)
+        uploads: list[list[tuple[int, bytes]]] = []
+        native_buffer = mock.Mock()
+
+        def upload_ranges(ranges: list[tuple[int, bytes]]) -> None:
+            uploads.append(ranges)
+            for offset, data in ranges:
+                backing[offset : offset + len(data)] = data
+
+        native_buffer.upload_ranges.side_effect = upload_ranges
+        native_buffer.download_ranges.side_effect = lambda ranges: [
+            (begin, bytes(backing[begin:end])) for begin, end in ranges
+        ]
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        uploads.clear()
+        backing[:] = np.full((element_count,), 2.0, dtype=np.float32).tobytes()
+        storage._publish_device_write(_context(state), (storage._region,))
+        storage.view(shape=(element_count // 2,), strides=(2,), access="write").copy_from_numpy(
+            np.full((element_count // 2,), 3.0, dtype=np.float32)
+        )
+        storage._resident_buffer(_context(state))
+        result = storage.to_numpy()
+
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(len(uploads[0]), 1)
+        self.assertEqual(uploads[0][0][0], 0)
+        self.assertEqual(len(uploads[0][0][1]), (element_count - 1) * np.dtype(np.float32).itemsize)
+        expected = np.full((element_count,), 2.0, dtype=np.float32)
+        expected[::2] = 3.0
+        np.testing.assert_array_equal(result, expected)
+
+    def test_large_fragmented_view_read_uses_one_exact_batched_download(self) -> None:
+        element_count = 10_000
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(element_count,))
+        backing = bytearray(np.full((element_count,), 2.0, dtype=np.float32).tobytes())
+        downloads: list[list[tuple[int, int]]] = []
+        native_buffer = mock.Mock()
+        native_buffer.upload_ranges.return_value = None
+
+        def download_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, bytes]]:
+            downloads.append(ranges)
+            return [(begin, bytes(backing[begin:end])) for begin, end in ranges]
+
+        native_buffer.download_ranges.side_effect = download_ranges
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        storage._publish_device_write(_context(state), (storage._region,))
+        result = storage.view(shape=(element_count // 2,), strides=(2,), access="read").to_numpy()
+
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(len(downloads[0]), element_count // 2)
+        self.assertEqual(downloads[0][0], (0, 4))
+        self.assertEqual(downloads[0][-1], ((element_count - 2) * 4, (element_count - 1) * 4))
+        np.testing.assert_array_equal(result, np.full((element_count // 2,), 2.0, dtype=np.float32))
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_gpu_buffer_accepts_disjoint_partial_uploads(self, backend: BackendRow) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
+        context = _context(vd.current_session())
+        native_buffer = storage._resident_buffer(context)
+        storage.update([1, 513], np.array([5.0, 7.0], dtype=np.float32))
+        storage._resident_buffer(context)
+
+        resident = np.frombuffer(native_buffer.download(), dtype=np.float32)
+        np.testing.assert_array_equal(resident[[1, 513]], np.array([5.0, 7.0], dtype=np.float32))
+
     def test_strided_and_negative_views_project_without_copying(self) -> None:
         values = np.arange(12, dtype=np.float32).reshape(3, 4)
         storage = vd.TensorStorage.from_numpy(values)
@@ -78,16 +332,37 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(interleaved.layout.byte_strides, (16, 4))
         self.assertEqual(interleaved.layout.byte_offset, 4)
 
-    def test_view_validation_rejects_out_of_bounds_and_writable_aliasing(self) -> None:
+    def test_rank_zero_view_round_trips_scalar_storage(self) -> None:
+        storage = vd.TensorStorage.from_numpy(np.array(3.0, dtype=np.float32))
+        view = storage.view(shape=(), strides=())
+
+        self.assertEqual(view.shape, ())
+        self.assertEqual(view.layout.byte_strides, ())
+        self.assertEqual(view.to_numpy().shape, ())
+        self.assertEqual(view.to_numpy()[()], 3.0)
+        self.assertEqual(view[()], 3.0)
+
+        view[()] = 7.0
+        self.assertEqual(storage.to_numpy()[()], 7.0)
+
+    @covers_case("LANG-VIEW-003/strict-direct-binding", layers="F")
+    @covers_case("LANG-VIEW-005/alias-lifetime-proof", layers="F")
+    def test_view_validation_rejects_out_of_bounds_and_defers_injectivity(self) -> None:
+        binding_case = case_by_id("LANG-VIEW-003/strict-direct-binding")
+        alias_case = case_by_id("LANG-VIEW-005/alias-lifetime-proof")
         storage = vd.TensorStorage.zeros(dtype=vd.i32, shape=(8,))
 
-        with self.assertRaisesRegex(ValueError, "outside its owner"):
+        with (
+            contract_oracle(binding_case),
+            self.subTest(case=binding_case.id),
+            self.assertRaisesRegex(ValueError, "outside its owner"),
+        ):
             storage.view(shape=(4,), strides=(1,), offset=6)
-        with self.assertRaisesRegex(ValueError, "internally injective"):
-            storage.view(shape=(2, 2), strides=(1, 1), access="write")
-
-        overlapping_reader = storage.view(shape=(2, 2), strides=(1, 1), access="read")
-        np.testing.assert_array_equal(overlapping_reader.to_numpy(), np.zeros((2, 2), dtype=np.int32))
+        with contract_oracle(alias_case), self.subTest(case=alias_case.id):
+            writable_alias = storage.view(shape=(2, 2), strides=(1, 1), access="write")
+            self.assertEqual(writable_alias.layout.element_strides, (1, 1))
+            overlapping_reader = storage.view(shape=(2, 2), strides=(1, 1), access="read")
+            np.testing.assert_array_equal(overlapping_reader.to_numpy(), np.zeros((2, 2), dtype=np.int32))
 
     def test_access_modes_and_owner_lifetime_are_enforced(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
@@ -105,23 +380,29 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         write_view.copy_from_numpy(np.arange(4, dtype=np.float32))
         np.testing.assert_array_equal(read_view.to_numpy(), np.arange(4, dtype=np.float32))
 
+    @covers_case("LANG-STORAGE-001/owning-storage", layers="F")
     def test_storage_namespace_is_distinct_from_tensor_values(self) -> None:
-        storage = vd.storage.zeros(dtype=vd.f32, shape=(2,))
+        case = case_by_id("LANG-STORAGE-001/owning-storage")
+        namespace: dict[str, object] = {}
+        exec(compile(case.source, f"{case.name}.py", "exec"), namespace)
+        storage = namespace["value"]
         value = vd.Tensor([1.0, 2.0])
 
-        self.assertIsInstance(storage, vd.TensorStorage)
+        with contract_oracle(case), self.subTest(case=case.id):
+            self.assertIsInstance(storage, vd.TensorStorage)
         self.assertFalse(hasattr(vd.Tensor, "zeros"))
         self.assertFalse(value.flags.writeable)
 
-    def test_dispatch_borrows_allow_disjoint_writes_and_reject_aliases(self) -> None:
+    def test_dispatch_borrows_defer_same_dispatch_alias_validation(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4, 4))
         left = storage.view(shape=(4, 2), strides=(4, 1), offset=0, access="write")
         right = storage.view(shape=(4, 2), strides=(4, 1), offset=2, access="write")
         overlapping = storage.view(shape=(4, 2), strides=(4, 1), offset=1, access="read")
 
-        _validate_dispatch_borrows([("left", left, "write"), ("right", right, "write")])
-        with self.assertRaisesRegex(ValueError, "incompatible overlapping borrows"):
-            _validate_dispatch_borrows([("left", left, "write"), ("overlapping", overlapping, "read")])
+        with _DispatchBorrowLease([("left", left, "write"), ("right", right, "write")], _TEST_CONTEXT):
+            pass
+        with _DispatchBorrowLease([("left", left, "write"), ("overlapping", overlapping, "read")], _TEST_CONTEXT):
+            pass
 
     def test_dispatch_access_cannot_exceed_view_capability(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
@@ -129,26 +410,61 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         writer = storage.view(shape=(4,), strides=(1,), access="write")
 
         with self.assertRaisesRegex(ValueError, "does not permit writes"):
-            _validate_dispatch_borrows([("reader", reader, "write")])
+            _DispatchBorrowLease([("reader", reader, "write")], _TEST_CONTEXT)
         with self.assertRaisesRegex(ValueError, "does not permit reads"):
-            _validate_dispatch_borrows([("writer", writer, "read")])
+            _DispatchBorrowLease([("writer", writer, "read")], _TEST_CONTEXT)
+        with self.assertRaisesRegex(ValueError, "does not permit writes"):
+            reader._with_access("write")
+        with self.assertRaisesRegex(ValueError, "does not permit reads"):
+            writer._with_access("read")
 
     def test_dispatch_scope_blocks_host_access_until_completion(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
         values = np.arange(4, dtype=np.float32)
 
-        with _dispatch_borrow_scope([("input", storage, "read")]):
+        with _DispatchBorrowLease([("input", storage, "read")], _TEST_CONTEXT):
             np.testing.assert_array_equal(storage.to_numpy(), np.zeros((4,), dtype=np.float32))
             with self.assertRaisesRegex(RuntimeError, "host mutation"):
                 storage.copy_from_numpy(values)
         storage.copy_from_numpy(values)
 
-        with _dispatch_borrow_scope([("output", storage, "write")]):
+        with _DispatchBorrowLease([("output", storage, "write")], _TEST_CONTEXT):
             with self.assertRaisesRegex(RuntimeError, "host reads"):
                 storage.to_numpy()
             with self.assertRaisesRegex(RuntimeError, "host mutation"):
                 storage.copy_from_numpy(values)
         np.testing.assert_array_equal(storage.to_numpy(), values)
+
+    def test_dispatch_scope_protects_texture_host_access(self) -> None:
+        texture = vd.Texture.zeros(shape=(2, 2), usage=("storage", "transfer_source", "transfer_destination"))
+        values = np.ones((2, 2, 4), dtype=np.uint8)
+
+        with _DispatchBorrowLease([("input", texture, "read")], _TEST_CONTEXT):
+            np.testing.assert_array_equal(texture.download(), np.zeros_like(values))
+            with self.assertRaisesRegex(RuntimeError, "host mutation"):
+                texture.upload(values)
+            with _DispatchBorrowLease([("second_input", texture, "read")], _TEST_CONTEXT):
+                pass
+
+        with _DispatchBorrowLease([("output", texture, "write")], _TEST_CONTEXT):
+            with self.assertRaisesRegex(RuntimeError, "host reads"):
+                texture.download()
+            with self.assertRaisesRegex(RuntimeError, "host mutation"):
+                texture.upload(values)
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                with _DispatchBorrowLease([("conflicting_output", texture, "write")], _TEST_CONTEXT):
+                    pass
+
+        texture.upload(values)
+        np.testing.assert_array_equal(texture.download(), values)
+
+    def test_dispatch_lease_retains_borrows_until_release(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        lease = _DispatchBorrowLease([("output", storage, "write")], _TEST_CONTEXT)
+        with self.assertRaisesRegex(RuntimeError, "host mutation"):
+            storage.copy_from_numpy(np.ones((4,), dtype=np.float32))
+        lease.release()
+        storage.copy_from_numpy(np.ones((4,), dtype=np.float32))
 
     def test_outstanding_dispatch_borrows_are_region_aware(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
@@ -156,30 +472,367 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         right = storage.view(shape=(4,), strides=(1,), offset=4, access="write")
         overlap = storage.view(shape=(4,), strides=(1,), offset=2, access="write")
 
-        with _dispatch_borrow_scope([("left", left, "write")]):
-            with _dispatch_borrow_scope([("right", right, "write")]):
+        with _DispatchBorrowLease([("left", left, "write")], _TEST_CONTEXT):
+            with _DispatchBorrowLease([("right", right, "write")], _TEST_CONTEXT):
                 pass
             with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
-                with _dispatch_borrow_scope([("overlap", overlap, "write")]):
+                with _DispatchBorrowLease([("overlap", overlap, "write")], _TEST_CONTEXT):
                     pass
 
-    def test_raw_buffer_requires_explicit_byte_layout_units(self) -> None:
-        values = np.arange(12, dtype=np.float32).reshape(3, 4)
-        backing = bytearray(values.tobytes())
-        raw = vd.interop.RawBuffer.from_buffer(backing, alignment=4)
-        view = raw.typed_view(
-            dtype=vd.f32,
-            shape=(3, 2),
-            byte_strides=(16, 4),
-            byte_offset=4,
-            access="read_write",
-            layout_units="bytes",
+    def test_strided_views_use_exact_cached_byte_regions(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
+        even = storage.view(shape=(4,), strides=(2,), offset=0, access="read_write")
+        odd = storage.view(shape=(4,), strides=(2,), offset=1, access="read_write")
+        overlapping = storage.view(shape=(3,), strides=(2,), offset=2, access="read_write")
+
+        with _DispatchBorrowLease([("even", even, "write")], _TEST_CONTEXT):
+            with _DispatchBorrowLease([("odd", odd, "write")], _TEST_CONTEXT):
+                pass
+            np.testing.assert_array_equal(odd.to_numpy(), np.zeros((4,), dtype=np.float32))
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                _DispatchBorrowLease([("overlapping", overlapping, "read")], _TEST_CONTEXT)
+
+    def test_host_claim_spans_synchronization_and_copy(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        entered = threading.Event()
+        resume = threading.Event()
+        original_synchronize = storage.synchronize
+
+        def blocked_synchronize() -> None:
+            entered.set()
+            self.assertTrue(resume.wait(timeout=5))
+            original_synchronize()
+
+        storage.synchronize = blocked_synchronize  # type: ignore[method-assign]
+        failure: list[BaseException] = []
+
+        def read_host() -> None:
+            try:
+                storage.to_numpy()
+            except BaseException as error:
+                failure.append(error)
+
+        thread = threading.Thread(target=read_host)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                _DispatchBorrowLease([("writer", storage, "write")], _TEST_CONTEXT)
+        finally:
+            resume.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failure, [])
+
+    def test_device_publication_commits_or_poison_rolls_back(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        backing = bytearray(storage.to_numpy().tobytes())
+        native_buffer = mock.Mock()
+        native_buffer.upload_ranges.side_effect = lambda ranges: [
+            backing.__setitem__(slice(offset, offset + len(data)), data) for offset, data in ranges
+        ]
+        native_buffer.download_ranges.side_effect = lambda ranges: [
+            (begin, bytes(backing[begin:end])) for begin, end in ranges
+        ]
+        state = SimpleNamespace(
+            identity=41,
+            arch=vd.metal,
+            native=native,
+            rhi_host=SimpleNamespace(create_buffer=lambda _: native_buffer),
+        )
+        context = _context(state)
+        storage._resident_buffer(context)
+
+        backing[:] = np.full((4,), 3.0, dtype=np.float32).tobytes()
+        committed = _DispatchBorrowLease([(0, storage, "write")], context)
+        committed.resolve(SimpleNamespace(ok=True, mutations=[(0, 0, 1)]))
+        committed.release()
+        np.testing.assert_array_equal(storage.to_numpy(), np.full((4,), 3.0, dtype=np.float32))
+
+        failed = _DispatchBorrowLease([(0, storage, "write")], context)
+        failed.resolve(SimpleNamespace(ok=False, mutations=[(0, 0, 3)]))
+        failed.release()
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            storage.to_numpy()
+        storage.copy_from_numpy(np.full((4,), 7.0, dtype=np.float32))
+        np.testing.assert_array_equal(storage.to_numpy(), np.full((4,), 7.0, dtype=np.float32))
+
+    def test_device_authority_migrates_between_session_residencies(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(2,))
+        backings = [bytearray(storage.to_numpy().tobytes()), bytearray(storage.to_numpy().tobytes())]
+        buffers = [mock.Mock(), mock.Mock()]
+        for native_buffer, backing in zip(buffers, backings, strict=True):
+            native_buffer.upload_ranges.side_effect = lambda ranges, target=backing: [
+                target.__setitem__(slice(offset, offset + len(data)), data) for offset, data in ranges
+            ]
+            native_buffer.download_ranges.side_effect = lambda ranges, source=backing: [
+                (begin, bytes(source[begin:end])) for begin, end in ranges
+            ]
+        states = [
+            SimpleNamespace(
+                identity=index + 51,
+                arch=vd.metal,
+                native=native,
+                rhi_host=SimpleNamespace(create_buffer=lambda _, value=native_buffer: value),
+            )
+            for index, native_buffer in enumerate(buffers)
+        ]
+        contexts = tuple(_context(state) for state in states)
+
+        storage._resident_buffer(contexts[0])
+        backings[0][:] = np.array([5.0, 9.0], dtype=np.float32).tobytes()
+        lease = _DispatchBorrowLease([(0, storage, "write")], contexts[0])
+        lease.resolve(SimpleNamespace(ok=True, mutations=[(0, 0, 1)]))
+        lease.release()
+        storage._resident_buffer(contexts[1])
+        np.testing.assert_array_equal(
+            np.frombuffer(backings[1], dtype=np.float32),
+            np.array([5.0, 9.0], dtype=np.float32),
+        )
+        self.assertIsNotNone(storage._control.residencies.get(states[0]))
+        self.assertIsNotNone(storage._control.residencies.get(states[1]))
+
+    def test_same_session_buffer_materialization_is_single_flight(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        native_buffer = mock.Mock()
+        entered = threading.Event()
+        second_started = threading.Event()
+        release = threading.Event()
+        create_count = 0
+
+        def create_buffer(_: int) -> Any:
+            nonlocal create_count
+            create_count += 1
+            entered.set()
+            second_started.wait(timeout=2)
+            release.wait(timeout=2)
+            return native_buffer
+
+        state = SimpleNamespace(
+            identity=61, arch=vd.metal, native=native, rhi_host=SimpleNamespace(create_buffer=create_buffer)
+        )
+        context = _context(state)
+
+        def materialize(started: threading.Event | None = None) -> Any:
+            if started is not None:
+                started.set()
+            lease = _DispatchBorrowLease([("reader", storage, "read")], context)
+            try:
+                return storage._resident_buffer(context)
+            finally:
+                lease.release()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(materialize)
+            self.assertTrue(entered.wait(timeout=2))
+            second = executor.submit(materialize, second_started)
+            self.assertTrue(second_started.wait(timeout=2))
+            release.set()
+            self.assertIs(first.result(timeout=2), native_buffer)
+            self.assertIs(second.result(timeout=2), native_buffer)
+        self.assertEqual(create_count, 1)
+
+    def test_failed_materialization_flight_wakes_retry(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        native_buffer = mock.Mock()
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        attempts = 0
+
+        def create_buffer(_: int) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_entered.set()
+                second_started.wait(timeout=2)
+                raise RuntimeError("injected allocation failure")
+            return native_buffer
+
+        state = SimpleNamespace(
+            identity=62, arch=vd.metal, native=native, rhi_host=SimpleNamespace(create_buffer=create_buffer)
+        )
+        context = _context(state)
+
+        def materialize(started: threading.Event | None = None) -> Any:
+            if started is not None:
+                started.set()
+            lease = _DispatchBorrowLease([("reader", storage, "read")], context)
+            try:
+                return storage._resident_buffer(context)
+            finally:
+                lease.release()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(materialize)
+            self.assertTrue(first_entered.wait(timeout=2))
+            second = executor.submit(materialize, second_started)
+            with self.assertRaisesRegex(RuntimeError, "allocation failure"):
+                first.result(timeout=2)
+            self.assertIs(second.result(timeout=2), native_buffer)
+        self.assertEqual(attempts, 2)
+
+    def test_disjoint_existing_buffer_tickets_upload_concurrently(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
+        native_buffer = mock.Mock()
+        state = SimpleNamespace(
+            identity=63,
+            arch=vd.metal,
+            native=native,
+            rhi_host=SimpleNamespace(create_buffer=lambda _: native_buffer),
+        )
+        context = _context(state)
+        storage._resident_buffer(context)
+        storage.update([0, 7], np.array([1.0, 2.0], dtype=np.float32))
+        barrier = threading.Barrier(2)
+        native_buffer.upload_ranges.side_effect = lambda _: barrier.wait(timeout=2)
+        views = (
+            storage.view(shape=(1,), strides=(1,), offset=0, access="read"),
+            storage.view(shape=(1,), strides=(1,), offset=7, access="read"),
         )
 
-        self.assertEqual(raw.byte_size, values.nbytes)
+        def materialize(index: int) -> Any:
+            lease = _DispatchBorrowLease([("reader", views[index], "read")], context)
+            try:
+                return views[index]._resident_buffer(context)
+            finally:
+                lease.release()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            handles = tuple(executor.map(materialize, range(2)))
+        self.assertEqual(handles, (native_buffer, native_buffer))
+        self.assertEqual(native_buffer.upload_ranges.call_count, 3)
+
+    def test_texture_view_borrows_are_subresource_aware(self) -> None:
+        texture = vd.Texture.zeros(
+            shape=(8, 8),
+            mip_levels=2,
+            usage=("storage", "transfer_source", "transfer_destination"),
+        )
+        mip0 = texture.view(base_mip_level=0, mip_level_count=1)
+        mip1 = texture.view(base_mip_level=1, mip_level_count=1)
+        texture.upload(np.zeros((4, 4, 4), dtype=np.uint8), mip_level=1)
+
+        with _DispatchBorrowLease([("mip0", mip0, "write")], _TEST_CONTEXT):
+            with _DispatchBorrowLease([("mip1", mip1, "write")], _TEST_CONTEXT):
+                pass
+            np.testing.assert_array_equal(texture.download(mip_level=1), np.zeros((4, 4, 4), dtype=np.uint8))
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                with _DispatchBorrowLease([("same_mip", mip0, "read")], _TEST_CONTEXT):
+                    pass
+
+    def test_cube_readback_transfers_only_dirty_face(self) -> None:
+        texture = vd.Texture.cube(np.zeros((6, 2, 2, 4), dtype=np.uint8))
+        native_image = mock.Mock()
+        state = SimpleNamespace(
+            identity=64,
+            arch=vd.metal,
+            native=native,
+            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+        )
+        context = _context(state)
+        texture._resident_texture(context)
+        native_image.download_regions.return_value = [np.full((1, 2, 2, 4), 9, dtype=np.uint8).tobytes()]
+        face = texture.view(dimension="2d", base_array_layer=3, array_layer_count=1)
+        texture._publish_device_write(context, (face._region,))
+
+        result = texture.to_numpy()
+
+        native_image.download_regions.assert_called_once()
+        self.assertEqual(
+            native_image.download_regions.call_args.args[0][0],
+            {
+                "mip_level": 0,
+                "offset_x": 0,
+                "offset_y": 0,
+                "offset_z": 0,
+                "width": 2,
+                "height": 2,
+                "depth": 1,
+                "base_array_layer": 3,
+                "array_layer_count": 1,
+                "aspects": 1,
+            },
+        )
+        np.testing.assert_array_equal(result[3], np.full((2, 2, 4), 9, dtype=np.uint8))
+        np.testing.assert_array_equal(result[:3], np.zeros((3, 2, 2, 4), dtype=np.uint8))
+        np.testing.assert_array_equal(result[4:], np.zeros((2, 2, 2, 4), dtype=np.uint8))
+
+    def test_disjoint_cube_readback_uses_one_native_batch(self) -> None:
+        texture = vd.Texture.cube(np.zeros((6, 2, 2, 4), dtype=np.uint8))
+        native_image = mock.Mock()
+        state = SimpleNamespace(
+            identity=66,
+            arch=vd.metal,
+            native=native,
+            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+        )
+        context = _context(state)
+        texture._resident_texture(context)
+        native_image.download_regions.return_value = [
+            np.full((1, 2, 2, 4), value, dtype=np.uint8).tobytes() for value in (3, 7)
+        ]
+        face_one = texture.view(dimension="2d", base_array_layer=1, array_layer_count=1)
+        face_three = texture.view(dimension="2d", base_array_layer=3, array_layer_count=1)
+        texture._publish_device_write(context, (face_one._region, face_three._region))
+
+        result = texture.to_numpy()
+
+        native_image.download_regions.assert_called_once()
+        requests = native_image.download_regions.call_args.args[0]
+        self.assertEqual([request["base_array_layer"] for request in requests], [1, 3])
+        np.testing.assert_array_equal(result[1], np.full((2, 2, 4), 3, dtype=np.uint8))
+        np.testing.assert_array_equal(result[3], np.full((2, 2, 4), 7, dtype=np.uint8))
+
+    def test_depth_stencil_readback_transfers_only_dirty_aspect(self) -> None:
+        values = np.zeros((2, 2), dtype=vd.d32_float_s8_uint.dtype)
+        texture = vd.Texture.from_numpy(
+            values,
+            format=vd.d32_float_s8_uint,
+            usage=("depth_stencil_attachment", "transfer_source", "transfer_destination"),
+        )
+        native_image = mock.Mock()
+        state = SimpleNamespace(
+            identity=65,
+            arch=vd.metal,
+            native=native,
+            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+        )
+        context = _context(state)
+        texture._resident_texture(context)
+        native_image.download_regions.return_value = [np.full((2, 2), 7, dtype=np.uint8).tobytes()]
+        stencil = texture.view(aspects=("stencil",))
+        texture._publish_device_write(context, (stencil._region,))
+
+        result = texture.to_numpy()
+
+        native_image.download_regions.assert_called_once()
+        self.assertEqual(native_image.download_regions.call_args.args[0][0]["aspects"], 4)
+        np.testing.assert_array_equal(result["depth"], np.zeros((2, 2), dtype=np.float32))
+        np.testing.assert_array_equal(result["stencil"], np.full((2, 2), 7, dtype=np.uint8))
+
+    @covers_case("LANG-INTEROP-001/raw-buffer-boundary", layers="F")
+    def test_raw_buffer_requires_explicit_byte_layout_units(self) -> None:
+        case = case_by_id("LANG-INTEROP-001/raw-buffer-boundary")
+        namespace: dict[str, object] = {}
+        exec(compile(case.source, f"{case.name}.py", "exec"), namespace)
+        values = namespace["values"]
+        backing = namespace["backing"]
+        raw = namespace["raw"]
+        view = namespace["value"]
+        assert isinstance(values, np.ndarray)
+        assert isinstance(backing, bytearray)
+        assert isinstance(raw, vd.interop.RawBuffer)
+        assert isinstance(view, vd.TensorView)
+
+        with contract_oracle(case), self.subTest(case=case.id):
+            self.assertEqual(raw.byte_size, values.nbytes)
         np.testing.assert_array_equal(view.to_numpy(), values[:, 1:3])
         view.copy_from_numpy(np.full((3, 2), 7, dtype=np.float32))
-        np.testing.assert_array_equal(np.frombuffer(backing, dtype=np.float32).reshape(3, 4)[:, 1:3], 7)
+        np.testing.assert_array_equal(view.to_numpy(), 7)
+        np.testing.assert_array_equal(
+            np.frombuffer(backing, dtype=np.float32).reshape(3, 4)[:, 1:3],
+            values[:, 1:3],
+        )
 
         with self.assertRaisesRegex(ValueError, "layout_units='bytes'"):
             raw.typed_view(
@@ -190,7 +843,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 layout_units="elements",
             )
 
-    def test_raw_buffer_rejects_ambiguous_alignment_and_readonly_writes(self) -> None:
+    def test_raw_buffer_rejects_ambiguous_alignment_and_owns_source_bytes(self) -> None:
         raw = vd.interop.RawBuffer.allocate(16, alignment=4)
         with self.assertRaisesRegex(ValueError, "divisible"):
             raw.typed_view(
@@ -201,15 +854,17 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 access="read",
                 layout_units="bytes",
             )
-        readonly = vd.interop.RawBuffer.from_buffer(bytes(16), alignment=4)
-        with self.assertRaisesRegex(ValueError, "writable RawBuffer"):
-            readonly.typed_view(
-                dtype=vd.f32,
-                shape=(4,),
-                byte_strides=(4,),
-                access="write",
-                layout_units="bytes",
-            )
+        source = bytes(16)
+        owned = vd.interop.RawBuffer.from_buffer(source, alignment=4)
+        writable = owned.typed_view(
+            dtype=vd.f32,
+            shape=(4,),
+            byte_strides=(4,),
+            access="write",
+            layout_units="bytes",
+        )
+        writable.copy_from_numpy(np.ones((4,), dtype=np.float32))
+        self.assertEqual(source, bytes(16))
 
     def test_raw_buffer_typed_view_accepts_aggregate_value_abi(self) -> None:
         vertex = StorageVertex(vd.Vector([1.0, 2.0, 3.0]), 4.0, vd.Vector([0.25, 0.75]))
@@ -228,10 +883,17 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(view.dtype, packed.dtype)
         np.testing.assert_array_equal(view.to_numpy(), packed.to_numpy())
 
+    @covers_case("LANG-PAIR-003/field-projection-alias-proof", layers="FI")
     def test_struct_storage_uses_canonical_aos_layout_and_field_views(self) -> None:
+        case = case_by_id("LANG-PAIR-003/field-projection-alias-proof")
+        assert isinstance(case.expected, str)
+        mlir = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, mlir, case)
+        self.assertIn(case.expected, mlir)
         storage = vd.TensorStorage.zeros(dtype=StorageVertex, shape=(4,))
 
-        self.assertEqual(storage.dtype.itemsize, 32)
+        with self.subTest(case=case.id):
+            self.assertEqual(storage.dtype.itemsize, 32)
         self.assertEqual(storage.dtype.fields["position"][1], 0)
         self.assertEqual(storage.dtype.fields["weight"][1], 16)
         self.assertEqual(storage.dtype.fields["uv"][1], 24)
@@ -256,7 +918,8 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(storage.field("weight", access="read").to_numpy(), weights)
         np.testing.assert_array_equal(storage.field("uv", access="read").to_numpy(), coordinates)
 
-        _validate_dispatch_borrows([("position", position, "write"), ("uv", uv, "write")])
+        with _DispatchBorrowLease([("position", position, "write"), ("uv", uv, "write")], _TEST_CONTEXT):
+            pass
 
     def test_struct_storage_rejects_non_projectable_or_unknown_fields(self) -> None:
         @vd.struct
@@ -292,6 +955,12 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             np.testing.assert_array_equal(actual.uv, expected.uv)
             self.assertEqual(actual.weight, expected.weight)
             self.assertFalse(actual.position.flags.writeable)
+
+        replacement = StorageVertex(vd.Vector([9.0, 8.0, 7.0]), vd.f64(6.0), vd.Vector([0.5, 0.25]))
+        storage.update_values(1, replacement)
+        updated = storage.to_values()[1]
+        np.testing.assert_array_equal(updated.position, replacement.position)
+        self.assertEqual(updated.weight, replacement.weight)
 
         storage.field("weight").copy_from_numpy(np.zeros((3,), dtype=np.float64))
         self.assertEqual(round_trip[2].weight, values[2].weight)
@@ -347,65 +1016,65 @@ class TensorViewFrontendTests(unittest.TestCase):
         self.assertNotIn("storage", parameters[0])
         self.assertEqual(parameters[1]["access"], "read")
 
-    def test_tensor_view_accepts_static_dynamic_and_mixed_shapes(self) -> None:
-        output = compile_source(
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def shapes(\n"
-            "    static: TensorView[f32, (4, 8), read],\n"
-            "    dynamic: TensorView[f32, (dyn,), read],\n"
-            "    mixed: TensorView[f32, (dyn, 4), read],\n"
-            ") -> None:\n"
-            "    pass\n",
-            "tensor_view_shapes.py",
-        )
+    @covers_case("LANG-VIEW-001/shape-and-access-matrix", layers="FI")
+    @covers_case("LANG-VIEW-001/non-tuple-shape", layers="F")
+    def test_tensor_view_accepts_rank_zero_static_dynamic_and_mixed_shapes(
+        self,
+    ) -> None:
+        case = case_by_id("LANG-VIEW-001/shape-and-access-matrix")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
 
+        self.assertIn(
+            '!vernon.tensor_view<f32, [], "read_write", "device">',
+            output,
+        )
         self.assertIn(
             '!vernon.tensor_view<f32, [4, 8], "read", "device">',
             output,
         )
         self.assertFalse(callable(vd.dyn))
-        with self.assertRaisesRegex(CompileError, "shape must be a non-empty tuple"):
-            compile_source(
-                "from vernon_dsl import *\n@kernel\ndef removed(value: TensorView[f32, 1, read]) -> None:\n    pass\n",
-                "removed_tensor_view_rank.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-VIEW-001/non-tuple-shape"))
 
+    @covers_case("LANG-STORAGE-001/device-annotation", layers="F")
+    @covers_case("LANG-VIEW-006/write-only-load", layers="F")
+    @covers_case("LANG-VIEW-006/rank-two-load", layers="FI")
     def test_storage_diagnostics_are_explicit(self) -> None:
-        with self.assertRaisesRegex(CompileError, "host-runtime owner"):
-            compile_source(
-                "from vernon_dsl import *\n@kernel\ndef bad(value: TensorStorage[f32]) -> None:\n    pass\n",
-                "storage_parameter.py",
-            )
-        with self.assertRaisesRegex(CompileError, "write-only TensorView"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad(value: TensorView[f32, (dyn,), write]) -> f32:\n"
-                "    return value[0]\n",
-                "write_only_load.py",
-            )
-        output = compile_source(
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def read(value: TensorView[f32, (dyn, dyn), read]) -> f32:\n"
-            "    return value[0, 0]\n",
-            "rank_two_view.py",
-        )
+        assert_frontend_rejects(self, case_by_id("LANG-STORAGE-001/device-annotation"))
+        assert_frontend_rejects(self, case_by_id("LANG-VIEW-006/write-only-load"))
+        case = case_by_id("LANG-VIEW-006/rank-two-load")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
         self.assertIn('"vernon.load"', output)
 
-    def test_tensor_view_layout_is_not_frontend_specialization_data(self) -> None:
-        source = (
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def read(output: TensorView[f32, (1,), write], value: TensorView[f32, (2, dyn), read]) -> None:\n"
-            "    output[0] = value[1, 2]\n"
+    @covers_case("LANG-TENSOR-005/tensor-and-view-shape", layers="FI")
+    def test_shape_lowers_to_get_shape_for_tensor_and_tensor_view(self) -> None:
+        case = case_by_id("LANG-TENSOR-005/tensor-and-view-shape")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        self.assertEqual(output.count('"vernon.get_shape"'), 4)
+        self.assertIn(
+            '!vernon.tensor_view<f32, [-1, -1], "write", "device">) -> tensor<2xi32>',
+            output,
         )
+        self.assertIn("tensor<2x5xf32>) -> tensor<2xi32>", output)
+        self.assertIn("tensor<3xf32>) -> tensor<1xi32>", output)
+        self.assertIn("tensor<2x4xf32>) -> tensor<2xi32>", output)
+        self.assertNotIn("cannot load through a write-only TensorView", output)
+
+    @covers_case("LANG-TENSOR-005/rank-zero-shape", layers="F")
+    def test_rank_zero_view_shape_is_rejected(self) -> None:
+        assert_frontend_rejects(self, case_by_id("LANG-TENSOR-005/rank-zero-shape"))
+
+    @covers_case("LANG-VIEW-004/layout-not-specialization", layers="FI")
+    def test_tensor_view_layout_is_not_frontend_specialization_data(self) -> None:
+        case = case_by_id("LANG-VIEW-004/layout-not-specialization")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rank_two_view.py"
-            path.write_text(source, encoding="utf-8")
+            path.write_text(case.source, encoding="utf-8")
             result = Compiler().compile_request(FrontendCompileRequest(path, "read"))
 
+        assert_verified_ir(self, result.mlir, case)
         self.assertIn('"vernon.load"', result.mlir)
         self.assertNotIn("vernon.tensor_shape", result.mlir)
         self.assertNotIn("vernon.tensor_strides", result.mlir)
@@ -422,12 +1091,41 @@ class TensorViewFrontendTests(unittest.TestCase):
 
     def test_raw_buffer_is_runtime_interop_not_source_type(self) -> None:
         self.assertFalse(hasattr(vd, "RawBuffer"))
-        self.assertEqual(vd.interop.RawBuffer.__module__, "vernon_dsl._runtime.resources")
+        self.assertEqual(vd.interop.RawBuffer.__module__, "vernon_dsl._runtime.tensor")
         with self.assertRaisesRegex(CompileError, "unknown DSL type 'RawBuffer'"):
             compile_source(
                 "from vernon_dsl import *\n@kernel\ndef bad(value: RawBuffer) -> None:\n    pass\n",
                 "runtime_only_raw_buffer.py",
             )
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def fill_with_extents(
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    tile: vd.Tensor[vd.f32, (2, 5)],
+    vec: vd.Vector[vd.f32, 3],
+    mat: vd.Matrix[vd.f32, 2, 4],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[1], gid[0]] = (
+        vd.f32(output.shape[0]) * 1000.0
+        + vd.f32(tile.shape[1]) * 100.0
+        + vd.f32(vec.shape[0]) * 10.0
+        + vd.f32(mat.shape[1])
+    )
+
+
+@expand_backend_matrix_tests
+class TensorViewShapeRuntimeTests(unittest.TestCase):
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_tensor_and_tensor_view_shape_read_static_and_descriptor_extents(self, backend: BackendRow) -> None:
+        expected = np.full((3, 4), 3534.0, dtype=np.float32)
+        tile = np.zeros((2, 5), dtype=np.float32)
+        vec = np.zeros(3, dtype=np.float32)
+        mat = np.zeros((2, 4), dtype=np.float32)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(3, 4))
+        fill_with_extents(output, tile, vec, mat, grid=(4, 3, 1))
+        np.testing.assert_array_equal(output.to_numpy(), expected)
 
 
 if __name__ == "__main__":

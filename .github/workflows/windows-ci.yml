@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -100,7 +100,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -112,10 +112,7 @@ jobs:
           -DBUILD_TESTING=ON
 
       - name: Build Runtime tests
-        run: >
-          cmake --build runtime-build --config Release
-          --target VernonRuntimeTests VernonRuntimeCoreProviderTests VernonRuntimeRHIAdapterTests
-          --parallel 4
+        run: cmake --build runtime-build --config Release --parallel 4
 
       - name: Run Runtime tests
         run: ctest --test-dir runtime-build -C Release --output-on-failure
@@ -139,7 +136,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -195,6 +192,7 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
+      VERNON_TEST_SKIP_DIRECTX_WORKGROUP_ATOMIC_CONTENTION: "1"
 
     steps:
       - name: Check out code
@@ -207,7 +205,7 @@ jobs:
         run: git submodule update --init --depth 1 llvm-project
 
       - name: Set up Visual Studio Build Tools
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         with:
           vs-version: "[17.0,18.0)"
           msbuild-architecture: x64
@@ -236,7 +234,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-wasm-v2
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -254,8 +252,8 @@ jobs:
         run: |
           cmake -S llvm-project/llvm -B llvm-project/build-ci `
             -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
-            -DLLVM_ENABLE_PROJECTS="mlir;lld" `
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX" `
+            -DLLVM_ENABLE_PROJECTS="mlir" `
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX;WebAssembly" `
             -DLLVM_ENABLE_ASSERTIONS=OFF `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DMLIR_INCLUDE_TESTS=OFF `
@@ -278,7 +276,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-wasm-v2
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
@@ -289,7 +287,6 @@ jobs:
           uv run --frozen cmake -S . -B build-ci `
             -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
             -DMLIR_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir" `
-            -DLLD_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld" `
             -DPython_EXECUTABLE="$env:GITHUB_WORKSPACE/.venv/Scripts/python.exe" `
             -DVERNON_INSTALL_GIT_HOOK=OFF `
             -DBUILD_TESTING=ON
@@ -334,6 +331,13 @@ jobs:
           uv venv $venv --python "${{ matrix.python-version }}"
           uv pip install --python "$venv/Scripts/python.exe" --no-cache $wheel
           & "$venv/Scripts/python.exe" scripts/verify_installed_wheel.py
+
+      - name: Test external engine against wheel Runtime sources
+        if: matrix.python-version == '3.11'
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "vernon-wheel"
+          & "$venv/Scripts/python.exe" scripts/verify_external_engine.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@v6

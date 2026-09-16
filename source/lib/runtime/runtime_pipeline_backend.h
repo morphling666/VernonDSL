@@ -1,43 +1,87 @@
 #ifndef VERNON_RUNTIME_PIPELINE_BACKEND_H
 #define VERNON_RUNTIME_PIPELINE_BACKEND_H
 
+#include "backend_stage_pipeline.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "prepared_binding_plan.h"
 #include "runtime_state.h"
 
 namespace vernon::runtime {
 
-bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-void destroyCpuPipeline(VernonLoadedPipeline &pipeline);
-VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+inline BackendPipelineResult backendPipelineResolutionFailure(BackendStageBuildInputs &inputs) {
+    std::string diagnostic;
+    if (inputs.context)
+        diagnostic.swap(invocationDiagnostic(*inputs.context));
+    return BackendPipelineResult{
+        vernon::err(BackendPipelineFailure{BackendPipelineError::BackendResolutionFailed, std::move(diagnostic)})};
+}
 
-bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-void destroyCudaPipeline(VernonLoadedPipeline &pipeline);
-VernonStatus invokeCudaComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+inline bool bindComputeValueStorage(const VernonRuntimeProviderBindingLayoutEntry &layout,
+                                    const ComputeLaunchArgument &argument, VernonRuntimeProviderBindingValue &value) {
+    if (layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+        layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM)
+        return false;
+    const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+    if (!scalar || !scalar->data || scalar->size != layout.element_size)
+        return false;
+    value.payload.inline_value.data = scalar->data;
+    value.payload.inline_value.size = scalar->size;
+    return true;
+}
 
-void destroyVulkanPipeline(VernonLoadedPipeline &pipeline);
-bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+inline bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
+                                       const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
+                                       VernonRuntimeProviderBindingValue &value) {
+    if (!source.metadataCarrier || launch.metadataPayload.empty() ||
+        launch.metadataPayload.size() != layout.element_size || launch.metadataAlignment != layout.element_alignment)
+        return false;
+    value.payload.inline_value.data = launch.metadataPayload.data();
+    value.payload.inline_value.size = launch.metadataPayload.size();
+    return true;
+}
+
+BackendPipelineResult resolveCpuPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                         VernonStageExecutable &pipeline);
+void destroyCpuPipeline(VernonStageExecutable &pipeline);
+VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
+
+BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                          VernonStageExecutable &pipeline);
+void destroyCudaPipeline(VernonStageExecutable &pipeline);
+VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
+
+void destroyVulkanPipeline(VernonStageExecutable &pipeline);
+BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                            VernonStageExecutable &pipeline);
+VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
+                                          const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan);
-VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyDirectX12Pipeline(VernonLoadedPipeline &pipeline);
-bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+void destroyDirectX12Pipeline(VernonStageExecutable &pipeline);
+BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                               VernonStageExecutable &pipeline);
+VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
+                                             const VernonStageInvocationDescriptor &invocation,
                                              const PlannedGraphicsInvocation &plan);
-VernonStatus invokeDirectX12ComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyMetalPipeline(VernonLoadedPipeline &pipeline);
-bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+void destroyMetalPipeline(VernonStageExecutable &pipeline);
+BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                           VernonStageExecutable &pipeline);
+VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
+                                         const VernonStageInvocationDescriptor &invocation,
                                          const PlannedGraphicsInvocation &plan);
-VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyOpenGLPipeline(VernonLoadedPipeline &pipeline);
-bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+void destroyOpenGLPipeline(VernonStageExecutable &pipeline);
+BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                            VernonStageExecutable &pipeline);
+VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
+                                          const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan);
-VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
+VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
 } // namespace vernon::runtime
 

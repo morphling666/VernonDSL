@@ -5,7 +5,6 @@
 
 namespace vernon::runtime {
 
-VernonRuntimeRhiAdapter *createOwnedCudaRhiAdapter(uint32_t deviceIndex);
 VernonRuntimeRhiAdapter *createCudaRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
 VernonRuntimeRhiAdapter *createOpenGLRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
 #if defined(VERNON_HAS_VULKAN_RHI)

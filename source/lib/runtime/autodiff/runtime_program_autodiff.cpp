@@ -1,0 +1,817 @@
+#include "runtime_autodiff_internal.h"
+
+#include "host_tape_allocator.h"
+#include "program_invocation_builder.h"
+#include "program_invocation_spec.h"
+#include "program_invocation_values.h"
+#include "program_residual_planner.h"
+#include "program_tape_lifecycle.h"
+#include "program_tape_scratch.h"
+#include "retained_pullback_state.h"
+#include "runtime/program_execution/failure_injection.h"
+#include "runtime/program_execution/program_invocation_state.h"
+#include "runtime/program_execution/publication_executor.h"
+#include "runtime/program_execution/publication_transaction.h"
+#include "runtime/program_execution/resolved_transfer_executor.h"
+#include "runtime/program_execution_manifest.h"
+#include "runtime/program_invocation_context.h"
+#include "runtime/runtime_dispatch.h"
+#include "runtime/runtime_state.h"
+#include "runtime_autodiff_memory_usage.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace vernon::runtime::ad {
+namespace {
+
+using HostProgramValue = program_execution::ProgramValueState;
+using program_execution::ProgramInvocationState;
+using program_execution::ProgramStorageBacking;
+using program_execution::ProgramValueState;
+using program_execution::PublicationTransaction;
+using program_execution::ResolvedTransferExecutor;
+
+void recordRenderPassMutations(const program::Graph &graph, program_execution::SubmissionState submission,
+                               program_execution::InvocationMutationOutcome &outcome) {
+    if (submission == program_execution::SubmissionState::NotSubmitted)
+        return;
+    const VernonBoundaryMutationState state = submission == program_execution::SubmissionState::Completed
+                                                  ? VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED
+                                                  : VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+    for (const program::Node &node : graph.nodes)
+        if (program::executionKind(node) == program::ExecutionKind::Graphics)
+            outcome.set(VERNON_MUTATION_RENDER_PASS_CONTROL, program::graphicsOperation(node).renderPassControl, state);
+}
+
+bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, const ProgramTapeScratch &tapeScratch,
+                               std::string &error) {
+    if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
+        return error = "injected Program tape validation failure", false;
+    for (size_t value = 0; value < storage.size(); ++value) {
+        const auto batch = tapeScratch.hostBatch(static_cast<uint32_t>(value));
+        if (!batch)
+            continue;
+        for (size_t lane = 0; lane < batch->size(); ++lane) {
+            const VernonAdTapeAllocator *allocator = batch->descriptor(lane);
+            if (!allocator || allocator->status == VERNON_AD_TAPE_ALLOCATOR_OK)
+                continue;
+            const char *reason = allocator->status == VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED ? "capacity exhausted"
+                                 : allocator->status == VERNON_AD_TAPE_ALLOCATOR_ARITHMETIC_OVERFLOW
+                                     ? "arithmetic overflow"
+                                 : allocator->status == VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE
+                                     ? "host allocation failed (context limit)"
+                                 : allocator->status == VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI ? "invalid ABI"
+                                                                                             : "invalid state";
+            return error = std::string("autodiff tape allocator ") + reason, false;
+        }
+    }
+    return true;
+}
+
+bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonProgramArgument> &values,
+                           ProgramTapeScratch &tapeScratch, std::string &error) {
+    if (values.size() < storage.size())
+        return error = "Program autodiff tape value arena is incomplete", false;
+    if (!validateProgramTapeValues(storage, tapeScratch, error))
+        return false;
+    for (size_t value = 0; value < storage.size(); ++value) {
+        HostProgramValue &slot = storage[value];
+        const auto batch = tapeScratch.hostBatch(static_cast<uint32_t>(value));
+        if (!batch)
+            continue;
+        if (!batch->compact(true))
+            return error = "Program autodiff tape could not be compacted", false;
+        if (!fillProgramTapeHostValue(slot, batch, tapeScratch, static_cast<uint32_t>(value), error))
+            return false;
+        values[value] = slot.argument;
+    }
+    return true;
+}
+
+VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
+    invocationDiagnostic(context) = error;
+    return VERNON_STATUS_INVALID_ARGUMENT;
+}
+
+class ProgramPullback final : public PullbackExecution {
+public:
+    ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<const program::ResolvedExecutionPlan> topology,
+                    StageBindingPlan stagePlan, Signature signature,
+                    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings,
+                    std::shared_ptr<const RetainedPullbackState> state,
+                    std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
+        : context_(&context), topology_(std::move(topology)), stagePlan_(std::move(stagePlan)),
+          signature_(std::move(signature)), derivativeBindings_(std::move(derivativeBindings)),
+          state_(std::move(state)), passTelemetry_(std::move(passTelemetry)) {
+        rebuildStageBindingLayoutViews(stagePlan_);
+        if (topology_ && topology_->resolvedProgram)
+            preparation_ = prepareProgramInvocation(topology_->resolvedProgram->program);
+    }
+
+    VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
+                       const PullbackApplyOptions &options,
+                       program_execution::InvocationMutationOutcome &outcome) override {
+        outcome = {};
+        const std::lock_guard lock(applyMutex_);
+        if (!topology_->resolvedProgram || !state_)
+            return fail(*context_, "Program pullback has no retained canonical state");
+        const program::Program &execution = topology_->resolvedProgram->program;
+        const program::Graph *backward = program::findGraph(execution, "backward");
+        if (!backward)
+            return fail(*context_, "Program pullback has no backward graph");
+        std::vector<char> required(execution.values.size());
+        program::markGraphValues(*backward, required);
+        std::optional<program::Graph> replay;
+        if (state_->residualPlan().replayEnd) {
+            const program::Graph *forward = program::findGraph(execution, "forward");
+            if (!forward)
+                return fail(*context_, "Program pullback replay has no forward graph");
+            replay = *forward;
+            replay->nodes.resize(state_->residualPlan().replayEnd);
+            program::markGraphValues(*replay, required);
+        }
+        for (uint32_t value : state_->residualPlan().retainedValues)
+            if (value < required.size())
+                required[value] = 1;
+
+        const std::vector<std::vector<uint8_t>> &captures = state_->residualCaptures();
+        const std::vector<std::vector<uint64_t>> &captureShapes = state_->captureShapes();
+        std::vector<ProgramValueState> storage;
+        PublicationTransaction publication(topology_->publications);
+        struct OutcomePublication {
+            const PublicationTransaction &publication;
+            program_execution::InvocationMutationOutcome &outcome;
+            ~OutcomePublication() { outcome.merge(publication.mutationOutcome()); }
+        } outcomePublication{publication, outcome};
+        PullbackInvocationSpec frame{
+            required, {arguments, argumentCount, derivativeBindings_, publication},
+            captures, captureShapes,
+            nullptr,  &state_->valueSnapshots(),
+        };
+        std::string error;
+        std::map<uint32_t, ProgramStorageBacking> storageBackings;
+        ProgramTapeScratch tapeScratch(execution.values.size());
+        if (!buildProgramInvocationValues(*context_, execution, topology_.get(), preparation_, bindingScratch_, storage,
+                                          storageBackings, tapeScratch, frame, context_->autodiffMemoryPolicy, error))
+            return fail(*context_, error);
+
+        size_t temporaryBytes = 0;
+        for (const ProgramValueState &value : storage) {
+            if (value.ownedHostBytes.size() > std::numeric_limits<size_t>::max() - temporaryBytes)
+                return fail(*context_, "Program pullback temporary memory accounting overflows");
+            temporaryBytes += value.ownedHostBytes.size();
+        }
+        if (temporaryBytes > options.maximumTemporaryBytes)
+            return fail(*context_, "Program pullback exceeds its temporary memory limit");
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Allocation))
+            return fail(*context_, "injected Program pullback allocation failure");
+
+        ProgramInvocationState values(*topology_, std::move(storage), std::move(storageBackings));
+        if (!state_->importInto(values, tapeScratch, !replay, error))
+            return fail(*context_, error);
+        auto allocatedImages = values.allocateOwnedImageStorages(*context_, execution);
+        if (allocatedImages.isErr())
+            return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
+        if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
+            return fail(*context_, "injected Program pullback tape validation failure");
+        const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
+            [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
+            if (binding.semantic == program::CarrierSemantic::Tape)
+                if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
+                    return argument;
+            auto argument = values.argument(value);
+            return argument ? &argument.value().get() : nullptr;
+        };
+        const bool device = context_->backend != VERNON_RUNTIME_CPU;
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
+            return fail(*context_, "injected Program pullback submission failure");
+        if (replay) {
+            if (device) {
+                std::vector<ProgramTapeState> tapeStates;
+                if (!prepareProgramTapeStates(values, tapeScratch, *context_, execution, *topology_, *replay,
+                                              tapeStates, error))
+                    return fail(*context_, error);
+                for (;;) {
+                    program_execution::SubmissionState replaySubmission;
+                    const VernonStatus replayStatus = executePipelineProgramGraph(
+                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                    publication.noteSubmission(replaySubmission);
+                    if (replayStatus != VERNON_STATUS_OK)
+                        return replayStatus;
+                    bool retry = false;
+                    if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
+                        return fail(*context_, error);
+                    if (!retry)
+                        break;
+                    ResolvedTransferExecutor transfers(*context_, values);
+                    if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
+                        return fail(*context_, error);
+                    if (!state_->importInto(values, tapeScratch, false, error))
+                        return fail(*context_, error);
+                    for (ProgramTapeState &tape : tapeStates)
+                        if (!allocateProgramTapeState(tapeScratch, *context_, tape, error))
+                            return fail(*context_, error);
+                }
+            } else {
+                program_execution::SubmissionState replaySubmission;
+                const VernonStatus replayStatus = executePipelineProgramGraph(
+                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                publication.noteSubmission(replaySubmission);
+                if (replayStatus != VERNON_STATUS_OK)
+                    return replayStatus;
+                if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
+                    return fail(*context_, error);
+            }
+        }
+        program_execution::SubmissionState backwardSubmission;
+        const VernonStatus status = executePipelineProgramGraph(*context_, *topology_, *backward, values,
+                                                                resolvePhysicalEndpoint, backwardSubmission);
+        publication.noteInPlaceSubmission(backwardSubmission);
+        if (status != VERNON_STATUS_OK)
+            return status;
+
+        if (device) {
+            std::vector<char> downloads = publication.hostReadbackValues(execution.values.size());
+            ResolvedTransferExecutor transfers(*context_, values);
+            if (!transfers.readbackBoundaryValues(downloads, error))
+                return fail(*context_, error);
+            ++usage_.readbacks;
+        }
+        if (const VernonStatus publicationStatus =
+                program_execution::executePublicationCommit(*context_, publication, values, error);
+            publicationStatus != VERNON_STATUS_OK) {
+            return error.empty() ? publicationStatus : fail(*context_, error);
+        }
+        ++usage_.submissions;
+        ++usage_.waits;
+        ++usage_.atomicPublications;
+        usage_.temporaryAllocationBytes += temporaryBytes;
+        return VERNON_STATUS_OK;
+    }
+
+    size_t mutationCapacity() const override { return topology_->publications.transactions.size(); }
+
+    PullbackMemoryUsage memoryUsage() const override {
+        MemoryAccounting memory;
+        memory.logicalPayloadBytes = state_->residualPlan().checkpoint.logicalResidualBytes;
+        const auto add = [](size_t &total, size_t bytes) {
+            if (bytes > std::numeric_limits<size_t>::max() - total)
+                total = std::numeric_limits<size_t>::max();
+            else
+                total += bytes;
+        };
+        add(memory.residentBytes, state_->residentBytes());
+        add(memory.retainedAllocationBytes, state_->residentBytes());
+        add(memory.allocatedBytes, state_->allocatedTapeBytes());
+        memory.retainedAllocationBytes =
+            std::max(memory.retainedAllocationBytes,
+                     static_cast<size_t>(state_->residualPlan().checkpoint.retainedAllocationBytes));
+        add(memory.retainedAllocationBytes, memory.allocatedBytes);
+        return pullbackMemoryUsage(memory);
+    }
+
+    program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const override {
+        const std::lock_guard lock(applyMutex_);
+        return usage_;
+    }
+
+    AutodiffPullbackCheckpointPlan checkpointPlan() const override {
+        AutodiffPullbackCheckpointPlan snapshot;
+        snapshot.present = true;
+        snapshot.peakBytes = state_->residualPlan().checkpoint.peakBytes;
+        snapshot.memoryBudget = state_->residualPlan().checkpoint.memoryBudget;
+        snapshot.logicalResidualBytes = state_->residualPlan().checkpoint.logicalResidualBytes;
+        snapshot.retainedAllocationBytes = state_->residualPlan().checkpoint.retainedAllocationBytes;
+        snapshot.initialStateBytes = state_->residualPlan().checkpoint.initialStateBytes;
+        snapshot.restorationBytes = state_->residualPlan().checkpoint.restorationBytes;
+        snapshot.transactionBytes = state_->residualPlan().checkpoint.transactionBytes;
+        snapshot.persistentCheckpointBytes = state_->residualPlan().checkpoint.persistentCheckpointBytes;
+        snapshot.backwardValueBytes = state_->residualPlan().checkpoint.backwardValueBytes;
+        snapshot.replayCost = state_->residualPlan().checkpoint.replayCost;
+        snapshot.recomputationCost = state_->residualPlan().checkpoint.recomputationCost;
+        snapshot.selectedPolicy = state_->residualPlan().checkpoint.selectedPolicy;
+        return snapshot;
+    }
+
+    std::vector<AutodiffPullbackPassTelemetry> passTelemetry() const override { return passTelemetry_; }
+
+    uint64_t peakRuntimeManagedBytes() const override {
+        const PullbackMemoryUsage usage = memoryUsage();
+        const uint64_t held =
+            std::max(std::max(usage.retainedAllocationBytes, usage.allocatedBytes), usage.peakTemporaryBytes);
+        return std::max(held, state_->residualPlan().checkpoint.peakBytes);
+    }
+
+private:
+    VernonRuntimeContext *context_;
+    std::shared_ptr<const program::ResolvedExecutionPlan> topology_;
+    StageBindingPlan stagePlan_;
+    ProgramInvocationPreparation preparation_;
+    ProgramBoundaryBindingScratch bindingScratch_;
+    Signature signature_;
+    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
+    std::shared_ptr<const RetainedPullbackState> state_;
+    std::vector<AutodiffPullbackPassTelemetry> passTelemetry_;
+    mutable std::mutex applyMutex_;
+    program_execution::ExecutionControlPlaneUsage usage_;
+};
+
+class ProgramForwardWorkspace final : public CanonicalProgramExecutionWorkspace {
+public:
+    ProgramForwardWorkspace(const program::ResolvedExecutionPlan &plan, const ProgramInvocationPreparation &preparation,
+                            size_t boundaryCount)
+        : arena(plan, std::vector<ProgramValueState>(preparation.layouts.size()), preparation.storageBackings),
+          tapeScratch(preparation.layouts.size()), publication(plan.publications) {
+        boundaryArguments.reserve(boundaryCount);
+    }
+
+    ProgramInvocationState arena;
+    ProgramTapeScratch tapeScratch;
+    PublicationTransaction publication;
+    ProgramBoundaryBindingScratch bindingScratch;
+};
+
+class ProgramExecutable final : public CanonicalProgramExecution {
+public:
+    ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<const program::ResolvedExecutionPlan> topology,
+                      CanonicalProgramAutodiffState &programAutodiff, StageBindingPlan stagePlan,
+                      const std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> *nodeAutodiff)
+        : context_(&context), topology_(std::move(topology)), programAutodiff_(&programAutodiff),
+          stagePlan_(std::move(stagePlan)), nodeAutodiff_(nodeAutodiff) {
+        rebuildStageBindingLayoutViews(stagePlan_);
+        const std::shared_ptr<const program::ResolvedExecutionPlan> locked = topology_.lock();
+        if (!locked || !locked->resolvedProgram) {
+            signatureError_ = "Program executable has no resolved canonical owner";
+            return;
+        }
+        const program::Program &canonicalProgram = locked->resolvedProgram->program;
+        preparation_ = prepareProgramInvocation(canonicalProgram);
+        const bool hasBackward = program::findGraph(canonicalProgram, "backward") != nullptr;
+        for (const program::TapePlan &plan : canonicalProgram.abi.tapePlans)
+            if (!plan.forwardProducer || (hasBackward && !plan.backwardConsumer)) {
+                signatureError_ = "compiler TapePlan does not connect its forward producer and backward consumer";
+                return;
+            }
+        for (const program::BoundarySlot &slot : canonicalProgram.abi.boundarySlots) {
+            if (slot.role == program::BoundaryRole::Input ||
+                (slot.role == program::BoundaryRole::Output && slot.publication != program::BoundaryPublication::None))
+                forwardBindings_.emplace_back(slot.id, slot.value);
+            else if (slot.role == program::BoundaryRole::Cotangent || slot.role == program::BoundaryRole::Gradient)
+                derivativeBindings_.emplace_back(slot.id, slot.value);
+        }
+        // ProgramABI is the execution authority. Signature is validated against
+        // it while parsing, but runtime binding and leaf materialization must
+        // not join the two representations again.
+        const auto append = [&](const program::BoundarySlot &publicSlot,
+                                const std::vector<program::LayoutPathComponent> *projectionPath,
+                                std::vector<ValueAbi> &values) {
+            if (publicSlot.category == program::BoundaryCategory::Texture ||
+                publicSlot.category == program::BoundaryCategory::Sampler)
+                return;
+            std::string error;
+            if (!publicSlot.layout) {
+                signatureError_ = "ProgramABI tensor boundary has no canonical ValueLayout";
+                return;
+            }
+            ValueLayout layout = program::materializeValueLayout(*publicSlot.layout, publicSlot.logicalType);
+            rebuildValueLayoutPathViews(layout);
+            std::vector<const ValueLeaf *> selectedLeaves;
+            ValueLayout publicLayout = layout;
+            if (projectionPath && !projectionPath->empty()) {
+                publicLayout.leaves.clear();
+                for (const ValueLeaf &leaf : layout.leaves) {
+                    if (leaf.path.size() < projectionPath->size())
+                        continue;
+                    bool selected = true;
+                    for (size_t component = 0; component < projectionPath->size(); ++component) {
+                        const auto &expected = (*projectionPath)[component];
+                        const auto &actual = leaf.path[component];
+                        selected &= expected.index ? !actual.field && *expected.index == actual.index
+                                                   : actual.field && expected.field == *actual.field;
+                    }
+                    if (!selected)
+                        continue;
+                    ValueLeaf projected = leaf;
+                    projected.path.erase(projected.path.begin(),
+                                         projected.path.begin() + static_cast<ptrdiff_t>(projectionPath->size()));
+                    publicLayout.leaves.push_back(std::move(projected));
+                    selectedLeaves.push_back(&leaf);
+                }
+                if (selectedLeaves.empty()) {
+                    signatureError_ = "DerivativeProjection does not select a canonical Value leaf";
+                    return;
+                }
+                rebuildValueLayoutPathViews(publicLayout);
+            } else {
+                for (const ValueLeaf &leaf : layout.leaves)
+                    selectedLeaves.push_back(&leaf);
+            }
+            const size_t begin = values.size();
+            if (!appendValueLayoutAbi(publicLayout, publicSlot.outerShape, publicSlot.path, values, error)) {
+                signatureError_ = std::move(error);
+                return;
+            }
+            if (values.size() - begin != selectedLeaves.size()) {
+                signatureError_ = "Program aggregate ABI contains duplicate leaf paths";
+                return;
+            }
+        };
+        for (const program::BoundarySlot &slot : canonicalProgram.abi.boundarySlots) {
+            if (slot.role == program::BoundaryRole::Input)
+                append(slot, nullptr, signature_.inputs);
+            else if (slot.role == program::BoundaryRole::Output &&
+                     slot.publication != program::BoundaryPublication::None)
+                append(slot, nullptr, signature_.outputs);
+        }
+        for (const program::DerivativeProjection &projection : canonicalProgram.abi.derivativeProjections) {
+            const program::BoundarySlot &derivative = canonicalProgram.abi.boundarySlots[projection.derivative.slot];
+            if (derivative.role == program::BoundaryRole::Cotangent)
+                append(derivative, &projection.valuePath, signature_.cotangents);
+            else if (derivative.role == program::BoundaryRole::Gradient)
+                append(derivative, &projection.valuePath, signature_.gradients);
+            else {
+                signatureError_ = "DerivativeProjection does not reference a derivative boundary";
+                return;
+            }
+        }
+    }
+
+    const Signature &signature() const override { return signature_; }
+
+    std::unique_ptr<CanonicalProgramExecutionWorkspace> createWorkspace() const override {
+        const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
+        if (!topology)
+            return {};
+        return std::make_unique<ProgramForwardWorkspace>(*topology, preparation_, forwardBindings_.size());
+    }
+
+    VernonStatus forward(const ForwardExecutionTarget &target, std::unique_ptr<PullbackExecution> &pullback) override {
+        target.outcome = {};
+        const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
+        const program::Program *execution =
+            topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
+        const program::Graph *forward = execution ? program::findGraph(*execution, "forward") : nullptr;
+        const bool hasBackward = execution && program::findGraph(*execution, "backward");
+        if (!signatureError_.empty())
+            return fail(*context_, signatureError_);
+        if (!topology || !forward)
+            return fail(*context_, "Program autodiff forward requires a live Program");
+        auto *workspace = target.programContext
+                              ? static_cast<ProgramForwardWorkspace *>(target.programContext->executionWorkspace)
+                              : nullptr;
+        if (!workspace)
+            return fail(*context_, "Program invocation has no instance-local execution workspace");
+        workspace->arena.prepareForInvocation(*topology);
+        workspace->tapeScratch.reset();
+        workspace->publication.reset();
+        ProgramInvocationState &arena = workspace->arena;
+        ProgramTapeScratch &tapeScratch = workspace->tapeScratch;
+        PublicationTransaction &publication = workspace->publication;
+        std::string error;
+        struct OutcomePublication {
+            const PublicationTransaction &publication;
+            program_execution::InvocationMutationOutcome &outcome;
+            ~OutcomePublication() { outcome.merge(publication.mutationOutcome()); }
+        } outcomePublication{publication, target.outcome};
+        ForwardInvocationSpec frame{
+            preparation_.forwardRequiredValues,
+            {target.arguments, target.argumentCount, forwardBindings_, publication},
+        };
+        if (!buildProgramInvocationValues(*context_, *execution, topology.get(), preparation_,
+                                          workspace->bindingScratch, arena.values(), arena.storageBackings(),
+                                          tapeScratch, frame, context_->autodiffMemoryPolicy, error))
+            return fail(*context_, error);
+        arena.finalizeInvocationValues();
+        auto allocatedImages = arena.allocateOwnedImageStorages(*context_, *execution);
+        if (allocatedImages.isErr())
+            return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
+        if (const VernonStatus initialization =
+                program_execution::executePublicationInitialization(*context_, publication, error);
+            initialization != VERNON_STATUS_OK)
+            return error.empty() ? initialization : fail(*context_, error);
+        const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
+            [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
+            if (binding.semantic == program::CarrierSemantic::Tape)
+                if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
+                    return argument;
+            auto argument = arena.argument(value);
+            return argument ? &argument.value().get() : nullptr;
+        };
+        arena.setInvocationContext(target.programContext);
+        for (const program::Node &node : forward->nodes)
+            if (program::executionKind(node) == program::ExecutionKind::Compute)
+                for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
+                    auto resolvedControl = arena.resolveControl(*execution, control);
+                    if (resolvedControl.isErr())
+                        return fail(*context_,
+                                    program_execution::programInvocationErrorMessage(resolvedControl.error()));
+                }
+        const bool device = context_->backend != VERNON_RUNTIME_CPU;
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
+            return fail(*context_, "injected Program forward submission failure");
+        if (device) {
+            std::vector<ProgramTapeState> tapeStates;
+            if (!prepareProgramTapeStates(arena, tapeScratch, *context_, *execution, *topology, *forward, tapeStates,
+                                          error))
+                return fail(*context_, error);
+            for (;;) {
+                program_execution::SubmissionState submission;
+                const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
+                                                                        resolvePhysicalEndpoint, submission);
+                publication.noteInPlaceSubmission(submission);
+                recordRenderPassMutations(*forward, submission, target.outcome);
+                if (status != VERNON_STATUS_OK)
+                    return status;
+                bool retry = false;
+                if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
+                    return fail(*context_, error);
+                if (!retry)
+                    break;
+                ResolvedTransferExecutor transfers(*context_, arena);
+                if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
+                    return fail(*context_, error);
+                for (ProgramTapeState &state : tapeStates)
+                    if (!allocateProgramTapeState(tapeScratch, *context_, state, error))
+                        return fail(*context_, error);
+            }
+        } else {
+            program_execution::SubmissionState submission;
+            const VernonStatus status =
+                executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint, submission);
+            publication.noteInPlaceSubmission(submission);
+            recordRenderPassMutations(*forward, submission, target.outcome);
+            if (status != VERNON_STATUS_OK)
+                return status;
+            if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
+                return fail(*context_, error);
+        }
+
+        if (target.nodePullbacks && nodeAutodiff_ && !nodeAutodiff_->empty()) {
+            ProgramTapeSnapshot globalTape = tapeScratch.releaseSnapshot();
+            for (const auto &[node, config] : *nodeAutodiff_) {
+                if (!config.executable || !config.executable->programAutodiff.canonicalExecution)
+                    continue;
+                auto child =
+                    std::dynamic_pointer_cast<ProgramExecutable>(config.executable->programAutodiff.canonicalExecution);
+                if (!child)
+                    return fail(*context_, "ProgramGraph child has no canonical Program execution");
+                const std::shared_ptr<const program::ResolvedExecutionPlan> childTopology = child->topology_.lock();
+                if (!childTopology || !childTopology->resolvedProgram)
+                    return fail(*context_, "ProgramGraph child has no resolved Program");
+                const program::Program &childProgram = childTopology->resolvedProgram->program;
+                if (config.globalValues.size() != childProgram.values.size() ||
+                    config.globalStorages.size() != childProgram.storages.size())
+                    return fail(*context_, "ProgramGraph child remapping is incomplete");
+
+                std::map<uint32_t, ProgramStorageBacking> childBackings;
+                for (uint32_t local = 0; local < config.globalStorages.size(); ++local) {
+                    const auto backing = arena.storageBackings().find(config.globalStorages[local]);
+                    if (backing == arena.storageBackings().end())
+                        return fail(*context_, "ProgramGraph child Storage remapping is unavailable");
+                    ProgramStorageBacking childBacking = backing->second;
+                    childBacking.owner = childProgram.storages[local].initialValue;
+                    childBackings.emplace(local, std::move(childBacking));
+                }
+                const auto childBackingSnapshots = childBackings;
+                ProgramInvocationState childArena(*childTopology,
+                                                  std::vector<ProgramValueState>(childProgram.values.size()),
+                                                  std::move(childBackings));
+                std::vector<program_execution::CanonicalValueSnapshot> childSnapshots;
+                childSnapshots.reserve(config.globalValues.size());
+                for (uint32_t local = 0; local < config.globalValues.size(); ++local) {
+                    if (config.globalValues[local] >= arena.values().size())
+                        return fail(*context_, "ProgramGraph child Value remapping is unavailable");
+                    auto snapshot = arena.snapshotValue(config.globalValues[local]);
+                    if (!snapshot)
+                        return fail(*context_, "ProgramGraph child Value remapping is unavailable");
+                    snapshot.value().value = local;
+                    auto imported = childArena.importSnapshot(snapshot.value());
+                    if (imported.isErr())
+                        return fail(*context_, program_execution::programInvocationErrorMessage(imported.error()));
+                    childSnapshots.push_back(std::move(snapshot).value());
+                }
+                ProgramTapeSnapshot childTape;
+                childTape.hostBatches.resize(childProgram.values.size());
+                childTape.carriers.resize(childProgram.values.size());
+                for (uint32_t local = 0; local < config.globalValues.size(); ++local) {
+                    const uint32_t global = config.globalValues[local];
+                    if (global < globalTape.hostBatches.size())
+                        childTape.hostBatches[local] = globalTape.hostBatches[global];
+                    if (global < globalTape.carriers.size())
+                        childTape.carriers[local] = globalTape.carriers[global];
+                }
+                ProgramTapeScratch childScratch(childProgram.values.size());
+                childScratch.importSnapshot(childTape);
+                std::unique_ptr<PullbackExecution> nodePullback;
+                if (!child->retainPullback(childArena, childScratch, nodePullback, error, &childSnapshots,
+                                           &childBackingSnapshots))
+                    return fail(*context_, error);
+                if (nodePullback)
+                    target.nodePullbacks->emplace(node, std::move(nodePullback));
+            }
+        }
+        if (hasBackward && target.retainPullback && !retainPullback(arena, tapeScratch, pullback, error))
+            return fail(*context_, error);
+        if (device) {
+            std::vector<char> downloads = publication.hostReadbackValues(execution->values.size());
+            ResolvedTransferExecutor transfers(*context_, arena);
+            if (!transfers.readbackBoundaryValues(downloads, error))
+                return fail(*context_, error);
+        }
+        if (const VernonStatus publicationStatus =
+                program_execution::executePublicationCommit(*context_, publication, arena, error);
+            publicationStatus != VERNON_STATUS_OK) {
+            return error.empty() ? publicationStatus : fail(*context_, error);
+        }
+        return VERNON_STATUS_OK;
+    }
+
+private:
+    bool retainPullback(ProgramInvocationState &arena, ProgramTapeScratch &tapeScratch,
+                        std::unique_ptr<PullbackExecution> &pullback, std::string &error,
+                        const std::vector<program_execution::CanonicalValueSnapshot> *sourceSnapshots = nullptr,
+                        const std::map<uint32_t, ProgramStorageBacking> *sourceStorages = nullptr) const {
+        const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
+        const program::Program *execution =
+            topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
+        const program::Graph *forward = execution ? program::findGraph(*execution, "forward") : nullptr;
+        if (!topology || !execution || !forward || !program::findGraph(*execution, "backward"))
+            return error = "Program pullback retention requires a differentiated Program", false;
+        ProgramResidualPlan plan;
+        uint64_t memoryBudget = context_->autodiffMemoryPolicy->invocationLimit();
+        const ProgramInvocationContext *invocation = arena.invocationContext();
+        const bool rematerializeTapes = invocation && invocation->checkpointMemoryBudget.has_value();
+        if (rematerializeTapes)
+            memoryBudget = *invocation->checkpointMemoryBudget;
+        const std::string_view checkpointPolicy = invocation ? invocation->checkpointPolicy : std::string_view{};
+        if (!planProgramResiduals(*execution, topology.get(), stagePlan_, arena.values(), tapeScratch, memoryBudget,
+                                  checkpointPolicy, rematerializeTapes, plan, error))
+            return false;
+        for (uint32_t value : plan.retainedValues) {
+            if (value >= arena.values().size())
+                return error = "Program pullback residual plan references an unknown Value", false;
+            ProgramValueState &slot = arena.values()[value];
+            const auto batch = tapeScratch.hostBatch(value);
+            if (batch) {
+                if (!batch->compact(true) || !fillProgramTapeHostValue(slot, batch, tapeScratch, value, error))
+                    return error = error.empty() ? "Program autodiff tape could not be compacted" : error, false;
+                arena.arguments()[value] = slot.argument;
+            }
+        }
+        std::vector<AutodiffPullbackPassTelemetry> telemetry =
+            collectProgramPassTelemetry(*forward, *execution, arena.values(), tapeScratch, plan);
+        std::shared_ptr<const RetainedPullbackState> state;
+        if (sourceSnapshots && sourceStorages) {
+            std::vector<program_execution::CanonicalValueSnapshot> retainedSnapshots;
+            retainedSnapshots.reserve(plan.retainedValues.size());
+            for (uint32_t value : plan.retainedValues) {
+                auto retainedSnapshot = arena.snapshotValue(value);
+                if (!retainedSnapshot)
+                    return error = "ProgramGraph retained Value snapshot is unavailable", false;
+                const auto source = std::find_if(sourceSnapshots->begin(), sourceSnapshots->end(),
+                                                 [&](const auto &candidate) { return candidate.value == value; });
+                if (source == sourceSnapshots->end())
+                    return error = "ProgramGraph retained Value snapshot is unavailable", false;
+                if (source->deviceOwner) {
+                    retainedSnapshot.value().residentArgument = source->residentArgument;
+                    retainedSnapshot.value().deviceOwner = source->deviceOwner;
+                }
+                retainedSnapshots.push_back(std::move(retainedSnapshot).value());
+            }
+            state =
+                std::make_shared<const RetainedPullbackState>(std::move(plan), *execution, std::move(retainedSnapshots),
+                                                              *sourceStorages, tapeScratch.releaseSnapshot());
+        } else {
+            state =
+                std::make_shared<const RetainedPullbackState>(std::move(plan), arena, tapeScratch.releaseSnapshot());
+        }
+        pullback = std::make_unique<ProgramPullback>(*context_, topology, stagePlan_, signature_, derivativeBindings_,
+                                                     std::move(state), std::move(telemetry));
+        return true;
+    }
+
+    VernonRuntimeContext *context_;
+    std::weak_ptr<const program::ResolvedExecutionPlan> topology_;
+    const CanonicalProgramAutodiffState *programAutodiff_{};
+    StageBindingPlan stagePlan_;
+    ProgramInvocationPreparation preparation_;
+    Signature signature_;
+    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
+    std::vector<std::pair<uint32_t, uint32_t>> forwardBindings_;
+    std::string signatureError_;
+    const std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> *nodeAutodiff_{};
+};
+
+} // namespace
+
+bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
+                            const std::vector<AutodiffDerivativeGroup> &derivativeGroups) {
+    if (!pipeline.context)
+        return false;
+    CanonicalProgramAutodiffState &state = pipeline.programAutodiff;
+    const program::Program &execution = pipeline.executionPlan->resolvedProgram->program;
+    if (!program::findGraph(execution, "forward")) {
+        invocationDiagnostic(*pipeline.context) = "Program execution topology requires a forward graph";
+        return false;
+    }
+    {
+        std::lock_guard lock(pipeline.context->autodiffMemoryPolicyMutex);
+        if (!pipeline.context->autodiffMemoryPolicy)
+            pipeline.context->autodiffMemoryPolicy = std::make_shared<AutodiffMemoryPolicy>();
+    }
+    auto executable = std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.executionPlan, state,
+                                                          StageBindingPlan{}, &pipeline.programGraphNodeAutodiff);
+    std::vector<AutodiffDerivativeGroup> groups = derivativeGroups;
+    const auto appendGroups = [&](AutodiffDerivativeRole role, program::BoundaryRole boundaryRole,
+                                  const std::vector<ValueAbi> &leaves, std::vector<AutodiffDerivativeGroup> &result) {
+        for (const program::DerivativeProjection &projection : execution.abi.derivativeProjections) {
+            const program::BoundarySlot &derivative = execution.abi.boundarySlots[projection.derivative.slot];
+            if (derivative.role != boundaryRole)
+                continue;
+            if (!derivative.layout) {
+                invocationDiagnostic(*pipeline.context) =
+                    "ProgramABI derivative projection has no canonical ValueLayout";
+                return false;
+            }
+            AutodiffDerivativeGroup group{role, projection.derivative.path, {}};
+            ValueLayout layout = program::materializeValueLayout(*derivative.layout, derivative.logicalType);
+            for (const ValueLeaf &layoutLeaf : layout.leaves) {
+                if (layoutLeaf.path.size() < projection.valuePath.size())
+                    continue;
+                bool selected = true;
+                for (size_t component = 0; component < projection.valuePath.size(); ++component) {
+                    const auto &expected = projection.valuePath[component];
+                    const auto &actual = layoutLeaf.path[component];
+                    selected &= expected.index ? !actual.field && *expected.index == actual.index
+                                               : actual.field && expected.field == *actual.field;
+                }
+                if (!selected)
+                    continue;
+                ValueLeaf publicLeaf = layoutLeaf;
+                publicLeaf.path.erase(publicLeaf.path.begin(),
+                                      publicLeaf.path.begin() + static_cast<ptrdiff_t>(projection.valuePath.size()));
+                const std::string leafPath = canonicalValueLeafPath(derivative.path, publicLeaf);
+                if (std::none_of(leaves.begin(), leaves.end(),
+                                 [&](const ValueAbi &leaf) { return leaf.path == leafPath; })) {
+                    invocationDiagnostic(*pipeline.context) =
+                        "ProgramABI derivative projection does not resolve to its declared leaf ABI";
+                    return false;
+                }
+                group.leafPaths.push_back(leafPath);
+            }
+            if (group.leafPaths.empty()) {
+                invocationDiagnostic(*pipeline.context) =
+                    "ProgramABI derivative projection selects no declared leaf ABI";
+                return false;
+            }
+            std::sort(group.leafPaths.begin(), group.leafPaths.end());
+            result.push_back(std::move(group));
+        }
+        return true;
+    };
+    if (groups.empty()) {
+        if (!appendGroups(AutodiffDerivativeRole::Gradient, program::BoundaryRole::Gradient,
+                          executable->signature().gradients, groups))
+            return false;
+        std::sort(groups.begin(), groups.end(),
+                  [](const AutodiffDerivativeGroup &left, const AutodiffDerivativeGroup &right) {
+                      return left.declaredPath < right.declaredPath;
+                  });
+        const size_t gradientCount = groups.size();
+        if (!appendGroups(AutodiffDerivativeRole::Cotangent, program::BoundaryRole::Cotangent,
+                          executable->signature().cotangents, groups))
+            return false;
+        std::sort(groups.begin() + static_cast<std::ptrdiff_t>(gradientCount), groups.end(),
+                  [](const AutodiffDerivativeGroup &left, const AutodiffDerivativeGroup &right) {
+                      return left.declaredPath < right.declaredPath;
+                  });
+    }
+    std::string groupError;
+    const bool completeDerivativeBoundary =
+        !executable->signature().cotangents.empty() && !executable->signature().gradients.empty();
+    const bool validGroups = !completeDerivativeBoundary || validateAutodiffDerivativeGroups(groups, groupError);
+    const bool validSignature = !completeDerivativeBoundary || validateDerivativeGroupsAgainstSignature(
+                                                                   *pipeline.context, groups, executable->signature());
+    if (!validGroups || !validSignature) {
+        if (!groupError.empty())
+            invocationDiagnostic(*pipeline.context) = std::move(groupError);
+        else if (invocationDiagnostic(*pipeline.context).empty())
+            invocationDiagnostic(*pipeline.context) = "Program autodiff derivative groups do not match its signature";
+        return false;
+    }
+    state.canonicalExecution = std::move(executable);
+    state.derivativeGroups = std::move(groups);
+    return true;
+}
+
+} // namespace vernon::runtime::ad

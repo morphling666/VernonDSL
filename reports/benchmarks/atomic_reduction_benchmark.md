@@ -1,0 +1,68 @@
+# Atomic and Workgroup Publication Benchmark
+
+- Iterations per case: 20
+- Workgroup size: 64
+
+- cpu / one_bin / 128: median 0.000300s, p95 0.000426s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / one_bin / 256: median 0.000296s, p95 0.000374s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / one_bin / 512: median 0.000300s, p95 0.000400s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / one_bin / 1024: median 0.000299s, p95 0.000384s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / few_bin / 128: median 0.000294s, p95 0.000406s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=640 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / few_bin / 256: median 0.000374s, p95 0.000455s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=640 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / few_bin / 512: median 0.000163s, p95 0.000206s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=640 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / few_bin / 1024: median 0.000281s, p95 0.000378s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=640 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / low_collision / 128: median 0.000288s, p95 0.000376s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=10240 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / low_collision / 256: median 0.000303s, p95 0.000368s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=20480 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / low_collision / 512: median 0.000313s, p95 0.000404s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=40960 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / low_collision / 1024: median 0.000283s, p95 0.000382s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=81920 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / workgroup_publication / 128: median 0.000350s, p95 0.000446s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=40, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / workgroup_publication / 256: median 0.000360s, p95 0.000424s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=80, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / workgroup_publication / 512: median 0.000360s, p95 0.000437s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=160, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- cpu / workgroup_publication / 1024: median 0.000390s, p95 0.000504s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=320, temporary allocation traffic=80 bytes; GPU timestamp skipped (CPU backend has no GPU timestamp)
+- metal / one_bin / 128: median 0.000969s, p95 0.001475s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / one_bin / 256: median 0.001173s, p95 0.001365s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / one_bin / 512: median 0.001492s, p95 0.009484s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / one_bin / 1024: median 0.001943s, p95 0.002035s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / few_bin / 128: median 0.000894s, p95 0.001004s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / few_bin / 256: median 0.001052s, p95 0.001270s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / few_bin / 512: median 0.001068s, p95 0.001656s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / few_bin / 1024: median 0.001102s, p95 0.001423s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / low_collision / 128: median 0.001029s, p95 0.001258s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=10240 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / low_collision / 256: median 0.000860s, p95 0.000936s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=20480 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / low_collision / 512: median 0.001048s, p95 0.001659s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=40960 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / low_collision / 1024: median 0.001022s, p95 0.001268s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=81920 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / workgroup_publication / 128: median 0.001046s, p95 0.001622s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=40, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / workgroup_publication / 256: median 0.001050s, p95 0.001199s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=80, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / workgroup_publication / 512: median 0.001053s, p95 0.001513s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=160, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- metal / workgroup_publication / 1024: median 0.000899s, p95 0.000991s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=320, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / one_bin / 128: median 0.001161s, p95 0.001280s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / one_bin / 256: median 0.001140s, p95 0.001330s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / one_bin / 512: median 0.001437s, p95 0.001893s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / one_bin / 1024: median 0.002014s, p95 0.002090s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / few_bin / 128: median 0.001103s, p95 0.001556s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / few_bin / 256: median 0.001084s, p95 0.001155s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / few_bin / 512: median 0.000980s, p95 0.001558s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / few_bin / 1024: median 0.001149s, p95 0.001712s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=640 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / low_collision / 128: median 0.001083s, p95 0.001570s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=2560, temporary allocation traffic=10240 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / low_collision / 256: median 0.001075s, p95 0.001526s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=5120, temporary allocation traffic=20480 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / low_collision / 512: median 0.001079s, p95 0.001188s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=10240, temporary allocation traffic=40960 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / low_collision / 1024: median 0.001085s, p95 0.001237s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=20480, temporary allocation traffic=81920 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / workgroup_publication / 128: median 0.001082s, p95 0.001205s, sum 128.0, submissions/waits/readbacks=20/20/20, atomic publications=40, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / workgroup_publication / 256: median 0.001103s, p95 0.001184s, sum 256.0, submissions/waits/readbacks=20/20/20, atomic publications=80, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / workgroup_publication / 512: median 0.001099s, p95 0.001193s, sum 512.0, submissions/waits/readbacks=20/20/20, atomic publications=160, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+- vulkan / workgroup_publication / 1024: median 0.000945s, p95 0.001193s, sum 1024.0, submissions/waits/readbacks=20/20/20, atomic publications=320, temporary allocation traffic=80 bytes; GPU timestamp skipped (RHI timestamp queries are unavailable)
+
+## Uniform-contention crossover
+
+- cpu / 128: workgroup/direct ratio 1.164, recommended direct_atomic
+- cpu / 256: workgroup/direct ratio 1.216, recommended direct_atomic
+- cpu / 512: workgroup/direct ratio 1.201, recommended direct_atomic
+- cpu / 1024: workgroup/direct ratio 1.303, recommended direct_atomic
+- metal / 128: workgroup/direct ratio 1.080, recommended direct_atomic
+- metal / 256: workgroup/direct ratio 0.895, recommended workgroup_reduction
+- metal / 512: workgroup/direct ratio 0.706, recommended workgroup_reduction
+- metal / 1024: workgroup/direct ratio 0.463, recommended workgroup_reduction
+- vulkan / 128: workgroup/direct ratio 0.932, recommended workgroup_reduction
+- vulkan / 256: workgroup/direct ratio 0.968, recommended workgroup_reduction
+- vulkan / 512: workgroup/direct ratio 0.765, recommended workgroup_reduction
+- vulkan / 1024: workgroup/direct ratio 0.469, recommended workgroup_reduction

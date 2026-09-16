@@ -1,0 +1,71 @@
+{
+  "cpu_gpu_comparisons": [
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.23397661300169897,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 256,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 17409948,
+      "speedup_over_cpu": 4.273931429175525
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.13157339162750314,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 512,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 70948764,
+      "speedup_over_cpu": 7.600320913145537
+    },
+    {
+      "architecture": "metal",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.07936658500898369,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 1024,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 133778876,
+      "speedup_over_cpu": 12.599760968508443
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.19610454391257567,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 256,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 17409948,
+      "speedup_over_cpu": 5.099320903271903
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.09148694428554156,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 512,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 70948764,
+      "speedup_over_cpu": 10.930521374491226
+    },
+    {
+      "architecture": "vulkan",
+      "bounded_device_tape": true,
+      "elapsed_ratio_to_cpu": 0.05041260304866283,
+      "forward_matches_cpu": true,
+      "gradient_matches_cpu": true,
+      "grid": 1024,
+      "logical_residual_matches_cpu": true,
+      "peak_temporary_tape_delta_bytes": 133778876,
+      "speedup_over_cpu": 19.83630956399353
+    }
+  ],
+  "schema_version": 1
+}

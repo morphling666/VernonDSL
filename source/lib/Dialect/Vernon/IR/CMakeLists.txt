@@ -4,6 +4,7 @@ add_mlir_dialect_library(
     VernonDialect.cpp
     VernonTypes.cpp
     VernonOps.cpp
+    VernonMetadataAbi.cpp
     VernonValueAbi.cpp
     ADDITIONAL_HEADER_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../../include/mlir/Dialect/Vernon

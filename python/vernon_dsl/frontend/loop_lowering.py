@@ -4,35 +4,22 @@ import ast
 from typing import Protocol
 
 from ..language.ast_utils import dotted_name
-from .control_flow_lowering import emit_loop_body, return_state_items
-from .lowering_types import DslType, FunctionSignature, ModuleContext, Value
+from .control_flow_lowering import (
+    ControlFlowEmitter,
+    assigned_names,
+    contains_loop_exit,
+    contains_return,
+    emit_loop_body,
+    emit_source_block,
+    return_state_items,
+    yield_values,
+)
+from .lowering_types import DslType, Value
 from .model import TypedStatement
 
 
-class LoopEmitter(Protocol):
-    context: ModuleContext
-    signature: FunctionSignature
-    indent: int
-    environment: dict[str, Value]
-    loop_controls: list[str]
-    return_flag_name: str | None
-    typed_statements: dict[int, TypedStatement]
-
-    def _expression(self, node: ast.expr, expected: DslType | None = None) -> Value: ...
-
-    def _coerce_implicit(self, node: ast.AST, value: Value, target: DslType) -> Value: ...
-
-    def _require_same_type(self, node: ast.AST, expected: DslType, actual: DslType) -> None: ...
-
+class LoopEmitter(ControlFlowEmitter, Protocol):
     def _hidden_name(self, prefix: str) -> str: ...
-
-    def _control_constant(self, value: int) -> Value: ...
-
-    def _bool_constant(self, value: bool) -> Value: ...
-
-    def _fresh(self) -> str: ...
-
-    def _line(self, text: str) -> None: ...
 
 
 def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
@@ -42,8 +29,6 @@ def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
         or dotted_name(node.iter.func) != "range"
     ):
         raise emitter.context.error(node, "for loops must have the form 'for name in range(...)'")
-    if node.orelse:
-        raise emitter.context.error(node, "for-else is not supported")
     if not 1 <= len(node.iter.args) <= 3 or node.iter.keywords:
         raise emitter.context.error(node.iter, "range requires one to three positional i32 arguments")
     integer_type = DslType("scalar", "i32")
@@ -68,8 +53,92 @@ def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
         emitter._line(f"{nonzero} = arith.cmpi ne, {step.name}, {zero.name} : i32")
         emitter._line(f'cf.assert {nonzero}, "range step must not be zero"')
 
-    outer = emitter.environment.copy()
     typed_statement = emitter.typed_statements[id(node)]
+    if _is_canonical_range(node, typed_statement):
+        _lower_canonical_for(emitter, node, typed_statement, start, stop)
+        return
+    _lower_dynamic_for(emitter, node, typed_statement, start, stop, step, zero, integer_type)
+
+
+def _is_canonical_range(node: ast.For, typed_statement: TypedStatement) -> bool:
+    assert isinstance(node.iter, ast.Call)
+    if len(node.iter.args) == 3 and _literal_integer(node.iter.args[2]) != 1:
+        return False
+    body_ids = {id(statement) for statement in node.body}
+    body = tuple(child for child in typed_statement.children if id(child.source) in body_ids)
+    target_depth = typed_statement.loop_depth + 1
+    return not any(contains_return(statement) or contains_loop_exit(statement, target_depth) for statement in body)
+
+
+def _lower_canonical_for(
+    emitter: LoopEmitter,
+    node: ast.For,
+    typed_statement: TypedStatement,
+    start: Value,
+    stop: Value,
+) -> None:
+    assert isinstance(node.target, ast.Name)
+    lower_bound = emitter._fresh()
+    emitter._line(f"{lower_bound} = arith.index_cast {start.name} : i32 to index")
+    upper_bound = emitter._fresh()
+    emitter._line(f"{upper_bound} = arith.index_cast {stop.name} : i32 to index")
+    step = emitter._fresh()
+    emitter._line(f"{step} = arith.constant 1 : index")
+
+    outer = emitter.environment.copy()
+    carried_names = [merge.name for merge in typed_statement.branch_merges]
+    carried_types = [merge.type for merge in typed_statement.branch_merges]
+    for name, value_type in zip(carried_names, carried_types, strict=True):
+        outer[name] = emitter._coerce_implicit(node, outer[name], value_type)
+
+    results = [emitter._fresh() for _ in carried_names]
+    induction = emitter._fresh()
+    result_prefix = f"{', '.join(results)} = " if results else ""
+    if carried_names:
+        arguments = [emitter._fresh() for _ in carried_names]
+        iter_args = ", ".join(
+            f"{argument} = {outer[name].name}" for argument, name in zip(arguments, carried_names, strict=True)
+        )
+        result_types = ", ".join(value_type.mlir for value_type in carried_types)
+        suffix = f" iter_args({iter_args}) -> ({result_types})"
+    else:
+        arguments = []
+        suffix = ""
+    emitter._line(f"{result_prefix}scf.for {induction} = {lower_bound} to {upper_bound} step {step}{suffix} {{")
+    emitter.indent += 1
+    emitter.environment = outer.copy()
+    for name, value_type, argument in zip(carried_names, carried_types, arguments, strict=True):
+        emitter.environment[name] = Value(argument, value_type)
+    dsl_induction = emitter._fresh()
+    emitter._line(f"{dsl_induction} = arith.index_cast {induction} : index to i32")
+    emitter.environment[node.target.id] = Value(
+        dsl_induction,
+        DslType("scalar", "i32"),
+        canonical_index=induction,
+    )
+    emit_source_block(emitter, node.body)
+    yield_values(emitter, node, carried_names, carried_types)
+    emitter.indent -= 1
+    emitter._line("}")
+
+    emitter.environment = outer
+    for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
+        emitter.environment[name] = Value(result, value_type)
+    emit_source_block(emitter, node.orelse)
+
+
+def _lower_dynamic_for(
+    emitter: LoopEmitter,
+    node: ast.For,
+    typed_statement: TypedStatement,
+    start: Value,
+    stop: Value,
+    step: Value,
+    zero: Value,
+    integer_type: DslType,
+) -> None:
+    assert isinstance(node.target, ast.Name)
+    outer = emitter.environment.copy()
     control_name = emitter._hidden_name("loop_control")
     current_name = emitter._hidden_name("range_current")
     active_name = emitter._hidden_name("range_active")
@@ -126,9 +195,7 @@ def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
     emitter._line(f"^bb0({block_arguments}):")
     for name, value_type, argument in zip(carried_names, carried_types, after_arguments, strict=True):
         emitter.environment[name] = Value(argument, value_type)
-    induction = emitter._fresh()
-    emitter._line(f"{induction} = arith.index_cast {emitter.environment[current_name].name} : i32 to index")
-    emitter.environment[node.target.id] = Value(induction, DslType("index", "index"))
+    emitter.environment[node.target.id] = emitter.environment[current_name]
     emitter.loop_controls.append(control_name)
     emit_loop_body(emitter, node.body, control_name, typed_statement.loop_depth + 1)
     emitter.loop_controls.pop()
@@ -152,19 +219,17 @@ def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
     yielded = ", ".join(emitter.environment[name].name for name in carried_names)
     emitter._line(f"scf.yield {yielded} : {operand_types}")
     emitter.indent -= 1
-    emitter._line("}")
+    emitter._line(f"}}{_loop_state_attributes(emitter, carried_names, control_name)}")
     emitter.environment = outer
     internal_names = {current_name, active_name, control_name}
     for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
-        if name not in internal_names:
-            emitter.environment[name] = Value(result, value_type)
+        emitter.environment[name] = Value(result, value_type)
+    _emit_loop_else(emitter, node.orelse, control_name)
     for name in internal_names:
         emitter.environment.pop(name, None)
 
 
 def lower_while(emitter: LoopEmitter, node: ast.While) -> None:
-    if node.orelse:
-        raise emitter.context.error(node, "while-else is not supported")
     outer = emitter.environment.copy()
     typed_statement = emitter.typed_statements[id(node)]
     control_name = emitter._hidden_name("loop_control")
@@ -231,11 +296,11 @@ def lower_while(emitter: LoopEmitter, node: ast.While) -> None:
     yielded = ", ".join(emitter.environment[name].name for name in carried_names)
     emitter._line(f"scf.yield {yielded}{suffix}")
     emitter.indent -= 1
-    emitter._line("}")
+    emitter._line(f"}}{_loop_state_attributes(emitter, carried_names, control_name)}")
     emitter.environment = outer
     for name, result, result_type in zip(carried_names, results, carried_types, strict=True):
-        if name != control_name:
-            emitter.environment[name] = Value(result, result_type)
+        emitter.environment[name] = Value(result, result_type)
+    _emit_loop_else(emitter, node.orelse, control_name)
     emitter.environment.pop(control_name, None)
 
 
@@ -248,6 +313,13 @@ def _append_return_state(
         if name not in names:
             names.append(name)
             types.append(value_type)
+
+
+def _loop_state_attributes(emitter: LoopEmitter, carried_names: list[str], control_name: str) -> str:
+    attributes = [f"vernon.loop_control_index = {carried_names.index(control_name)} : i64"]
+    if emitter.return_flag_name is not None and emitter.return_flag_name in carried_names:
+        attributes.append(f"vernon.return_flag_index = {carried_names.index(emitter.return_flag_name)} : i64")
+    return " attributes {" + ", ".join(attributes) + "}"
 
 
 def _guard_return(emitter: LoopEmitter, active: str) -> str:
@@ -271,6 +343,58 @@ def _normalize_continue(emitter: LoopEmitter, control: Value) -> Value:
     normalized = emitter._fresh()
     emitter._line(f"{normalized} = arith.select {is_continue}, {normal_value.name}, {control.name} : i32")
     return Value(normalized, DslType("scalar", "i32"))
+
+
+def _emit_loop_else(
+    emitter: LoopEmitter,
+    statements: list[ast.stmt],
+    control_name: str,
+) -> None:
+    if not statements:
+        return
+    outer = emitter.environment.copy()
+    assigned = assigned_names(statements)
+    carried_names = [
+        name
+        for name in sorted(assigned & outer.keys())
+        if outer[name].type.kind not in {"sampler", "tensor_storage", "tensor_view", "texture"}
+    ]
+    for name, _ in return_state_items(emitter):
+        if name in outer and name not in carried_names:
+            carried_names.append(name)
+    carried_types = [outer[name].type for name in carried_names]
+    break_value = emitter._control_constant(1)
+    normal = emitter._fresh()
+    emitter._line(f"{normal} = arith.cmpi ne, {outer[control_name].name}, {break_value.name} : i32")
+    normal = _guard_return(emitter, normal)
+
+    outer_lines = emitter.lines
+    outer_indent = emitter.indent
+    emitter.lines = []
+    emitter.indent = outer_indent + 1
+    emitter.environment = outer.copy()
+    emit_source_block(emitter, statements)
+    yield_values(emitter, statements[0], carried_names, carried_types)
+    then_lines = emitter.lines
+
+    emitter.lines = []
+    emitter.environment = outer.copy()
+    yield_values(emitter, statements[0], carried_names, carried_types)
+    else_lines = emitter.lines
+
+    results = [emitter._fresh() for _ in carried_names]
+    prefix = f"{', '.join(results)} = " if results else ""
+    result_types = f" -> ({', '.join(value.mlir for value in carried_types)})" if results else ""
+    emitter.lines = outer_lines
+    emitter.indent = outer_indent
+    emitter.environment = outer
+    emitter._line(f"{prefix}scf.if {normal}{result_types} {{")
+    emitter.lines.extend(then_lines)
+    emitter._line("} else {")
+    emitter.lines.extend(else_lines)
+    emitter._line("}")
+    for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
+        emitter.environment[name] = Value(result, value_type)
 
 
 def _literal_integer(node: ast.expr) -> int | None:
