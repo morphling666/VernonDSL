@@ -1,11 +1,11 @@
-# Joint planner, cost model, and agents
+# Joint planner, candidate generation, and evidence
 
 Status: future design, not a current VernonDSL contract.
 
-This document defines topology, recipe-free joint search, cost modeling,
-profiles, measurement, Pareto selection, and agent proposals. IR and legality
-belong to [`optimization_ir.md`](optimization_ir.md). Numerical quality and
-representation belong to
+This document defines topology, recipe-free joint search, the common candidate
+generator protocol, cost modeling, profiles, optimization memory, measurement,
+and Pareto selection. IR and legality belong to
+[`optimization_ir.md`](optimization_ir.md). Numerical quality and representation belong to
 [`numerical_representation.md`](numerical_representation.md).
 
 ## 1. Planner responsibility
@@ -92,6 +92,42 @@ TP, EP, DP, CP, PP, attention, MoE, halo, and similar domain names are not
 actions or hidden cost features. A generic search may rediscover the same
 physical plan when it is profitable.
 
+The action space is the initial vocabulary, not a privileged deterministic
+path or the maximum future intelligence of the compiler. A generator may
+synthesize a new algorithmic rewrite, fusion region, physical implementation,
+or target lowering outside the current rule closure. The concrete result still
+enters the same typed plan, translation-validation, evaluation, and fallback
+protocols.
+
+### 4.1 Candidate generator protocol
+
+All proposal mechanisms implement:
+
+```text
+CandidateGenerator {
+  accepted_problem_kinds
+  required_semantic_and_analysis_interfaces
+  accepted_constraints_profiles_and_prior_evidence
+  generated_decisions_regions_or_implementations
+  declared_assumptions_and_expected_evidence
+  identity_version_and_replay_information
+}
+```
+
+Initial implementations include:
+
+- handwritten rewrites and region-growth passes;
+- constraint, graph, ILP, and equality-saturation solvers;
+- schedule enumerators and autotuners;
+- retrieval and adaptation from optimization memory;
+- learned proposers and agents;
+- external synthesis services.
+
+A generator may propose one `DecisionNode`, a consistent decision subgraph, a
+complete `PlanCandidate`, or an `ImplementationCandidate`. Generator identity
+changes provenance and reproducibility requirements, not semantic authority or
+acceptance criteria.
+
 ## 5. Bounded joint search
 
 Search remains hierarchical but revisable:
@@ -100,6 +136,7 @@ Search remains hierarchical but revisable:
 flowchart TB
     Hard["Apply hard constraints"]
     Analyze["Propagate semantic relations"]
+    Generate["CandidateGenerator set"]
     Outer["Partition, representation, placement beam"]
     Redist["Materialize redistribution"]
     Async["Generate communication and async schedules"]
@@ -108,9 +145,12 @@ flowchart TB
     Evaluate["Model, compile, reference, measure"]
     Pareto["Retain explainable Pareto variants"]
 
-    Hard --> Analyze --> Outer --> Redist --> Async --> Inner
+    Hard --> Analyze --> Generate
+    Generate --> Outer --> Redist --> Async --> Inner
+    Generate --> Inner
     Inner --> Verify --> Evaluate --> Pareto
     Evaluate -. bounded feedback .-> Outer
+    Evaluate -. evidence and failures .-> Generate
 ```
 
 Initial algorithms:
@@ -127,6 +167,13 @@ Every outer candidate materializes communication and receives an inner
 implementation estimate. Material measured deviations may trigger a bounded,
 cached outer reconsideration.
 
+The outer/global loop owns representation, partition, placement, replication,
+redistribution, checkpointing, fusion boundaries, and asynchronous
+composition. The inner/local loop owns algorithmic replacement, tiles,
+layouts, pipelines, memory hierarchy, target operations, and leaf lowering.
+They exchange explicit decision and evidence edges rather than running once in
+a fixed order.
+
 ## 6. Cost model role
 
 The optimization system separates authority:
@@ -134,15 +181,23 @@ The optimization system separates authority:
 | Component | Authority |
 | --- | --- |
 | Semantic rules and verifiers | Define the feasible set |
-| Generic transformations | Define candidate actions |
-| Cost model | Approximate multi-objective value with uncertainty |
+| Generic transformations | Define the reusable baseline action vocabulary |
+| Agent or learned proposer | Supply an implicit prior over useful unexplored candidates |
+| Explicit accounting and cost model | Approximate multi-objective value with uncertainty |
 | Hardware measurement | Supply ground-truth observations |
-| Planner or agent | Propose candidates |
+| Planner, agent, or external synthesizer | Propose candidates and implementations |
 
 A favorable model score cannot legalize an invalid candidate.
 
 The model evaluates a complete `PlanCandidate`, not a kernel after distribution
 has already been fixed.
+
+Agent intuition does not replace the explicit model. Exact accounting,
+calibrated topology facts, event simulation, versioned uncertainty, and
+explanations provide a shared evaluator across generators. Agent intuition may
+challenge the ranking and request exploration of an uncertain or
+out-of-distribution candidate; it may not declare its own candidate faster.
+Measurement remains performance evidence.
 
 ## 7. Candidate features
 
@@ -301,6 +356,40 @@ Report:
 
 Average runtime prediction error alone is not an adequate planner metric.
 
+### 9.3 Optimization memory
+
+Optimization memory is a versioned evidence store, not a committed source
+kernel library:
+
+```text
+OptimizationMemoryRecord {
+  semantic_and_analysis_fingerprint
+  shape_phase_topology_and_target_conditions
+  reusable_optimization_decision_subgraph
+  implementation_and_artifact_identity
+  EvidenceBundle
+  failed_attempts_and_counterexamples
+  generator_and_toolchain_identity
+}
+```
+
+Retrieval is itself a `CandidateGenerator`: it finds related records, adapts
+their decisions to the current problem, and submits the result to normal
+verification. Exact artifacts may be reused only when all qualified identities
+match.
+
+Knowledge is promoted by evidence:
+
+```text
+one qualified success     -> cached implementation
+repeated related success  -> parameterized schedule schema
+cross-workload success    -> algorithmic rewrite or lowering pattern
+stable prediction gain    -> shared cost feature or residual model
+```
+
+Failures and qualification boundaries remain first-class memory because they
+prevent repeated expensive exploration.
+
 ## 10. Objectives and Pareto selection
 
 Objectives may include:
@@ -345,7 +434,23 @@ Runtime may not change hard placement, Program numerics, synchronization,
 representation, or an immutable installed plan. New decisions require
 compilation and validation.
 
-## 13. Agent proposal layer
+### 12.1 Tiered optimization
+
+Deployment does not wait for open-ended synthesis:
+
+```text
+Tier 0  deterministic reference or baseline lowering
+Tier 1  reusable rules, retrieval, and explicit cost-guided search
+Tier 2  bounded autotuning and active measurement
+Tier 3  agentic algorithm, graph, and kernel synthesis
+```
+
+Each tier may install a better qualified `PhysicalPlanVariant` without mutating
+an executing one. Expensive tiers focus on high-regret, high-uncertainty,
+out-of-distribution, or high-value regions. Compilation and measurement budget
+are explicit objectives.
+
+## 13. Generator specialization: agents
 
 ### 13.1 Inputs and outputs
 
@@ -355,17 +460,43 @@ obligations, and prior failures.
 
 It may propose:
 
+- complete graph-level numerical, partition, placement, redistribution, and
+  asynchronous plans;
 - partition or placement transformations;
 - task decompositions and availability regions;
-- fusion or split candidates;
-- physical schedule templates;
+- compositional fusion, split, or algorithmic replacement regions;
+- physical schedule templates or concrete physical IR;
+- target lowering implementations in any registered inspectable target IR or
+  source adapter;
 - search-order and pruning hypotheses;
-- new cost features or residual models.
+- new cost features, analytical components, event simulators, residual models,
+  or candidate-specific cost extensions.
 
 Typed builders are preferred. Free-form DSL must parse into the same typed IR
-and pass the same checks.
+and pass the same checks. An agent is therefore allowed to act both as a
+graph-level optimizer and as a kernel-lowering pass. It need not encode a
+successful implementation as a deterministic compiler rule before that
+implementation can be evaluated or installed.
 
-### 13.2 Evaluation
+### 13.2 One protocol, different proposal policies
+
+Operation analysis interfaces serve every generator:
+
+```text
+operation semantics and analysis
+  -> CandidateGenerator
+  -> typed FusionRegion, PlanCandidate, or ImplementationCandidate
+  -> shared verification and evaluation
+```
+
+Rules provide fast, reproducible coverage of known cases; solvers provide
+systematic bounded exploration; retrieval amortizes prior work; and agents
+provide a broader but uncertain proposal distribution that may escape the
+current transformation closure. These are policies behind one protocol, not
+separate compiler paths. Rules are retained as validated, amortized knowledge
+rather than treated as the maximum intelligence available to the compiler.
+
+### 13.3 Evaluation
 
 ```text
 construct
@@ -379,7 +510,43 @@ construct
 Failures are semantic, capability, resource, progress, compilation,
 correctness, numerical, or performance failures.
 
-### 13.3 Insight promotion
+The same agent must not make an uncalibrated performance claim authoritative
+for the candidate it generated. It may request measurement, explain why the
+current model is out of distribution, or propose an independently testable
+cost extension.
+
+### 13.4 Generated cost extensions
+
+For a candidate outside the current explicit model, an agent may produce:
+
+```text
+GeneratedCostExtension {
+  applicability_and_feature_extractor
+  exact_accounting_dependencies
+  analytical_decomposition_or_event_model
+  topology_and_toolchain_dependencies
+  calibration_parameters
+  uncertainty_and_out_of_distribution_policy
+  required_microbenchmarks_and_holdout_cases
+}
+```
+
+The extension is advisory until dimensional and monotonicity checks,
+microbenchmarks, held-out calibration, and candidate measurements establish
+its useful range. A small candidate set may be measured directly instead.
+Repeatedly validated extensions may enter the versioned shared cost model;
+failed extensions remain failure records.
+
+The resulting division of authority is:
+
+```text
+agent intuition      = proposal and exploration prior
+explicit cost model  = shared calibrated critic
+hardware measurement = performance evidence
+verifier             = correctness authority
+```
+
+### 13.5 Insight promotion
 
 ```text
 InsightRecord {
@@ -396,7 +563,11 @@ InsightRecord {
 
 An insight becomes a deterministic compiler rule only after held-out replay
 across shapes, devices, versions, and negative cases. Generated artifacts stay
-in caches or bundles rather than becoming a source kernel library.
+in caches or bundles rather than becoming a source kernel library. A
+successful one-off generated implementation may be installed as a qualified
+physical-plan variant without first becoming a general rule. Repeated success
+may be distilled into an algorithmic rewrite, schedule schema, target lowering
+pattern, cost feature, or residual model.
 
 As agents improve they may control more proposal policy. They never replace
 semantic authority, verification, reference checks, measurement, or immutable

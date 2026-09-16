@@ -39,6 +39,19 @@ An operation exposes the meaningful subset of:
 An operation need not implement every interface. Unknown information causes
 conservative barriers or candidate rejection, not invented semantics.
 
+These interfaces are not specific to deterministic fusion passes. They are the
+shared, typed optimization API for handwritten rules, solvers, agents, and
+external synthesizers. A candidate generator may derive a region using fixed
+rules or propose a new algorithmic replacement using learned reasoning. In
+both cases the source operations retain semantic authority and the candidate
+must preserve or explicitly refine their contracts.
+
+`FusionRules` does not enumerate profitable neighboring operation names. It
+states exceptional composition conditions, required completion or
+materialization points, and legal refinement preconditions that cannot be
+derived from iteration, access, scalar, effect, alias, dependency, and
+numerical semantics.
+
 ### 2.1 Structured computation
 
 For structured tensor computation, the complete contract is:
@@ -89,6 +102,62 @@ An opaque Stage remains legal with typed inputs/outputs, effects, aliases,
 capabilities, optional partition/fusion constraints, conservative cost
 metadata, alternatives, and a fallback. Backend code is never inspected to
 reconstruct missing semantics.
+
+### 2.4 Semantic regions and progressive analyzability
+
+Candidate generators consume a `SemanticRegion`, which references one or more
+canonical Program operations and their observable boundary:
+
+```text
+SemanticRegion {
+  Program operations and provenance
+  external Values, Storages, and regions
+  observable effects and dependencies
+  implemented analysis interfaces
+  algebraic and numerical laws
+  conservative reference semantics
+}
+```
+
+The view may expose progressively more structure:
+
+```text
+typed opaque reference
+  -> effects and conservative access
+  -> iteration, scalar, and reduction semantics
+  -> partition and composition laws
+  -> verified algorithmic refinements
+```
+
+A missing advanced interface limits transformations but does not require
+replacing the operation or hard-coding its domain name into the planner.
+
+### 2.5 Optimization decision graph
+
+Planning decisions are recorded as a persistent dependency graph rather than
+only mutating one monolithic plan:
+
+```text
+DecisionNode {
+  identity_and_kind
+  generator_and_parent_decisions
+  semantic_objects_and_regions
+  assumptions_and_constraints
+  selected_action_or_refinement
+  exact_derived_consequences
+  alternatives_and_rejection_reasons
+}
+```
+
+For example, a factor split may imply a `PartialValue`; its consumer placement
+may imply a `Redistribution`; the selected transfer representation may imply a
+conversion; and chunk availability may enable a fusion candidate. These edges
+explain why each physical task exists and allow measured local failures to
+replace the affected decisions without discarding unrelated choices.
+
+A `PlanCandidate` is one complete, consistent, evaluable projection of an
+`OptimizationDecisionGraph`. The graph is compiler search and provenance
+state; it is not serialized as mutable Runtime policy.
 
 ## 3. Logical distribution IR
 
@@ -267,6 +336,14 @@ A `FusionRegion` records semantic eligibility:
 
 It is not yet a kernel schedule.
 
+Fusion-region proposers include deterministic producer-consumer growth,
+bounded graph search, user constraints, reusable algorithmic rewrites, and
+agents. An agent may choose a boundary or replace the region with a synthesized
+algorithm not present in the deterministic rule set. Such a replacement
+records source-to-replacement Value and region mappings, preconditions,
+numerical refinement, effects, completion, and a reference or split fallback.
+Agent selection does not itself establish eligibility.
+
 ### 7.1 Region growth
 
 Deterministic producer-consumer fusion:
@@ -389,6 +466,39 @@ structure and records:
 It is an optional optimization form, not the required result for every
 Program.
 
+### 8.7 Implementation candidates
+
+A verified physical region may be implemented by an ordinary lowering pass,
+schedule enumeration, an agent acting as a lowering pass, or another
+registered synthesizer:
+
+```text
+ImplementationCandidate {
+  source_region_and_semantic_provenance
+  selected_optimization_decisions
+  generator_identity_and_inputs
+  target_and_capability_preconditions
+  shape_layout_and_representation_assumptions
+  input_output_region_mapping
+  numerical_refinement
+  effects_memory_and_synchronization_contract
+  source_physical_or_target_IR
+  resource_requirements_or_analysis
+  validation_evidence
+  fallback
+}
+```
+
+The generator may emit typed Vernon physical IR, a registered external DSL,
+target IR, or lower target representation. Intermediate forms are aids to
+generation and verification, not mandatory semantic authorities. A lower or
+less inspectable output requires stronger target parsing, translation
+validation, reference testing, capability restrictions, and fallback.
+
+Cross-platform semantics means that the same verified source region may be
+regenerated into different target implementations. It does not require one
+low-level implementation to execute unchanged on every backend.
+
 ## 9. Composable verification
 
 Every candidate passes shared checks:
@@ -402,6 +512,31 @@ Every candidate passes shared checks:
 7. resource capacity and concurrent residency;
 8. capability satisfaction;
 9. fallback validity.
+
+For a synthesized region or direct target implementation, these checks are
+translation validation of the concrete result rather than trust in the
+generator that produced it. Validation proves what is statically tractable and
+records numerical or semantic obligations discharged by differential testing.
+Incomplete evidence narrows the accepted shape and capability bucket or
+rejects the candidate; it never silently upgrades a candidate to a general
+rule.
+
+The acceptance result is an `EvidenceBundle` associated with, but not authored
+by, the candidate:
+
+```text
+EvidenceBundle {
+  verifier_and_translation_validation_results
+  numerical_and_differential_results
+  compilation_and_resource_results
+  analytical_estimates_and_uncertainty
+  measured_profiles
+  counterexamples_and_qualification_limits
+}
+```
+
+Keeping evidence separate prevents a generator from granting authority to its
+own correctness or performance claims.
 
 Typed checks add:
 
