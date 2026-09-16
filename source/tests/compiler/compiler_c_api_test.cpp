@@ -410,6 +410,16 @@ module {
 
     const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
     const VernonStringView compiledReflection = vernonCompileResultGetReflection(compiled);
+    const nlohmann::json compiledJson =
+        nlohmann::json::parse(compiledReflection.data, compiledReflection.data + compiledReflection.size);
+    const nlohmann::json &metadata = compiledJson.at("entries").at(0).at("metadata_carrier");
+    EXPECT_EQ(metadata.at("profile"), "host_metadata");
+    EXPECT_EQ(metadata.at("carrier"), "cpu_call_frame");
+    EXPECT_EQ(metadata.at("representation"), sizeof(void *) == 8 ? "i64" : "i32");
+    EXPECT_EQ(metadata.at("interface_plan").at("canonical_layout_hash").get<std::string>().size(), 64u);
+    EXPECT_FALSE(metadata.contains("parameter_ordinal"));
+    EXPECT_EQ(metadata.dump().find("tensor_view_descriptor"), std::string::npos);
+    EXPECT_EQ(metadata.dump().find("\"signed\""), std::string::npos);
     const std::string firstRequest = "forward:0";
     const std::string secondRequest = "forward:1";
     const std::string sharedStage = "compiled/shared-copy";
@@ -447,6 +457,9 @@ module {
               canonical_sha256(result.at("stage_contracts").at(firstRequest)));
     EXPECT_EQ(canonical.at("stages").at(secondRequest).at("contract_hash"),
               canonical_sha256(result.at("stage_contracts").at(secondRequest)));
+    EXPECT_TRUE(
+        result.at("stage_contracts").at(firstRequest).at("reflection").at("metadata_carrier").contains("fields"));
+    EXPECT_TRUE(result.at("target_implementations").at(firstRequest).at("metadata_carrier").contains("interface_plan"));
 
     vernonCompileResultDestroy(finalized);
     vernonCompileResultDestroy(compiled);
@@ -2419,8 +2432,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         nlohmann::json::parse(wasm_tensor_reflection.data, wasm_tensor_reflection.data + wasm_tensor_reflection.size);
     const nlohmann::json &wasm_tensor_host =
         wasm_tensor_json.at("entries").at(0).at("arguments").at(0).at("physical_layouts").at("host_value");
-    EXPECT_EQ(wasm_tensor_host.at("resource_kind"), "tensor_view_descriptor");
-    EXPECT_EQ(wasm_tensor_host.at("size"), 16);
+    EXPECT_EQ(wasm_tensor_host.at("resource_kind"), "host_pointer");
+    EXPECT_EQ(wasm_tensor_host.at("size"), 4);
     EXPECT_EQ(wasm_tensor_host.at("alignment"), 4);
     EXPECT_EQ(wasm_tensor_json.at("entries").at(0).at("physical_layouts").at("host_value").at("packed_arguments_size"),
               28);
@@ -2478,16 +2491,16 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonCpuEntryPoint increment = vernonCompileResultGetCpuEntry(cpu_compute_compile, "increment", 9);
     ASSERT_TRUE(increment != NULL);
     float compute_values[3] = {2.0f, 4.0f, 6.0f};
-    struct RankOneTensorViewDescriptor {
-        float *values;
+    struct RankOneTensorMetadata {
         int64_t offset;
-        uint64_t extent;
+        int64_t extent;
         int64_t stride;
     };
     struct {
-        RankOneTensorViewDescriptor values;
+        float *values;
         uint32_t id[3];
-    } compute_arguments = {{compute_values, 0, 3, 1}, {1, 0, 0}};
+        RankOneTensorMetadata metadata;
+    } compute_arguments = {compute_values, {1, 0, 0}, {0, 3, 1}};
     VernonCpuInvocation compute_invocation = {&compute_arguments, sizeof(compute_arguments), NULL, 0, NULL};
     ASSERT_TRUE(invoke_cpu_range(increment, compute_invocation, 1) == VERNON_STATUS_OK);
     ASSERT_TRUE(compute_values[0] == 2.0f && compute_values[1] == 5.0f && compute_values[2] == 6.0f);
@@ -2501,9 +2514,10 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(loop != NULL);
     float loop_values[1] = {0.0f};
     struct {
-        RankOneTensorViewDescriptor values;
+        float *values;
         float phase;
-    } loop_arguments = {{loop_values, 0, 1, 1}, 0.0f};
+        RankOneTensorMetadata metadata;
+    } loop_arguments = {loop_values, 0.0f, {0, 1, 1}};
     VernonCpuInvocation loop_invocation = {&loop_arguments, sizeof(loop_arguments), NULL, 0, NULL};
     ASSERT_TRUE(invoke_cpu_range(loop, loop_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(loop_values[0] == 4.0f);

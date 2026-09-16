@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -151,8 +152,7 @@ VernonStatus prepareCpuPipeline(void *data, const VernonRuntimeProviderPipelineD
 
 VernonStatus retainCpuResource(void *data, VernonRuntimeProviderResourceReference resource) {
     auto &context = *static_cast<CpuContextState *>(data);
-    if (resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)) || !resource.resource.value ||
-        !resource.size)
+    if (resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)) || !resource.resource.value)
         return fail(context.error, "CPU provider resource reference is invalid");
     return VERNON_STATUS_OK;
 }
@@ -183,7 +183,7 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
         if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const auto &resource = value.payload.buffer.resource;
             if (!resource.resource.value ||
-                resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)) || !resource.size)
+                resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)))
                 return fail(context.error, "CPU provider storage binding is invalid");
             const auto *storage =
                 reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(resource.resource.value) + resource.offset);
@@ -207,6 +207,25 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
             std::memcpy(frame.data() + argument.physical.offset, value.payload.inline_value.data,
                         value.payload.inline_value.size);
         }
+        ++reflectedIndex;
+    }
+    if (reflection.metadataCarrier) {
+        if (reflectedIndex >= valueCount)
+            return fail(context.error, "CPU metadata carrier exceeds its binding layout");
+        const auto &carrier = *reflection.metadataCarrier;
+        const auto &layout = bindings.pipeline->layout->entries[reflectedIndex];
+        const auto &value = values[reflectedIndex];
+        if (carrier.interfacePlan.frameOffset > std::numeric_limits<size_t>::max() ||
+            carrier.size > std::numeric_limits<size_t>::max())
+            return fail(context.error, "CPU metadata carrier exceeds the host address range");
+        const size_t offset = static_cast<size_t>(carrier.interfacePlan.frameOffset);
+        if (layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE || value.slot != layout.slot ||
+            value.kind != layout.kind || !value.payload.inline_value.data ||
+            value.payload.inline_value.size != carrier.size || layout.element_size != carrier.size ||
+            layout.element_alignment != carrier.alignment || offset > bindings.packed.size() ||
+            carrier.size > bindings.packed.size() - offset)
+            return fail(context.error, "CPU metadata carrier does not match its packed frame ABI");
+        std::memcpy(bindings.packed.data() + offset, value.payload.inline_value.data, value.payload.inline_value.size);
         ++reflectedIndex;
     }
     return reflectedIndex == valueCount ? VERNON_STATUS_OK

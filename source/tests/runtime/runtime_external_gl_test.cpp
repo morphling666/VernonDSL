@@ -32,6 +32,7 @@ constexpr GlEnum kLinkStatus = 0x8B82;
 constexpr GlEnum kFramebufferComplete = 0x8CD5;
 constexpr GlEnum kArrayBuffer = 0x8892;
 constexpr GlEnum kElementArrayBuffer = 0x8893;
+constexpr GlEnum kMaxUniformBlockSize = 0x8A30;
 constexpr GlEnum kInt = 0x1404;
 constexpr GlEnum kUnsignedInt = 0x1405;
 constexpr GlEnum kFloat = 0x1406;
@@ -198,7 +199,7 @@ GlUint GL_CALL createProgram() { return nextName++; }
 void GL_CALL shaderSource(GlUint, GlSize, const char *const *, const GlInt *) {}
 void GL_CALL getShaderiv(GlUint, GlEnum name, GlInt *value) { *value = name == kCompileStatus ? 1 : 0; }
 void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) { *value = name == kLinkStatus ? 1 : 0; }
-void GL_CALL getIntegerv(GlEnum, GlInt *value) { *value = 16; }
+void GL_CALL getIntegerv(GlEnum name, GlInt *value) { *value = name == kMaxUniformBlockSize ? 16 * 1024 : 16; }
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
         *names++ = nextName++;
@@ -225,6 +226,7 @@ void GL_CALL bindVertexArray(GlUint name) { boundVertexArray = name; }
 void GL_CALL useProgram(GlUint) { ++programBindCount; }
 void GL_CALL bindFramebuffer(GlEnum, GlUint) { ++framebufferBindCount; }
 void GL_CALL bindBufferBase(GlEnum, GlUint, GlUint) { ++storageBindingCount; }
+void GL_CALL bindBufferRange(GlEnum, GlUint, GlUint, std::intptr_t, std::intptr_t) { ++storageBindingCount; }
 void GL_CALL bindImageTexture(GlUint, GlUint, GlInt, GlBoolean, GlInt, GlEnum, GlEnum) { ++storageBindingCount; }
 void GL_CALL dispatchCompute(GlUint, GlUint, GlUint) { ++dispatchCount; }
 void GL_CALL memoryBarrier(unsigned bits) {
@@ -380,6 +382,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGenBuffers", genNames);
     PROC("glBindBuffer", bindBuffer);
     PROC("glBindBufferBase", bindBufferBase);
+    PROC("glBindBufferRange", bindBufferRange);
     PROC("glBindImageTexture", bindImageTexture);
     PROC("glDeleteBuffers", deleteBufferNames);
     PROC("glBufferData", bufferData);

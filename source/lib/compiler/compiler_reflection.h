@@ -4,11 +4,13 @@
 #include "VernonCpuAbiWrapper.h"
 #include "compiler_frontend.h"
 
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/JSON.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,9 +26,13 @@ llvm::json::Object reflectCanonicalValueLayout(const mlir::vernon::ValueAbiLayou
 std::vector<PhysicalEntryModel> buildPhysicalEntryModels(mlir::ModuleOp module,
                                                          const std::vector<PhysicalEntryProvenance> &provenance);
 
-mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const LogicalReflectionModel &logical,
-                                             const std::vector<PhysicalEntryModel> &physicalEntries,
-                                             const std::vector<PhysicalEntryProvenance> &provenance);
+// Target-neutral validation omits physical metadata layouts; target compilation
+// supplies the one profile whose native ABI is being emitted.
+mlir::FailureOr<std::string>
+buildReflection(mlir::ModuleOp module, const LogicalReflectionModel &logical,
+                const std::vector<PhysicalEntryModel> &physicalEntries,
+                const std::vector<PhysicalEntryProvenance> &provenance,
+                std::optional<mlir::vernon::MetadataPhysicalProfile> metadataProfile = std::nullopt);
 
 bool selectTargetPhysicalLayouts(std::string &reflection, VernonTarget target, std::string &diagnostics);
 

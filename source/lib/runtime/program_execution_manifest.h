@@ -116,6 +116,7 @@ struct StageArtifact {
     std::vector<CodeModule> modules;
     std::vector<ReflectedEndpoint> endpoints;
     std::vector<CompiledEndpointAbi> compiledAbi;
+    std::optional<vernon::runtime::MetadataCarrier> metadataCarrier;
     std::vector<vernon::runtime::NativeResourceSlot> nativeSlots;
     uint32_t workgroupSize[3]{1, 1, 1};
     std::vector<std::string> capabilities;

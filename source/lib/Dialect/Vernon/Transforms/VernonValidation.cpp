@@ -383,11 +383,9 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
             Attribute workgroupAttr = function->getAttr(kWorkgroupSizeAttrName);
 
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-                if (function.getArgAttr(index, kTensorDescriptorOwnerAttrName) ||
-                    function.getArgAttr(index, kTensorDescriptorComponentAttrName) ||
-                    function.getArgAttr(index, kTensorDescriptorDimensionAttrName)) {
+                if (function.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
                     function.emitError() << "argument #" << index
-                                         << " contains internal TensorView descriptor metadata";
+                                         << " contains compiler-owned TensorView metadata ABI state";
                     invalid = true;
                 }
             }

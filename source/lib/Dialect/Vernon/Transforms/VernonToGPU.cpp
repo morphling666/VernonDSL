@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
@@ -313,6 +314,18 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
         OpBuilder moduleBuilder = OpBuilder::atBlockBegin(gpuModule.getBody());
 
         for (func::FuncOp source : computeEntries) {
+            if (failed(appendTensorViewMetadataArgument(source))) {
+                source.emitError("cannot materialize aggregate TensorView metadata input");
+                return signalPassFailure();
+            }
+            FailureOr<std::shared_ptr<const SemanticMetadataPlan>> semanticMetadata = getSemanticMetadataPlan(source);
+            const MetadataPhysicalProfile metadataProfile = useSpirvStorage
+                                                                ? MetadataPhysicalProfile::PortableShaderMetadataI32
+                                                                : MetadataPhysicalProfile::CudaKernelMetadata;
+            if (failed(semanticMetadata)) {
+                source.emitError("cannot build target TensorView metadata ABI plan");
+                return signalPassFailure();
+            }
             struct InlineTensorArgument {
                 unsigned sourceIndex;
                 unsigned kernelIndex;
@@ -323,9 +336,29 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             SmallVector<InlineTensorArgument> inlineTensorArguments;
             DenseMap<unsigned, TensorType> aggregateTensorArguments;
             SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>> resourceBindings;
+            std::optional<unsigned> metadataSourceIndex;
+            std::optional<unsigned> metadataKernelIndex;
+            DictionaryAttr metadataKernelAttrs;
             for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
                 InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
+                if (source.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
+                    if (metadataKernelIndex || (*semanticMetadata)->empty()) {
+                        source.emitError("has a malformed aggregate TensorView metadata carrier");
+                        return signalPassFailure();
+                    }
+                    unsigned kernelIndex = kernelArgumentTypes.size();
+                    SmallVector<Type> members((*semanticMetadata)->getFieldCount(),
+                                              useSpirvStorage ? static_cast<Type>(moduleBuilder.getI32Type())
+                                                              : static_cast<Type>(moduleBuilder.getI64Type()));
+                    kernelArgumentTypes.push_back(TupleType::get(source.getContext(), members));
+                    sourceArgumentRanges[index] = {kernelIndex, 1};
+                    metadataSourceIndex = index;
+                    metadataKernelIndex = kernelIndex;
+                    if (useSpirvStorage)
+                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                    continue;
+                }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<TensorType>(type)) {
                         FailureOr<ValueAbiLayout> layout = getValueStorageLayout(tensor.getElementType(), module);
@@ -401,21 +434,52 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     kernel.setArgAttr(range.first, "vernon.texture_access",
                                       moduleBuilder.getStringAttr(texture.getAccess()));
             }
-            for (unsigned sourceIndex = 0; sourceIndex < source.getNumArguments(); ++sourceIndex) {
-                auto component = source.getArgAttrOfType<StringAttr>(sourceIndex, kTensorDescriptorComponentAttrName);
-                auto range = sourceArgumentRanges.find(sourceIndex);
-                if (!component || range == sourceArgumentRanges.end() || range->second.second != 1)
-                    continue;
-                const unsigned kernelIndex = range->second.first;
-                auto owner = source.getArgAttrOfType<IntegerAttr>(sourceIndex, kTensorDescriptorOwnerAttrName);
-                auto ownerRange = owner ? sourceArgumentRanges.find(owner.getInt()) : sourceArgumentRanges.end();
-                if (!owner || ownerRange == sourceArgumentRanges.end())
+            if (metadataKernelIndex) {
+                uint32_t physicalOrdinal = 0;
+                if (useSpirvStorage) {
+                    for (unsigned index = 0; index < *metadataKernelIndex; ++index) {
+                        if (auto view = dyn_cast<TensorViewType>(kernelArgumentTypes[index])) {
+                            FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
+                            if (failed(layout) || layout->leaves.empty() ||
+                                layout->leaves.size() > std::numeric_limits<uint32_t>::max() - physicalOrdinal)
+                                return signalPassFailure();
+                            physicalOrdinal += static_cast<uint32_t>(layout->leaves.size());
+                        } else {
+                            if (physicalOrdinal == std::numeric_limits<uint32_t>::max())
+                                return signalPassFailure();
+                            ++physicalOrdinal;
+                        }
+                    }
+                } else {
+                    if (!metadataSourceIndex)
+                        return signalPassFailure();
+                    FailureOr<uint32_t> cudaOrdinal =
+                        getCudaMetadataKernelParameterOrdinal(source, *metadataSourceIndex);
+                    if (failed(cudaOrdinal))
+                        return signalPassFailure();
+                    physicalOrdinal = *cudaOrdinal;
+                }
+                MetadataNativeLocation nativeLocation;
+                if (useSpirvStorage) {
+                    nativeLocation.descriptorSet = 0;
+                    nativeLocation.binding = physicalOrdinal;
+                } else {
+                    nativeLocation.kernelParameterOrdinal = physicalOrdinal;
+                }
+                FailureOr<std::shared_ptr<const PhysicalMetadataPlan>> physicalMetadata =
+                    getPhysicalMetadataPlan(**semanticMetadata, metadataProfile, nativeLocation);
+                if (failed(physicalMetadata)) {
+                    source.emitError("TensorView metadata aggregate exceeds the selected target ABI");
                     return signalPassFailure();
-                kernel.setArgAttr(kernelIndex, kTensorDescriptorOwnerAttrName,
-                                  moduleBuilder.getI64IntegerAttr(ownerRange->second.first));
-                kernel.setArgAttr(kernelIndex, kTensorDescriptorComponentAttrName, component);
-                if (auto dimension = source.getArgAttr(sourceIndex, kTensorDescriptorDimensionAttrName))
-                    kernel.setArgAttr(kernelIndex, kTensorDescriptorDimensionAttrName, dimension);
+                }
+                metadataKernelAttrs = moduleBuilder.getDictionaryAttr({
+                    moduleBuilder.getNamedAttr(kTensorMetadataCarrierAttrName, moduleBuilder.getUnitAttr()),
+                    moduleBuilder.getNamedAttr(
+                        kTensorMetadataProfileAttrName,
+                        moduleBuilder.getStringAttr(stringifyMetadataPhysicalProfile(metadataProfile))),
+                });
+                for (NamedAttribute attribute : metadataKernelAttrs)
+                    kernel.setArgAttr(*metadataKernelIndex, attribute.getName(), attribute.getValue());
             }
             if (auto workgroup = source->getAttrOfType<DenseI32ArrayAttr>(kWorkgroupSizeAttrName)) {
                 kernel.setKnownBlockSizeAttr(workgroup);
@@ -559,6 +623,31 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             }
             if (failed(materializeTensorViewProjections(kernel)))
                 return signalPassFailure();
+            SmallVector<TupleGetOp> nestedMetadataReads;
+            kernel.walk([&](TupleGetOp read) {
+                auto input = dyn_cast<BlockArgument>(read.getInput());
+                if (input && input.getOwner() == &kernel.front() &&
+                    kernel.getArgAttr(input.getArgNumber(), kTensorMetadataCarrierAttrName) &&
+                    read.getResult().getType().isIndex())
+                    nestedMetadataReads.push_back(read);
+            });
+            for (TupleGetOp read : nestedMetadataReads) {
+                auto carrierType = cast<TupleType>(read.getInput().getType());
+                if (read.getIndex() < 0 || static_cast<size_t>(read.getIndex()) >= carrierType.size()) {
+                    read.emitError("references an invalid nested TensorView metadata member");
+                    return signalPassFailure();
+                }
+                OpBuilder readBuilder(read);
+                OperationState state(read.getLoc(), TupleGetOp::getOperationName());
+                state.addOperands(read.getInput());
+                state.addTypes(carrierType.getType(read.getIndex()));
+                state.addAttribute("index", readBuilder.getI64IntegerAttr(read.getIndex()));
+                Value member = readBuilder.create(state)->getResult(0);
+                Value logical =
+                    arith::IndexCastOp::create(readBuilder, read.getLoc(), readBuilder.getIndexType(), member);
+                read.getResult().replaceAllUsesWith(logical);
+                read.erase();
+            }
 
             TypeConverter storageConverter;
             storageConverter.addConversion([](Type type) { return type; });
@@ -609,6 +698,18 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     return signalPassFailure();
                 convertedArgumentRanges.emplace_back(convertedIndex, convertedTypes.size());
                 convertedIndex += convertedTypes.size();
+            }
+            if (metadataKernelIndex) {
+                auto [first, count] = convertedArgumentRanges[*metadataKernelIndex];
+                if (count != 1 || first >= kernel.getNumArguments()) {
+                    source.emitError("metadata carrier did not preserve one aggregate GPU argument");
+                    return signalPassFailure();
+                }
+                for (unsigned index = 0; index < kernel.getNumArguments(); ++index)
+                    for (NamedAttribute attribute : metadataKernelAttrs)
+                        kernel.removeArgAttr(index, attribute.getName());
+                for (NamedAttribute attribute : metadataKernelAttrs)
+                    kernel.setArgAttr(first, attribute.getName(), attribute.getValue());
             }
             for (auto [originalIndex, binding] : resourceBindings) {
                 if (originalIndex >= convertedArgumentRanges.size()) {

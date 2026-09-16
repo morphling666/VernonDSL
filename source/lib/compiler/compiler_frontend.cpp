@@ -177,12 +177,6 @@ mlir::FailureOr<std::vector<PhysicalEntryProvenance>> TargetPreparationProvenanc
         const LogicalEntryModel *logicalEntry = logical_ ? findLogicalEntry(*logical_, function.getSymName()) : nullptr;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::IntegerAttr origin = function.getArgAttrOfType<mlir::IntegerAttr>(index, kLogicalArgumentOriginAttr);
-            if (!origin)
-                if (auto owner = function.getArgAttrOfType<mlir::IntegerAttr>(
-                        index, mlir::vernon::kTensorDescriptorOwnerAttrName);
-                    owner && owner.getInt() >= 0 && static_cast<uint64_t>(owner.getInt()) < function.getNumArguments())
-                    origin = function.getArgAttrOfType<mlir::IntegerAttr>(static_cast<unsigned>(owner.getInt()),
-                                                                          kLogicalArgumentOriginAttr);
             if (origin) {
                 const int64_t logicalIndex = origin.getInt();
                 if (!logicalEntry || logicalIndex < 0 ||

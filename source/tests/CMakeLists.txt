@@ -240,8 +240,10 @@ if(TARGET VernonRuntime)
         add_executable(VernonCompilerRuntimeIntegrationTests runtime/runtime_synchronization_test.cpp)
         set_target_properties(VernonCompilerRuntimeIntegrationTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                "${CMAKE_BINARY_DIR}/source")
-        target_include_directories(VernonCompilerRuntimeIntegrationTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                                 "${VERNON_TEST_ROOT}/support")
+        target_include_directories(
+            VernonCompilerRuntimeIntegrationTests
+            PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                    "${VERNON_TEST_BINARY_ROOT}/generated")
         target_link_libraries(
             VernonCompilerRuntimeIntegrationTests
             PRIVATE GTest::gtest_main
@@ -465,7 +467,6 @@ if(TARGET VernonRuntime)
         target_compile_definitions(
             VernonCompilerRuntimeIntegrationTests PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1
                                                           VERNON_SYNCHRONIZATION_CPU_FIXTURES_AVAILABLE=1)
-        target_include_directories(VernonCompilerRuntimeIntegrationTests PRIVATE "${VERNON_TEST_BINARY_ROOT}/generated")
         target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE ${synchronization_cpu_fixture_targets})
         add_dependencies(VernonCompilerRuntimeIntegrationTests ${synchronization_fixture_targets})
 
@@ -477,15 +478,6 @@ if(TARGET VernonRuntime)
             vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
             cooked_autodiff_fixture_target)
-        file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")
-        file(
-            GENERATE
-            OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_registration_declarations.inc"
-            CONTENT "${VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS}")
-        file(
-            GENERATE
-            OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_manifest_rows.inc"
-            CONTENT "${VERNON_TEST_FIXTURE_MANIFEST_ROWS}")
         vernon_add_cpu_program_fixture(
             typed-specialization
             typed_specialization_fixture
@@ -1168,6 +1160,16 @@ if(TARGET VernonRuntime)
             vernon-opengl-f32-vertex-test-bundle
             vernon-opengl-storage-image-test-bundle)
     endif()
+
+    file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")
+    file(
+        GENERATE
+        OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_registration_declarations.inc"
+        CONTENT "${VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS}")
+    file(
+        GENERATE
+        OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_manifest_rows.inc"
+        CONTENT "${VERNON_TEST_FIXTURE_MANIFEST_ROWS}")
 
     vernon_discover_gtests(VernonRuntimeTests)
     add_test(

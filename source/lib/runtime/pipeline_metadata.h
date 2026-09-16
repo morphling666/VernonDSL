@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "dispatch_contract.h"
+#include "stage_binding_plan.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -14,9 +15,6 @@
 
 namespace vernon::runtime {
 
-struct ValueLayout;
-struct Parameter;
-
 struct ReflectedStorageLeaf {
     size_t elementSize{};
     size_t byteOffset{};
@@ -27,13 +25,6 @@ struct PhysicalArgumentLayout {
     size_t offset{};
     size_t size{};
     size_t alignment{1};
-};
-
-struct TensorViewDescriptorLayout {
-    uint32_t rank{};
-    uint32_t offsetBinding{UINT32_MAX};
-    std::vector<uint32_t> extentBindings;
-    std::vector<uint32_t> strideBindings;
 };
 
 struct ReflectedArgument {
@@ -51,7 +42,6 @@ struct ReflectedArgument {
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
     std::vector<ReflectedStorageLeaf> storageLeaves;
-    std::optional<TensorViewDescriptorLayout> tensorViewDescriptor;
     std::vector<int64_t> sourceShape;
 };
 
@@ -68,6 +58,7 @@ struct PackedArgumentsLayout {
 
 struct ReflectedEntry {
     std::vector<ReflectedArgument> arguments;
+    std::optional<MetadataCarrier> metadataCarrier;
     std::optional<PackedArgumentsLayout> packedArguments;
     std::optional<PackedArgumentsLayout> packedResults;
     uint32_t workgroup[3]{1, 1, 1};

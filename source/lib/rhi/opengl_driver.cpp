@@ -53,6 +53,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(mapBufferRange, "glMapBufferRange");
         LOAD(unmapBuffer, "glUnmapBuffer");
         LOAD(bindBufferBase, "glBindBufferBase");
+        LOAD(bindBufferRange, "glBindBufferRange");
         LOAD(genVertexArrays, "glGenVertexArrays");
         LOAD(deleteVertexArrays, "glDeleteVertexArrays");
         LOAD(bindVertexArray, "glBindVertexArray");

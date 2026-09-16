@@ -30,11 +30,8 @@ struct OpenGLPipelineState {
     PreparedGraphicsVariant rhiGraphicsVariant;
     PreparedComputeBindingPlan rhiComputeBindingPlan;
     PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
-    std::vector<VernonRuntimeProviderVertexAttribute> rhiVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiValues;
     std::vector<std::vector<uint8_t>> rhiComputeBindingStorage;
-    std::vector<int32_t> rhiComputeDescriptorValues;
     uint32_t workgroup[3]{1, 1, 1};
 };
 

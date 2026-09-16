@@ -19,8 +19,6 @@ struct ComputeTensorArgument {
     const void *hostData{};
     size_t hostSize{};
     const VernonTensorView *tensorView{};
-    const void *tensorViewData{};
-    size_t tensorViewSize{};
 };
 
 struct ComputeImageArgument {
@@ -39,14 +37,6 @@ struct ComputeSamplerArgument {
 using ComputeLaunchArgument =
     std::variant<ComputeTensorArgument, ComputeImageArgument, ComputeScalarArgument, ComputeSamplerArgument>;
 
-enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };
-
-struct ComputeBindingSource {
-    ComputeBindingSourceKind kind{ComputeBindingSourceKind::Argument};
-    uint32_t argumentIndex{};
-    uint32_t dimension{};
-};
-
 struct ResultCommitPlan {
     size_t storageIndex{};
     VernonTensorView destination{};
@@ -58,6 +48,8 @@ struct PlannedComputeLaunch {
     std::vector<std::vector<uint8_t>> hostTensorStorage;
     std::vector<ResultCommitPlan> resultCommits;
     std::vector<const VernonTensorView *> validationTensors;
+    std::vector<uint8_t> metadataPayload;
+    size_t metadataAlignment{};
     std::vector<uint8_t> assignedArguments;
     size_t hostTensorStorageCount{};
     VernonLaunchSize grid{};
@@ -67,8 +59,8 @@ struct PlannedComputeLaunch {
     std::vector<uint8_t> &appendHostTensorStorage();
 };
 
-std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
-                                                     const ComputeBindingSource &source);
+bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vector<ComputeLaunchArgument> &arguments,
+                                std::vector<uint8_t> &payload, std::string &error);
 
 bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error);

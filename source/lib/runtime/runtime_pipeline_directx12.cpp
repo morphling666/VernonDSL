@@ -83,7 +83,6 @@ BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, 
                 return false;
             }
             pipelineState->rhiComputeValues.resize(pipelineState->rhiComputeBindingPlan.size());
-            pipelineState->rhiComputeDescriptorValues.resize(pipelineState->rhiComputeBindingPlan.size());
             std::copy_n(stage.workgroup, 3, pipelineState->rhiComputeWorkgroup);
             const VernonRuntimeProviderShaderDescriptor shaderDescriptor{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                          VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -264,23 +263,18 @@ VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, con
     for (size_t index = 0; index < state.rhiComputeBindingPlan.size(); ++index) {
         const VernonRuntimeProviderBindingLayoutEntry &layout = state.rhiComputeBindingPlan.layouts[index];
         const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
-        if (layout.argument_index >= launch.arguments.size())
-            return fail(*pipeline.context, "D3D12 prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
         VernonRuntimeProviderBindingValue &value = state.rhiComputeValues[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        const ComputeBindingSource &source = preparedSource.source;
-        if (source.kind != ComputeBindingSourceKind::Argument) {
-            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
-            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
-                return fail(*pipeline.context, "D3D12 TensorView descriptor exceeds the shader index range");
-            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
-            value.payload.inline_value.data = &state.rhiComputeDescriptorValues[index];
-            value.payload.inline_value.size = sizeof(int32_t);
+        if (preparedSource.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
+                return fail(*pipeline.context, "D3D12 metadata carrier payload does not match its compiled ABI");
             continue;
         }
+        if (preparedSource.argumentIndex >= launch.arguments.size())
+            return fail(*pipeline.context, "D3D12 prepared argument index is invalid");
+        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
                 if (!bindComputeValueStorage(layout, argument, value))
@@ -291,6 +285,10 @@ VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, con
             if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");
             value.payload.buffer.resource = tensor->resource;
+            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
+                preparedSource.resourceOffset >
+                    value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
+                return fail(*pipeline.context, "D3D12 aggregate storage leaf exceeds its Tensor resource");
             value.payload.buffer.resource.offset += preparedSource.resourceOffset;
         } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                    layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {

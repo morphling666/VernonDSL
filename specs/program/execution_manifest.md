@@ -462,7 +462,8 @@ Filename suffix is diagnostic only. A text parse, binary parse, link, or
 entry-role mismatch is an artifact validation failure, not permission to try
 another module.
 
-Reflection is exactly `{required_features, endpoints, compute}` for compute or
+Reflection is exactly `{required_features, endpoints, compute}` or
+`{required_features, endpoints, compute, metadata_carrier}` for compute, and
 `{required_features, endpoints, graphics}` for graphics. Endpoint and operation reflection are
 defined in section 11.1. Reflection describes the complete StageArtifact,
 including all graphics modules; it is not duplicated per module.
@@ -1006,6 +1007,38 @@ Appendix B. Capabilities are a sorted unique array that MUST include
 `direct_dispatch` and MUST NOT require indirect dispatch.
 Device dispatch-count and invocation limits are Runtime capabilities, not
 serialized StageContract fields.
+
+A compute reflection with one or more device TensorView arguments contains
+exactly one entry-owned `metadata_carrier`. It is forbidden on graphics
+reflection and omitted when no TensorView metadata exists. The portable
+carrier contains exactly one non-empty `fields` array. Each field contains:
+
+- `ordinal`: its zero-based position in `fields`;
+- `argument`: the reflected compute argument index that owns the field;
+- `kind`: `offset`, `extent`, or `stride`;
+- `units`: exactly `logical_elements`;
+- `dimension`: required only for `extent` and `stride`.
+
+Fields are ordered by ascending argument index and, within each TensorView, as
+`offset`, all dimensions of `extent`, then all dimensions of `stride`.
+`offset` and `extent` must be non-negative; `stride` may be negative. Signed
+integer encoding is selected once by the physical profile and is therefore not
+repeated as a field property. Endpoint ABI bindings do not redeclare metadata
+fields or allocate per-field slots.
+
+The selected target implementation contains one matching physical
+`metadata_carrier` with required `profile`, `representation`, `carrier`,
+`encoded_size`, `size`, `alignment`, `members`, and `interface_plan`, plus
+one profile-specific native location: shaders use top-level `set` and
+`binding`, CUDA uses top-level `parameter_ordinal`, and CPU uses only
+`interface_plan.frame_offset`. Every
+member contains `semantic_ordinal`, `byte_offset`, `byte_size`, and
+`alignment`; semantic ordinals form a bijection with portable fields and
+member byte ranges must be ordered, aligned, non-overlapping, and exactly cover
+`encoded_size`. The interface plan has the same profile, size, alignment,
+scalar representation, member order, and canonical layout hash. Runtime
+rejects disagreement and never reconstructs this layout from endpoint order or
+neighboring bindings.
 
 Graphics reflection contains exactly `topology`, `vertex_inputs`,
 `fragment_outputs`, `linkage`, `attachment_constraints`, `index_formats`, and

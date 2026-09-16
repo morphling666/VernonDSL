@@ -40,7 +40,6 @@ struct VulkanPipelineState {
     VernonRuntimeCoreBindings *rhiComputeBindings{};
     PreparedComputeBindingPlan rhiComputeBindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
-    std::vector<int64_t> rhiComputeDescriptorValues;
     uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
     VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};

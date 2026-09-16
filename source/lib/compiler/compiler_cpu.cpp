@@ -10,6 +10,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/IR/Diagnostics.h"
@@ -18,6 +19,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -110,26 +112,49 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::Type type = function.getArgumentTypes()[index];
             mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
-            if (attrs.get(mlir::vernon::kTensorDescriptorComponentAttrName))
-                continue;
             mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> dtypes = logicalDtypes(attrs);
             if (mlir::failed(dtypes)) {
                 diagnostics = "malformed CPU ABI dtype metadata in entry '" + function.getSymName().str() + "'";
                 return false;
             }
+            const bool metadataCarrier = attrs.get(mlir::vernon::kTensorMetadataCarrierAttrName) != nullptr;
             const bool tensorView = mlir::isa<mlir::vernon::TensorViewType>(type);
             std::optional<mlir::vernon::CpuCallPlan> valuePlan;
-            if (!tensorView)
+            if (!tensorView && !metadataCarrier)
                 if (mlir::FailureOr<mlir::vernon::CpuCallPlan> plan =
                         mlir::vernon::getCpuCallPlan(type, module, *dtypes);
                     mlir::succeeded(plan))
                     valuePlan = std::move(*plan);
-            const vernon::CpuAbiArgumentKind kind = tensorView  ? vernon::CpuAbiArgumentKind::TensorView
-                                                    : valuePlan ? vernon::CpuAbiArgumentKind::CanonicalValue
-                                                                : vernon::CpuAbiArgumentKind::OpaqueScalar;
+            const vernon::CpuAbiArgumentKind kind = tensorView        ? vernon::CpuAbiArgumentKind::TensorView
+                                                    : metadataCarrier ? vernon::CpuAbiArgumentKind::MetadataCarrier
+                                                    : valuePlan       ? vernon::CpuAbiArgumentKind::CanonicalValue
+                                                                      : vernon::CpuAbiArgumentKind::OpaqueScalar;
             uint64_t size = 0;
             uint64_t alignment = 0;
-            if (valuePlan) {
+            std::vector<vernon::CpuCallLanePacking> metadataLanes;
+            if (metadataCarrier) {
+                auto dataLayout = module->getAttrOfType<mlir::StringAttr>("llvm.data_layout");
+                mlir::FailureOr<std::shared_ptr<const mlir::vernon::SemanticMetadataPlan>> semantic =
+                    mlir::vernon::getSemanticMetadataPlan(function);
+                if (!dataLayout || mlir::failed(semantic)) {
+                    diagnostics =
+                        "cannot plan CPU TensorView metadata ABI in entry '" + function.getSymName().str() + "'";
+                    return false;
+                }
+                const uint32_t indexBits = llvm::DataLayout(dataLayout.getValue()).getPointerSizeInBits();
+                mlir::FailureOr<std::shared_ptr<const mlir::vernon::PhysicalMetadataPlan>> physical =
+                    mlir::vernon::getPhysicalMetadataPlan(
+                        **semantic, mlir::vernon::MetadataPhysicalProfile::HostMetadata, {}, indexBits);
+                if (mlir::failed(physical)) {
+                    diagnostics =
+                        "cannot materialize CPU TensorView metadata ABI in entry '" + function.getSymName().str() + "'";
+                    return false;
+                }
+                size = (*physical)->getBlockSize();
+                alignment = (*physical)->getAbiAlignment();
+                for (const mlir::vernon::PhysicalMetadataMember &member : (*physical)->getMembers())
+                    metadataLanes.push_back({member.byteOffset, member.size});
+            } else if (valuePlan) {
                 size = valuePlan->layout.size;
                 alignment = valuePlan->layout.alignment;
             } else if (tensorView || mlir::vernon::isCpuOpaqueAbiType(type)) {
@@ -172,6 +197,8 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 for (const mlir::vernon::ValueAbiLeaf &leaf : layout->leaves)
                     packing.tensorLeafElementSizes.push_back(
                         std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
+            } else if (metadataCarrier) {
+                packing.callLanes = std::move(metadataLanes);
             } else if (packing.kind == vernon::CpuAbiArgumentKind::CanonicalValue) {
                 for (const mlir::vernon::CpuCallLane &lane : valuePlan->lanes) {
                     const mlir::vernon::ValueAbiLeaf &leaf = valuePlan->layout.leaves[lane.leafIndex];
@@ -291,8 +318,9 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     sourceModule->getOperation()->setAttr(mlir::LLVM::LLVMDialect::getTargetTripleAttrName(),
                                           mlir::StringAttr::get(&context, targetTriple));
 
-    mlir::FailureOr<std::string> targetReflection = buildReflection(
-        *sourceModule, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    mlir::FailureOr<std::string> targetReflection =
+        buildReflection(*sourceModule, prepared.logicalReflection(), preparedTarget->entries,
+                        preparedTarget->provenance, mlir::vernon::MetadataPhysicalProfile::HostMetadata);
     if (mlir::failed(targetReflection))
         return CpuCompileResult::CodegenFailure;
     reflection = std::move(*targetReflection);

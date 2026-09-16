@@ -839,6 +839,10 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument,
                     {"metal_resource_binding_has_the_wrong_type_is_stale_or_belongs_to_another_device", 0, 0}})};
+            if (!image && resource->offset >= resource->size)
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"metal_buffer_binding_range_is_empty_or_out_of_bounds", resource->offset, resource->size}})};
             auto resolved = resolveRhiResource(adapter, *resource);
             if (!resolved)
                 return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};

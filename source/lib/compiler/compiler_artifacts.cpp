@@ -97,16 +97,11 @@ bool validatePortableComputeSlots(const llvm::json::Object &root, std::string &d
                     if (const llvm::json::Object *leaf = leafValue.getAsObject())
                         if (std::optional<int64_t> binding = leaf->getInteger("binding"); binding && *binding >= 0)
                             slots.insert(static_cast<uint64_t>(*binding));
-            if (const llvm::json::Object *descriptor = argument->getObject("tensor_view_descriptor")) {
-                if (std::optional<int64_t> binding = descriptor->getInteger("offset_binding"); binding && *binding >= 0)
-                    slots.insert(static_cast<uint64_t>(*binding));
-                for (llvm::StringRef field : {"extent_bindings", "stride_bindings"}) {
-                    if (const llvm::json::Array *bindings = descriptor->getArray(field))
-                        for (const llvm::json::Value &value : *bindings)
-                            if (std::optional<int64_t> binding = value.getAsInteger(); binding && *binding >= 0)
-                                slots.insert(static_cast<uint64_t>(*binding));
-                }
-            }
+        }
+        if (const llvm::json::Object *metadata = entry->getObject("metadata_carrier")) {
+            std::optional<int64_t> slot = metadata->getInteger("binding");
+            if (slot && *slot >= 0)
+                slots.insert(static_cast<uint64_t>(*slot));
         }
         uint64_t expected = 0;
         for (uint64_t slot : slots) {

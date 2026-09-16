@@ -7,10 +7,6 @@
 #include "prepared_binding_plan.h"
 #include "runtime_state.h"
 
-#include <optional>
-#include <string_view>
-#include <vector>
-
 namespace vernon::runtime {
 
 inline BackendPipelineResult backendPipelineResolutionFailure(BackendStageBuildInputs &inputs) {
@@ -19,22 +15,6 @@ inline BackendPipelineResult backendPipelineResolutionFailure(BackendStageBuildI
         diagnostic.swap(invocationDiagnostic(*inputs.context));
     return BackendPipelineResult{
         vernon::err(BackendPipelineFailure{BackendPipelineError::BackendResolutionFailed, std::move(diagnostic)})};
-}
-
-inline std::optional<VernonRuntimeProviderBindingKind> providerBindingKindForTransport(std::string_view transport) {
-    if (transport == "storage_buffer")
-        return VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-    if (transport == "uniform_buffer")
-        return VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
-    if (transport == "push_constant")
-        return VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-    return std::nullopt;
-}
-
-inline void configureComputeValueStorage(const ParameterUse &use, VernonRuntimeProviderBindingLayoutEntry &layout) {
-    if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && use.interfaceKind == "value" &&
-        !use.tensorViewDescriptor)
-        layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
 }
 
 inline bool bindComputeValueStorage(const VernonRuntimeProviderBindingLayoutEntry &layout,
@@ -47,6 +27,17 @@ inline bool bindComputeValueStorage(const VernonRuntimeProviderBindingLayoutEntr
         return false;
     value.payload.inline_value.data = scalar->data;
     value.payload.inline_value.size = scalar->size;
+    return true;
+}
+
+inline bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
+                                       const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
+                                       VernonRuntimeProviderBindingValue &value) {
+    if (!source.metadataCarrier || launch.metadataPayload.empty() ||
+        launch.metadataPayload.size() != layout.element_size || launch.metadataAlignment != layout.element_alignment)
+        return false;
+    value.payload.inline_value.data = launch.metadataPayload.data();
+    value.payload.inline_value.size = launch.metadataPayload.size();
     return true;
 }
 

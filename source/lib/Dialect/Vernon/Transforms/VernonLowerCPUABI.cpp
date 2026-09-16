@@ -1,6 +1,8 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
 #include "mlir/IR/Builders.h"
@@ -8,6 +10,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/DataLayout.h"
 
 #include <vector>
 
@@ -19,6 +22,7 @@ struct ArgumentPlan {
     std::optional<CpuCallPlan> value;
     unsigned firstBridgeArgument{};
     unsigned bridgeArgumentCount{};
+    bool metadataCarrier{};
 };
 
 FailureOr<SmallVector<StringRef>> logicalDtypes(DictionaryAttr attributes) {
@@ -76,7 +80,7 @@ struct VernonLowerCPUABIPass final : PassWrapper<VernonLowerCPUABIPass, Operatio
         SmallVector<Type> bridgeArgumentTypes;
         argumentPlans.reserve(function.getNumArguments());
         for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
-            ArgumentPlan argument{type, std::nullopt, static_cast<unsigned>(bridgeArgumentTypes.size()), 1};
+            ArgumentPlan argument{type, std::nullopt, static_cast<unsigned>(bridgeArgumentTypes.size()), 1, false};
             FailureOr<SmallVector<StringRef>> dtypes = logicalDtypes(function.getArgAttrDict(index));
             if (failed(dtypes)) {
                 function.emitError("CPU entry argument has malformed logical dtype metadata");
@@ -87,6 +91,23 @@ struct VernonLowerCPUABIPass final : PassWrapper<VernonLowerCPUABIPass, Operatio
                 argument.bridgeArgumentCount = argument.value->lanes.size();
                 for (const CpuCallLane &lane : argument.value->lanes)
                     bridgeArgumentTypes.push_back(argument.value->layout.leaves[lane.leafIndex].scalarType);
+            } else if (function.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
+                auto tuple = dyn_cast<TupleType>(type);
+                if (!tuple || !llvm::all_of(tuple.getTypes(), [](Type member) { return member.isIndex(); })) {
+                    function.emitError() << "CPU metadata carrier argument #" << index
+                                         << " is not a tuple of logical index fields";
+                    return failure();
+                }
+                auto dataLayout = module->getAttrOfType<StringAttr>("llvm.data_layout");
+                const unsigned indexBits =
+                    dataLayout ? llvm::DataLayout(dataLayout.getValue()).getPointerSizeInBits() : 0;
+                if (indexBits != 32 && indexBits != 64) {
+                    function.emitError("CPU metadata carrier requires a 32-bit or 64-bit target index");
+                    return failure();
+                }
+                argument.metadataCarrier = true;
+                argument.bridgeArgumentCount = tuple.size();
+                bridgeArgumentTypes.append(tuple.size(), IntegerType::get(function.getContext(), indexBits));
             } else if (isa<TensorViewType>(type) || isCpuOpaqueAbiType(type)) {
                 bridgeArgumentTypes.push_back(type);
             } else {
@@ -131,6 +152,8 @@ struct VernonLowerCPUABIPass final : PassWrapper<VernonLowerCPUABIPass, Operatio
         bridge->setAttr("vernon.entry", builder.getUnitAttr());
         for (auto [sourceIndex, plan] : llvm::enumerate(argumentPlans)) {
             DictionaryAttr attributes = function.getArgAttrDict(sourceIndex);
+            if (plan.metadataCarrier)
+                continue;
             for (unsigned lane = 0; lane < plan.bridgeArgumentCount; ++lane)
                 bridge.setArgAttrs(plan.firstBridgeArgument + lane, attributes);
         }
@@ -145,6 +168,27 @@ struct VernonLowerCPUABIPass final : PassWrapper<VernonLowerCPUABIPass, Operatio
         for (auto [sourceIndex, plan] : llvm::enumerate(argumentPlans)) {
             ValueRange bridgeValues =
                 entry->getArguments().slice(bridgeBase + plan.firstBridgeArgument, plan.bridgeArgumentCount);
+            if (plan.metadataCarrier) {
+                SmallVector<TupleGetOp> reads;
+                for (Operation *user : sourceArguments[sourceIndex].getUsers()) {
+                    auto read = dyn_cast<TupleGetOp>(user);
+                    if (!read || read.getInput() != sourceArguments[sourceIndex] ||
+                        read.getIndex() >= bridgeValues.size()) {
+                        bridge.emitError("CPU metadata carrier has a non-canonical use");
+                        bridge.erase();
+                        return failure();
+                    }
+                    reads.push_back(read);
+                }
+                for (TupleGetOp read : reads) {
+                    builder.setInsertionPoint(read);
+                    Value logical = arith::IndexCastOp::create(builder, read.getLoc(), builder.getIndexType(),
+                                                               bridgeValues[read.getIndex()]);
+                    read.getResult().replaceAllUsesWith(logical);
+                    read.erase();
+                }
+                continue;
+            }
             if (!plan.value) {
                 sourceArguments[sourceIndex].replaceAllUsesWith(bridgeValues.front());
                 continue;

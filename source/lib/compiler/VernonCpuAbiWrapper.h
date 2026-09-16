@@ -16,6 +16,7 @@ enum class CpuAbiArgumentKind {
     CanonicalValue,
     OpaqueScalar,
     TensorView,
+    MetadataCarrier,
 };
 
 struct CpuCallLanePacking {

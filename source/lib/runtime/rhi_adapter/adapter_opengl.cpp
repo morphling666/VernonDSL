@@ -8,8 +8,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <optional>
 #include <string>
@@ -153,6 +153,7 @@ struct PreparedBindingSet {
         uint64_t resource{};
         VernonRuntimeProviderResourceReference resourceReference{};
         uint64_t resourceOffset{};
+        uint64_t resourceRange{};
         VernonRhiImageDimension resourceTarget{VERNON_RHI_IMAGE_2D};
         uint32_t resourceStride{};
         VernonRhiFormat textureFormat{VERNON_RHI_FORMAT_UNDEFINED};
@@ -175,6 +176,16 @@ struct PreparedBindingSet {
                 device->destroyBuffer(slot.inlineBuffer);
     }
 };
+
+void bindIndexedBuffer(rhi::opengl::Driver &driver, rhi::opengl::Enum target, uint32_t binding,
+                       const PreparedBindingSet::Slot &slot) {
+    const auto resource = static_cast<rhi::opengl::Uint>(slot.resource);
+    if (slot.resourceOffset == 0)
+        driver.bindBufferBase(target, binding, resource);
+    else
+        driver.bindBufferRange(target, binding, resource, static_cast<rhi::opengl::IntPtr>(slot.resourceOffset),
+                               static_cast<rhi::opengl::SizePtr>(slot.resourceRange));
+}
 
 void releaseCommandBindings(void *context, uint64_t);
 void releaseCommandPipeline(void *context, uint64_t);
@@ -379,8 +390,63 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
         if (!openGLState(adapter).device->makeCurrent())
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::BackendFailure, {"opengl_make_context_current_for_layout", 0, 0}})};
+        size_t computeUniformBuffers = 0;
+        size_t computeStorageBuffers = 0;
+        auto &driver = openGLState(adapter).device->driver;
+        for (const PreparedLayout::Entry &entry : layout->entries) {
+            if (entry.layout.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
+                continue;
+            if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
+                ++computeUniformBuffers;
+            else if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                     entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+                ++computeStorageBuffers;
+            }
+        }
+        if (computeUniformBuffers || computeStorageBuffers) {
+            rhi::opengl::Int maximumUniformBindings = 0;
+            rhi::opengl::Int maximumUniformBlockSize = 0;
+            rhi::opengl::Int maximumComputeUniformBlocks = 0;
+            rhi::opengl::Int maximumComputeStorageBlocks = 0;
+            rhi::opengl::Int maximumStorageBindings = 0;
+            driver.getIntegerv(rhi::opengl::kMaxUniformBufferBindings, &maximumUniformBindings);
+            driver.getIntegerv(rhi::opengl::kMaxUniformBlockSize, &maximumUniformBlockSize);
+            driver.getIntegerv(rhi::opengl::kMaxComputeUniformBlocks, &maximumComputeUniformBlocks);
+            driver.getIntegerv(rhi::opengl::kMaxComputeShaderStorageBlocks, &maximumComputeStorageBlocks);
+            driver.getIntegerv(rhi::opengl::kMaxShaderStorageBufferBindings, &maximumStorageBindings);
+            for (const PreparedLayout::Entry &entry : layout->entries)
+                if (entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE &&
+                    entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                    (maximumUniformBindings <= 0 || maximumUniformBlockSize <= 0 ||
+                     entry.layout.binding >= static_cast<uint32_t>(maximumUniformBindings) ||
+                     entry.layout.element_size > static_cast<uint32_t>(maximumUniformBlockSize)))
+                    return RhiAdapterResult<void>{
+                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::Unsupported,
+                                                          {"opengl_compute_uniform_buffer_exceeds_device_limits",
+                                                           entry.layout.binding, entry.layout.element_size}})};
+                else if (entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE &&
+                         (entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                          entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) &&
+                         (maximumStorageBindings <= 0 ||
+                          entry.layout.binding >= static_cast<uint32_t>(maximumStorageBindings)))
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::Unsupported,
+                        {"opengl_compute_storage_buffer_binding_exceeds_device_limits", entry.layout.binding,
+                         maximumStorageBindings > 0 ? static_cast<uint32_t>(maximumStorageBindings) : 0u}})};
+            if (maximumComputeUniformBlocks < 0 || maximumComputeStorageBlocks < 0 ||
+                computeUniformBuffers > static_cast<size_t>(maximumComputeUniformBlocks) ||
+                computeStorageBuffers > static_cast<size_t>(maximumComputeStorageBlocks)) {
+                const uint32_t storageCount =
+                    computeStorageBuffers > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(computeStorageBuffers);
+                const uint32_t uniformCount =
+                    computeUniformBuffers > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(computeUniformBuffers);
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::Unsupported,
+                    {"opengl_compute_buffer_binding_count_exceeds_device_limits", storageCount, uniformCount}})};
+            }
+        }
         rhi::opengl::Int maximumLocations = 0;
-        openGLState(adapter).device->driver.getIntegerv(rhi::opengl::kMaxVertexAttribs, &maximumLocations);
+        driver.getIntegerv(rhi::opengl::kMaxVertexAttribs, &maximumLocations);
         for (size_t index = 0; index < descriptor->vertex_attribute_count; ++index) {
             const auto &attribute = descriptor->vertex_attributes[index];
             const bool bindingExists =
@@ -642,14 +708,31 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
             }
             const bool imageBinding = slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                       slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+            const bool bufferBinding = slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                                       slot.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+            const bool indexedBufferBinding = slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                                              slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
             if ((value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0 ||
                 (!defaultResource && ((image ? !isRhiImageReference(resource)
                                              : (resource.identity & kRhiResourceKindMask) != expectedKind) ||
-                                      native == 0)) ||
+                                      native == 0 || (bufferBinding && resource.offset >= resource.size))) ||
                 (slot.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && !defaultResource &&
                  value->payload.buffer.stride == 0))
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"opengl_resource_binding_is_invalid", 0, 0}})};
+            if (!defaultResource && indexedBufferBinding && resource.offset != 0) {
+                rhi::opengl::Int alignment = 0;
+                bindings.device->driver.getIntegerv(slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                        ? rhi::opengl::kUniformBufferOffsetAlignment
+                                                        : rhi::opengl::kShaderStorageBufferOffsetAlignment,
+                                                    &alignment);
+                const uint64_t range = resource.size - resource.offset;
+                if (alignment <= 0 || resource.offset % static_cast<uint64_t>(alignment) != 0 ||
+                    resource.offset > static_cast<uint64_t>(std::numeric_limits<rhi::opengl::IntPtr>::max()) ||
+                    range > static_cast<uint64_t>(std::numeric_limits<rhi::opengl::SizePtr>::max()))
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::InvalidArgument, {"opengl_buffer_range_binding_is_invalid", 0, 0}})};
+            }
             if (imageBinding) {
                 VernonRhiImageDescriptor imageDescriptor{};
                 if (!defaultResource) {
@@ -688,6 +771,7 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
             slot.resource = native;
             slot.resourceReference = defaultResource ? VernonRuntimeProviderResourceReference{} : resource;
             slot.resourceOffset = resource.offset;
+            slot.resourceRange = resource.size - resource.offset;
             slot.resourceStride = value->payload.buffer.stride;
             if (slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                 slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
@@ -816,7 +900,8 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         const auto &binding = pipeline->native->bindings[index];
         const auto &slot = bindings->slots[index];
         if (binding.slot != slot.slot || binding.kind != slot.kind ||
-            (binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+            (binding.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+             binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
              binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
              binding.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE))
             return RhiAdapterResult<void>{
@@ -834,8 +919,10 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
             device.driver.bindImageTexture(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource), 0,
                                            slot.resourceTarget == VERNON_RHI_IMAGE_3D, 0, access, *format);
         } else {
-            device.driver.bindBufferBase(rhi::opengl::kShaderStorageBuffer, binding.binding,
-                                         static_cast<rhi::opengl::Uint>(slot.resource));
+            const rhi::opengl::Enum target = binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                 ? rhi::opengl::kUniformBuffer
+                                                 : rhi::opengl::kShaderStorageBuffer;
+            bindIndexedBuffer(device.driver, target, binding.binding, slot);
         }
     }
     device.driver.dispatchCompute(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
@@ -1026,11 +1113,9 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         if (binding.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
             continue;
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-            driver.bindBufferBase(rhi::opengl::kUniformBuffer, binding.binding,
-                                  static_cast<rhi::opengl::Uint>(slot.resource));
+            bindIndexedBuffer(driver, rhi::opengl::kUniformBuffer, binding.binding, slot);
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            driver.bindBufferBase(rhi::opengl::kShaderStorageBuffer, binding.binding,
-                                  static_cast<rhi::opengl::Uint>(slot.resource));
+            bindIndexedBuffer(driver, rhi::opengl::kShaderStorageBuffer, binding.binding, slot);
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
             const auto target = slot.resourceTarget == VERNON_RHI_IMAGE_2D   ? rhi::opengl::kTexture2D
                                 : slot.resourceTarget == VERNON_RHI_IMAGE_3D ? rhi::opengl::kTexture3D

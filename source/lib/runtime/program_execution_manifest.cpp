@@ -61,12 +61,7 @@ bool uint32Value(const nlohmann::json &value, uint32_t &result) {
 }
 
 bool digestValue(const nlohmann::json &value) {
-    if (!value.is_string() || value.get_ref<const std::string &>().size() != 64)
-        return false;
-    return std::all_of(value.get_ref<const std::string &>().begin(), value.get_ref<const std::string &>().end(),
-                       [](char character) {
-                           return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-                       });
+    return value.is_string() && isSha256Hex(value.get_ref<const std::string &>());
 }
 
 bool uint64Value(const nlohmann::json &value, uint64_t &result) {
@@ -1501,6 +1496,148 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
     return true;
 }
 
+static bool parseSemanticMetadataCarrier(const nlohmann::json &value, vernon::runtime::MetadataCarrier &carrier,
+                                         Diagnostic &diagnostic, const std::string &path) {
+    if (!exactObject(value, {"fields"}, {}, diagnostic, path) || !value["fields"].is_array() || value["fields"].empty())
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                    "entry metadata carrier must contain a non-empty semantic field sequence");
+    for (size_t ordinal = 0; ordinal < value["fields"].size(); ++ordinal) {
+        const auto &row = value["fields"][ordinal];
+        const std::string fieldPath = path + "/fields/" + std::to_string(ordinal);
+        if (!row.is_object() || !row.contains("kind") || !row["kind"].is_string() || !row.contains("units") ||
+            !row["units"].is_string())
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", fieldPath,
+                        "metadata field kind and units must be strings");
+        const std::string kind = row["kind"].get<std::string>();
+        const bool dimensioned = kind == "extent" || kind == "stride";
+        if (!exactObject(row,
+                         dimensioned ? std::initializer_list<std::string_view>{"ordinal", "argument", "kind", "units",
+                                                                               "dimension"}
+                                     : std::initializer_list<std::string_view>{"ordinal", "argument", "kind", "units"},
+                         {}, diagnostic, fieldPath)) {
+            return false;
+        }
+        vernon::runtime::MetadataFieldIdentity field;
+        uint32_t reflectedOrdinal{};
+        if (!uint32Value(row["ordinal"], reflectedOrdinal) || reflectedOrdinal != ordinal ||
+            !uint32Value(row["argument"], field.argument) || !row["kind"].is_string() || !row["units"].is_string() ||
+            row["units"] != "logical_elements")
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", fieldPath,
+                        "metadata field has an invalid ordinal, argument, kind, or units");
+        if (kind == "offset")
+            field.kind = vernon::runtime::MetadataFieldKind::Offset;
+        else if (kind == "extent")
+            field.kind = vernon::runtime::MetadataFieldKind::Extent;
+        else if (kind == "stride")
+            field.kind = vernon::runtime::MetadataFieldKind::Stride;
+        else
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", fieldPath + "/kind",
+                        "metadata field kind must be offset, extent, or stride");
+        if (dimensioned) {
+            uint32_t dimension{};
+            if (!uint32Value(row["dimension"], dimension))
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", fieldPath + "/dimension",
+                            "metadata field dimension is invalid");
+            field.dimension = dimension;
+        }
+        carrier.fields.push_back(field);
+    }
+    return true;
+}
+
+static bool parsePhysicalMetadataCarrier(const nlohmann::json &value, vernon::runtime::MetadataCarrier &carrier,
+                                         Diagnostic &diagnostic, const std::string &path) {
+    if (!exactObject(
+            value,
+            {"profile", "representation", "carrier", "encoded_size", "size", "alignment", "members", "interface_plan"},
+            {"set", "binding", "parameter_ordinal"}, diagnostic, path) ||
+        !value["profile"].is_string() || !value["representation"].is_string() || !value["carrier"].is_string() ||
+        !value["members"].is_array() || value["members"].size() != carrier.fields.size() ||
+        !uint64Value(value["encoded_size"], carrier.encodedSize) || !carrier.encodedSize ||
+        !uint64Value(value["size"], carrier.size) || carrier.size < carrier.encodedSize ||
+        !uint64Value(value["alignment"], carrier.alignment) || !carrier.alignment ||
+        (carrier.alignment & (carrier.alignment - 1)) || carrier.size % carrier.alignment)
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                    "entry metadata carrier has an invalid physical layout");
+    carrier.profile = value["profile"].get<std::string>();
+    carrier.representation = value["representation"].get<std::string>();
+    carrier.carrier = value["carrier"].get<std::string>();
+    const bool shader = carrier.profile == "portable_shader_metadata_i32";
+    const bool cuda = carrier.profile == "cuda_kernel_metadata_i64";
+    const bool host = carrier.profile == "host_metadata";
+    if ((!shader && !cuda && !host) || (shader && carrier.representation != "i32") ||
+        (cuda && carrier.representation != "i64") ||
+        (host && carrier.representation != "i32" && carrier.representation != "i64") ||
+        (shader && carrier.carrier != "constant_region") || (cuda && carrier.carrier != "kernel_parameter") ||
+        (host && carrier.carrier != "cpu_call_frame"))
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/profile",
+                    "metadata profile and signed representation disagree");
+    if (shader) {
+        if (!value.contains("set") || !value.contains("binding") || !uint32Value(value["set"], carrier.descriptorSet) ||
+            !uint32Value(value["binding"], carrier.binding) || value.contains("parameter_ordinal"))
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                        "shader metadata carrier requires exactly one set and binding");
+    } else if (cuda) {
+        if (!value.contains("parameter_ordinal") ||
+            !uint32Value(value["parameter_ordinal"], carrier.parameterOrdinal) || value.contains("set") ||
+            value.contains("binding"))
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                        "CUDA metadata carrier requires exactly one parameter ordinal");
+    } else if (value.contains("parameter_ordinal") || value.contains("set") || value.contains("binding")) {
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                    "host metadata carrier must use only its call-frame offset");
+    }
+    std::vector<uint8_t> seen(carrier.fields.size());
+    uint64_t previousEnd = 0;
+    for (size_t index = 0; index < value["members"].size(); ++index) {
+        const auto &row = value["members"][index];
+        const std::string memberPath = path + "/members/" + std::to_string(index);
+        vernon::runtime::PhysicalMetadataMember member;
+        if (!exactObject(row, {"semantic_ordinal", "byte_offset", "byte_size", "alignment"}, {}, diagnostic,
+                         memberPath) ||
+            !uint32Value(row["semantic_ordinal"], member.semanticOrdinal) ||
+            !uint64Value(row["byte_offset"], member.byteOffset) || !uint64Value(row["byte_size"], member.byteSize) ||
+            !uint64Value(row["alignment"], member.alignment) || member.semanticOrdinal >= carrier.fields.size() ||
+            seen[member.semanticOrdinal]++ || !member.byteSize || !member.alignment ||
+            (member.alignment & (member.alignment - 1)) || member.byteOffset % member.alignment ||
+            member.byteOffset != previousEnd || member.byteOffset > carrier.encodedSize ||
+            member.byteSize > carrier.encodedSize - member.byteOffset ||
+            member.byteSize != (carrier.representation == "i32" ? 4u : 8u))
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", memberPath,
+                        "metadata member is not a valid bijective physical projection");
+        previousEnd = member.byteOffset + member.byteSize;
+        carrier.members.push_back(member);
+    }
+    if (previousEnd != carrier.encodedSize ||
+        (shader && (carrier.alignment != 16 || carrier.size > 16 * 1024 ||
+                    carrier.size != ((carrier.encodedSize + 15) & ~uint64_t{15}))) ||
+        (cuda && carrier.size != carrier.encodedSize))
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path,
+                    "metadata carrier encoded and ABI block sizes disagree");
+    std::string planError;
+    if (!vernon::runtime::parseArtifactInterfacePlan(value["interface_plan"], carrier.interfacePlan, planError) ||
+        carrier.interfacePlan.profile != carrier.profile ||
+        carrier.interfacePlan.kind != (shader ? vernon::runtime::InterfacePlanKind::ByteTransport
+                                       : cuda ? vernon::runtime::InterfacePlanKind::KernelParameter
+                                              : vernon::runtime::InterfacePlanKind::CpuCall) ||
+        !carrier.interfacePlan.root || carrier.interfacePlan.root->size != carrier.size ||
+        carrier.interfacePlan.root->alignment != carrier.alignment ||
+        carrier.interfacePlan.root->kind != vernon::runtime::TransportNodeKind::Product ||
+        carrier.interfacePlan.root->children.size() != carrier.members.size())
+        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/interface_plan",
+                    planError.empty() ? "metadata carrier interface plan disagrees with its physical members"
+                                      : std::move(planError));
+    for (size_t index = 0; index < carrier.members.size(); ++index) {
+        const auto &node = carrier.interfacePlan.root->children[index];
+        const auto &member = carrier.members[index];
+        if (node.kind != vernon::runtime::TransportNodeKind::Scalar || node.representation != carrier.representation ||
+            node.offset != member.byteOffset || node.size != member.byteSize || node.alignment != member.alignment)
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/interface_plan/root",
+                        "metadata carrier transport children do not match physical members");
+    }
+    return true;
+}
+
 static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann::json &blobs,
                                     const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic) {
     artifacts = {};
@@ -1688,7 +1825,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
 
         const auto &reflection = row["reflection"];
         std::vector<std::string> reflectedFeatures;
-        if (!exactObject(reflection, {"required_features", "endpoints", operation}, {}, diagnostic,
+        if (!exactObject(reflection, {"required_features", "endpoints", operation}, {"metadata_carrier"}, diagnostic,
                          path + "/reflection") ||
             !reflection["endpoints"].is_array() ||
             !stringArray(reflection["required_features"], reflectedFeatures, diagnostic,
@@ -1697,6 +1834,15 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
         if (reflectedFeatures != stage.requiredFeatures)
             return fail(diagnostic, "PROGRAM_RUNTIME_REQUIREMENTS", "parse", path + "/runtime_requirements/features",
                         "Runtime requirements must equal reflected features");
+        if (reflection.contains("metadata_carrier")) {
+            if (operation != "compute")
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/reflection/metadata_carrier",
+                            "graphics reflection cannot declare a compute metadata carrier");
+            stage.metadataCarrier.emplace();
+            if (!parseSemanticMetadataCarrier(reflection["metadata_carrier"], *stage.metadataCarrier, diagnostic,
+                                              path + "/reflection/metadata_carrier"))
+                return false;
+        }
         for (size_t endpointIndex = 0; endpointIndex < reflection["endpoints"].size(); ++endpointIndex) {
             const auto &endpointValue = reflection["endpoints"][endpointIndex];
             const std::string endpointPath = path + "/reflection/endpoints/" + std::to_string(endpointIndex);
@@ -1860,8 +2006,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                 }
                 const auto &abi = endpointValue["abi"];
                 if (!exactObject(abi, {"bindings"}, {}, diagnostic, endpointPath + "/abi") ||
-                    !abi["bindings"].is_array() ||
-                    abi["bindings"].size() < 1 + (endpoint.viewDescriptor ? 1 + 2 * endpoint.viewRank : 0)) {
+                    !abi["bindings"].is_array() || abi["bindings"].empty()) {
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/abi",
                                 "buffer endpoint has an incomplete portable ABI");
                 }
@@ -1875,23 +2020,19 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                     EndpointAbiBinding binding;
                     if (abiBinding["semantic"].is_string()) {
                         binding.semantic = abiBinding["semantic"].get<std::string>();
-                        if (binding.semantic != "resource" && binding.semantic != "sampler" &&
-                            binding.semantic != "byte_offset")
+                        if (binding.semantic != "resource" && binding.semantic != "sampler")
                             return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", bindingPath + "/semantic",
                                         "unknown portable ABI semantic");
                     } else if (abiBinding["semantic"].is_object()) {
                         const auto &semantic = abiBinding["semantic"];
                         const bool storageLeaf = semantic.contains("storage_leaf");
-                        const bool extent = semantic.contains("extent");
-                        const std::string_view semanticName = storageLeaf ? "storage_leaf"
-                                                              : extent    ? "extent"
-                                                                          : "byte_stride";
+                        const std::string_view semanticName = "storage_leaf";
                         if (!exactObject(semantic, {semanticName}, {}, diagnostic, bindingPath + "/semantic")) {
                             return false;
                         }
                         uint32_t axis{};
                         const auto &axisValue = semantic[semanticName];
-                        if (!uint32Value(axisValue, axis) || (!storageLeaf && axis >= endpoint.viewRank))
+                        if (!storageLeaf || !uint32Value(axisValue, axis))
                             return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", bindingPath + "/semantic",
                                         "portable ABI axis is out of range");
                         binding.semantic = std::string(semanticName);
@@ -1929,10 +2070,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                     return std::count_if(endpoint.abiBindings.begin(), endpoint.abiBindings.end(),
                                          [&](const EndpointAbiBinding &binding) { return binding.semantic == name; });
                 };
-                if (semanticCount("resource") + semanticCount("sampler") + semanticCount("storage_leaf") == 0 ||
-                    semanticCount("byte_offset") != (endpoint.viewDescriptor ? 1 : 0) ||
-                    semanticCount("extent") != (endpoint.viewDescriptor ? endpoint.viewRank : 0) ||
-                    semanticCount("byte_stride") != (endpoint.viewDescriptor ? endpoint.viewRank : 0))
+                if (semanticCount("resource") + semanticCount("sampler") + semanticCount("storage_leaf") == 0)
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/abi",
                                 "buffer endpoint portable ABI semantics are incomplete");
             } else {
@@ -1973,6 +2111,35 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
             }
             stage.endpoints.push_back(std::move(endpoint));
         }
+        std::vector<vernon::runtime::MetadataFieldIdentity> expectedMetadataFields;
+        std::vector<const ReflectedEndpoint *> descriptorEndpoints;
+        for (const ReflectedEndpoint &endpoint : stage.endpoints)
+            if (endpoint.viewDescriptor)
+                descriptorEndpoints.push_back(&endpoint);
+        std::sort(
+            descriptorEndpoints.begin(), descriptorEndpoints.end(),
+            [](const ReflectedEndpoint *left, const ReflectedEndpoint *right) { return left->index < right->index; });
+        for (const ReflectedEndpoint *endpoint : descriptorEndpoints) {
+            expectedMetadataFields.push_back(
+                {endpoint->index, vernon::runtime::MetadataFieldKind::Offset, std::nullopt});
+            for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
+                expectedMetadataFields.push_back(
+                    {endpoint->index, vernon::runtime::MetadataFieldKind::Extent, dimension});
+            for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
+                expectedMetadataFields.push_back(
+                    {endpoint->index, vernon::runtime::MetadataFieldKind::Stride, dimension});
+        }
+        const auto sameField = [](const vernon::runtime::MetadataFieldIdentity &left,
+                                  const vernon::runtime::MetadataFieldIdentity &right) {
+            return left.argument == right.argument && left.kind == right.kind && left.dimension == right.dimension;
+        };
+        if (expectedMetadataFields.empty() != !stage.metadataCarrier ||
+            (stage.metadataCarrier &&
+             (stage.metadataCarrier->fields.size() != expectedMetadataFields.size() ||
+              !std::equal(stage.metadataCarrier->fields.begin(), stage.metadataCarrier->fields.end(),
+                          expectedMetadataFields.begin(), sameField))))
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/reflection/metadata_carrier",
+                        "entry metadata fields are not the canonical argument/kind/dimension sequence");
         std::vector<uint32_t> allSlots;
         for (const ReflectedEndpoint &endpoint : stage.endpoints) {
             for (const EndpointAbiBinding &binding : endpoint.abiBindings) {
@@ -1987,7 +2154,8 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
         if (row.contains("implementation")) {
             const auto &implementation = row["implementation"];
             const std::string implementationPath = path + "/implementation";
-            if (!exactObject(implementation, {"target", "metadata", "endpoints"}, {}, diagnostic, implementationPath) ||
+            if (!exactObject(implementation, {"target", "metadata", "endpoints"}, {"metadata_carrier"}, diagnostic,
+                             implementationPath) ||
                 !implementation["target"].is_string() || implementation["target"] != stage.backend ||
                 !implementation["metadata"].is_object() || !implementation["endpoints"].is_array())
                 return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", implementationPath,
@@ -1997,6 +2165,23 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
             if (!parseTargetImplementationMetadata(stage.backend, metadata, stage.nativeSlots, targetError))
                 return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", implementationPath + "/metadata",
                             std::move(targetError));
+            if (stage.metadataCarrier) {
+                if (!implementation.contains("metadata_carrier") ||
+                    !parsePhysicalMetadataCarrier(implementation["metadata_carrier"], *stage.metadataCarrier,
+                                                  diagnostic, implementationPath + "/metadata_carrier"))
+                    return false;
+                const std::string expectedProfile = stage.backend == "cpu"    ? "host_metadata"
+                                                    : stage.backend == "cuda" ? "cuda_kernel_metadata_i64"
+                                                                              : "portable_shader_metadata_i32";
+                if (stage.metadataCarrier->profile != expectedProfile)
+                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                implementationPath + "/metadata_carrier/profile",
+                                "compiled metadata profile does not match the artifact target");
+            } else if (implementation.contains("metadata_carrier")) {
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                            implementationPath + "/metadata_carrier",
+                            "compiled metadata carrier has no semantic entry carrier");
+            }
             for (size_t index = 0; index < implementation["endpoints"].size(); ++index) {
                 const auto &rowValue = implementation["endpoints"][index];
                 const std::string endpointPath = implementationPath + "/endpoints/" + std::to_string(index);
@@ -2073,6 +2258,9 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                 stage.compiledAbi.push_back(std::move(compiled));
             }
         }
+        if (stage.metadataCarrier && stage.metadataCarrier->profile.empty())
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/implementation/metadata_carrier",
+                        "semantic metadata carrier has no compiled physical carrier");
         if (operation == "graphics") {
             const auto &graphics = reflection["graphics"];
             if (!exactObject(graphics,

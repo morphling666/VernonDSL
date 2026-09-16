@@ -170,16 +170,20 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
                 return false;
             llvm::json::Object stageContract;
             if (!buildCanonicalComputeStageContract(compiledEntry, compiledReflection, computePlan.endpoints.take(),
-                                                    stageContract, error))
+                                                    std::move(computePlan.semanticMetadataCarrier), stageContract,
+                                                    error))
                 return false;
             const std::string contractHash = canonicalJsonSha256(llvm::json::Value(copyJsonObject(stageContract)));
             plan.stageContracts[requestId] = std::move(stageContract);
-            if (!computePlan.implementationEndpoints.empty() || !compiled.targetImplementation.metadata.empty()) {
+            if (!computePlan.implementationEndpoints.empty() || !compiled.targetImplementation.metadata.empty() ||
+                computePlan.physicalMetadataCarrier) {
                 llvm::json::Object implementation{
                     {"target", compiled.targetImplementation.target},
                     {"metadata", copyJsonObject(compiled.targetImplementation.metadata)},
                 };
                 implementation["endpoints"] = computePlan.implementationEndpoints.take();
+                if (computePlan.physicalMetadataCarrier)
+                    implementation["metadata_carrier"] = std::move(*computePlan.physicalMetadataCarrier);
                 plan.targetImplementations[requestId] = std::move(implementation);
             }
             plan.stages[requestId] = llvm::json::Object{{"operation", "compute"}, {"contract_hash", contractHash}};

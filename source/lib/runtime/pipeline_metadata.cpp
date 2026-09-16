@@ -11,6 +11,168 @@
 #include <utility>
 
 namespace vernon::runtime {
+namespace {
+
+bool parseUnsigned(const nlohmann::json &value, uint64_t &result) {
+    if (!value.is_number_integer())
+        return false;
+    if (value.is_number_unsigned()) {
+        result = value.get<uint64_t>();
+        return true;
+    }
+    const int64_t signedValue = value.get<int64_t>();
+    if (signedValue < 0)
+        return false;
+    result = static_cast<uint64_t>(signedValue);
+    return true;
+}
+
+bool parseEntryMetadataCarrier(const nlohmann::json &value, VernonRuntimeBackend backend, MetadataCarrier &carrier,
+                               std::string &error) {
+    static constexpr std::string_view keys[] = {
+        "profile", "representation", "carrier",           "encoded_size", "size",    "alignment",
+        "set",     "binding",        "parameter_ordinal", "fields",       "members", "interface_plan"};
+    bool knownKeys = value.is_object();
+    if (knownKeys)
+        for (auto row = value.begin(); row != value.end(); ++row)
+            knownKeys &= std::find(std::begin(keys), std::end(keys), row.key()) != std::end(keys);
+    if (!knownKeys || !value.contains("profile") || !value["profile"].is_string() ||
+        !value.contains("representation") || !value["representation"].is_string() || !value.contains("carrier") ||
+        !value["carrier"].is_string() || !value.contains("encoded_size") || !value.contains("size") ||
+        !value.contains("alignment") || !value.contains("fields") || !value["fields"].is_array() ||
+        value["fields"].empty() || !value.contains("members") || !value["members"].is_array() ||
+        value["members"].size() != value["fields"].size() || !value.contains("interface_plan")) {
+        error = "entry metadata carrier schema is invalid";
+        return false;
+    }
+    carrier.profile = value["profile"].get<std::string>();
+    carrier.representation = value["representation"].get<std::string>();
+    carrier.carrier = value["carrier"].get<std::string>();
+    const std::string expectedProfile = backend == VERNON_RUNTIME_CPU    ? "host_metadata"
+                                        : backend == VERNON_RUNTIME_CUDA ? "cuda_kernel_metadata_i64"
+                                                                         : "portable_shader_metadata_i32";
+    if (carrier.profile != expectedProfile || !parseUnsigned(value["encoded_size"], carrier.encodedSize) ||
+        !carrier.encodedSize || !parseUnsigned(value["size"], carrier.size) || carrier.size < carrier.encodedSize ||
+        !parseUnsigned(value["alignment"], carrier.alignment) || !carrier.alignment ||
+        (carrier.alignment & (carrier.alignment - 1)) || carrier.size % carrier.alignment) {
+        error = "entry metadata carrier profile, size, or alignment is invalid";
+        return false;
+    }
+    const bool shader = carrier.profile == "portable_shader_metadata_i32";
+    const bool cuda = carrier.profile == "cuda_kernel_metadata_i64";
+    if ((shader && carrier.representation != "i32") || (cuda && carrier.representation != "i64") ||
+        (!shader && !cuda && carrier.representation != "i32" && carrier.representation != "i64") ||
+        (shader && carrier.carrier != "constant_region") || (cuda && carrier.carrier != "kernel_parameter") ||
+        (!shader && !cuda && carrier.carrier != "cpu_call_frame")) {
+        error = "entry metadata profile and representation disagree";
+        return false;
+    }
+    const auto parseLocation = [&](const char *key, uint32_t &target) {
+        uint64_t parsed = 0;
+        if (!value.contains(key) || !parseUnsigned(value[key], parsed) || parsed > UINT32_MAX)
+            return false;
+        target = static_cast<uint32_t>(parsed);
+        return true;
+    };
+    if ((shader && (!parseLocation("set", carrier.descriptorSet) || !parseLocation("binding", carrier.binding) ||
+                    value.contains("parameter_ordinal"))) ||
+        (cuda && (!parseLocation("parameter_ordinal", carrier.parameterOrdinal) || value.contains("set") ||
+                  value.contains("binding"))) ||
+        (!shader && !cuda &&
+         (value.contains("parameter_ordinal") || value.contains("set") || value.contains("binding")))) {
+        error = "entry metadata carrier native location is invalid";
+        return false;
+    }
+    for (size_t ordinal = 0; ordinal < value["fields"].size(); ++ordinal) {
+        const auto &row = value["fields"][ordinal];
+        uint64_t reflectedOrdinal = 0;
+        if (!row.is_object() || !row.contains("ordinal") || !parseUnsigned(row["ordinal"], reflectedOrdinal) ||
+            reflectedOrdinal != ordinal || !row.contains("argument") || !row.contains("kind") ||
+            !row["kind"].is_string() || !row.contains("units") || !row["units"].is_string() ||
+            row["units"] != "logical_elements") {
+            error = "entry metadata semantic field is invalid";
+            return false;
+        }
+        uint64_t argument = 0;
+        if (!parseUnsigned(row["argument"], argument) || argument > UINT32_MAX) {
+            error = "entry metadata semantic argument is invalid";
+            return false;
+        }
+        MetadataFieldIdentity field;
+        field.argument = static_cast<uint32_t>(argument);
+        const std::string kind = row["kind"].get<std::string>();
+        if (kind == "offset")
+            field.kind = MetadataFieldKind::Offset;
+        else if (kind == "extent")
+            field.kind = MetadataFieldKind::Extent;
+        else if (kind == "stride")
+            field.kind = MetadataFieldKind::Stride;
+        else {
+            error = "entry metadata semantic kind is invalid";
+            return false;
+        }
+        const bool dimensioned = field.kind != MetadataFieldKind::Offset;
+        uint64_t dimension = 0;
+        if (dimensioned != row.contains("dimension") ||
+            (dimensioned && (!parseUnsigned(row["dimension"], dimension) || dimension > UINT32_MAX)) ||
+            row.size() != (dimensioned ? 5u : 4u)) {
+            error = "entry metadata semantic dimension is invalid";
+            return false;
+        }
+        if (dimensioned)
+            field.dimension = static_cast<uint32_t>(dimension);
+        carrier.fields.push_back(field);
+    }
+    std::vector<uint8_t> seen(carrier.fields.size());
+    uint64_t previousEnd = 0;
+    for (const auto &row : value["members"]) {
+        PhysicalMetadataMember member;
+        uint64_t ordinal = 0;
+        if (!row.is_object() || row.size() != 4 || !row.contains("semantic_ordinal") || !row.contains("byte_offset") ||
+            !row.contains("byte_size") || !row.contains("alignment") ||
+            !parseUnsigned(row["semantic_ordinal"], ordinal) || ordinal >= carrier.fields.size() || seen[ordinal]++ ||
+            !parseUnsigned(row["byte_offset"], member.byteOffset) ||
+            !parseUnsigned(row["byte_size"], member.byteSize) || !parseUnsigned(row["alignment"], member.alignment) ||
+            !member.alignment || member.byteOffset % member.alignment || member.byteOffset != previousEnd ||
+            member.byteSize != (carrier.representation == "i32" ? 4u : 8u) || member.byteOffset > carrier.encodedSize ||
+            member.byteSize > carrier.encodedSize - member.byteOffset) {
+            error = "entry metadata physical member is invalid";
+            return false;
+        }
+        member.semanticOrdinal = static_cast<uint32_t>(ordinal);
+        previousEnd = member.byteOffset + member.byteSize;
+        carrier.members.push_back(member);
+    }
+    if (previousEnd != carrier.encodedSize ||
+        (shader && (carrier.alignment != 16 || carrier.size > 16 * 1024 ||
+                    carrier.size != ((carrier.encodedSize + 15) & ~uint64_t{15}))) ||
+        (cuda && carrier.size != carrier.encodedSize) ||
+        !parseArtifactInterfacePlan(value["interface_plan"], carrier.interfacePlan, error) ||
+        carrier.interfacePlan.profile != carrier.profile ||
+        carrier.interfacePlan.kind != (shader ? InterfacePlanKind::ByteTransport
+                                       : cuda ? InterfacePlanKind::KernelParameter
+                                              : InterfacePlanKind::CpuCall) ||
+        !carrier.interfacePlan.root || carrier.interfacePlan.root->kind != TransportNodeKind::Product ||
+        carrier.interfacePlan.root->size != carrier.size ||
+        carrier.interfacePlan.root->alignment != carrier.alignment ||
+        carrier.interfacePlan.root->children.size() != carrier.members.size()) {
+        if (error.empty())
+            error = "entry metadata physical layout is inconsistent";
+        return false;
+    }
+    for (size_t index = 0; index < carrier.members.size(); ++index) {
+        const auto &node = carrier.interfacePlan.root->children[index];
+        const auto &member = carrier.members[index];
+        if (node.kind != TransportNodeKind::Scalar || node.representation != carrier.representation ||
+            node.offset != member.byteOffset || node.size != member.byteSize || node.alignment != member.alignment) {
+            error = "entry metadata transport children disagree with physical members";
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::string &transport) {
     switch (backend) {
@@ -83,6 +245,12 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 output.workgroup[index] = entry["workgroup_size"][index].get<uint32_t>();
         if (!parseDispatchContract(entry, output.dispatchContract, error))
             return false;
+        if (entry.contains("metadata_carrier")) {
+            MetadataCarrier carrier;
+            if (!parseEntryMetadataCarrier(entry["metadata_carrier"], backend, carrier, error))
+                return false;
+            output.metadataCarrier = std::move(carrier);
+        }
         if (!entry.contains("arguments") || !entry["arguments"].is_array()) {
             error = "entry has no argument layout";
             return false;
@@ -166,7 +334,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             const std::string planKind = physical->value("kind", "");
             if (planKind == "resource_binding") {
                 const std::string resourceKind = physical->value("resource_kind", "");
-                const bool handle = resourceKind == "host_pointer" || resourceKind == "tensor_view_descriptor";
+                const bool handle = resourceKind == "host_pointer";
                 const bool descriptor = resourceKind == "strided_memref_storage_leaves" ||
                                         resourceKind == "descriptor_storage_leaves" ||
                                         resourceKind == "image_reference" || resourceKind == "sampler_descriptor";
@@ -227,27 +395,6 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                                                       leaf["binding"].get<uint32_t>()});
                 }
             }
-            if (value.contains("tensor_view_descriptor")) {
-                const auto &descriptor = value["tensor_view_descriptor"];
-                if (!descriptor.is_object() || !descriptor.contains("rank") ||
-                    !descriptor["rank"].is_number_unsigned() || !descriptor.contains("offset_binding") ||
-                    !descriptor["offset_binding"].is_number_unsigned() || !descriptor.contains("extent_bindings") ||
-                    !descriptor["extent_bindings"].is_array() || !descriptor.contains("stride_bindings") ||
-                    !descriptor["stride_bindings"].is_array()) {
-                    error = "TensorView reflection has an invalid descriptor layout";
-                    return false;
-                }
-                TensorViewDescriptorLayout layout;
-                layout.rank = descriptor["rank"].get<uint32_t>();
-                layout.offsetBinding = descriptor["offset_binding"].get<uint32_t>();
-                layout.extentBindings = descriptor["extent_bindings"].get<std::vector<uint32_t>>();
-                layout.strideBindings = descriptor["stride_bindings"].get<std::vector<uint32_t>>();
-                if (layout.extentBindings.size() != layout.rank || layout.strideBindings.size() != layout.rank) {
-                    error = "TensorView descriptor rank does not match its binding sequence";
-                    return false;
-                }
-                argument.tensorViewDescriptor = std::move(layout);
-            }
             size_t elementSize = 0;
             if (argument.kind == "tensor") {
                 auto layout = value.find("element_layout");
@@ -263,6 +410,12 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 }
             }
             argument.tensorElementSize = elementSize;
+            for (const ReflectedStorageLeaf &leaf : argument.storageLeaves)
+                if (!leaf.elementSize || leaf.byteOffset > elementSize ||
+                    leaf.elementSize > elementSize - leaf.byteOffset) {
+                    error = "Tensor storage-leaf reflection exceeds its canonical element layout";
+                    return false;
+                }
             if (value.contains("source_shape") && value["source_shape"].is_array())
                 for (const nlohmann::json &dimension : value["source_shape"]) {
                     if (!dimension.is_number_integer()) {
@@ -309,6 +462,41 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 return false;
             }
         }
+        if (output.metadataCarrier) {
+            size_t ordinal = 0;
+            while (ordinal < output.metadataCarrier->fields.size()) {
+                const uint32_t argumentIndex = output.metadataCarrier->fields[ordinal].argument;
+                if (argumentIndex >= output.arguments.size() || output.arguments[argumentIndex].kind != "tensor" ||
+                    output.metadataCarrier->fields[ordinal].kind != MetadataFieldKind::Offset ||
+                    output.metadataCarrier->fields[ordinal].dimension) {
+                    error = "entry metadata carrier does not begin each TensorView record with offset";
+                    return false;
+                }
+                const size_t rank = output.arguments[argumentIndex].sourceShape.size();
+                ++ordinal;
+                for (uint32_t dimension = 0; dimension < rank; ++dimension, ++ordinal)
+                    if (ordinal >= output.metadataCarrier->fields.size() ||
+                        output.metadataCarrier->fields[ordinal].argument != argumentIndex ||
+                        output.metadataCarrier->fields[ordinal].kind != MetadataFieldKind::Extent ||
+                        output.metadataCarrier->fields[ordinal].dimension != dimension) {
+                        error = "entry metadata extent fields are not in canonical dimension order";
+                        return false;
+                    }
+                for (uint32_t dimension = 0; dimension < rank; ++dimension, ++ordinal)
+                    if (ordinal >= output.metadataCarrier->fields.size() ||
+                        output.metadataCarrier->fields[ordinal].argument != argumentIndex ||
+                        output.metadataCarrier->fields[ordinal].kind != MetadataFieldKind::Stride ||
+                        output.metadataCarrier->fields[ordinal].dimension != dimension) {
+                        error = "entry metadata stride fields are not in canonical dimension order";
+                        return false;
+                    }
+                if (ordinal < output.metadataCarrier->fields.size() &&
+                    output.metadataCarrier->fields[ordinal].argument <= argumentIndex) {
+                    error = "entry metadata TensorView records are not ordered by argument";
+                    return false;
+                }
+            }
+        }
         const auto footprintArgument = [&](const std::string &owner) {
             return std::find_if(output.arguments.begin(), output.arguments.end(),
                                 [&](const ReflectedArgument &candidate) { return candidate.sourceName == owner; });
@@ -351,8 +539,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                     }
                     footprint.indices.push_back(index.get<uint64_t>());
                 }
-                const size_t rank = argument->tensorViewDescriptor ? argument->tensorViewDescriptor->rank
-                                                                   : argument->sourceShape.size();
+                const size_t rank = argument->sourceShape.size();
                 if ((footprint.wholeView && !footprint.indices.empty()) ||
                     (!footprint.wholeView && footprint.indices.size() != rank)) {
                     error = "TensorView read footprint rank does not match its reflected shape";
@@ -406,8 +593,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                     }
                     footprint.indices.push_back(index.get<uint64_t>());
                 }
-                const size_t rank = argument->tensorViewDescriptor ? argument->tensorViewDescriptor->rank
-                                                                   : argument->sourceShape.size();
+                const size_t rank = argument->sourceShape.size();
                 if ((footprint.wholeView && !footprint.indices.empty()) ||
                     (!footprint.wholeView && footprint.indices.size() != rank)) {
                     error = "TensorView write footprint rank does not match its reflected shape";

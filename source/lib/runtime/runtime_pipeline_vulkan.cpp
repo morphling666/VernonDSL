@@ -78,7 +78,6 @@ BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, con
                 return false;
             }
             state->rhiComputeValues.resize(state->rhiComputeBindingPlan.size());
-            state->rhiComputeDescriptorValues.resize(state->rhiComputeBindingPlan.size());
             std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
             const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -258,22 +257,19 @@ VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const 
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
     for (size_t index = 0; index < state.rhiComputeBindingPlan.size(); ++index) {
         const auto &layout = state.rhiComputeBindingPlan.layouts[index];
-        const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
+        const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
         auto &value = state.rhiComputeValues[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
-        const ComputeBindingSource &source = preparedSource.source;
-        if (source.kind != ComputeBindingSourceKind::Argument) {
-            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
-            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
-                return fail(*pipeline.context, "Vulkan TensorView descriptor exceeds the shader index range");
-            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
-            value.payload.inline_value.data = &state.rhiComputeDescriptorValues[index];
-            value.payload.inline_value.size = sizeof(int32_t);
+        if (preparedSource.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
+                return fail(*pipeline.context, "Vulkan metadata carrier payload does not match its compiled ABI");
             continue;
         }
+        if (preparedSource.argumentIndex >= launch.arguments.size())
+            return fail(*pipeline.context, "Vulkan prepared argument index is invalid");
+        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
                 if (!bindComputeValueStorage(layout, argument, value))
@@ -285,10 +281,10 @@ VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const 
                 return fail(*pipeline.context, "Vulkan prepared storage binding requires an RHI Tensor");
             value.payload.buffer.resource = tensor->resource;
             const uint64_t leafOffset = preparedSource.resourceOffset;
-            if (leafOffset > value.payload.buffer.resource.size)
+            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
+                leafOffset > value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
                 return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor resource");
             value.payload.buffer.resource.offset += leafOffset;
-            value.payload.buffer.resource.size -= leafOffset;
         } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                    layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
             const auto *image = std::get_if<ComputeImageArgument>(&argument);

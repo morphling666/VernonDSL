@@ -242,7 +242,8 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
             return false;
     }
     mlir::FailureOr<std::string> targetReflection =
-        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance,
+                        mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32);
     if (mlir::failed(targetReflection))
         return false;
     reflection = std::move(*targetReflection);

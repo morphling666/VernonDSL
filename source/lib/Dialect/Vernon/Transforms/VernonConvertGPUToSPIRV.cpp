@@ -16,6 +16,7 @@
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -251,6 +252,71 @@ struct StorageTextureIntrinsicToSPIRVPattern final : OpConversionPattern<Intrins
     }
 };
 
+// Aggregate metadata is one explicit Uniform block. The generic SPIR-V ABI
+// lowering can assign storage classes only to scalar function arguments, so
+// materialize the compiler-owned block before that pass sees the function.
+LogicalResult materializeMetadataInterfaceVariables(ModuleOp module) {
+    SmallVector<spirv::FuncOp> functions;
+    module.walk([&](spirv::FuncOp function) { functions.push_back(function); });
+    const StringRef abiName = spirv::getInterfaceVarABIAttrName();
+    for (spirv::FuncOp function : functions) {
+        llvm::BitVector erase(function.getNumArguments());
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            if (!function.getArgAttr(index, kTensorMetadataCarrierAttrName))
+                continue;
+            auto valueType = dyn_cast<spirv::StructType>(function.getArgument(index).getType());
+            auto abi = function.getArgAttrOfType<spirv::InterfaceVarABIAttr>(index, abiName);
+            auto profile = function.getArgAttrOfType<StringAttr>(index, kTensorMetadataProfileAttrName);
+            if (!valueType || !abi || !profile || profile.getValue() != "portable_shader_metadata_i32")
+                return function.emitError()
+                       << "metadata argument #" << index << " has no portable shader aggregate ABI";
+
+            OpBuilder moduleBuilder(function);
+            SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+            valueType.getMemberDecorations(memberDecorations);
+            SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
+            structDecorations.emplace_back(spirv::Decoration::Block, moduleBuilder.getUnitAttr());
+            SmallVector<uint32_t> memberOffsets;
+            SmallVector<Type> memberTypes(valueType.getElementTypes());
+            memberOffsets.reserve(valueType.getNumElements());
+            for (unsigned member = 0; member < valueType.getNumElements(); ++member)
+                memberOffsets.push_back(static_cast<uint32_t>(valueType.getMemberOffset(member)));
+            auto blockType = spirv::StructType::get(memberTypes, memberOffsets, memberDecorations, structDecorations);
+            auto pointerType = spirv::PointerType::get(blockType, spirv::StorageClass::Uniform);
+            const std::string name = (function.getName() + "_metadata").str();
+            auto global = spirv::GlobalVariableOp::create(moduleBuilder, function.getLoc(), pointerType, name,
+                                                          abi.getDescriptorSet(), abi.getBinding());
+
+            OpBuilder bodyBuilder = OpBuilder::atBlockBegin(&function.front());
+            Value address = spirv::AddressOfOp::create(bodyBuilder, function.getLoc(), global);
+            SmallVector<spirv::CompositeExtractOp> reads;
+            for (Operation *user : function.getArgument(index).getUsers()) {
+                auto read = dyn_cast<spirv::CompositeExtractOp>(user);
+                if (!read || read.getComposite() != function.getArgument(index) || read.getIndices().size() != 1)
+                    return function.emitError() << "metadata argument #" << index << " has a non-canonical use";
+                reads.push_back(read);
+            }
+            for (spirv::CompositeExtractOp read : reads) {
+                auto member = dyn_cast<IntegerAttr>(read.getIndices()[0]);
+                if (!member)
+                    return read.emitError("metadata field index is not an integer");
+                OpBuilder readBuilder(read);
+                Value memberIndex = spirv::ConstantOp::create(readBuilder, read.getLoc(), readBuilder.getI32Type(),
+                                                              readBuilder.getI32IntegerAttr(member.getInt()));
+                Value pointer =
+                    spirv::AccessChainOp::create(readBuilder, read.getLoc(), address, ValueRange{memberIndex});
+                Value loaded = spirv::LoadOp::create(readBuilder, read.getLoc(), pointer);
+                read.getResult().replaceAllUsesWith(loaded);
+                read.erase();
+            }
+            erase.set(index);
+        }
+        if (erase.any() && failed(function.eraseArguments(erase)))
+            return function.emitError("cannot remove materialized metadata arguments");
+    }
+    return success();
+}
+
 // MLIR's generic SPIR-V ABI lowering materializes SampledImage arguments but
 // intentionally does not support unsampled Image arguments. Materialize those
 // opaque UniformConstant resources here so the generic pass only receives ABI
@@ -353,7 +419,8 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
                 return;
             }
         }
-        if (failed(materializeStorageImageInterfaceVariables(getOperation())))
+        if (failed(materializeMetadataInterfaceVariables(getOperation())) ||
+            failed(materializeStorageImageInterfaceVariables(getOperation())))
             signalPassFailure();
     }
 };

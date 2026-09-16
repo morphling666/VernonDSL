@@ -1,4 +1,5 @@
 #include "stage_binding_plan.h"
+#include "content_hash.h"
 #include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
@@ -144,8 +145,10 @@ bool parseTransportNode(const nlohmann::json &value, TransportNode &node, std::s
             node.representation == "bool"                                                                  ? 1
             : node.representation == "f16"                                                                 ? 2
             : node.representation == "i32" || node.representation == "u32" || node.representation == "f32" ? 4
-            : node.representation == "f64" || node.representation == "index"                               ? 8
-                                                                                                           : 0;
+            : node.representation == "i64" || node.representation == "u64" || node.representation == "f64" ||
+                    node.representation == "index"
+                ? 8
+                : 0;
         if (!representationSize || node.size != representationSize || node.alignment > representationSize) {
             error = "interface plan scalar representation does not match its size and alignment";
             return false;
@@ -185,7 +188,8 @@ bool parseTransportNode(const nlohmann::json &value, TransportNode &node, std::s
 bool parseInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error) {
     if (!value.is_object() || !hasOnlyKeys(value, kInterfacePlanKeys) || !value.contains("kind") ||
         !value["kind"].is_string() || !value.contains("profile") || !value["profile"].is_string() ||
-        !value.contains("canonical_layout_hash") || !value["canonical_layout_hash"].is_string()) {
+        !value.contains("canonical_layout_hash") || !value["canonical_layout_hash"].is_string() ||
+        !isSha256Hex(value["canonical_layout_hash"].get_ref<const std::string &>())) {
         error = "interface_plan is missing typed plan metadata";
         return false;
     }
@@ -528,6 +532,53 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
             error = "sampler references an unknown sampled image binding";
             return false;
         }
+    if (plan.metadataCarrier) {
+        const MetadataCarrier &carrier = *plan.metadataCarrier;
+        if (carrier.fields.empty() || carrier.fields.size() != carrier.members.size() || !carrier.size ||
+            !carrier.alignment || (carrier.alignment & (carrier.alignment - 1)) || carrier.size % carrier.alignment ||
+            !carrier.interfacePlan.root || carrier.interfacePlan.root->kind != TransportNodeKind::Product ||
+            carrier.interfacePlan.root->size != carrier.size ||
+            carrier.interfacePlan.root->alignment != carrier.alignment) {
+            error = "Stage metadata carrier physical plan is invalid";
+            return false;
+        }
+        std::vector<uint8_t> seen(carrier.fields.size());
+        for (const PhysicalMetadataMember &member : carrier.members) {
+            if (member.semanticOrdinal >= carrier.fields.size() || seen[member.semanticOrdinal]++ || !member.byteSize ||
+                !member.alignment || member.byteOffset % member.alignment || member.byteOffset > carrier.encodedSize ||
+                member.byteSize > carrier.encodedSize - member.byteOffset) {
+                error = "Stage metadata carrier member mapping is not bijective";
+                return false;
+            }
+        }
+        if (carrier.profile == "portable_shader_metadata_i32") {
+            BindingKey key{"compute", carrier.descriptorSet, carrier.binding};
+            if (carrier.carrier != "constant_region" || carrier.representation != "i32" ||
+                carrier.descriptorSet == UINT32_MAX || carrier.binding == UINT32_MAX ||
+                carrier.parameterOrdinal != UINT32_MAX || descriptorOwners.count(key)) {
+                error = "Stage shader metadata carrier has an invalid or colliding native binding";
+                return false;
+            }
+        } else if (carrier.profile == "cuda_kernel_metadata_i64") {
+            if (carrier.carrier != "kernel_parameter" || carrier.representation != "i64" ||
+                carrier.parameterOrdinal == UINT32_MAX || carrier.descriptorSet != UINT32_MAX ||
+                carrier.binding != UINT32_MAX || carrier.interfacePlan.kind != InterfacePlanKind::KernelParameter) {
+                error = "Stage CUDA metadata carrier has an invalid aggregate parameter ABI";
+                return false;
+            }
+        } else if (carrier.profile == "host_metadata") {
+            if (carrier.carrier != "cpu_call_frame" ||
+                (carrier.representation != "i32" && carrier.representation != "i64") ||
+                carrier.descriptorSet != UINT32_MAX || carrier.binding != UINT32_MAX ||
+                carrier.parameterOrdinal != UINT32_MAX || carrier.interfacePlan.kind != InterfacePlanKind::CpuCall) {
+                error = "Stage host metadata carrier has an invalid call-frame ABI";
+                return false;
+            }
+        } else {
+            error = "Stage metadata carrier profile is unsupported";
+            return false;
+        }
+    }
     const bool computeTopology = !plan.compute.empty() && plan.artifactKeys.size() == 1;
     const bool graphicsTopology =
         plan.compute.empty() && !plan.vertex.empty() && !plan.fragment.empty() && plan.artifactKeys.size() == 2;

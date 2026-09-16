@@ -358,6 +358,12 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
+        const PreparedBindingSource &source = plan.sources[index];
+        if (source.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, source, launch, value))
+                return fail(*pipeline.context, "CPU metadata carrier payload does not match its compiled ABI");
+            continue;
+        }
         if (!prepared.builtin.empty()) {
             const std::string &builtin = prepared.builtin;
             if (builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN) {
@@ -377,25 +383,22 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
                 return fail(*pipeline.context, "CPU tape builtin size does not match its packed ABI");
             continue;
         }
-        if (layout.argument_index >= launch.arguments.size())
+        if (source.argumentIndex >= launch.arguments.size())
             return fail(*pipeline.context, "CPU prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
+        const ComputeLaunchArgument &argument = launch.arguments[source.argumentIndex];
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->hostData || !tensor->hostSize)
+            if (!tensor || !tensor->hostData || source.resourceOffset > tensor->hostSize)
                 return fail(*pipeline.context, "CPU storage binding requires a host Tensor");
             value.payload.buffer.resource.identity = cpuProviderResourceIdentity(*pipeline.context);
-            value.payload.buffer.resource.resource.value = reinterpret_cast<uintptr_t>(tensor->hostData);
-            value.payload.buffer.resource.size = tensor->hostSize;
+            value.payload.buffer.resource.resource.value =
+                reinterpret_cast<uintptr_t>(static_cast<const uint8_t *>(tensor->hostData) + source.resourceOffset);
+            value.payload.buffer.resource.size = tensor->hostSize - source.resourceOffset;
         } else {
             const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
             if (scalar && scalar->data && scalar->size) {
                 value.payload.inline_value.data = scalar->data;
                 value.payload.inline_value.size = scalar->size;
-            } else if (tensor && tensor->tensorViewData && tensor->tensorViewSize == layout.element_size) {
-                value.payload.inline_value.data = tensor->tensorViewData;
-                value.payload.inline_value.size = tensor->tensorViewSize;
             } else {
                 std::string parameterName;
                 for (const Parameter &parameter : pipeline.bindingProjection.parameters)
@@ -406,10 +409,8 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
                         break;
                     }
                 return fail(*pipeline.context, "CPU inline binding '" + parameterName + "' at " +
-                                                   std::to_string(layout.argument_index) + " requires host data of " +
-                                                   std::to_string(layout.element_size) +
-                                                   " bytes (TensorView descriptor has " +
-                                                   std::to_string(tensor ? tensor->tensorViewSize : 0) + ")");
+                                                   std::to_string(source.argumentIndex) + " requires host data of " +
+                                                   std::to_string(layout.element_size) + " bytes");
             }
         }
     }

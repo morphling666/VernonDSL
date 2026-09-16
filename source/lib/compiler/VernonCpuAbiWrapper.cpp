@@ -236,8 +236,6 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         loweredArgumentCount += argument.kind == CpuAbiArgumentKind::TensorView
                                     ? 5 * argument.tensorLeafElementSizes.size()
                                     : argument.callLanes.size();
-        if (argument.kind == CpuAbiArgumentKind::TensorView)
-            loweredArgumentCount += 1 + 2 * argument.tensorRank;
     }
     if (function->arg_size() != loweredArgumentCount + (metadata.requiresPhases ? 1 : 0))
         return invalidAbi("lowered CPU entry '" + metadata.internalFunctionSymbol +
@@ -326,9 +324,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             continue;
         }
 
-        const uint64_t descriptorSize = pointerBytes * (2 + 2 * static_cast<uint64_t>(packing.tensorRank));
-        if (packing.size != descriptorSize)
-            return invalidAbi("CPU TensorView descriptor has an incompatible size");
+        if (packing.size != pointerBytes)
+            return invalidAbi("CPU TensorView storage handle has an incompatible size");
         llvm::LoadInst *rawPointerBits = builder.CreateLoad(sizeType, address, "buffer_address");
         rawPointerBits->setAlignment(llvm::Align(1));
         llvm::Value *rawPointer = builder.CreateIntToPtr(rawPointerBits, pointerType, "buffer");
@@ -347,35 +344,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             if (!offset || !extent || !stride)
                 return invalidAbi("lowered CPU buffer descriptor index types are "
                                   "incompatible");
-            for (uint32_t dimension = 0; dimension < packing.tensorRank; ++dimension) {
-                llvm::Value *extentAddress =
-                    builder.CreateGEP(builder.getInt8Ty(), address,
-                                      builder.getInt64(pointerBytes * (2 + static_cast<uint64_t>(dimension))));
-                llvm::LoadInst *runtimeExtent = builder.CreateLoad(sizeType, extentAddress);
-                runtimeExtent->setAlignment(llvm::Align(1));
-                extent = builder.CreateMul(extent, runtimeExtent);
-            }
             argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
-        }
-    }
-    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
-        if (packing.kind != CpuAbiArgumentKind::TensorView)
-            continue;
-        llvm::Value *descriptor =
-            builder.CreateGEP(llvm::Type::getInt8Ty(context), arguments,
-                              llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), packing.offset));
-        const uint32_t fieldCount = 1 + 2 * packing.tensorRank;
-        for (uint32_t field = 0; field < fieldCount; ++field) {
-            llvm::Type *fieldType = function->getArg(loweredIndex++)->getType();
-            if (!llvm::isa<llvm::IntegerType>(fieldType))
-                return invalidAbi("CPU TensorView descriptor field type is not an integer");
-            llvm::Value *fieldAddress =
-                builder.CreateGEP(llvm::Type::getInt8Ty(context), descriptor,
-                                  llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                                         pointerBytes * (1 + static_cast<uint64_t>(field))));
-            llvm::LoadInst *fieldValue = builder.CreateLoad(fieldType, fieldAddress);
-            fieldValue->setAlignment(llvm::Align(1));
-            argumentsToCall.push_back(fieldValue);
         }
     }
     argumentsToCall.push_back(textures);

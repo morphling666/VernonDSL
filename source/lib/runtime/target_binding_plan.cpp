@@ -315,6 +315,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     };
     bool hasSlots = false;
     const bool compute = executionKind(node) == ExecutionKind::Compute;
+    plan.metadataCarrier = compute ? stage.stage.metadataCarrier : std::nullopt;
     const std::string entry = stage.stage.modules.empty() ? std::string() : stage.stage.modules.front().entryPoint;
     if (entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos)
         plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
@@ -595,8 +596,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             for (const EndpointAbiBinding &binding : endpoint.abiBindings)
                 if (binding.semantic == "storage_leaf")
                     storageBindings.push_back(&binding);
-            const EndpointAbiBinding *offset = semantic(endpoint, "byte_offset");
-            if (storageBindings.size() != compiled->elementLayout->leaves.size() || !offset ||
+            if (storageBindings.size() != compiled->elementLayout->leaves.size() ||
                 compiled->elementLayout->leaves.empty())
                 return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                               "opaque tape carrier has an incomplete storage ABI");
@@ -621,20 +621,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                                 static_cast<size_t>(layoutLeaf.byteOffset),
                                                 storageBindings[leaf]->slot});
             }
-            TensorViewDescriptorUse descriptor;
-            descriptor.rank = endpoint.viewRank;
-            descriptor.offsetBinding = offset->slot;
-            for (uint32_t axis = 0; axis < endpoint.viewRank; ++axis) {
-                const EndpointAbiBinding *extent = semantic(endpoint, "extent", axis);
-                const EndpointAbiBinding *stride = semantic(endpoint, "byte_stride", axis);
-                if (!extent || !stride)
-                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                  "opaque tape carrier lacks an extent or stride ABI");
-                descriptor.extentBindings.push_back(extent->slot);
-                descriptor.strideBindings.push_back(stride->slot);
-            }
-            hasSlots = true;
-            target.tensorViewDescriptor = std::move(descriptor);
             plan.bindings.push_back(std::move(target));
             continue;
         }
@@ -705,16 +691,11 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 target.transport = TargetPhysicalTransport{std::move(physical), target.native};
                 target.endpoint.portableSlot = slot->slot;
                 if (endpoint.tag == "resource") {
-                    const EndpointAbiBinding *offset = semantic(endpoint, "byte_offset");
-                    if (!offset || endpoint.viewRank != 0 || target.carrier != TargetCarrier::StorageBuffer)
+                    if (endpoint.viewRank != 0 || target.carrier != TargetCarrier::StorageBuffer)
                         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                       "physical resource projection has an incompatible TensorView descriptor");
                     target.storageLeaves.push_back(
                         {static_cast<size_t>(value.layout->byteSize), size_t{0}, slot->slot});
-                    TensorViewDescriptorUse descriptor;
-                    descriptor.rank = 0;
-                    descriptor.offsetBinding = offset->slot;
-                    target.tensorViewDescriptor = std::move(descriptor);
                 }
                 hasSlots = true;
             } else {
@@ -770,14 +751,12 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     }
                     elementLayout.leaves = std::move(projectedLeaves);
                 }
-                const EndpointAbiBinding *offset = semantic(endpoint, "byte_offset");
-                if ((endpoint.viewDescriptor && !offset) ||
-                    (vertexBuffer ? storageBindings.size() != 1
+                if ((vertexBuffer ? storageBindings.size() != 1
                                   : storageBindings.size() != elementLayout.leaves.size()) ||
                     elementLayout.leaves.empty())
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "TensorView endpoint lacks required storage-leaf or offset carriers");
-                target.source = endpoint.viewDescriptor ? SourceRepresentation::TensorViewDescriptor
+                target.source = endpoint.viewDescriptor ? SourceRepresentation::ResourceHandle
                                                         : SourceRepresentation::ElementStream;
                 target.carrier = endpoint.role == "vertex" ? TargetCarrier::VertexBuffer : TargetCarrier::StorageBuffer;
                 target.reflectedKind = "tensor";
@@ -818,25 +797,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     };
                 }
                 if (endpoint.viewDescriptor) {
-                    TensorViewDescriptorUse descriptor;
-                    descriptor.rank = endpoint.viewRank;
-                    descriptor.offsetBinding = offset->slot;
-                    for (uint32_t axis = 0; axis < endpoint.viewRank; ++axis) {
-                        const EndpointAbiBinding *extent = semantic(endpoint, "extent", axis);
-                        const EndpointAbiBinding *stride = semantic(endpoint, "byte_stride", axis);
-                        if (!extent || !stride)
-                            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                          "TensorView endpoint lacks an extent or stride carrier");
-                        descriptor.extentBindings.push_back(extent->slot);
-                        descriptor.strideBindings.push_back(stride->slot);
-                    }
-                    hasSlots = true;
-                    target.tensorViewDescriptor = std::move(descriptor);
                     if (backend == VERNON_RUNTIME_CPU) {
-                        const uint64_t descriptorSize =
-                            static_cast<uint64_t>(2 + 2 * endpoint.viewRank) * sizeof(uintptr_t);
-                        if (!assignCpuPhysical(cpuFrameOffset(target), compiled, alignof(uintptr_t), descriptorSize,
-                                               target.physical, nullptr, diagnostic, "TensorView descriptor"))
+                        if (!assignCpuPhysical(cpuFrameOffset(target), compiled, alignof(uintptr_t), sizeof(uintptr_t),
+                                               target.physical, nullptr, diagnostic, "TensorView storage pointer"))
                             return false;
                     }
                 } else if (backend == VERNON_RUNTIME_CPU) {
@@ -912,6 +875,25 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
 
     for (const GraphicsFragmentOutput &output : stage.stage.fragmentOutputs)
         plan.outputs.push_back({output.location, output.type});
+    if (backend == VERNON_RUNTIME_CPU && plan.metadataCarrier) {
+        const MetadataCarrier &carrier = *plan.metadataCarrier;
+        if (carrier.interfacePlan.kind != InterfacePlanKind::CpuCall ||
+            carrier.interfacePlan.frameOffset % carrier.alignment ||
+            carrier.interfacePlan.frameOffset > std::numeric_limits<uint64_t>::max() - carrier.size)
+            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carrier/interface_plan",
+                          "host metadata carrier has an invalid call-frame range");
+        const uint64_t carrierEnd = carrier.interfacePlan.frameOffset + carrier.size;
+        for (const TargetBinding &binding : plan.bindings) {
+            if (binding.endpoint.interfaceKind == "result" || !binding.physical.size)
+                continue;
+            const uint64_t bindingBegin = binding.physical.offset;
+            const uint64_t bindingEnd = bindingBegin + binding.physical.size;
+            if (carrier.interfacePlan.frameOffset < bindingEnd && bindingBegin < carrierEnd)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carrier/interface_plan",
+                              "host metadata carrier overlaps a physical argument");
+        }
+        cpuArgumentFrameOffset = std::max(cpuArgumentFrameOffset, carrierEnd);
+    }
     if (backend == VERNON_RUNTIME_CPU)
         plan.packedArgumentsSize = cpuArgumentFrameOffset;
     if (backend == VERNON_RUNTIME_CPU)
@@ -940,6 +922,26 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
     diagnostic = {};
     stagePlan = {};
     reflection = {};
+    if (plan.metadataCarrier) {
+        MetadataCarrier carrier = *plan.metadataCarrier;
+        for (MetadataFieldIdentity &field : carrier.fields) {
+            std::optional<uint32_t> runtimeIndex;
+            for (size_t index = 0; index < plan.bindings.size(); ++index)
+                if (plan.bindings[index].endpoint.module == "compute" &&
+                    plan.bindings[index].endpoint.index == field.argument) {
+                    if (runtimeIndex)
+                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carrier/fields",
+                                      "metadata field argument identity is ambiguous");
+                    runtimeIndex = static_cast<uint32_t>(index);
+                }
+            if (!runtimeIndex)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carrier/fields",
+                              "metadata field references an unknown compute argument");
+            field.argument = *runtimeIndex;
+        }
+        stagePlan.metadataCarrier = carrier;
+        reflection.metadataCarrier = std::move(carrier);
+    }
     std::copy(std::begin(plan.workgroupSize), std::end(plan.workgroupSize), reflection.workgroup);
     reflection.dispatchContract = plan.dispatch;
     if (plan.backend == VERNON_RUNTIME_CPU)
@@ -987,14 +989,6 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
             argument.tensorElements = elements;
             argument.tensorBytes = elements * argument.tensorElementSize;
         }
-        if (binding.tensorViewDescriptor) {
-            TensorViewDescriptorLayout descriptor;
-            descriptor.rank = binding.tensorViewDescriptor->rank;
-            descriptor.offsetBinding = binding.tensorViewDescriptor->offsetBinding;
-            descriptor.extentBindings = binding.tensorViewDescriptor->extentBindings;
-            descriptor.strideBindings = binding.tensorViewDescriptor->strideBindings;
-            argument.tensorViewDescriptor = std::move(descriptor);
-        }
         reflection.arguments.push_back(std::move(argument));
         if (binding.source == SourceRepresentation::SystemValue)
             continue;
@@ -1023,16 +1017,16 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         ParameterUse use;
         use.stage = "compute";
         use.index = runtimeArgumentIndex;
-        use.interfaceKind = binding.endpoint.interfaceKind == "result"             ? "result"
-                            : binding.kind == "image" || binding.kind == "sampler" ? "resource"
-                            : plan.backend != VERNON_RUNTIME_CPU && binding.carrier == TargetCarrier::StorageBuffer &&
-                                    (binding.source == SourceRepresentation::ElementStream ||
-                                     !binding.storageLeaves.empty() || binding.tensorViewDescriptor)
-                                ? "storage"
-                            : binding.source == SourceRepresentation::WholeValueBytes ||
-                                    (binding.source == SourceRepresentation::ElementStream && binding.transport)
-                                ? "value"
-                                : "storage";
+        use.interfaceKind =
+            binding.endpoint.interfaceKind == "result"             ? "result"
+            : binding.kind == "image" || binding.kind == "sampler" ? "resource"
+            : plan.backend != VERNON_RUNTIME_CPU && binding.carrier == TargetCarrier::StorageBuffer &&
+                    (binding.source == SourceRepresentation::ElementStream || !binding.storageLeaves.empty())
+                ? "storage"
+            : binding.source == SourceRepresentation::WholeValueBytes ||
+                    (binding.source == SourceRepresentation::ElementStream && binding.transport)
+                ? "value"
+                : "storage";
         use.dtype = binding.elementLayout.logicalType.empty() && !binding.elementLayout.leaves.empty()
                         ? binding.elementLayout.leaves.front().dtype
                         : binding.elementLayout.logicalType;
@@ -1049,7 +1043,6 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                               : std::optional<vernon::runtime::ValueLayout>(binding.elementLayout);
         use.interfacePlan = binding.transport ? std::optional<InterfacePlan>(binding.transport->targetAbi)
                                               : std::optional<InterfacePlan>{};
-        use.tensorViewDescriptor = binding.tensorViewDescriptor;
         use.descriptorSet = 0;
         use.binding = binding.endpoint.portableSlot;
         parameter.uses.push_back(std::move(use));
@@ -1064,7 +1057,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
     };
     for (const TargetBinding &binding : plan.bindings) {
         const bool storageTensor =
-            binding.kind == "tensor" && (binding.source == SourceRepresentation::TensorViewDescriptor ||
+            binding.kind == "tensor" && (binding.source == SourceRepresentation::ResourceHandle ||
                                          (binding.source == SourceRepresentation::ElementStream && !binding.transport));
         if (!storageTensor && binding.writeFootprintKind.empty())
             continue;

@@ -120,7 +120,7 @@ def _interface_plan(
     return {
         "kind": kind,
         "profile": profile,
-        "canonical_layout_hash": "test-layout-hash",
+        "canonical_layout_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         "root": root,
     }
 
@@ -598,14 +598,9 @@ class PipelineCompileTests(unittest.TestCase):
                             "type": '!vernon.tensor_view<f32, [-1, -1], "write", "device">',
                             "element_layout": _scalar_layout("f32"),
                             "source_shape": [-1, -1],
-                            "tensor_view_descriptor": {
-                                "rank": 2,
-                                "offset_binding": 1,
-                                "extent_bindings": [2, 3],
-                                "stride_bindings": [4, 5],
-                            },
                             "access": "write",
                             "vernon.source_name": "output",
+                            "tensor_view_descriptor": {"legacy": True},
                             "vernon.interface": "resource",
                             "vernon.set": 0,
                             "vernon.binding": 0,
@@ -618,11 +613,8 @@ class PipelineCompileTests(unittest.TestCase):
         use = external_parameters(records)["output"][0]
         self.assertEqual(use["interface"], "storage")
         self.assertEqual(use["shape"], [0, 0])
-        self.assertEqual(
-            use["tensor_view_descriptor"],
-            {"rank": 2, "offset_binding": 1, "extent_bindings": [2, 3], "stride_bindings": [4, 5]},
-        )
         self.assertNotIn("interface_plan", use)
+        self.assertNotIn("tensor_view_descriptor", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
         with self.assertRaisesRegex(ProgramCompileError, "missing reflected set/binding"):

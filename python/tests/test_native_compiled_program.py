@@ -416,11 +416,18 @@ class CompiledProgramTests(unittest.TestCase):
         entry = json.loads(program.reflection)["entries"][0]
         argument = entry["arguments"][0]
         self.assertEqual(argument["source_shape"], [-1])
+        self.assertNotIn("tensor_view_descriptor", argument)
         self.assertEqual(
-            argument["tensor_view_descriptor"],
-            {"rank": 1, "offset_binding": 1, "extent_bindings": [2], "stride_bindings": [3]},
+            entry["metadata_carrier"]["fields"],
+            [
+                {"ordinal": 0, "argument": 0, "kind": "offset", "units": "logical_elements"},
+                {"ordinal": 1, "argument": 0, "kind": "extent", "dimension": 0, "units": "logical_elements"},
+                {"ordinal": 2, "argument": 0, "kind": "stride", "dimension": 0, "units": "logical_elements"},
+            ],
         )
-        self.assertEqual(argument["physical_layouts"]["host_value"]["resource_kind"], "tensor_view_descriptor")
+        self.assertEqual(argument["physical_layouts"]["host_value"]["resource_kind"], "host_pointer")
+        self.assertEqual(entry["metadata_carrier"]["profile"], "host_metadata")
+        self.assertEqual(entry["metadata_carrier"]["carrier"], "cpu_call_frame")
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
         program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)

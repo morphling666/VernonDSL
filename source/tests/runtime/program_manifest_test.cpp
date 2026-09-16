@@ -803,8 +803,45 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                         {"workgroups", nlohmann::json::array({{{"control", {{"value", 2}}}}, 1, 1})}}}}})}}})}};
     setProgramAbi(manifest, {{"x", 0, "input", "input"}, {"y", 1, "output", "output"}});
 
+    nlohmann::json metadataFields = nlohmann::json::array({{{"argument", 0}, {"kind", "offset"}},
+                                                           {{"argument", 0}, {"kind", "extent"}, {"dimension", 0}},
+                                                           {{"argument", 0}, {"kind", "stride"}, {"dimension", 0}},
+                                                           {{"argument", 1}, {"kind", "offset"}},
+                                                           {{"argument", 1}, {"kind", "extent"}, {"dimension", 0}},
+                                                           {{"argument", 1}, {"kind", "stride"}, {"dimension", 0}}});
+    nlohmann::json metadataMembers = nlohmann::json::array();
+    nlohmann::json metadataChildren = nlohmann::json::array();
+    for (uint32_t ordinal = 0; ordinal < metadataFields.size(); ++ordinal) {
+        metadataFields[ordinal]["ordinal"] = ordinal;
+        metadataFields[ordinal]["units"] = "logical_elements";
+        metadataMembers.push_back({{"semantic_ordinal", ordinal},
+                                   {"byte_offset", ordinal * uint32_t{8}},
+                                   {"byte_size", 8},
+                                   {"alignment", 8}});
+        metadataChildren.push_back({{"kind", "scalar"},
+                                    {"representation", "i64"},
+                                    {"offset", ordinal * uint32_t{8}},
+                                    {"size", 8},
+                                    {"alignment", 8}});
+    }
+    const nlohmann::json hostMetadataCarrier{
+        {"profile", "host_metadata"},
+        {"representation", "i64"},
+        {"carrier", "cpu_call_frame"},
+        {"encoded_size", 48},
+        {"size", 48},
+        {"alignment", 8},
+        {"members", metadataMembers},
+        {"interface_plan",
+         {{"kind", "cpu_call"},
+          {"profile", "host_metadata"},
+          {"canonical_layout_hash", "0000000000000000000000000000000000000000000000000000000000000000"},
+          {"frame_offset", 16},
+          {"root",
+           {{"kind", "product"}, {"offset", 0}, {"size", 48}, {"alignment", 8}, {"children", metadataChildren}}}}}};
     nlohmann::json reflection{
         {"required_features", nlohmann::json::array()},
+        {"metadata_carrier", {{"fields", metadataFields}}},
         {"endpoints",
          nlohmann::json::array(
              {{{"tag", "resource"},
@@ -822,22 +859,8 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                {"transport", "resource_handle"},
                {"access", "read"},
                {"abi",
-                {{"bindings",
-                  nlohmann::json::array(
-                      {{{"semantic", "resource"}, {"carrier", {{"tag", "resource_slot"}, {"slot", 0}}}},
-                       {{"semantic", "byte_offset"},
-                        {"carrier",
-                         {{"tag", "value_slot"}, {"slot", 1}, {"byte_offset", 0}, {"byte_size", 8}, {"alignment", 8}}}},
-                       {{"semantic", {{"extent", 0}}},
-                        {"carrier",
-                         {{"tag", "value_slot"}, {"slot", 3}, {"byte_offset", 0}, {"byte_size", 8}, {"alignment", 8}}}},
-                       {{"semantic", {{"byte_stride", 0}}},
-                        {"carrier",
-                         {{"tag", "value_slot"},
-                          {"slot", 4},
-                          {"byte_offset", 0},
-                          {"byte_size", 8},
-                          {"alignment", 8}}}}})}}}},
+                {{"bindings", nlohmann::json::array({{{"semantic", "resource"},
+                                                      {"carrier", {{"tag", "resource_slot"}, {"slot", 0}}}}})}}}},
               {{"tag", "resource"},
                {"module", "compute"},
                {"interface", "argument"},
@@ -853,22 +876,8 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                {"transport", "resource_handle"},
                {"access", "write"},
                {"abi",
-                {{"bindings",
-                  nlohmann::json::array(
-                      {{{"semantic", "resource"}, {"carrier", {{"tag", "resource_slot"}, {"slot", 2}}}},
-                       {{"semantic", "byte_offset"},
-                        {"carrier",
-                         {{"tag", "value_slot"}, {"slot", 5}, {"byte_offset", 0}, {"byte_size", 8}, {"alignment", 8}}}},
-                       {{"semantic", {{"extent", 0}}},
-                        {"carrier",
-                         {{"tag", "value_slot"}, {"slot", 6}, {"byte_offset", 0}, {"byte_size", 8}, {"alignment", 8}}}},
-                       {{"semantic", {{"byte_stride", 0}}},
-                        {"carrier",
-                         {{"tag", "value_slot"},
-                          {"slot", 7},
-                          {"byte_offset", 0},
-                          {"byte_size", 8},
-                          {"alignment", 8}}}}})}}}}})},
+                {{"bindings", nlohmann::json::array({{{"semantic", "resource"},
+                                                      {"carrier", {{"tag", "resource_slot"}, {"slot", 1}}}}})}}}}})},
         {"compute",
          {{"workgroup_size", nlohmann::json::array({64, 1, 1})},
           {"subgroup", nullptr},
@@ -906,7 +915,12 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                                                                           {"offset", 0},
                                                                           {"byte_length", 4},
                                                                           {"sha256", codeHash}}})},
-                                      {"reflection", reflection}}}}}};
+                                      {"reflection", reflection},
+                                      {"implementation",
+                                       {{"target", "cpu"},
+                                        {"metadata", nlohmann::json::object()},
+                                        {"endpoints", nlohmann::json::array()},
+                                        {"metadata_carrier", hostMetadataCarrier}}}}}}}};
 
     vernon::runtime::program::Program program;
     vernon::runtime::program::ArtifactSystem artifacts;
@@ -1019,6 +1033,28 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     };
     expectBoundaryMismatch(std::move(byValueInPlace), "/publication");
 
+    nlohmann::json hostWithParameterOrdinal = artifactSystem;
+    hostWithParameterOrdinal["artifacts"]["scale"]["implementation"]["metadata_carrier"]["parameter_ordinal"] = 2;
+    EXPECT_TRUE(
+        vernon::runtime::program::parseArtifactSystem(target, blobs, hostWithParameterOrdinal, diagnostic).isErr());
+    EXPECT_NE(diagnostic.message.find("host metadata carrier"), std::string::npos) << diagnostic.message;
+    for (const nlohmann::json &invalidField :
+         {nlohmann::json(7),
+          nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", 7}, {"units", "logical_elements"}},
+          nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", "offset"}, {"units", 7}}}) {
+        nlohmann::json invalidMetadataField = artifactSystem;
+        invalidMetadataField["artifacts"]["scale"]["reflection"]["metadata_carrier"]["fields"][0] = invalidField;
+        EXPECT_TRUE(
+            vernon::runtime::program::parseArtifactSystem(target, blobs, invalidMetadataField, diagnostic).isErr());
+    }
+    nlohmann::json gappedMetadata = artifactSystem;
+    auto &gappedCarrier = gappedMetadata["artifacts"]["scale"]["implementation"]["metadata_carrier"];
+    gappedCarrier["encoded_size"] = 56;
+    gappedCarrier["size"] = 56;
+    gappedCarrier["members"][5]["byte_offset"] = 48;
+    gappedCarrier["interface_plan"]["root"]["size"] = 56;
+    gappedCarrier["interface_plan"]["root"]["children"][5]["offset"] = 48;
+    EXPECT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, gappedMetadata, diagnostic).isErr());
     auto parsedArtifacts = vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, diagnostic);
     ASSERT_TRUE(parsedArtifacts.isOk()) << diagnostic.message;
     artifacts = std::move(parsedArtifacts).value();

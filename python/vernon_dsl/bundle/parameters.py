@@ -124,8 +124,6 @@ def reflected_parameters(
                 "sample_result_class": row.get("sample_result_class"),
                 "exact_storage_format": row.get("exact_storage_format"),
             }
-            if "tensor_view_descriptor" in row:
-                use["tensor_view_descriptor"] = row["tensor_view_descriptor"]
             physical_layouts = row.get("physical_layouts")
             compute_plan = None
             if isinstance(physical_layouts, Mapping):

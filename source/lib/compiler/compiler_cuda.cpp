@@ -65,7 +65,8 @@ bool compileCuda(PreparedModule &prepared, const TargetProfile &profile, std::ve
             return false;
     }
     mlir::FailureOr<std::string> targetReflection =
-        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance,
+                        mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata);
     if (mlir::failed(targetReflection))
         return false;
     reflection = std::move(*targetReflection);

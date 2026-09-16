@@ -16,8 +16,10 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <functional>
+#include <limits>
 
 namespace mlir::vernon {
 namespace {
@@ -602,11 +604,48 @@ struct GpuAggregateTensorGetPattern final : OpConversionPattern<TensorGetOp> {
     bool useSpirv;
 };
 
+struct GpuFuncSignatureConversionPattern final : OpConversionPattern<gpu::GPUFuncOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(gpu::GPUFuncOp function, OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        FunctionType functionType = function.getFunctionType();
+        Block &entry = function.getBody().front();
+        const unsigned functionArgumentCount = functionType.getNumInputs();
+        if (entry.getNumArguments() < functionArgumentCount)
+            return rewriter.notifyMatchFailure(function, "entry block has fewer arguments than its function type");
+
+        TypeConverter::SignatureConversion signature(entry.getNumArguments());
+        SmallVector<Type> convertedFunctionArguments;
+        for (unsigned index = 0; index < entry.getNumArguments(); ++index) {
+            SmallVector<Type> converted;
+            if (failed(getTypeConverter()->convertType(entry.getArgument(index), converted)))
+                return failure();
+            signature.addInputs(index, converted);
+            if (index < functionArgumentCount)
+                convertedFunctionArguments.append(converted);
+        }
+
+        SmallVector<Type> convertedResults;
+        if (failed(getTypeConverter()->convertTypes(functionType.getResults(), convertedResults)))
+            return failure();
+        rewriter.applySignatureConversion(&entry, signature, getTypeConverter());
+
+        rewriter.modifyOpInPlace(function, [&] {
+            function.setType(FunctionType::get(function.getContext(), convertedFunctionArguments, convertedResults));
+        });
+        return success();
+    }
+};
+
 struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, OperationPass<gpu::GPUModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonLowerGPUTensorsPass)
 
     VernonLowerGPUTensorsPass() = default;
-    explicit VernonLowerGPUTensorsPass(bool useSpirvTupleAbi) : useSpirvTupleAbi(useSpirvTupleAbi) {}
+    explicit VernonLowerGPUTensorsPass(bool useSpirvTupleAbi) : VernonLowerGPUTensorsPass() {
+        this->useSpirvTupleAbi = useSpirvTupleAbi;
+    }
+    VernonLowerGPUTensorsPass(const VernonLowerGPUTensorsPass &other) : PassWrapper(other) {}
 
     StringRef getArgument() const final { return "vernon-lower-gpu-tensors"; }
     StringRef getDescription() const final { return "Lower Vernon value tensors to GPU register vectors"; }
@@ -706,8 +745,27 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
             SmallVector<Type> elements;
             if (failed(converter.convertTypes(tuple.getTypes(), elements)))
                 return std::nullopt;
-            if (useSpirvTupleAbi)
-                return spirv::StructType::get(elements);
+            if (useSpirvTupleAbi) {
+                SmallVector<uint32_t> offsets;
+                uint64_t offset = 0;
+                bool scalarLayout = true;
+                for (Type element : elements) {
+                    if (!element.isIntOrFloat() || element.getIntOrFloatBitWidth() == 0 ||
+                        element.getIntOrFloatBitWidth() % 8 != 0) {
+                        scalarLayout = false;
+                        break;
+                    }
+                    const uint64_t size = element.getIntOrFloatBitWidth() / 8;
+                    offset = llvm::alignTo(offset, size);
+                    if (offset > std::numeric_limits<uint32_t>::max()) {
+                        scalarLayout = false;
+                        break;
+                    }
+                    offsets.push_back(static_cast<uint32_t>(offset));
+                    offset += size;
+                }
+                return scalarLayout ? spirv::StructType::get(elements, offsets) : spirv::StructType::get(elements);
+            }
             return LLVM::LLVMStructType::getLiteral(tuple.getContext(), elements);
         });
         converter.addConversion([&](TensorType tensor) -> std::optional<Type> {
@@ -752,7 +810,7 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
                      GpuFlatTensorElementwisePattern<arith::MulFOp>, GpuFlatTensorElementwisePattern<arith::DivFOp>,
                      GpuFlatTensorElementwisePattern<arith::AddIOp>, GpuFlatTensorElementwisePattern<arith::SubIOp>,
                      GpuFlatTensorElementwisePattern<arith::MulIOp>>(converter, context, useSpirvTupleAbi);
-        populateFunctionOpInterfaceTypeConversionPattern(gpu::GPUFuncOp::getOperationName(), patterns, converter);
+        patterns.add<GpuFuncSignatureConversionPattern>(converter, context);
 
         ConversionTarget target(*context);
         target.addLegalDialect<vector::VectorDialect>();
@@ -785,7 +843,9 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
             signalPassFailure();
     }
 
-    bool useSpirvTupleAbi = false;
+    Option<bool> useSpirvTupleAbi{
+        *this, "use-spirv-tuple-abi",
+        llvm::cl::desc("Lower aggregate register values to explicit-layout SPIR-V composites"), llvm::cl::init(false)};
 };
 
 } // namespace

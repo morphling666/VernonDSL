@@ -23,12 +23,6 @@ std::vector<uint8_t> readFile(const std::filesystem::path &path) {
     return bytes;
 }
 
-bool isSha256(const std::string &value) {
-    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char character) {
-               return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-           });
-}
-
 const char *hostArchitecture() {
 #if defined(_M_X64) || defined(__x86_64__)
     return "x86_64";
@@ -50,7 +44,7 @@ StageArtifactResult<void> validateProgramBundleHash(const nlohmann::json &root, 
     if (!root["content_hash"].is_string())
         return StageArtifactResult<void>{vernon::err(StageArtifactError::InvalidContentHash)};
     const std::string expected = root["content_hash"].get<std::string>();
-    if (!isSha256(expected))
+    if (!isSha256Hex(expected))
         return StageArtifactResult<void>{vernon::err(StageArtifactError::InvalidContentHash)};
     nlohmann::json canonical = root;
     canonical.erase("content_hash");
@@ -92,7 +86,7 @@ StageArtifactResult<ResolvedCpuNativeArtifact> resolveCpuNativeArtifact(const Cp
     const bool nativeLibrary = artifact.format == "native_library";
     const bool relocatableObject = artifact.format == "relocatable_object";
     if (artifact.entry.empty() || artifact.symbol.empty() || artifact.relativeLibrary.empty() || !artifact.size ||
-        !isSha256(artifact.sha256) || (!nativeLibrary && !relocatableObject) ||
+        !isSha256Hex(artifact.sha256) || (!nativeLibrary && !relocatableObject) ||
         (artifact.staticallyLinked && !relocatableObject) || artifact.targetTriple.empty() ||
         (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" && artifact.objectFormat != "macho" &&
          artifact.objectFormat != "wasm"))

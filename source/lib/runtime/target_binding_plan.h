@@ -17,7 +17,6 @@ namespace vernon::runtime::program {
 enum class SourceRepresentation {
     WholeValueBytes,
     ElementStream,
-    TensorViewDescriptor,
     ResourceHandle,
     SystemValue,
     ImplicitSampler,
@@ -130,7 +129,6 @@ struct TargetBinding {
     std::vector<vernon::runtime::AttributeLeaf> attributeLeaves;
     std::vector<vernon::runtime::SampledImageBinding> sampledImageBindings;
     std::vector<vernon::runtime::ReflectedStorageLeaf> storageLeaves;
-    std::optional<vernon::runtime::TensorViewDescriptorUse> tensorViewDescriptor;
     vernon::runtime::PhysicalArgumentLayout physical;
     std::string writeFootprintKind;
     std::vector<uint32_t> writeFootprintIndices;
@@ -157,6 +155,7 @@ struct TargetBindingPlan {
     uint64_t packedArgumentsSize{};
     uint64_t packedResultsSize{};
     std::vector<TargetBinding> bindings;
+    std::optional<vernon::runtime::MetadataCarrier> metadataCarrier;
     std::vector<TargetOutput> outputs;
     std::vector<TargetModule> modules;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;

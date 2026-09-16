@@ -27,7 +27,6 @@ struct CudaPipelineState {
     VernonRuntimeCoreBindings *bindings{};
     PreparedComputeBindingPlan bindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> values;
-    std::vector<int64_t> descriptorValues;
     uint32_t workgroup[3]{1, 1, 1};
 };
 

@@ -1,5 +1,6 @@
 #include "content_hash.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,12 @@ constexpr std::array<uint32_t, 64> kRoundConstants{
 uint32_t rotateRight(uint32_t value, uint32_t amount) { return (value >> amount) | (value << (32 - amount)); }
 
 } // namespace
+
+bool isSha256Hex(std::string_view value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char character) {
+               return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+           });
+}
 
 std::string sha256Hex(const void *data, size_t size) {
     const auto *bytes = static_cast<const uint8_t *>(data);

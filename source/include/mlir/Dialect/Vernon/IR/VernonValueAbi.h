@@ -139,7 +139,6 @@ struct ByteTransportPlan {
 
 enum class PhysicalResourceAbiKind {
     HostPointer,
-    TensorViewDescriptor,
     CudaStorageLeaves,
     GraphicsStorageLeaves,
     GraphicsTexture,

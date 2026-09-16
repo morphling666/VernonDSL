@@ -301,7 +301,7 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 if (!resolved)
                     return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
                 const DevicePointer resource = std::move(resolved).value();
-                if (reference.size == 0)
+                if (reference.offset >= reference.size)
                     return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                         vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_binding_is_invalid", 0, 0}})};
                 resolvedValues[index] = resource + reference.offset;
@@ -321,8 +321,9 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const DevicePointer pointer = resolvedValues[index];
             const bool hostStorage = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
-            const uint64_t byteSize =
-                hostStorage ? value->payload.inline_value.size : value->payload.buffer.resource.size;
+            const uint64_t byteSize = hostStorage
+                                          ? value->payload.inline_value.size
+                                          : value->payload.buffer.resource.size - value->payload.buffer.resource.offset;
             const uint64_t byteStride =
                 hostStorage || !value->payload.buffer.stride ? slot.layout.element_size : value->payload.buffer.stride;
             if (byteStride < slot.layout.element_size || byteStride % slot.layout.element_size != 0)

@@ -71,11 +71,40 @@ struct ValueLayout {
     std::vector<VernonValueLeafView> abiLeaves;
 };
 
-struct TensorViewDescriptorUse {
-    uint32_t rank{};
-    uint32_t offsetBinding{UINT32_MAX};
-    std::vector<uint32_t> extentBindings;
-    std::vector<uint32_t> strideBindings;
+enum class MetadataFieldKind : uint8_t {
+    Offset,
+    Extent,
+    Stride,
+};
+
+struct MetadataFieldIdentity {
+    uint32_t argument{UINT32_MAX};
+    MetadataFieldKind kind{MetadataFieldKind::Offset};
+    std::optional<uint32_t> dimension;
+};
+
+struct PhysicalMetadataMember {
+    uint32_t semanticOrdinal{UINT32_MAX};
+    uint64_t byteOffset{};
+    uint64_t byteSize{};
+    uint64_t alignment{};
+};
+
+// One immutable, entry-owned TensorView metadata ABI. `fields` is the
+// canonical semantic order; `members` is a bijective physical projection.
+struct MetadataCarrier {
+    std::string profile;
+    std::string representation;
+    std::string carrier;
+    uint64_t encodedSize{};
+    uint64_t size{};
+    uint64_t alignment{};
+    uint32_t descriptorSet{UINT32_MAX};
+    uint32_t binding{UINT32_MAX};
+    uint32_t parameterOrdinal{UINT32_MAX};
+    std::vector<MetadataFieldIdentity> fields;
+    std::vector<PhysicalMetadataMember> members;
+    InterfacePlan interfacePlan;
 };
 
 enum class TensorRepresentation {
@@ -100,7 +129,6 @@ struct ParameterUse {
     TensorRepresentation tensorPacking{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;
     std::optional<InterfacePlan> interfacePlan;
-    std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
 };
 
 enum class StageParameterSource {
@@ -182,6 +210,7 @@ struct StageBindingPlan {
     std::vector<Parameter> parameters;
     std::vector<Parameter> runtimeParameters;
     std::vector<Output> outputs;
+    std::optional<MetadataCarrier> metadataCarrier;
     std::map<std::string, std::string> artifactKeys;
     std::string compute;
     std::string vertex;

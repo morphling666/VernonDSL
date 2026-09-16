@@ -241,10 +241,10 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
         for (size_t index = 0; index < state->rhiComputeBindingPlan.size(); ++index) {
             auto &layout = state->rhiComputeBindingPlan.layouts[index];
             const PreparedBindingSource &source = state->rhiComputeBindingPlan.sources[index];
-            const char *resourceKind = source.source.kind != ComputeBindingSourceKind::Argument ? "storage_buffer"
-                                       : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE   ? "sampled_image"
-                                       : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE   ? "storage_image"
-                                                                                                : "storage_buffer";
+            const char *resourceKind = source.metadataCarrier                                 ? "uniform_buffer"
+                                       : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? "sampled_image"
+                                       : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? "storage_image"
+                                                                                              : "storage_buffer";
             MetalResourceLocation location;
             if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind, layout.set,
                                               layout.binding, location, invocationDiagnostic(*inputs.context)))
@@ -254,7 +254,6 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
             layout.array_count = location.count;
         }
         state->rhiComputeValues.resize(state->rhiComputeBindingPlan.size());
-        state->rhiComputeDescriptorValues.resize(state->rhiComputeBindingPlan.size());
         std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
         const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                            VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -384,23 +383,18 @@ VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const P
     for (size_t index = 0; index < state.rhiComputeBindingPlan.size(); ++index) {
         const auto &layout = state.rhiComputeBindingPlan.layouts[index];
         const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
-        const ComputeBindingSource &source = preparedSource.source;
         auto &value = state.rhiComputeValues[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        if (layout.argument_index >= launch.arguments.size())
-            return fail(*pipeline.context, "Metal prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
-        if (source.kind != ComputeBindingSourceKind::Argument) {
-            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
-            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
-                return fail(*pipeline.context, "Metal TensorView descriptor exceeds the shader index range");
-            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
-            value.payload.inline_value.data = &state.rhiComputeDescriptorValues[index];
-            value.payload.inline_value.size = sizeof(int32_t);
+        if (preparedSource.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
+                return fail(*pipeline.context, "Metal metadata carrier payload does not match its compiled ABI");
             continue;
         }
+        if (preparedSource.argumentIndex >= launch.arguments.size())
+            return fail(*pipeline.context, "Metal prepared argument index is invalid");
+        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
                 if (!bindComputeValueStorage(layout, argument, value))
@@ -411,6 +405,10 @@ VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const P
             if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "Metal prepared storage binding requires an RHI Tensor");
             value.payload.buffer.resource = tensor->resource;
+            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
+                preparedSource.resourceOffset >
+                    value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
+                return fail(*pipeline.context, "Metal aggregate storage leaf exceeds its Tensor resource");
             value.payload.buffer.resource.offset += preparedSource.resourceOffset;
         } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                    layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {

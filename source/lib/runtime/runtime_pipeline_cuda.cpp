@@ -38,7 +38,6 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
                                              invocationDiagnostic(*inputs.context)))
             return false;
         state->values.resize(state->bindingPlan.size());
-        state->descriptorValues.resize(state->bindingPlan.size());
         std::copy_n(stage.workgroup, 3, state->workgroup);
         const VernonRuntimeProviderShaderDescriptor shaderDescriptor{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                      VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -92,33 +91,29 @@ VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const Pl
     CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
     for (size_t index = 0; index < state.bindingPlan.size(); ++index) {
         const auto &layout = state.bindingPlan.layouts[index];
-        if (layout.argument_index >= launch.arguments.size())
-            return fail(*pipeline.context, "CUDA prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
+        const PreparedBindingSource &preparedSource = state.bindingPlan.sources[index];
         auto &value = state.values[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        const PreparedBindingSource &preparedSource = state.bindingPlan.sources[index];
-        const ComputeBindingSource &source = preparedSource.source;
-        if (source.kind != ComputeBindingSourceKind::Argument) {
-            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
-            if (!descriptor)
-                return fail(*pipeline.context, "CUDA TensorView descriptor value is invalid");
-            state.descriptorValues[index] = *descriptor;
-            value.payload.inline_value.data = &state.descriptorValues[index];
-            value.payload.inline_value.size = sizeof(int64_t);
+        if (preparedSource.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
+                return fail(*pipeline.context, "CUDA metadata carrier payload does not match its compiled ABI");
             continue;
         }
+        if (preparedSource.argumentIndex >= launch.arguments.size())
+            return fail(*pipeline.context, "CUDA prepared argument index is invalid");
+        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
             const auto *packed = std::get_if<ComputeScalarArgument>(&argument);
             if (tensor && tensor->resource.resource.value) {
                 value.payload.buffer.resource = tensor->resource;
-                if (preparedSource.resourceOffset > value.payload.buffer.resource.size)
+                if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
+                    preparedSource.resourceOffset >
+                        value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
                     return fail(*pipeline.context, "CUDA aggregate storage leaf exceeds its Tensor resource");
                 value.payload.buffer.resource.offset += preparedSource.resourceOffset;
-                value.payload.buffer.resource.size -= preparedSource.resourceOffset;
             } else if (packed && packed->data && packed->size) {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE;
                 value.payload.inline_value.data = packed->data;

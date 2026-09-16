@@ -1,5 +1,8 @@
+#include "runtime/pipeline_metadata.h"
 #include "runtime/stage_artifact.h"
 #include "runtime/stage_binding_plan.h"
+
+#include "VernonVersions.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -146,7 +149,7 @@ TEST(StageArtifactContract, ParsesSharedInterfacePlansTransactionally) {
     const nlohmann::json source = {
         {"kind", "native_uniform"},
         {"profile", "opengl_native_uniform"},
-        {"canonical_layout_hash", "layout"},
+        {"canonical_layout_hash", "0000000000000000000000000000000000000000000000000000000000000000"},
         {"frame_offset", 16},
         {"root",
          {{"kind", "array"},
@@ -175,6 +178,66 @@ TEST(StageArtifactContract, ParsesSharedInterfacePlansTransactionally) {
     invalid = source;
     invalid["unknown"] = true;
     EXPECT_FALSE(vernon::runtime::parseArtifactInterfacePlan(invalid, plan, error));
+
+    invalid = source;
+    invalid["canonical_layout_hash"] = "not-a-digest";
+    EXPECT_FALSE(vernon::runtime::parseArtifactInterfacePlan(invalid, plan, error));
+}
+
+TEST(StageArtifactContract, RejectsWrongTypedMetadataFieldsWithoutThrowing) {
+    const std::string hash(64, '0');
+    const nlohmann::json metadata = {
+        {"profile", "portable_shader_metadata_i32"},
+        {"representation", "i32"},
+        {"carrier", "constant_region"},
+        {"encoded_size", 4},
+        {"size", 16},
+        {"alignment", 16},
+        {"set", 0},
+        {"binding", 1},
+        {"fields",
+         nlohmann::json::array({{{"ordinal", 0}, {"argument", 0}, {"kind", "offset"}, {"units", "logical_elements"}}})},
+        {"members",
+         nlohmann::json::array({{{"semantic_ordinal", 0}, {"byte_offset", 0}, {"byte_size", 4}, {"alignment", 4}}})},
+        {"interface_plan",
+         {{"kind", "byte_transport"},
+          {"profile", "portable_shader_metadata_i32"},
+          {"canonical_layout_hash", hash},
+          {"root",
+           {{"kind", "product"},
+            {"offset", 0},
+            {"size", 16},
+            {"alignment", 16},
+            {"children",
+             nlohmann::json::array(
+                 {{{"kind", "scalar"}, {"representation", "i32"}, {"offset", 0}, {"size", 4}, {"alignment", 4}}})}}}}},
+    };
+    const auto reflection = [&](nlohmann::json carrier) {
+        return nlohmann::json{
+            {"compiler_contract_version", VERNON_COMPILER_CONTRACT_VERSION},
+            {"program_version", VERNON_PROGRAM_VERSION},
+            {"entries", nlohmann::json::array(
+                            {{{"name", "metadata"},
+                              {"physical_layouts",
+                               {{"vulkan_std430_storage_buffer", {{"profile", "vulkan_std430_storage_buffer"}}}}},
+                              {"dispatch_contract",
+                               {{"unit_grid_axes", nlohmann::json::array()}, {"requires_unit_workgroup", false}}},
+                              {"metadata_carrier", std::move(carrier)},
+                              {"arguments", nlohmann::json::array()}}})},
+        };
+    };
+
+    vernon::runtime::ReflectedEntry parsed;
+    std::string error;
+    for (const nlohmann::json &invalidField :
+         {nlohmann::json(7),
+          nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", 7}, {"units", "logical_elements"}},
+          nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", "offset"}, {"units", 7}}}) {
+        nlohmann::json invalid = metadata;
+        invalid["fields"][0] = invalidField;
+        EXPECT_FALSE(vernon::runtime::parseReflection(reflection(std::move(invalid)), "metadata", parsed = {},
+                                                      VERNON_RUNTIME_VULKAN, error));
+    }
 }
 
 TEST(StageArtifactContract, ValidatesExternalAndRuntimeParameterOwnership) {

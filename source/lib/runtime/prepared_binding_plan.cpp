@@ -10,6 +10,8 @@
 namespace vernon::runtime {
 namespace {
 
+constexpr uint64_t kCudaRankOneMemRefParameterCount = 5;
+
 bool isOpenGLBackend(VernonRuntimeBackend backend) {
     return backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES;
 }
@@ -19,14 +21,13 @@ uint32_t accessMask(const Parameter &parameter) {
 }
 
 bool appendBinding(PreparedComputeBindingPlan &plan, VernonRuntimeProviderBindingLayoutEntry layout,
-                   ComputeBindingSource source, PreparedDescriptorWidth width, uint64_t resourceOffset,
-                   std::string &error) {
+                   uint32_t argumentIndex, uint64_t resourceOffset, std::string &error) {
     if (!layout.element_size) {
         error = "prepared compute binding has zero element size";
         return false;
     }
     plan.layouts.push_back(layout);
-    plan.sources.push_back({source, width, resourceOffset});
+    plan.sources.push_back({argumentIndex, resourceOffset, false});
     return true;
 }
 
@@ -97,9 +98,8 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
             layout.slot = static_cast<uint32_t>(output.layouts.size());
             layout.set = argument.descriptorSet;
             layout.binding = argument.binding == UINT32_MAX ? layout.slot : argument.binding;
-            layout.kind = argument.kind == "tensor" && !argument.tensorViewDescriptor
-                              ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                              : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+            layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                    : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
             layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
             layout.access = 3;
             layout.array_count = 1;
@@ -112,8 +112,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                 return false;
             }
             output.layouts.push_back(layout);
-            output.sources.push_back(
-                {{ComputeBindingSourceKind::Argument, layout.argument_index, 0}, PreparedDescriptorWidth::None, 0});
+            output.sources.push_back({layout.argument_index, 0, false});
             output.cpuBindings.push_back(
                 {tapeBuiltin ? argument.builtin : std::string(), argument.physical.offset, argument.physical.size,
                  argument.result,
@@ -122,6 +121,24 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                 output.tapeAllocatorOffset = argument.physical.offset;
             if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
                 output.tapeRootOffset = argument.physical.offset;
+        }
+        if (reflection.metadataCarrier) {
+            const MetadataCarrier &carrier = *reflection.metadataCarrier;
+            VernonRuntimeProviderBindingLayoutEntry layout{};
+            layout.slot = static_cast<uint32_t>(output.layouts.size());
+            layout.binding = layout.slot;
+            layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+            layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+            layout.access = 1;
+            layout.array_count = 1;
+            layout.argument_index = UINT32_MAX;
+            layout.element_size = static_cast<uint32_t>(carrier.size);
+            layout.element_alignment = static_cast<uint32_t>(carrier.alignment);
+            output.metadataCarrier = PreparedMetadataCarrier{carrier, layout};
+            output.layouts.push_back(layout);
+            output.sources.push_back({UINT32_MAX, 0, true});
+            output.cpuBindings.push_back(
+                {"", carrier.interfacePlan.frameOffset, static_cast<size_t>(carrier.size), false, std::nullopt});
         }
         return validatePreparedComputeBindingPlan(output, error);
     }
@@ -138,14 +155,6 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
             flattenedBinding +=
                 static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
     }
-
-    std::vector<uint32_t> cudaDescriptorBindings(reflection.arguments.size(), UINT32_MAX);
-    if (backend == VERNON_RUNTIME_CUDA)
-        for (size_t index = 0; index < reflection.arguments.size(); ++index)
-            if (reflection.arguments[index].tensorViewDescriptor) {
-                cudaDescriptorBindings[index] = flattenedBinding;
-                flattenedBinding += 1 + 2 * reflection.arguments[index].tensorViewDescriptor->rank;
-            }
 
     for (const Parameter &parameter : stagePlan.parameters) {
         if (isOpenGLBackend(backend) && parameter.kind == "image" && parameter.bindingRole == "sampled") {
@@ -195,8 +204,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                                                                             : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
                                   : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                                                               : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && use.interfaceKind == "value" &&
-                    !use.tensorViewDescriptor)
+                if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && use.interfaceKind == "value")
                     layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                 layout.access = accessMask(parameter);
@@ -216,42 +224,44 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                     error = "prepared compute native binding is incomplete";
                     return false;
                 }
-                if (!appendBinding(output, layout, {ComputeBindingSourceKind::Argument, use.index, 0},
-                                   PreparedDescriptorWidth::None, 0, error))
+                if (!appendBinding(output, layout, use.index, 0, error))
                     return false;
             }
-
-            if (!use.tensorViewDescriptor)
-                continue;
-            uint32_t cudaBinding = backend == VERNON_RUNTIME_CUDA ? cudaDescriptorBindings[use.index] : UINT32_MAX;
-            const PreparedDescriptorWidth width =
-                backend == VERNON_RUNTIME_CUDA ? PreparedDescriptorWidth::I64 : PreparedDescriptorWidth::I32;
-            const uint32_t elementSize = backend == VERNON_RUNTIME_CUDA ? 8u : 4u;
-            const auto appendDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
-                                              uint32_t reflectedBinding) {
-                VernonRuntimeProviderBindingLayoutEntry layout{};
-                layout.slot = ++internalSlot;
-                layout.set = backend == VERNON_RUNTIME_CUDA || isOpenGLBackend(backend) ? 0 : argument.descriptorSet;
-                layout.binding = backend == VERNON_RUNTIME_CUDA ? cudaBinding++ : reflectedBinding;
-                layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                layout.access = 1;
-                layout.array_count = 1;
-                layout.argument_index = use.index;
-                layout.element_size = elementSize;
-                return appendBinding(output, layout, {kind, use.index, dimension}, width, 0, error);
-            };
-            if (!appendDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding))
-                return false;
-            for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                if (!appendDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
-                                      use.tensorViewDescriptor->extentBindings[dimension]))
-                    return false;
-            for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
-                if (!appendDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
-                                      use.tensorViewDescriptor->strideBindings[dimension]))
-                    return false;
         }
+    }
+
+    if (stagePlan.metadataCarrier) {
+        const MetadataCarrier &carrier = *stagePlan.metadataCarrier;
+        if (carrier.size > UINT32_MAX || carrier.alignment > UINT32_MAX || output.layouts.size() > UINT32_MAX) {
+            error = "prepared metadata carrier exceeds provider layout limits";
+            return false;
+        }
+        VernonRuntimeProviderBindingLayoutEntry layout{};
+        const bool parameterCarrier = backend == VERNON_RUNTIME_CUDA;
+        if (parameterCarrier) {
+            uint64_t nativeOrdinal = 0;
+            for (const VernonRuntimeProviderBindingLayoutEntry &existing : output.layouts)
+                nativeOrdinal +=
+                    existing.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? kCudaRankOneMemRefParameterCount : 1;
+            if (nativeOrdinal != carrier.parameterOrdinal) {
+                error = "CUDA metadata carrier parameter ordinal does not match the native kernel ABI";
+                return false;
+            }
+        }
+        layout.slot = ++internalSlot;
+        layout.set = carrier.descriptorSet == UINT32_MAX ? 0 : carrier.descriptorSet;
+        layout.binding = parameterCarrier ? static_cast<uint32_t>(output.layouts.size()) : carrier.binding;
+        layout.kind = parameterCarrier ? VERNON_RUNTIME_PROVIDER_INLINE_VALUE : VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+        layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+        layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+        layout.access = 1;
+        layout.array_count = 1;
+        layout.argument_index = UINT32_MAX;
+        layout.element_size = static_cast<uint32_t>(carrier.size);
+        layout.element_alignment = static_cast<uint32_t>(carrier.alignment);
+        output.metadataCarrier = PreparedMetadataCarrier{carrier, layout};
+        output.layouts.push_back(layout);
+        output.sources.push_back({UINT32_MAX, 0, true});
     }
 
     std::vector<size_t> order(output.layouts.size());
@@ -259,15 +269,14 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         order[index] = index;
     std::sort(order.begin(), order.end(),
               [&](size_t left, size_t right) { return output.layouts[left].slot < output.layouts[right].slot; });
-    PreparedComputeBindingPlan sorted;
-    sorted.backend = backend;
-    sorted.layouts.reserve(order.size());
-    sorted.sources.reserve(order.size());
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> layouts = std::move(output.layouts);
+    std::vector<PreparedBindingSource> sources = std::move(output.sources);
+    output.layouts.reserve(order.size());
+    output.sources.reserve(order.size());
     for (size_t index : order) {
-        sorted.layouts.push_back(output.layouts[index]);
-        sorted.sources.push_back(output.sources[index]);
+        output.layouts.push_back(layouts[index]);
+        output.sources.push_back(sources[index]);
     }
-    output = std::move(sorted);
     return validatePreparedComputeBindingPlan(output, error);
 }
 
@@ -285,6 +294,7 @@ bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, 
         return false;
     }
     std::unordered_set<uint32_t> slots;
+    size_t metadataCarrierCount = 0;
     for (size_t index = 0; index < plan.layouts.size(); ++index) {
         const auto &layout = plan.layouts[index];
         const auto &source = plan.sources[index];
@@ -292,16 +302,32 @@ bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, 
             error = "prepared compute binding contains a duplicate provider slot";
             return false;
         }
-        const uint32_t expectedSize = source.descriptorWidth == PreparedDescriptorWidth::I32   ? 4u
-                                      : source.descriptorWidth == PreparedDescriptorWidth::I64 ? 8u
-                                                                                               : layout.element_size;
-        if (!layout.element_size || layout.element_size != expectedSize) {
-            error = "prepared compute descriptor width disagrees with its provider layout";
+        if (!layout.element_size) {
+            error = "prepared compute binding has zero element size";
             return false;
         }
-        if (source.source.kind != ComputeBindingSourceKind::Argument &&
-            source.descriptorWidth == PreparedDescriptorWidth::None) {
-            error = "prepared compute descriptor binding has no scalar width";
+        const bool carrier = source.metadataCarrier;
+        metadataCarrierCount += carrier ? 1u : 0u;
+        if (carrier != (plan.metadataCarrier && layout.slot == plan.metadataCarrier->layout.slot)) {
+            error = "prepared compute metadata carrier is not represented exactly once";
+            return false;
+        }
+    }
+    if (metadataCarrierCount != (plan.metadataCarrier ? 1u : 0u)) {
+        error = "prepared compute plan does not contain exactly one declared metadata carrier";
+        return false;
+    }
+    if (plan.metadataCarrier) {
+        const MetadataCarrier &carrier = plan.metadataCarrier->plan;
+        const auto &layout = plan.metadataCarrier->layout;
+        const bool shader = carrier.profile == "portable_shader_metadata_i32";
+        const bool cuda = carrier.profile == "cuda_kernel_metadata_i64";
+        const bool host = carrier.profile == "host_metadata";
+        if ((!shader && !cuda && !host) || (shader && plan.backend == VERNON_RUNTIME_CUDA) ||
+            (cuda != (plan.backend == VERNON_RUNTIME_CUDA)) || (host != (plan.backend == VERNON_RUNTIME_CPU)) ||
+            layout.element_size != carrier.size || layout.element_alignment != carrier.alignment ||
+            carrier.fields.size() != carrier.members.size()) {
+            error = "prepared metadata carrier profile disagrees with its target or layout";
             return false;
         }
     }

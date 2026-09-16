@@ -932,7 +932,10 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                                           {"vulkan_inline_or_uniform_buffer_binding_size_is_invalid", 0, 0}})};
         } else if ((value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
             const auto *resource = providerBindingResource(*value);
-            if (!resource || !resource->identity || !resource->resource.value)
+            const bool buffer = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                                slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+            if (!resource || !resource->identity || !resource->resource.value ||
+                (buffer && resource->offset >= resource->size))
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"vulkan_resource_binding_is_invalid", 0, 0}})};
             if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->payload.buffer.stride == 0)
@@ -1116,7 +1119,9 @@ snapshotBindings(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject e
             buffers.push_back(
                 {buffer->buffer,
                  internallyOwned ? snapshot->inlineOffsets[index] : slot.value.payload.buffer.resource.offset,
-                 internallyOwned ? slot.inlineStorage.size() : slot.value.payload.buffer.resource.size});
+                 internallyOwned
+                     ? slot.inlineStorage.size()
+                     : slot.value.payload.buffer.resource.size - slot.value.payload.buffer.resource.offset});
             write.pBufferInfo = &buffers.back();
         } else {
             VkDescriptorImageInfo info{};

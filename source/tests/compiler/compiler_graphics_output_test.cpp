@@ -887,7 +887,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
         const VernonTarget target = backend.compiler;
         if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX &&
-            target != VERNON_TARGET_CUDA)
+            target != VERNON_TARGET_CUDA && target != VERNON_TARGET_METAL && target != VERNON_TARGET_OPENGL_ES)
             continue;
         const vernon::tests::BackendProbeResult probe =
             vernon::tests::probeCompilerBackend(compiler, backend, requirements);
@@ -927,11 +927,12 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
         EXPECT_EQ(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\"") != std::string_view::npos,
-                  target != VERNON_TARGET_CUDA);
+                  target != VERNON_TARGET_CUDA && target != VERNON_TARGET_METAL);
         EXPECT_EQ(reflected.find("\"profile\":\"cuda_kernel_parameter\"") != std::string_view::npos,
                   target == VERNON_TARGET_CUDA);
         EXPECT_EQ(reflected.find("\"profile\":\"host_value\""), std::string_view::npos);
-        EXPECT_EQ(reflected.find("\"profile\":\"metal_constant_buffer\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"metal_constant_buffer\"") != std::string_view::npos,
+                  target == VERNON_TARGET_METAL);
         EXPECT_EQ(reflected.find("\"profile\":\"directx_constant_buffer\""), std::string_view::npos);
         EXPECT_EQ(reflected.find("\"profile\":\"opengl_native_uniform\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
@@ -939,10 +940,70 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"offset_binding\":2"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"extent_bindings\":[3]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"stride_bindings\":[4]"), std::string_view::npos);
+        const nlohmann::json reflectionJson = nlohmann::json::parse(reflected);
+        const nlohmann::json &metadata = reflectionJson.at("entries").at(0).at("metadata_carrier");
+        const char *metadataProfile =
+            target == VERNON_TARGET_CUDA ? "cuda_kernel_metadata_i64" : "portable_shader_metadata_i32";
+        EXPECT_EQ(metadata.at("profile"), metadataProfile);
+        ASSERT_EQ(metadata.at("fields").size(), 3u);
+        EXPECT_EQ(metadata.at("fields").at(0).at("ordinal"), 0);
+        EXPECT_EQ(metadata.at("fields").at(0).at("units"), "logical_elements");
+        EXPECT_EQ(metadata.at("fields").at(0).at("kind"), "offset");
+        EXPECT_EQ(metadata.at("fields").at(1).at("kind"), "extent");
+        EXPECT_EQ(metadata.at("fields").at(2).at("kind"), "stride");
+        EXPECT_EQ(metadata.at("representation"), target == VERNON_TARGET_CUDA ? "i64" : "i32");
+        EXPECT_EQ(metadata.at("carrier"), target == VERNON_TARGET_CUDA ? "kernel_parameter" : "constant_region");
+        EXPECT_EQ(metadata.at(target == VERNON_TARGET_CUDA ? "parameter_ordinal" : "binding"),
+                  target == VERNON_TARGET_CUDA ? 10 : 2);
+        EXPECT_EQ(metadata.at("interface_plan").at("canonical_layout_hash").get<std::string>().size(), 64u);
+        EXPECT_EQ(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"offset_binding\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"extent_bindings\":"), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"stride_bindings\":"), std::string_view::npos);
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, RejectsMetadataCarriersExceedingTargetProfileCeilings) {
+    const auto moduleWithRank = [](unsigned rank) {
+        std::string shape;
+        for (unsigned dimension = 0; dimension < rank; ++dimension) {
+            if (dimension)
+                shape += ", ";
+            shape += "-1";
+        }
+        return std::string("module attributes {") + VERNON_MLIR_VERSION_ATTRIBUTES +
+               R"mlir(} {
+  func.func @oversized(
+      %view: !vernon.tensor_view<f32, [)mlir" +
+               shape +
+               R"mlir(], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+})mlir";
+    };
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (const auto &[target, rank] :
+         std::array{std::pair{VERNON_TARGET_CUDA, 256u}, std::pair{VERNON_TARGET_VULKAN, 2048u}}) {
+        const std::string source = moduleWithRank(rank);
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, source.data(), source.size(), target);
+        ASSERT_TRUE(result);
+        EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size)
+                      .find("TensorView metadata carrier exceeds its compiled profile limit"),
+                  std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -1157,8 +1218,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
     EXPECT_FALSE(root.contains("backend_abi_routes"));
     EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "resource_binding");
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("resource_kind"), "tensor_view_descriptor");
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), 32);
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("resource_kind"), "host_pointer");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), sizeof(void *));
     EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("resource_kind"),
               "strided_memref_storage_leaves");
     EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("resource_kind"),

@@ -270,20 +270,12 @@ private:
         indices.pop_back();
     }
 
-    FailureOr<Value> descriptorExtent(Value source, unsigned dimension) {
+    FailureOr<Value> descriptorExtent(Value source, unsigned dimension, Operation *insertionPoint) {
         auto argument = dyn_cast<BlockArgument>(source);
         if (!argument || argument.getOwner() != &function.getBody().front())
             return failure();
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            auto owner = function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorOwnerAttrName);
-            auto component = function.getArgAttrOfType<StringAttr>(index, kTensorDescriptorComponentAttrName);
-            auto descriptorDimension =
-                function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorDimensionAttrName);
-            if (owner && owner.getInt() == argument.getArgNumber() && component && component.getValue() == "extent" &&
-                descriptorDimension && descriptorDimension.getInt() == dimension)
-                return function.getArgument(index);
-        }
-        return failure();
+        OpBuilder metadataBuilder(insertionPoint);
+        return tensorViewMetadataField(source, 1 + dimension, insertionPoint->getLoc(), metadataBuilder);
     }
 
     Value zero(OpBuilder &builder, Location location, Type type) {
@@ -353,7 +345,7 @@ private:
                         return create.emitError("dynamic adjoint element dimensions are unsupported");
                     if (!shapeSource)
                         return create.emitError("dynamic adjoint buffer has no TensorView shape source");
-                    FailureOr<Value> runtimeExtent = descriptorExtent(shapeSource, dimension);
+                    FailureOr<Value> runtimeExtent = descriptorExtent(shapeSource, dimension, create);
                     if (failed(runtimeExtent))
                         return create.emitError("dynamic adjoint buffer has no canonical TensorView extent source");
                     bound = *runtimeExtent;
@@ -1119,7 +1111,7 @@ struct VernonLowerCPUAutodiffPass final : PassWrapper<VernonLowerCPUAutodiffPass
     }
 
     void runOnOperation() override {
-        if (failed(appendTensorViewDescriptorArguments(getOperation()))) {
+        if (failed(appendTensorViewMetadataArgument(getOperation()))) {
             signalPassFailure();
             return;
         }

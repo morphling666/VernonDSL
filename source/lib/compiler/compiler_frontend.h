@@ -89,9 +89,6 @@ struct PhysicalArgumentModel {
     std::string builtin;
     std::optional<unsigned> logicalIndex;
     std::string logicalPath;
-    std::optional<unsigned> descriptorOwner;
-    std::string descriptorComponent;
-    std::optional<unsigned> descriptorDimension;
 };
 
 struct PhysicalResultModel {

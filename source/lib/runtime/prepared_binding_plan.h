@@ -18,16 +18,10 @@
 
 namespace vernon::runtime {
 
-enum class PreparedDescriptorWidth : uint8_t {
-    None,
-    I32,
-    I64,
-};
-
 struct PreparedBindingSource {
-    ComputeBindingSource source;
-    PreparedDescriptorWidth descriptorWidth{PreparedDescriptorWidth::None};
+    uint32_t argumentIndex{UINT32_MAX};
     uint64_t resourceOffset{};
+    bool metadataCarrier{};
 };
 
 struct PreparedCpuBinding {
@@ -38,6 +32,11 @@ struct PreparedCpuBinding {
     std::optional<VernonDataType> resultReduction;
 };
 
+struct PreparedMetadataCarrier {
+    MetadataCarrier plan;
+    VernonRuntimeProviderBindingLayoutEntry layout{};
+};
+
 // Immutable, ordinal-aligned physical binding sequence for one compute Stage.
 // layouts and sources have identical length. CPU plans additionally carry one
 // packed call-frame record per physical parameter ordinal.
@@ -45,6 +44,7 @@ struct PreparedComputeBindingPlan {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> layouts;
     std::vector<PreparedBindingSource> sources;
+    std::optional<PreparedMetadataCarrier> metadataCarrier;
     std::vector<PreparedCpuBinding> cpuBindings;
     size_t packedArgumentSize{};
     size_t packedResultSize{};

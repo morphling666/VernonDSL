@@ -397,6 +397,17 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                 } else {
                     spirv_cross::CompilerGLSL compiler(words);
                     compiler.set_entry_point(entry.name, entry.execution_model);
+                    if (entry.execution_model == spv::ExecutionModelGLCompute) {
+                        const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+                        constexpr size_t portableComputeStorageBlockLimit = 16;
+                        if (resources.storage_buffers.size() > portableComputeStorageBlockLimit) {
+                            diagnostics = "OpenGL compute entry '" + entry.name + "' requires " +
+                                          std::to_string(resources.storage_buffers.size()) +
+                                          " genuine storage-buffer blocks; the portable limit is " +
+                                          std::to_string(portableComputeStorageBlockLimit);
+                            return false;
+                        }
+                    }
                     if (target == VERNON_TARGET_OPENGL_ES) {
                         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
                         for (const spirv_cross::Resource &resource : resources.storage_images) {

@@ -284,10 +284,13 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
         auto layout = std::make_unique<PreparedLayout>();
         layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
         for (const auto &entry : layout->entries) {
-            const bool compute = (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-                                  entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                                  entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) &&
-                                 entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE && entry.element_size != 0;
+            const bool compute =
+                ((entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                  entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM && entry.binding != UINT32_MAX) ||
+                 entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                 entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                 entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) &&
+                entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE && entry.element_size != 0;
             const bool graphicsResource = (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                                            entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                            entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) &&
@@ -662,9 +665,12 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
     try {
         ranges.reserve(layout->entries.size());
-        for (const auto &entry : layout->entries)
-            ranges.push_back(
-                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+        for (const auto &entry : layout->entries) {
+            const D3D12_DESCRIPTOR_RANGE_TYPE rangeType = entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                              ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                                                              : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            ranges.push_back({rangeType, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+        }
     } catch (const std::bad_alloc &) {
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"d3d12_pipeline_preparation_ran_out_of_memory", 0, 0}})};
@@ -977,17 +983,27 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                                                   {"d3d12_dispatch_could_not_track_inline_resource_state", 0, 0}})};
                     commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
                                                slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                    const bool constantBuffer = slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+                    const D3D12_RESOURCE_STATES targetState = constantBuffer
+                                                                  ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+                                                                  : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource, targetState))
                         return RhiAdapterResult<void>{vernon::err(
                             vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                   {"d3d12_dispatch_could_not_track_inline_resource_state", 0, 0}})};
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    view.Format = DXGI_FORMAT_R32_TYPELESS;
-                    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                    device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view, cpu);
+                    if (constantBuffer) {
+                        D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
+                        view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
+                        view.SizeInBytes = (static_cast<UINT>(slot.inlineStorage.size()) + 255u) & ~255u;
+                        device.device->CreateConstantBufferView(&view, cpu);
+                    } else {
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                        view.Format = DXGI_FORMAT_R32_TYPELESS;
+                        view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                        device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view, cpu);
+                    }
                 } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
                     auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
                     if (!buffer || !buffer->resource ||

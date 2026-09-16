@@ -6,95 +6,65 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
 #include <limits>
 
 namespace mlir::vernon {
 
-inline LogicalResult appendTensorViewDescriptorArguments(Operation *root) {
+inline LogicalResult appendTensorViewMetadataArgument(Operation *root) {
     SmallVector<func::FuncOp> functions;
     root->walk([&](func::FuncOp function) { functions.push_back(function); });
     for (func::FuncOp function : functions) {
-        bool alreadyExpanded = false;
-        unsigned descriptorBase = function.getNumArguments();
+        FailureOr<std::shared_ptr<const SemanticMetadataPlan>> semantic = getSemanticMetadataPlan(function);
+        if (failed(semantic))
+            return function.emitError("cannot build canonical TensorView metadata plan");
+        std::optional<unsigned> carrierIndex;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            const bool hasDescriptorAttribute = function.getArgAttr(index, kTensorDescriptorOwnerAttrName) ||
-                                                function.getArgAttr(index, kTensorDescriptorComponentAttrName) ||
-                                                function.getArgAttr(index, kTensorDescriptorDimensionAttrName);
-            alreadyExpanded |= hasDescriptorAttribute;
-            if (hasDescriptorAttribute && descriptorBase == function.getNumArguments())
-                descriptorBase = index;
+            if (!function.getArgAttr(index, kTensorMetadataCarrierAttrName))
+                continue;
+            if (carrierIndex)
+                return function.emitError("has multiple TensorView metadata carriers");
+            carrierIndex = index;
         }
-        if (alreadyExpanded) {
-            struct ExpectedDescriptor {
-                unsigned owner;
-                StringRef component;
-                std::optional<unsigned> dimension;
-            };
-            SmallVector<ExpectedDescriptor> expected;
-            for (unsigned index = 0; index < descriptorBase; ++index) {
-                auto view = dyn_cast<TensorViewType>(function.getArgumentTypes()[index]);
-                if (!view || view.getAddressSpace() != "device")
-                    continue;
-                expected.push_back({index, "offset", std::nullopt});
-                for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension)
-                    expected.push_back({index, "extent", dimension});
-                for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension)
-                    expected.push_back({index, "stride", dimension});
-            }
-            bool canonical = descriptorBase + expected.size() == function.getNumArguments();
-            for (auto [offset, descriptor] : llvm::enumerate(expected)) {
-                const unsigned index = descriptorBase + offset;
-                if (index >= function.getNumArguments()) {
-                    canonical = false;
-                    break;
-                }
-                auto owner = function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorOwnerAttrName);
-                auto component = function.getArgAttrOfType<StringAttr>(index, kTensorDescriptorComponentAttrName);
-                auto dimension = function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorDimensionAttrName);
-                canonical &= function.getArgumentTypes()[index].isIndex() && owner &&
-                             owner.getInt() == descriptor.owner && component &&
-                             component.getValue() == descriptor.component &&
-                             ((!descriptor.dimension && !dimension) ||
-                              (descriptor.dimension && dimension &&
-                               dimension.getInt() == static_cast<int64_t>(*descriptor.dimension)));
-            }
-            if (!canonical)
-                return function.emitError("has a malformed internal TensorView descriptor argument sequence");
+        if ((*semantic)->empty()) {
+            if (carrierIndex)
+                return function.emitError("has a metadata carrier but no device TensorView arguments");
             continue;
         }
-        const unsigned sourceArgumentCount = function.getNumArguments();
-        OpBuilder builder(function);
-        auto append = [&](unsigned owner, StringRef component,
-                          std::optional<unsigned> dimension = std::nullopt) -> LogicalResult {
-            SmallVector<NamedAttribute> attributes{
-                builder.getNamedAttr(kTensorDescriptorOwnerAttrName, builder.getI64IntegerAttr(owner)),
-                builder.getNamedAttr(kTensorDescriptorComponentAttrName, builder.getStringAttr(component))};
-            if (dimension)
-                attributes.push_back(
-                    builder.getNamedAttr(kTensorDescriptorDimensionAttrName, builder.getI64IntegerAttr(*dimension)));
-            return function.insertArgument(function.getNumArguments(), builder.getIndexType(),
-                                           builder.getDictionaryAttr(attributes), function.getLoc());
-        };
-        for (unsigned index = 0; index < sourceArgumentCount; ++index) {
-            auto view = dyn_cast<TensorViewType>(function.getArgumentTypes()[index]);
-            if (!view || view.getAddressSpace() != "device")
-                continue;
-            if (failed(append(index, "offset")))
-                return failure();
-            for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension)
-                if (failed(append(index, "extent", dimension)))
-                    return failure();
-            for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension)
-                if (failed(append(index, "stride", dimension)))
-                    return failure();
+        SmallVector<Type> fields((*semantic)->getFieldCount(), IndexType::get(function.getContext()));
+        TupleType carrierType = TupleType::get(function.getContext(), fields);
+        if (carrierIndex) {
+            auto existing = dyn_cast<TupleType>(function.getArgumentTypes()[*carrierIndex]);
+            auto count = function.getArgAttrOfType<IntegerAttr>(*carrierIndex, kTensorMetadataFieldCountAttrName);
+            if (!existing || existing != carrierType || !count ||
+                count.getInt() != static_cast<int64_t>((*semantic)->getFieldCount()))
+                return function.emitError("has a malformed TensorView aggregate metadata carrier");
+            continue;
         }
+        OpBuilder builder(function);
+        DictionaryAttr attrs = builder.getDictionaryAttr({
+            builder.getNamedAttr(kTensorMetadataCarrierAttrName, builder.getUnitAttr()),
+            builder.getNamedAttr(kTensorMetadataFieldCountAttrName,
+                                 builder.getI64IntegerAttr((*semantic)->getFieldCount())),
+        });
+        SmallVector<DictionaryAttr> argumentAttrs;
+        argumentAttrs.reserve(function.getNumArguments() + 1);
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            DictionaryAttr existing = function.getArgAttrDict(index);
+            argumentAttrs.push_back(existing ? existing : builder.getDictionaryAttr({}));
+        }
+        argumentAttrs.push_back(attrs);
+        if (failed(
+                function.insertArgument(function.getNumArguments(), carrierType, DictionaryAttr{}, function.getLoc())))
+            return failure();
+        function.setAllArgAttrs(argumentAttrs);
     }
     return success();
 }
 
-inline FailureOr<unsigned> tensorViewDescriptorBase(Value storage) {
+inline FailureOr<std::pair<Value, uint32_t>> tensorViewMetadataBase(Value storage) {
     auto view = dyn_cast<TensorViewType>(storage.getType());
     if (!view || view.getAddressSpace() != "device")
         return failure();
@@ -103,19 +73,36 @@ inline FailureOr<unsigned> tensorViewDescriptorBase(Value storage) {
         argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp()) : FunctionOpInterface{};
     if (!function)
         return failure();
-    unsigned descriptorBase = 0;
-    while (descriptorBase < function.getNumArguments() &&
-           !function.getArgAttr(descriptorBase, kTensorDescriptorComponentAttrName))
-        ++descriptorBase;
-    if (descriptorBase == function.getNumArguments() || argument.getArgNumber() >= descriptorBase)
+    FailureOr<std::shared_ptr<const SemanticMetadataPlan>> semantic = getSemanticMetadataPlan(function);
+    if (failed(semantic))
         return failure();
-    for (unsigned index = 0; index < argument.getArgNumber(); ++index)
-        if (auto preceding = dyn_cast<TensorViewType>(function.getArgumentTypes()[index]);
-            preceding && preceding.getAddressSpace() == "device")
-            descriptorBase += 1 + 2 * preceding.getShape().size();
-    if (descriptorBase + 1 + 2 * view.getShape().size() > function.getNumArguments())
+    std::optional<unsigned> carrierIndex;
+    for (unsigned index = 0; index < function.getNumArguments(); ++index)
+        if (function.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
+            if (carrierIndex)
+                return failure();
+            carrierIndex = index;
+        }
+    if (!carrierIndex)
         return failure();
-    return descriptorBase;
+    auto owner = llvm::find_if((*semantic)->getViews(), [&](const SemanticMetadataView &candidate) {
+        return candidate.argumentIndex == argument.getArgNumber();
+    });
+    if (owner == (*semantic)->getViews().end())
+        return failure();
+    return std::pair<Value, uint32_t>{function.getArgument(*carrierIndex), owner->firstFieldOrdinal};
+}
+
+inline FailureOr<Value> tensorViewMetadataField(Value storage, uint32_t ordinal, Location location,
+                                                OpBuilder &builder) {
+    FailureOr<std::pair<Value, uint32_t>> base = tensorViewMetadataBase(storage);
+    if (failed(base))
+        return failure();
+    OperationState state(location, TupleGetOp::getOperationName());
+    state.addOperands(base->first);
+    state.addTypes(builder.getIndexType());
+    state.addAttribute("index", builder.getI64IntegerAttr(base->second + ordinal));
+    return builder.create(state)->getResult(0);
 }
 
 inline FailureOr<Value> tensorViewExtent(Value storage, unsigned axis, Location location, OpBuilder &builder) {
@@ -123,13 +110,7 @@ inline FailureOr<Value> tensorViewExtent(Value storage, unsigned axis, Location 
     if (!view || axis >= view.getShape().size())
         return failure();
     if (view.getAddressSpace() == "device") {
-        auto argument = dyn_cast<BlockArgument>(storage);
-        auto function = argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp())
-                                 : FunctionOpInterface{};
-        FailureOr<unsigned> descriptorBase = tensorViewDescriptorBase(storage);
-        if (!function || failed(descriptorBase))
-            return failure();
-        return function.getArgument(*descriptorBase + 1 + axis);
+        return tensorViewMetadataField(storage, 1 + axis, location, builder);
     }
     int64_t extent = view.getShape()[axis];
     if (extent <= 0)
@@ -180,7 +161,7 @@ inline LogicalResult materializeGetShape(GetShapeOp getShape, OpBuilder &builder
 }
 
 /// Convert a logical ranked TensorView index to its canonical physical record
-/// index. Device views consume per-dispatch descriptor operands. Non-device
+/// index. Device views consume the entry-scoped metadata carrier. Non-device
 /// views are statically shaped and use canonical row-major projection.
 inline FailureOr<Value> projectTensorViewIndex(Operation *operation, TensorViewType view, ValueRange indices,
                                                OpBuilder &builder) {
@@ -188,20 +169,22 @@ inline FailureOr<Value> projectTensorViewIndex(Operation *operation, TensorViewT
         return failure();
     Value storage = isa<StoreOp>(operation) ? operation->getOperand(1) : operation->getOperand(0);
     if (view.getAddressSpace() == "device") {
-        FailureOr<unsigned> descriptorBaseOrError = tensorViewDescriptorBase(storage);
-        if (failed(descriptorBaseOrError))
+        if (failed(tensorViewMetadataBase(storage)))
             return failure();
-        auto argument = cast<BlockArgument>(storage);
-        auto function = cast<FunctionOpInterface>(argument.getOwner()->getParentOp());
-        unsigned descriptorBase = *descriptorBaseOrError;
-        Value offset = function.getArgument(descriptorBase);
+        FailureOr<Value> offsetValue = tensorViewMetadataField(storage, 0, operation->getLoc(), builder);
+        if (failed(offsetValue))
+            return failure();
+        Value offset = *offsetValue;
         SmallVector<Value> strides;
         strides.reserve(view.getShape().size());
-        const unsigned strideBase = descriptorBase + 1 + view.getShape().size();
-        for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension)
-            strides.push_back(function.getArgument(strideBase + dimension));
-        // Descriptor attributes identify generated arguments to later ABI passes;
-        // projection follows their canonical positional sequence.
+        const uint32_t strideBase = 1 + view.getShape().size();
+        for (unsigned dimension = 0; dimension < view.getShape().size(); ++dimension) {
+            FailureOr<Value> stride =
+                tensorViewMetadataField(storage, strideBase + dimension, operation->getLoc(), builder);
+            if (failed(stride))
+                return failure();
+            strides.push_back(*stride);
+        }
         Value projected = offset;
         for (auto [index, stride] : llvm::zip_equal(indices, strides)) {
             Value term = arith::MulIOp::create(builder, operation->getLoc(), index, stride);
@@ -236,7 +219,7 @@ inline FailureOr<Value> projectTensorViewIndex(Operation *operation, TensorViewT
 /// Replace logical storage operations with internal physical operations while
 /// TensorView types and descriptor projection data are still available.
 inline LogicalResult materializeTensorViewProjections(Operation *root) {
-    if (failed(appendTensorViewDescriptorArguments(root)))
+    if (failed(appendTensorViewMetadataArgument(root)))
         return failure();
     SmallVector<Operation *> operations;
     root->walk([&](Operation *operation) {

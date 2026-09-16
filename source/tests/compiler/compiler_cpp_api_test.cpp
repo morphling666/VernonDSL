@@ -319,7 +319,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     vernonCompileResultDestroy(result);
 
-    std::fprintf(stderr, "relation\n");
     constexpr std::string_view relationModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @relation(
@@ -368,7 +367,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   }
 })mlir";
     nlohmann::json relationReflection = validateReflection(context, relationModule);
-    std::fprintf(stderr, "%s\n", relationReflection.dump(2).c_str());
     const nlohmann::json &relationEntry = entry(relationReflection, "relation");
     ASSERT_TRUE(argument(relationEntry, 1).at("kind") == "image");
     ASSERT_TRUE(argument(relationEntry, 2).at("kind") == "sampler");
@@ -381,7 +379,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(!argument(relationEntry, 5).contains("sampled_texture_set"));
     ASSERT_TRUE(!argument(relationEntry, 5).contains("sampled_image_binding"));
 
-    std::fprintf(stderr, "forwarding\n");
     constexpr std::string_view forwardingModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @forwarding(
@@ -456,7 +453,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(argument(forwardingEntry, 3).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 1}}, {{"set", 0}, {"binding", 2}}}));
 
-    std::fprintf(stderr, "helper\n");
     constexpr std::string_view helperModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func private @sample_helper(
@@ -494,7 +490,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(argument(helperEntry, 1).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 4}}}));
 
-    std::fprintf(stderr, "ambiguity\n");
     constexpr std::string_view ambiguousSamplerModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @ambiguous(
@@ -529,7 +524,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 })mlir";
     expectDiagnostic(context, ambiguousSamplerModule, "may use multiple sampler entry arguments (#2, #4)");
 
-    std::fprintf(stderr, "unknown\n");
     constexpr std::string_view unknownProvenanceModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @unknown(
@@ -556,7 +550,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 })mlir";
     expectDiagnostic(context, unknownProvenanceModule, "argument #0 has no finite canonical Value ABI layout");
 
-    std::fprintf(stderr, "intrinsic\n");
     expectDiagnostic(context, R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         func.func @bad(%texture: !vernon.texture<"2d", f32, "unknown", "sampled">,
                        %coordinates: tensor<2xf32>) -> tensor<4xf32> {

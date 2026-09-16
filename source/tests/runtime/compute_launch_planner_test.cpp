@@ -75,6 +75,35 @@ ParameterUse tensorViewF32Use(std::vector<uint64_t> shape) {
     return use;
 }
 
+MetadataCarrier i32MetadataCarrier(uint32_t argument, uint32_t rank) {
+    MetadataCarrier carrier;
+    carrier.profile = "portable_shader_metadata_i32";
+    carrier.representation = "i32";
+    carrier.carrier = "constant_region";
+    carrier.alignment = 16;
+    carrier.fields.push_back({argument, MetadataFieldKind::Offset, std::nullopt});
+    for (uint32_t dimension = 0; dimension < rank; ++dimension)
+        carrier.fields.push_back({argument, MetadataFieldKind::Extent, dimension});
+    for (uint32_t dimension = 0; dimension < rank; ++dimension)
+        carrier.fields.push_back({argument, MetadataFieldKind::Stride, dimension});
+    carrier.encodedSize = carrier.fields.size() * sizeof(int32_t);
+    carrier.size = (carrier.encodedSize + 15) & ~uint64_t{15};
+    TransportNode root;
+    root.kind = TransportNodeKind::Product;
+    root.size = carrier.size;
+    root.alignment = carrier.alignment;
+    for (uint32_t ordinal = 0; ordinal < carrier.fields.size(); ++ordinal) {
+        carrier.members.push_back({ordinal, ordinal * sizeof(int32_t), sizeof(int32_t), alignof(int32_t)});
+        root.children.push_back(
+            {TransportNodeKind::Scalar, "i32", ordinal * sizeof(int32_t), sizeof(int32_t), alignof(int32_t)});
+    }
+    carrier.interfacePlan.kind = InterfacePlanKind::ByteTransport;
+    carrier.interfacePlan.profile = carrier.profile;
+    carrier.interfacePlan.canonicalLayoutHash = "test_metadata";
+    carrier.interfacePlan.root = std::move(root);
+    return carrier;
+}
+
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     StageBindingPlan variant;
     Parameter contiguous;
@@ -151,8 +180,8 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     parameter.source = StageParameterSource::Direct;
     parameter.access = "read";
     parameter.uses.push_back(tensorViewF32Use({2, 0}));
-    parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{2, 1, {2, 3}, {4, 5}};
     variant.parameters = {parameter};
+    variant.metadataCarrier = i32MetadataCarrier(0, 2);
 
     const std::array<uint64_t, 2> shape{2, 3};
     const std::array<int64_t, 2> strides{6 * sizeof(float), -static_cast<int64_t>(sizeof(float))};
@@ -193,14 +222,19 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     invocation.compute_grid = {4, 2, 1};
     ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_TRUE(std::get<ComputeTensorArgument>(plan.arguments[0]).tensorView);
-    EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorExtent, 0, 1}), 4);
-    EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorStride, 0, 0}), 4);
+    ASSERT_EQ(plan.metadataPayload.size(), 32u);
+    int32_t fields[5]{};
+    std::memcpy(fields, plan.metadataPayload.data(), sizeof(fields));
+    EXPECT_EQ(fields[1], 2);
+    EXPECT_EQ(fields[2], 4);
+    EXPECT_EQ(fields[3], 4);
+    EXPECT_EQ(fields[4], 1);
 
     const std::array<uint64_t, 2> invalidStaticShape{3, 4};
     supplied.tensor.shape = invalidStaticShape.data();
     ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error,
-              "pipeline Tensor argument '' TensorView descriptor violates static shape or element stride at axis 0");
+              "pipeline Tensor argument '' TensorView metadata violates static shape or element stride at axis 0");
 
     supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
@@ -210,13 +244,13 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     EXPECT_EQ(error, "pipeline Tensor argument '' at byte offset 8 requires 36 bytes but its allocation has 24");
 }
 
-TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
+TEST(ComputeLaunchPlannerTest, MaterializesRankZeroMetadataCarrier) {
     StageBindingPlan variant;
     Parameter parameter = storageF32Parameter(0, 0, "read_write");
     parameter.shape = {};
     parameter.uses.front().shape = {};
-    parameter.uses.front().tensorViewDescriptor = TensorViewDescriptorUse{0, 1, {}, {}};
     variant.parameters = {parameter};
+    variant.metadataCarrier = i32MetadataCarrier(0, 0);
 
     VernonProgramArgument supplied{};
     supplied.slot = 0;
@@ -240,7 +274,62 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
     const auto &argument = std::get<ComputeTensorArgument>(plan.arguments.front());
     ASSERT_NE(argument.tensorView, nullptr);
     EXPECT_EQ(argument.tensorView->rank, 0u);
-    EXPECT_EQ(argument.tensorViewSize, 2 * sizeof(uintptr_t));
+    ASSERT_EQ(plan.metadataPayload.size(), 16u);
+    int32_t offset = -1;
+    std::memcpy(&offset, plan.metadataPayload.data(), sizeof(offset));
+    EXPECT_EQ(offset, 0);
+}
+
+TEST(ComputeLaunchPlannerTest, ZeroExtentSkipsProjectionButValidatesRepresentation) {
+    const std::array<uint64_t, 2> shape{0, static_cast<uint64_t>(std::numeric_limits<int32_t>::max())};
+    const std::array<int64_t, 2> strides{static_cast<int64_t>(sizeof(float)),
+                                         static_cast<int64_t>(std::numeric_limits<int32_t>::max()) *
+                                             static_cast<int64_t>(sizeof(float))};
+    VernonTensorView tensor{};
+    tensor.struct_size = sizeof(tensor);
+    tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    tensor.resource = {1, {2}, 0, sizeof(float)};
+    tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    tensor.access = VERNON_ACCESS_READ;
+    tensor.rank = 2;
+    tensor.shape = shape.data();
+    tensor.byte_strides = strides.data();
+    tensor.byte_size = sizeof(float);
+    ComputeTensorArgument tensorArgument{};
+    tensorArgument.tensorView = &tensor;
+    std::vector<ComputeLaunchArgument> arguments{tensorArgument};
+    std::vector<uint8_t> payload;
+    std::string error;
+    EXPECT_TRUE(materializeMetadataCarrier(i32MetadataCarrier(0, 2), arguments, payload, error)) << error;
+
+    const std::array<uint64_t, 2> unrepresentableShape{0,
+                                                       static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) + 1};
+    tensor.shape = unrepresentableShape.data();
+    EXPECT_FALSE(materializeMetadataCarrier(i32MetadataCarrier(0, 2), arguments, payload, error));
+    EXPECT_EQ(error, "TensorView extent or byte stride is not exactly representable in logical elements");
+}
+
+TEST(ComputeLaunchPlannerTest, RejectsProjectionIntermediateOverflow) {
+    const std::array<uint64_t, 1> shape{3};
+    const std::array<int64_t, 1> strides{static_cast<int64_t>(std::numeric_limits<int32_t>::max()) *
+                                         static_cast<int64_t>(sizeof(float))};
+    VernonTensorView tensor{};
+    tensor.struct_size = sizeof(tensor);
+    tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    tensor.resource = {1, {2}, 0, std::numeric_limits<size_t>::max()};
+    tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    tensor.access = VERNON_ACCESS_READ;
+    tensor.rank = 1;
+    tensor.shape = shape.data();
+    tensor.byte_strides = strides.data();
+    tensor.byte_size = std::numeric_limits<size_t>::max();
+    ComputeTensorArgument tensorArgument{};
+    tensorArgument.tensorView = &tensor;
+    std::vector<ComputeLaunchArgument> arguments{tensorArgument};
+    std::vector<uint8_t> payload;
+    std::string error;
+    EXPECT_FALSE(materializeMetadataCarrier(i32MetadataCarrier(0, 1), arguments, payload, error));
+    EXPECT_EQ(error, "TensorView projection multiplication overflows the metadata profile");
 }
 
 TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
@@ -252,8 +341,8 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     parameter.access = "read";
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.uses.push_back(tensorViewF32Use({2}));
-    parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{1, 1, {2}, {3}};
     variant.parameters = {parameter};
+    variant.metadataCarrier = i32MetadataCarrier(0, 1);
 
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> strides{sizeof(float)};

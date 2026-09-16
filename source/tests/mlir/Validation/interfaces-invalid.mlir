@@ -4,7 +4,7 @@
 // CHECK-DAG: uniform must provide both 'vernon.set' and 'vernon.binding', or neither
 // CHECK-DAG: 'vernon.instance_divisor' is only valid on vertex inputs
 // CHECK-DAG: compute entry requires 'vernon.workgroup_size'
-// CHECK-DAG: contains internal TensorView descriptor metadata
+// CHECK-DAG: contains compiler-owned TensorView metadata ABI state
 // CHECK-DAG: but the vertex output has type
 
 module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
@@ -35,9 +35,8 @@ module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_ve
   }
 
   func.func @bad_compute(
-      %forged_descriptor: index {
-        vernon.tensor_descriptor_owner = 0 : i64,
-        vernon.tensor_descriptor_component = "offset"
+      %forged_metadata: index {
+        vernon.tensor_metadata_carrier
       }) attributes {
     vernon.entry, vernon.stage = "compute"
   } {

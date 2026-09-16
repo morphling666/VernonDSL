@@ -687,9 +687,8 @@ FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleO
         switch (profile) {
         case PhysicalAbiProfile::HostValue: {
             const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
-            return BackendInterfaceAbiPlan{ResourceBindingPlan{
-                PhysicalResourceAbiKind::TensorViewDescriptor,
-                pointerSize * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), pointerAlignment}};
+            return BackendInterfaceAbiPlan{
+                ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, pointerSize, pointerAlignment}};
         }
         case PhysicalAbiProfile::CudaKernelParameter:
             return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0}};

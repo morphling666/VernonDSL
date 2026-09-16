@@ -8,6 +8,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -15,6 +16,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
@@ -211,17 +213,6 @@ std::vector<PhysicalEntryModel> buildPhysicalEntryModels(mlir::ModuleOp module,
                     argument.logicalIndex = origin->index;
                     argument.logicalPath = origin->path;
                 }
-            if (auto owner =
-                    function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorOwnerAttrName))
-                if (owner.getInt() >= 0)
-                    argument.descriptorOwner = static_cast<unsigned>(owner.getInt());
-            if (auto component = function.getArgAttrOfType<mlir::StringAttr>(
-                    index, mlir::vernon::kTensorDescriptorComponentAttrName))
-                argument.descriptorComponent = component.getValue().str();
-            if (auto dimension = function.getArgAttrOfType<mlir::IntegerAttr>(
-                    index, mlir::vernon::kTensorDescriptorDimensionAttrName))
-                if (dimension.getInt() >= 0)
-                    argument.descriptorDimension = static_cast<unsigned>(dimension.getInt());
             entry.arguments.push_back(std::move(argument));
         }
         for (auto [index, type] : llvm::enumerate(function.getResultTypes())) {
@@ -503,7 +494,8 @@ llvm::json::Object reflectCanonicalValueLayout(const mlir::vernon::ValueAbiLayou
 
 mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const LogicalReflectionModel &logical,
                                              const std::vector<PhysicalEntryModel> &physicalEntries,
-                                             const std::vector<PhysicalEntryProvenance> &provenance) {
+                                             const std::vector<PhysicalEntryProvenance> &provenance,
+                                             std::optional<mlir::vernon::MetadataPhysicalProfile> metadataProfile) {
     std::map<std::string, const LogicalEntryModel *> logicalEntries;
     for (const LogicalEntryModel &entry : logical.entries)
         logicalEntries.emplace(entry.name, &entry);
@@ -594,9 +586,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         switch (resource.kind) {
         case mlir::vernon::PhysicalResourceAbiKind::HostPointer:
             reflected["resource_kind"] = "host_pointer";
-            break;
-        case mlir::vernon::PhysicalResourceAbiKind::TensorViewDescriptor:
-            reflected["resource_kind"] = "tensor_view_descriptor";
             break;
         case mlir::vernon::PhysicalResourceAbiKind::CudaStorageLeaves:
             reflected["resource_kind"] = "strided_memref_storage_leaves";
@@ -776,12 +765,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             physicalValueLayouts.emplace(index, std::move(*layout));
         }
         llvm::SmallVector<std::optional<uint32_t>> computeBindings(function.getNumArguments());
-        llvm::SmallVector<std::optional<uint32_t>> tensorDescriptorBindings(function.getNumArguments());
+        std::optional<uint32_t> metadataCarrierBinding;
+        std::optional<unsigned> metadataCarrierArgumentIndex;
+        uint32_t nextComputeBinding = 0;
         if (stage.getValue() == "compute") {
             uint32_t flattenedBinding = 0;
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
                 mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
-                if (attrs.get("vernon.builtin") || attrs.get(mlir::vernon::kTensorDescriptorOwnerAttrName))
+                if (attrs && (attrs.get("vernon.builtin") || attrs.get(mlir::vernon::kTensorMetadataCarrierAttrName)))
                     continue;
                 computeBindings[index] = flattenedBinding;
                 size_t leafCount = 1;
@@ -800,12 +791,145 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 }
                 flattenedBinding += static_cast<uint32_t>(std::max<size_t>(leafCount, 1));
             }
+            nextComputeBinding = flattenedBinding;
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-                auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index]);
-                if (!view || function.getArgAttrDict(index).get("vernon.builtin"))
-                    continue;
-                tensorDescriptorBindings[index] = flattenedBinding;
-                flattenedBinding += 1 + 2 * static_cast<uint32_t>(view.getShape().size());
+                if (function.getArgAttr(index, mlir::vernon::kTensorMetadataCarrierAttrName)) {
+                    if (metadataCarrierBinding) {
+                        function.emitError("contains multiple aggregate TensorView metadata carriers");
+                        invalid = true;
+                        return;
+                    }
+                    metadataCarrierBinding = flattenedBinding;
+                    metadataCarrierArgumentIndex = index;
+                }
+            }
+        }
+        llvm::json::Object reflectedMetadataCarrier;
+        bool hasMetadataCarrier = false;
+        if (stage.getValue() == "compute") {
+            mlir::FailureOr<std::shared_ptr<const mlir::vernon::SemanticMetadataPlan>> semantic =
+                mlir::vernon::getSemanticMetadataPlan(function);
+            if (mlir::failed(semantic)) {
+                function.emitError("cannot reflect canonical TensorView metadata plan");
+                invalid = true;
+                return;
+            }
+            if (!(*semantic)->empty()) {
+                if (!metadataCarrierBinding)
+                    metadataCarrierBinding = nextComputeBinding;
+                hasMetadataCarrier = true;
+                llvm::json::Array fields;
+                for (const mlir::vernon::SemanticMetadataField &field : (*semantic)->getFields()) {
+                    llvm::json::Object reflected{
+                        {"ordinal", static_cast<int64_t>(field.ordinal)},
+                        {"argument_index", static_cast<int64_t>(field.identity.argumentIndex)},
+                        {"kind", mlir::vernon::stringifyMetadataFieldKind(field.identity.kind).str()},
+                        {"units", "logical_elements"},
+                    };
+                    if (field.identity.dimension)
+                        reflected["dimension"] = static_cast<int64_t>(*field.identity.dimension);
+                    fields.emplace_back(std::move(reflected));
+                }
+                reflectedMetadataCarrier = llvm::json::Object{
+                    {"kind", "constant_region"},
+                    {"semantic_fields", std::move(fields)},
+                };
+
+                llvm::SmallVector<std::pair<mlir::vernon::MetadataPhysicalProfile, uint32_t>> profiles;
+                if (metadataProfile &&
+                    *metadataProfile == mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32)
+                    profiles.emplace_back(mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32, 0);
+                if (metadataProfile && *metadataProfile == mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata)
+                    profiles.emplace_back(mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata, 0);
+                if (auto dataLayout = module->getAttrOfType<mlir::StringAttr>("llvm.data_layout")) {
+                    const llvm::DataLayout hostLayout(dataLayout.getValue());
+                    const uint32_t indexBits = hostLayout.getPointerSizeInBits();
+                    if ((indexBits == 32 || indexBits == 64) && metadataProfile &&
+                        *metadataProfile == mlir::vernon::MetadataPhysicalProfile::HostMetadata)
+                        profiles.emplace_back(mlir::vernon::MetadataPhysicalProfile::HostMetadata, indexBits);
+                }
+                llvm::json::Object layouts;
+                for (auto [profile, hostIndexBitWidth] : profiles) {
+                    mlir::vernon::MetadataNativeLocation nativeLocation;
+                    if (profile == mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32) {
+                        nativeLocation.descriptorSet = 0;
+                        nativeLocation.binding = *metadataCarrierBinding;
+                    } else if (profile == mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata) {
+                        mlir::FailureOr<uint32_t> ordinal = mlir::vernon::getCudaMetadataKernelParameterOrdinal(
+                            function, metadataCarrierArgumentIndex.value_or(function.getNumArguments()));
+                        if (mlir::failed(ordinal)) {
+                            function.emitError("cannot compute CUDA TensorView metadata carrier parameter ordinal");
+                            invalid = true;
+                            return;
+                        }
+                        nativeLocation.kernelParameterOrdinal = *ordinal;
+                    }
+                    mlir::FailureOr<std::shared_ptr<const mlir::vernon::PhysicalMetadataPlan>> physical =
+                        mlir::vernon::getPhysicalMetadataPlan(**semantic, profile, nativeLocation, hostIndexBitWidth);
+                    if (mlir::failed(physical)) {
+                        function.emitError("TensorView metadata carrier exceeds its compiled profile limit");
+                        invalid = true;
+                        return;
+                    }
+                    llvm::json::Array members;
+                    llvm::json::Array transportChildren;
+                    for (const mlir::vernon::PhysicalMetadataMember &member : (*physical)->getMembers()) {
+                        members.emplace_back(llvm::json::Object{
+                            {"semantic_ordinal", static_cast<int64_t>(member.semanticOrdinal)},
+                            {"offset", static_cast<int64_t>(member.byteOffset)},
+                            {"size", static_cast<int64_t>(member.size)},
+                            {"alignment", static_cast<int64_t>(member.alignment)},
+                        });
+                        transportChildren.emplace_back(llvm::json::Object{
+                            {"kind", "scalar"},
+                            {"offset", static_cast<int64_t>(member.byteOffset)},
+                            {"size", static_cast<int64_t>(member.size)},
+                            {"alignment", static_cast<int64_t>(member.alignment)},
+                            {"representation", (*physical)->getScalarRepresentation().str()},
+                        });
+                    }
+                    llvm::json::Object layout{
+                        {"profile", mlir::vernon::stringifyMetadataPhysicalProfile(profile).str()},
+                        {"representation", (*physical)->getScalarRepresentation().str()},
+                        {"carrier", mlir::vernon::stringifyMetadataCarrierKind((*physical)->getCarrierKind()).str()},
+                        {"encoded_size", static_cast<int64_t>((*physical)->getEncodedSize())},
+                        {"block_size", static_cast<int64_t>((*physical)->getBlockSize())},
+                        {"abi_alignment", static_cast<int64_t>((*physical)->getAbiAlignment())},
+                        {"compiled_size_ceiling", static_cast<int64_t>((*physical)->getCompiledSizeCeiling())},
+                        {"members", std::move(members)},
+                        {"interface_plan",
+                         llvm::json::Object{
+                             {"kind", profile == mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32
+                                          ? "byte_transport"
+                                      : profile == mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata
+                                          ? "kernel_parameter"
+                                          : "cpu_call"},
+                             {"profile", mlir::vernon::stringifyMetadataPhysicalProfile(profile).str()},
+                             {"canonical_layout_hash", (*physical)->getCanonicalLayoutHash().str()},
+                             {"root",
+                              llvm::json::Object{
+                                  {"kind", "product"},
+                                  {"offset", int64_t{0}},
+                                  {"size", static_cast<int64_t>((*physical)->getBlockSize())},
+                                  {"alignment", static_cast<int64_t>((*physical)->getAbiAlignment())},
+                                  {"children", std::move(transportChildren)},
+                              }},
+                         }},
+                    };
+                    if (profile == mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32) {
+                        layout["set"] = static_cast<int64_t>(*(*physical)->getNativeLocation().descriptorSet);
+                        layout["binding"] = static_cast<int64_t>(*(*physical)->getNativeLocation().binding);
+                    } else if (profile == mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata) {
+                        layout["kernel_parameter_ordinal"] =
+                            static_cast<int64_t>(*(*physical)->getNativeLocation().kernelParameterOrdinal);
+                    }
+                    layouts[mlir::vernon::stringifyMetadataPhysicalProfile(profile)] = std::move(layout);
+                }
+                reflectedMetadataCarrier["physical_layouts"] = std::move(layouts);
+            } else if (metadataCarrierBinding) {
+                function.emitError("has an aggregate metadata carrier without semantic fields");
+                invalid = true;
+                return;
             }
         }
         uint32_t nextBinding = 0;
@@ -814,7 +938,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding"))
                 nextBinding = std::max(nextBinding, static_cast<uint32_t>(binding.getInt() + 1));
         }
-        bool sawTensorDescriptorArgument = false;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             const PhysicalArgumentModel &physicalArgument = physicalEntry.arguments[index];
             std::string physicalType;
@@ -822,26 +945,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             function.getArgumentTypes()[index].print(physicalTypeStream);
             physicalTypeStream.flush();
             auto builtin = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.builtin");
-            const auto descriptorOwner =
-                function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorOwnerAttrName);
-            const auto descriptorComponent =
-                function.getArgAttrOfType<mlir::StringAttr>(index, mlir::vernon::kTensorDescriptorComponentAttrName);
-            const auto descriptorDimension =
-                function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorDimensionAttrName);
-            const std::optional<unsigned> actualDescriptorOwner =
-                descriptorOwner && descriptorOwner.getInt() >= 0
-                    ? std::optional<unsigned>(static_cast<unsigned>(descriptorOwner.getInt()))
-                    : std::nullopt;
-            const std::optional<unsigned> actualDescriptorDimension =
-                descriptorDimension && descriptorDimension.getInt() >= 0
-                    ? std::optional<unsigned>(static_cast<unsigned>(descriptorDimension.getInt()))
-                    : std::nullopt;
             if (physicalArgument.index != index || physicalArgument.type != physicalType ||
-                physicalArgument.builtin != (builtin ? builtin.getValue().str() : std::string()) ||
-                physicalArgument.descriptorOwner != actualDescriptorOwner ||
-                physicalArgument.descriptorComponent !=
-                    (descriptorComponent ? descriptorComponent.getValue().str() : std::string()) ||
-                physicalArgument.descriptorDimension != actualDescriptorDimension) {
+                physicalArgument.builtin != (builtin ? builtin.getValue().str() : std::string())) {
                 function.emitError() << "argument #" << index << " does not match its physical entry model";
                 invalid = true;
                 return;
@@ -870,17 +975,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 logicalValue = &logicalEntry->arguments[*physicalArgument.logicalIndex];
             if (mlir::vernon::containsLogicalAutodiffHandle(function.getArgumentTypes()[index]))
                 continue;
-            if (function.getArgAttr(index, mlir::vernon::kTensorDescriptorOwnerAttrName) ||
-                function.getArgAttr(index, mlir::vernon::kTensorDescriptorComponentAttrName) ||
-                function.getArgAttr(index, mlir::vernon::kTensorDescriptorDimensionAttrName)) {
-                sawTensorDescriptorArgument = true;
+            if (function.getArgAttr(index, mlir::vernon::kTensorMetadataCarrierAttrName))
                 continue;
-            }
-            if (sawTensorDescriptorArgument) {
-                function.emitError() << "contains a visible argument after projected TensorView descriptor arguments";
-                invalid = true;
-                return;
-            }
             llvm::json::Object argument;
             argument["index"] = static_cast<int64_t>(index);
             argument["kind"] = "scalar";
@@ -1284,25 +1380,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);
-                    if (!tensorDescriptorBindings[index]) {
-                        function.emitError("TensorView has no dispatch descriptor binding sequence");
-                        invalid = true;
-                        return;
-                    }
-                    const uint32_t descriptorBase = *tensorDescriptorBindings[index];
-                    llvm::json::Object descriptor;
-                    descriptor["rank"] = static_cast<int64_t>(view.getShape().size());
-                    descriptor["offset_binding"] = static_cast<int64_t>(descriptorBase);
-                    llvm::json::Array extentBindings;
-                    llvm::json::Array strideBindings;
-                    for (uint32_t dimension = 0; dimension < view.getShape().size(); ++dimension) {
-                        extentBindings.emplace_back(static_cast<int64_t>(descriptorBase + 1 + dimension));
-                        strideBindings.emplace_back(
-                            static_cast<int64_t>(descriptorBase + 1 + view.getShape().size() + dimension));
-                    }
-                    descriptor["extent_bindings"] = std::move(extentBindings);
-                    descriptor["stride_bindings"] = std::move(strideBindings);
-                    argument["tensor_view_descriptor"] = std::move(descriptor);
                 } else if (!mlir::isa<mlir::RankedTensorType, mlir::VectorType>(argumentType)) {
                     argument["kind"] = "scalar";
                     if (const std::string dtype = languageDtype(valueLogicalDtypes, sourceDtype); !dtype.empty())
@@ -1505,10 +1582,24 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
 
         llvm::json::Object entry;
         entry["name"] = function.getSymName().str();
+        if (hasMetadataCarrier) {
+            llvm::json::Object *layouts = reflectedMetadataCarrier.getObject("physical_layouts");
+            llvm::json::Object *host = layouts ? layouts->getObject("host_metadata") : nullptr;
+            llvm::json::Object *interfacePlan = host ? host->getObject("interface_plan") : nullptr;
+            const std::optional<int64_t> alignment = host ? host->getInteger("abi_alignment") : std::nullopt;
+            const std::optional<int64_t> size = host ? host->getInteger("block_size") : std::nullopt;
+            if (host && interfacePlan && alignment && *alignment > 0 && size && *size > 0) {
+                argumentOffset = llvm::alignTo(argumentOffset, static_cast<uint64_t>(*alignment));
+                (*interfacePlan)["frame_offset"] = static_cast<int64_t>(argumentOffset);
+                argumentOffset += static_cast<uint64_t>(*size);
+            }
+        }
         entry["symbol"] = function.getSymName().str();
         entry["stage"] = stage.getValue().str();
         entry["arguments"] = std::move(arguments);
         entry["results"] = std::move(results);
+        if (hasMetadataCarrier)
+            entry["metadata_carrier"] = std::move(reflectedMetadataCarrier);
         entry["physical_layouts"] = llvm::json::Object{
             {"host_value", llvm::json::Object{{"profile", "host_value"},
                                               {"packed_arguments_size", static_cast<int64_t>(argumentOffset)},
@@ -1535,6 +1626,32 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             entry["workgroup_size"] = std::move(dimensions);
         }
         if (stage.getValue() == "compute") {
+            uint64_t storageBufferCount = 0;
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                mlir::Type type = function.getArgumentTypes()[index];
+                mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+                if ((attrs &&
+                     (attrs.get("vernon.builtin") || attrs.get(mlir::vernon::kTensorMetadataCarrierAttrName))) ||
+                    mlir::isa<mlir::vernon::TextureType, mlir::vernon::SamplerType>(type))
+                    continue;
+                if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type)) {
+                    mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
+                        mlir::vernon::getValueStorageLayout(view.getElementType(), module);
+                    if (mlir::failed(layout)) {
+                        function.emitError("cannot account TensorView storage resources");
+                        invalid = true;
+                        return;
+                    }
+                    storageBufferCount += layout->leaves.size();
+                } else {
+                    ++storageBufferCount;
+                }
+            }
+            entry["resource_counts"] = llvm::json::Object{
+                {"storage_buffer_count", static_cast<int64_t>(storageBufferCount)},
+                {"uniform_buffer_count", int64_t{hasMetadataCarrier ? 1 : 0}},
+                {"metadata_storage_buffer_count", int64_t{0}},
+            };
             auto contract = function->getAttrOfType<mlir::DictionaryAttr>(mlir::vernon::kDispatchContractAttrName);
             auto axes = contract ? contract.getAs<mlir::DenseI32ArrayAttr>("unit_grid_axes") : nullptr;
             auto unitWorkgroup = contract ? contract.getAs<mlir::BoolAttr>("requires_unit_workgroup") : nullptr;
@@ -1743,12 +1860,69 @@ bool selectTargetPhysicalLayouts(std::string &reflection, VernonTarget target, s
         }
         return std::nullopt;
     };
+    const std::string metadataProfile = target == VERNON_TARGET_CPU    ? "host_metadata"
+                                        : target == VERNON_TARGET_CUDA ? "cuda_kernel_metadata_i64"
+                                                                       : "portable_shader_metadata_i32";
     for (llvm::json::Value &entryValue : *entries) {
         llvm::json::Object *entry = entryValue.getAsObject();
         llvm::json::Object *entryLayouts = entry ? entry->getObject("physical_layouts") : nullptr;
         if (!entry || !entryLayouts) {
             diagnostics = "compiler reflection entry has no physical layout table";
             return false;
+        }
+        if (llvm::json::Object *carrier = entry->getObject("metadata_carrier")) {
+            llvm::json::Object *metadataLayouts = carrier->getObject("physical_layouts");
+            llvm::json::Array *semanticFields = carrier->getArray("semantic_fields");
+            llvm::json::Object *selectedMetadata =
+                metadataLayouts ? metadataLayouts->getObject(metadataProfile) : nullptr;
+            if (!semanticFields || !selectedMetadata) {
+                diagnostics = "compiler reflection metadata carrier has no layout for the selected target";
+                return false;
+            }
+            llvm::json::Object concrete = std::move(*selectedMetadata);
+            llvm::json::Array fields;
+            for (const llvm::json::Value &fieldValue : *semanticFields) {
+                const llvm::json::Object *field = fieldValue.getAsObject();
+                if (!field) {
+                    diagnostics = "compiler reflection metadata carrier has an invalid semantic field";
+                    return false;
+                }
+                llvm::json::Object projected{
+                    {"ordinal", field->getInteger("ordinal").value_or(-1)},
+                    {"argument", field->getInteger("argument_index").value_or(-1)},
+                    {"kind", field->getString("kind").value_or("").str()},
+                    {"units", field->getString("units").value_or("").str()},
+                };
+                if (std::optional<int64_t> dimension = field->getInteger("dimension"))
+                    projected["dimension"] = *dimension;
+                fields.emplace_back(std::move(projected));
+            }
+            concrete["fields"] = std::move(fields);
+            concrete["size"] = concrete.getInteger("block_size").value_or(-1);
+            concrete["alignment"] = concrete.getInteger("abi_alignment").value_or(-1);
+            if (std::optional<int64_t> ordinal = concrete.getInteger("kernel_parameter_ordinal"))
+                concrete["parameter_ordinal"] = *ordinal;
+            llvm::json::Array *members = concrete.getArray("members");
+            if (!members) {
+                diagnostics = "compiler reflection metadata carrier has no physical members";
+                return false;
+            }
+            for (llvm::json::Value &memberValue : *members) {
+                llvm::json::Object *member = memberValue.getAsObject();
+                if (!member) {
+                    diagnostics = "compiler reflection metadata carrier has an invalid physical member";
+                    return false;
+                }
+                (*member)["byte_offset"] = member->getInteger("offset").value_or(-1);
+                (*member)["byte_size"] = member->getInteger("size").value_or(-1);
+                member->erase("offset");
+                member->erase("size");
+            }
+            concrete.erase("block_size");
+            concrete.erase("abi_alignment");
+            concrete.erase("compiled_size_ceiling");
+            concrete.erase("kernel_parameter_ordinal");
+            *carrier = std::move(concrete);
         }
         std::set<std::string> retainedProfiles;
         for (llvm::StringRef field : {"arguments", "results"}) {

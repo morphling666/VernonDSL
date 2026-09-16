@@ -5,13 +5,13 @@ Status: implemented architecture record and design assessment.
 This document records how typed compiler reflection becomes executable
 bindings for CPU, CUDA, Vulkan, DirectX 12, Metal, OpenGL, and OpenGL ES. It
 describes the implemented `PreparedComputeBindingPlan` and
-`PreparedGraphicsBindingPlan` architecture and its remaining schema work.
+`PreparedGraphicsBindingPlan` architecture.
 
 Normative Program fields are defined by
 [`../program/execution_manifest.md`](../program/execution_manifest.md).
 Runtime ownership and execution are defined by [`design.md`](design.md).
-The remaining physical-binding migration is tracked by
-[`binding_and_tape_contract_plan.md`](binding_and_tape_contract_plan.md).
+TensorView metadata transport is defined by
+[`tensor_view_metadata_abi_plan.md`](tensor_view_metadata_abi_plan.md).
 This document does not introduce a second manifest schema.
 
 ## 1. Decision summary
@@ -48,12 +48,13 @@ The current flow is:
 typed Vernon entry IR
   -> compiler logical reflection
   -> target lowering and target physical-layout reflection
+  -> entry metadata_carrier semantic fields + selected physical profile
   -> Program StageArtifact endpoints + compiled_abi
   -> strict Program manifest parsing
   -> TargetBindingPlan
   -> StageBindingPlan + ReflectedEntry
   -> PreparedComputeBindingPlan or PreparedGraphicsBindingPlan
-  -> PlannedComputeLaunch or PlannedGraphicsInvocation
+  -> PlannedComputeLaunch metadataPayload or PlannedGraphicsInvocation
   -> shared invocation binding materialization
   -> RuntimeCore binding revision
   -> RHI adapter / CPU provider
@@ -140,10 +141,35 @@ legal for the selected target. Representative profiles are:
 - `directx_constant_buffer`;
 - `metal_constant_buffer`.
 
+Entry metadata uses a separate profile family:
+
+- `portable_shader_metadata_i32` with `constant_region`;
+- `cuda_kernel_metadata_i64` with `kernel_parameter`;
+- `host_metadata` with `cpu_call_frame`.
+
 The selected profile is target code ABI. Runtime must not replace it with a
 layout derived only from dtype and shape.
 
-### 3.3 Compiled endpoint ABI
+### 3.3 TensorView metadata reflection
+
+A compute entry with device TensorViews owns one metadata carrier outside its
+argument rows. Portable reflection records ordered semantic fields as
+`(ordinal, argument, kind, dimension, units)`. Target reflection selects
+one physical profile and records representation, member layout, aggregate
+size/alignment, `InterfacePlan`, and one native location.
+
+Shader targets use `portable_shader_metadata_i32` and one `constant_region`.
+CUDA uses `cuda_kernel_metadata_i64` and one native kernel parameter. CPU uses
+`host_metadata` and one compiler-owned call-frame range. Runtime validates the
+semantic-to-physical bijection and never reconstructs field order from
+argument adjacency.
+
+The compiler implementation is
+`source/lib/Dialect/Vernon/IR/VernonMetadataAbi.cpp`; Runtime carrier types and
+strict parsing live in `stage_binding_plan.h`, `pipeline_metadata.cpp`, and
+`program_execution_manifest.cpp`.
+
+### 3.4 Compiled endpoint ABI
 
 `compiledProgramEndpointAbi()` in
 `source/lib/compiler/compiler_program_stage.cpp` copies the target facts needed
@@ -159,6 +185,10 @@ at deployment into each StageArtifact `compiled_abi` row:
 - element layout;
 - sampled-image binding provenance.
 
+Compute StageArtifacts with TensorView metadata additionally carry one
+entry-owned semantic `metadata_carrier` and one matching target implementation
+carrier. It is not represented as per-argument descriptor bindings.
+
 `source/lib/runtime/program_execution_manifest.cpp` parses this object
 fail-closed into `CompiledEndpointAbi`, declared in
 `source/lib/runtime/program_execution_manifest.h`. Unknown, missing, empty, or
@@ -168,24 +198,31 @@ The source-derived `uniform_name` is part of this ABI projection. OpenGL must
 not recreate it from a Program parameter name: optimizer activity and
 SPIRV-Cross naming can otherwise make a valid native uniform appear inactive.
 
-### 3.4 Two reflection products
+### 3.5 Two reflection products
 
 The repository has two intentionally different reflection products:
 
-1. raw kernel/stage reflection uses `entries[].arguments[]`,
-   `entries[].results[]`, and each row's `physical_layouts`; it is parsed by
-   `pipeline_metadata.cpp` into `ReflectedEntry`;
+1. raw target reflection uses `entries[].arguments[]`,
+   `entries[].results[]`, each row's selected physical layout, and a flat
+   entry-level `metadata_carrier`; it is parsed by `pipeline_metadata.cpp`
+   into `ReflectedEntry`;
 2. Program StageArtifact reflection uses portable `endpoints[].abi.bindings`
-   plus target-selected `compiled_abi`; it is parsed by
+   plus semantic `reflection.metadata_carrier` and target-selected
+   `implementation.metadata_carrier`; it is parsed by
    `program_execution_manifest.cpp`, merged with Program graph projections,
    and only then projected into `TargetBindingPlan`.
+
+Before target selection, compiler-internal reflection represents metadata as
+`semantic_fields` with `argument_index` plus nested `physical_layouts`.
+`selectTargetPhysicalLayouts()` flattens the selected profile to `fields` with
+`argument`, `members` with byte ranges, one `interface_plan`, and one native
+location. That intermediate representation is not a Runtime input schema.
 
 They share compiler layout authorities but are not interchangeable JSON
 schemas. Feeding a raw entry row to the Program endpoint parser, or treating a
 portable endpoint as if it already contained the compiled target ABI, is a
-contract error. The final prepared-binding migration may share typed internal
-builders, but it must not add a permissive compatibility parser between these
-schemas.
+contract error. Typed internal builders may share layout authorities, but
+there is no permissive compatibility parser between these schemas.
 
 ## 4. The four binding namespaces
 
@@ -199,9 +236,9 @@ and diagnostic conveniences, not transport identity.
 
 ### 4.2 Portable endpoint slot
 
-Stage endpoint `abiBindings` assign portable slots to value, resource,
-storage-leaf, offset, extent, stride, sampler, and other endpoint semantics.
-These slots are stable inside the Program contract.
+Stage endpoint `abiBindings` assign portable slots to values, resources,
+storage leaves, samplers, and other endpoint semantics. TensorView metadata is
+entry-owned and therefore has no per-field portable endpoint slots.
 
 ### 4.3 Provider slot and physical ordinal
 
@@ -211,8 +248,9 @@ or descriptor entry. Both must be unique and deterministic. They need not
 equal the Program or portable endpoint slot.
 
 The shared prepared-plan builders allocate additional internal provider slots
-for storage leaves and TensorView descriptor fields and sort the sequence once.
-Backends do not create a second ordinal namespace.
+for storage leaves and the single metadata carrier, then sort the sequence
+once. The carrier source is marked `metadataCarrier` and has no external
+argument index. Backends do not create a second ordinal namespace.
 
 ### 4.4 Native location
 
@@ -244,28 +282,35 @@ Each `TargetBinding` records independent dimensions:
 
 - `ProgramProjection`: supplying Value, optional logical leaf, physical leaf,
   and input/output direction;
-- `SourceRepresentation`: whole Value bytes, element stream, TensorView
-  descriptor, resource handle, system value, or implicit sampler;
+- `SourceRepresentation`: whole Value bytes, element stream, resource handle,
+  system value, or implicit sampler;
 - `TargetCarrier`: inline value, uniform buffer, storage buffer, vertex/index
   buffer, image, sampler, or attachment;
 - `CarrierSemantic`: Value, resource, or tape;
 - canonical whole-Value and element layouts;
 - compiler-selected target transport and native location;
 - storage-leaf expansion;
-- TensorView descriptor field bindings;
 - graphics attribute leaves and sampled-image provenance;
 - access, role, view transform, shape, and write footprint.
+
+For compute, `TargetBindingPlan.metadataCarrier` separately owns the complete
+entry-level TensorView metadata ABI. Keeping it outside `TargetBinding`
+prevents a shared carrier from being mistaken for an argument-owned resource.
+An endpoint `viewDescriptor` flag only marks TensorView storage semantics and
+contributes to expected field validation; it is not a physical descriptor
+transport.
 
 This separation is essential. A ranked Tensor supplied as canonical whole
 Value bytes may use a storage buffer as its target carrier. Reclassifying that
 source as an element stream skips compiler-directed packing and is incorrect
 for matrix and aggregate layouts.
 
-`buildStageBindingPlan()` currently projects `TargetBindingPlan` into the
-older `StageBindingPlan` and `ReflectedEntry` views. `ParameterUse` retains the
-stage interface, argument index, native binding, transport, packing mode,
-`InterfacePlan`, TensorView descriptor bindings, attribute leaves, and sampled
-image bindings.
+`buildStageBindingPlan()` projects `TargetBindingPlan` into `StageBindingPlan`
+and `ReflectedEntry`. `ParameterUse` retains the stage interface, argument
+index, native binding, transport, packing mode, `InterfacePlan`, attribute
+leaves, and sampled-image bindings. The entry metadata carrier is copied once
+to both typed views, with semantic argument identities remapped to runtime
+argument indices.
 
 Compiler reflection shapes use signed extents with `-1` for a dynamic axis.
 Runtime contract shapes use unsigned extents with `0` for a dynamic axis.
@@ -291,6 +336,9 @@ Materialization performs these operations:
 - register host result unpacking in `resultCommits`;
 - attach image and sampler resource references;
 - validate and expose concrete TensorView offset, extents, and strides;
+- prove TensorView projection bounds and selected integer-width
+  representability, then materialize one `metadataPayload` from the reflected
+  semantic-to-physical mapping;
 - retain the command encoder and concrete dispatch grid.
 
 `commitComputeResults()` unpacks host Value results only after successful
@@ -319,10 +367,10 @@ controls and resource transitions, not shader parameters.
 
 `runtime_pipeline_cpu.cpp` and `backend_cpu.cpp` consume compiler-reflected
 packed frame offsets and sizes. Storage tensors are host pointers. Values and
-results occupy inline packed-frame fields. A CPU TensorView is passed as one
-packed descriptor structure, including pointer-sized fields. CPU autodiff adds
-typed tape and reduction behavior but does not change public Program binding
-identity.
+results occupy inline packed-frame fields. A CPU TensorView contributes its
+host storage pointer plus one entry-owned `host_metadata` aggregate whose
+fields occupy reflected call-frame lanes. CPU autodiff adds typed tape and
+reduction behavior but does not change public Program binding identity.
 
 CPU has no graphics rasterizer. Graphics semantics are validated and compiled
 for shader reference behavior only where explicitly supported.
@@ -331,8 +379,9 @@ for shader reference behavior only where explicitly supported.
 
 `runtime_pipeline_cuda.cpp` creates the ordered `cuLaunchKernel` argument
 sequence. True storage and ranked Value carriers use storage-buffer provider
-bindings; scalar kernel values remain inline. TensorView offset, extent, and
-stride fields are currently emitted as separate 64-bit inline values.
+bindings; scalar kernel values remain inline. All TensorView offset, extent,
+and stride fields are packed into one reflected
+`cuda_kernel_metadata_i64` aggregate parameter.
 
 `rhi_adapter/adapter_cuda.cpp` converts storage bindings to the five-word
 memref descriptor expected by lowered kernels. Packed host Values whose
@@ -348,8 +397,8 @@ CUDA is compute-only.
 `runtime_pipeline_vulkan.cpp` maps reflected descriptor sets/bindings to
 storage buffers, uniform buffers, images, samplers, and push constants. Static
 Value tensors transported through buffers are packed with their
-`InterfacePlan`. TensorView descriptor fields are separate 32-bit values at
-the reflected bindings.
+`InterfacePlan`. TensorView metadata occupies one reflected
+`portable_shader_metadata_i32` Uniform block.
 
 Graphics uses reflected vertex leaves, descriptor-backed resources, packed
 uniforms, generated resolution, and explicit sampler provenance.
@@ -361,7 +410,8 @@ native command encoding.
 `runtime_pipeline_directx12.cpp` maps the provider binding plan to root
 constants, constant buffers, SRV/UAV descriptors, vertex buffers, images, and
 samplers. The Runtime consumes compiler-generated DXIL and never runs DXC.
-TensorView fields are currently 32-bit values.
+TensorView metadata uses one constant-buffer view; the compute root signature
+classifies that binding as CBV rather than UAV.
 
 Graphics resources currently require descriptor set zero and a stricter
 single-use parameter shape than the general Stage model. Depth-only graphics
@@ -374,7 +424,8 @@ color attachments.
 facts through `NativeResourceSlot` into Metal argument-buffer indices and
 member IDs. It maps Values to inline constants or reflected buffers, vertex
 inputs to Metal vertex buffer indices, and images/samplers to their native
-indices. TensorView descriptor fields are currently separate 32-bit values.
+indices. TensorView metadata uses one constant-buffer binding carrying the
+portable 32-bit aggregate.
 
 `adapter_metal.mm` owns `MTLArgumentEncoder`, pipeline state, render/compute
 encoders, and completion lifetime.
@@ -385,12 +436,14 @@ encoders, and completion lifetime.
 set zero. It maps buffers, images, samplers, attributes, and native uniforms to
 the provider layout. Native uniforms use the reflected `uniform_name` and
 physical scalar/vector/matrix shape. Buffered Values are packed from their
-`InterfacePlan`. TensorView descriptor fields are currently 32-bit values.
+`InterfacePlan`. TensorView metadata uses one uniform-buffer binding.
 
-`adapter_opengl.cpp` performs `glUniform*`, `glBindBufferBase`, texture/image
-unit, sampler, vertex attribute, framebuffer, and draw encoding after making
-the associated context current. OpenGL ES uses the same architecture with its
-stricter storage-image and language-version constraints.
+`adapter_opengl.cpp` performs `glUniform*`, indexed buffer binding,
+texture/image unit, sampler, vertex attribute, framebuffer, and draw encoding
+after making the associated context current. It uses `glBindBufferRange` when
+the prepared resource has a non-zero offset and validates native range
+alignment. OpenGL ES uses the same architecture with its stricter
+storage-image and language-version constraints.
 
 ## 8. Cross-backend invariants
 
@@ -407,8 +460,17 @@ The following invariants are required before provider pipeline creation:
   hashes;
 - packed byte size and alignment exactly match the physical root node;
 - storage-leaf offset and size fit the carrier stride;
-- TensorView rank and descriptor field count match reflection;
-- descriptor values use checked conversion to the compiler-reflected width;
+- TensorView rank and metadata field identity match reflection;
+- metadata fields form a bijection with physical members and use checked
+  conversion to the selected profile width;
+- the metadata carrier has one non-colliding native location and its payload
+  size/alignment match the prepared provider entry;
+- shader metadata uses one uniform/constant buffer, never an SSBO, and its
+  rounded block size does not exceed 16 KiB;
+- CUDA metadata uses one aggregate ordinal whose position accounts for
+  five-word native memref expansion;
+- CPU metadata occupies a reflected call-frame range that does not overlap
+  another physical argument;
 - dynamic extents and strides change values, never ordinals;
 - access does not weaken while crossing planning layers;
 - image dimension, format class, and sampler provenance are preserved;
@@ -429,6 +491,10 @@ The following choices should be retained:
 - target physical ABI is compiler-owned and hash-covered;
 - Program projection is resolved once, before invocation;
 - dynamic TensorView data is excluded from artifact identity;
+- TensorView metadata is entry-owned, profile-explicit, and materialized by
+  one shared semantic validator;
+- metadata uniform-buffer accounting is separate from genuine storage
+  resources;
 - resource lifetime is enforced below binding materialization;
 - native target APIs remain specialized instead of being forced into a fake
   universal descriptor model;
@@ -448,28 +514,27 @@ and invocation filling. These broader schema limitations remain:
 1. `ParameterUse.interfaceKind` and `transport` are strings. The shared
    prepared-plan builder currently interprets them when selecting a physical
    binding kind.
-2. CUDA descriptor fields are 64-bit while the SPIR-V-derived backends use
-   32-bit fields. A target difference may be valid, but it must be represented
-   explicitly in compiler reflection rather than selected from backend identity.
-3. Host result commit and backend result publication are represented by
+2. Host result commit and backend result publication are represented by
    separate mechanisms rather than one typed prepared output variant.
-4. A binding crosses MLIR attributes, logical reflection models, JSON,
+3. A binding crosses MLIR attributes, logical reflection models, JSON,
    StageArtifact endpoints, `TargetBinding`, `ParameterUse`, and sometimes
    `ReflectedArgument`. No generated typed schema currently guarantees that a
-   field addition reaches every representation.
-5. Raw kernel reflection and Program StageArtifact reflection are separate
+   field addition reaches every representation. Metadata similarly crosses
+   `SemanticMetadataPlan`, `PhysicalMetadataPlan`, manifest JSON,
+   `MetadataCarrier`, `PreparedMetadataCarrier`, and `metadataPayload`.
+4. Raw kernel reflection and Program StageArtifact reflection are separate
     schemas but use structurally similar field names, increasing the risk of
     accidental cross-consumption.
-6. Logical Value and signless storage layouts are distinct C++ values but
+5. Logical Value and signless storage layouts are distinct C++ values but
     their hashes are represented as ordinary strings, so the type system does
     not prevent an invalid comparison.
-7. Compiler and runtime dynamic-shape sentinels differ and rely on explicit
+6. Compiler and runtime dynamic-shape sentinels differ and rely on explicit
     conversion rather than distinct encoded types.
 
 These are maintenance and correctness risks, not reasons to discard the
 layered design.
 
-### 9.3 Optimal end state
+### 9.3 Implemented prepared-plan state
 
 Runtime produces immutable compute and graphics prepared plans containing
 ordered typed physical entries. Each entry directly contains the applicable
@@ -482,15 +547,17 @@ subset of:
 - native location;
 - complete physical layout;
 - optional storage-leaf projection;
-- optional TensorView descriptor field kind and integer width;
 - optional image, sampler, attribute, attachment, or system metadata;
 - transient ownership and lifetime class;
 - output commit policy.
 
-Invocation materialization should produce the corresponding typed
+Compute plans additionally contain at most one `PreparedMetadataCarrier`,
+which owns the semantic and physical plan plus its provider layout.
+
+Invocation materialization produces the corresponding typed
 `PreparedBinding` values: inline bytes, resource reference, transient uploaded
-storage, descriptor scalar, image view, sampler, attachment, or output
-destination.
+storage, aggregate metadata payload, image view, sampler, attachment, or
+output destination.
 
 Backend resolution may validate native limits and cache native objects.
 Backend invocation should only iterate the prepared sequence and encode it. It
@@ -501,13 +568,14 @@ This is the optimal design for Vernon because it centralizes policy while
 retaining the native distinctions needed for CPU call frames, CUDA kernel
 parameters, descriptor APIs, Metal argument buffers, and OpenGL uniforms.
 
-## 10. Migration and verification
+## 10. Verification
 
 Implemented:
 
 1. typed compute and graphics prepared binding entries;
 2. shared physical expansion and structural validation;
-3. explicit descriptor scalar widths in prepared compute sources;
+3. one entry-owned TensorView metadata carrier with compiler-selected
+   `i32`, `i64`, or host-index-width representation;
 4. one ordered compute sequence consumed by CUDA, Vulkan, DirectX 12, Metal,
    OpenGL, and OpenGL ES;
 5. one ordered graphics sequence consumed by Vulkan, DirectX 12, Metal,
@@ -515,10 +583,13 @@ Implemented:
 6. CPU packed-frame offsets, result policy, and tape builtins represented in
    the compute plan;
 7. deletion of backend-local candidate sorting and duplicated invocation
-   filling.
+   filling;
+8. deletion of per-field TensorView descriptor bindings and compatibility
+   readers.
 
-Release acceptance still requires rebuilding all fixtures and passing the
-complete C++ and Python suites on each supported platform.
+Release verification rebuilds all fixtures and runs the complete C++ and
+Python suites on each supported platform. Hardware-dependent Metal execution
+is verified on macOS.
 
 Regression tests must include:
 
@@ -527,6 +598,10 @@ Regression tests must include:
 - nested Struct/Tuple/Tensor Values;
 - dynamic TensorView shapes, offsets, negative/legal strides, and repeated
   invocation with stable ordinals;
+- rank-zero and zero-extent metadata materialization;
+- projection-intermediate overflow rejection;
+- one CUDA metadata parameter after native memref expansion;
+- shader and CUDA metadata-profile size ceilings;
 - aggregate storage-leaf expansion;
 - sampled image/sampler provenance;
 - native and spilled graphics uniforms;
@@ -538,7 +613,11 @@ Regression tests must include:
 
 Compiler reflection and Program aggregation:
 
+- `source/include/mlir/Dialect/Vernon/IR/VernonMetadataAbi.h`
+- `source/lib/Dialect/Vernon/IR/VernonMetadataAbi.cpp`
+- `source/lib/Dialect/Vernon/Transforms/VernonToGPU.cpp`
 - `source/lib/compiler/compiler_reflection.cpp`
+- `source/lib/compiler/compiler_program_compute.cpp`
 - `source/lib/compiler/compiler_program_stage.cpp`
 - `source/lib/compiler/compiler_program_abi.cpp`
 - `source/lib/compiler/compiler_program_aggregation.cpp`
@@ -554,6 +633,8 @@ Runtime parsing and resolve-time projection:
 - `source/lib/runtime/stage_binding_plan.cpp`
 - `source/lib/runtime/pipeline_metadata.h`
 - `source/lib/runtime/pipeline_metadata.cpp`
+- `source/lib/runtime/prepared_binding_plan.h`
+- `source/lib/runtime/prepared_binding_plan.cpp`
 
 Invocation materialization:
 
@@ -567,6 +648,7 @@ Invocation materialization:
 Backend and provider mapping:
 
 - `source/lib/runtime/runtime_pipeline_dispatch.cpp`
+- `source/lib/runtime/runtime_pipeline_backend.h`
 - `source/lib/runtime/runtime_pipeline_cpu.cpp`
 - `source/lib/runtime/runtime_pipeline_cuda.cpp`
 - `source/lib/runtime/runtime_pipeline_vulkan.cpp`

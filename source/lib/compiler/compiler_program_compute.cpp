@@ -20,15 +20,6 @@ void collectPortableSlots(const llvm::json::Object &row, std::set<int64_t> &slot
             if (const llvm::json::Object *leaf = leafValue.getAsObject())
                 if (std::optional<int64_t> slot = leaf->getInteger("binding"))
                     slots.insert(*slot);
-    if (const llvm::json::Object *descriptor = row.getObject("tensor_view_descriptor")) {
-        if (std::optional<int64_t> slot = descriptor->getInteger("offset_binding"))
-            slots.insert(*slot);
-        for (llvm::StringRef field : {"extent_bindings", "stride_bindings"})
-            if (const llvm::json::Array *fieldSlots = descriptor->getArray(field))
-                for (const llvm::json::Value &slotValue : *fieldSlots)
-                    if (std::optional<int64_t> slot = slotValue.getAsInteger())
-                        slots.insert(*slot);
-    }
 }
 
 } // namespace
@@ -106,6 +97,48 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                                     const ProgramNodeBindingIndex &boundValues,
                                     std::map<int64_t, ProgramLogicalResource> &resources, int64_t nextPortableSlot,
                                     ProgramComputeEndpointPlan &plan, std::string &error) {
+    std::set<int64_t> metadataArguments;
+    std::map<int64_t, int64_t> metadataRanks;
+    if (const llvm::json::Object *metadata = compiledEntry.getObject("metadata_carrier")) {
+        const llvm::json::Array *fields = metadata->getArray("fields");
+        if (!fields || fields->empty()) {
+            error = "compiled compute metadata carrier has no semantic fields";
+            return false;
+        }
+        llvm::json::Array semanticFields;
+        for (const auto &[ordinal, fieldValue] : llvm::enumerate(*fields)) {
+            const llvm::json::Object *field = fieldValue.getAsObject();
+            const std::optional<int64_t> argument = field ? field->getInteger("argument") : std::nullopt;
+            const std::optional<llvm::StringRef> kind = field ? field->getString("kind") : std::nullopt;
+            if (!argument || *argument < 0 || !kind || (*kind != "offset" && *kind != "extent" && *kind != "stride") ||
+                field->getInteger("ordinal") != static_cast<int64_t>(ordinal) ||
+                field->getString("units") != "logical_elements") {
+                error = "compiled compute metadata carrier has an invalid semantic field";
+                return false;
+            }
+            metadataArguments.insert(*argument);
+            llvm::json::Object projected{{"ordinal", static_cast<int64_t>(ordinal)},
+                                         {"argument", *argument},
+                                         {"kind", kind->str()},
+                                         {"units", "logical_elements"}};
+            if (*kind == "extent" || *kind == "stride") {
+                const std::optional<int64_t> dimension = field->getInteger("dimension");
+                if (!dimension || *dimension < 0) {
+                    error = "compiled compute metadata carrier has an invalid field dimension";
+                    return false;
+                }
+                projected["dimension"] = *dimension;
+                metadataRanks[*argument] = std::max(metadataRanks[*argument], *dimension + 1);
+            } else if (field->get("dimension")) {
+                error = "compiled compute offset metadata cannot have a dimension";
+                return false;
+            }
+            semanticFields.emplace_back(std::move(projected));
+        }
+        plan.semanticMetadataCarrier = llvm::json::Object{{"fields", std::move(semanticFields)}};
+        plan.physicalMetadataCarrier = copyJsonObject(*metadata);
+        plan.physicalMetadataCarrier->erase("fields");
+    }
     std::map<int64_t, int64_t> accessByValue;
     std::map<std::string, llvm::json::Object> footprints;
     if (const llvm::json::Array *rows = compiledEntry.getArray("tensor_view_write_footprints"))
@@ -316,27 +349,14 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         }
         if (resourceBackedValue) {
             const std::optional<int64_t> slot = row.getInteger("vernon.binding");
-            const llvm::json::Object *descriptor = row.getObject("tensor_view_descriptor");
-            const std::optional<int64_t> offset =
-                descriptor ? descriptor->getInteger("offset_binding") : std::optional<int64_t>{};
-            if (!slot || !offset) {
+            if (!slot || !metadataArguments.count(endpointIndex)) {
                 error = "compiled resource-backed value has an incomplete TensorView carrier";
                 return false;
             }
-            llvm::json::Array abi{
-                llvm::json::Object{
-                    {"semantic", "resource"},
-                    {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}},
-                },
-                llvm::json::Object{
-                    {"semantic", "byte_offset"},
-                    {"carrier", llvm::json::Object{{"tag", "value_slot"},
-                                                   {"slot", *offset},
-                                                   {"byte_offset", int64_t{0}},
-                                                   {"byte_size", int64_t{8}},
-                                                   {"alignment", int64_t{8}}}},
-                },
-            };
+            llvm::json::Array abi{llvm::json::Object{
+                {"semantic", "resource"},
+                {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}},
+            }};
             llvm::json::Object endpoint{
                 {"tag", "resource"},
                 {"module", "compute"},
@@ -412,7 +432,8 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
             error = "compiled compute resource access disagrees with logical access for '" + source->str() + "'";
             return false;
         }
-        const llvm::json::Object *descriptor = row.getObject("tensor_view_descriptor");
+        const bool descriptor = metadataArguments.count(endpointIndex) != 0;
+        const int64_t descriptorRank = descriptor ? metadataRanks[endpointIndex] : 0;
         llvm::json::Array abi;
         if (opaqueResourceEndpoint)
             if (std::optional<int64_t> slot = row.getInteger("vernon.binding"))
@@ -428,32 +449,6 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                              llvm::json::Object{
                                  {"storage_leaf", static_cast<int64_t>(projectedLeafIndex.value_or(0) + leafIndex)}}},
                             {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}}});
-        if (descriptor) {
-            const int64_t rank = descriptor->getInteger("rank").value_or(0);
-            abi.emplace_back(llvm::json::Object{
-                {"semantic", "byte_offset"},
-                {"carrier", llvm::json::Object{{"tag", "value_slot"},
-                                               {"slot", descriptor->getInteger("offset_binding").value_or(-1)},
-                                               {"byte_offset", int64_t{0}},
-                                               {"byte_size", int64_t{8}},
-                                               {"alignment", int64_t{8}}}}});
-            for (llvm::StringRef field : {"extent_bindings", "stride_bindings"}) {
-                const llvm::json::Array *slots = descriptor->getArray(field);
-                if (!slots || static_cast<int64_t>(slots->size()) != rank) {
-                    error = "compiled compute TensorView descriptor is incomplete";
-                    return false;
-                }
-                for (size_t axis = 0; axis < slots->size(); ++axis)
-                    abi.emplace_back(llvm::json::Object{
-                        {"semantic", llvm::json::Object{{field == "extent_bindings" ? "extent" : "byte_stride",
-                                                         static_cast<int64_t>(axis)}}},
-                        {"carrier", llvm::json::Object{{"tag", "value_slot"},
-                                                       {"slot", (*slots)[axis].getAsInteger().value_or(-1)},
-                                                       {"byte_offset", int64_t{0}},
-                                                       {"byte_size", int64_t{8}},
-                                                       {"alignment", int64_t{8}}}}});
-            }
-        }
         if (abi.empty()) {
             error = "compiled compute resource endpoint has no storage leaves";
             return false;
@@ -470,9 +465,9 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         else {
             resourceLayout =
                 llvm::json::Object{{"tag", "buffer"},
-                                   {"view_rank", descriptor ? descriptor->getInteger("rank").value_or(0) : 0},
+                                   {"view_rank", descriptorRank},
                                    {"shape", copyJsonArray(*(physicalShape ? physicalShape : logicalShape))},
-                                   {"descriptor", descriptor != nullptr},
+                                   {"descriptor", descriptor},
                                    {"element_layout_hash", wholeLayout->getString("layout_hash").value_or("").str()},
                                    {"minimum_alignment", wholeLayout->getInteger("alignment").value_or(0)}};
             if (const std::optional<llvm::StringRef> carrier = row.getString("vernon.autodiff_carrier"))
@@ -565,6 +560,7 @@ bool validateCanonicalComputePortableSlots(const llvm::json::Array &endpoints, s
 
 bool buildCanonicalComputeStageContract(const llvm::json::Object &compiledEntry,
                                         const llvm::json::Object &compiledReflection, llvm::json::Array endpoints,
+                                        std::optional<llvm::json::Object> metadataCarrier,
                                         llvm::json::Object &stageContract, std::string &error) {
     llvm::json::Array features;
     std::set<std::string> uniqueFeatures;
@@ -592,6 +588,8 @@ bool buildCanonicalComputeStageContract(const llvm::json::Object &compiledEntry,
     llvm::json::Object reflection{{"required_features", std::move(features)},
                                   {"endpoints", std::move(endpoints)},
                                   {"compute", std::move(compute)}};
+    if (metadataCarrier)
+        reflection["metadata_carrier"] = std::move(*metadataCarrier);
     stageContract = llvm::json::Object{{"operation", "compute"}, {"reflection", std::move(reflection)}};
     return true;
 }

@@ -139,10 +139,9 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         const program::Value &programValue = program.values[binding.value];
         const bool requiresHostProjection =
             std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                return !use.tensorViewDescriptor &&
-                       (use.interfaceKind == "uniform" || use.interfaceKind == "value" ||
-                        use.interfaceKind == "result" ||
-                        (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform));
+                return use.interfaceKind == "uniform" || use.interfaceKind == "value" ||
+                       use.interfaceKind == "result" ||
+                       (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform);
             });
         auto image = programValue.storage
                          ? invocation.controlImage(*programValue.storage)

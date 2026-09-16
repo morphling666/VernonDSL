@@ -29,7 +29,7 @@ namespace mlir::vernon {
 ///
 /// Input/output interfaces have exactly one of location or builtin.
 /// Resource interfaces have both set and binding. Uniform interfaces may omit
-/// both for legacy OpenGL uniforms, or provide both when backed by a descriptor.
+/// both for native OpenGL uniforms, or provide both when backed by a descriptor.
 /// Ordinary values use standard tensor/vector/linalg types and operations; this
 /// schema introduces no Vernon-specific vector or matrix type.
 inline constexpr llvm::StringLiteral kEntryAttrName = "vernon.entry";
@@ -42,9 +42,9 @@ inline constexpr llvm::StringLiteral kBuiltinAttrName = "vernon.builtin";
 inline constexpr llvm::StringLiteral kDescriptorSetAttrName = "vernon.set";
 inline constexpr llvm::StringLiteral kBindingAttrName = "vernon.binding";
 inline constexpr llvm::StringLiteral kInstanceDivisorAttrName = "vernon.instance_divisor";
-inline constexpr llvm::StringLiteral kTensorDescriptorOwnerAttrName = "vernon.tensor_descriptor_owner";
-inline constexpr llvm::StringLiteral kTensorDescriptorComponentAttrName = "vernon.tensor_descriptor_component";
-inline constexpr llvm::StringLiteral kTensorDescriptorDimensionAttrName = "vernon.tensor_descriptor_dimension";
+inline constexpr llvm::StringLiteral kTensorMetadataCarrierAttrName = "vernon.tensor_metadata_carrier";
+inline constexpr llvm::StringLiteral kTensorMetadataProfileAttrName = "vernon.tensor_metadata_profile";
+inline constexpr llvm::StringLiteral kTensorMetadataFieldCountAttrName = "vernon.tensor_metadata_field_count";
 
 enum class ShaderStage { Vertex, Fragment, Compute };
 enum class InterfaceKind { Input, Output, Uniform, Resource };
