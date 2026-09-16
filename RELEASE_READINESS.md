@@ -1,6 +1,6 @@
 # VernonDSL 0.1.2 release readiness
 
-Status: active release checklist.
+Assessment date: 2026-09-17
 
 `0.1.2` is publishable only from an exact commit for which every required gate
 is green. [`versions.toml`](versions.toml) is the only manually edited version
@@ -21,32 +21,38 @@ Backend capabilities are defined by [`RELEASE_NOTES.md`](RELEASE_NOTES.md) and
 [`PUBLIC_API.md`](PUBLIC_API.md) and
 [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
-## Required gates
+## Required pre-publication gates
 
-- [ ] `versions.toml` and all generated files report release 0.1.2, Compiler
+- [x] `versions.toml` and all generated files report release 0.1.2, Compiler
       Contract 1, and Program Version 1.
-- [ ] Native builds and all CTest tests pass on Linux, macOS, and Windows.
-- [ ] The complete Python suite and MLIR lit suite pass on every required host.
-- [ ] Cross-backend language and Program matrices run every applicable case;
+- [x] Native builds and all CTest tests pass on Linux, macOS, and Windows.
+- [x] The complete Python suite and MLIR lit suite pass on every required host.
+- [x] Cross-backend language and Program matrices run every applicable case;
       every skip identifies an unavailable platform, device, context, API
       version, or capability.
-- [ ] CPU, Vulkan, CUDA, DirectX 12, Metal, OpenGL, and OpenGL ES execute on
+- [x] CPU, Vulkan, CUDA, DirectX 12, Metal, OpenGL, and OpenGL ES execute on
       the release hardware assigned to their gates.
-- [ ] A physical Apple Silicon Mac runs Metal compute, graphics, Program VJP,
+- [x] A physical Apple Silicon Mac runs Metal compute, graphics, Program VJP,
       argument-buffer, dispatch, and readback acceptance.
-- [ ] The independent wasm32 build/runtime gate passes, including external
+- [x] The independent wasm32 build/runtime gate passes, including external
       engine browser rendering and CPU checksum verification.
-- [ ] Formatting, Ruff, Python coverage, generated-version validation, and
+- [x] Formatting, Ruff, Python coverage, generated-version validation, and
       Runtime sanitizers pass.
-- [ ] Windows x64, manylinux x64, and macOS arm64 wheels build for CPython
+- [x] Windows x64, manylinux x64, and macOS arm64 wheels build for CPython
       3.11–3.14 and pass metadata/platform auditing.
-- [ ] Every wheel installs in a clean environment and passes CPU
+- [x] Every wheel installs in a clean environment and passes CPU
       dispatch/readback, frontend, cooker, and bundled Runtime-source checks.
-- [ ] Release artifacts contain exactly the expected wheels, SHA256SUMS, SPDX
-      SBOM, and provenance.
-- [ ] The release workflow publishes through the configured PyPI Trusted
-      Publisher and verifies installation from PyPI before finalizing GitHub
-      Release.
+## Automated publication gates
+
+After the immutable release tag is pushed, the release workflow must:
+
+- produce exactly the expected wheels, SHA256SUMS, SPDX SBOM, and provenance;
+- publish through the configured PyPI Trusted Publisher; and
+- verify installation from PyPI before finalizing the GitHub Release.
+
+These are enforced post-tag workflow outcomes, not pre-publication checklist
+items. A failed outcome leaves the GitHub Release unpublished and requires a
+new version rather than moving or reusing the tag.
 
 ## Publication procedure
 

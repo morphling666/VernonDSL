@@ -1,8 +1,5 @@
 # VernonDSL 0.1.2 release notes
 
-Status: development release notes. Final publication requires every gate in
-[`RELEASE_READINESS.md`](RELEASE_READINESS.md).
-
 VernonDSL 0.1.2 uses Compiler Contract 1 and Program Version 1. The latest
 released version is 0.1.1. These contract numbers remain fixed throughout the
 0.1.2 release line.
