@@ -832,6 +832,8 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
             const auto *resource = providerBindingResource(value);
             const bool image = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+            const bool buffer = slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                                slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
             const uint64_t expectedKind =
                 slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource : kRhiBufferResource;
             if (!resource ||
@@ -839,10 +841,11 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument,
                     {"metal_resource_binding_has_the_wrong_type_is_stale_or_belongs_to_another_device", 0, 0}})};
-            if (!image && resource->offset >= resource->size)
+            if (buffer && resource->offset >= resource->size)
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument,
-                    {"metal_buffer_binding_range_is_empty_or_out_of_bounds", resource->offset, resource->size}})};
+                    {"metal_buffer_binding_range_is_empty_or_out_of_bounds", resource->offset,
+                     static_cast<uint32_t>(std::min<uint64_t>(resource->size, UINT32_MAX))}})};
             auto resolved = resolveRhiResource(adapter, *resource);
             if (!resolved)
                 return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
