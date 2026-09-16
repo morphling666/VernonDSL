@@ -230,7 +230,7 @@ jobs:
       - name: Repair wheel for manylinux
         run: |
           mkdir -p wheelhouse
-          uvx --from auditwheel auditwheel repair dist/*.whl --wheel-dir wheelhouse
+          uvx --from auditwheel --with "patchelf>=0.14.5" auditwheel repair dist/*.whl --wheel-dir wheelhouse
 
       - name: Validate wheel metadata
         run: uvx --from twine twine check wheelhouse/*.whl
