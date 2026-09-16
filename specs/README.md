@@ -77,9 +77,10 @@ Architecture and tutorials link to the contract instead of redefining fields.
 
 ## Active plans and future designs
 
-- [`runtime/binding_and_tape_contract_plan.md`](runtime/binding_and_tape_contract_plan.md)
-  defines the active PreparedBindingPlan migration, compiler-owned autodiff
-  tape sizing contract, and remaining cross-platform investigation gates.
+- [`runtime/reflection_binding_architecture.md`](runtime/reflection_binding_architecture.md)
+  records the implemented prepared-binding architecture.
+- [`runtime/tensor_view_metadata_abi_plan.md`](runtime/tensor_view_metadata_abi_plan.md)
+  records the implemented aggregate TensorView metadata ABI.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)
   tracks contract-driven, capability-based language test normalization.
 - [`testing/language_feature_inventory.md`](testing/language_feature_inventory.md)
@@ -89,6 +90,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
   permanent Kernel/Module/Program/VJP regression gates.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   lists remaining language-v4 gates.
+- [`future/README.md`](future/README.md) indexes the non-normative future
+  compiler architecture, optimization IR, joint planner, numerical
+  representation, backend lowering, and implementation roadmap.
 - [`future/host_language.md`](future/host_language.md) is a non-normative future
   Host-language and native-interop design.
 - [`roadmap.md`](roadmap.md) lists project-wide unfinished work.

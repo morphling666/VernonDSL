@@ -42,12 +42,13 @@ operands/results, ResourceAccess records, controls, and logical-to-physical
 endpoint projections. Several Nodes MAY reference one Stage; a loader or
 runtime MUST NOT attach one Node's projections to the shared Stage.
 
-The Program object and every ABI object it contains are platform-neutral.
-ArtifactSystem is the only target-specific deployment layer: it selects code
-format and target requirements, but it cannot inject native API binding
-locations into Program or endpoint ABI. Descriptor sets, root parameters,
-Metal indices, GL locations, register numbers, native handles, and native
-pipeline-state objects are forbidden manifest data.
+The Program object and every portable ABI object it contains are
+platform-neutral. ArtifactSystem is the only target-specific deployment layer.
+It selects code format and requirements, and a StageArtifact may carry a
+hash-covered target `implementation` containing compiled endpoint locations
+and interface plans. Descriptor sets, root parameters, Metal indices, GL
+locations, register numbers, native handles, and native pipeline-state objects
+remain forbidden in Program and portable StageContract/endpoint ABI.
 
 Names are diagnostic labels and never identity. IDs, artifact keys, Parameter
 paths, ProgramABI slot IDs and paths, and array position are identity where
@@ -422,6 +423,12 @@ fixture because its Blob and digest are placeholders. A StageArtifact is:
 
 Required members are `tag`, `operation`, `contract_hash`,
 `runtime_requirements`, `modules`, and `reflection`.
+The optional `implementation` member contains the selected target's compiled
+ABI. When present it contains exactly required `target`, `metadata`, and
+`endpoints`, plus `metadata_carrier` exactly when portable compute reflection
+declares one. `target` equals the enclosing ArtifactSystem backend.
+`implementation` is target-specific, hash-covered StageArtifact content; it
+does not alter the portable StageContract identified by `contract_hash`.
 `operation` is `compute` or `graphics`. Each CodeModule contains exactly
 `role`, `format`, `entry_point`, `blob`, `offset`, `byte_length`, and
 `sha256`. Its checked non-empty range and range hash follow value-artifact
@@ -686,7 +693,14 @@ A Value is a strict object containing:
 - optional `storage`, required for a storage-backed root or view;
 - optional `view`, required exactly for a `ViewOrigin`;
 - optional `value_layout`, allowed only for canonical value elements or the
-  whole by-value ABI.
+  whole by-value ABI;
+- optional positive `minimum_tape_stride_bytes`, required exactly for an
+  `!vernon.ad_tape` Value and forbidden for every other type.
+
+`minimum_tape_stride_bytes` is the compiler-derived minimum valid initial byte
+stride for one logical tape lane. It is ABI, not a frontend hint. It
+participates in canonical Program identity and must equal the corresponding
+TapePlan value.
 
 There is no external token or effect-token Value in this contract.
 
@@ -1412,7 +1426,10 @@ Cotangents project from forward outputs and gradients project from forward
 inputs. Each `!vernon.ad_tape` Value has exactly one ordered `tape_plans`
 record describing its forward producer, backward consumer, required carriers
 `["tape_data","replay_segment"]`, and optional carriers
-`["launch_metadata","replay_status"]`.
+`["launch_metadata","replay_status"]`. The record also contains required
+positive `minimum_tape_stride_bytes`, equal to the tape Value field. Runtime
+uses it as the initial per-lane lower bound and may grow it only through the
+checked overflow/replay contract.
 
 Parameters do not appear in ProgramABI boundary slots. They are bound through
 `parameters`. State updates are not public values unless also represented by
@@ -2187,50 +2204,37 @@ their numeric tuple. Numeric fields are uint32, sizes/alignments are positive,
 and alignment is a power of two. Endpoint transport constrains its primary
 `value`, `resource`, or `sampler` semantic: `by_value` uses a value slot or
 constant region; `resource_handle` uses a resource slot; `device_address` uses
-a device-address slot or value slot. Auxiliary offset, length, extent, and
-stride semantics use value slots or constant regions independently of the
-primary transport. TensorView endpoints list one `storage_leaf` resource
-carrier for every canonical element-layout leaf, followed by every extent,
-stride, byte offset, and byte length carrier consumed by emitted code.
+a device-address slot or value slot. TensorView endpoint ABI lists only genuine
+value or storage-leaf carriers. Offset, extent, and stride are owned by the
+entry `metadata_carrier` semantic sequence and do not allocate per-field
+endpoint slots.
 `sampler_endpoint` is required when image and sampler are one logical combined
 binding.
 
-Native descriptor sets/bindings, root parameters, argument-buffer indices,
-uniform locations, texture units, register numbers, and host frame symbols
-are never serialized in Program or StageArtifact reflection. Each target
-format has a deterministic lowering from portable ABI slots to its native
-locations. Artifact validation proves that emitted code implements that
-lowering; Runtime does not recover native locations from Program metadata.
+Portable endpoint slots are global within one stage, contiguous, and contain no
+native-location policy. Native descriptor sets/bindings, root parameters,
+argument-buffer indices, uniform locations, texture units, register numbers,
+CUDA parameter ordinals, and host frame offsets are forbidden in Program and
+portable StageContract reflection.
 
-Portable slots are global within one stage and contiguous from zero. A slot is
-lowered as follows; this table is target ABI, not serialized reflection:
+The optional StageArtifact `implementation` record is the compiler-selected
+physical ABI:
 
-- CPU: endpoints are ordered by reflected endpoint order and each endpoint's
-  carriers are ordered by semantic ordinal. Those carriers are concatenated
-  into a pointer-aligned frame; resource and device-address carriers contain
-  their address and value carriers contain their declared bytes. This
-  endpoint-major frame rule is independent of graphics slot numbering and has
-  no hidden TensorView fields because every frame word has a declared carrier.
-- Vulkan: slot `S` is descriptor set 0, binding `S`. Resource carriers use the
-  descriptor type implied by endpoint role. Value slots are storage-buffer
-  descriptors containing the declared bytes. No push-constant substitution is
-  permitted.
-- Metal: slot `S` is member ID `S` of argument buffer index 0. Resource and
-  value carriers are represented by the corresponding argument-buffer pointer;
-  a value slot points at bytes with the declared size and alignment.
-- CUDA: slot `S` is kernel parameter `S`. Resources and device addresses are
-  pointer parameters; value slots are pointer parameters to the declared bytes.
-- DirectX: slot `S` is register index `S`, space 0, in the register class
-  implied by endpoint role. Value slots are SRV byte-address buffers. The root
-  ProgramABI boundary order is derived from this sequence.
-- OpenGL and OpenGL ES: slot `S` is interface binding `S`; resources use the
-  endpoint-implied interface class and value slots use shader-storage blocks.
+- `metadata` is the strict backend implementation metadata;
+- `endpoints` maps each compiled module interface/index to its portable
+  endpoint and may include target locations such as descriptor set/binding,
+  packed-frame offset, value transport, element layout, or sampled-image
+  bindings;
+- `metadata_carrier`, when required, maps the semantic metadata ordinals
+  bijectively to one physical aggregate and records its profile, layout,
+  interface plan, and target location.
 
-The compiler MUST emit the exact locations above and validate them against its
-own artifact parser before returning a successful result. Runtime derives the
-same mapping from portable slots and rejects an artifact whose target
-reflection disagrees. Compiler-private sidecars may report native locations,
-but neither cooker nor Runtime may require those sidecars.
+CPU, CUDA, and shader targets may select different physical carrier layouts.
+Runtime validates this hash-covered target implementation and materializes it
+through `TargetBindingPlan`, `StageBindingPlan`, and the prepared binding plan.
+It does not derive native locations from portable slot numbers or neighboring
+bindings. Compiler-private sidecars are diagnostic only; cooker and Runtime
+consume the StageArtifact record.
 
 System semantics are `position`, `vertex_index`, `instance_index`,
 `fragment_coordinates`, `sample_index`, `sample_mask`, `target_extent`, or

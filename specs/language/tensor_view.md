@@ -320,9 +320,11 @@ HLSL workgroup   -> groupshared
 
 Reflection describes canonical TensorView records with element layout, source
 shape constraints, rank, access, externally visible address space, storage-leaf
-bindings, and the offset/extent/stride descriptor binding sequence. Concrete
-dispatch values are never reflected. The capability name remains
-`tensor_views`.
+bindings, and one entry-owned offset/extent/stride metadata field sequence.
+The selected StageArtifact implementation maps that sequence to one aggregate
+physical metadata carrier. Metadata fields do not consume independent endpoint
+slots. Concrete dispatch values are never reflected. The capability name
+remains `tensor_views`.
 
 Native runtime records use `VernonTensorView`. Its serialized descriptor is
 frozen for the active release line; backend implementations must conform to it. A future

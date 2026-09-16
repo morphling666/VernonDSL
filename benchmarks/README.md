@@ -17,8 +17,9 @@ single output format consumed by reports and future comparison tooling.
 `environment.surface` distinguishes direct Python DSL calls from cooked C++
 Runtime calls. Both surfaces are generated from `workloads.py`; the C++ surface
 never has a separately authored test Program. A fixture becomes runnable only
-after both drivers are implemented. Catalog validation and listing include
-planned fixtures without presenting them as measurements.
+after both drivers are implemented. The catalog format and listing support
+planned fixtures without presenting them as measurements; the current catalog
+contains only runnable entries.
 
 Binding, Program, backend, and graphics fixtures are runnable on both
 surfaces. Autodiff and application fixtures remain planned and are

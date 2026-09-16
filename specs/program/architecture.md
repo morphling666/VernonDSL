@@ -293,8 +293,9 @@ resource versions, or replay/checkpoint descriptions selected by the resolved
 plan. Each pullback application creates fresh invocation scratch and fresh
 gradient publications.
 
-Graphics execution is currently primal-only. Differentiation fails closed only
-when the requested derivative path traverses a graphics Node.
+Graphics execution is currently primal-only. Capture rejects Program or Module
+VJP when graphics Nodes are present; path-selective pruning of unrelated
+graphics Nodes is not part of the current contract.
 
 The normative differentiation contract is
 [`../autodiff/contract.md`](../autodiff/contract.md).

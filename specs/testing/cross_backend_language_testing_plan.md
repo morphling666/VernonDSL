@@ -1,6 +1,7 @@
 # Cross-Backend Language Testing Plan
 
-Status: active implementation plan.
+Status: active release-validation plan. Checked items are implemented
+infrastructure; unchecked items remain release gates.
 
 ## Goals
 
@@ -50,8 +51,8 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
 
 ## Phase 1: Canonical backend test matrix
 
-- [ ] Add `source/tests/support/backend_test_matrix.h`.
-- [ ] Define one backend row for each compiler/runtime pair:
+- [x] Add `source/tests/support/backend_test_matrix.h`.
+- [x] Define one backend row for each compiler/runtime pair:
   - CPU;
   - CUDA;
   - Vulkan;
@@ -59,7 +60,7 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
   - Metal;
   - OpenGL;
   - OpenGL ES.
-- [ ] Define test requirements for:
+- [x] Define test requirements for:
   - compute;
   - graphics;
   - storage buffers;
@@ -69,28 +70,28 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
   - texture and sampler operations;
   - minimum OpenGL/OpenGL ES API versions;
   - backend-specific ABI or interop capabilities.
-- [ ] Derive availability from existing compiler, runtime, and context capability APIs.
-- [ ] Distinguish platform-not-built, device/context-unavailable, and capability-unsupported skip reasons.
+- [x] Derive availability from existing compiler, runtime, and context capability APIs.
+- [x] Distinguish platform-not-built, device/context-unavailable, and capability-unsupported skip reasons.
 - [ ] Consolidate RHI device/context ownership in `source/tests/support/runtime_rhi_test_utils.h`.
 - [ ] Remove duplicated `OwnedGpuRuntime` implementations after migration.
-- [ ] Add `python/tests/backend_test_matrix.py` with the same backend and requirement semantics.
+- [x] Add `python/tests/backend_test_matrix.py` with the same backend and requirement semantics.
 - [ ] Reject catch-all exception-based skips in the shared harness.
 
 ## Phase 2: Fixture and manifest matrix
 
-- [ ] Replace repeated per-backend fixture blocks in `source/tests/CMakeLists.txt` with one enabled-target loop.
-- [ ] Add OpenGL ES to the fixture target matrix.
-- [ ] Generate a test-only `(fixture_id, target) -> manifest path` table.
-- [ ] Ensure each target-specific artifact is built once and reused by all tests for that target.
-- [ ] Remove grouped `VERNON_*_METAL_MANIFEST`, `VERNON_*_VULKAN_MANIFEST`, and equivalent path macros after consumers migrate.
-- [ ] Parameterize `source/tests/runtime/runtime_module_program_gpu_c_api_test.cpp` as the reference suite.
-- [ ] Run compute Module forward, TensorView chain, dynamic shape/grid reuse, and Module VJP on every applicable backend.
-- [ ] Verify expected run and skip sets on the current platform.
+- [x] Replace repeated per-backend fixture blocks in `source/tests/CMakeLists.txt` with one enabled-target loop.
+- [x] Add OpenGL ES to the fixture target matrix.
+- [x] Generate a test-only `(fixture_id, target) -> manifest path` table.
+- [x] Ensure each target-specific artifact is built once and reused by all tests for that target.
+- [x] Remove grouped `VERNON_*_METAL_MANIFEST`, `VERNON_*_VULKAN_MANIFEST`, and equivalent path macros after consumers migrate.
+- [x] Parameterize `source/tests/runtime/runtime_module_program_gpu_c_api_test.cpp` as the reference suite.
+- [x] Run compute Module forward, TensorView chain, dynamic shape/grid reuse, and Module VJP on every applicable backend.
+- [x] Verify expected run and skip sets on the current platform.
 
 ## Phase 3: Contract-driven language cases
 
-- [ ] Add `python/tests/language_contract_cases.py`.
-- [ ] Give each case:
+- [x] Add `python/tests/language_contract_cases.py`.
+- [x] Give each case:
   - stable contract ID;
   - source construct;
   - valid regions;
@@ -128,7 +129,7 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
 
 ## Phase 5: Existing suite migration
 
-- [ ] Parameterize `source/tests/runtime/runtime_gpu_autodiff_test.cpp`.
+- [x] Parameterize `source/tests/runtime/runtime_gpu_autodiff_test.cpp`.
 - [ ] Parameterize `source/tests/runtime/runtime_module_graphics_program_c_api_test.cpp`.
 - [ ] Migrate `python/tests/test_kernel_runtime.py` to the shared Python backend matrix.
 - [ ] Migrate `python/tests/test_module_graphics_controls.py` to the shared Python backend matrix.
@@ -141,7 +142,7 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
 
 ## Phase 6: CI and release gates
 
-- [ ] Register the complete frontend language-contract suite in CTest.
+- [x] Register the complete frontend language-contract suite in CTest.
 - [ ] Remove the discrepancy between full pytest coverage and CTest Python coverage.
 - [ ] Run compile matrices in Linux, macOS, and Windows jobs for every enabled target.
 - [ ] Run runtime matrices against all capabilities available on each CI machine.

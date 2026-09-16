@@ -5,6 +5,13 @@ Status: future design, not a current VernonDSL contract.
 None of the Host language, C++ extern, desktop Host AOT, or browser
 WebAssembly interfaces described here are part of the current public contract.
 
+This is an orthogonal language and deployment track. The future device
+compiler is organized under [`architecture.md`](architecture.md). Host IR does
+not participate in device partition, communication fusion, tile scheduling, or
+their cost model. A later Host-to-Program invocation contract may submit an
+already validated device plan without changing either side's semantic
+authority.
+
 The first acceptance target is one gameplay example whose source:
 
 - executes through a typed interpreter during development;
@@ -216,9 +223,9 @@ versioned Host entry wrapper and reflection containing:
 ### Invocation ABI
 
 The Host invocation contract is pointer-width-safe. The C struct is compiled
-for the destination target and uses explicit sizes for values and buffers.
-CPU call-frame reflection and TensorView descriptor packing use the target
-pointer size and alignment; they must not use the compiler host ABI.
+for the destination target and uses explicit sizes for supported scalar,
+vector, matrix, struct, enum, and opaque-handle values. TensorView and device
+resource arguments are not part of the first Host ABI.
 
 The Host compiler installs and validates the target data layout before
 reflection, ABI metadata capture, or wrapper lowering. Native and wasm32
@@ -242,8 +249,8 @@ through the native Runtime.
 Requirements:
 
 - build the pinned LLVM with the WebAssembly target enabled;
-- reject host-pointer and TensorView descriptor layouts that cannot be
-  represented by the target pointer width;
+- reject supported Host ABI layouts that cannot be represented by the target
+  pointer width;
 - set the wasm target triple and data layout before LLVM conversion;
 - preserve imported and exported versioned C symbols;
 - use a pinned Emscripten toolchain for final linking;

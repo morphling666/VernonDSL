@@ -214,12 +214,13 @@ image/attachment extents.
 
 Language-level typed shape, strides, and offset use units of the recursively
 resolved leaf element. Compiler reflection and `PROGRAM_VERSION` manifests
-record static shape constraints and descriptor binding positions, never
-concrete dispatch values. Runtime descriptors record byte strides and byte
-offsets after Tensor and Struct layout is resolved. Runtime validation performs
-one checked byte-to-element conversion. External APIs must state whether
-supplied layout values are element or byte units; implicit unit conversion is
-forbidden.
+record static shape constraints and the entry-owned semantic metadata field
+sequence, never concrete dispatch values. The selected StageArtifact
+implementation records one aggregate physical metadata carrier and its target
+location. Runtime descriptors record byte strides and byte offsets after
+Tensor and Struct layout is resolved. Runtime validation performs one checked
+byte-to-element conversion. External APIs must state whether supplied layout
+values are element or byte units; implicit unit conversion is forbidden.
 
 A view is legal when every in-bounds logical index maps within its owner.
 Writable views must be internally injective: distinct logical indices cannot

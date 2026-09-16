@@ -180,8 +180,11 @@ adjoint, and bounded tape representations with deterministic ABI and cache
 identity. Floating leaves are differentiable; aggregates derive adjoint
 structure recursively, while integer, Boolean, Resource handle, sampler, and
 opaque leaves remain non-differentiable unless a versioned custom rule applies.
-Stateful Kernel and graphics VJP require ProgramGraph functionalization,
-effect/alias-safe reverse traversal, and explicit custom graphics primitives.
+Stateful compute Kernel and Module VJP use Program functionalization,
+effect/alias-safe reverse traversal, explicit residuals, and compiler-owned
+tape/replay planning. Graphics VJP remains unsupported and requires separately
+versioned differentiability rules for rasterization, visibility, depth, blend,
+and texture sampling.
 The initial public surface rejects JVP, full Jacobian materialization, nested
 transforms, Hessians, and HVPs.
 Native stage compilation, compile-result normalization, variant deduplication,
@@ -803,10 +806,14 @@ relocatable object, PTX, SPIR-V, GLSL/GLES, MSL, and DXIL.
 One cooked bundle contains one target ArtifactSystem and all typed
 specialization variants for that target. Multi-target deployment emits
 separate bundles.
-Artifact reflection emits the closed endpoint resource-layout and portable
-ABI slots from the Program manifest Appendix B. Backend lowering maps these
-slots deterministically to native locations; descriptor sets, root
-parameters, Metal indices, and GL locations are not manifest fields. Legacy
+Artifact reflection emits the closed endpoint resource layout and portable ABI
+from the Program manifest. The optional target `implementation` record may
+serialize hash-covered compiled endpoint locations, interface plans, and the
+aggregate TensorView metadata carrier selected by the compiler. Descriptor
+sets, root parameters, Metal indices, and GL locations are forbidden in
+portable Program/StageContract reflection, but may appear in this
+target-specific StageArtifact record. Runtime validates it and does not infer
+native locations from neighboring portable slots. Legacy
 `entries[].arguments[].physical_layouts` is not carried into the new pair.
 
 The compiler serializes no node `dependencies` member. It emits Value SSA,

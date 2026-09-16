@@ -108,13 +108,9 @@ The kernel is already `_program_add_{dtype}_rank{n}` with `TensorView[...,
 vd.dyn, ..., write|read]` and `-> None`. Rank selects the kernel; extents stay
 dynamic and come from the descriptor.
 
-Host wiring today still rejects dyn extents in places (`implementationGrid`
-wants a static ranked result to fill `grid`; `_lower_builtin_add` /
-`program_add_invocation` require `extent >= 0`). That is **not** the kernel
-contract. If fluid cook hits it after typing is fixed, fix the host to pass
-rank plus descriptor extents (same as other dyn TensorView kernels). Do not
-specialize `vd.dyn` into the artifact and do not treat static shape as the
-add design.
+The implementation selector preserves dynamic extents and supplies a
+descriptor-driven grid for the builtin add. It does not specialize `vd.dyn`
+into the artifact or treat a static shape as part of add identity.
 
 ## 6. Implementation scope
 
@@ -143,5 +139,5 @@ PYTHONPATH=python .venv/bin/python -m pytest \
   -q --tb=short
 ```
 
-P2 is closed when those two fluid cases **cook**. Numeric pullback may lag one
-step. Existing green AD tests must stay green.
+These cases are permanent regression coverage for dynamic descriptor-driven
+adjoint accumulation. Existing AD tests must remain green.

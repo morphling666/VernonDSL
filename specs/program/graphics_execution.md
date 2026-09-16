@@ -142,16 +142,19 @@ identical with or without fusion.
 
 ## 8. Backend boundary
 
-Physical resolution produces a `ResolvedGraphicsInvocation` containing:
+Physical resolution produces immutable graphics Stage, binding, hazard,
+transition, and publication plans. After invocation bindings and controls are
+available, invocation planning materializes a `PlannedGraphicsInvocation`
+containing:
 
 - selected native graphics Stage executable;
-- exact endpoint carriers and resource bindings;
+- exact endpoint carriers and bound resources;
 - normalized static pipeline state;
 - concrete render-pass, draw, and dynamic controls;
 - planned barriers and image transitions;
-- publication actions.
+- publication actions and retained owners.
 
-Backends consume this normalized object. They do not:
+Backends consume this planned invocation. They do not:
 
 - choose between old and current schemas;
 - parse graphics state at execution time;

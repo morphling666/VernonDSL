@@ -7,13 +7,10 @@ Completed milestones and migrations belong in release notes and Git history.
 
 ## 1. Release verification
 
-- Complete the contract-driven cross-backend language matrix in
+- Complete the unchecked release gates in
   [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md).
-- Run compiler matrices independently from runtime device matrices on Linux,
-  macOS, and Windows.
-- Require explicit capability reasons for every skipped backend case.
-- Keep full CTest, Python, MLIR lit, native example, packaging, and WASM gates
-  green.
+- Complete every gate in [`../RELEASE_READINESS.md`](../RELEASE_READINESS.md)
+  on the exact release commit.
 - Add deterministic and malformed-input fuzzing for source, Program,
   ArtifactSystem, reflection, TensorView, and Command DAG boundaries.
 
@@ -53,13 +50,15 @@ Value/Storage/Resource category.
   worker pool.
 - Extend asynchronous multi-frame execution only through resolved command
   plans, explicit completion, and retained resource ownership.
-- Continue optimizing transfer coalescing, device residency, render-scope
-  fusion, checkpoint selection, and command submission without changing
-  Program semantics.
+- Measure transfer coalescing, device residency, render-scope fusion, and
+  command submission through reproducible reports before changing planner
+  policy.
 - Keep engine-owned graph/encoder embedding separate from the canonical
   Program load, bind, and invoke API.
-- Add distributed execution only after a separate ownership, topology,
-  synchronization, failure, and deployment contract is accepted.
+- The proposed distributed compiler is documented under
+  [`future/README.md`](future/README.md). Before implementation reaches
+  Runtime, accept a versioned ownership, topology, synchronization, failure,
+  transport, and deployment contract.
 
 ## 5. Graphics and resources
 
@@ -95,8 +94,10 @@ requires:
 - one acceptance workload with matching interpreted, native, and browser
   results.
 
-It must compose Programs through the public Program lifecycle rather than
-embedding Python or exposing private Runtime scheduling objects.
+The first Host-language milestone may remain independent of device dispatch.
+A later Host-to-Program integration must compose already validated Programs
+through the public Program lifecycle rather than embedding Python or exposing
+private Runtime scheduling objects.
 
 ## 8. Performance policy
 
