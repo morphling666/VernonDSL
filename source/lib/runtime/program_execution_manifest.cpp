@@ -243,12 +243,11 @@ bool parseTextureFormat(const nlohmann::json &value, VernonTextureFormat &format
 
 bool parseAttachmentSignature(const nlohmann::json &value, bool color, GraphicsAttachmentSignature &signature,
                               Diagnostic &diagnostic, const std::string &path) {
-    const std::initializer_list<std::string_view> required =
-        color ? std::initializer_list<std::string_view>{"location", "access", "formats", "sample_counts"}
-              : std::initializer_list<std::string_view>{"access", "formats", "sample_counts", "aspects"};
-    if (!exactObject(value, required, {}, diagnostic, path) || !uint32Value(value["access"], signature.access) ||
-        !value["formats"].is_array() || value["formats"].empty() || !value["sample_counts"].is_array() ||
-        value["sample_counts"].empty())
+    const bool validFields =
+        color ? exactObject(value, {"location", "access", "formats", "sample_counts"}, {}, diagnostic, path)
+              : exactObject(value, {"access", "formats", "sample_counts", "aspects"}, {}, diagnostic, path);
+    if (!validFields || !uint32Value(value["access"], signature.access) || !value["formats"].is_array() ||
+        value["formats"].empty() || !value["sample_counts"].is_array() || value["sample_counts"].empty())
         return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path,
                     "invalid graphics attachment signature");
     if (color) {
@@ -1705,25 +1704,30 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
         stage.contractHash = row["contract_hash"].get<std::string>();
 
         const auto &requirements = row["runtime_requirements"];
-        const std::initializer_list<std::string_view> requirementFields =
+        const bool validRequirementFields =
             artifacts.target == "cpu"
-                ? std::initializer_list<std::string_view>{"backend", "features", "target_triple", "object_format"}
+                ? exactObject(requirements, {"backend", "features", "target_triple", "object_format"}, {}, diagnostic,
+                              path + "/runtime_requirements")
             : artifacts.target == "metal"
-                ? std::initializer_list<std::string_view>{"backend", "features", "apple_platform", "msl_version",
-                                                          "minimum_os_version"}
+                ? exactObject(requirements,
+                              {"backend", "features", "apple_platform", "msl_version", "minimum_os_version"}, {},
+                              diagnostic, path + "/runtime_requirements")
             : artifacts.target == "opengl" || artifacts.target == "opengles"
-                ? std::initializer_list<std::string_view>{"backend", "features", "glsl_version", "api_version",
-                                                          "profile"}
+                ? exactObject(requirements, {"backend", "features", "glsl_version", "api_version", "profile"}, {},
+                              diagnostic, path + "/runtime_requirements")
             : artifacts.target == "directx"
-                ? std::initializer_list<std::string_view>{"backend",      "features",
-                                                          "api_version",  "minimum_feature_level",
-                                                          "shader_model", "root_signature_version"}
+                ? exactObject(requirements,
+                              {"backend", "features", "api_version", "minimum_feature_level", "shader_model",
+                               "root_signature_version"},
+                              {}, diagnostic, path + "/runtime_requirements")
             : artifacts.target == "cuda"
-                ? std::initializer_list<std::string_view>{"backend", "features", "ptx_version", "address_size",
-                                                          "minimum_compute_capability"}
-                : std::initializer_list<std::string_view>{"backend", "features", "api_version", "spirv_version"};
-        if (!exactObject(requirements, requirementFields, {}, diagnostic, path + "/runtime_requirements") ||
-            !requirements["backend"].is_string() || requirements["backend"] != artifacts.target ||
+                ? exactObject(requirements,
+                              {"backend", "features", "ptx_version", "address_size", "minimum_compute_capability"}, {},
+                              diagnostic, path + "/runtime_requirements")
+                : exactObject(requirements, {"backend", "features", "api_version", "spirv_version"}, {}, diagnostic,
+                              path + "/runtime_requirements");
+        if (!validRequirementFields || !requirements["backend"].is_string() ||
+            requirements["backend"] != artifacts.target ||
             !stringArray(requirements["features"], stage.requiredFeatures, diagnostic,
                          path + "/runtime_requirements/features"))
             return false;
