@@ -1,0 +1,2971 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Joint Optimization Architecture: From Semantic Graph Plans to Simulatable LLM Physical Plans</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f14;
+      --surface: #111821;
+      --surface-2: #17212c;
+      --surface-3: #1d2a37;
+      --text: #e7edf3;
+      --muted: #94a3b2;
+      --line: #293745;
+      --accent: #55c2ff;
+      --accent-2: #70e1b2;
+      --warn: #f2c66d;
+      --danger: #ff8c8c;
+      --code: #0a121a;
+      --max: 1240px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font: 15px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    button,
+    select {
+      font: inherit;
+    }
+
+    code,
+    pre {
+      font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    }
+
+    code {
+      padding: .08rem .3rem;
+      color: #c7eaff;
+      background: var(--code);
+      border-radius: 4px;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      overflow: auto;
+      color: #d7e6f3;
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      line-height: 1.55;
+    }
+
+    .math-block {
+      margin: 18px 0;
+      padding: 18px 20px;
+      overflow-x: auto;
+      color: #d7e6f3;
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .math-block math {
+      min-width: max-content;
+      margin: 0 auto;
+      font-family: "Cambria Math", "STIX Two Math", "Latin Modern Math", serif;
+      font-size: 1.12rem;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 24px 18px;
+      overflow: auto;
+      background: #0e141c;
+      border-right: 1px solid var(--line);
+    }
+
+    .brand {
+      margin-bottom: 26px;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: .02em;
+    }
+
+    .brand small {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    nav a {
+      display: block;
+      margin: 2px 0;
+      padding: 7px 9px;
+      color: var(--muted);
+      border-left: 2px solid transparent;
+    }
+
+    nav a:hover,
+    nav a.active {
+      color: var(--text);
+      background: var(--surface);
+      border-left-color: var(--accent);
+      text-decoration: none;
+    }
+
+    .status {
+      margin-top: 24px;
+      padding: 12px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 12px;
+    }
+
+    main {
+      width: 100%;
+      max-width: var(--max);
+      margin: 0 auto;
+      padding: 56px 44px 100px;
+    }
+
+    section {
+      padding: 28px 0 48px;
+      border-bottom: 1px solid var(--line);
+      scroll-margin-top: 24px;
+    }
+
+    section:last-child {
+      border-bottom: 0;
+    }
+
+    h1 {
+      max-width: 880px;
+      margin: 0 0 18px;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 28px;
+      line-height: 1.25;
+      letter-spacing: -.02em;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 18px;
+    }
+
+    p {
+      max-width: 860px;
+    }
+
+    .lead {
+      max-width: 830px;
+      color: #bdc9d5;
+      font-size: 19px;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .thesis {
+      margin: 32px 0;
+      padding: 20px 24px;
+      background: var(--surface);
+      border-left: 4px solid var(--accent);
+      font-size: 18px;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .accent {
+      color: var(--accent);
+    }
+
+    .good {
+      color: var(--accent-2);
+    }
+
+    .warning {
+      color: var(--warn);
+    }
+
+    .grid-2,
+    .grid-3,
+    .grid-5 {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-5 {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 18px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .metric {
+      color: var(--accent);
+      font-size: 26px;
+      font-weight: 700;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .pill {
+      display: inline-block;
+      margin: 3px 4px 3px 0;
+      padding: 3px 8px;
+      color: var(--muted);
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 12px;
+    }
+
+    .callout {
+      padding: 16px 18px;
+      background: rgba(85, 194, 255, .06);
+      border: 1px solid rgba(85, 194, 255, .35);
+      border-radius: 8px;
+    }
+
+    .callout.warn {
+      background: rgba(242, 198, 109, .06);
+      border-color: rgba(242, 198, 109, .4);
+    }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(110px, 1fr));
+      gap: 8px;
+      margin: 24px 0;
+      overflow-x: auto;
+    }
+
+    .pipeline .node {
+      position: relative;
+      min-width: 110px;
+      padding: 14px 10px;
+      text-align: center;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+
+    .pipeline .node:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -9px;
+      width: 9px;
+      height: 1px;
+      content: "";
+      background: var(--accent);
+    }
+
+    .pipeline strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .pipeline small {
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .architecture {
+      display: grid;
+      gap: 12px;
+      margin: 24px 0;
+      padding: 18px;
+      overflow-x: auto;
+      background: #0d141c;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    .arch-layer {
+      display: grid;
+      grid-template-columns: 150px minmax(720px, 1fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .arch-label {
+      display: grid;
+      place-items: center;
+      min-height: 76px;
+      padding: 12px;
+      color: var(--accent);
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .arch-flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(125px, 1fr));
+      gap: 8px;
+      align-items: center;
+    }
+
+    .arch-flow.four {
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+    }
+
+    .arch-node {
+      position: relative;
+      min-height: 76px;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      font-size: 12px;
+    }
+
+    .arch-node:not(:last-child)::after {
+      position: absolute;
+      top: 50%;
+      right: -9px;
+      z-index: 2;
+      width: 9px;
+      height: 1px;
+      content: "";
+      background: var(--accent);
+    }
+
+    .arch-node b {
+      display: block;
+      color: #d8eaf7;
+    }
+
+    .arch-node small {
+      color: var(--muted);
+    }
+
+    .arch-service {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .arch-service .arch-node {
+      min-height: auto;
+      border-color: rgba(112, 225, 178, .45);
+    }
+
+    .arch-service .arch-node::after {
+      display: none;
+    }
+
+    .arch-feedback {
+      color: var(--accent-2);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    table {
+      width: 100%;
+      margin: 18px 0;
+      border-collapse: collapse;
+      background: var(--surface);
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      text-align: left;
+      vertical-align: top;
+      border: 1px solid var(--line);
+    }
+
+    th {
+      color: #c9d7e4;
+      background: var(--surface-2);
+    }
+
+    td:first-child {
+      color: #d8eaf7;
+      font-weight: 600;
+    }
+
+    .rule {
+      display: grid;
+      grid-template-columns: 38px minmax(0, 1fr);
+      gap: 12px;
+      margin: 11px 0;
+      padding: 14px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .rule-index {
+      display: grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      color: var(--bg);
+      background: var(--accent);
+      border-radius: 50%;
+      font-weight: 800;
+    }
+
+    .rule strong {
+      display: block;
+      margin-bottom: 3px;
+    }
+
+    .tabs,
+    .segmented {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin: 16px 0;
+    }
+
+    button,
+    select {
+      padding: 8px 12px;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    button:hover,
+    button[aria-selected="true"] {
+      color: var(--bg);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    select {
+      cursor: default;
+    }
+
+    .tab-panel[hidden] {
+      display: none;
+    }
+
+    .strategy-layout {
+      display: grid;
+      grid-template-columns: minmax(180px, .7fr) minmax(0, 2fr);
+      gap: 18px;
+    }
+
+    .strategy-list button {
+      display: block;
+      width: 100%;
+      margin-bottom: 7px;
+      text-align: left;
+    }
+
+    .strategy-detail {
+      min-height: 310px;
+      padding: 20px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+    }
+
+    .strategy-detail h3 {
+      margin-top: 0;
+    }
+
+    .derivation {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 16px 0;
+    }
+
+    .derivation div {
+      padding: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 12px;
+    }
+
+    .derivation b {
+      display: block;
+      color: var(--accent);
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+
+    .mesh {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(42px, 1fr));
+      gap: 5px;
+      margin: 18px 0;
+    }
+
+    .gpu {
+      padding: 9px 3px;
+      text-align: center;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      font-size: 11px;
+    }
+
+    .gpu:nth-child(8n) {
+      border-right-color: var(--accent);
+    }
+
+    .gpu b {
+      display: block;
+      color: var(--accent);
+    }
+
+    .attention-state {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 10px;
+      margin: 20px 0;
+    }
+
+    .state-box {
+      padding: 14px;
+      text-align: center;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+
+    .operator {
+      color: var(--accent);
+      font-size: 24px;
+    }
+
+    .explorer {
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .controls {
+      padding: 18px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .controls label {
+      display: block;
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .controls select {
+      display: block;
+      width: 100%;
+      margin-top: 5px;
+    }
+
+    .candidate {
+      padding: 20px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .candidate h3 {
+      margin-top: 0;
+    }
+
+    .candidate-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 16px 0;
+    }
+
+    .candidate-grid div {
+      padding: 11px;
+      background: var(--surface-2);
+      border-radius: 6px;
+    }
+
+    .candidate-grid b {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+
+    .scorebar {
+      height: 8px;
+      margin: 6px 0 14px;
+      overflow: hidden;
+      background: var(--surface-3);
+      border-radius: 999px;
+    }
+
+    .scorebar span {
+      display: block;
+      height: 100%;
+      background: var(--accent);
+    }
+
+    .timeline {
+      position: relative;
+      margin: 22px 0;
+      padding-left: 30px;
+    }
+
+    .timeline::before {
+      position: absolute;
+      top: 8px;
+      bottom: 8px;
+      left: 9px;
+      width: 2px;
+      content: "";
+      background: var(--line);
+    }
+
+    .timeline-step {
+      position: relative;
+      margin: 0 0 18px;
+    }
+
+    .timeline-step::before {
+      position: absolute;
+      top: 6px;
+      left: -26px;
+      width: 10px;
+      height: 10px;
+      content: "";
+      background: var(--accent);
+      border: 3px solid var(--bg);
+      border-radius: 50%;
+    }
+
+    .timeline-step b {
+      display: block;
+    }
+
+    @media (max-width: 920px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      aside {
+        display: none;
+      }
+
+      main {
+        padding: 34px 20px 80px;
+      }
+
+      .grid-3,
+      .grid-5 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .strategy-layout,
+      .explorer {
+        grid-template-columns: 1fr;
+      }
+
+      .derivation {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .arch-layer,
+      .arch-service {
+        grid-template-columns: 120px minmax(720px, 1fr);
+      }
+    }
+
+    @media (max-width: 580px) {
+
+      .grid-2,
+      .grid-3,
+      .grid-5,
+      .candidate-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .attention-state {
+        grid-template-columns: 1fr;
+      }
+
+      .operator {
+        transform: rotate(90deg);
+        text-align: center;
+      }
+
+      .mesh {
+        grid-template-columns: repeat(4, 1fr);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">
+        VernonDSL
+        <small>Future compiler case study</small>
+      </div>
+      <nav id="toc">
+        <a href="#thesis">Core thesis</a>
+        <a href="#architecture">1. End-to-end architecture</a>
+        <a href="#agent">1.1 CandidateGenerator</a>
+        <a href="#semantic">2. Semantic contracts</a>
+        <a href="#rules">3. Joint graph planning</a>
+        <a href="#fusion">3.1 Communication-aware fusion</a>
+        <a href="#precision">3.2 Mixed precision</a>
+        <a href="#lowering">4. Portable Tile IR</a>
+        <a href="#cost">5. External simulation</a>
+        <a href="#workload">6.1 Case-study workload</a>
+        <a href="#strategies">6.2 Strategy candidates</a>
+        <a href="#attention">6.3 Attention candidate</a>
+        <a href="#combined">6.4 Physical-plan derivation</a>
+        <a href="#explorer">6.5 Alternative plans</a>
+        <a href="#boundary">7. Conclusions</a>
+      </nav>
+      <div class="status">
+        Future design, not a current VernonDSL contract.<br><br>
+        This architectural case study defines no current ABI.
+      </div>
+    </aside>
+
+    <main>
+      <section id="thesis">
+        <div class="eyebrow">Future compiler architecture / worked case study</div>
+        <h1>From semantic graph choices to simulatable physical plans</h1>
+        <p class="lead">
+          The compiler does not claim to invent distributed algorithms or novel fusion algorithms. Humans,
+          rules, solvers, search procedures, and agents propose bounded alternatives. The compiler composes and
+          verifies those alternatives, lowers their compute regions to portable tile-level semantics, and only
+          then forms complete physical-plan candidates that an external Simulation Engine can compare.
+        </p>
+        <div class="thesis">
+          <strong>Authority boundary:</strong>
+          <span class="accent">the Program and semantic contracts define what must be preserved</span>.
+          Candidate generators propose how to distribute, represent, fuse, and implement it. The verifier defines
+          the legal set. A replaceable Simulation Engine predicts whole-plan behavior but never makes an illegal
+          plan legal.
+        </div>
+        <div class="callout">
+          <strong>The critical ordering is deliberate.</strong>
+          A joint graph plan is not yet a physical plan: high-level fusion regions do not expose enough local
+          computation and data movement to predict kernel performance. After distribution and representation
+          choices are expanded, the compiler lowers each compute region to <code>Portable Tile IR</code>. A
+          physical plan then combines those tile programs with communication, transfer, placement, dependency,
+          and resource events.
+        </div>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Generate and verify</h3>
+            <p>Propose bounded graph choices, propagate their consequences, and reject violations of semantic,
+              distribution, numerical, memory, or effect contracts.</p>
+          </div>
+          <div class="card">
+            <h3>Make plans evaluable</h3>
+            <p>Lower compute and fused regions to portable tile-level semantics before claiming to predict their
+              performance.</p>
+          </div>
+          <div class="card">
+            <h3>Evaluate externally</h3>
+            <p>Send complete physical plans to analytical models, event simulators, vendor tools, learned models,
+              or measurements through one extensible interface.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <div class="eyebrow">1 / End-to-end compiler architecture</div>
+        <h2>Physical plans are formed only after portable tile semantics exist</h2>
+        <p>
+          The architecture separates four responsibilities: semantic preservation, candidate generation,
+          compilation, and evaluation. The compiler owns semantic composition, verification, tile semantic
+          lowering, and the candidate protocol; proposal mechanisms remain extensible. Evaluation is delegated
+          through a stable protocol to a replaceable Simulation Engine, which may be maintained by this project,
+          another system, or a hardware vendor.
+        </p>
+        <div class="architecture" role="img"
+          aria-label="End-to-end architecture from semantic program to simulated physical plan">
+          <div class="arch-layer">
+            <div class="arch-label">Semantic<br>front end</div>
+            <div class="arch-flow four">
+              <div class="arch-node"><b>Program IR</b><small>Values · Storage · operations · effects</small></div>
+              <div class="arch-node"><b>Operator contracts</b><small>domains · accesses · algebra · aliases</small>
+              </div>
+              <div class="arch-node"><b>Numerical policy</b><small>representations · reductions · quality</small></div>
+              <div class="arch-node"><b>Planning request</b><small>workload · topology · objectives · budgets</small>
+              </div>
+            </div>
+          </div>
+          <div class="arch-service">
+            <div class="arch-label">Candidate<br>generation plane</div>
+            <div class="arch-node">
+              <b>Human · Rules · Solvers · Search · Retrieval · Agent · External synthesis</b>
+              <small>
+                CandidateGenerator is a cross-cutting proposal protocol, not an authority. It can contribute
+                graph decisions, portable-tile rewrites, implementation lowerings, or Simulation Engine adapters.
+                All graph and tile proposals retain provenance, preconditions, fallbacks, and verification evidence.
+              </small>
+            </div>
+          </div>
+          <div class="arch-feedback">↓ propose bounded alternatives under semantic and user constraints</div>
+          <div class="arch-layer">
+            <div class="arch-label">Joint graph<br>planner</div>
+            <div class="arch-flow">
+              <div class="arch-node"><b>Partition</b><small>shards · replicas · partial values</small></div>
+              <div class="arch-node"><b>Logical placement</b><small>mesh shape · topology domains</small></div>
+              <div class="arch-node"><b>Representation</b><small>storage · transfer · compute · accumulator</small>
+              </div>
+              <div class="arch-node"><b>Fusion</b><small>known legal refinements · region boundaries</small></div>
+              <div class="arch-node"><b>Graph schedule</b><small>stages · recompute · asynchronous intent</small></div>
+            </div>
+          </div>
+          <div class="arch-feedback">↓ JointGraphPlanCandidate: decisions and requirements, not predicted performance
+          </div>
+          <div class="arch-layer">
+            <div class="arch-label">Expand and<br>verify</div>
+            <div class="arch-flow">
+              <div class="arch-node"><b>Propagate</b><small>shardings · layouts · representations</small></div>
+              <div class="arch-node"><b>Redistribute</b><small>collectives · routes · chunks</small></div>
+              <div class="arch-node"><b>Convert</b><small>quantize · pack · dequantize</small></div>
+              <div class="arch-node"><b>Materialize</b><small>effects · availability · dependencies</small></div>
+              <div class="arch-node"><b>Verify</b><small>legality · numerics · capacity · progress</small></div>
+            </div>
+          </div>
+          <div class="arch-feedback">↓ DistributedGraphPlan: explicit communication and conversion, high-level compute
+            regions</div>
+          <div class="arch-layer">
+            <div class="arch-label">Tile semantic<br>lowering</div>
+            <div class="arch-flow">
+              <div class="arch-node"><b>Project regions</b><small>exact local inputs and outputs</small></div>
+              <div class="arch-node"><b>Tile data movement</b><small>load · store · gather · convert</small></div>
+              <div class="arch-node"><b>Tile computation</b><small>contract · reduce · map · scan</small></div>
+              <div class="arch-node"><b>Tile dependencies</b><small>completion · effects · allowed splits</small></div>
+              <div class="arch-node"><b>Portable Tile IR</b><small>target-independent tile semantics</small></div>
+            </div>
+          </div>
+          <div class="arch-feedback">↓ assemble tile programs with physical placement, communication, transfer, and
+            resources</div>
+          <div class="arch-layer">
+            <div class="arch-label">Physical plan<br>candidates</div>
+            <div class="arch-flow">
+              <div class="arch-node"><b>Compute tasks</b><small>portable tile programs</small></div>
+              <div class="arch-node"><b>Communication</b><small>participants · routes · representations</small></div>
+              <div class="arch-node"><b>Placement</b><small>devices · memories · topology</small></div>
+              <div class="arch-node"><b>Event DAG</b><small>dependencies · overlap · critical path</small></div>
+              <div class="arch-node"><b>Fallbacks</b><small>legal split and baseline paths</small></div>
+            </div>
+          </div>
+          <div class="arch-feedback">↓ evaluate complete plans, not isolated graph decisions</div>
+          <div class="arch-service">
+            <div class="arch-label">External<br>Simulation Engine</div>
+            <div class="arch-node">
+              <b>Analytical model · Tile IR predictor · Event simulator · Vendor model · Learned model · Measurement</b>
+              <small>
+                A replaceable component consumes PhysicalPlan, HardwareSpec, WorkloadProfile, and objectives.
+                It returns latency, throughput, memory, energy, quality, uncertainty, bottlenecks, and unsupported
+                features. The compiler owns the query contract, not a mandatory implementation.
+              </small>
+            </div>
+          </div>
+          <div class="arch-feedback">↕ rank top-K candidates; refine graph or tile choices when evidence changes the
+            ordering</div>
+          <div class="arch-layer">
+            <div class="arch-label">Select, implement,<br>and execute</div>
+            <div class="arch-flow">
+              <div class="arch-node"><b>Select</b><small>Pareto plan · guards · qualification</small></div>
+              <div class="arch-node"><b>Implement</b><small>baseline · rules · autotuning · Agent</small></div>
+              <div class="arch-node"><b>Lower</b><small>external kernel DSL · target IR · source</small></div>
+              <div class="arch-node"><b>Execute</b><small>artifacts · buffers · declared events</small></div>
+              <div class="arch-node"><b>Observe</b><small>measure · calibrate · replan</small></div>
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <strong>Definition of PhysicalPlan:</strong>
+          an evaluable event graph containing physical placement, explicit communication and conversion, resource
+          requirements, and portable Tile IR for every compute task. It is physical with respect to distribution
+          and execution dependencies, while tile programs remain portable and do not prescribe a backend-specific
+          thread mapping or instruction sequence.
+        </div>
+      </section>
+
+      <section id="agent">
+        <div class="eyebrow">1.1 / Cross-cutting candidate generation</div>
+        <h2>Candidate generators expand a bounded search space without owning correctness or cost</h2>
+        <p>
+          The architecture does not require the compiler to discover a new distributed algorithm or fusion
+          algorithm. A human, library, rule, solver, search procedure, or agent first makes such an algorithm
+          available as a parameterized candidate. The compiler then composes it with other decisions and verifies
+          each instantiated plan.
+        </p>
+        <div>
+          <span class="pill">human schedule</span>
+          <span class="pill">handwritten rewrite</span>
+          <span class="pill">constraint solver</span>
+          <span class="pill">bounded search</span>
+          <span class="pill">autotuner</span>
+          <span class="pill">retrieval</span>
+          <span class="pill">agent</span>
+          <span class="pill">external synthesis</span>
+        </div>
+        <h3>Objects exchanged across the architecture</h3>
+        <div class="grid-5">
+          <div class="card">
+            <h3>SemanticRegion</h3><span class="muted">The observable Program boundary and contracts that every
+              alternative must preserve.</span>
+          </div>
+          <div class="card">
+            <h3>DecisionGraph</h3><span class="muted">Choices, requirements, consequences, rejected alternatives,
+              and provenance.</span>
+          </div>
+          <div class="card">
+            <h3>JointGraphPlan</h3><span class="muted">Provisional partition, placement, representation, fusion,
+              and graph-schedule choices.</span>
+          </div>
+          <div class="card">
+            <h3>PortableTileProgram</h3><span class="muted">Target-independent tile-level computation, data
+              movement, dependencies, and numerical semantics.</span>
+          </div>
+          <div class="card">
+            <h3>PhysicalPlan</h3><span class="muted">A complete evaluable event graph, qualified by workload,
+              topology, and capability.</span>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Before Portable Tile IR</h3>
+            <pre>Op analysis interfaces
+  → CandidateGenerator
+           ↓
+JointGraphPlanCandidate
+  partition + logical placement
+  representation + FusionRegion
+           ↓
+expand + propagate + verify</pre>
+          </div>
+          <div class="card">
+            <h3>After Portable Tile IR</h3>
+            <pre>DistributedGraphPlan
+  → tile semantic lowering
+           ↓
+Portable Tile IR
+  + placement / communication / events
+           ↓
+PhysicalPlanCandidate
+  → external Simulation Engine</pre>
+          </div>
+        </div>
+        <h3>Four proposal points, one acceptance discipline</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Proposal point</th>
+              <th>Possible contribution</th>
+              <th>Acceptance boundary</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Joint graph planning</td>
+              <td>Parameterized distributed strategy, mesh, partition, representation, FusionRegion, stage cut,
+                recomputation, or partial plan</td>
+              <td>Semantic mapping, sharding consistency, effects, numerics, capacity, and communication or
+                progress legality</td>
+            </tr>
+            <tr>
+              <td>Tile semantic lowering</td>
+              <td>Portable tile decomposition or rewrite of a verified compute region</td>
+              <td>Coverage, dependence preservation, numerical refinement, effects, allowed splits, and portable
+                capability contracts</td>
+            </tr>
+            <tr>
+              <td>Simulation integration</td>
+              <td>Feature extractor, analytical predictor, event simulator, learned residual, vendor adapter, or
+                measurement provider</td>
+              <td>Typed query schema, applicability, units, unsupported cases, uncertainty, calibration, and
+                reproducible identity</td>
+            </tr>
+            <tr>
+              <td>Implementation lowering</td>
+              <td>External kernel DSL, target IR, source program, library call, or executable artifact</td>
+              <td>Translation validation, exact target capability, resource checks, reference comparison, and a
+                deterministic fallback</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          An agent may contribute at every proposal point, but it cannot certify its own output. Portability comes
+          from preserving the same SemanticRegion and Portable Tile IR meaning while regenerating target-specific
+          implementations—not from assuming one low-level kernel is portable.
+        </p>
+        <h3>Tiered candidate generation</h3>
+        <div class="pipeline" aria-label="Tiered candidate generation">
+          <div class="node"><strong>Tier 0</strong><small>deterministic baseline</small></div>
+          <div class="node"><strong>Tier 1</strong><small>rules + templates</small></div>
+          <div class="node"><strong>Tier 2</strong><small>search + autotuning</small></div>
+          <div class="node"><strong>Tier 3</strong><small>agent synthesis</small></div>
+          <div class="node"><strong>Verify</strong><small>shared obligations</small></div>
+          <div class="node"><strong>Simulate</strong><small>external evidence</small></div>
+          <div class="node"><strong>Retain</strong><small>qualified variants</small></div>
+        </div>
+        <div class="callout">
+          Candidate history is indexed by semantic region, shape, workload phase, topology, hardware
+          capabilities, toolchain, and counterexample boundaries. It seeds future searches but never bypasses
+          revalidation or Simulation Engine applicability checks.
+        </div>
+      </section>
+
+      <section id="semantic">
+        <div class="eyebrow">2 / Operator semantics and compute fusion</div>
+        <h2>Operators expose provable semantics from which the compiler derives compute fusion</h2>
+        <p>
+          The planner does not infer behavior from names such as <code>matmul</code>, <code>softmax</code>, or
+          <code>attention</code>. Operators expose semantic facts, compositional algebra, and exceptional
+          constraints—not implementation hints such as “use FlashAttention” or “tile=128.” Unknown information
+          creates a conservative barrier rather than fabricated semantics.
+        </p>
+        <h3>The general theory: fusion is a schedule transformation</h3>
+        <p>
+          Fusion is not justified by recognizing adjacent operator names. In the dependence and polyhedral
+          formulation, each operation <code>S</code> has an iteration domain <code>D<sub>S</sub></code>, read and
+          write relations from iterations to logical data coordinates, and a schedule
+          <code>θ<sub>S</sub></code> that assigns each dynamic operation instance a lexicographic logical time.
+          Accesses to the same logical coordinate induce true, anti-, and output dependences; effects and explicit
+          semantic ordering add further dependence edges.
+        </p>
+        <div class="math-block">
+          <math display="block" aria-label="Operation domains and access relations">
+            <mtable columnalign="left left" columnspacing="1.8em" rowspacing=".65em">
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>D</mi>
+                    <mi>S</mi>
+                  </msub>
+                </mtd>
+                <mtd>
+                  <mtext>dynamic instances of operation S</mtext>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>R</mi>
+                    <mrow>
+                      <mi>S</mi>
+                      <mo>,</mo>
+                      <mi>o</mi>
+                    </mrow>
+                  </msub>
+                  <mo>⊆</mo>
+                  <msub>
+                    <mi>D</mi>
+                    <mi>S</mi>
+                  </msub>
+                  <mo>×</mo>
+                  <msub>
+                    <mi>I</mi>
+                    <mi>o</mi>
+                  </msub>
+                </mtd>
+                <mtd>
+                  <mtext>read relation from instances to coordinates of object o</mtext>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>W</mi>
+                    <mrow>
+                      <mi>S</mi>
+                      <mo>,</mo>
+                      <mi>o</mi>
+                    </mrow>
+                  </msub>
+                  <mo>⊆</mo>
+                  <msub>
+                    <mi>D</mi>
+                    <mi>S</mi>
+                  </msub>
+                  <mo>×</mo>
+                  <msub>
+                    <mi>I</mi>
+                    <mi>o</mi>
+                  </msub>
+                </mtd>
+                <mtd>
+                  <mtext>write relation from instances to coordinates of object o</mtext>
+                </mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <div class="math-block">
+          <math display="block" aria-label="True dependence relation from operation S to operation T">
+            <mrow>
+              <msub>
+                <mi>Δ</mi>
+                <mrow>
+                  <mi>S</mi>
+                  <mo>→</mo>
+                  <mi>T</mi>
+                  <mo>,</mo>
+                  <mi>o</mi>
+                </mrow>
+              </msub>
+              <mo>=</mo>
+              <mo>{</mo>
+              <mrow>
+                <mo>(</mo>
+                <mi>x</mi>
+                <mo>,</mo>
+                <mi>y</mi>
+                <mo>)</mo>
+              </mrow>
+              <mo>∈</mo>
+              <msub>
+                <mi>D</mi>
+                <mi>S</mi>
+              </msub>
+              <mo>×</mo>
+              <msub>
+                <mi>D</mi>
+                <mi>T</mi>
+              </msub>
+              <mo>|</mo>
+              <mo>∃</mo>
+              <mi>a</mi>
+              <mo>:</mo>
+              <mrow>
+                <mo>(</mo>
+                <mi>x</mi>
+                <mo>,</mo>
+                <mi>a</mi>
+                <mo>)</mo>
+              </mrow>
+              <mo>∈</mo>
+              <msub>
+                <mi>W</mi>
+                <mrow>
+                  <mi>S</mi>
+                  <mo>,</mo>
+                  <mi>o</mi>
+                </mrow>
+              </msub>
+              <mo>∧</mo>
+              <mrow>
+                <mo>(</mo>
+                <mi>y</mi>
+                <mo>,</mo>
+                <mi>a</mi>
+                <mo>)</mo>
+              </mrow>
+              <mo>∈</mo>
+              <msub>
+                <mi>R</mi>
+                <mrow>
+                  <mi>T</mi>
+                  <mo>,</mo>
+                  <mi>o</mi>
+                </mrow>
+              </msub>
+              <mo>}</mo>
+            </mrow>
+          </math>
+        </div>
+        <div class="math-block">
+          <math display="block" aria-label="Schedule legality requires every dependence to move forward">
+            <mrow>
+              <mo>∀</mo>
+              <mrow>
+                <mo>(</mo>
+                <mi>x</mi>
+                <mo>,</mo>
+                <mi>y</mi>
+                <mo>)</mo>
+              </mrow>
+              <mo>∈</mo>
+              <msub>
+                <mi>Δ</mi>
+                <mtext>required</mtext>
+              </msub>
+              <mo>,</mo>
+              <msub>
+                <mi>θ</mi>
+                <mi>S</mi>
+              </msub>
+              <mo>(</mo>
+              <mi>x</mi>
+              <mo>)</mo>
+              <msub>
+                <mo>≺</mo>
+                <mtext>lex</mtext>
+              </msub>
+              <msub>
+                <mi>θ</mi>
+                <mi>T</mi>
+              </msub>
+              <mo>(</mo>
+              <mi>y</mi>
+              <mo>)</mo>
+            </mrow>
+          </math>
+        </div>
+        <p>
+          A fusion candidate replaces the original schedules and may eliminate an intermediate materialization.
+          It is accepted only when the following sufficient proof obligations all hold. For affine or Presburger
+          domains and accesses, relation composition, image/preimage, emptiness, and lexicographic-order checks
+          can discharge these obligations exactly. General data-dependent accesses use a richer domain-specific
+          relation or a conservative unknown; the compiler does not pretend that every operator is polyhedral.
+        </p>
+        <div class="grid-3">
+          <div class="card">
+            <h3>1. Coverage and value mapping</h3>
+            <p>Every required source instance is executed exactly once, or is deliberately recomputed under a valid
+              refinement. Boundary Values and Storage versions map to the same observable results.</p>
+          </div>
+          <div class="card">
+            <h3>2. Dependence preservation</h3>
+            <p>Every required RAW, WAR, WAW, effect, alias, publication, and explicit-order edge remains
+              lexicographically forward in the fused schedule.</p>
+          </div>
+          <div class="card">
+            <h3>3. Region availability</h3>
+            <p>For each consumer tile, access-relation preimages identify the exact producer instances and data regions
+              that must be complete before consumption.</p>
+          </div>
+          <div class="card">
+            <h3>4. Reduction completion</h3>
+            <p>A nonlinear consumer cannot observe a partial reduction. Reordering or distributed combination requires
+              declared identity, associativity, commutativity, and ordering laws.</p>
+          </div>
+          <div class="card">
+            <h3>5. Effects and lifetime</h3>
+            <p>Fusion preserves aliases, visible side effects, synchronization, ownership, other users, and the lifetime
+              of any intermediate whose materialization is removed.</p>
+          </div>
+          <div class="card">
+            <h3>6. Numerical refinement</h3>
+            <p>The new evaluation order, precision, overflow, rounding, and exceptional-value behavior must satisfy the
+              declared numerical and reproducibility policy.</p>
+          </div>
+        </div>
+        <div class="thesis">
+          <strong>Sufficient-condition guarantee:</strong>
+          if the fused implementation preserves boundary coverage and value mapping, orders every required
+          dependence, consumes only complete required regions, and satisfies effect, alias, reduction, and
+          numerical contracts, then it is observationally equivalent at the SemanticRegion boundary.
+          Failure to prove any obligation rejects the candidate; profitability is a separate question.
+        </div>
+        <h3>Foundations and concrete compiler machinery</h3>
+        <ul>
+          <li>
+            <a href="https://link.springer.com/article/10.1007/BF01407835" target="_blank" rel="noopener">
+              Feautrier, “Some efficient solutions to the affine scheduling problem, Part I”
+            </a>
+            formalizes dependence-preserving affine schedules.
+          </li>
+          <li>
+            <a href="https://mlir.llvm.org/doxygen/classmlir_1_1presburger_1_1IntegerRelation.html" target="_blank"
+              rel="noopener">MLIR IntegerRelation</a>
+            provides integer-set relations, composition, inversion, intersection, and emptiness operations used
+            to represent domains, accesses, and dependences.
+          </li>
+          <li>
+            <a href="https://mlir.llvm.org/docs/Dialects/Linalg/" target="_blank" rel="noopener">
+              MLIR Linalg dialect rationale
+            </a>
+            explains how iteration spaces and indexing maps support tiling and tiled producer-consumer fusion.
+          </li>
+          <li>
+            <a href="https://mlir.llvm.org/docs/Tutorials/transform/Ch1/" target="_blank" rel="noopener">
+              MLIR Transform tutorial: tile and fuse
+            </a>
+            demonstrates consumer tiling followed by producer fusion through required operand slices.
+          </li>
+        </ul>
+        <table>
+          <thead>
+            <tr>
+              <th>Operator interface</th>
+              <th>Required contract</th>
+              <th>Graph-compiler use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>TypesAndShapes</td>
+              <td>Operand and result element types, ranks, symbolic extents, equalities, divisibility, bounds, and
+                dynamic constraints</td>
+              <td>Prove region coverage, enumerate legal splits and tiles, and generate shape guards</td>
+            </tr>
+            <tr>
+              <td>IterationDomain</td>
+              <td><code>b,hq,q,k,d,dv</code>; token and expert index sets; causal or ragged domains</td>
+              <td>Identify parallel, splittable, and ordered work domains</td>
+            </tr>
+            <tr>
+              <td>AccessRelation</td>
+              <td>Value and Storage regions read or written by each iteration; GQA maps, KV page tables, and expert
+                token lists</td>
+              <td>Compute producer iterations required by a consumer tile, reuse, communication regions, and
+                materialization</td>
+            </tr>
+            <tr>
+              <td>IteratorKinds</td>
+              <td>Parallel, reduction, scan, ordered, and data-dependent iterators</td>
+              <td>Determine whether a split produces independent Values or a <code>PartialValue</code>, and when it is
+                complete</td>
+            </tr>
+            <tr>
+              <td>ScalarSemantics</td>
+              <td>Contribution, combiner, identity, associativity, commutativity, ordering, and online-summary
+                refinements</td>
+              <td>Prove reduction reordering, partial combination, algorithmic replacement, and cross-tile merging</td>
+            </tr>
+            <tr>
+              <td>EffectsAndAliases</td>
+              <td>Read, write, atomic, allocation, and publication effects; Storage versions and alias sets</td>
+              <td>Prevent fusion across observable writes, hazards, or ownership boundaries</td>
+            </tr>
+            <tr>
+              <td>Dependencies</td>
+              <td>Semantic ordering and completion requirements not captured by SSA, effects, or Storage versions</td>
+              <td>Build asynchronous task edges and prevent premature consumption through overlap or fusion</td>
+            </tr>
+            <tr>
+              <td>PartitionRules</td>
+              <td>Operand/result factor correspondence, legal splits, required replication, padding, raggedness, and
+                partial combination</td>
+              <td>Propagate partitions to a fixed point in both directions and create redistribution at
+                incompatibilities</td>
+            </tr>
+            <tr>
+              <td>FusionRules</td>
+              <td>Mandatory materialization, completion points, and refinement preconditions not derivable from general
+                facts</td>
+              <td>Add exceptional legality constraints without enumerating adjacent operator names worth fusing</td>
+            </tr>
+            <tr>
+              <td>NumericalPolicy</td>
+              <td>Logical encoding, reassociation, accumulator and order, rounding and overflow, reproducibility, and
+                quality</td>
+              <td>Enumerate mixed-precision plans and reject fusion that changes numerical meaning</td>
+            </tr>
+            <tr>
+              <td>ReferenceSemantics</td>
+              <td>A trusted conservative implementation, observable boundaries, and input/output mapping</td>
+              <td>Support translation validation, differential testing, and split fallback</td>
+            </tr>
+            <tr>
+              <td>CostFeatures</td>
+              <td>Only typed payloads not derivable from domains and accesses, such as ragged distributions or cache-hit
+                priors</td>
+              <td>Contribute to valuation without deciding legality or embedding a target schedule</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Operators should not expose</h3>
+            <p class="muted">
+              GPU ranks, collective-library names, warps or CTAs, tile sizes, shared-memory swizzles, CUDA
+              intrinsics, stream IDs, predicted runtime, or strategies named TP or Flash. These belong to
+              topology profiles, physical schedules, backend capabilities, or cost profiles.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Opaque operators remain valid</h3>
+            <p class="muted">
+              They still require typed boundaries, effects and aliases, capabilities, conservative cost,
+              reference behavior, and fallback. Missing access or algebra information makes an operator a
+              partition and fusion barrier; backend code is never used to reconstruct semantics.
+            </p>
+          </div>
+        </div>
+        <h3>Strict derivation: tiled matmul followed by ReLU</h3>
+        <p>
+          Consider a contraction that produces <code>C</code> and a pointwise consumer that produces
+          <code>O</code>. The derivation below uses only the contracts and proof obligations above.
+        </p>
+        <div class="math-block">
+          <math display="block" aria-label="Iteration domains for matrix multiplication and ReLU">
+            <mtable columnalign="left" rowspacing=".8em">
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>D</mi>
+                    <mi>M</mi>
+                  </msub>
+                  <mo>=</mo>
+                  <mo>{</mo>
+                  <mrow>
+                    <mo>(</mo>
+                    <mi>i</mi>
+                    <mo>,</mo>
+                    <mi>j</mi>
+                    <mo>,</mo>
+                    <mi>k</mi>
+                    <mo>)</mo>
+                  </mrow>
+                  <mo>∈</mo>
+                  <msup>
+                    <mi>ℤ</mi>
+                    <mn>3</mn>
+                  </msup>
+                  <mo>|</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>i</mi>
+                  <mo>&lt;</mo>
+                  <mi>M</mi>
+                  <mo>,</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>j</mi>
+                  <mo>&lt;</mo>
+                  <mi>N</mi>
+                  <mo>,</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>k</mi>
+                  <mo>&lt;</mo>
+                  <mi>K</mi>
+                  <mo>}</mo>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>D</mi>
+                    <mi>R</mi>
+                  </msub>
+                  <mo>=</mo>
+                  <mo>{</mo>
+                  <mrow>
+                    <mo>(</mo>
+                    <mi>i</mi>
+                    <mo>,</mo>
+                    <mi>j</mi>
+                    <mo>)</mo>
+                  </mrow>
+                  <mo>∈</mo>
+                  <msup>
+                    <mi>ℤ</mi>
+                    <mn>2</mn>
+                  </msup>
+                  <mo>|</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>i</mi>
+                  <mo>&lt;</mo>
+                  <mi>M</mi>
+                  <mo>,</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>j</mi>
+                  <mo>&lt;</mo>
+                  <mi>N</mi>
+                  <mo>}</mo>
+                </mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <pre>Producer M:
+  reads  A[i,k], B[k,j]
+  reduction contribution: A[i,k] * B[k,j]
+  combiner: floating-point add under NumericalPolicy
+  writes completed C[i,j] after all k
+
+Consumer R:
+  reads  C[i,j]
+  writes O[i,j] = max(C[i,j], 0)</pre>
+        <div class="math-block">
+          <math display="block" aria-label="Dependence, consumer tile, and required producer preimage">
+            <mtable columnalign="left" rowspacing=".8em">
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>Δ</mi>
+                    <mrow>
+                      <mi>M</mi>
+                      <mo>→</mo>
+                      <mi>R</mi>
+                    </mrow>
+                  </msub>
+                  <mo>=</mo>
+                  <mo>{</mo>
+                  <mrow>
+                    <mo>(</mo>
+                    <mrow>
+                      <mo>(</mo>
+                      <mi>i</mi>
+                      <mo>,</mo>
+                      <mi>j</mi>
+                      <mo>,</mo>
+                      <mi>k</mi>
+                      <mo>)</mo>
+                    </mrow>
+                    <mo>,</mo>
+                    <mrow>
+                      <mo>(</mo>
+                      <mi>i</mi>
+                      <mo>,</mo>
+                      <mi>j</mi>
+                      <mo>)</mo>
+                    </mrow>
+                    <mo>)</mo>
+                  </mrow>
+                  <mo>|</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>k</mi>
+                  <mo>&lt;</mo>
+                  <mi>K</mi>
+                  <mo>}</mo>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>T</mi>
+                    <mi>R</mi>
+                  </msub>
+                  <mo>=</mo>
+                  <mi>I</mi>
+                  <mo>×</mo>
+                  <mi>J</mi>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd>
+                  <msub>
+                    <mi>P</mi>
+                    <mi>M</mi>
+                  </msub>
+                  <mo>(</mo>
+                  <msub>
+                    <mi>T</mi>
+                    <mi>R</mi>
+                  </msub>
+                  <mo>)</mo>
+                  <mo>=</mo>
+                  <mo>{</mo>
+                  <mrow>
+                    <mo>(</mo>
+                    <mi>i</mi>
+                    <mo>,</mo>
+                    <mi>j</mi>
+                    <mo>,</mo>
+                    <mi>k</mi>
+                    <mo>)</mo>
+                  </mrow>
+                  <mo>|</mo>
+                  <mi>i</mi>
+                  <mo>∈</mo>
+                  <mi>I</mi>
+                  <mo>,</mo>
+                  <mi>j</mi>
+                  <mo>∈</mo>
+                  <mi>J</mi>
+                  <mo>,</mo>
+                  <mn>0</mn>
+                  <mo>≤</mo>
+                  <mi>k</mi>
+                  <mo>&lt;</mo>
+                  <mi>K</mi>
+                  <mo>}</mo>
+                </mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <h3>Discharging the obligations</h3>
+        <div class="timeline">
+          <div class="timeline-step"><b>1. Tile the consumer</b>Choose <code>T_R = I × J</code>. Its read relation
+            requires exactly <code>C[I,J]</code>.</div>
+          <div class="timeline-step"><b>2. Compute the producer preimage</b>Inverting the producer write map for
+            <code>C[I,J]</code> yields <code>I × J × [0,K)</code>. The full reduction dimension is required; this is a
+            relation calculation, not a pattern guess.</div>
+          <div class="timeline-step"><b>3. Construct the fused schedule</b>For each <code>(i,j) ∈ I × J</code>, execute
+            all required <code>k</code> contributions, complete the reduction into a private tile value, then execute
+            ReLU. Thus every edge in <code>Δ_(M→R)</code> remains forward.</div>
+          <div class="timeline-step"><b>4. Prove materialization removal</b>If <code>C[I,J]</code> has no external user,
+            observable storage identity, alias, or publication effect, the private completed tile supplies the same
+            Value and the global C write/read pair may be removed.</div>
+          <div class="timeline-step"><b>5. Check numerical policy</b>The candidate preserves the declared order of the
+            <code>k</code> reduction, then applies ReLU once. It does not move ReLU into the reduction.</div>
+          <div class="timeline-step"><b>6. Form the physical region</b>The accepted FusionRegion contains the producer
+            preimage, completed tile value, and consumer tile, with an allowed split between completed matmul and ReLU.
+            Tile scheduling remains a later profitability decision.</div>
+        </div>
+        <pre>Legal fused order for each output tile:
+  for i in I, j in J:
+    c = reduction_identity
+    for k in [0,K):
+      c = combine(c, A[i,k] * B[k,j])
+    O[i,j] = relu(c)
+
+Rejected order:
+  for k in [0,K):
+    c = relu(combine(c, A[i,k] * B[k,j]))
+
+Reason:
+  the nonlinear consumer observes incomplete reduction states, and in general
+  relu(Σ x_k) ≠ Σ relu(x_k).</pre>
+        <div class="callout warn">
+          <strong>Where attention differs:</strong> replacing materialized softmax with an online
+          <code>AttentionSummary(m,l,o)</code> is not implied by generic fusion theory. It is an algorithmic
+          refinement with a separately declared and verified combine law. Once that equivalence is available,
+          the same coverage, dependence, completion, effect, and numerical obligations derive legal tiled,
+          split-K, paged, or streamed fusion candidates. Without the refinement proof, the compiler must retain
+          materialized softmax or another validated fallback.
+        </div>
+      </section>
+
+      <section id="rules">
+        <div class="eyebrow">3 / Joint graph planning</div>
+        <h2>Partition, placement, representation, and fusion are proposed together and expanded explicitly</h2>
+        <p>
+          Joint optimization means shared global evaluation, not one monolithic solver. Candidate generators
+          propose bounded combinations; the planner keeps several alternatives and expands each one. Logical
+          distribution first represents partitions, placements, replicas, and partial results. Any incompatible
+          producer and consumer partition, placement, or representation creates a <code>Redistribution</code>;
+          route, algorithm, conversion, and chunk choices then become explicit asynchronous work.
+        </p>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Logical distribution IR</h3>
+            <pre>Partition
+  semantic factors / regions → logical pieces
+
+Placement
+  pieces → compute + memory resources
+
+Replication
+  replicas + owners + consistency
+
+PartialValue
+  contributions + declared combine + numerics</pre>
+          </div>
+          <div class="card">
+            <h3>Mismatch becomes explicit work</h3>
+            <pre>producer partition / placement / representation
+                  ≠
+consumer requirement
+                  ↓
+Redistribution(logical Value region)
+                  ↓
+copy · send/receive · collective · remote access
+conversion · synchronization · completion</pre>
+          </div>
+        </div>
+        <div class="pipeline" aria-label="Logical distribution to communication-aware physical regions">
+          <div class="node"><strong>Split factors</strong><small>logical pieces</small></div>
+          <div class="node"><strong>Place pieces</strong><small>persistent / temporary</small></div>
+          <div class="node"><strong>Propagate</strong><small>op partition rules</small></div>
+          <div class="node"><strong>Detect mismatch</strong><small>consumer requirement</small></div>
+          <div class="node"><strong>Redistribute</strong><small>route · algorithm · chunk</small></div>
+          <div class="node"><strong>Async tasks</strong><small>comm · copy · conversion</small></div>
+          <div class="node"><strong>AvailableRegion</strong><small>chunk-level readiness</small></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Logical decision</th>
+              <th>Why communication is required</th>
+              <th>Possible physical tasks</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Split a contraction reduction factor</td>
+              <td>Each placement produces only an output contribution, while a nonlinear consumer requires a completed
+                Value</td>
+              <td>Reduce-to-owner, reduce-scatter, or tree/ring combination, yielding a <code>PartialValue</code> with a
+                declared combiner</td>
+            </tr>
+            <tr>
+              <td>Split a free or output factor</td>
+              <td>A downstream consumer may require different piece ownership or replicated inputs</td>
+              <td>Local views, point-to-point transfers, all-gather, or replicated and multicast chunks</td>
+            </tr>
+            <tr>
+              <td>Place persistent state remotely</td>
+              <td>Persistent parameters, KV pages, or expert weights differ from temporary compute placement</td>
+              <td>Prefetch, remote get, streamed send/receive, or cache-aware routing</td>
+            </tr>
+            <tr>
+              <td>Change transfer representation</td>
+              <td>Sender storage encoding differs from network or receiver compute encoding</td>
+              <td>Quantize/pack → transfer → unpack/dequantize, with scale metadata and completion</td>
+            </tr>
+            <tr>
+              <td>Cross a Program-region placement</td>
+              <td>A live Value crosses a stage cut or failure domain</td>
+              <td>Chunked activation or gradient transfer, buffer lifetime, and schedule tokens</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>From Redistribution to CommunicationTask</h3>
+        <div class="timeline">
+          <div class="timeline-step"><b>1. Prove the logical requirement</b>PartitionRules propagates factors in both
+            directions; reduction splits create PartialValue; producer-consumer mismatches create Redistribution.</div>
+          <div class="timeline-step"><b>2. Enumerate physical implementations</b>Topology, participants, addressability,
+            failure domains, and representation determine direct or staged routes, collective or remote algorithms, and
+            chunks.</div>
+          <div class="timeline-step"><b>3. Create asynchronous tasks</b>Each CommunicationTask declares source and
+            destination regions, byte ranges, engines, ordering, visibility, progress, lifetime, and an ordinary runtime
+            fallback.</div>
+          <div class="timeline-step"><b>4. Publish region availability</b><code>AvailableRegion</code> states that a
+            chunk is visible at the destination in the required representation, so consumers need not await the entire
+            tensor.</div>
+          <div class="timeline-step"><b>5. Apply communication-aware fusion</b>The compiler can now compare
+            conventional, overlapped, and fused physical regions. Communication must be explicit before fusion.</div>
+        </div>
+        <div class="callout warn">
+          <strong>Terminology boundary:</strong> semantic exchanges written explicitly by the user remain part of
+          the Program. Communication introduced by physical planning belongs to the AsyncTask graph. NCCL, MPI,
+          NVSHMEM, and device-side instructions are candidate implementations of Redistribution; they do not
+          define Program semantics.
+        </div>
+      </section>
+
+      <section id="fusion">
+        <div class="eyebrow">3.1 / Communication-aware fusion</div>
+        <h2>Communication can fuse with compute and conversion only after it becomes explicit</h2>
+        <p>
+          Each partition candidate first materializes required redistribution, then undergoes local fusion and tile
+          evaluation. Communication tasks produce region-availability tokens, so consumers need not wait for an
+          entire tensor.
+        </p>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Attention stream</h3>
+            <p><code>receive KV chunk → dequant → QK → summary update</code></p>
+            <p class="muted">Eliminates staging and overlaps by chunk, subject to verified communication progress and
+              compute residency.</p>
+          </div>
+          <div class="card">
+            <h3>TP output</h3>
+            <p><code>partial O projection → reduce-scatter → residual/RMSNorm</code></p>
+            <p class="muted">May fuse packing, casting, and a consumer prefix; a collective cannot be assumed to fit
+              inside one GPU kernel.</p>
+          </div>
+          <div class="card">
+            <h3>MoE dispatch</h3>
+            <p><code>top-k → histogram/pack → transfer → unpack → grouped GEMM</code></p>
+            <p class="muted">A token chunk may enter an expert tile on arrival; ragged capacity and ordering remain
+              explicit.</p>
+          </div>
+        </div>
+        <h3>Fusion legality</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Check</th>
+              <th>Example rejection</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Effects / aliases</td>
+              <td>Fusion reorders observable KV-cache writes or Storage versions</td>
+            </tr>
+            <tr>
+              <td>Completion / visibility</td>
+              <td>A consumer reads a region before a remote write becomes visible</td>
+            </tr>
+            <tr>
+              <td>Numerics</td>
+              <td>Softmax reordering exceeds the reproducibility or quality policy</td>
+            </tr>
+            <tr>
+              <td>Resources</td>
+              <td>Register or shared-memory pressure invalidates occupancy or communication progress</td>
+            </tr>
+            <tr>
+              <td>Fallback boundary</td>
+              <td>The backend cannot execute the fused region and has no verifiable split fallback</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="precision">
+        <div class="eyebrow">3.2 / Mixed precision and explicit conversions</div>
+        <h2>Mixed precision introduces explicit quantization, dequantization, metadata, and numerical constraints</h2>
+        <p>
+          A Value may use distinct storage, transfer, compute, and accumulation representations. Changing one
+          affects HBM and network traffic, conversion work, tile shapes, error, and fusion opportunities.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Object</th>
+              <th>Candidate representations</th>
+              <th>Interaction with partitioning and fusion</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Weights</td>
+              <td>BF16, FP8, or INT8/INT4 with group scales</td>
+              <td>Determines per-GPU capacity and TP/EP shard size; dequantization may fuse into GEMM loads</td>
+            </tr>
+            <tr>
+              <td>Activations</td>
+              <td>BF16, FP16, or FP8</td>
+              <td>Changes pipeline transfers and MoE dispatch traffic; may require dynamic scale synchronization</td>
+            </tr>
+            <tr>
+              <td>KV cache</td>
+              <td>BF16, FP8, or INT4</td>
+              <td>Changes persistent placement, context-parallel or ring traffic, and paged-attention load pipelines
+              </td>
+            </tr>
+            <tr>
+              <td>QK / PV</td>
+              <td>Low-precision multiplication with FP32 accumulation</td>
+              <td>Affects matrix-instruction capability, register pressure, and tile candidates</td>
+            </tr>
+            <tr>
+              <td>Softmax state</td>
+              <td>Usually FP32 <code>m/l/o</code>, or a constrained mixed representation</td>
+              <td>Determines summary-combination traffic, stability, and reassociation legality</td>
+            </tr>
+            <tr>
+              <td>Gradients</td>
+              <td>BF16, FP32, or compressed transfer</td>
+              <td>Affects data-parallel partial combination, error feedback, and optimizer-state placement</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout">
+          Changing KV from BF16 to INT4 does more than reduce bytes by 4×. The candidate must include scale
+          metadata, unpacking and dequantization, error bounds, and target-instruction capability, then reassess
+          whether lower traffic makes all-gather preferable to a ring.
+        </div>
+      </section>
+
+      <section id="lowering">
+        <div class="eyebrow">4 / Portable tile semantics</div>
+        <h2>Portable Tile IR makes distributed graph plans evaluable before target lowering</h2>
+        <p>
+          A <code>FusionRegion</code> says that a joint implementation is semantically legal; it is not yet a
+          kernel and does not contain enough information for credible kernel-performance prediction. Tile
+          semantic lowering projects every compute region—fused or unfused—into exact local tile computation,
+          data movement, representation, dependency, effect, and completion semantics.
+        </p>
+        <div class="pipeline" aria-label="Distributed graph plan to physical plan">
+          <div class="node"><strong>Distributed plan</strong><small>explicit comm + conversion</small></div>
+          <div class="node"><strong>Project region</strong><small>local boundary</small></div>
+          <div class="node"><strong>Tile movement</strong><small>load · store · gather</small></div>
+          <div class="node"><strong>Tile compute</strong><small>contract · reduce · map</small></div>
+          <div class="node"><strong>Portable Tile IR</strong><small>cross-platform semantics</small></div>
+          <div class="node"><strong>Physical plan</strong><small>tile + comm event DAG</small></div>
+          <div class="node"><strong>Simulate</strong><small>external evaluator</small></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Portable Tile IR expresses</th>
+              <th>Why the Simulation Engine needs it</th>
+              <th>What remains unspecified</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Exact local tile domains and input/output regions</td>
+              <td>Derive operation counts, boundary traffic, reuse opportunities, and legal decomposition ranges</td>
+              <td>Backend thread hierarchy and instruction sequence</td>
+            </tr>
+            <tr>
+              <td>Load, store, gather, scatter, convert, contract, reduce, map, scan, and collective-facing regions</td>
+              <td>Estimate movement, arithmetic intensity, temporary state, and producer-consumer materialization</td>
+              <td>Registers, shared memory allocation, swizzles, and pipeline depth</td>
+            </tr>
+            <tr>
+              <td>Storage, transfer, compute, and accumulator representations plus scale metadata</td>
+              <td>Account for bytes, conversions, target capability envelopes, and numerical constraints</td>
+              <td>Exact native matrix instruction or conversion opcode</td>
+            </tr>
+            <tr>
+              <td>Dependences, completion points, effects, allowed recomputation, and legal split fallbacks</td>
+              <td>Construct legal overlap windows and reject estimators that assume impossible reorderings</td>
+              <td>Streams, barriers, launch geometry, and target ABI</td>
+            </tr>
+            <tr>
+              <td>Symbolic shapes, guards, sparsity, raggedness, page or expert index relations</td>
+              <td>Evaluate workload buckets and report unsupported or high-uncertainty regions</td>
+              <td>One permanently chosen shape specialization</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Example: portable tile semantics for one attention region</h3>
+        <pre>Distributed graph region:
+  inputs  = Q[q_tile, d], K[k_chunk, d], V[k_chunk, dv], mask
+  state   = AttentionSummary&lt;FP32&gt;(m, l, o)
+  output  = O[q_tile, dv]
+  token   = AvailableRegion(KV[k_chunk])
+
+Portable Tile IR:
+  tile.load Q
+  tile.load K/V after token
+  tile.dequant K/V if selected representation requires it
+  tile.contract Q × K^T with declared accumulator
+  tile.map causal-mask
+  tile.reduce/update online (m, l)
+  tile.contract P × V and update o
+  tile.finalize o / l
+  tile.store O
+
+The IR does not yet prescribe:
+  warp/workgroup mapping, register assignment, pipeline stages,
+  target matrix instructions, external kernel DSL, or artifact format.</pre>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Deterministic path</h3>
+            <p class="muted">Every portable tile program has a legal baseline implementation path. The system
+              remains correct and portable when no agent, autotuner, or specialized backend is available.</p>
+          </div>
+          <div class="card">
+            <h3>Optimized path</h3>
+            <p class="muted">Rules, autotuners, agents, or external systems may rewrite Portable Tile IR or lower it
+              directly to a kernel DSL, target IR, library call, or artifact. Translation validation preserves
+              the same tile semantics.</p>
+          </div>
+        </div>
+        <div class="callout">
+          Portable Tile IR also makes proposed hardware evaluable before silicon exists. A hardware team can
+          supply a hypothetical <code>HardwareSpec</code> and simulator, search legal implementations internally,
+          and compare compute, memory, precision, and interconnect choices over the same workload suite.
+        </div>
+      </section>
+
+      <section id="cost">
+        <div class="eyebrow">5 / External Simulation Engine</div>
+        <h2>The compiler standardizes evaluation queries without requiring one built-in cost model</h2>
+        <p>
+          Joint optimization requires a shared whole-plan objective, but the evaluator need not be implemented
+          inside the compiler. The compiler sends a complete <code>PhysicalPlan</code> to an external
+          <code>SimulationEngine</code>. The engine may orchestrate analytical models, portable-Tile-IR
+          predictors, network simulators, profile databases, vendor tools, learned models, and real measurements.
+        </p>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Evaluation request</h3>
+            <pre>Evaluate(
+  PhysicalPlan,
+  HardwareSpec,
+  WorkloadProfile,
+  Objectives,
+  FidelityBudget
+)</pre>
+          </div>
+          <div class="card">
+            <h3>Evaluation result</h3>
+            <pre>CostEstimate {
+  latency, throughput, peak_memory,
+  communication, energy, quality,
+  uncertainty, bottlenecks,
+  unsupported_features
+}</pre>
+          </div>
+        </div>
+        <pre>whole_plan_latency is not:
+  sum(kernel_times) + sum(network_times) - guessed_overlap
+
+It is:
+  evaluate the resource-constrained critical path over:
+    portable tile compute tasks
+    collective and point-to-point tasks
+    representation conversions and memory transfers
+    topology, contention, capacity, dependencies, and legal overlap</pre>
+        <h3>Pluggable evaluation providers</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Fast pruning</h3>
+            <p>Symbolic bounds, roofline estimates, memory accounting, capability checks, and conservative
+              communication formulas reject clearly dominated plans.</p>
+          </div>
+          <div class="card">
+            <h3>Plan simulation</h3>
+            <p>Tile predictors and event or network simulators model local compute, communication, contention,
+              overlap, staging, and critical paths.</p>
+          </div>
+          <div class="card">
+            <h3>High-fidelity evidence</h3>
+            <p>Compilation, vendor simulators, cycle-level models, profile lookup, microbenchmarks, or complete
+              execution calibrate a small set of promising candidates.</p>
+          </div>
+        </div>
+        <div class="callout">
+          <strong>Extensibility boundary:</strong>
+          the compiler owns the typed query, semantic provenance, units, objectives, and required result fields.
+          Each Simulation Engine provider owns its prediction method and declares applicability, uncertainty,
+          unsupported features, version, and calibration evidence. A missing provider reduces optimization quality;
+          it does not prevent deterministic compilation.
+        </div>
+        <p class="muted">
+          Portable Tile IR makes prediction possible; it does not make prediction exact. An engine may internally
+          search legal implementation families, use analytical envelopes or profile analogues, delegate to a
+          hardware simulator, or compile and measure. It must report the method and uncertainty so that estimates
+          produced at different fidelity levels are not treated as equally authoritative.
+        </p>
+        <h3>Factorized joint optimization</h3>
+        <div class="timeline">
+          <div class="timeline-step"><b>1. Generate macro alternatives</b>Instantiate known distributed strategies,
+            logical meshes, placements, boundary representations, fusion regions, stage cuts, and recomputation
+            choices.</div>
+          <div class="timeline-step"><b>2. Expand and prune</b>Propagate partitions and representations, materialize
+            redistribution and conversions, verify legality, and retain a top-K frontier rather than one early
+            winner.</div>
+          <div class="timeline-step"><b>3. Lower tile semantics</b>Convert every surviving compute region to Portable
+            Tile IR and assemble complete PhysicalPlan candidates.</div>
+          <div class="timeline-step"><b>4. Evaluate at increasing fidelity</b>Use cheap bounds broadly, simulation for
+            the reduced frontier, and compilation or measurement only where its value exceeds its cost.</div>
+          <div class="timeline-step"><b>5. Feed evidence back</b>If tile feasibility, workspace, communication
+            progress, numerical error, or measurement changes the ranking, revise only the affected decisions.</div>
+        </div>
+        <div class="thesis">
+          <strong>Meaning of joint:</strong>
+          partition, physical placement, mixed precision, and fusion share one whole-plan evaluation loop.
+          <strong>Meaning of factorized:</strong>
+          candidate generation and verification remain staged so that the compiler never attempts an intractable
+          flat Cartesian search.
+        </div>
+      </section>
+
+      <section id="workload">
+        <div class="eyebrow">6.1 / Case study: semantic workload</div>
+        <h2>A MoE LLM exercises the architecture from proposals to simulation</h2>
+        <p>
+          The case study starts from an ordinary semantic model plus a registered library of known distributed and
+          fusion algorithms. It demonstrates how the compiler instantiates, composes, verifies, lowers, and
+          evaluates them. It does not claim that the compiler rediscovers TP, CP, EP, pipeline scheduling, online
+          attention, or MoE dispatch from primitive arithmetic.
+        </p>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Model</h3>
+            <span class="pill">64 layers</span>
+            <span class="pill">d_model = 8192</span>
+            <span class="pill">64 Q heads</span>
+            <span class="pill">8 KV heads</span>
+            <span class="pill">head dim = 128</span>
+          </div>
+          <div class="card">
+            <h3>MoE</h3>
+            <span class="pill">64 experts</span>
+            <span class="pill">top-2 routing</span>
+            <span class="pill">d_ff = 28672</span>
+            <span class="pill">capacity bound</span>
+          </div>
+          <div class="card">
+            <h3>Deployment topology</h3>
+            <span class="pill">8 nodes × 8 GPUs</span>
+            <span class="pill">fast intra-node fabric</span>
+            <span class="pill">slower inter-node fabric</span>
+            <span class="pill">HBM per GPU</span>
+          </div>
+        </div>
+        <h3>Semantic graph of one Transformer block</h3>
+        <div class="pipeline" aria-label="Transformer block semantic pipeline">
+          <div class="node"><strong>RMSNorm</strong><small>x → x̂</small></div>
+          <div class="node"><strong>QKV projection</strong><small>x̂Wq, x̂Wk, x̂Wv</small></div>
+          <div class="node"><strong>Attention</strong><small>mask + softmax + PV</small></div>
+          <div class="node"><strong>O projection</strong><small>OWo + residual</small></div>
+          <div class="node"><strong>Router</strong><small>top-k expert IDs</small></div>
+          <div class="node"><strong>Expert MLP</strong><small>grouped nonlinear GEMM</small></div>
+          <div class="node"><strong>Combine</strong><small>weighted sum + residual</small></div>
+        </div>
+        <p class="muted">
+          The semantic Program contains no GPU ranks, collective names, tile sizes, or FlashAttention marker. It
+          stores only Values, Storages, operations, numerical semantics, effects, and ordering.
+        </p>
+      </section>
+
+      <section id="strategies">
+        <div class="eyebrow">6.2 / Case study: strategy candidates</div>
+        <h2>Known strategy templates enter through CandidateGenerator</h2>
+        <p>
+          The templates below are supplied by humans, libraries, retrieval, or agents. General partition,
+          placement, partial-value, and redistribution semantics make their instances composable and verifiable;
+          those semantics do not invent the templates. Select a strategy to inspect the decisions contributed to
+          a joint graph plan.
+        </p>
+        <div class="strategy-layout">
+          <div class="strategy-list" role="tablist" aria-label="Parallel strategy">
+            <button role="tab" aria-selected="true" data-strategy="dp">Data parallel / DP</button>
+            <button role="tab" aria-selected="false" data-strategy="tp">Tensor parallel / TP</button>
+            <button role="tab" aria-selected="false" data-strategy="cp">Context parallel / CP</button>
+            <button role="tab" aria-selected="false" data-strategy="ep">Expert parallel / EP</button>
+            <button role="tab" aria-selected="false" data-strategy="pp">Pipeline parallel / PP</button>
+          </div>
+          <div id="strategy-detail" class="strategy-detail" aria-live="polite"></div>
+        </div>
+        <div class="callout warn">
+          <strong>Composition is an optimization problem, not a Cartesian product.</strong>
+          Expert parallelism may reuse the current stage's devices only within a MoE region. Context-parallel
+          attention placement may be redistributed before entering MoE. Decode, prefill, and training may retain
+          different physical plans. Candidate generation bounds the combinations; propagation and verification
+          expose their actual communication and conversion consequences.
+        </div>
+      </section>
+
+      <section id="attention">
+        <div class="eyebrow">6.3 / Case study: supplied attention refinement</div>
+        <h2>From standard softmax attention to a composable block state</h2>
+        <p>
+          This section does not introduce a primitive compiler operator. It starts from standard attention and
+          derives the established online-softmax state used by blockwise attention algorithms. The equations are
+          established algorithmic machinery; the name <code>AttentionSummary</code> is only this document's IR
+          abstraction for carrying that state through partitioning, fusion, and tile lowering.
+        </p>
+        <div class="callout">
+          <strong>Provenance:</strong>
+          online maximum and normalizer updates come from established online-softmax work and are used by
+          FlashAttention's blockwise algorithm. <code>Summary(m,l,o)</code> is not a standardized industry IR
+          operation and is not inferred automatically from the name <code>attention</code>.
+          See <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Online normalizer
+            calculation for softmax</a> and
+          <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention</a>.
+        </div>
+        <div class="thesis">
+          <strong>Central consequence:</strong>
+          online summary exposes softmax attention as a block reduction over the key/value axis. Matching K/V
+          blocks can therefore be processed sequentially or in parallel, stored locally or remotely, and accessed
+          contiguously or through pages. Tiled, Split-K, ring, streamed, and paged implementations are different
+          choices along those physical dimensions—not five mutually exclusive algorithms.
+        </div>
+        <h3>1. Begin with ordinary attention</h3>
+        <p>
+          For one query vector <code>q</code>, key <code>k<sub>j</sub></code>, and value
+          <code>v<sub>j</sub></code>, let <code>s<sub>j</sub></code> be the masked and scaled attention score.
+          The output is a softmax-weighted sum of all values:
+        </p>
+        <div class="math-block">
+          <math display="block" aria-label="Standard attention score and output">
+            <mtable columnalign="right center left" columnspacing=".5em" rowspacing=".65em">
+              <mtr>
+                <mtd><msub><mi>s</mi><mi>j</mi></msub></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <mfrac>
+                    <mrow><mi>q</mi><mo>·</mo><msub><mi>k</mi><mi>j</mi></msub></mrow>
+                    <msqrt><mi>d</mi></msqrt>
+                  </mfrac>
+                  <mo>+</mo><msub><mi>mask</mi><mi>j</mi></msub>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd><mi>O</mi></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <mfrac>
+                    <mrow>
+                      <munderover><mo>∑</mo><mi>j</mi><mtext>all keys</mtext></munderover>
+                      <mi>exp</mi><mo>(</mo><msub><mi>s</mi><mi>j</mi></msub><mo>)</mo>
+                      <msub><mi>v</mi><mi>j</mi></msub>
+                    </mrow>
+                    <mrow>
+                      <munderover><mo>∑</mo><mi>j</mi><mtext>all keys</mtext></munderover>
+                      <mi>exp</mi><mo>(</mo><msub><mi>s</mi><mi>j</mi></msub><mo>)</mo>
+                    </mrow>
+                  </mfrac>
+                </mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <p>
+          A materialized implementation writes the score matrix and softmax probabilities before multiplying by
+          <code>V</code>. A blockwise implementation instead visits subsets of keys and retains only enough state
+          to produce the same final result.
+        </p>
+        <h3>2. Define the state for one key/value block</h3>
+        <p>
+          Let <code>C</code> be any subset or block of key/value positions. Stable softmax first subtracts the
+          largest score in that block. Define:
+        </p>
+        <div class="math-block">
+          <math display="block" aria-label="Definition of attention block state">
+            <mtable columnalign="right center left" columnspacing=".5em" rowspacing=".65em">
+              <mtr>
+                <mtd><msub><mi>m</mi><mi>C</mi></msub></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <munder><mi>max</mi><mrow><mi>j</mi><mo>∈</mo><mi>C</mi></mrow></munder>
+                  <msub><mi>s</mi><mi>j</mi></msub>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd><msub><mi>l</mi><mi>C</mi></msub></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <munder><mo>∑</mo><mrow><mi>j</mi><mo>∈</mo><mi>C</mi></mrow></munder>
+                  <mi>exp</mi><mo>(</mo><msub><mi>s</mi><mi>j</mi></msub><mo>−</mo>
+                  <msub><mi>m</mi><mi>C</mi></msub><mo>)</mo>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd><msub><mi>o</mi><mi>C</mi></msub></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <munder><mo>∑</mo><mrow><mi>j</mi><mo>∈</mo><mi>C</mi></mrow></munder>
+                  <mi>exp</mi><mo>(</mo><msub><mi>s</mi><mi>j</mi></msub><mo>−</mo>
+                  <msub><mi>m</mi><mi>C</mi></msub><mo>)</mo>
+                  <msub><mi>v</mi><mi>j</mi></msub>
+                </mtd>
+              </mtr>
+              <mtr>
+                <mtd><msub><mi>O</mi><mi>C</mi></msub></mtd>
+                <mtd><mo>=</mo></mtd>
+                <mtd>
+                  <mfrac><msub><mi>o</mi><mi>C</mi></msub><msub><mi>l</mi><mi>C</mi></msub></mfrac>
+                </mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <div class="grid-3">
+          <div class="card">
+            <h3><code>m</code>: stability scalar</h3>
+            <p>The maximum score for this query in the block. Subtracting it prevents overflow without changing
+              the normalized result.</p>
+          </div>
+          <div class="card">
+            <h3><code>l</code>: denominator scalar</h3>
+            <p>The block's softmax normalizer after maximum subtraction.</p>
+          </div>
+          <div class="card">
+            <h3><code>o</code>: numerator vector</h3>
+            <p>The unnormalized weighted sum of value vectors. Lowercase <code>o</code> is not the final attention
+              output; final <code>O</code> is <code>o/l</code>.</p>
+          </div>
+        </div>
+        <p>
+          This document packages those three quantities as
+          <code>AttentionSummary&lt;FP32&gt;(m,l,o)</code>. The package name is compiler terminology introduced
+          here; the underlying online-softmax state is established.
+        </p>
+        <h3>3. Combine independently computed blocks</h3>
+        <p>
+          Suppose blocks <code>A</code> and <code>B</code> were evaluated independently. Their exponentials use
+          different local maxima, so their <code>l</code> and <code>o</code> values cannot be added directly.
+          First rescale both blocks to the maximum of their union:
+        </p>
+        <div class="attention-state">
+          <div class="state-box"><b>Block A</b><br><code>(mₐ, lₐ, oₐ)</code></div>
+          <div class="operator">⊕</div>
+          <div class="state-box"><b>Block B</b><br><code>(mᵦ, lᵦ, oᵦ)</code></div>
+          <div class="operator">→</div>
+          <div class="state-box"><b>A ∪ B</b><br><code>(m, l, o)</code></div>
+        </div>
+        <div class="math-block">
+          <math display="block" aria-label="Combination of two attention block states">
+            <mtable columnalign="right center left" columnspacing=".5em" rowspacing=".65em">
+              <mtr>
+                <mtd><mi>m</mi></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mi>max</mi><mo>(</mo><msub><mi>m</mi><mi>A</mi></msub><mo>,</mo>
+                  <msub><mi>m</mi><mi>B</mi></msub><mo>)</mo></mtd>
+              </mtr>
+              <mtr>
+                <mtd><mi>α</mi></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mi>exp</mi><mo>(</mo><msub><mi>m</mi><mi>A</mi></msub><mo>−</mo><mi>m</mi><mo>)</mo></mtd>
+              </mtr>
+              <mtr>
+                <mtd><mi>β</mi></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mi>exp</mi><mo>(</mo><msub><mi>m</mi><mi>B</mi></msub><mo>−</mo><mi>m</mi><mo>)</mo></mtd>
+              </mtr>
+              <mtr>
+                <mtd><mi>l</mi></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mi>α</mi><msub><mi>l</mi><mi>A</mi></msub><mo>+</mo>
+                  <mi>β</mi><msub><mi>l</mi><mi>B</mi></msub></mtd>
+              </mtr>
+              <mtr>
+                <mtd><mi>o</mi></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mi>α</mi><msub><mi>o</mi><mi>A</mi></msub><mo>+</mo>
+                  <mi>β</mi><msub><mi>o</mi><mi>B</mi></msub></mtd>
+              </mtr>
+              <mtr>
+                <mtd><msub><mi>O</mi><mtext>final</mtext></msub></mtd><mtd><mo>=</mo></mtd>
+                <mtd><mfrac><mi>o</mi><mi>l</mi></mfrac></mtd>
+              </mtr>
+            </mtable>
+          </math>
+        </div>
+        <p>
+          The rescaling follows directly from
+          <code>exp(s − m) = exp(s − m<sub>A</sub>) · exp(m<sub>A</sub> − m)</code> for elements in block
+          <code>A</code>, and likewise for <code>B</code>. Consequently the combined state represents exactly
+          the union of both blocks in real arithmetic. Floating-point reassociation and accumulation order still
+          require the declared numerical policy.
+        </p>
+        <h3>4. Small numerical example</h3>
+        <pre>scores = [1, 2, 3]
+values = [10, 20, 30]          // scalar values only to keep the example short
+
+Block A = first two positions:
+  mA = 2
+  lA = exp(-1) + 1             ≈ 1.3679
+  oA = 10·exp(-1) + 20         ≈ 23.6788
+
+Block B = final position:
+  mB = 3, lB = 1, oB = 30
+
+Combine using m = 3, α = exp(-1), β = 1:
+  l  ≈ 1.5032
+  o  ≈ 38.710
+  O  = o / l                   ≈ 25.75
+
+This equals the ordinary softmax-weighted sum over all three positions.</pre>
+        <h3>5. The reduction structure exposed to the compiler</h3>
+        <p>
+          Once a domain library or agent supplies this refinement and its validation contract, the key-position
+          dimension becomes a declared reduction whose element is a matching K/V block and whose partial result
+          is <code>AttentionSummary</code>:
+        </p>
+        <pre>for each query row or query tile:
+  partials = []
+  for each matching key/value block C:
+    partials.append(make_summary(Q, K[C], V[C]))
+  final_summary = reduce(combine_summary, partials)
+  O = final_summary.o / final_summary.l</pre>
+        <p>
+          K and V must be partitioned together along the same key-position set: <code>K[j]</code> produces score
+          <code>s[j]</code>, and <code>V[j]</code> supplies that score's value contribution. Splitting the query
+          axis produces independent outputs and needs no summary combination. Splitting the key axis divides this
+          reduction and therefore produces partial summaries that must be combined.
+        </p>
+        <div class="callout warn">
+          <strong>Fallback boundary:</strong>
+          online summary is a supplied algorithmic refinement, not a consequence of generic fusion. Without its
+          registered equivalence and numerical contract, the compiler must retain materialized softmax or another
+          independently validated implementation.
+        </div>
+        <h3>6. Orthogonal physical choices enabled by the reduction</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Semantic implementation</h3>
+            <p><strong>Materialized:</strong> write complete score and probability matrices, then compute
+              <code>PV</code>. This conservative path does not require online summary.</p>
+            <p><strong>Online:</strong> retain only block state and avoid complete <code>S</code>/<code>P</code>
+              materialization.</p>
+          </div>
+          <div class="card">
+            <h3>Local traversal</h3>
+            <p><strong>Tiled fused:</strong> one worker visits local K/V blocks, updates an on-chip summary, and
+              fuses QK, mask, online update, and PV. The traversal may be sequential even though the reduction is
+              decomposable.</p>
+          </div>
+          <div class="card">
+            <h3>Reduction parallelism</h3>
+            <p><strong>Split-K:</strong> multiple workers process different K/V ranges for the same query. Each
+              emits a <code>PartialValue&lt;AttentionSummary&gt;</code>; an explicit reduction combines them.</p>
+          </div>
+          <div class="card">
+            <h3>Distributed movement</h3>
+            <p><strong>Ring or streamed KV:</strong> K/V blocks reside on different devices and move through a
+              supplied route. A query owner updates its summary whenever a block becomes available.</p>
+          </div>
+          <div class="card">
+            <h3>Storage and addressing</h3>
+            <p><strong>Paged KV:</strong> a page table selects non-contiguous K/V blocks. Each gathered page
+              contributes to the same reduction; page loading and dequantization may join the tile region.</p>
+          </div>
+          <div class="card">
+            <h3>Representation</h3>
+            <p>K/V blocks may use BF16, FP8, or INT4 storage and transfer while the summary remains FP32. Every
+              conversion, scale, error constraint, and communication byte remains explicit.</p>
+          </div>
+        </div>
+        <h3>7. These choices compose into physical candidates</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Local prefill</h3>
+            <pre>online summary
++ local tiled traversal
++ contiguous K/V
++ fused QK/mask/update/PV</pre>
+            <p class="muted">A FlashAttention-style local candidate.</p>
+          </div>
+          <div class="card">
+            <h3>Long-KV decode</h3>
+            <pre>online summary
++ paged K/V
++ quantized page loads
++ Split-K workers
++ summary reduction</pre>
+            <p class="muted">Storage layout and reduction parallelism are combined rather than selected as
+              alternatives.</p>
+          </div>
+          <div class="card">
+            <h3>Distributed long context</h3>
+            <pre>online summary
++ context-partitioned K/V
++ ring or hierarchical stream
++ receive/dequant/update fusion
++ optional local paging</pre>
+            <p class="muted">Placement, route, local storage, precision, and fusion jointly define the physical
+              plan.</p>
+          </div>
+        </div>
+        <p>
+          The compiler enumerates only combinations made available by CandidateGenerators, verifies their
+          distribution and numerical obligations, lowers each surviving local update to Portable Tile IR, and
+          asks the Simulation Engine to compare complete physical plans.
+        </p>
+      </section>
+
+      <section id="combined">
+        <div class="eyebrow">6.4 / Case study: one physical-plan derivation</div>
+        <h2>One 64-GPU candidate, traced through every architectural boundary</h2>
+        <p>
+          Assume CandidateGenerator proposes four pipeline stages, two batch replicas, tensor-parallel dense
+          projections, context-distributed online attention, expert placement, and bounded FP8 transfer choices.
+          This is one supplied macro candidate, not a strategy discovered from operator names. The compiler now
+          turns that proposal into an evaluable physical plan.
+        </p>
+        <div class="timeline">
+          <div class="timeline-step"><b>1. Form a JointGraphPlanCandidate</b>Record PP=4 and DP=2 globally; propose
+            temporary TP, CP, and EP mappings per region; attach representation and FusionRegion alternatives,
+            topology requirements, provenance, and fallbacks.</div>
+          <div class="timeline-step"><b>2. Expand distribution and representation</b>Propagate shardings through
+            operators. Insert stage transfers, TP reductions, streamed KV movement, MoE dispatch/return, FP8
+            conversion, scale metadata, and every required completion edge.</div>
+          <div class="timeline-step"><b>3. Verify the DistributedGraphPlan</b>Check ownership, partial-value
+            completion, effects, aliases, online-summary algebra, numerical policy, memory capacity, route
+            progress, and legal fusion boundaries.</div>
+          <div class="timeline-step"><b>4. Lower compute regions to Portable Tile IR</b>Represent local projection,
+            normalization, attention-summary, routing, grouped-GEMM, conversion, and residual work as tile-level
+            computation, movement, dependencies, and allowed splits.</div>
+          <div class="timeline-step"><b>5. Assemble and simulate the PhysicalPlan</b>Combine portable tile programs
+            with device placement, communication and conversion tasks, buffers, resources, and the asynchronous
+            event DAG. Submit the complete plan to the selected Simulation Engine.</div>
+        </div>
+        <div class="mesh" aria-label="64 GPU conceptual placement">
+          <div class="gpu"><b>S0 D0</b>G0</div>
+          <div class="gpu"><b>S0 D0</b>G1</div>
+          <div class="gpu"><b>S0 D0</b>G2</div>
+          <div class="gpu"><b>S0 D0</b>G3</div>
+          <div class="gpu"><b>S0 D0</b>G4</div>
+          <div class="gpu"><b>S0 D0</b>G5</div>
+          <div class="gpu"><b>S0 D0</b>G6</div>
+          <div class="gpu"><b>S0 D0</b>G7</div>
+          <div class="gpu"><b>S0 D1</b>G0</div>
+          <div class="gpu"><b>S0 D1</b>G1</div>
+          <div class="gpu"><b>S0 D1</b>G2</div>
+          <div class="gpu"><b>S0 D1</b>G3</div>
+          <div class="gpu"><b>S0 D1</b>G4</div>
+          <div class="gpu"><b>S0 D1</b>G5</div>
+          <div class="gpu"><b>S0 D1</b>G6</div>
+          <div class="gpu"><b>S0 D1</b>G7</div>
+          <div class="gpu"><b>S1 D0</b>G0</div>
+          <div class="gpu"><b>S1 D0</b>G1</div>
+          <div class="gpu"><b>S1 D0</b>G2</div>
+          <div class="gpu"><b>S1 D0</b>G3</div>
+          <div class="gpu"><b>S1 D0</b>G4</div>
+          <div class="gpu"><b>S1 D0</b>G5</div>
+          <div class="gpu"><b>S1 D0</b>G6</div>
+          <div class="gpu"><b>S1 D0</b>G7</div>
+          <div class="gpu"><b>S1 D1</b>G0</div>
+          <div class="gpu"><b>S1 D1</b>G1</div>
+          <div class="gpu"><b>S1 D1</b>G2</div>
+          <div class="gpu"><b>S1 D1</b>G3</div>
+          <div class="gpu"><b>S1 D1</b>G4</div>
+          <div class="gpu"><b>S1 D1</b>G5</div>
+          <div class="gpu"><b>S1 D1</b>G6</div>
+          <div class="gpu"><b>S1 D1</b>G7</div>
+          <div class="gpu"><b>S2 D0</b>G0</div>
+          <div class="gpu"><b>S2 D0</b>G1</div>
+          <div class="gpu"><b>S2 D0</b>G2</div>
+          <div class="gpu"><b>S2 D0</b>G3</div>
+          <div class="gpu"><b>S2 D0</b>G4</div>
+          <div class="gpu"><b>S2 D0</b>G5</div>
+          <div class="gpu"><b>S2 D0</b>G6</div>
+          <div class="gpu"><b>S2 D0</b>G7</div>
+          <div class="gpu"><b>S2 D1</b>G0</div>
+          <div class="gpu"><b>S2 D1</b>G1</div>
+          <div class="gpu"><b>S2 D1</b>G2</div>
+          <div class="gpu"><b>S2 D1</b>G3</div>
+          <div class="gpu"><b>S2 D1</b>G4</div>
+          <div class="gpu"><b>S2 D1</b>G5</div>
+          <div class="gpu"><b>S2 D1</b>G6</div>
+          <div class="gpu"><b>S2 D1</b>G7</div>
+          <div class="gpu"><b>S3 D0</b>G0</div>
+          <div class="gpu"><b>S3 D0</b>G1</div>
+          <div class="gpu"><b>S3 D0</b>G2</div>
+          <div class="gpu"><b>S3 D0</b>G3</div>
+          <div class="gpu"><b>S3 D0</b>G4</div>
+          <div class="gpu"><b>S3 D0</b>G5</div>
+          <div class="gpu"><b>S3 D0</b>G6</div>
+          <div class="gpu"><b>S3 D0</b>G7</div>
+          <div class="gpu"><b>S3 D1</b>G0</div>
+          <div class="gpu"><b>S3 D1</b>G1</div>
+          <div class="gpu"><b>S3 D1</b>G2</div>
+          <div class="gpu"><b>S3 D1</b>G3</div>
+          <div class="gpu"><b>S3 D1</b>G4</div>
+          <div class="gpu"><b>S3 D1</b>G5</div>
+          <div class="gpu"><b>S3 D1</b>G6</div>
+          <div class="gpu"><b>S3 D1</b>G7</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Region</th>
+              <th>General planning facts</th>
+              <th>Conventional name</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Global Program</td>
+              <td>Split 64 layers into four ordered regions; place microbatch Values across stages</td>
+              <td>PP = 4</td>
+            </tr>
+            <tr>
+              <td>Replica</td>
+              <td>Split the batch or request factor in two; replicate parameters; training gradients become partial</td>
+              <td>DP = 2</td>
+            </tr>
+            <tr>
+              <td>Dense projections</td>
+              <td>Within each eight-GPU group, split head or output factors by four; reduction splits produce partial
+                outputs</td>
+              <td>TP = 4</td>
+            </tr>
+            <tr>
+              <td>Long-context attention</td>
+              <td>Split q/k sequence pieces by two while retaining the TP head split; stream KV chunks and combine
+                summaries</td>
+              <td>CP = 2</td>
+            </tr>
+            <tr>
+              <td>MoE region</td>
+              <td>Replace temporary attention placement; map 64 expert pieces across all eight GPUs; route ragged token
+                sets</td>
+              <td>EP = 8</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Concrete decisions in this candidate</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Distribution and placement</h3>
+            <p>Each <code>(stage, replica)</code> group occupies one eight-GPU node. Dense attention uses
+              <code>TP=4 × CP=2</code> inside that node. The MoE region redistributes to <code>EP=8</code> on the
+              same node. Pipeline transfers cross nodes.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Representations</h3>
+            <p>Residual and normalization boundaries use BF16. Supported dense and expert matrix operands use
+              FP8 with FP32 accumulation. Pipeline, streamed-KV, and MoE-dispatch payloads use FP8 with explicit
+              scales. Online-attention state remains FP32.</p>
+          </div>
+          <div class="card">
+            <h3>Fusion and communication</h3>
+            <p>QKV epilogues produce the selected transfer layout. KV receive, dequantization, and online-summary
+              update form one portable tile region. TP output uses reduce-scatter. MoE pack, transfer, unpack, and
+              grouped-GEMM remain explicit dependent tasks with chunk availability.</p>
+          </div>
+        </div>
+        <h3>Physical path of one microbatch</h3>
+        <div class="timeline">
+          <div class="timeline-step"><b>Stage receives an activation chunk</b>The pipeline transfer representation is
+            FP8 with explicit scale metadata; dequantization produces the BF16 RMSNorm boundary as each chunk
+            becomes available.</div>
+          <div class="timeline-step"><b>Dense attention prefix</b>RMSNorm, QKV projection, and layout conversion fuse
+            within resource constraints; tensor-parallel head pieces remain local.</div>
+          <div class="timeline-step"><b>Context-distributed attention</b>Each context piece runs tiled online attention
+            while streaming FP8 KV chunks and combining FP32 summaries.</div>
+          <div class="timeline-step"><b>Output projection and residual</b>Tensor-parallel partial outputs use
+            reduce-scatter; packing and casting are represented in the producer and communication-facing tile
+            regions, while the BF16 residual boundary remains explicit.</div>
+          <div class="timeline-step"><b>MoE redistribution</b>The router creates a dynamic expert index set and
+            dispatches FP8 token chunks with scale metadata to the eight expert placements.</div>
+          <div class="timeline-step"><b>Expert compute and combine</b>Arriving token chunks enter grouped GEMMs;
+            weighted partial contributions return to their owner and merge with the residual.</div>
+          <div class="timeline-step"><b>Next pipeline stage</b>The schedule sends activation chunks; training also
+            schedules backward work and partial gradient combination.</div>
+        </div>
+        <h3>Simulation handoff</h3>
+        <pre>PhysicalPlanCandidate {
+  workload      = long-context training bucket
+  placement     = 4 stages × 2 replicas × 8-GPU node
+  compute       = PortableTileProgram references for every local region
+  communication = stage transfer + TP reduce-scatter
+                  + streamed KV + MoE dispatch/return
+  representation= BF16 boundaries + FP8 payloads/operands
+                  + FP32 accumulators and attention summaries
+  event_graph   = chunk availability, dependencies, engines, buffers
+  fallbacks     = unfused tile regions + conservative communication paths
+}</pre>
+        <div class="callout">
+          The compiler does not attach invented throughput numbers to this plan. It submits the physical plan,
+          hardware specification, long-context training profile, quality constraints, and fidelity budget to a
+          selected Simulation Engine. The returned estimate—together with uncertainty and unsupported
+          features—is compared with other complete physical plans. Only after selection does target-specific
+          implementation lowering and qualification begin.
+        </div>
+      </section>
+
+      <section id="explorer">
+        <div class="eyebrow">6.5 / Case study: alternative physical plans</div>
+        <h2>One Program retains different candidates for different workloads</h2>
+        <p>
+          Change the phase and objective to inspect a macro candidate that could enter the same derivation flow.
+          The displayed scores are explanatory placeholders, not Simulation Engine output or measured
+          performance.
+        </p>
+        <div class="explorer">
+          <div class="controls">
+            <label>Execution phase
+              <select id="phase">
+                <option value="prefill">Prefill</option>
+                <option value="decode">Decode</option>
+                <option value="training">Training</option>
+              </select>
+            </label>
+            <label>Primary objective
+              <select id="objective">
+                <option value="latency">Latency</option>
+                <option value="throughput">Throughput</option>
+                <option value="memory">Memory capacity</option>
+                <option value="quality">Numerical quality</option>
+              </select>
+            </label>
+            <label>Context bucket
+              <select id="context">
+                <option value="short">≤ 4K</option>
+                <option value="long">32K</option>
+                <option value="extreme">128K+</option>
+              </select>
+            </label>
+          </div>
+          <div id="candidate" class="candidate" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="boundary">
+        <div class="eyebrow">7 / Conclusions and limits</div>
+        <h2>The framework composes and evaluates supplied algorithms; it does not promise to invent them</h2>
+        <div class="grid-2">
+          <div class="card">
+            <h3 class="good">Compiler-owned mechanisms</h3>
+            <ul>
+              <li>Instantiate and compose supplied partition, placement, precision, fusion, and schedule candidates;
+              </li>
+              <li>Propagate shardings and representations and materialize redistribution and conversion;</li>
+              <li>Verify effects, partial values, fusion, numerical policy, capacity, and progress;</li>
+              <li>Lower all compute regions to Portable Tile IR and assemble complete physical plans;</li>
+              <li>Query replaceable Simulation Engines and retain qualified variants with deterministic fallbacks.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3 class="warning">Not promised by the core compiler</h3>
+            <ul>
+              <li>Inventing TP, CP, EP, pipeline schedules, online attention, or novel fusion algorithms;</li>
+              <li>Inferring aliases, effects, numerical equivalence, or visibility from operator names;</li>
+              <li>Obtaining accurate performance from high-level FusionRegion alone, before tile lowering;</li>
+              <li>Allowing a Simulation Engine score or an agent assertion to override legality;</li>
+              <li>Requiring one built-in cost model or treating one strategy as optimal for every workload.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="thesis">
+          <strong>Precise claim:</strong>
+          supplied algorithms become typed CandidateGenerators with explicit preconditions and verification
+          obligations. The compiler can then compose partition, placement, mixed precision, and fusion decisions;
+          expose their consequences; lower surviving compute regions to Portable Tile IR; and compare complete
+          physical plans through an external, replaceable Simulation Engine.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const strategies = {
+      dp: {
+        title: "Data parallel / DP",
+        summary: "Split the batch, request, or sample factor; replicate model state; during training, gradients are PartialValues that require combination.",
+        steps: ["split b", "replicate parameters", "place replicas", "combine gradients"],
+        communication: "Training: gradient reduction or reduce-scatter. Inference: typically request ingress and egress only.",
+        caveat: "Optimizer-state sharding is a separate placement decision; the DP label does not imply it."
+      },
+      tp: {
+        title: "Tensor parallel / TP",
+        summary: "Split head, channel, matrix-output, or contraction-reduction factors. Free-factor splits produce independent output pieces; reduction splits produce partial outputs.",
+        steps: ["split h/n/k", "propagate maps", "create partial if reduction", "redistribute consumer"],
+        communication: "Depends on whether a free or reduction factor is split; candidates include all-gather, reduce-scatter, and point-to-point.",
+        caveat: "Column and row parallelism derive from access relations and consumer placement; they are not core IR operations."
+      },
+      cp: {
+        title: "Context parallel / CP",
+        summary: "Split query or key sequence factors. Q/O can be independent over q; splitting k requires AttentionSummary combination or streamed KV access.",
+        steps: ["split q or k", "place KV pieces", "select stream/combine", "fuse chunk consumer"],
+        communication: "All-gathered KV, ring-streamed KV, remote reads, and reduced AttentionSummary values are all enumerable candidates.",
+        caveat: "The causal domain, GQA map, KV-cache placement, and context bucket can change the best plan."
+      },
+      ep: {
+        title: "Expert parallel / EP",
+        summary: "Split the expert index set and place expert weights; the router creates a dynamic token-to-expert access relation.",
+        steps: ["split expert set", "place expert weights", "route ragged tokens", "combine top-k outputs"],
+        communication: "Dispatch and return redistribution may use all-to-all, hierarchical routes, or sparse point-to-point transfers.",
+        caveat: "Load imbalance, capacity, replicated hot experts, and topology placement require explicit modeling."
+      },
+      pp: {
+        title: "Pipeline parallel / PP",
+        summary: "Split layer regions at legal cuts in the Program DAG; activation Values crossing a cut require placement transfer and scheduling.",
+        steps: ["choose region cuts", "place regions", "transfer live values", "schedule microbatches"],
+        communication: "Activation and gradient transfers cross stage boundaries and may be chunked by region availability.",
+        caveat: "Names such as 1F1B and interleaved describe AsyncTask schedules; bubbles, memory, and recomputation jointly determine value."
+      }
+    };
+
+    function renderStrategy(key) {
+      const s = strategies[key];
+      document.getElementById("strategy-detail").innerHTML = `
+        <h3>${s.title}</h3>
+        <p>${s.summary}</p>
+        <div class="derivation">
+          ${s.steps.map((step, i) => `<div><b>Step ${i + 1}</b>${step}</div>`).join("")}
+        </div>
+        <p><strong>Possible communication:</strong> ${s.communication}</p>
+        <p class="muted"><strong>Important boundary:</strong> ${s.caveat}</p>
+      `;
+    }
+
+    document.querySelectorAll("[data-strategy]").forEach(button => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll("[data-strategy]").forEach(x => x.setAttribute("aria-selected", "false"));
+        button.setAttribute("aria-selected", "true");
+        renderStrategy(button.dataset.strategy);
+      });
+    });
+    renderStrategy("dp");
+
+    document.querySelectorAll("[data-tab]").forEach(button => {
+      button.addEventListener("click", () => {
+        const group = button.parentElement;
+        group.querySelectorAll("[data-tab]").forEach(x => x.setAttribute("aria-selected", "false"));
+        button.setAttribute("aria-selected", "true");
+        document.querySelectorAll(".tab-panel").forEach(panel => panel.hidden = true);
+        document.getElementById(button.dataset.tab).hidden = false;
+      });
+    });
+
+    const candidateRules = {
+      prefill: {
+        short: {
+          title: "Head-sharded tiled fused attention",
+          attention: "local Flash-style fusion; K/V replicated within small group",
+          partition: "batch + heads; avoid CP overhead",
+          precision: "FP8/BF16 QKV, FP32 softmax state",
+          fusion: "QK + mask + online softmax + PV",
+          reason: "For short contexts, the startup cost of additional KV circulation is usually difficult to amortize."
+        },
+        long: {
+          title: "Context-sharded streamed attention",
+          attention: "q pieces local; chunked K/V ring or hierarchical stream",
+          partition: "TP heads × CP sequence",
+          precision: "FP8 transfer, FP32 summary",
+          fusion: "receive + dequant + QK/PV summary update",
+          reason: "Long contexts make KV capacity and HBM or network traffic dominant, so chunk overlap becomes important."
+        },
+        extreme: {
+          title: "Hierarchical CP with persistent KV placement",
+          attention: "node-local tiled attention + inter-node summary/stream hierarchy",
+          partition: "q/k across topology hierarchy",
+          precision: "compressed persistent KV; guarded FP32 combine",
+          fusion: "paged gather + dequant + persistent attention loop",
+          reason: "At 128K+ context, capacity and inter-node topology constrain the plan before local kernel optimization."
+        }
+      },
+      decode: {
+        short: {
+          title: "Paged GQA decode",
+          attention: "paged gather; group query heads reuse K/V pages",
+          partition: "requests + KV-head-aware placement",
+          precision: "INT4/FP8 KV, FP32 softmax state",
+          fusion: "page lookup + dequant + attention",
+          reason: "Single-token queries underutilize compute, making KV bandwidth, batching, and page locality more important."
+        },
+        long: {
+          title: "Split-K paged decode",
+          attention: "multiple workers produce PartialValue<AttentionSummary>",
+          partition: "requests × key chunks",
+          precision: "INT4/FP8 KV; compressed summary only if quality permits",
+          fusion: "paged load + dequant + local summary; explicit combine",
+          reason: "Long KV with short queries requires splitting k to expose enough parallelism."
+        },
+        extreme: {
+          title: "Distributed KV-cache decode",
+          attention: "hierarchical KV stream or remote page fetch",
+          partition: "KV pages placed by capacity/locality",
+          precision: "INT4 persistent/transfer, FP32 summary",
+          fusion: "remote arrival + dequant + online update",
+          reason: "Capacity determines KV placement first; requests should route near existing cache state rather than a fixed data-parallel rank."
+        }
+      },
+      training: {
+        short: {
+          title: "TP/DP fused training block",
+          attention: "tiled forward/backward; save m/l and recompute scores",
+          partition: "batch replicas × head/channel pieces",
+          precision: "BF16/FP8 compute, FP32 reductions",
+          fusion: "forward/backward regions with explicit checkpoint split",
+          reason: "Balances matrix-engine throughput, gradient combination, and activation memory."
+        },
+        long: {
+          title: "CP training with recomputation",
+          attention: "distributed summary forward; streamed/recomputed backward",
+          partition: "batch × heads × context",
+          precision: "BF16/FP8 tensors, FP32 softmax/grad accumulators",
+          fusion: "communication-aware attention forward and VJP leaves",
+          reason: "Context activation capacity and backward communication make checkpointing a joint decision."
+        },
+        extreme: {
+          title: "Memory-constrained hierarchical training",
+          attention: "hierarchical CP + aggressive recompute",
+          partition: "layers × batch × model × context",
+          precision: "quality-bounded FP8 with FP32 critical reductions",
+          fusion: "chunked forward/backward and gradient redistribution",
+          reason: "First satisfy peak capacity for parameters, optimizer state, activations, and communication staging."
+        }
+      }
+    };
+
+    function renderCandidate() {
+      const phase = document.getElementById("phase").value;
+      const objective = document.getElementById("objective").value;
+      const context = document.getElementById("context").value;
+      const c = candidateRules[phase][context];
+      const objectiveNotes = {
+        latency: "Prefer fewer launches and startups and a shorter critical path, allowing bounded replication.",
+        throughput: "Prefer stable pipelines, high occupancy, and overlap across microbatches.",
+        memory: "Prefer sharding, compressed storage, and recomputation even when communication increases.",
+        quality: "Restrict reassociation and quantization while retaining higher-precision accumulation and transfer."
+      };
+      const scores = {
+        latency: [82, 68, 63],
+        throughput: [71, 85, 69],
+        memory: [61, 72, 91],
+        quality: [68, 64, 88]
+      }[objective];
+      document.getElementById("candidate").innerHTML = `
+        <div class="eyebrow">Illustrative selected candidate</div>
+        <h3>${c.title}</h3>
+        <p>${c.reason} ${objectiveNotes[objective]}</p>
+        <div class="candidate-grid">
+          <div><b>Partition / placement</b>${c.partition}</div>
+          <div><b>Attention</b>${c.attention}</div>
+          <div><b>Representation</b>${c.precision}</div>
+          <div><b>Fusion</b>${c.fusion}</div>
+          <div><b>Phase</b>${phase}</div>
+          <div><b>Objective</b>${objective}</div>
+        </div>
+        <span class="muted">Illustrative score: compute utilization</span>
+        <div class="scorebar"><span style="width:${scores[0]}%"></span></div>
+        <span class="muted">Illustrative score: communication efficiency</span>
+        <div class="scorebar"><span style="width:${scores[1]}%"></span></div>
+        <span class="muted">Illustrative score: memory and quality objective fit</span>
+        <div class="scorebar"><span style="width:${scores[2]}%"></span></div>
+        <small class="muted">These scores illustrate selection dimensions only; they are neither benchmark results nor performance commitments.</small>
+      `;
+    }
+    ["phase", "objective", "context"].forEach(id => {
+      document.getElementById(id).addEventListener("change", renderCandidate);
+    });
+    renderCandidate();
+
+    const sections = [...document.querySelectorAll("main section")];
+    const navLinks = [...document.querySelectorAll("#toc a")];
+    const observer = new IntersectionObserver(entries => {
+      const visible = entries.filter(e => e.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      navLinks.forEach(link => link.classList.toggle("active", link.getAttribute("href") === `#${visible.target.id}`));
+    }, { rootMargin: "-15% 0px -70% 0px", threshold: [0, .1, .5] });
+    sections.forEach(section => observer.observe(section));
+  </script>
+</body>
+
+</html>
