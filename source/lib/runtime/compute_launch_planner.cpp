@@ -144,6 +144,12 @@ bool metadataTensorValid(const VernonTensorView &tensor, uint32_t rank, int64_t 
     return true;
 }
 
+bool metadataArgument(const StageBindingPlan &stagePlan, const ParameterUse &use) {
+    const MetadataCarrier *carrier = stageMetadataCarrier(stagePlan, "compute");
+    return carrier && std::any_of(carrier->fields.begin(), carrier->fields.end(),
+                                  [&](const MetadataFieldIdentity &field) { return field.argument == use.index; });
+}
+
 const VernonProgramArgument *findArgument(const VernonStageInvocationDescriptor &invocation, uint32_t slot) {
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (invocation.arguments[index].slot == slot)
@@ -244,11 +250,7 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const VernonStageIn
                             {plan.hostTensorStorageCount - 1, supplied.tensor, std::move(layout).value()});
                 }
             }
-            const bool metadataArgument =
-                stagePlan.metadataCarrier &&
-                std::any_of(stagePlan.metadataCarrier->fields.begin(), stagePlan.metadataCarrier->fields.end(),
-                            [&](const MetadataFieldIdentity &field) { return field.argument == use.index; });
-            if (metadataArgument) {
+            if (metadataArgument(stagePlan, use)) {
                 auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
                 if (!tensor)
                     return fail(error, "metadata carrier field is attached to a non-storage Tensor argument");
@@ -293,6 +295,15 @@ std::vector<uint8_t> &PlannedComputeLaunch::appendHostTensorStorage() {
 
 bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vector<ComputeLaunchArgument> &arguments,
                                 std::vector<uint8_t> &payload, std::string &error) {
+    std::vector<const VernonTensorView *> views(arguments.size());
+    for (size_t index = 0; index < arguments.size(); ++index)
+        if (const auto *tensor = std::get_if<ComputeTensorArgument>(&arguments[index]))
+            views[index] = tensor->tensorView;
+    return materializeTensorViewMetadata(carrier, views, payload, error);
+}
+
+bool materializeTensorViewMetadata(const MetadataCarrier &carrier, const std::vector<const VernonTensorView *> &views,
+                                   std::vector<uint8_t> &payload, std::string &error) {
     payload.clear();
     const bool i32 = carrier.representation == "i32";
     const bool i64 = carrier.representation == "i64";
@@ -316,7 +327,7 @@ bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vecto
                 return false;
             }
     }
-    std::vector<uint8_t> validated(arguments.size());
+    std::vector<uint8_t> validated(views.size());
     std::vector<uint8_t> initialized(carrier.members.size());
     payload.assign(static_cast<size_t>(carrier.size), 0);
     for (size_t memberIndex = 0; memberIndex < carrier.members.size(); ++memberIndex) {
@@ -340,13 +351,12 @@ bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vecto
             }
         }
         const MetadataFieldIdentity &field = carrier.fields[member.semanticOrdinal];
-        if (field.argument >= arguments.size()) {
+        if (field.argument >= views.size()) {
             error = "metadata field references an unknown argument";
             payload.clear();
             return false;
         }
-        const auto *tensorArgument = std::get_if<ComputeTensorArgument>(&arguments[field.argument]);
-        const VernonTensorView *tensor = tensorArgument ? tensorArgument->tensorView : nullptr;
+        const VernonTensorView *tensor = views[field.argument];
         if (!tensor) {
             error = "metadata field source is not a TensorView";
             payload.clear();
@@ -466,13 +476,7 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         if (tensor.access != VERNON_ACCESS_READ && !tensorByteLayoutInjective(tensor))
             return fail(error, "writable pipeline Tensor argument must have an injective byte layout");
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != stagePlan.compute)
-                continue;
-            const bool metadataArgument =
-                stagePlan.metadataCarrier &&
-                std::any_of(stagePlan.metadataCarrier->fields.begin(), stagePlan.metadataCarrier->fields.end(),
-                            [&](const MetadataFieldIdentity &field) { return field.argument == use.index; });
-            if (!metadataArgument)
+            if ((use.stage != "compute" && use.stage != stagePlan.compute) || !metadataArgument(stagePlan, use))
                 continue;
             if (tensor.rank != use.shape.size() || (tensor.rank && (!tensor.shape || !tensor.byte_strides)) ||
                 !tensor.element_layout.byte_size || tensor.byte_offset % tensor.element_layout.byte_size)
@@ -527,10 +531,10 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
                        false;
     if (!planComputeArguments(stagePlan, invocation, plan, error))
         return false;
-    if (stagePlan.metadataCarrier) {
-        if (!materializeMetadataCarrier(*stagePlan.metadataCarrier, plan.arguments, plan.metadataPayload, error))
+    if (const MetadataCarrier *carrier = stageMetadataCarrier(stagePlan, "compute")) {
+        if (!materializeMetadataCarrier(*carrier, plan.arguments, plan.metadataPayload, error))
             return false;
-        plan.metadataAlignment = static_cast<size_t>(stagePlan.metadataCarrier->alignment);
+        plan.metadataAlignment = static_cast<size_t>(carrier->alignment);
     }
     return true;
 }

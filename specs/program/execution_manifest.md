@@ -213,7 +213,7 @@ A cooked deployment bundle is exactly:
 ```json
 {
   "compiler_contract_version": 1,
-  "program_version": 1,
+  "program_version": 2,
   "type": "program",
   "id": "example/program",
   "target": {"kind": "vulkan", "options": {}},
@@ -425,8 +425,8 @@ Required members are `tag`, `operation`, `contract_hash`,
 `runtime_requirements`, `modules`, and `reflection`.
 The optional `implementation` member contains the selected target's compiled
 ABI. When present it contains exactly required `target`, `metadata`, and
-`endpoints`, plus `metadata_carrier` exactly when portable compute reflection
-declares one. `target` equals the enclosing ArtifactSystem backend.
+`endpoints`, plus `metadata_carriers` exactly when portable reflection
+declares them. `target` equals the enclosing ArtifactSystem backend.
 `implementation` is target-specific, hash-covered StageArtifact content; it
 does not alter the portable StageContract identified by `contract_hash`.
 `operation` is `compute` or `graphics`. Each CodeModule contains exactly
@@ -469,9 +469,9 @@ Filename suffix is diagnostic only. A text parse, binary parse, link, or
 entry-role mismatch is an artifact validation failure, not permission to try
 another module.
 
-Reflection is exactly `{required_features, endpoints, compute}` or
-`{required_features, endpoints, compute, metadata_carrier}` for compute, and
-`{required_features, endpoints, graphics}` for graphics. Endpoint and operation reflection are
+Reflection is exactly `{required_features, endpoints, <operation>}`, plus
+`metadata_carriers` when any module owns TensorView metadata, where
+`<operation>` is `compute` or `graphics`. Endpoint and operation reflection are
 defined in section 11.1. Reflection describes the complete StageArtifact,
 including all graphics modules; it is not duplicated per module.
 `required_features` is a sorted unique array from the contract pair's closed
@@ -1022,13 +1022,18 @@ Appendix B. Capabilities are a sorted unique array that MUST include
 Device dispatch-count and invocation limits are Runtime capabilities, not
 serialized StageContract fields.
 
-A compute reflection with one or more device TensorView arguments contains
-exactly one entry-owned `metadata_carrier`. It is forbidden on graphics
-reflection and omitted when no TensorView metadata exists. The portable
-carrier contains exactly one non-empty `fields` array. Each field contains:
+`metadata_carriers` maps a module role to that module's portable carrier. It
+contains one entry for every module with one or more TensorView arguments and
+is omitted when no module has any; keys are module roles of the artifact
+(`compute`, or `vertex`/`fragment`). Compute and graphics carriers share one
+record shape and one Runtime path
+([`graphics_storage_reads.md`](graphics_storage_reads.md) section 4). The
+portable carrier contains exactly one non-empty `fields` array. Each field
+contains:
 
 - `ordinal`: its zero-based position in `fields`;
-- `argument`: the reflected compute argument index that owns the field;
+- `argument`: the argument endpoint index, within the carrier's module, that
+  owns the field;
 - `kind`: `offset`, `extent`, or `stride`;
 - `units`: exactly `logical_elements`;
 - `dimension`: required only for `extent` and `stride`.
@@ -1040,9 +1045,10 @@ integer encoding is selected once by the physical profile and is therefore not
 repeated as a field property. Endpoint ABI bindings do not redeclare metadata
 fields or allocate per-field slots.
 
-The selected target implementation contains one matching physical
-`metadata_carrier` with required `profile`, `representation`, `carrier`,
-`encoded_size`, `size`, `alignment`, `members`, and `interface_plan`, plus
+The selected target implementation contains `metadata_carriers` with the same
+module-role keys; each value is the physical carrier with required `profile`,
+`representation`, `carrier`, `encoded_size`, `size`, `alignment`, `members`,
+and `interface_plan`, plus
 one profile-specific native location: shaders use top-level `set` and
 `binding`, CUDA uses top-level `parameter_ordinal`, and CPU uses only
 `interface_plan.frame_offset`. Every
@@ -1053,6 +1059,18 @@ member byte ranges must be ordered, aligned, non-overlapping, and exactly cover
 scalar representation, member order, and canonical layout hash. Runtime
 rejects disagreement and never reconstructs this layout from endpoint order or
 neighboring bindings.
+
+The profile is selected by the backend, not by the operation: CPU uses
+`host_metadata`, CUDA uses `cuda_kernel_metadata_i64`, and every shader
+backend uses `portable_shader_metadata_i32` for compute, vertex, and fragment
+modules alike.
+
+A TensorView endpoint whose buffer layout has `descriptor = true` lists one
+`storage_leaf` binding per storage leaf of its element layout, each with its
+own `resource_slot` carrier. Its implementation endpoint records the native
+location of every leaf in `storage_leaves` as `{binding, byte_offset,
+element_size}`; Runtime checks these against the leaves it derives from the
+element layout and rejects a descriptor endpoint without them.
 
 Graphics reflection contains exactly `topology`, `vertex_inputs`,
 `fragment_outputs`, `linkage`, `attachment_constraints`, `index_formats`, and
@@ -2206,7 +2224,7 @@ and alignment is a power of two. Endpoint transport constrains its primary
 constant region; `resource_handle` uses a resource slot; `device_address` uses
 a device-address slot or value slot. TensorView endpoint ABI lists only genuine
 value or storage-leaf carriers. Offset, extent, and stride are owned by the
-entry `metadata_carrier` semantic sequence and do not allocate per-field
+module's `metadata_carriers` semantic sequence and do not allocate per-field
 endpoint slots.
 `sampler_endpoint` is required when image and sampler are one logical combined
 binding.
@@ -2225,9 +2243,9 @@ physical ABI:
   endpoint and may include target locations such as descriptor set/binding,
   packed-frame offset, value transport, element layout, or sampled-image
   bindings;
-- `metadata_carrier`, when required, maps the semantic metadata ordinals
-  bijectively to one physical aggregate and records its profile, layout,
-  interface plan, and target location.
+- `metadata_carriers`, when required, maps each module's semantic metadata
+  ordinals bijectively to one physical aggregate and records its profile,
+  layout, interface plan, and target location.
 
 CPU, CUDA, and shader targets may select different physical carrier layouts.
 Runtime validates this hash-covered target implementation and materializes it

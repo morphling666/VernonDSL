@@ -831,14 +831,20 @@ Result<void, RhiError> downloadImageLocked(OpenGLDevice &state, const ImageSlot 
     const size_t expected = *imageDownloadByteSize(slot.descriptor, download);
     FormatInfo format;
     formatInfo(slot.descriptor.format, format);
-    Enum externalFormat = format.external;
-    Enum allocationType = format.allocationType;
+    Enum externalFormat = imageDataFormat(download.destination_format);
+    Enum allocationType = download.destination_type == VERNON_RHI_IMAGE_DATA_UINT8     ? 0x1401
+                          : download.destination_type == VERNON_RHI_IMAGE_DATA_FLOAT16 ? 0x140B
+                          : download.destination_type == VERNON_RHI_IMAGE_DATA_FLOAT32 ? 0x1406
+                          : download.destination_type == VERNON_RHI_IMAGE_DATA_UINT32  ? 0x1405
+                                                                                       : format.allocationType;
     const bool packedDepthStencil =
         download.aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
     if (slot.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT && !packedDepthStencil) {
         externalFormat = download.aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL ? 0x1901 : 0x1902;
         allocationType = download.aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL ? 0x1401 : 0x1406;
     }
+    if (!externalFormat || !allocationType)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"download_opengl_image", 0, 0}})};
     if (slot.descriptor.dimension == VERNON_RHI_IMAGE_3D)
         return state.state.downloadImage3D(slot.image, static_cast<Int>(download.mip_level),
                                            static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),

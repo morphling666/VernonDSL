@@ -6,6 +6,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <algorithm>
+
 namespace vernon::compiler {
 namespace {
 
@@ -113,6 +115,8 @@ llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llv
         compiled["binding"] = *binding;
     if (const llvm::json::Array *sampled = row.getArray("sampled_image_bindings"))
         compiled["sampled_image_bindings"] = copyJsonArray(*sampled);
+    if (const llvm::json::Array *leaves = row.getArray("storage_leaves"))
+        compiled["storage_leaves"] = copyJsonArray(*leaves);
     if (const llvm::json::Object *element = row.getObject("element_layout"))
         compiled["element_layout"] = copyJsonObject(*element);
     if (const llvm::json::Object *plan = selectedTransportPlan(row))
@@ -122,6 +126,59 @@ llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llv
             if (const std::optional<int64_t> offset = host->getInteger("frame_offset"); offset && *offset >= 0)
                 compiled["packed_frame_offset"] = *offset;
     return compiled;
+}
+
+bool projectProgramMetadataCarrier(const llvm::json::Object &compiled, llvm::StringRef module,
+                                   ProgramModuleMetadataCarrier &carrier, std::string &error) {
+    carrier = {};
+    const llvm::json::Array *fields = compiled.getArray("fields");
+    if (!fields || fields->empty()) {
+        error = "compiled " + module.str() + " metadata carrier has no semantic fields";
+        return false;
+    }
+    llvm::json::Array semanticFields;
+    for (const auto &[ordinal, fieldValue] : llvm::enumerate(*fields)) {
+        const llvm::json::Object *field = fieldValue.getAsObject();
+        const std::optional<int64_t> argument = field ? field->getInteger("argument") : std::nullopt;
+        const std::optional<llvm::StringRef> kind = field ? field->getString("kind") : std::nullopt;
+        const std::optional<int64_t> dimension = field ? field->getInteger("dimension") : std::nullopt;
+        const bool dimensional = kind == "extent" || kind == "stride";
+        if (!argument || *argument < 0 || (kind != "offset" && !dimensional) ||
+            dimensional != (field->get("dimension") != nullptr) || dimensional != dimension.has_value() ||
+            (dimension && *dimension < 0) || field->getInteger("ordinal") != static_cast<int64_t>(ordinal) ||
+            field->getString("units") != "logical_elements") {
+            error = "compiled " + module.str() + " metadata carrier has an invalid semantic field";
+            return false;
+        }
+        int64_t &rank = carrier.argumentRanks[*argument];
+        llvm::json::Object projected{{"ordinal", static_cast<int64_t>(ordinal)},
+                                     {"argument", *argument},
+                                     {"kind", kind->str()},
+                                     {"units", "logical_elements"}};
+        if (dimension) {
+            projected["dimension"] = *dimension;
+            rank = std::max(rank, *dimension + 1);
+        }
+        semanticFields.emplace_back(std::move(projected));
+    }
+    carrier.semantic = llvm::json::Object{{"fields", std::move(semanticFields)}};
+    carrier.physical = copyJsonObject(compiled);
+    carrier.physical.erase("fields");
+    return true;
+}
+
+llvm::json::Object semanticProgramMetadataCarriers(const ProgramModuleMetadataCarriers &carriers) {
+    llvm::json::Object projected;
+    for (const auto &[module, carrier] : carriers)
+        projected[module] = copyJsonObject(carrier.semantic);
+    return projected;
+}
+
+llvm::json::Object physicalProgramMetadataCarriers(const ProgramModuleMetadataCarriers &carriers) {
+    llvm::json::Object projected;
+    for (const auto &[module, carrier] : carriers)
+        projected[module] = copyJsonObject(carrier.physical);
+    return projected;
 }
 
 bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, ProgramNodeBindingIndex &boundValues,

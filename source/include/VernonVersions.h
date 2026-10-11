@@ -4,11 +4,11 @@
 
 #define VERNON_RELEASE_VERSION "0.1.2"
 #define VERNON_COMPILER_CONTRACT_VERSION 1
-#define VERNON_PROGRAM_VERSION 1
+#define VERNON_PROGRAM_VERSION 2
 #define VERNON_COMPILER_CONTRACT_VERSION_STRING "1"
-#define VERNON_PROGRAM_VERSION_STRING "1"
-#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64"
-#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":1,\"program_version\":1"
-#define VERNON_PROGRAM_JSON_FIELD "\"program_version\":1"
+#define VERNON_PROGRAM_VERSION_STRING "2"
+#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 1 : i64, vernon.program_version = 2 : i64"
+#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":1,\"program_version\":2"
+#define VERNON_PROGRAM_JSON_FIELD "\"program_version\":2"
 
 #endif // VERNON_VERSIONS_H

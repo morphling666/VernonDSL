@@ -21,8 +21,7 @@ struct ProgramComputeEndpointPlan {
     ProgramEndpointBindingRecords endpointBindings;
     ProgramImplementationEndpointRecords implementationEndpoints;
     ProgramAccessRecords accesses;
-    std::optional<llvm::json::Object> semanticMetadataCarrier;
-    std::optional<llvm::json::Object> physicalMetadataCarrier;
+    ProgramModuleMetadataCarriers metadataCarriers;
 };
 
 bool isProgramTapeCarrierRole(llvm::StringRef role);
@@ -44,7 +43,7 @@ bool validateCanonicalComputePortableSlots(const llvm::json::Array &endpoints, s
 
 bool buildCanonicalComputeStageContract(const llvm::json::Object &compiledEntry,
                                         const llvm::json::Object &compiledReflection, llvm::json::Array endpoints,
-                                        std::optional<llvm::json::Object> metadataCarrier,
+                                        const ProgramModuleMetadataCarriers &metadataCarriers,
                                         llvm::json::Object &stageContract, std::string &error);
 
 } // namespace vernon::compiler

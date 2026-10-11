@@ -1,5 +1,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
+#include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGraphicsBindings.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
@@ -632,7 +634,49 @@ FailureOr<Value> lowerCompositeElementwise(Location location, Type resultType, A
     return createLeaf(resultType, operands);
 }
 
-FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping) {
+/// Source graphics TensorView argument -> pointers to its storage-leaf buffers,
+/// in ValueAbi leaf order. Every leaf views the whole record buffer as an array
+/// of that leaf's scalar type.
+using StorageLeafMap = DenseMap<Value, SmallVector<Value>>;
+
+FailureOr<Value> translatePhysicalLoad(PhysicalLoadOp load, OpBuilder &builder, IRMapping &mapping,
+                                       const StorageLeafMap &storage) {
+    ModuleOp sourceModule = load->getParentOfType<ModuleOp>();
+    auto leaves = storage.find(load.getStorage());
+    Value recordIndex = mapping.lookupOrNull(load.getIndex());
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(load.getResult().getType(), sourceModule);
+    if (leaves == storage.end() || !recordIndex || failed(layout) || layout->leaves.size() != leaves->second.size())
+        return load.emitError("graphics TensorView load requires a stage-entry TensorView argument");
+    Location location = load.getLoc();
+    Type indexType = recordIndex.getType();
+    auto constant = [&](uint64_t value) {
+        return spirv::ConstantOp::create(builder, location, indexType, builder.getIntegerAttr(indexType, value));
+    };
+    Value blockMember =
+        spirv::ConstantOp::create(builder, location, builder.getI32Type(), builder.getI32IntegerAttr(0));
+    SmallVector<Value> scalars;
+    for (auto [leaf, pointer] : llvm::zip_equal(layout->leaves, leaves->second)) {
+        const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+        if (layout->size % scalarSize != 0 || leaf.byteOffset % scalarSize != 0)
+            return load.emitError("graphics TensorView record is not aligned to its storage leaf scalars");
+        Value base = spirv::IMulOp::create(builder, location, recordIndex, constant(layout->size / scalarSize));
+        for (uint64_t scalar = 0; scalar < leaf.scalarCount; ++scalar) {
+            Value index =
+                spirv::IAddOp::create(builder, location, base, constant(leaf.byteOffset / scalarSize + scalar));
+            Value element = spirv::AccessChainOp::create(builder, location, pointer, ValueRange{blockMember, index});
+            scalars.push_back(spirv::LoadOp::create(builder, location, element));
+        }
+    }
+    FailureOr<Type> resultType = convertValueType(load.getResult().getType(), sourceModule);
+    if (failed(resultType))
+        return load.emitError("cannot lower graphics TensorView element type to SPIR-V");
+    return constructComposite(location, *resultType, scalars, builder);
+}
+
+FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping,
+                                    const StorageLeafMap &storage) {
+    if (auto load = dyn_cast<PhysicalLoadOp>(operation))
+        return translatePhysicalLoad(load, builder, mapping, storage);
     Location location = operation.getLoc();
     ModuleOp sourceModule = operation.getParentOfType<ModuleOp>();
     auto mapped = [&](Value value) { return mapping.lookupOrNull(value); };
@@ -1094,9 +1138,16 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return spirv::SGreaterThanOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpIPredicate::sge:
             return spirv::SGreaterThanEqualOp::create(builder, location, lhs, rhs).getResult();
-        default:
-            return failure();
+        case arith::CmpIPredicate::ult:
+            return spirv::ULessThanOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpIPredicate::ule:
+            return spirv::ULessThanEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpIPredicate::ugt:
+            return spirv::UGreaterThanOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpIPredicate::uge:
+            return spirv::UGreaterThanEqualOp::create(builder, location, lhs, rhs).getResult();
         }
+        return failure();
     }
 
     if (auto cast = dyn_cast<arith::SIToFPOp>(operation)) {
@@ -1208,13 +1259,14 @@ LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, I
 }
 
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         SmallVectorImpl<Value> &yieldedValues, Value *condition = nullptr);
+                                         const StorageLeafMap &storage, SmallVectorImpl<Value> &yieldedValues,
+                                         Value *condition = nullptr);
 
 LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                         SmallVectorImpl<Value> &results);
+                         const StorageLeafMap &storage, SmallVectorImpl<Value> &results);
 
 LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                      SmallVectorImpl<Value> &results) {
+                      const StorageLeafMap &storage, SmallVectorImpl<Value> &results) {
     Value condition = mapping.lookupOrNull(ifOp.getCondition());
     ModuleOp sourceModule = ifOp->getParentOfType<ModuleOp>();
     if (!condition || !ifOp.getThenRegion().hasOneBlock() ||
@@ -1248,7 +1300,7 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
         SmallVector<Value> thenValues;
         OpBuilder thenBuilder = OpBuilder::atBlockBegin(thenBlock);
         if (failed(translateStraightLineBlock(ifOp.getThenRegion().front(), thenBuilder, functionEntry, mapping,
-                                              thenValues)) ||
+                                              storage, thenValues)) ||
             thenValues.size() != resultVariables.size())
             return failure();
         for (auto [variable, value] : llvm::zip_equal(resultVariables, thenValues))
@@ -1261,7 +1313,7 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
             if (!resultVariables.empty())
                 return failure();
         } else if (failed(translateStraightLineBlock(ifOp.getElseRegion().front(), elseBuilder, functionEntry, mapping,
-                                                     elseValues)) ||
+                                                     storage, elseValues)) ||
                    elseValues.size() != resultVariables.size()) {
             return failure();
         }
@@ -1279,7 +1331,8 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
 }
 
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         SmallVectorImpl<Value> &yieldedValues, Value *condition) {
+                                         const StorageLeafMap &storage, SmallVectorImpl<Value> &yieldedValues,
+                                         Value *condition) {
     for (Operation &operation : source) {
         if (auto conditionOp = dyn_cast<scf::ConditionOp>(operation)) {
             if (!condition)
@@ -1306,7 +1359,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerIf(ifOp, builder, functionEntry, mapping, translatedResults)))
+            if (failed(lowerIf(ifOp, builder, functionEntry, mapping, storage, translatedResults)))
                 return failure();
             if (translatedResults.size() != ifOp.getNumResults())
                 return failure();
@@ -1316,7 +1369,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
         }
         if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerWhile(whileOp, builder, functionEntry, mapping, translatedResults)) ||
+            if (failed(lowerWhile(whileOp, builder, functionEntry, mapping, storage, translatedResults)) ||
                 translatedResults.size() != whileOp.getNumResults())
                 return failure();
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
@@ -1329,7 +1382,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
                        << "operation cannot be translated inside structured control flow: " << operation.getName();
             continue;
         }
-        FailureOr<Value> translated = translateOperation(operation, builder, mapping);
+        FailureOr<Value> translated = translateOperation(operation, builder, mapping, storage);
         if (failed(translated) || operation.getNumResults() != 1)
             return operation.emitError() << "operation cannot be translated inside structured control flow: "
                                          << operation.getName();
@@ -1339,7 +1392,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
 }
 
 LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                         SmallVectorImpl<Value> &results) {
+                         const StorageLeafMap &storage, SmallVectorImpl<Value> &results) {
     if (!whileOp.getBefore().hasOneBlock() || !whileOp.getAfter().hasOneBlock())
         return whileOp.emitError("structured loop regions must contain one block");
 
@@ -1384,7 +1437,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
         Value condition;
         OpBuilder beforeBuilder = OpBuilder::atBlockBegin(beforeBlock);
         if (failed(translateStraightLineBlock(whileOp.getBefore().front(), beforeBuilder, functionEntry, mapping,
-                                              conditionValues, &condition)) ||
+                                              storage, conditionValues, &condition)) ||
             conditionValues.size() != whileOp.getAfter().front().getNumArguments())
             return whileOp.emitError("cannot translate a structured loop condition region");
         for (auto [argument, value] : llvm::zip_equal(whileOp.getAfter().front().getArguments(), conditionValues)) {
@@ -1401,7 +1454,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 
         SmallVector<Value> yieldedValues;
         OpBuilder afterBuilder = OpBuilder::atBlockBegin(afterBlock);
-        if (failed(translateStraightLineBlock(whileOp.getAfter().front(), afterBuilder, functionEntry, mapping,
+        if (failed(translateStraightLineBlock(whileOp.getAfter().front(), afterBuilder, functionEntry, mapping, storage,
                                               yieldedValues)) ||
             yieldedValues.size() != beforeBlock->getNumArguments())
             return whileOp.emitError("cannot translate a structured loop body region");
@@ -1418,8 +1471,14 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder &moduleBuilder,
                          llvm::StringSet<> &usedInterfaceNames, bool useVulkanInterfaceAbi,
-                         const DenseMap<Value, std::pair<uint32_t, uint32_t>> &generatedBindings) {
+                         const GraphicsBindingPlan &bindings) {
     ModuleOp sourceModule = source->getParentOfType<ModuleOp>();
+    const auto generatedBinding = [&](unsigned index) -> std::optional<uint32_t> {
+        const SmallVector<uint32_t> *planned = bindings.find(source.getSymName(), index);
+        if (!planned || planned->size() != 1)
+            return std::nullopt;
+        return planned->front();
+    };
     auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
     if (!stage)
         return success();
@@ -1445,8 +1504,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             break;
         InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
-        if (!kind || kind.getValue() != "uniform" || attrs.binding ||
-            generatedBindings.contains(source.getArgument(index)))
+        if (!kind || kind.getValue() != "uniform" || attrs.binding || generatedBinding(index))
             continue;
         FailureOr<Type> converted = convertValueType(type, sourceModule);
         if (failed(converted))
@@ -1482,8 +1540,89 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             spirv::LinkageAttributesAttr());
         interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), pushConstantBlock.getSymName()));
     }
+    SmallVector<std::pair<BlockArgument, SmallVector<spirv::GlobalVariableOp>>> storageArguments;
+    SmallVector<std::pair<BlockArgument, spirv::GlobalVariableOp>> carrierArguments;
+    const auto createBlockGlobal = [&](StringRef name, ArrayRef<Type> memberTypes, ArrayRef<uint32_t> memberOffsets,
+                                       spirv::StorageClass storageClass, uint32_t binding, bool nonWritable) {
+        SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+        if (nonWritable)
+            for (uint32_t member = 0; member < memberTypes.size(); ++member)
+                memberDecorations.emplace_back(member, spirv::Decoration::NonWritable, moduleBuilder.getUnitAttr());
+        SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
+        structDecorations.emplace_back(spirv::Decoration::Block, moduleBuilder.getUnitAttr());
+        auto blockType = spirv::StructType::get(memberTypes, memberOffsets, memberDecorations, structDecorations);
+        auto global = spirv::GlobalVariableOp::create(
+            moduleBuilder, source.getLoc(), spirv::PointerType::get(blockType, storageClass), name, FlatSymbolRefAttr(),
+            IntegerAttr(), moduleBuilder.getI32IntegerAttr(binding), moduleBuilder.getI32IntegerAttr(0), StringAttr(),
+            spirv::LinkageAttributesAttr());
+        interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
+        return global;
+    };
+    const auto createDescriptorBlock = [&](StringRef name, Type memberType, spirv::StorageClass storageClass,
+                                           uint32_t binding, bool nonWritable) {
+        return createBlockGlobal(name, {memberType}, {0}, storageClass, binding, nonWritable);
+    };
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
         if (isa<SamplerType>(type)) {
+            inputs.emplace_back();
+            inputMembers.push_back(std::nullopt);
+            inputAttributes.push_back(false);
+            continue;
+        }
+        if (source.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
+            FailureOr<std::shared_ptr<const SemanticMetadataPlan>> semantic = getSemanticMetadataPlan(source);
+            std::optional<uint32_t> binding = generatedBinding(index);
+            if (failed(semantic) || (*semantic)->empty() || !binding)
+                return source.emitError("graphics TensorView metadata carrier has no binding plan");
+            MetadataNativeLocation nativeLocation;
+            nativeLocation.descriptorSet = 0;
+            nativeLocation.binding = *binding;
+            FailureOr<std::shared_ptr<const PhysicalMetadataPlan>> physical =
+                getPhysicalMetadataPlan(**semantic, MetadataPhysicalProfile::PortableShaderMetadataI32, nativeLocation);
+            if (failed(physical))
+                return source.emitError("graphics TensorView metadata carrier exceeds its compiled profile limit");
+            SmallVector<PhysicalMetadataMember> members((*physical)->getMembers());
+            llvm::sort(members, [](const PhysicalMetadataMember &left, const PhysicalMetadataMember &right) {
+                return left.semanticOrdinal < right.semanticOrdinal;
+            });
+            SmallVector<Type> memberTypes(members.size(), moduleBuilder.getI32Type());
+            SmallVector<uint32_t> memberOffsets;
+            for (const PhysicalMetadataMember &member : members)
+                memberOffsets.push_back(static_cast<uint32_t>(member.byteOffset));
+            std::string name = uniqueInterfaceName((source.getSymName() + "_tensor_metadata").str(), stage.getValue(),
+                                                   usedInterfaceNames);
+            carrierArguments.emplace_back(
+                source.getArgument(index),
+                createBlockGlobal(name, memberTypes, memberOffsets, spirv::StorageClass::Uniform, *binding, false));
+            inputs.emplace_back();
+            inputMembers.push_back(std::nullopt);
+            inputAttributes.push_back(false);
+            continue;
+        }
+        if (auto view = dyn_cast<TensorViewType>(type); view && view.getAddressSpace() == "device") {
+            const SmallVector<uint32_t> *planned = bindings.find(source.getSymName(), index);
+            FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), sourceModule);
+            if (!planned || failed(layout) || planned->size() != layout->leaves.size())
+                return source.emitError() << "graphics TensorView argument #" << index << " has no binding plan";
+            std::string fallback = (source.getSymName() + "_arg_" + Twine(index)).str();
+            auto sourceName = source.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+            std::string name = uniqueInterfaceName(
+                sanitizeInterfaceName(sourceName ? sourceName.getValue() : StringRef(), fallback, false),
+                stage.getValue(), usedInterfaceNames);
+            SmallVector<spirv::GlobalVariableOp> leafGlobals;
+            for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
+                FailureOr<Type> scalar = convertValueType(leaf.scalarType, sourceModule);
+                if (failed(scalar))
+                    return source.emitError()
+                           << "graphics TensorView argument #" << index << " has an unsupported storage scalar";
+                const unsigned scalarSize = std::max(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1u);
+                std::string leafName = uniqueInterfaceName(name + "_leaf_" + std::to_string(leafIndex),
+                                                           stage.getValue(), usedInterfaceNames);
+                leafGlobals.push_back(createDescriptorBlock(leafName, spirv::RuntimeArrayType::get(*scalar, scalarSize),
+                                                            spirv::StorageClass::StorageBuffer, (*planned)[leafIndex],
+                                                            true));
+            }
+            storageArguments.emplace_back(source.getArgument(index), std::move(leafGlobals));
             inputs.emplace_back();
             inputMembers.push_back(std::nullopt);
             inputAttributes.push_back(false);
@@ -1494,9 +1633,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return source.emitError() << "cannot lower argument #" << index << " type " << type << " to SPIR-V";
         Type convertedType = *converted;
         NamedAttrList effectiveAttrs(source.getArgAttrDict(index));
-        if (auto generated = generatedBindings.find(source.getArgument(index)); generated != generatedBindings.end()) {
-            effectiveAttrs.set(kDescriptorSetAttrName, moduleBuilder.getI64IntegerAttr(generated->second.first));
-            effectiveAttrs.set(kBindingAttrName, moduleBuilder.getI64IntegerAttr(generated->second.second));
+        if (std::optional<uint32_t> generated = generatedBinding(index)) {
+            effectiveAttrs.set(kDescriptorSetAttrName, moduleBuilder.getI64IntegerAttr(0));
+            effectiveAttrs.set(kBindingAttrName, moduleBuilder.getI64IntegerAttr(*generated));
         }
         DictionaryAttr argumentAttrs = effectiveAttrs.getDictionary(source.getContext());
         InterfaceAttrs attrs = parseInterfaceAttrs(argumentAttrs);
@@ -1620,6 +1759,31 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     Block *entry = function.addEntryBlock();
     OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
     IRMapping mapping;
+    StorageLeafMap storage;
+    for (auto &[argument, leafGlobals] : storageArguments) {
+        SmallVector<Value> pointers;
+        for (spirv::GlobalVariableOp global : leafGlobals)
+            pointers.push_back(spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global));
+        storage[argument] = std::move(pointers);
+    }
+    // The carrier block holds the i32 fields directly because SPIR-V forbids a
+    // Block struct nested in another Block. The tuple value is rebuilt from
+    // per-member loads so no Block-typed value is ever loaded.
+    for (auto [argument, global] : carrierArguments) {
+        auto blockType = cast<spirv::StructType>(cast<spirv::PointerType>(global.getType()).getPointeeType());
+        SmallVector<Type> fieldTypes(blockType.getElementTypes());
+        auto tupleType = spirv::StructType::get(fieldTypes);
+        Value block = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
+        SmallVector<Value> fields;
+        for (uint32_t member = 0; member < blockType.getNumElements(); ++member) {
+            Value memberIndex = spirv::ConstantOp::create(bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
+                                                          bodyBuilder.getI32IntegerAttr(member));
+            Value pointer = spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), block, memberIndex);
+            fields.push_back(spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer));
+        }
+        mapping.map(argument,
+                    spirv::CompositeConstructOp::create(bodyBuilder, source.getLoc(), tupleType, fields).getResult());
+    }
     for (auto [argument, globals, member, attribute] :
          llvm::zip_equal(source.getArguments(), inputs, inputMembers, inputAttributes)) {
         if (globals.empty())
@@ -1688,7 +1852,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerIf(ifOp, bodyBuilder, entry, mapping, translatedResults)) ||
+            if (failed(lowerIf(ifOp, bodyBuilder, entry, mapping, storage, translatedResults)) ||
                 translatedResults.size() != ifOp.getNumResults())
                 return operation.emitError("structured conditional is not supported by SPIR-V lowering");
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(ifOp.getResults(), translatedResults))
@@ -1697,7 +1861,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerWhile(whileOp, bodyBuilder, entry, mapping, translatedResults)) ||
+            if (failed(lowerWhile(whileOp, bodyBuilder, entry, mapping, storage, translatedResults)) ||
                 translatedResults.size() != whileOp.getNumResults())
                 return operation.emitError("structured loop is not supported by SPIR-V lowering");
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
@@ -1724,7 +1888,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                        << "operation '" << operation.getName() << "' is not supported by SPIR-V lowering";
             continue;
         }
-        FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping);
+        FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping, storage);
         if (failed(translated)) {
             if (auto intrinsic = dyn_cast<IntrinsicOp>(operation))
                 return operation.emitError()
@@ -1775,44 +1939,10 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
         target->setAttr(spirv::getTargetEnvAttrName(), spirv::getDefaultTargetEnv(module.getContext()));
         OpBuilder moduleBuilder = OpBuilder::atBlockBegin(target.getBody());
         llvm::StringSet<> usedInterfaceNames;
-        DenseMap<Value, std::pair<uint32_t, uint32_t>> generatedBindings;
-        uint32_t nextGeneratedBinding = 0;
-        for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-                InterfaceAttrs attrs = parseInterfaceAttrs(function.getArgAttrDict(index));
-                auto descriptorSet = dyn_cast_if_present<IntegerAttr>(attrs.descriptorSet);
-                auto binding = dyn_cast_if_present<IntegerAttr>(attrs.binding);
-                if (binding && (!descriptorSet || descriptorSet.getInt() == 0))
-                    nextGeneratedBinding = std::max(nextGeneratedBinding, static_cast<uint32_t>(binding.getInt() + 1));
-            }
-        }
-        for (func::FuncOp function : entries) {
-            uint64_t inlineSize = 0;
-            for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
-                InterfaceAttrs attrs = parseInterfaceAttrs(function.getArgAttrDict(index));
-                auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
-                if (!kind || kind.getValue() != "uniform" || attrs.binding)
-                    continue;
-                if (isa<TensorType>(type)) {
-                    generatedBindings[function.getArgument(index)] = std::make_pair(0u, nextGeneratedBinding++);
-                    continue;
-                }
-                FailureOr<ByteTransportPlan> layout =
-                    getByteTransportPlan(type, module, PhysicalAbiProfile::VulkanPushConstant);
-                if (failed(layout)) {
-                    function.emitError() << "cannot plan graphics inline layout for argument #" << index;
-                    target.erase();
-                    return signalPassFailure();
-                }
-                uint64_t offset = llvm::alignTo(inlineSize, layout->root->alignment);
-                bool spill = (isa<RankedTensorType>(type) && cast<RankedTensorType>(type).getRank() > 2) ||
-                             offset > 128 || layout->root->size > 128 - std::min<uint64_t>(offset, 128);
-                if (spill) {
-                    generatedBindings[function.getArgument(index)] = std::make_pair(0u, nextGeneratedBinding++);
-                } else {
-                    inlineSize = offset + layout->root->size;
-                }
-            }
+        FailureOr<GraphicsBindingPlan> generatedBindings = planGraphicsBindings(module);
+        if (failed(generatedBindings)) {
+            target.erase();
+            return signalPassFailure();
         }
         int64_t expectedImageQueryCount = 0;
 
@@ -1822,7 +1952,7 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
                     ++expectedImageQueryCount;
             });
             if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, useVulkanInterfaceAbi,
-                                  generatedBindings))) {
+                                  *generatedBindings))) {
                 target.erase();
                 return signalPassFailure();
             }

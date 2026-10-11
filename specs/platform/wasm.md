@@ -4,16 +4,18 @@ Status: current wasm32 CPU deployment architecture.
 
 Vernon's first browser target is `wasm32-unknown-emscripten`. The compiler emits relocatable
 WebAssembly objects, the cooker keeps those objects separate from the manifest, and the application
-links them together with the static Runtime and generated registration source.
+links them together with the static Runtime.
 
 ## Architecture
 
 The browser path uses the same compiler, Program, and CPU entry contracts:
 
 1. Compile each CPU stage to `module.wasm.o`.
-2. Cook the object as `artifacts/<sha256>.wasm.o` and emit
-   `vernon_cpu_registration_<hash>.c`.
-3. Link the object, registration source, and `VernonRuntime` into the Emscripten application.
+2. Cook the object as `artifacts/<sha256>.wasm.o`. The object carries a static constructor that
+   registers its entries with `vernonRuntimeRegisterStaticCpuEntries`.
+3. Link the object and `VernonRuntime` into the Emscripten application. Link objects directly, or
+   whole-archive when they are placed in a static library, because an archive drops unreferenced
+   members together with their constructors.
 4. Load the cooked manifest from application memory with
    `vernonRuntimeLoadProgramBundleWithOptions(..., nullptr)`.
 5. Resolve the stage through the static CPU entry registry. The web profile never opens the
@@ -25,7 +27,10 @@ bytes cannot be re-hashed as a standalone object at Runtime load time.
 
 ## Build and cook
 
-Build LLVM with the WebAssembly target enabled. A host build of the compiler performs cooking:
+Build LLVM with the WebAssembly target enabled. A host build of the compiler performs cooking. CMake
+applications cook at build time with `vernon_add_program_asset(... TARGET cpu COOK_OPTIONS
+--cpu-triple wasm32-unknown-emscripten)` and link the returned target. Manual cooking uses the
+same cooker:
 
 ```sh
 python -m vernon_dsl.program_asset_cli \
@@ -49,7 +54,6 @@ The final application link must include:
 
 - `wasm-build/libVernonRuntime.a` and its installed static Runtime dependencies;
 - every `cooked/artifacts/*.wasm.o` used by the application;
-- every generated `cooked/vernon_cpu_registration_*.c` source;
 - the application code that supplies manifest JSON bytes.
 
 [`examples/external_engine/`](../../examples/external_engine/) provides a minimal
@@ -73,7 +77,7 @@ the calling-thread scheduler. The external-engine example loads both bundles in 
 the animated `examples/fractal.py` kernel runs through a persistent CPU Program instance in the
 left panel while a persistent graphics Program instance renders Mandelbulb through desktop OpenGL
 or Emscripten WebGL2 in the right panel. The web build embeds integrity-checked GLSL ES stages and
-the statically linked CPU object. On pull requests, the `External Engine Pages` workflow cooks both
-bundles, builds the Emscripten application, runs the headless Node checksum smoke, and verifies
+the statically linked CPU object. On pull requests, the `External Engine Pages` workflow builds the
+Emscripten application, which cooks both bundles, runs the headless Node checksum smoke, and verifies
 browser startup with an explicitly installed headless Chrome. Pages staging and deployment run
 only for non-PR workflow events.

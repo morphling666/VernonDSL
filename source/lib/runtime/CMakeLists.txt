@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/VernonVersions.cmake")
-    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/VernonVersions.cmake")
+    set(_vernon_runtime_cmake_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake")
 else()
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VernonVersions.cmake")
+    set(_vernon_runtime_cmake_dir "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 endif()
+include("${_vernon_runtime_cmake_dir}/VernonVersions.cmake")
+# Every project that adds VernonRuntime also gets build-time Program cooking; CMake functions are global.
+include("${_vernon_runtime_cmake_dir}/VernonProgramAsset.cmake")
 set(_vernon_is_ios OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_OSX_SYSROOT MATCHES "(^|/)(iphoneos|iphonesimulator)(\\.sdk)?$")
     set(_vernon_is_ios ON)
@@ -241,7 +244,10 @@ if(SKBUILD)
         DESTINATION vernon_dsl/runtime_src
         COMPONENT VernonWheel)
     install(
-        FILES "${_vernon_runtime_target_file}" "${_vernon_repository_root}/cmake/VernonVersions.cmake"
+        FILES "${_vernon_runtime_target_file}"
+              "${_vernon_repository_root}/cmake/VernonVersions.cmake"
+              "${_vernon_repository_root}/cmake/VernonProgramAsset.cmake"
+              "${_vernon_repository_root}/cmake/VernonArchiveCpuProgram.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake
         COMPONENT VernonWheel)
     install(

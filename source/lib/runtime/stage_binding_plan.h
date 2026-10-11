@@ -36,6 +36,12 @@ struct InterfacePlan {
     std::optional<TransportNode> root;
 };
 
+struct ReflectedStorageLeaf {
+    size_t elementSize{};
+    size_t byteOffset{};
+    uint32_t binding{UINT32_MAX};
+};
+
 struct AttributeLeaf {
     uint32_t locationOffset{};
     std::string dtype;
@@ -125,6 +131,9 @@ struct ParameterUse {
     uint32_t binding{UINT32_MAX};
     std::vector<SampledImageBinding> sampledImageBindings;
     std::vector<AttributeLeaf> attributeLeaves;
+    // Graphics TensorView storage: one native binding per storage leaf in leaf
+    // order. Each leaf binds the whole record buffer.
+    std::vector<ReflectedStorageLeaf> storageLeaves;
     std::string transport;
     TensorRepresentation tensorPacking{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;
@@ -154,6 +163,9 @@ enum class AutodiffResourceRole {
 
 struct Parameter {
     uint32_t slot{};
+    // First target binding of this parameter; Node endpoint projections are
+    // read from it, so they stay indexed like `parameters`.
+    uint32_t targetBinding{UINT32_MAX};
     std::string name;
     std::string kind;
     StageParameterSource source;
@@ -210,7 +222,9 @@ struct StageBindingPlan {
     std::vector<Parameter> parameters;
     std::vector<Parameter> runtimeParameters;
     std::vector<Output> outputs;
-    std::optional<MetadataCarrier> metadataCarrier;
+    // Keyed by module role. Field `argument` equals ParameterUse::index of a use
+    // in that module.
+    std::map<std::string, MetadataCarrier> metadataCarriers;
     std::map<std::string, std::string> artifactKeys;
     std::string compute;
     std::string vertex;
@@ -219,6 +233,8 @@ struct StageBindingPlan {
 
 // Immutable physical ABI projection for one reusable Stage implementation.
 // Program-to-endpoint projection is performed once while resolving a Node.
+
+const MetadataCarrier *stageMetadataCarrier(const StageBindingPlan &plan, const std::string &module);
 
 std::optional<VernonTextureDimension> artifactTextureDimension(const std::string &dimension);
 std::optional<VernonTextureFormat> artifactTextureFormat(const std::string &format);

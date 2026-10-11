@@ -8,6 +8,8 @@
 #include "compiler_program_stage.h"
 #include "compiler_program_storage.h"
 #include "compiler_python_bridge.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGraphicsBindings.h"
+#include "mlir/IR/BuiltinOps.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -19,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -60,9 +63,110 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, co
     return result;
 }
 
+llvm::json::Value graphicsBindingLayoutJson(const mlir::vernon::GraphicsBindingLayout &layout) {
+    llvm::json::Array rows;
+    for (const auto &[request, bindings] : layout.assignments) {
+        llvm::json::Array values;
+        for (uint32_t binding : bindings)
+            values.emplace_back(static_cast<int64_t>(binding));
+        rows.emplace_back(llvm::json::Object{
+            {"entry", request.entry},
+            {"argument", request.argument ? llvm::json::Value(static_cast<int64_t>(*request.argument))
+                                          : llvm::json::Value(nullptr)},
+            {"kind", request.kind},
+            {"source_name", request.sourceName},
+            {"bindings", std::move(values)},
+        });
+    }
+    return llvm::json::Object{{"assignments", std::move(rows)}};
+}
+
+std::optional<mlir::vernon::GraphicsBindingLayout> parseGraphicsBindingLayout(llvm::StringRef text) {
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(text);
+    if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        return std::nullopt;
+    }
+    const llvm::json::Object *root = parsed->getAsObject();
+    const llvm::json::Array *rows = root ? root->getArray("assignments") : nullptr;
+    if (!rows)
+        return std::nullopt;
+    mlir::vernon::GraphicsBindingLayout layout;
+    for (const llvm::json::Value &rowValue : *rows) {
+        const llvm::json::Object *row = rowValue.getAsObject();
+        std::optional<llvm::StringRef> entry = row ? row->getString("entry") : std::nullopt;
+        const llvm::json::Value *argument = row ? row->get("argument") : nullptr;
+        const llvm::json::Array *bindings = row ? row->getArray("bindings") : nullptr;
+        if (!entry || !argument || !bindings)
+            return std::nullopt;
+        mlir::vernon::GraphicsBindingRequest request;
+        request.entry = entry->str();
+        if (argument->getAsNull()) {
+            request.argument = std::nullopt;
+        } else if (std::optional<int64_t> index = argument->getAsInteger(); index && *index >= 0) {
+            request.argument = static_cast<unsigned>(*index);
+        } else {
+            return std::nullopt;
+        }
+        llvm::SmallVector<uint32_t> values;
+        for (const llvm::json::Value &binding : *bindings) {
+            std::optional<int64_t> value = binding.getAsInteger();
+            if (!value || *value < 0 || *value > std::numeric_limits<int32_t>::max())
+                return std::nullopt;
+            values.push_back(static_cast<uint32_t>(*value));
+        }
+        layout.assignments.emplace_back(std::move(request), std::move(values));
+    }
+    return layout;
+}
+
 } // namespace
 
 extern "C" {
+
+VernonCompileResult *vernonCompilerLinkGraphicsBindings(VernonCompilerContext *context, const VernonStringView *modules,
+                                                        size_t moduleCount) {
+    auto result = std::make_unique<VernonCompileResult>();
+    if (!context || (!modules && moduleCount != 0)) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "context and graphics modules must be valid";
+        return result.release();
+    }
+    std::vector<mlir::vernon::GraphicsBindingRequests> requests;
+    for (size_t index = 0; index < moduleCount; ++index) {
+        vernon::compiler::PreparedModulePtr prepared;
+        auto validated = validate(context, modules[index].data, modules[index].size, &prepared);
+        if (validated->status != VERNON_STATUS_OK) {
+            validated->artifacts.clear();
+            validated->reflection.clear();
+            return validated.release();
+        }
+        std::string diagnostics;
+        mlir::FailureOr<mlir::vernon::GraphicsBindingRequests> collected =
+            vernon::compiler::collectPreparedGraphicsBindingRequests(*prepared, diagnostics);
+        if (mlir::failed(collected)) {
+            result->status = VERNON_STATUS_VERIFICATION_ERROR;
+            result->diagnostics = std::move(diagnostics);
+            return result.release();
+        }
+        requests.push_back(std::move(*collected));
+    }
+    std::string error;
+    mlir::FailureOr<std::vector<mlir::vernon::GraphicsBindingLayout>> layouts =
+        mlir::vernon::linkGraphicsBindings(requests, error);
+    if (mlir::failed(layouts)) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        result->diagnostics = std::move(error);
+        return result.release();
+    }
+    llvm::json::Array rows;
+    for (const mlir::vernon::GraphicsBindingLayout &layout : *layouts)
+        rows.push_back(graphicsBindingLayoutJson(layout));
+    llvm::raw_string_ostream stream(result->reflection);
+    stream << llvm::json::Value(llvm::json::Object{{"layouts", std::move(rows)}});
+    result->status = VERNON_STATUS_OK;
+    return result.release();
+}
 
 VernonStatus vernonCompilerRegisterCpuRuntimeHelpers(VernonCompilerContext *context,
                                                      const VernonCpuRuntimeHelpers *helpers) {
@@ -144,6 +248,17 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext 
     if (result->status != VERNON_STATUS_OK) {
         result->artifacts.clear();
         return result.release();
+    }
+    if (const VernonStringView layout = vernon::compiler::graphicsBindingLayout(*options); layout.size != 0) {
+        std::optional<mlir::vernon::GraphicsBindingLayout> parsed =
+            layout.data ? parseGraphicsBindingLayout(llvm::StringRef(layout.data, layout.size)) : std::nullopt;
+        if (!parsed) {
+            result->status = VERNON_STATUS_INVALID_ARGUMENT;
+            result->diagnostics = "graphics binding layout is not a layout from vernonCompilerLinkGraphicsBindings";
+            result->artifacts.clear();
+            return result.release();
+        }
+        mlir::vernon::attachGraphicsBindingLayout(prepared->logicalModule(), *parsed);
     }
     result->status =
         vernon::compiler::compileTarget(*prepared, parsedOptions, result->artifacts, result->reflection,

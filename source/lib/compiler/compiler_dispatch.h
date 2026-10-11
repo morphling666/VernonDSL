@@ -42,6 +42,7 @@ struct TargetProfile {
 VernonTargetCapabilities targetCapabilities(VernonTarget target);
 
 VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options, std::string &diagnostics);
+VernonStringView graphicsBindingLayout(const VernonCompileOptions &source);
 CompileOptions defaultCompileOptions(VernonTarget target);
 VernonTarget compileTargetKind(const CompileOptions &options);
 TargetProfile resolveTargetProfile(const CompileOptions &options);

@@ -181,7 +181,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     parameter.access = "read";
     parameter.uses.push_back(tensorViewF32Use({2, 0}));
     variant.parameters = {parameter};
-    variant.metadataCarrier = i32MetadataCarrier(0, 2);
+    variant.metadataCarriers.emplace("compute", i32MetadataCarrier(0, 2));
 
     const std::array<uint64_t, 2> shape{2, 3};
     const std::array<int64_t, 2> strides{6 * sizeof(float), -static_cast<int64_t>(sizeof(float))};
@@ -250,7 +250,7 @@ TEST(ComputeLaunchPlannerTest, MaterializesRankZeroMetadataCarrier) {
     parameter.shape = {};
     parameter.uses.front().shape = {};
     variant.parameters = {parameter};
-    variant.metadataCarrier = i32MetadataCarrier(0, 0);
+    variant.metadataCarriers.emplace("compute", i32MetadataCarrier(0, 0));
 
     VernonProgramArgument supplied{};
     supplied.slot = 0;
@@ -342,7 +342,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.uses.push_back(tensorViewF32Use({2}));
     variant.parameters = {parameter};
-    variant.metadataCarrier = i32MetadataCarrier(0, 1);
+    variant.metadataCarriers.emplace("compute", i32MetadataCarrier(0, 1));
 
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> strides{sizeof(float)};

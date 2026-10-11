@@ -15,12 +15,6 @@
 
 namespace vernon::runtime {
 
-struct ReflectedStorageLeaf {
-    size_t elementSize{};
-    size_t byteOffset{};
-    uint32_t binding{UINT32_MAX};
-};
-
 struct PhysicalArgumentLayout {
     size_t offset{};
     size_t size{};

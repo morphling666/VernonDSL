@@ -496,16 +496,23 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
                 return false;
             }
             if (descriptorRequired && parameter.kind != "sampler") {
-                BindingKey key{use.stage, use.descriptorSet, use.binding};
-                const auto [found, inserted] = descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
-                if (!inserted && found->second.first != parameter.name) {
-                    error = "Stage descriptor " + use.stage + " set " + std::to_string(use.descriptorSet) +
-                            " binding " + std::to_string(use.binding) + " is assigned to both '" + found->second.first +
-                            "' and '" + parameter.name + "'";
-                    return false;
+                std::vector<uint32_t> bindings{use.binding};
+                for (const ReflectedStorageLeaf &leaf : use.storageLeaves)
+                    if (leaf.binding != use.binding)
+                        bindings.push_back(leaf.binding);
+                for (uint32_t binding : bindings) {
+                    BindingKey key{use.stage, use.descriptorSet, binding};
+                    const auto [found, inserted] =
+                        descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
+                    if (!inserted && found->second.first != parameter.name) {
+                        error = "Stage descriptor " + use.stage + " set " + std::to_string(use.descriptorSet) +
+                                " binding " + std::to_string(binding) + " is assigned to both '" + found->second.first +
+                                "' and '" + parameter.name + "'";
+                        return false;
+                    }
+                    if (parameter.kind == "image")
+                        imageBindings.insert(std::move(key));
                 }
-                if (parameter.kind == "image")
-                    imageBindings.insert(std::move(key));
             }
             if (parameter.kind == "sampler") {
                 if (use.sampledImageBindings.empty()) {
@@ -532,8 +539,7 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
             error = "sampler references an unknown sampled image binding";
             return false;
         }
-    if (plan.metadataCarrier) {
-        const MetadataCarrier &carrier = *plan.metadataCarrier;
+    const auto validCarrierLayout = [&](const MetadataCarrier &carrier) {
         if (carrier.fields.empty() || carrier.fields.size() != carrier.members.size() || !carrier.size ||
             !carrier.alignment || (carrier.alignment & (carrier.alignment - 1)) || carrier.size % carrier.alignment ||
             !carrier.interfacePlan.root || carrier.interfacePlan.root->kind != TransportNodeKind::Product ||
@@ -551,11 +557,33 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
                 return false;
             }
         }
+        return true;
+    };
+    for (const auto &[stage, carrier] : plan.metadataCarriers) {
+        if (!plan.artifactKeys.count(stage)) {
+            error = "Stage metadata carrier names an unknown module";
+            return false;
+        }
+        if (!validCarrierLayout(carrier))
+            return false;
+        for (const MetadataFieldIdentity &field : carrier.fields) {
+            const bool tensorUse =
+                std::any_of(plan.parameters.begin(), plan.parameters.end(), [&](const Parameter &parameter) {
+                    return parameter.kind == "tensor" &&
+                           std::any_of(parameter.uses.begin(), parameter.uses.end(), [&](const ParameterUse &use) {
+                               return use.stage == stage && use.index == field.argument;
+                           });
+                });
+            if (!tensorUse) {
+                error = "Stage metadata field does not name a Tensor use of its module";
+                return false;
+            }
+        }
         if (carrier.profile == "portable_shader_metadata_i32") {
-            BindingKey key{"compute", carrier.descriptorSet, carrier.binding};
             if (carrier.carrier != "constant_region" || carrier.representation != "i32" ||
                 carrier.descriptorSet == UINT32_MAX || carrier.binding == UINT32_MAX ||
-                carrier.parameterOrdinal != UINT32_MAX || descriptorOwners.count(key)) {
+                carrier.parameterOrdinal != UINT32_MAX ||
+                descriptorOwners.count({stage, carrier.descriptorSet, carrier.binding})) {
                 error = "Stage shader metadata carrier has an invalid or colliding native binding";
                 return false;
             }
@@ -587,6 +615,11 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
         return false;
     }
     return true;
+}
+
+const MetadataCarrier *stageMetadataCarrier(const StageBindingPlan &plan, const std::string &module) {
+    const auto found = plan.metadataCarriers.find(module);
+    return found == plan.metadataCarriers.end() ? nullptr : &found->second;
 }
 
 bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required) {

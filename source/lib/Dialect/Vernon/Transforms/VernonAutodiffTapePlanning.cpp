@@ -147,8 +147,8 @@ uint64_t estimateRematerializationCost(Operation *operation) {
     if (operation->hasTrait<OpTrait::ConstantLike>())
         return 0;
     const StringRef name = operation->getName().getStringRef();
-    if (name == "arith.divf" || name == "arith.divsi" || name == "arith.divui" || name == "arith.remf" ||
-        name == "arith.remsi" || name == "arith.remui")
+    if (name == "arith.divf" || name == "arith.divsi" || name == "arith.floordivsi" || name == "arith.divui" ||
+        name == "arith.remf" || name == "arith.remsi" || name == "arith.remui")
         return 4;
     return 1;
 }

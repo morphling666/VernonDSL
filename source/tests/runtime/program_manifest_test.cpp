@@ -841,7 +841,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
            {{"kind", "product"}, {"offset", 0}, {"size", 48}, {"alignment", 8}, {"children", metadataChildren}}}}}};
     nlohmann::json reflection{
         {"required_features", nlohmann::json::array()},
-        {"metadata_carrier", {{"fields", metadataFields}}},
+        {"metadata_carriers", {{"compute", {{"fields", metadataFields}}}}},
         {"endpoints",
          nlohmann::json::array(
              {{{"tag", "resource"},
@@ -920,7 +920,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                                        {{"target", "cpu"},
                                         {"metadata", nlohmann::json::object()},
                                         {"endpoints", nlohmann::json::array()},
-                                        {"metadata_carrier", hostMetadataCarrier}}}}}}}};
+                                        {"metadata_carriers", {{"compute", hostMetadataCarrier}}}}}}}}}};
 
     vernon::runtime::program::Program program;
     vernon::runtime::program::ArtifactSystem artifacts;
@@ -1034,7 +1034,8 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     expectBoundaryMismatch(std::move(byValueInPlace), "/publication");
 
     nlohmann::json hostWithParameterOrdinal = artifactSystem;
-    hostWithParameterOrdinal["artifacts"]["scale"]["implementation"]["metadata_carrier"]["parameter_ordinal"] = 2;
+    hostWithParameterOrdinal["artifacts"]["scale"]["implementation"]["metadata_carriers"]["compute"]
+                            ["parameter_ordinal"] = 2;
     EXPECT_TRUE(
         vernon::runtime::program::parseArtifactSystem(target, blobs, hostWithParameterOrdinal, diagnostic).isErr());
     EXPECT_NE(diagnostic.message.find("host metadata carrier"), std::string::npos) << diagnostic.message;
@@ -1043,18 +1044,27 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
           nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", 7}, {"units", "logical_elements"}},
           nlohmann::json{{"ordinal", 0}, {"argument", 0}, {"kind", "offset"}, {"units", 7}}}) {
         nlohmann::json invalidMetadataField = artifactSystem;
-        invalidMetadataField["artifacts"]["scale"]["reflection"]["metadata_carrier"]["fields"][0] = invalidField;
+        invalidMetadataField["artifacts"]["scale"]["reflection"]["metadata_carriers"]["compute"]["fields"][0] =
+            invalidField;
         EXPECT_TRUE(
             vernon::runtime::program::parseArtifactSystem(target, blobs, invalidMetadataField, diagnostic).isErr());
     }
     nlohmann::json gappedMetadata = artifactSystem;
-    auto &gappedCarrier = gappedMetadata["artifacts"]["scale"]["implementation"]["metadata_carrier"];
+    auto &gappedCarrier = gappedMetadata["artifacts"]["scale"]["implementation"]["metadata_carriers"]["compute"];
     gappedCarrier["encoded_size"] = 56;
     gappedCarrier["size"] = 56;
     gappedCarrier["members"][5]["byte_offset"] = 48;
     gappedCarrier["interface_plan"]["root"]["size"] = 56;
     gappedCarrier["interface_plan"]["root"]["children"][5]["offset"] = 48;
     EXPECT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, gappedMetadata, diagnostic).isErr());
+    for (const char *section : {"reflection", "implementation"}) {
+        nlohmann::json foreignModule = artifactSystem;
+        auto &carriers = foreignModule["artifacts"]["scale"][section]["metadata_carriers"];
+        carriers["vertex"] = carriers["compute"];
+        carriers.erase("compute");
+        EXPECT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, foreignModule, diagnostic).isErr())
+            << section;
+    }
     auto parsedArtifacts = vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, diagnostic);
     ASSERT_TRUE(parsedArtifacts.isOk()) << diagnostic.message;
     artifacts = std::move(parsedArtifacts).value();

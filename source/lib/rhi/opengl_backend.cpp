@@ -205,9 +205,10 @@ bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel,
     driver.bindFramebuffer(kFramebuffer, framebuffer);
     ++framebufferGeneration;
     const bool depthStencil = externalFormat == 0x84F9;
-    driver.framebufferTexture2D(kFramebuffer, depthStencil ? kDepthStencilAttachment : kColorAttachment0, target,
-                                image.name, mipLevel);
-    if (depthStencil) {
+    const bool depthOnly = externalFormat == 0x1902;
+    const Enum attachment = depthStencil ? kDepthStencilAttachment : depthOnly ? kDepthAttachment : kColorAttachment0;
+    driver.framebufferTexture2D(kFramebuffer, attachment, target, image.name, mipLevel);
+    if (depthStencil || depthOnly) {
         const Enum none = kNone;
         driver.drawBuffers(1, &none);
         driver.readBuffer(kNone);

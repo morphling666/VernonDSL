@@ -19,6 +19,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonExpandFloorCeilDivision.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
@@ -109,6 +110,7 @@ void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonLowerCPUTensorsPass());
     passManager.addPass(createVernonLowerCPUSynchronizationPass());
     passManager.addPass(createVernonLowerCPUResourcesPass());
+    passManager.addPass(createVernonExpandFloorCeilDivisionPass());
     passManager.addPass(createSCFToControlFlowPass());
     passManager.addPass(createConvertToLLVMPass());
     passManager.addPass(std::make_unique<VerifyVernonCpuLLVMConversionPass>());

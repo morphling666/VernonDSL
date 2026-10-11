@@ -21,8 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "benchmark_registration_declarations.inc"
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -140,7 +138,6 @@ struct Manifest {
     std::string_view asset;
     std::string_view backend;
     std::string_view path;
-    VernonStatus (*prepare)();
 };
 
 constexpr Manifest manifests[]{
@@ -153,8 +150,6 @@ const Manifest &manifest(std::string_view asset, std::string_view backend) {
     });
     if (found == std::end(manifests))
         throw Skip(std::string(backend) + " compiler/runtime target is not built");
-    if (found->prepare && found->prepare() != VERNON_STATUS_OK)
-        fail("register CPU fixture failed");
     return *found;
 }
 

@@ -7,6 +7,10 @@
 #include "compiler_target_test_utils.h"
 
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/BinaryFormat/COFF.h"
+#include "llvm/Object/COFF.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SHA256.h"
 
 #include <cstdint>
@@ -48,6 +52,66 @@ TEST(CompilerProgramAbi, RejectsGraphicsDtypeMismatchBeforeRuntime) {
     std::string error;
     EXPECT_FALSE(vernon::compiler::verifyProgramEndpointAbi(expected, compiled, error));
     EXPECT_NE(error.find("dtype"), std::string::npos);
+}
+
+// COFF folds duplicate definitions through COMDAT sections rather than weak
+// symbols; every other object format marks the definition weak.
+static bool isFoldableDefinition(const llvm::object::SymbolRef &symbol) {
+    llvm::Expected<uint32_t> flags = symbol.getFlags();
+    if (!flags) {
+        llvm::consumeError(flags.takeError());
+        return false;
+    }
+    if ((*flags & llvm::object::SymbolRef::SF_Weak) != 0)
+        return true;
+    const auto *coff = llvm::dyn_cast<llvm::object::COFFObjectFile>(symbol.getObject());
+    if (coff == nullptr)
+        return false;
+    llvm::Expected<llvm::object::section_iterator> section = symbol.getSection();
+    if (!section) {
+        llvm::consumeError(section.takeError());
+        return false;
+    }
+    return *section != coff->section_end() &&
+           (coff->getCOFFSection(**section)->Characteristics & llvm::COFF::IMAGE_SCN_LNK_COMDAT) != 0;
+}
+
+static void expectSelfRegisteringCpuObject(VernonStringView object, const char *constructorSection) {
+    llvm::Expected<std::unique_ptr<llvm::object::ObjectFile>> parsed = llvm::object::ObjectFile::createObjectFile(
+        llvm::MemoryBufferRef(llvm::StringRef(object.data, object.size), "module"));
+    ASSERT_TRUE(static_cast<bool>(parsed)) << llvm::toString(parsed.takeError());
+    size_t entryDefinitions = 0;
+    bool importsRegistration = false;
+    bool importsUnregistration = false;
+    for (const llvm::object::SymbolRef &symbol : (*parsed)->symbols()) {
+        llvm::Expected<llvm::StringRef> name = symbol.getName();
+        ASSERT_TRUE(static_cast<bool>(name)) << llvm::toString(name.takeError());
+        llvm::Expected<uint32_t> flags = symbol.getFlags();
+        ASSERT_TRUE(static_cast<bool>(flags)) << llvm::toString(flags.takeError());
+        const bool undefined = (*flags & llvm::object::SymbolRef::SF_Undefined) != 0;
+        // Mach-O prefixes C symbols with an underscore.
+        const llvm::StringRef unprefixed = name->starts_with("_v") ? name->drop_front() : *name;
+        if (undefined && unprefixed == "vernonRuntimeRegisterStaticCpuEntries")
+            importsRegistration = true;
+        if (undefined && unprefixed == "vernonRuntimeUnregisterStaticCpuEntries")
+            importsUnregistration = true;
+        if (!undefined && (*flags & llvm::object::SymbolRef::SF_Global) != 0 && unprefixed.contains("_vernon_cpu_")) {
+            ++entryDefinitions;
+            EXPECT_TRUE(isFoldableDefinition(symbol)) << name->str();
+        }
+    }
+    EXPECT_GT(entryDefinitions, 0u);
+    EXPECT_TRUE(importsRegistration);
+    EXPECT_TRUE(importsUnregistration);
+    if (constructorSection == nullptr)
+        return;
+    bool hasConstructorSection = false;
+    for (const llvm::object::SectionRef &section : (*parsed)->sections()) {
+        llvm::Expected<llvm::StringRef> name = section.getName();
+        ASSERT_TRUE(static_cast<bool>(name)) << llvm::toString(name.takeError());
+        hasConstructorSection = hasConstructorSection || *name == constructorSection;
+    }
+    EXPECT_TRUE(hasConstructorSection) << constructorSection;
 }
 
 static int view_contains(VernonStringView value, const char *needle) {
@@ -457,9 +521,17 @@ module {
               canonical_sha256(result.at("stage_contracts").at(firstRequest)));
     EXPECT_EQ(canonical.at("stages").at(secondRequest).at("contract_hash"),
               canonical_sha256(result.at("stage_contracts").at(secondRequest)));
-    EXPECT_TRUE(
-        result.at("stage_contracts").at(firstRequest).at("reflection").at("metadata_carrier").contains("fields"));
-    EXPECT_TRUE(result.at("target_implementations").at(firstRequest).at("metadata_carrier").contains("interface_plan"));
+    EXPECT_TRUE(result.at("stage_contracts")
+                    .at(firstRequest)
+                    .at("reflection")
+                    .at("metadata_carriers")
+                    .at("compute")
+                    .contains("fields"));
+    EXPECT_TRUE(result.at("target_implementations")
+                    .at(firstRequest)
+                    .at("metadata_carriers")
+                    .at("compute")
+                    .contains("interface_plan"));
 
     vernonCompileResultDestroy(finalized);
     vernonCompileResultDestroy(compiled);
@@ -2360,6 +2432,13 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
 #endif
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile), "__vernon_cpu_"));
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile), "_add_vectors"));
+#if defined(_WIN32)
+    expectSelfRegisteringCpuObject(vernonCompileResultGetArtifactData(cpu_compile, 0), ".CRT$XCU");
+#elif defined(__APPLE__)
+    expectSelfRegisteringCpuObject(vernonCompileResultGetArtifactData(cpu_compile, 0), "__mod_init_func");
+#else
+    expectSelfRegisteringCpuObject(vernonCompileResultGetArtifactData(cpu_compile, 0), ".init_array");
+#endif
     VernonCpuEntryPoint add_vectors = vernonCompileResultGetCpuEntry(cpu_compile, "add_vectors", 11);
     ASSERT_TRUE(add_vectors != NULL);
     float cpu_arguments[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
@@ -2395,6 +2474,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE((unsigned char)ios_object.data[1] == 0xfa);
     ASSERT_TRUE((unsigned char)ios_object.data[2] == 0xed);
     ASSERT_TRUE((unsigned char)ios_object.data[3] == 0xfe);
+    expectSelfRegisteringCpuObject(ios_object, "__mod_init_func");
     ASSERT_TRUE(vernonCompileResultGetCpuEntry(ios_cpu_compile, "add_vectors", 11) == NULL);
     vernonCompileResultDestroy(ios_cpu_compile);
 
@@ -2416,6 +2496,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE((unsigned char)wasm_object.data[1] == 0x61);
     ASSERT_TRUE((unsigned char)wasm_object.data[2] == 0x73);
     ASSERT_TRUE((unsigned char)wasm_object.data[3] == 0x6d);
+    // Wasm records constructors in the linking metadata, not in a section.
+    expectSelfRegisteringCpuObject(wasm_object, nullptr);
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(wasm_cpu_compile), "wasm32-unknown-emscripten"));
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(wasm_cpu_compile), "__vernon_cpu_"));
     ASSERT_TRUE(vernonCompileResultGetCpuEntry(wasm_cpu_compile, "add_vectors", 11) == NULL);

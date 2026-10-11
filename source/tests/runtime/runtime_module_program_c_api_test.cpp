@@ -21,8 +21,6 @@
 #include <thread>
 #include <vector>
 
-extern "C" VernonStatus vernonRegisterTypedSpecializationFixture(void);
-
 std::atomic<size_t> runtimeAllocationFailures{};
 
 void *operator new(size_t size) {
@@ -132,8 +130,6 @@ const vernon::tests::ProgramFixtureManifest &cpuFixture(std::string_view fixture
 
 std::string fixtureManifest(std::string_view fixtureId) {
     const auto &fixture = cpuFixture(fixtureId);
-    if (fixture.prepare() != VERNON_STATUS_OK)
-        throw std::runtime_error("cannot register CPU fixture '" + std::string(fixtureId) + "'");
     std::ifstream input(std::string(fixture.manifestPath), std::ios::binary);
     if (!input)
         throw std::runtime_error("cannot read CPU fixture manifest '" + std::string(fixture.manifestPath) + "'");
@@ -247,7 +243,6 @@ TEST(RuntimeModuleProgramCApi, ForeignLeaseCallbacksHaveImmediateFailureBoundari
 }
 
 TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublicLifecycle) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_MODULE_PROGRAM_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -422,7 +417,6 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
 }
 
 TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompositeAutodiff) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -546,7 +540,6 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
 }
 
 TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -660,7 +653,6 @@ INSTANTIATE_TEST_SUITE_P(RetiredAndUnknownTypes, RuntimeProgramEnvelopeRejection
                                          "programs", "PROGRAM", " program", "program ", "null", "true", "unknown"));
 
 TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -900,7 +892,6 @@ TEST(RuntimeModuleProgramCApi, AllocationFailurePublishesExactEmergencyDiagnosti
 }
 
 TEST(RuntimeModuleProgramCppApi, ProgramGraphExecutesThroughCanonicalExportedBoundaries) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -1019,7 +1010,6 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphExecutesThroughCanonicalExportedBou
 }
 
 TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes) {
-    ASSERT_EQ(vernonRegisterTypedSpecializationFixture(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_TYPED_SPECIALIZATION_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -1144,7 +1134,6 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
 }
 
 TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
-    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};

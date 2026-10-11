@@ -417,9 +417,17 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                 const auto existing = std::find_if(setBindings.begin(), setBindings.end(), [&](const auto &binding) {
                     return binding.binding == source.binding;
                 });
+                // The compiler links one descriptor per Program Value across a
+                // pipeline, so a repeated binding of the same type is one value
+                // read by several stages.
                 if (existing == setBindings.end())
                     setBindings.push_back(
                         {source.binding, descriptorType(source.kind), 1, stages(source.stage_mask), nullptr});
+                else if (existing->descriptorType == descriptorType(source.kind) ||
+                         (existing->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                          (source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                           source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)))
+                    existing->stageFlags |= stages(source.stage_mask);
                 else if ((existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
                           source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) ||
                          (existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER &&

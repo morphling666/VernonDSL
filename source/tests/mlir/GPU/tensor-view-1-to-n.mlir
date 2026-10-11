@@ -5,22 +5,21 @@
 // CHECK-SAME: memref<
 // CHECK-SAME: memref<
 // CHECK-SAME: memref<
-// CHECK-SAME: tuple<i64, i64, i64, i64, i64, i64>
+// CHECK-SAME: tuple<i64, i64, i64, i64, i64, i64> {vernon.tensor_metadata_carrier
+// CHECK-SAME: vernon.tensor_metadata_profile = "cuda_kernel_metadata_i64"}
 // CHECK-NOT: memref<
 // CHECK-SAME: ) kernel
-// CHECK-SAME: vernon.tensor_metadata_carrier
-// CHECK-SAME: vernon.tensor_metadata_profile = "cuda_kernel_metadata_i64"
+// CHECK: "vernon.tuple_get"(%arg3)
+// CHECK: arith.index_cast
 // CHECK: memref.load
 // CHECK: memref.store
 // CHECK: memref.atomic_rmw addi
-// CHECK: "vernon.tuple_get"
-// CHECK: arith.index_cast
 // CHECK-NOT: !vernon.tensor_view
 // CHECK-NOT: vernon.physical_
 // CHECK-NOT: vernon.tensor_descriptor_
 // CHECK-NOT: unrealized_conversion_cast
 
-module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
+module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 2 : i64} {
   "vernon.struct"() {
     sym_name = "Pair",
     fields = ["left:i32", "right:f32"],

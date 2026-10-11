@@ -97,47 +97,13 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                                     const ProgramNodeBindingIndex &boundValues,
                                     std::map<int64_t, ProgramLogicalResource> &resources, int64_t nextPortableSlot,
                                     ProgramComputeEndpointPlan &plan, std::string &error) {
-    std::set<int64_t> metadataArguments;
     std::map<int64_t, int64_t> metadataRanks;
     if (const llvm::json::Object *metadata = compiledEntry.getObject("metadata_carrier")) {
-        const llvm::json::Array *fields = metadata->getArray("fields");
-        if (!fields || fields->empty()) {
-            error = "compiled compute metadata carrier has no semantic fields";
+        ProgramModuleMetadataCarrier carrier;
+        if (!projectProgramMetadataCarrier(*metadata, "compute", carrier, error))
             return false;
-        }
-        llvm::json::Array semanticFields;
-        for (const auto &[ordinal, fieldValue] : llvm::enumerate(*fields)) {
-            const llvm::json::Object *field = fieldValue.getAsObject();
-            const std::optional<int64_t> argument = field ? field->getInteger("argument") : std::nullopt;
-            const std::optional<llvm::StringRef> kind = field ? field->getString("kind") : std::nullopt;
-            if (!argument || *argument < 0 || !kind || (*kind != "offset" && *kind != "extent" && *kind != "stride") ||
-                field->getInteger("ordinal") != static_cast<int64_t>(ordinal) ||
-                field->getString("units") != "logical_elements") {
-                error = "compiled compute metadata carrier has an invalid semantic field";
-                return false;
-            }
-            metadataArguments.insert(*argument);
-            llvm::json::Object projected{{"ordinal", static_cast<int64_t>(ordinal)},
-                                         {"argument", *argument},
-                                         {"kind", kind->str()},
-                                         {"units", "logical_elements"}};
-            if (*kind == "extent" || *kind == "stride") {
-                const std::optional<int64_t> dimension = field->getInteger("dimension");
-                if (!dimension || *dimension < 0) {
-                    error = "compiled compute metadata carrier has an invalid field dimension";
-                    return false;
-                }
-                projected["dimension"] = *dimension;
-                metadataRanks[*argument] = std::max(metadataRanks[*argument], *dimension + 1);
-            } else if (field->get("dimension")) {
-                error = "compiled compute offset metadata cannot have a dimension";
-                return false;
-            }
-            semanticFields.emplace_back(std::move(projected));
-        }
-        plan.semanticMetadataCarrier = llvm::json::Object{{"fields", std::move(semanticFields)}};
-        plan.physicalMetadataCarrier = copyJsonObject(*metadata);
-        plan.physicalMetadataCarrier->erase("fields");
+        metadataRanks = carrier.argumentRanks;
+        plan.metadataCarriers.emplace("compute", std::move(carrier));
     }
     std::map<int64_t, int64_t> accessByValue;
     std::map<std::string, llvm::json::Object> footprints;
@@ -349,7 +315,7 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         }
         if (resourceBackedValue) {
             const std::optional<int64_t> slot = row.getInteger("vernon.binding");
-            if (!slot || !metadataArguments.count(endpointIndex)) {
+            if (!slot || !metadataRanks.count(endpointIndex)) {
                 error = "compiled resource-backed value has an incomplete TensorView carrier";
                 return false;
             }
@@ -432,8 +398,9 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
             error = "compiled compute resource access disagrees with logical access for '" + source->str() + "'";
             return false;
         }
-        const bool descriptor = metadataArguments.count(endpointIndex) != 0;
-        const int64_t descriptorRank = descriptor ? metadataRanks[endpointIndex] : 0;
+        const auto descriptorFields = metadataRanks.find(endpointIndex);
+        const bool descriptor = descriptorFields != metadataRanks.end();
+        const int64_t descriptorRank = descriptor ? descriptorFields->second : 0;
         llvm::json::Array abi;
         if (opaqueResourceEndpoint)
             if (std::optional<int64_t> slot = row.getInteger("vernon.binding"))
@@ -560,7 +527,7 @@ bool validateCanonicalComputePortableSlots(const llvm::json::Array &endpoints, s
 
 bool buildCanonicalComputeStageContract(const llvm::json::Object &compiledEntry,
                                         const llvm::json::Object &compiledReflection, llvm::json::Array endpoints,
-                                        std::optional<llvm::json::Object> metadataCarrier,
+                                        const ProgramModuleMetadataCarriers &metadataCarriers,
                                         llvm::json::Object &stageContract, std::string &error) {
     llvm::json::Array features;
     std::set<std::string> uniqueFeatures;
@@ -588,8 +555,8 @@ bool buildCanonicalComputeStageContract(const llvm::json::Object &compiledEntry,
     llvm::json::Object reflection{{"required_features", std::move(features)},
                                   {"endpoints", std::move(endpoints)},
                                   {"compute", std::move(compute)}};
-    if (metadataCarrier)
-        reflection["metadata_carrier"] = std::move(*metadataCarrier);
+    if (!metadataCarriers.empty())
+        reflection["metadata_carriers"] = semanticProgramMetadataCarriers(metadataCarriers);
     stageContract = llvm::json::Object{{"operation", "compute"}, {"reflection", std::move(reflection)}};
     return true;
 }

@@ -1009,8 +1009,12 @@ VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntim
     });
 }
 
-VernonStatus vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
-    return runtimeResultBoundary(nullptr, [&] { return registerBackendStaticCpuEntry(symbol, entryPoint); });
+VernonStatus vernonRuntimeRegisterStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count) {
+    return runtimeResultBoundary(nullptr, [&] { return registerBackendStaticCpuEntries(entries, count); });
+}
+
+VernonStatus vernonRuntimeUnregisterStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count) {
+    return runtimeResultBoundary(nullptr, [&] { return unregisterBackendStaticCpuEntries(entries, count); });
 }
 
 VernonStatus vernonRuntimeRegisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,
@@ -2489,22 +2493,36 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const VernonRhiDevice device = batch.draws.front()->pipeline.context->rhiDevice;
     auto begun = vernon::rhi::beginProviderRendering(device, encoder);
-    if (!begun)
-        return vernon::toVernonRhiStatus(std::move(begun).error());
+    if (!begun) {
+        const vernon::RhiError error = std::move(begun).error();
+        invocationDiagnostic(*batch.draws.front()->pipeline.context) =
+            error.context.operation ? error.context.operation : "failed to begin managed graphics rendering";
+        return vernon::toVernonRhiStatus(error);
+    }
     VernonRhiStatus status = VERNON_RHI_STATUS_OK;
     for (const std::shared_ptr<ManagedGraphicsCommandContext> &context : batch.draws) {
         if (!context || context->pipeline.context->rhiDevice.index != device.index ||
             vernonRuntimeReferenceRhiCommandEncoder(context->pipeline.context, encoder,
                                                     &context->invocation.command_encoder) != VERNON_STATUS_OK) {
+            if (context)
+                invocationDiagnostic(*context->pipeline.context) =
+                    "failed to reference the managed graphics command encoder";
             status = VERNON_RHI_STATUS_INVALID_ARGUMENT;
             break;
         }
-        if (invokeBackendPipeline(context->pipeline, context->invocation, context->plan).isErr()) {
-            status = VERNON_RHI_STATUS_INTERNAL_ERROR;
+        auto invoked = invokeBackendPipeline(context->pipeline, context->invocation, context->plan);
+        if (invoked.isErr()) {
+            const vernon::RuntimeError error = std::move(invoked).error();
+            if (invocationDiagnostic(*context->pipeline.context).empty())
+                invocationDiagnostic(*context->pipeline.context) =
+                    error.context.operation ? error.context.operation : "managed graphics draw failed";
+            status = vernon::toVernonRhiStatus(error);
             break;
         }
     }
     const VernonRhiStatus ended = vernonRhiCommandEncoderEndRendering(device, encoder);
+    if (status == VERNON_RHI_STATUS_OK && ended != VERNON_RHI_STATUS_OK)
+        invocationDiagnostic(*batch.draws.front()->pipeline.context) = "failed to end managed graphics rendering";
     return status == VERNON_RHI_STATUS_OK ? ended : status;
 }
 

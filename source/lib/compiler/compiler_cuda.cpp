@@ -10,6 +10,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonExpandFloorCeilDivision.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
@@ -82,6 +83,7 @@ bool compileCuda(PreparedModule &prepared, const TargetProfile &profile, std::ve
     passManager.addPass(mlir::bufferization::createOneShotBufferizePass(bufferizationOptions));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertLinalgToLoopsPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerCUDAMathPass());
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonExpandFloorCeilDivisionPass());
     // VernonToGPU creates gpu.module directly, so the top-level SCF conversion
     // in MLIR's NVVM pipeline cannot enter that isolated symbol table.
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createSCFToControlFlowPass());

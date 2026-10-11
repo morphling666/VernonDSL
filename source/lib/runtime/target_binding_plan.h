@@ -8,6 +8,7 @@
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -128,6 +129,7 @@ struct TargetBinding {
     TargetNativeLocation native;
     std::vector<vernon::runtime::AttributeLeaf> attributeLeaves;
     std::vector<vernon::runtime::SampledImageBinding> sampledImageBindings;
+    // Native bindings from the selected implementation, one per storage leaf.
     std::vector<vernon::runtime::ReflectedStorageLeaf> storageLeaves;
     vernon::runtime::PhysicalArgumentLayout physical;
     std::string writeFootprintKind;
@@ -155,7 +157,7 @@ struct TargetBindingPlan {
     uint64_t packedArgumentsSize{};
     uint64_t packedResultsSize{};
     std::vector<TargetBinding> bindings;
-    std::optional<vernon::runtime::MetadataCarrier> metadataCarrier;
+    std::map<std::string, vernon::runtime::MetadataCarrier> metadataCarriers;
     std::vector<TargetOutput> outputs;
     std::vector<TargetModule> modules;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;

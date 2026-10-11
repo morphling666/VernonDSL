@@ -315,7 +315,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     };
     bool hasSlots = false;
     const bool compute = executionKind(node) == ExecutionKind::Compute;
-    plan.metadataCarrier = compute ? stage.stage.metadataCarrier : std::nullopt;
+    plan.metadataCarriers = stage.stage.metadataCarriers;
     const std::string entry = stage.stage.modules.empty() ? std::string() : stage.stage.modules.front().entryPoint;
     if (entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos)
         plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
@@ -695,7 +695,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                       "physical resource projection has an incompatible TensorView descriptor");
                     target.storageLeaves.push_back(
-                        {static_cast<size_t>(value.layout->byteSize), size_t{0}, slot->slot});
+                        {static_cast<size_t>(value.layout->byteSize), size_t{0}, target.native.binding});
                 }
                 hasSlots = true;
             } else {
@@ -783,6 +783,25 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                                     storageBindings[vertexBuffer ? 0 : leaf]->slot});
                     hasSlots = true;
                 }
+                if (endpoint.viewDescriptor && !(compiled && !compiled->storageLeaves.empty()))
+                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                  "TensorView endpoint has no compiled native storage leaves");
+                if (compiled && !compiled->storageLeaves.empty()) {
+                    const auto sameLeaf = [](const vernon::runtime::ReflectedStorageLeaf &portable,
+                                             const vernon::runtime::ReflectedStorageLeaf &native) {
+                        return portable.elementSize == native.elementSize && portable.byteOffset == native.byteOffset;
+                    };
+                    if (compiled->storageLeaves.size() != target.storageLeaves.size() ||
+                        !std::equal(target.storageLeaves.begin(), target.storageLeaves.end(),
+                                    compiled->storageLeaves.begin(), sameLeaf))
+                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                      "TensorView storage leaves disagree with the compiled implementation");
+                    target.storageLeaves = compiled->storageLeaves;
+                }
+                if (!compute && endpoint.viewDescriptor && backend != VERNON_RUNTIME_OPENGL &&
+                    backend != VERNON_RUNTIME_OPENGL_ES && backend != VERNON_RUNTIME_VULKAN)
+                    return reject(diagnostic, "PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED", "/endpoints",
+                                  "graphics TensorView storage reads are not implemented for this backend");
                 if (target.projection.leaf && target.elementLayout.leaves.size() == 1) {
                     const vernon::runtime::ValueLeaf &physicalLeaf = target.elementLayout.leaves.front();
                     const uint64_t scalarSize = scalarByteSize(physicalLeaf.dtype);
@@ -875,8 +894,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
 
     for (const GraphicsFragmentOutput &output : stage.stage.fragmentOutputs)
         plan.outputs.push_back({output.location, output.type});
-    if (backend == VERNON_RUNTIME_CPU && plan.metadataCarrier) {
-        const MetadataCarrier &carrier = *plan.metadataCarrier;
+    if (const auto hostCarrier = plan.metadataCarriers.find("compute");
+        backend == VERNON_RUNTIME_CPU && hostCarrier != plan.metadataCarriers.end()) {
+        const MetadataCarrier &carrier = hostCarrier->second;
         if (carrier.interfacePlan.kind != InterfacePlanKind::CpuCall ||
             carrier.interfacePlan.frameOffset % carrier.alignment ||
             carrier.interfacePlan.frameOffset > std::numeric_limits<uint64_t>::max() - carrier.size)
@@ -917,13 +937,32 @@ static TensorRepresentation tensorArgumentRepresentation(const TargetBinding &bi
                : TensorRepresentation::ElementStream;
 }
 
+// Endpoints that receive identical invocation data share one Stage parameter: the same Program Value, logical leaf,
+// and binding role. Each endpoint remains its own ParameterUse.
+static vernon::runtime::Parameter *sharedParameter(const TargetBindingPlan &plan, StageBindingPlan &stagePlan,
+                                                   const TargetBinding &binding) {
+    for (vernon::runtime::Parameter &parameter : stagePlan.parameters) {
+        const TargetBinding &first = plan.bindings[parameter.targetBinding];
+        if (first.projection.value == binding.projection.value && first.projection.leaf == binding.projection.leaf &&
+            first.role == binding.role)
+            return &parameter;
+    }
+    return nullptr;
+}
+
 static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBindingPlan &stagePlan,
                                          ReflectedEntry &reflection, Diagnostic &diagnostic) {
     diagnostic = {};
     stagePlan = {};
     reflection = {};
-    if (plan.metadataCarrier) {
-        MetadataCarrier carrier = *plan.metadataCarrier;
+    for (const auto &[module, carrier] : plan.metadataCarriers)
+        if (module != "compute")
+            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carriers",
+                          "compute Stage metadata carrier names a non-compute module");
+    if (const auto found = plan.metadataCarriers.find("compute"); found != plan.metadataCarriers.end()) {
+        // A compute ParameterUse::index is the kernel argument ordinal, one per
+        // target binding, so fields are renamed from endpoint indices into it.
+        MetadataCarrier carrier = found->second;
         for (MetadataFieldIdentity &field : carrier.fields) {
             std::optional<uint32_t> runtimeIndex;
             for (size_t index = 0; index < plan.bindings.size(); ++index)
@@ -939,7 +978,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                               "metadata field references an unknown compute argument");
             field.argument = *runtimeIndex;
         }
-        stagePlan.metadataCarrier = carrier;
+        stagePlan.metadataCarriers.emplace("compute", carrier);
         reflection.metadataCarrier = std::move(carrier);
     }
     std::copy(std::begin(plan.workgroupSize), std::end(plan.workgroupSize), reflection.workgroup);
@@ -952,7 +991,8 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         stagePlan.compute = plan.modules.front().entryPoint;
         stagePlan.artifactKeys.emplace("compute", stagePlan.compute);
     }
-    for (const TargetBinding &binding : plan.bindings) {
+    for (uint32_t bindingIndex = 0; bindingIndex < plan.bindings.size(); ++bindingIndex) {
+        const TargetBinding &binding = plan.bindings[bindingIndex];
         const uint32_t runtimeArgumentIndex = static_cast<uint32_t>(reflection.arguments.size());
         ReflectedArgument argument;
         argument.sourceName = binding.name;
@@ -1045,6 +1085,14 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                                               : std::optional<InterfacePlan>{};
         use.descriptorSet = 0;
         use.binding = binding.endpoint.portableSlot;
+        if (vernon::runtime::Parameter *shared = sharedParameter(plan, stagePlan, binding)) {
+            if (shared->access != "read" || parameter.access != "read")
+                return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/endpoints",
+                              "one Program Value projection is bound to several writable compute endpoints");
+            shared->uses.push_back(std::move(use));
+            continue;
+        }
+        parameter.targetBinding = bindingIndex;
         parameter.uses.push_back(std::move(use));
         stagePlan.parameters.push_back(std::move(parameter));
     }
@@ -1162,8 +1210,8 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
                                           Diagnostic &diagnostic) {
     diagnostic = {};
     stagePlan = {};
-    std::map<uint32_t, size_t> parameterByValue;
-    for (const TargetBinding &binding : plan.bindings) {
+    for (uint32_t bindingIndex = 0; bindingIndex < plan.bindings.size(); ++bindingIndex) {
+        const TargetBinding &binding = plan.bindings[bindingIndex];
         if (binding.source == SourceRepresentation::ImplicitSampler) {
             vernon::runtime::Parameter parameter;
             parameter.name =
@@ -1215,10 +1263,11 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             stagePlan.runtimeParameters.push_back(std::move(parameter));
             continue;
         }
-        auto found = parameterByValue.find(binding.projection.value);
-        if (found == parameterByValue.end()) {
+        vernon::runtime::Parameter *shared = sharedParameter(plan, stagePlan, binding);
+        if (!shared) {
             vernon::runtime::Parameter parameter;
             parameter.slot = static_cast<uint32_t>(stagePlan.parameters.size());
+            parameter.targetBinding = bindingIndex;
             parameter.name = binding.name;
             parameter.source = StageParameterSource::Direct;
             parameter.access = binding.access;
@@ -1236,9 +1285,9 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
                 parameter.sampleResultClass = "float";
             parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
             stagePlan.parameters.push_back(std::move(parameter));
-            found = parameterByValue.emplace(binding.projection.value, stagePlan.parameters.size() - 1).first;
+            shared = &stagePlan.parameters.back();
         }
-        vernon::runtime::Parameter &parameter = stagePlan.parameters[found->second];
+        vernon::runtime::Parameter &parameter = *shared;
         ParameterUse use;
         use.stage = binding.endpoint.module;
         use.tensorPacking =
@@ -1273,10 +1322,13 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             use.valueLayout = binding.elementLayout;
         }
         use.sampledImageBindings = binding.sampledImageBindings;
+        if (use.interfaceKind == "resource" && binding.carrier == TargetCarrier::StorageBuffer)
+            use.storageLeaves = binding.storageLeaves;
         if (use.interfaceKind != "input")
             use.uniformName = binding.stageSourceName.empty() ? binding.name : binding.stageSourceName;
         parameter.uses.push_back(std::move(use));
     }
+    stagePlan.metadataCarriers = plan.metadataCarriers;
     for (const TargetOutput &output : plan.outputs) {
         Output reflected;
         reflected.name = "output_" + std::to_string(output.location);

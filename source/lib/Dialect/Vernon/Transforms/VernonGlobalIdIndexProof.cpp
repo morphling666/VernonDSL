@@ -185,9 +185,9 @@ NormalizationResult normalize(Value value, DenseSet<Value> &visiting) {
         result.index->constant *= *scale;
         return result;
     }
-    if (value.getDefiningOp<arith::DivSIOp>() || value.getDefiningOp<arith::DivUIOp>() ||
-        value.getDefiningOp<arith::RemSIOp>() || value.getDefiningOp<arith::RemUIOp>() ||
-        value.getDefiningOp<arith::TruncIOp>())
+    if (value.getDefiningOp<arith::DivSIOp>() || value.getDefiningOp<arith::FloorDivSIOp>() ||
+        value.getDefiningOp<arith::DivUIOp>() || value.getDefiningOp<arith::RemSIOp>() ||
+        value.getDefiningOp<arith::RemUIOp>() || value.getDefiningOp<arith::TruncIOp>())
         return {{}, true};
     return {};
 }
@@ -262,9 +262,9 @@ NormalizationResult normalizeWorkgroup(Value value, DenseSet<Value> &visiting) {
         result.index->constant *= *scale;
         return result;
     }
-    if (value.getDefiningOp<arith::DivSIOp>() || value.getDefiningOp<arith::DivUIOp>() ||
-        value.getDefiningOp<arith::RemSIOp>() || value.getDefiningOp<arith::RemUIOp>() ||
-        value.getDefiningOp<arith::TruncIOp>())
+    if (value.getDefiningOp<arith::DivSIOp>() || value.getDefiningOp<arith::FloorDivSIOp>() ||
+        value.getDefiningOp<arith::DivUIOp>() || value.getDefiningOp<arith::RemSIOp>() ||
+        value.getDefiningOp<arith::RemUIOp>() || value.getDefiningOp<arith::TruncIOp>())
         return {{}, true};
     return {};
 }

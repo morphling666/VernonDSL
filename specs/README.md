@@ -53,6 +53,11 @@ Architecture and tutorials link to the contract instead of redefining fields.
 2. [`program/graphics_execution.md`](program/graphics_execution.md) defines
    graphics normalization, controls, attachments, image versions, and
    render-scope planning.
+   [`program/graphics_storage_reads.md`](program/graphics_storage_reads.md)
+   defines vertex and fragment TensorView reads, per-stage carriers, and
+   graphics binding allocation.
+   [`program/function_slots.md`](program/function_slots.md) defines function
+   slots, cook-time composition, and composition enumeration.
 3. [`compiler/design.md`](compiler/design.md) defines compiler layering,
    lowering, reflection, target routing, and artifact cooking.
 4. [`compiler/invocation_index_ownership.md`](compiler/invocation_index_ownership.md)

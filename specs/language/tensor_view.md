@@ -163,7 +163,9 @@ particles: Annotated[
 A host vertex buffer supplies many `position` records, but each vertex
 invocation receives one immutable Tensor Value. A uniform is also a Value even
 when a backend physically spills it to a buffer. Only TensorView exposes
-addressable Storage operations to shader code.
+addressable Storage operations to shader code. Vertex and fragment
+TensorView parameters are read-only; their binding and descriptor contract is
+[`program/graphics_storage_reads.md`](../program/graphics_storage_reads.md).
 
 ## 5. Owners, subviews, and layout
 

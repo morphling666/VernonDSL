@@ -9,14 +9,17 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonExpandFloorCeilDivision.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerMulOverflowChecks.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
@@ -87,6 +90,7 @@ int main(int argc, char **argv) {
     vernon::registerVernonPrepareCPUAutodiffSignaturesPass();
     vernon::registerVernonLowerCPUAutodiffPass();
     vernon::registerVernonCPUAutodiffToLLVMPass();
+    vernon::registerVernonLowerCPUABIPass();
     vernon::registerVernonLowerCPUTensorsPass();
     vernon::registerVernonLowerCPUResourcesPass();
     vernon::registerVernonCpuPassPipeline();
@@ -94,6 +98,8 @@ int main(int argc, char **argv) {
     vernon::registerVernonLowerCUDAMathPass();
     vernon::registerVernonLowerGPUAutodiffPass();
     vernon::registerVernonLowerGPUTensorsPass();
+    vernon::registerVernonLowerMulOverflowChecksPass();
+    vernon::registerVernonExpandFloorCeilDivisionPass();
     vernon::registerVernonToGPUPass();
     vernon::registerVernonToSPIRVPass();
     vernon::program::registerVernonProgramBuildExecutablePass();

@@ -30,41 +30,8 @@ def main() -> int:
         raise RuntimeError(f"Runtime source is not from the active wheel environment: {runtime_source}")
 
     with tempfile.TemporaryDirectory(prefix="vernon-external-engine-") as temporary:
-        root = Path(temporary)
-        cpu_cooked = root / "cpu-cooked"
-        graphics_cooked = root / "graphics-cooked"
-        build = root / "build"
+        build = Path(temporary) / "build"
 
-        run(
-            [
-                sys.executable,
-                "-m",
-                "vernon_dsl.program_asset_cli",
-                os.fspath(example / "fractal_pipeline.py") + ":asset",
-                "--target",
-                "cpu",
-                "-o",
-                os.fspath(cpu_cooked),
-            ],
-            cwd=repository,
-            environment=environment,
-        )
-        run(
-            [
-                sys.executable,
-                "-m",
-                "vernon_dsl.program_asset_cli",
-                os.fspath(repository / "examples" / "shader_lib" / "mandelbulb.py") + ":mandelbulb_asset",
-                "--target",
-                "opengl",
-                "--opengl-version",
-                "330",
-                "-o",
-                os.fspath(graphics_cooked),
-            ],
-            cwd=repository,
-            environment=environment,
-        )
         run(
             [
                 "cmake",
@@ -74,8 +41,6 @@ def main() -> int:
                 os.fspath(build),
                 "-DCMAKE_BUILD_TYPE=Release",
                 f"-DPython_EXECUTABLE={sys.executable}",
-                f"-DVERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR={cpu_cooked}",
-                f"-DVERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR={graphics_cooked}",
             ],
             cwd=repository,
             environment=environment,

@@ -21,11 +21,6 @@
 #include <thread>
 #include <vector>
 
-extern "C" VernonStatus vernonRegisterStructuredScalarAutodiffFixture(void);
-extern "C" VernonStatus vernonRegisterStructuredScalarBalancedAutodiffFixture(void);
-extern "C" VernonStatus vernonRegisterStructuredDynamicAutodiffFixture(void);
-extern "C" VernonStatus vernonRegisterStructuredF64AutodiffFixture(void);
-
 namespace {
 
 std::string lastError(VernonRuntimeContext *context) {
@@ -34,7 +29,6 @@ std::string lastError(VernonRuntimeContext *context) {
 }
 
 TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
-    ASSERT_EQ(vernonRegisterStructuredScalarAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -281,7 +275,6 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
     using vernon::runtime::program_execution::clearFailureInjectionForTesting;
     using vernon::runtime::program_execution::FailureBoundary;
     using vernon::runtime::program_execution::setFailureInjectionForTesting;
-    ASSERT_EQ(vernonRegisterStructuredScalarAutodiffFixture(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -389,7 +382,6 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAccounting) {
-    ASSERT_EQ(vernonRegisterStructuredScalarBalancedAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -536,7 +528,6 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
 }
 
 TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExecutedRecords) {
-    ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -632,7 +623,6 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
 }
 
 TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGradients) {
-    ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -730,7 +720,6 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
 #endif
 
 TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtypes) {
-    ASSERT_EQ(vernonRegisterStructuredF64AutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);

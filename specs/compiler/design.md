@@ -689,6 +689,42 @@ NVIDIA's redistributable `libdevice.10.bc` into MLIR's NVVM target support, so
 generated PTX has no end-user CUDA Toolkit dependency. Integer literals inherit
 the floating-point type of the other operand.
 
+## Unsigned multiply overflow checks
+
+SPIR-V-derived GPU targets (Vulkan, DirectX, OpenGL, OpenGL ES, Metal) run
+`vernon-lower-mul-overflow-checks` on each `gpu.module` before SPIR-V
+conversion, ahead of floor-division expansion. It rewrites unsigned and signed
+(truncating or floor) `(a * b) / a == b` and unsigned
+`b <= UMAX / a` (with their negations and commuted forms) into a division-free
+high-word test on half-width limbs; the signed form tests `|a| * |b|` against
+`SMAX` or `SMAX + 1`. NVIDIA's D3D12 and Vulkan compilers (driver 32.0.16.1088)
+fail pipeline creation on these idioms (D3D12 once `a` is provably nonzero,
+Vulkan unconditionally), and Vernon cannot depend on a driver fix. The rewrite
+is exact wherever the original is defined; `a == 0` and signed `SMIN / -1` are
+undefined, so any result is a valid refinement. CUDA and CPU keep the idiom
+because LLVM recognizes it as a multiply-with-overflow check.
+
+## Python division semantics
+
+`//` and `%` follow Python, because kernels are Python syntax and module-level
+constant folding already evaluates them with `operator.floordiv`/`operator.mod`;
+truncating kernels would disagree with their own folded constants. Signed `//`
+emits `arith.floordivsi` and signed `%` emits `a - (a // b) * b`; u32 keeps
+`divui`/`remui`, which already agree. Float `%` follows CPython `float_rem`:
+`fmod`, plus the divisor when the signs differ, and an exact zero takes the
+divisor's sign. The zero is built by masking the divisor's sign bit, since
+Vulkan and D3D12 compilers may fold `select(c, -0.0, +0.0)` to one constant.
+Float `//` stays unsupported. Division by zero and `SMIN // -1` are undefined.
+
+No MLIR conversion lowers `floordivsi`/`ceildivsi`/`ceildivui`, so
+`vernon-expand-floor-ceil-division` runs in the CPU, CUDA, and SPIR-V
+pipelines. Float `%` magnitude is the backend's `fmod`. It is exact on CPU and
+CUDA (libdevice `__nv_fmodf`, called directly because the NVVM pipeline turns
+`arith.remf` into an illegal `llvm.frem` before its libdevice patterns run).
+Shading languages define it through approximate division (D3D12 as
+`frac(x / y) * y`), so it loses precision for quotients near an integer or of
+large magnitude.
+
 ## Python control-flow type convergence
 
 Python frontend branch results use the safe common type of both outgoing

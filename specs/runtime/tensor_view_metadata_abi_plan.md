@@ -176,8 +176,9 @@ multiplication and every partial sum in the compiler-recorded accumulation
 dimension order; checking only the final minimum and maximum is insufficient.
 
 Reflection continues to expose the existing logical TensorView descriptor
-semantics. Program compute reflection owns one semantic `metadata_carrier`;
-the selected implementation owns one matching physical carrier with
+semantics. Program reflection owns one semantic carrier per module in
+`metadata_carriers`; the selected implementation owns one matching physical
+carrier per module with
 compiler-declared member offsets and sizes. Shader implementations use
 `constant_region`, CUDA uses `kernel_parameter`, and CPU uses
 `cpu_call_frame`. Argument endpoints do not redeclare the carrier. Scalar
@@ -185,17 +186,18 @@ child `i` of `interface_plan.root` is index-aligned with physical member `i`,
 whose explicit semantic ordinal links to the canonical field and source
 argument.
 
-This entry-owned carrier relation is defined in
+This module-owned carrier relation is defined in
 `program/execution_manifest.md`. Runtime never infers the carrier, field order,
-source argument, or offsets from neighboring bindings. The entry-level
-semantic carrier and member-source mapping are target-neutral; the physical
-carrier tag is selected by profile.
+source argument, or offsets from neighboring bindings. The semantic carrier
+and member-source mapping are target-neutral; the physical carrier tag is
+selected by profile.
 
 Compiler-internal reflection uses `semantic_fields`, `argument_index`, and
-nested `physical_layouts` before target selection. Target reflection and the
-Program manifest project that intermediate form into the authoritative flat
-`metadata_carrier` schema with `fields[].argument`; Runtime does not parse the
-intermediate form.
+nested `physical_layouts` before target selection. Target reflection projects
+that intermediate form into the flat entry-level `metadata_carrier` schema
+with `fields[].argument`, and the Program manifest stores one such record per
+module under `metadata_carriers`; Runtime does not parse the intermediate
+form.
 
 ## 5. Physical profiles
 

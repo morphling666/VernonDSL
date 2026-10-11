@@ -3,12 +3,15 @@
 #include "compiler_json.h"
 #include "compiler_program_stage.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace vernon::compiler {
@@ -82,11 +85,49 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
 
     int64_t nextSlot = 0;
     std::set<std::string> coveredBindings;
+    /* Vertex and fragment modules are compiled separately, so only this check sees both binding tables. Two modules
+     * may share a descriptor only when both endpoints bind the same Program Value. */
+    struct DescriptorOwner {
+        std::string role;
+        std::string owner;
+        std::string endpoint;
+    };
+    std::map<std::pair<int64_t, int64_t>, DescriptorOwner> descriptorOwners;
+    const auto claimDescriptor = [&](llvm::StringRef role, int64_t set, int64_t binding, const std::string &owner,
+                                     const std::string &endpoint) -> bool {
+        auto [owned, inserted] =
+            descriptorOwners.try_emplace({set, binding}, DescriptorOwner{role.str(), owner, endpoint});
+        if (inserted || owned->second.role == role || owned->second.owner == owner)
+            return true;
+        error = "graphics endpoints " + owned->second.endpoint + " and " + endpoint + " both use descriptor (set " +
+                std::to_string(set) + ", binding " + std::to_string(binding) + ") for different Program Values";
+        return false;
+    };
+    const auto claimRowDescriptors = [&](llvm::StringRef role, const llvm::json::Object &row,
+                                         const std::string &owner) -> bool {
+        const int64_t set = row.getInteger("vernon.set").value_or(0);
+        const std::string endpoint =
+            role.str() + " '" +
+            row.getString("vernon.source_name").value_or(row.getString("vernon.implicit").value_or("<unnamed>")).str() +
+            "'";
+        if (const llvm::json::Array *leaves = row.getArray("storage_leaves")) {
+            for (const llvm::json::Value &leafValue : *leaves)
+                if (const llvm::json::Object *leaf = leafValue.getAsObject())
+                    if (std::optional<int64_t> binding = leaf->getInteger("binding"))
+                        if (!claimDescriptor(role, set, *binding, owner, endpoint))
+                            return false;
+            return true;
+        }
+        if (std::optional<int64_t> binding = row.getInteger("vernon.binding"))
+            return claimDescriptor(role, set, *binding, owner, endpoint);
+        return true;
+    };
     for (llvm::StringRef role : {llvm::StringRef("vertex"), llvm::StringRef("fragment")}) {
         auto moduleIt = modules.find(role.str());
         if (moduleIt == modules.end())
             continue;
         const llvm::json::Object &entry = *moduleIt->second;
+        std::set<int64_t> storageArguments;
         const auto appendRows = [&](const llvm::json::Array *rows, llvm::StringRef interfaceKind) -> bool {
             if (!rows)
                 return true;
@@ -158,9 +199,13 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                     /* An implicit sampler carries no portable ABI binding, because a caller never supplies one.
                      * The target still has to bind it, so it needs the compiled row's descriptor set, binding, and
                      * the sampled images it pairs with. */
-                    if (implicit == "sampler")
+                    if (implicit == "sampler") {
+                        if (!claimRowDescriptors(role, *row,
+                                                 "implicit:" + role.str() + ":" + std::to_string(endpointIndex)))
+                            return false;
                         plan.implementationEndpoints.emplace_back(
                             compiledProgramEndpointAbi(*row, role, interfaceKind, endpointIndex));
+                    }
                     continue;
                 }
                 const std::optional<llvm::StringRef> source = row->getString("vernon.source_name");
@@ -200,13 +245,24 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                 };
                 if (!verifyProgramEndpointAbi(expectation, *row, error))
                     return false;
+                if (!claimRowDescriptors(role, *row, "value:" + std::to_string(valueId)))
+                    return false;
+                if (interfaceKind == "argument" && row->getArray("storage_leaves") && row->getString("address_space"))
+                    storageArguments.insert(endpointIndex);
                 const bool resourceEndpoint =
                     vertexAttribute || kind == "image" || kind == "sampler" || resources.count(valueId);
                 llvm::json::Array abiBindings;
                 if (resourceEndpoint) {
-                    abiBindings.emplace_back(llvm::json::Object{
-                        {"semantic", kind == "sampler" ? "sampler" : "resource"},
-                        {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", nextSlot++}}}});
+                    if (storageArguments.count(endpointIndex) && interfaceKind == "argument") {
+                        for (size_t leaf = 0; leaf < row->getArray("storage_leaves")->size(); ++leaf)
+                            abiBindings.emplace_back(llvm::json::Object{
+                                {"semantic", llvm::json::Object{{"storage_leaf", static_cast<int64_t>(leaf)}}},
+                                {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", nextSlot++}}}});
+                    } else {
+                        abiBindings.emplace_back(llvm::json::Object{
+                            {"semantic", kind == "sampler" ? "sampler" : "resource"},
+                            {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", nextSlot++}}}});
+                    }
                     const std::optional<int64_t> accessIndex = ensureProgramResourceAccess(
                         valueId, false, resources, plan.accessByValue, plan.accesses.json());
                     const llvm::json::Object *layout = programEndpointLayout(*row, true);
@@ -357,6 +413,34 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
         };
         if (!appendRows(entry.getArray("arguments"), "argument") || !appendRows(entry.getArray("results"), "result"))
             return false;
+        const llvm::json::Object *metadata = entry.getObject("metadata_carrier");
+        if (!metadata) {
+            if (!storageArguments.empty()) {
+                error = "compiled graphics " + role.str() + " module reads TensorViews without a metadata carrier";
+                return false;
+            }
+            continue;
+        }
+        const std::optional<int64_t> carrierSet = metadata->getInteger("set");
+        const std::optional<int64_t> carrierBinding = metadata->getInteger("binding");
+        if (metadata->getString("profile") != "portable_shader_metadata_i32" || !carrierSet || !carrierBinding) {
+            error = "compiled graphics " + role.str() + " metadata carrier is not a bound portable shader carrier";
+            return false;
+        }
+        ProgramModuleMetadataCarrier carrier;
+        if (!projectProgramMetadataCarrier(*metadata, role, carrier, error))
+            return false;
+        std::set<int64_t> fieldArguments;
+        for (const auto &[argument, rank] : carrier.argumentRanks)
+            fieldArguments.insert(argument);
+        if (fieldArguments != storageArguments) {
+            error = "compiled graphics " + role.str() + " metadata carrier does not cover its TensorView arguments";
+            return false;
+        }
+        if (!claimDescriptor(role, *carrierSet, *carrierBinding, "carrier:" + role.str(),
+                             role.str() + " TensorView metadata carrier"))
+            return false;
+        plan.metadataCarriers.emplace(role.str(), std::move(carrier));
     }
     if (coveredBindings.size() != boundValues.size()) {
         error = "compiled graphics ABI does not exactly cover logical bindings";
@@ -567,6 +651,8 @@ bool buildCanonicalGraphicsStageContract(const llvm::json::Object &node, llvm::j
     llvm::json::Object reflection{{"required_features", std::move(requiredFeatures)},
                                   {"endpoints", plan.endpoints.take()},
                                   {"graphics", std::move(graphics)}};
+    if (!plan.metadataCarriers.empty())
+        reflection["metadata_carriers"] = semanticProgramMetadataCarriers(plan.metadataCarriers);
     stageContract = llvm::json::Object{{"operation", "graphics"}, {"reflection", std::move(reflection)}};
     return true;
 }

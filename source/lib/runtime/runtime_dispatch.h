@@ -36,7 +36,8 @@ void destroyBackend(VernonRuntimeContext &context);
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &capabilities);
 RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
 
-RuntimeResult<void> registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint);
+RuntimeResult<void> registerBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
+RuntimeResult<void> unregisterBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
 using BackendStageLoadResult = vernon::Result<std::unique_ptr<VernonStageExecutable>, BackendPipelineFailure>;
 BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,

@@ -185,8 +185,10 @@ def main(
 """
         output = compile_source(source, "sampler_binding_collision.py")
         sampler = output[output.index('vernon.source_name = "__vernon_implicit_sampler_image"') :]
-        self.assertIn("vernon.set = 1 : i64", sampler)
-        self.assertIn("vernon.binding = 1 : i64", sampler)
+        sampler = sampler[: sampler.index("}")]
+        # The compiler's graphics binding planner owns the sampler binding (test_graphics_storage_reads.py).
+        self.assertNotIn("vernon.set", sampler)
+        self.assertNotIn("vernon.binding", sampler)
 
     def test_swizzle_aliases_are_canonicalized(self) -> None:
         source = """

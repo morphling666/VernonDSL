@@ -100,7 +100,6 @@ TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkg
     {
         const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
         ASSERT_NE(fixture, nullptr);
-        ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
         vernon::tests::OwnedProgramExecutable program(runtime, std::string(fixture->manifestPath));
         ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(runtime));
 
@@ -137,7 +136,6 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
     ASSERT_NE(runtime, nullptr);
     const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
     ASSERT_NE(fixture, nullptr);
-    ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = std::string(fixture->manifestPath);
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};

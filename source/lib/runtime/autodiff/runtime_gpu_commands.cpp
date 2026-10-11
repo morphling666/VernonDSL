@@ -332,18 +332,18 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
             std::find_if(deferred.encoders.begin(), deferred.encoders.end(),
                          [](const execution::detail::RhiCommandNodeEncoder &encoder) { return encoder.encode; });
         if (firstCommand == deferred.encoders.end())
-            return fail(context, "GPU autodiff command program has no encodable command", VERNON_STATUS_INTERNAL_ERROR);
+            return fail(context, "GPU command program has no encodable command", VERNON_STATUS_INTERNAL_ERROR);
         auto encodeContext = std::make_shared<EncodeFailureContext>(EncodeFailureContext{context, *firstCommand});
         *firstCommand = {encodeWithFailureBoundary, encodeContext.get(), nullptr};
         deferred.retainedContexts.push_back(std::move(encodeContext));
         if (sink->append(std::move(deferred)) != VERNON_RHI_STATUS_OK)
-            return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
+            return fail(context, "GPU command program failed", VERNON_STATUS_INTERNAL_ERROR);
         sink->onCompletion(std::make_shared<WaitFailureCompletion>(context));
         if (flush) {
             if (sink->flush() != VERNON_RHI_STATUS_OK) {
                 if (submission)
                     *submission = SubmissionState::Indeterminate;
-                return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
+                return fail(context, "GPU command program failed", VERNON_STATUS_INTERNAL_ERROR);
             }
             if (submission)
                 *submission = SubmissionState::Completed;
@@ -383,7 +383,7 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
         if (backendError.data && backendError.size)
             detail.assign(backendError.data, backendError.size);
     }
-    return fail(context, detail.empty() ? "GPU autodiff command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
+    return fail(context, detail.empty() ? "GPU command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
 }
 
 VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies) {

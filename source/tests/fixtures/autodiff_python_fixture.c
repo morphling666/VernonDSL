@@ -1,11 +1,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include "VernonRuntime.h"
-
-#ifndef VERNON_AUTODIFF_FIXTURE_REGISTRATION
-#error "VERNON_AUTODIFF_FIXTURE_REGISTRATION must name the fixture registration function"
-#endif
 #ifndef VERNON_AUTODIFF_FIXTURE_MODULE
 #error "VERNON_AUTODIFF_FIXTURE_MODULE must name the Python module"
 #endif
@@ -15,15 +10,9 @@
 #define VERNON_STRING_IMPL(value) #value
 #define VERNON_STRING(value) VERNON_STRING_IMPL(value)
 
-extern VernonStatus VERNON_AUTODIFF_FIXTURE_REGISTRATION(void);
-
+/* Importing the module loads the linked CPU objects, whose static constructors
+ * register their entries with the Runtime. */
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, VERNON_STRING(VERNON_AUTODIFF_FIXTURE_MODULE),
-                                    "Registers one statically linked cooked autodiff fixture.", -1, NULL};
+                                    "Statically links one cooked CPU Program fixture.", -1, NULL};
 
-PyMODINIT_FUNC VERNON_CONCAT(PyInit_, VERNON_AUTODIFF_FIXTURE_MODULE)(void) {
-    if (VERNON_AUTODIFF_FIXTURE_REGISTRATION() != VERNON_STATUS_OK) {
-        PyErr_SetString(PyExc_RuntimeError, "cannot register autodiff fixture");
-        return NULL;
-    }
-    return PyModule_Create(&module);
-}
+PyMODINIT_FUNC VERNON_CONCAT(PyInit_, VERNON_AUTODIFF_FIXTURE_MODULE)(void) { return PyModule_Create(&module); }

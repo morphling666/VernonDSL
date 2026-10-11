@@ -82,6 +82,14 @@ set(VERNON_PROGRAM_VERSION {program})
     return rendered
 
 
+def _existing_newline(path: Path) -> str:
+    # The working copy may be checked out with CRLF (core.autocrlf); rewriting
+    # with LF would mark every untouched fixture as modified.
+    if path.exists() and b"\r\n" in path.read_bytes():
+        return "\r\n"
+    return "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="fail if generated files are stale")
@@ -94,7 +102,7 @@ def main() -> int:
                 stale.append(path.relative_to(ROOT))
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(expected, encoding="utf-8", newline="\n")
+        path.write_text(expected, encoding="utf-8", newline=_existing_newline(path))
 
     if stale:
         print("stale generated version files:", file=sys.stderr)

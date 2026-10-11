@@ -7,7 +7,7 @@
 // CHECK-DAG: contains compiler-owned TensorView metadata ABI state
 // CHECK-DAG: but the vertex output has type
 
-module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
+module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 2 : i64} {
   func.func @bad_vertex(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64,

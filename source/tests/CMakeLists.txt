@@ -20,13 +20,6 @@ if(Python_EXECUTABLE)
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
 endif()
 
-file(
-    GLOB_RECURSE
-    VERNON_TEST_BUNDLE_PYTHON_SOURCES
-    CONFIGURE_DEPENDS
-    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/*.py")
-set(VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES ${VERNON_TEST_BUNDLE_PYTHON_SOURCES})
-include("${VERNON_REPOSITORY_ROOT}/cmake/VernonProgramFixture.cmake")
 set_property(
     DIRECTORY
     APPEND
@@ -54,12 +47,15 @@ function(
     asset_reference
     output_stem
     output_variable)
-    vernon_add_program_asset_bundle(
-        "${name}-test"
-        "${architecture}"
+    vernon_add_program_asset(
+        "vernon-${name}-test-bundle"
+        SOURCE
         "${asset_reference}"
-        "${VERNON_TEST_BINARY_ROOT}"
-        "${output_stem}"
+        TARGET
+        "${architecture}"
+        OUTPUT_DIRECTORY
+        "${VERNON_TEST_BINARY_ROOT}/${output_stem}"
+        MANIFEST_VARIABLE
         _vernon_bundle_manifest)
     set(${output_variable}
         "${_vernon_bundle_manifest}"
@@ -70,27 +66,24 @@ function(
     vernon_add_cpu_program_fixture
     name
     directory_stem
-    manifest_name
     asset_reference
-    wrapper_function
     manifest_variable
     target_variable)
-    set(_vernon_directory "${VERNON_TEST_BINARY_ROOT}/${directory_stem}")
-    vernon_add_cpu_program_fixture_library(
-        "${name}"
-        "${_vernon_directory}"
-        "${manifest_name}"
+    vernon_add_program_asset(
+        "vernon-${name}-fixture"
+        SOURCE
         "${asset_reference}"
-        "${wrapper_function}"
-        "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py"
-        _vernon_manifest
-        _vernon_target
-        ${ARGN})
+        TARGET
+        cpu
+        OUTPUT_DIRECTORY
+        "${VERNON_TEST_BINARY_ROOT}/${directory_stem}"
+        MANIFEST_VARIABLE
+        _vernon_manifest)
     set(${manifest_variable}
         "${_vernon_manifest}"
         PARENT_SCOPE)
     set(${target_variable}
-        "${_vernon_target}"
+        "vernon-${name}-fixture"
         PARENT_SCOPE)
 endfunction()
 
@@ -98,7 +91,6 @@ function(
     vernon_add_python_program_fixture
     target
     module
-    registration_function
     fixture_target)
     python_add_library(
         ${target}
@@ -106,8 +98,7 @@ function(
         WITH_SOABI
         "${VERNON_TEST_ROOT}/fixtures/autodiff_python_fixture.c")
     set_target_properties(${target} PROPERTIES OUTPUT_NAME "${module}")
-    target_compile_definitions(${target} PRIVATE VERNON_AUTODIFF_FIXTURE_MODULE=${module}
-                                                 VERNON_AUTODIFF_FIXTURE_REGISTRATION=${registration_function})
+    target_compile_definitions(${target} PRIVATE VERNON_AUTODIFF_FIXTURE_MODULE=${module})
     target_include_directories(${target} PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
     # GNU linkers process static archives from left to right and may discard shared libraries under --as-needed before
     # an archive introduces a use.
@@ -268,7 +259,6 @@ if(TARGET VernonRuntime)
         set(module_program_cpu_fixture_targets)
         set(synchronization_cpu_fixture_targets)
         set(language_contract_cpu_fixture_targets)
-        set(VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS)
         set(enabled_fixture_targets)
         list(APPEND enabled_fixture_targets "cpu|VERNON_RUNTIME_CPU|compute,autodiff,synchronization")
         if(VERNON_ENABLE_CUDA_RUNTIME)
@@ -408,26 +398,14 @@ if(TARGET VernonRuntime)
                             "${fixture_id}")
                 set(fixture_manifest_variable "${fixture_id}_${fixture_architecture}_manifest")
                 if(fixture_runtime STREQUAL "VERNON_RUNTIME_CPU")
-                    string(MAKE_C_IDENTIFIER "${fixture_id}_${fixture_architecture}" fixture_registration_suffix)
-                    set(fixture_registration "vernonRegisterFixture_${fixture_registration_suffix}")
                     set(fixture_target_variable "${fixture_id}_${fixture_architecture}_fixture_target")
                     vernon_add_cpu_program_fixture(
                         "${fixture_name}-${fixture_architecture}"
                         "${fixture_id}_${fixture_architecture}_fixture"
-                        "${fixture_id}_${fixture_architecture}_fixture.program.json"
                         "${fixture_asset}"
-                        "${fixture_registration}"
                         "${fixture_manifest_variable}"
                         "${fixture_target_variable}")
                     list(APPEND ${fixture_group}_cpu_fixture_targets "${${fixture_target_variable}}")
-                    string(TOUPPER "${fixture_group}" fixture_group_macro)
-                    string(MAKE_C_IDENTIFIER "${fixture_group_macro}" fixture_group_macro)
-                    string(
-                        APPEND
-                        VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS
-                        "#if defined(VERNON_${fixture_group_macro}_CPU_FIXTURES_AVAILABLE)\nextern \"C\" VernonStatus ${fixture_registration}(void);\n#endif\n"
-                    )
-                    set(fixture_registration_expression "&${fixture_registration}")
                 else()
                     vernon_add_program_asset_test_bundle(
                         "${fixture_name}-${fixture_architecture}"
@@ -437,7 +415,6 @@ if(TARGET VernonRuntime)
                         "${fixture_manifest_variable}")
                     list(APPEND ${fixture_group}_fixture_targets
                          "vernon-${fixture_name}-${fixture_architecture}-test-bundle")
-                    set(fixture_registration_expression "nullptr")
                 endif()
                 string(FIND "${${fixture_manifest_variable}}" ")vernon\"" fixture_raw_string_terminator)
                 if(NOT
@@ -453,13 +430,13 @@ if(TARGET VernonRuntime)
                     string(
                         APPEND
                         VERNON_TEST_FIXTURE_MANIFEST_ROWS
-                        "#if defined(VERNON_${fixture_group_macro}_CPU_FIXTURES_AVAILABLE)\n        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\", ${fixture_registration_expression}},\n#endif\n"
+                        "#if defined(VERNON_${fixture_group_macro}_CPU_FIXTURES_AVAILABLE)\n        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\"},\n#endif\n"
                     )
                 else()
                     string(
                         APPEND
                         VERNON_TEST_FIXTURE_MANIFEST_ROWS
-                        "        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\", ${fixture_registration_expression}},\n"
+                        "        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\"},\n"
                     )
                 endif()
             endforeach()
@@ -473,153 +450,115 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_program_fixture(
             cooked-autodiff
             autodiff_cooked_fixture
-            autodiff_cooked_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_aggregate_asset.py:asset"
-            vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
             cooked_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             typed-specialization
             typed_specialization_fixture
-            typed_specialization_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/typed_specialization_program_asset.py:asset"
-            vernonRegisterTypedSpecializationFixture
             typed_specialization_manifest
             typed_specialization_fixture_target)
         vernon_add_cpu_program_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
-            autodiff_native_f16_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_native_f16_asset.py:asset"
-            vernonRegisterNativeAutodiffF16Fixture
             native_autodiff_f16_manifest
             native_autodiff_f16_fixture_target)
         vernon_add_cpu_program_fixture(
             native-autodiff-numeric-cpu
             autodiff_native_numeric_cpu_fixture
-            autodiff_native_numeric_cpu_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-            vernonRegisterNativeAutodiffNumericCpuFixture
             native_autodiff_numeric_cpu_manifest
             native_autodiff_numeric_cpu_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-scalar-autodiff
             autodiff_structured_scalar_fixture
-            autodiff_structured_scalar_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:asset"
-            vernonRegisterStructuredScalarAutodiffFixture
             structured_scalar_autodiff_manifest
             structured_scalar_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-scalar-balanced-autodiff
             autodiff_structured_scalar_balanced_fixture
-            autodiff_structured_scalar_balanced_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:balanced_asset"
-            vernonRegisterStructuredScalarBalancedAutodiffFixture
             structured_scalar_balanced_autodiff_manifest
             structured_scalar_balanced_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-dynamic-autodiff
             autodiff_structured_dynamic_fixture
-            autodiff_structured_dynamic_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:dynamic_asset"
-            vernonRegisterStructuredDynamicAutodiffFixture
             structured_dynamic_autodiff_manifest
             structured_dynamic_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-f64-autodiff
             autodiff_structured_f64_fixture
-            autodiff_structured_f64_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:double_asset"
-            vernonRegisterStructuredF64AutodiffFixture
             structured_f64_autodiff_manifest
             structured_f64_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-aggregate-autodiff
             autodiff_structured_aggregate_fixture
-            autodiff_structured_aggregate_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_aggregate_asset.py:asset"
-            vernonRegisterStructuredAggregateAutodiffFixture
             structured_aggregate_autodiff_manifest
             structured_aggregate_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-storage-autodiff
             autodiff_structured_storage_fixture
-            autodiff_structured_storage_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:asset"
-            vernonRegisterStructuredStorageAutodiffFixture
             structured_storage_autodiff_manifest
             structured_storage_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-storage-aggregate-autodiff
             autodiff_structured_storage_aggregate_fixture
-            autodiff_structured_storage_aggregate_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:aggregate_asset"
-            vernonRegisterStructuredStorageAggregateAutodiffFixture
             structured_storage_aggregate_autodiff_manifest
             structured_storage_aggregate_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             structured-storage-workgroup-autodiff
             autodiff_structured_storage_workgroup_fixture
-            autodiff_structured_storage_workgroup_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_workgroup_storage_asset.py:asset"
-            vernonRegisterStructuredStorageWorkgroupAutodiffFixture
             structured_storage_workgroup_autodiff_manifest
             structured_storage_workgroup_autodiff_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-signed-stride
             autodiff_dynamic_parity_signed_stride_fixture
-            autodiff_dynamic_parity_signed_stride_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:signed_stride_asset"
-            vernonRegisterDynamicParitySignedStrideFixture
             dynamic_parity_signed_stride_manifest
             dynamic_parity_signed_stride_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-field-path
             autodiff_dynamic_parity_field_path_fixture
-            autodiff_dynamic_parity_field_path_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:field_path_asset"
-            vernonRegisterDynamicParityFieldPathFixture
             dynamic_parity_field_path_manifest
             dynamic_parity_field_path_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-strided-scatter
             autodiff_dynamic_parity_strided_scatter_fixture
-            autodiff_dynamic_parity_strided_scatter_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:strided_scatter_asset"
-            vernonRegisterDynamicParityStridedScatterFixture
             dynamic_parity_strided_scatter_manifest
             dynamic_parity_strided_scatter_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-gather
             autodiff_dynamic_parity_gather_fixture
-            autodiff_dynamic_parity_gather_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:gather_asset"
-            vernonRegisterDynamicParityGatherFixture
             dynamic_parity_gather_manifest
             dynamic_parity_gather_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-multi-output
             autodiff_dynamic_parity_multi_output_fixture
-            autodiff_dynamic_parity_multi_output_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:multi_output_asset"
-            vernonRegisterDynamicParityMultiOutputFixture
             dynamic_parity_multi_output_manifest
             dynamic_parity_multi_output_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-partially-dynamic
             autodiff_dynamic_parity_partially_dynamic_fixture
-            autodiff_dynamic_parity_partially_dynamic_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:partially_dynamic_asset"
-            vernonRegisterDynamicParityPartiallyDynamicFixture
             dynamic_parity_partially_dynamic_manifest
             dynamic_parity_partially_dynamic_fixture_target)
         vernon_add_cpu_program_fixture(
             dynamic-parity-mixed-alias
             autodiff_dynamic_parity_mixed_alias_fixture
-            autodiff_dynamic_parity_mixed_alias_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_parity_asset.py:mixed_alias_asset"
-            vernonRegisterDynamicParityMixedAliasFixture
             dynamic_parity_mixed_alias_manifest
             dynamic_parity_mixed_alias_fixture_target)
         add_executable(VernonModuleProgramRuntimeTests runtime/runtime_module_program_c_api_test.cpp)
@@ -791,65 +730,37 @@ if(TARGET VernonRuntime)
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_discover_gtests(VernonRuntimeWorkgroupAutodiffTests)
 
+        vernon_add_python_program_fixture(VernonCookedAutodiffPythonFixture vernon_cooked_autodiff_fixture
+                                          ${cooked_autodiff_fixture_target})
+        vernon_add_python_program_fixture(VernonNativeAutodiffF16PythonFixture vernon_native_autodiff_f16_fixture
+                                          ${native_autodiff_f16_fixture_target})
+        vernon_add_python_program_fixture(VernonTypedSpecializationPythonFixture vernon_typed_specialization_fixture
+                                          ${typed_specialization_fixture_target})
         vernon_add_python_program_fixture(
-            VernonCookedAutodiffPythonFixture
-            vernon_cooked_autodiff_fixture
-            vernonRegisterAutodiffFixture
-            ${cooked_autodiff_fixture_target})
-        vernon_add_python_program_fixture(
-            VernonNativeAutodiffF16PythonFixture
-            vernon_native_autodiff_f16_fixture
-            vernonRegisterNativeAutodiffF16Fixture
-            ${native_autodiff_f16_fixture_target})
-        vernon_add_python_program_fixture(
-            VernonTypedSpecializationPythonFixture
-            vernon_typed_specialization_fixture
-            vernonRegisterTypedSpecializationFixture
-            ${typed_specialization_fixture_target})
-        vernon_add_python_program_fixture(
-            VernonNativeAutodiffNumericCpuPythonFixture
-            vernon_native_autodiff_numeric_cpu_fixture
-            vernonRegisterNativeAutodiffNumericCpuFixture
+            VernonNativeAutodiffNumericCpuPythonFixture vernon_native_autodiff_numeric_cpu_fixture
             ${native_autodiff_numeric_cpu_fixture_target})
         vernon_add_python_program_fixture(
-            VernonStructuredStorageAggregateAutodiffPythonFixture
-            vernon_structured_storage_aggregate_autodiff_fixture
-            vernonRegisterStructuredStorageAggregateAutodiffFixture
+            VernonStructuredStorageAggregateAutodiffPythonFixture vernon_structured_storage_aggregate_autodiff_fixture
             ${structured_storage_aggregate_autodiff_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParitySignedStridePythonFixture
-            vernon_dynamic_parity_signed_stride_fixture
-            vernonRegisterDynamicParitySignedStrideFixture
+            VernonDynamicParitySignedStridePythonFixture vernon_dynamic_parity_signed_stride_fixture
             ${dynamic_parity_signed_stride_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParityFieldPathPythonFixture
-            vernon_dynamic_parity_field_path_fixture
-            vernonRegisterDynamicParityFieldPathFixture
+            VernonDynamicParityFieldPathPythonFixture vernon_dynamic_parity_field_path_fixture
             ${dynamic_parity_field_path_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParityStridedScatterPythonFixture
-            vernon_dynamic_parity_strided_scatter_fixture
-            vernonRegisterDynamicParityStridedScatterFixture
+            VernonDynamicParityStridedScatterPythonFixture vernon_dynamic_parity_strided_scatter_fixture
             ${dynamic_parity_strided_scatter_fixture_target})
+        vernon_add_python_program_fixture(VernonDynamicParityGatherPythonFixture vernon_dynamic_parity_gather_fixture
+                                          ${dynamic_parity_gather_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParityGatherPythonFixture
-            vernon_dynamic_parity_gather_fixture
-            vernonRegisterDynamicParityGatherFixture
-            ${dynamic_parity_gather_fixture_target})
-        vernon_add_python_program_fixture(
-            VernonDynamicParityMultiOutputPythonFixture
-            vernon_dynamic_parity_multi_output_fixture
-            vernonRegisterDynamicParityMultiOutputFixture
+            VernonDynamicParityMultiOutputPythonFixture vernon_dynamic_parity_multi_output_fixture
             ${dynamic_parity_multi_output_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParityPartiallyDynamicPythonFixture
-            vernon_dynamic_parity_partially_dynamic_fixture
-            vernonRegisterDynamicParityPartiallyDynamicFixture
+            VernonDynamicParityPartiallyDynamicPythonFixture vernon_dynamic_parity_partially_dynamic_fixture
             ${dynamic_parity_partially_dynamic_fixture_target})
         vernon_add_python_program_fixture(
-            VernonDynamicParityMixedAliasPythonFixture
-            vernon_dynamic_parity_mixed_alias_fixture
-            vernonRegisterDynamicParityMixedAliasFixture
+            VernonDynamicParityMixedAliasPythonFixture vernon_dynamic_parity_mixed_alias_fixture
             ${dynamic_parity_mixed_alias_fixture_target})
         add_test(
             NAME VernonPythonCookedAutodiffTest
@@ -1162,10 +1073,6 @@ if(TARGET VernonRuntime)
     endif()
 
     file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")
-    file(
-        GENERATE
-        OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_registration_declarations.inc"
-        CONTENT "${VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS}")
     file(
         GENERATE
         OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_manifest_rows.inc"

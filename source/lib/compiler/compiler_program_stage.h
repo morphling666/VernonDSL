@@ -23,6 +23,21 @@ llvm::json::Object programValueCarrier(llvm::StringRef tag, int64_t slot, const 
 llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module,
                                               llvm::StringRef interfaceKind, int64_t index);
 
+// One module's TensorView metadata carrier: `semantic` enters the StageContract
+// and `physical` the selected target implementation.
+struct ProgramModuleMetadataCarrier {
+    llvm::json::Object semantic;
+    llvm::json::Object physical;
+    // Module endpoint index -> TensorView rank described by the fields.
+    std::map<int64_t, int64_t> argumentRanks;
+};
+using ProgramModuleMetadataCarriers = std::map<std::string, ProgramModuleMetadataCarrier>;
+
+bool projectProgramMetadataCarrier(const llvm::json::Object &compiled, llvm::StringRef module,
+                                   ProgramModuleMetadataCarrier &carrier, std::string &error);
+llvm::json::Object semanticProgramMetadataCarriers(const ProgramModuleMetadataCarriers &carriers);
+llvm::json::Object physicalProgramMetadataCarriers(const ProgramModuleMetadataCarriers &carriers);
+
 struct ProgramEndpointExpectation {
     std::optional<llvm::StringRef> dtype;
     const llvm::json::Array *shape{};

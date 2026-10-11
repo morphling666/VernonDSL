@@ -565,7 +565,23 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 std::optional<int64_t> descriptorSet = parseNonNegative(attrs.descriptorSet, kDescriptorSetAttrName);
                 std::optional<int64_t> binding = parseNonNegative(attrs.binding, kBindingAttrName);
 
-                if (kind == InterfaceKind::Resource && (!attrs.descriptorSet || !attrs.binding)) {
+                auto view = dyn_cast<TensorViewType>(type);
+                const bool graphicsStorage = kind == InterfaceKind::Resource && !isResult && view &&
+                                             view.getAddressSpace() == "device" && *stage != ShaderStage::Compute;
+                if (graphicsStorage && (attrs.descriptorSet || attrs.binding)) {
+                    function.emitError() << "argument #" << index
+                                         << " graphics TensorView cannot declare an explicit set or binding";
+                    invalid = true;
+                }
+                if (graphicsStorage && view.getAccess() != "read") {
+                    function.emitError() << "argument #" << index << " graphics TensorView must have read access";
+                    invalid = true;
+                }
+                const bool graphicsPlannedResource =
+                    kind == InterfaceKind::Resource && !isResult && *stage != ShaderStage::Compute &&
+                    isa<TextureType, SamplerType>(type) && !attrs.descriptorSet && !attrs.binding;
+                if (kind == InterfaceKind::Resource && !graphicsStorage && !graphicsPlannedResource &&
+                    (!attrs.descriptorSet || !attrs.binding)) {
                     function.emitError() << (isResult ? "result #" : "argument #") << index << " "
                                          << stringifyInterfaceKind(kind) << " requires both '" << kDescriptorSetAttrName
                                          << "' and '" << kBindingAttrName << "'";

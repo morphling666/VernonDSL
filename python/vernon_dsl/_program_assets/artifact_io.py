@@ -12,7 +12,6 @@ from ..bundle import (
     build_program_manifest,
     inline_artifact_descriptor,
 )
-from .cpu_registration import write_cpu_static_registration
 
 
 def encode_runtime_stage(record: dict[str, Any], artifact: bytes) -> dict[str, Any]:
@@ -105,18 +104,26 @@ def write_bundle_artifacts(plan: BundlePlan, output: Path) -> Path:
         for stage in plan.compiled_stages
     }
     bundle = build_program_manifest(plan, descriptors)
-    if plan.target.target == "cpu":
-        write_cpu_static_registration(
-            output,
-            [str(stage.metadata.get("symbol", "")) for stage in plan.compiled_stages],
-        )
+    owned = {output / descriptor["path"] for descriptor in descriptors.values()}
     manifest = output / f"{output.name}.program.json"
     manifest.write_text(
         json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
         newline="\n",
     )
+    _prune_stale_outputs(output, owned)
     return manifest
+
+
+def _prune_stale_outputs(output: Path, owned: set[Path]) -> None:
+    # Content-addressed artifacts are never overwritten, so an earlier cook's
+    # artifacts would otherwise accumulate next to the current ones.
+    artifacts = output / "artifacts"
+    if not artifacts.is_dir():
+        return
+    for path in artifacts.iterdir():
+        if path.is_file() and path not in owned:
+            path.unlink()
 
 
 __all__ = ["artifact_extension", "encode_runtime_stage", "write_bundle_artifacts", "write_external_artifact"]

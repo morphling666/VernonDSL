@@ -232,11 +232,24 @@ OwnedCompileOptions parseCompileOptions(VernonTarget target, const nb::dict &tar
 } // namespace
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      const nb::dict &targetOptions) {
+                                                      const nb::dict &targetOptions,
+                                                      const std::string &graphicsBindingLayout) {
     OwnedCompileOptions options = parseCompileOptions(target, targetOptions);
+    options.value.graphics_binding_layout =
+        VernonStringView{graphicsBindingLayout.data(), graphicsBindingLayout.size()};
     options.refresh();
     return std::make_unique<CompiledProgram>(
         vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options.value), target);
+}
+
+std::unique_ptr<CompiledProgram> linkGraphicsBindingsResult(Compiler &compiler,
+                                                            const std::vector<std::string> &modules) {
+    std::vector<VernonStringView> views;
+    views.reserve(modules.size());
+    for (const std::string &module : modules)
+        views.push_back(VernonStringView{module.data(), module.size()});
+    return std::make_unique<CompiledProgram>(
+        vernonCompilerLinkGraphicsBindings(compiler.context, views.data(), views.size()), VERNON_TARGET_CPU);
 }
 
 std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std::string &program) {

@@ -33,6 +33,36 @@ if(VERNON_ENABLE_PYTHON_BINDINGS
     vernon_add_python_bindings("${VERNON_PYTHON_PACKAGE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+if(TARGET vernon-dsl-native)
+    find_package(
+        Python 3.11...<3.15
+        COMPONENTS Interpreter
+        QUIET)
+    if(Python_EXECUTABLE)
+        file(
+            GLOB_RECURSE
+            _vernon_cooker_python_sources
+            CONFIGURE_DEPENDS
+            "${VERNON_PYTHON_PACKAGE_DIR}/*.py")
+        set(_vernon_cooker_dependencies vernon-dsl-native "$<TARGET_FILE:vernon-dsl-native>")
+        if(TARGET VernonDSLCompiler)
+            list(
+                APPEND
+                _vernon_cooker_dependencies
+                VernonDSLCompiler
+                "$<TARGET_FILE:VernonDSLCompiler>")
+        endif()
+        vernon_configure_program_cooker(
+            PYTHON
+            "${Python_EXECUTABLE}"
+            PYTHON_PATH
+            "${VERNON_REPOSITORY_ROOT}/python"
+            DEPENDS
+            ${_vernon_cooker_dependencies}
+            ${_vernon_cooker_python_sources})
+    endif()
+endif()
+
 if(BUILD_TESTING)
     find_package(
         Python 3.11...<3.15

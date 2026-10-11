@@ -27,6 +27,8 @@ def _verify_runtime_source_contents(source: Path) -> None:
         "cmake/EmbedBinary.cmake",
         "cmake/IncludeNlohmannJson.cmake",
         "cmake/IncludeVulkanHeaders.cmake",
+        "cmake/VernonArchiveCpuProgram.cmake",
+        "cmake/VernonProgramAsset.cmake",
         "cmake/VernonRuntimeTarget.cmake",
         "cmake/VernonVersions.cmake",
         "include/VernonRuntime.h",

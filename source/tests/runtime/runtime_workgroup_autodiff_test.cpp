@@ -10,8 +10,6 @@
 #include <iterator>
 #include <string>
 
-extern "C" VernonStatus vernonRegisterStructuredStorageWorkgroupAutodiffFixture(void);
-
 namespace {
 
 std::string lastError(VernonRuntimeContext *context) {
@@ -20,7 +18,6 @@ std::string lastError(VernonRuntimeContext *context) {
 }
 
 TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
-    ASSERT_EQ(vernonRegisterStructuredStorageWorkgroupAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);

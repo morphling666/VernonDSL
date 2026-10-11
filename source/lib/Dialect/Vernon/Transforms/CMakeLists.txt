@@ -9,7 +9,9 @@ add_mlir_library(
     VernonAttributeAbi.cpp
     VernonGlobalIdIndexProof.cpp
     VernonGPUProfileABI.cpp
+    VernonGraphicsBindings.cpp
     VernonConvertGPUToSPIRV.cpp
+    VernonExpandFloorCeilDivision.cpp
     VernonInlineHelpers.cpp
     VernonLowerAccumulation.cpp
     VernonLowerCPUABI.cpp
@@ -20,6 +22,7 @@ add_mlir_library(
     VernonLowerCUDAMath.cpp
     VernonLowerGPUAutodiff.cpp
     VernonLowerGPUTensors.cpp
+    VernonLowerMulOverflowChecks.cpp
     VernonLowerSynchronization.cpp
     VernonAggregateStorage.cpp
     VernonSharedValuePatterns.cpp
@@ -40,6 +43,7 @@ add_mlir_library(
     PUBLIC
     MLIRArithToLLVM
     MLIRArithDialect
+    MLIRArithTransforms
     MLIRControlFlowDialect
     MLIRControlFlowToLLVM
     MLIRConvertToLLVMPass

@@ -14,6 +14,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -779,6 +780,67 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
     builder.SetInsertPoint(rangeInvalid);
     builder.CreateRet(builder.getInt32(1));
+    return llvm::Error::success();
+}
+
+llvm::Error emitCpuStaticRegistration(llvm::Module &module, const std::vector<CpuAbiWrapperMetadata> &entries) {
+    if (entries.empty())
+        return llvm::Error::success();
+    llvm::LLVMContext &context = module.getContext();
+    const llvm::DataLayout &layout = module.getDataLayout();
+    auto *pointerType = llvm::PointerType::getUnqual(context);
+    llvm::IntegerType *sizeType = layout.getIntPtrType(context);
+    auto *entryType = llvm::StructType::get(context, {pointerType, sizeType, pointerType});
+    const llvm::StructLayout *entryLayout = layout.getStructLayout(entryType);
+    if (sizeType->getBitWidth() == sizeof(void *) * 8 &&
+        (entryLayout->getSizeInBytes() != sizeof(VernonStaticCpuEntry) ||
+         entryLayout->getElementOffset(1) != offsetof(VernonStaticCpuEntry, symbol.size) ||
+         entryLayout->getElementOffset(2) != offsetof(VernonStaticCpuEntry, entry_point)))
+        return invalidAbi("CPU static entry layout does not match the host ABI");
+
+    const bool supportsComdat = llvm::Triple(module.getTargetTriple()).supportsCOMDAT();
+    std::vector<llvm::Constant *> rows;
+    rows.reserve(entries.size());
+    for (const CpuAbiWrapperMetadata &entry : entries) {
+        llvm::Function *wrapper = module.getFunction(entry.exportedWrapperSymbol);
+        if (!wrapper || wrapper->isDeclaration())
+            return invalidAbi("CPU static registration names missing wrapper '" + entry.exportedWrapperSymbol + "'");
+        // Wrapper names hash the module content, and Programs embed identical
+        // helper modules, so one application may link several copies of an
+        // object. The copies must fold instead of colliding; each copy's
+        // constructor then registers the surviving definition.
+        wrapper->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+        if (supportsComdat)
+            wrapper->setComdat(module.getOrInsertComdat(wrapper->getName()));
+        llvm::Constant *name = llvm::ConstantDataArray::getString(context, entry.exportedWrapperSymbol, false);
+        auto *nameGlobal = new llvm::GlobalVariable(module, name->getType(), true, llvm::GlobalValue::PrivateLinkage,
+                                                    name, "vernon.cpu.entry_name");
+        nameGlobal->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        rows.push_back(llvm::ConstantStruct::get(
+            entryType, {nameGlobal, llvm::ConstantInt::get(sizeType, entry.exportedWrapperSymbol.size()), wrapper}));
+    }
+    auto *tableType = llvm::ArrayType::get(entryType, rows.size());
+    auto *table = new llvm::GlobalVariable(module, tableType, true, llvm::GlobalValue::PrivateLinkage,
+                                           llvm::ConstantArray::get(tableType, rows), "vernon.cpu.entries");
+
+    // VernonStatus is a C enum, which every supported target lowers to i32.
+    auto *registryType = llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {pointerType, sizeType}, false);
+    // A failure can only mean malformed arguments or allocation failure; a
+    // missing entry is then reported when the Program loads.
+    const auto emitRegistryCall = [&](const char *callee, const char *name) {
+        llvm::Function *function =
+            llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
+                                   llvm::GlobalValue::InternalLinkage, name, module);
+        llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
+        builder.CreateCall(module.getOrInsertFunction(callee, registryType),
+                           {table, llvm::ConstantInt::get(sizeType, rows.size())});
+        builder.CreateRetVoid();
+        return function;
+    };
+    llvm::appendToGlobalCtors(module, emitRegistryCall(cpuStaticRegistrationSymbol, "vernon.cpu.register_entries"),
+                              65535);
+    llvm::appendToGlobalDtors(module, emitRegistryCall(cpuStaticUnregistrationSymbol, "vernon.cpu.unregister_entries"),
+                              65535);
     return llvm::Error::success();
 }
 

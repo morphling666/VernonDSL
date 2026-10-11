@@ -26,6 +26,7 @@ struct ProgramGraphicsInterfacePlan {
     std::map<int64_t, int64_t> accessByValue;
     ProgramStorageUsageRequirements storageUsageRequirements;
     std::optional<int64_t> vertexCountValue;
+    ProgramModuleMetadataCarriers metadataCarriers;
 };
 
 bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflection, const llvm::json::Array &rawValues,

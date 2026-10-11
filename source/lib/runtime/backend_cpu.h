@@ -57,7 +57,9 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
                                CpuPipelineState &state);
 void setCpuProgramTape(VernonStageExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root);
 
-VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entry);
+VernonStatus registerStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
+VernonStatus unregisterStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
+VernonCpuEntryPoint findStaticCpuEntry(const std::string &symbol);
 
 bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t reflectionSize, const char *entryName,
                   size_t entryNameSize, CpuKernelState &state, ReflectedEntry &metadata, std::string &error);

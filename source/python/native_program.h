@@ -195,7 +195,10 @@ struct CpuTargetOptionStrings {
 CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions);
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      const nb::dict &targetOptions);
+                                                      const nb::dict &targetOptions,
+                                                      const std::string &graphicsBindingLayout);
+std::unique_ptr<CompiledProgram> linkGraphicsBindingsResult(Compiler &compiler,
+                                                            const std::vector<std::string> &modules);
 std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std::string &program);
 std::unique_ptr<CompiledProgram>
 finalizeProgramResult(Compiler &compiler, const std::string &plan,

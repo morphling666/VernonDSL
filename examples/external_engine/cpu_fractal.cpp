@@ -16,12 +16,6 @@
 #include <utility>
 #include <vector>
 
-#ifndef VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION
-#error VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION must name the generated registration function
-#endif
-
-extern "C" VernonStatus VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION(void);
-
 namespace {
 
 constexpr uint32_t kWidth = 640;
@@ -37,10 +31,6 @@ public:
     bool initialize(GraphicsHost *graphics, bool headless) override {
         graphics_ = graphics;
         headless_ = headless;
-        if (VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION() != VERNON_STATUS_OK) {
-            std::cerr << "failed to register statically linked Vernon CPU entries\n";
-            return false;
-        }
         runtime_ = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
         if (!runtime_)
             return false;

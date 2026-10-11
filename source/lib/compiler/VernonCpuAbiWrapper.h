@@ -47,6 +47,14 @@ struct CpuAbiWrapperMetadata {
 
 llvm::Error defineCpuTextureSampleHelper(llvm::Module &module);
 llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata &metadata);
+inline constexpr const char *cpuStaticRegistrationSymbol = "vernonRuntimeRegisterStaticCpuEntries";
+inline constexpr const char *cpuStaticUnregistrationSymbol = "vernonRuntimeUnregisterStaticCpuEntries";
+
+// Emits a static constructor that registers every entry wrapper with the
+// Runtime and a static destructor that withdraws them. A JIT that loads such
+// an object must bind both symbols itself, because JIT entries are owned by
+// the compile result and must never reach the process-wide registry.
+llvm::Error emitCpuStaticRegistration(llvm::Module &module, const std::vector<CpuAbiWrapperMetadata> &entries);
 
 } // namespace vernon
 

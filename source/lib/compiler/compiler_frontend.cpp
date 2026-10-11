@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonGPUProfileABI.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGraphicsBindings.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
@@ -214,7 +215,8 @@ mlir::FailureOr<std::vector<PhysicalEntryProvenance>> TargetPreparationProvenanc
 }
 
 mlir::LogicalResult preparePortableTargetModule(mlir::ModuleOp module, TargetPreparationProvenance &) {
-    if (mlir::failed(mlir::vernon::materializeGPUAutodiffProfileBindings(module)))
+    if (mlir::failed(mlir::vernon::materializeGPUAutodiffProfileBindings(module)) ||
+        mlir::failed(mlir::vernon::materializeGraphicsResourceBindings(module)))
         return mlir::failure();
     mlir::PassManager passManager(module.getContext());
     passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
@@ -222,6 +224,18 @@ mlir::LogicalResult preparePortableTargetModule(mlir::ModuleOp module, TargetPre
     if (mlir::failed(passManager.run(module)))
         return mlir::failure();
     return mlir::vernon::materializeTensorViewProjections(module);
+}
+
+mlir::FailureOr<mlir::vernon::GraphicsBindingRequests>
+collectPreparedGraphicsBindingRequests(PreparedModule &prepared, std::string &diagnostics) {
+    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    mlir::ScopedDiagnosticHandler handler(
+        module->getContext(), [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+    // Argument indices in the requests must match the module that
+    // preparePortableTargetModule plans, so the same bindings materialize first.
+    if (mlir::failed(mlir::vernon::materializeGPUAutodiffProfileBindings(*module)))
+        return mlir::failure();
+    return mlir::vernon::collectGraphicsBindingRequests(*module);
 }
 
 mlir::FailureOr<TargetPreparationResult> prepareTargetModule(PreparedModule &prepared, const TargetPreparer &preparer) {
@@ -333,7 +347,8 @@ static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::Owni
     mlir::OwningOpRef<mlir::ModuleOp> reflectionModule(mlir::cast<mlir::ModuleOp>(module->clone()));
     mlir::PassManager reflectionPassManager(&frontend.context);
     reflectionPassManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
-    if (mlir::failed(reflectionPassManager.run(*reflectionModule)))
+    if (mlir::failed(reflectionPassManager.run(*reflectionModule)) ||
+        mlir::failed(mlir::vernon::materializeGraphicsResourceBindings(*reflectionModule)))
         return VERNON_STATUS_VERIFICATION_ERROR;
     mlir::FailureOr<LogicalReflectionModel> logicalReflection = buildLogicalReflectionModel(*module);
     if (mlir::failed(logicalReflection))

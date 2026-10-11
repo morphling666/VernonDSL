@@ -106,6 +106,12 @@ typedef struct VernonCompileOptions {
     uint32_t struct_size;
     VernonTarget target;
     VernonTargetCompileOptions as;
+    /*
+     * One layout from vernonCompilerLinkGraphicsBindings, for the module being
+     * compiled. Empty plans the module alone. Callers built before this member
+     * existed pass the shorter struct_size and plan the module alone.
+     */
+    VernonStringView graphics_binding_layout;
 } VernonCompileOptions;
 
 typedef struct VernonCompiledKernel {
@@ -141,6 +147,16 @@ VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerCon
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context,
                                                                           const char *source, size_t source_size,
                                                                           const VernonCompileOptions *options);
+/*
+ * Assigns generated set-0 bindings across the graphics modules of one pipeline.
+ * Reflection is a JSON object whose `layouts` array holds one layout per
+ * module, in input order.
+ * A Program Value read by several modules under the same source name, kind and
+ * type gets the same bindings in each.
+ */
+VERNON_DSL_CAPI VernonCompileResult *vernonCompilerLinkGraphicsBindings(VernonCompilerContext *context,
+                                                                        const VernonStringView *modules,
+                                                                        size_t module_count);
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerPlanProgram(VernonCompilerContext *context, const char *program,
                                                                size_t program_size);
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerFinalizeProgram(VernonCompilerContext *context, const char *plan,

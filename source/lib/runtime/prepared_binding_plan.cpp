@@ -254,8 +254,8 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         }
     }
 
-    if (stagePlan.metadataCarrier) {
-        const MetadataCarrier &carrier = *stagePlan.metadataCarrier;
+    if (const MetadataCarrier *computeCarrier = stageMetadataCarrier(stagePlan, "compute")) {
+        const MetadataCarrier &carrier = *computeCarrier;
         if (carrier.size > UINT32_MAX || carrier.alignment > UINT32_MAX || output.layouts.size() > UINT32_MAX) {
             error = "prepared metadata carrier exceeds provider layout limits";
             return false;
@@ -634,6 +634,35 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             return true;
         }
 
+        if (!internal && parameter.kind == "tensor" && use.interfaceKind == "resource" && !use.storageLeaves.empty()) {
+            for (size_t leafIndex = 0; leafIndex < use.storageLeaves.size(); ++leafIndex) {
+                const ReflectedStorageLeaf &leaf = use.storageLeaves[leafIndex];
+                if (leaf.binding == UINT32_MAX || !leaf.elementSize || leaf.elementSize > UINT32_MAX) {
+                    error = "graphics TensorView storage leaf reflection is incomplete";
+                    return false;
+                }
+                auto leafLayout = layout;
+                if (leafIndex != 0) {
+                    if (nextProviderSlot == UINT32_MAX) {
+                        error = "graphics storage leaf expansion exceeds the provider slot range";
+                        return false;
+                    }
+                    leafLayout.slot = nextProviderSlot++;
+                }
+                leafLayout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+                leafLayout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                leafLayout.set = use.descriptorSet;
+                leafLayout.binding = leaf.binding;
+                leafLayout.element_size = static_cast<uint32_t>(leaf.elementSize);
+                leafLayout.access = 1;
+                auto leafSource = source;
+                leafSource.kind = PreparedGraphicsBindingSourceKind::ExternalStorage;
+                leafSource.descriptorBinding = leaf.binding;
+                append(leafLayout, std::move(leafSource), {});
+            }
+            return true;
+        }
+
         error = "graphics parameter layout is unsupported";
         return false;
     };
@@ -665,6 +694,54 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             }
         }
     }
+    for (const auto &[stage, carrier] : stagePlan.metadataCarriers) {
+        const uint32_t stageMask = graphicsStageMask(stage);
+        if (!stageMask || !usesSequentialGraphicsSlots(options.backend) || nextProviderSlot == UINT32_MAX ||
+            output.metadataCarriers.size() >= UINT32_MAX) {
+            error = "graphics module metadata carrier cannot be assigned a provider slot";
+            return false;
+        }
+        PreparedGraphicsMetadataCarrier prepared;
+        prepared.plan = carrier;
+        for (const MetadataFieldIdentity &field : carrier.fields) {
+            uint32_t slot = UINT32_MAX;
+            for (const Parameter &parameter : stagePlan.parameters)
+                for (const ParameterUse &use : parameter.uses)
+                    if (parameter.kind == "tensor" && use.stage == stage && use.index == field.argument)
+                        slot = parameter.slot;
+            if (slot == UINT32_MAX) {
+                error = "graphics module metadata field does not name a Tensor use of its module";
+                return false;
+            }
+            if (prepared.argumentSlots.size() <= field.argument)
+                prepared.argumentSlots.resize(static_cast<size_t>(field.argument) + 1, UINT32_MAX);
+            prepared.argumentSlots[field.argument] = slot;
+        }
+        VernonRuntimeProviderBindingLayoutEntry layout{};
+        layout.slot = nextProviderSlot++;
+        layout.kind = VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+        layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+        layout.stage_mask = stageMask;
+        layout.set = carrier.descriptorSet;
+        layout.binding = carrier.binding;
+        layout.access = 1;
+        layout.array_count = 1;
+        layout.argument_index = UINT32_MAX;
+        if (!setMetadataLayoutSize(carrier, layout, error))
+            return false;
+        if (openGL && layout.set != 0) {
+            error = "OpenGL supports reflected resources only in descriptor set 0";
+            return false;
+        }
+        PreparedGraphicsBindingSource source;
+        source.kind = PreparedGraphicsBindingSourceKind::ModuleMetadata;
+        source.metadataCarrier = static_cast<uint32_t>(output.metadataCarriers.size());
+        source.descriptorSet = carrier.descriptorSet;
+        source.descriptorBinding = carrier.binding;
+        source.storage.resize(layout.element_size);
+        output.metadataCarriers.push_back(std::move(prepared));
+        append(layout, std::move(source), {});
+    }
 
     std::vector<size_t> order(output.layouts.size());
     for (size_t index = 0; index < order.size(); ++index)
@@ -674,6 +751,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
     PreparedGraphicsBindingPlan sorted;
     sorted.backend = options.backend;
     sorted.vertexAttributes = std::move(output.vertexAttributes);
+    sorted.metadataCarriers = std::move(output.metadataCarriers);
     sorted.layouts.reserve(order.size());
     sorted.sources.reserve(order.size());
     for (size_t index : order) {
@@ -716,6 +794,20 @@ bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan
              source.kind == PreparedGraphicsBindingSourceKind::ExternalImage) &&
             (source.descriptorSet == UINT32_MAX || source.descriptorBinding == UINT32_MAX)) {
             error = "prepared graphics resource has no canonical descriptor identity";
+            return false;
+        }
+        if (source.kind == PreparedGraphicsBindingSourceKind::ExternalStorage &&
+            (layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER || !layout.element_size ||
+             source.descriptorBinding != layout.binding)) {
+            error = "prepared graphics storage leaf disagrees with its provider layout";
+            return false;
+        }
+        if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata &&
+            (layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+             source.metadataCarrier >= plan.metadataCarriers.size() || !layout.element_size ||
+             source.storage.size() != layout.element_size ||
+             plan.metadataCarriers[source.metadataCarrier].plan.size != layout.element_size)) {
+            error = "prepared graphics metadata carrier disagrees with its provider layout";
             return false;
         }
     }
@@ -796,6 +888,37 @@ bool fillPreparedGraphicsBindingValues(PreparedGraphicsBindingPlan &prepared,
                 return false;
             }
             source.storage = std::move(packed).value();
+            value.payload.inline_value.data = source.storage.data();
+            value.payload.inline_value.size = source.storage.size();
+        } else if (source.kind == PreparedGraphicsBindingSourceKind::ExternalStorage) {
+            const auto found = invocation.arguments.find(source.externalSlot);
+            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value ||
+                found->second->tensor.resource.offset >= found->second->tensor.resource.size ||
+                found->second->tensor.byte_size >
+                    found->second->tensor.resource.size - found->second->tensor.resource.offset) {
+                error = "graphics TensorView storage argument must be an RHI Tensor within its resource";
+                return false;
+            }
+            // The view offset travels in the metadata carrier, so every leaf
+            // binds the base of the record buffer.
+            value.payload.buffer.resource = found->second->tensor.resource;
+        } else if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata) {
+            const PreparedGraphicsMetadataCarrier &carrier = prepared.metadataCarriers[source.metadataCarrier];
+            std::vector<const VernonTensorView *> views(carrier.argumentSlots.size());
+            for (size_t argument = 0; argument < carrier.argumentSlots.size(); ++argument) {
+                if (carrier.argumentSlots[argument] == UINT32_MAX)
+                    continue;
+                const auto found = invocation.arguments.find(carrier.argumentSlots[argument]);
+                if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR) {
+                    error = "graphics metadata carrier source is not a TensorView argument";
+                    return false;
+                }
+                views[argument] = &found->second->tensor;
+            }
+            if (!materializeTensorViewMetadata(carrier.plan, views, source.storage, error))
+                return false;
             value.payload.inline_value.data = source.storage.data();
             value.payload.inline_value.size = source.storage.size();
         } else {

@@ -92,11 +92,19 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *cont
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
 
 /*
- * Registers an AOT entry that was statically linked into the application.
- * Re-registering the same symbol and pointer is idempotent.
+ * Registers AOT entries that are statically linked into the application.
+ * Every cooked CPU Program object calls this from its own static constructor,
+ * so applications only link the objects. Objects placed in a static library
+ * must be linked whole-archive, or the linker drops them with their
+ * constructor. Registrations are reference counted per symbol and pointer, and
+ * each object's static destructor unregisters its own, so unloading a shared
+ * library withdraws exactly the definitions it contributed. Lookups use the
+ * oldest live definition of a symbol.
  */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol,
-                                                                     VernonCpuEntryPoint entry_point);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntries(const VernonStaticCpuEntry *entries,
+                                                                       size_t count);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterStaticCpuEntries(const VernonStaticCpuEntry *entries,
+                                                                         size_t count);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,
                                                                VernonCpuEntryPoint entry_point);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,

@@ -107,28 +107,12 @@ jobs:
           uv venv "$venv" --python "$PYTHON_VERSION"
           uv pip install --python "$venv/bin/python" --no-cache dist/*.whl
 
-      - name: Cook WebAssembly bundles
-        run: |
-          python="$RUNNER_TEMP/vernon-wheel/bin/python"
-          "$python" -m vernon_dsl.program_asset_cli \
-            examples/external_engine/fractal_pipeline.py:asset \
-            --target cpu \
-            --cpu-triple wasm32-unknown-emscripten \
-            -o pages-fractal-cooked
-          "$python" -m vernon_dsl.program_asset_cli \
-            examples/shader_lib/mandelbulb.py:mandelbulb_asset \
-            --target opengles \
-            --opengl-version 300 \
-            -o pages-mandelbulb-cooked
-
       - name: Build browser application
         run: |
           emcmake cmake -S examples/external_engine -B pages-build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPython_EXECUTABLE="$RUNNER_TEMP/vernon-wheel/bin/python" \
-            -DVERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR="$GITHUB_WORKSPACE/pages-fractal-cooked" \
-            -DVERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR="$GITHUB_WORKSPACE/pages-mandelbulb-cooked"
+            -DPython_EXECUTABLE="$RUNNER_TEMP/vernon-wheel/bin/python"
           cmake --build pages-build --parallel 3
 
       - name: Run headless Node smoke

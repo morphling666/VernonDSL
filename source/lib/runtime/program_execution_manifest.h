@@ -106,6 +106,7 @@ struct CompiledEndpointAbi {
     std::optional<uint64_t> packedFrameOffset;
     std::optional<vernon::runtime::ValueLayout> elementLayout;
     std::vector<vernon::runtime::SampledImageBinding> sampledImageBindings;
+    std::vector<vernon::runtime::ReflectedStorageLeaf> storageLeaves;
 };
 
 struct StageArtifact {
@@ -116,7 +117,9 @@ struct StageArtifact {
     std::vector<CodeModule> modules;
     std::vector<ReflectedEndpoint> endpoints;
     std::vector<CompiledEndpointAbi> compiledAbi;
-    std::optional<vernon::runtime::MetadataCarrier> metadataCarrier;
+    // TensorView metadata carriers keyed by module role. Field `argument` is the
+    // endpoint index within that module.
+    std::map<std::string, vernon::runtime::MetadataCarrier> metadataCarriers;
     std::vector<vernon::runtime::NativeResourceSlot> nativeSlots;
     uint32_t workgroupSize[3]{1, 1, 1};
     std::vector<std::string> capabilities;

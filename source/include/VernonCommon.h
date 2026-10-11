@@ -42,6 +42,11 @@ typedef struct VernonCpuInvocation {
 
 typedef VernonStatus (*VernonCpuEntryPoint)(const VernonCpuInvocation *invocation);
 
+typedef struct VernonStaticCpuEntry {
+    VernonStringView symbol;
+    VernonCpuEntryPoint entry_point;
+} VernonStaticCpuEntry;
+
 #ifdef __cplusplus
 }
 #endif

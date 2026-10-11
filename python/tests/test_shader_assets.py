@@ -1379,6 +1379,57 @@ asset = vd.program_asset(id="module/square", program=Square())
                             },
                         )
 
+    def test_recooking_prunes_outputs_of_the_previous_cook(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "module_compute.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def square(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * source[0]
+
+class Square(vd.Module):
+    def forward(
+        self,
+        source: vd.TensorView[vd.f32, (1,), vd.read],
+    ) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        square(source, output)
+        return output
+
+asset = vd.program_asset(id="module/square", program=Square())
+""",
+                encoding="utf-8",
+            )
+            cooked = root / "cooked"
+            (cooked / "artifacts").mkdir(parents=True)
+            stale = cooked / "artifacts" / f"{'0' * 64}.obj"
+            stale.write_bytes(b"stale")
+            unrelated = cooked / "README.md"
+            unrelated.write_text("kept", encoding="utf-8")
+
+            manifest = cook_program_asset(program_asset=f"{source}:asset", output=cooked, target="cpu")
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(unrelated.exists())
+            text = manifest.read_text(encoding="utf-8")
+            artifacts = sorted(path.name for path in (cooked / "artifacts").iterdir())
+            self.assertTrue(artifacts)
+            for artifact in artifacts:
+                self.assertIn(artifact, text)
+            self.assertEqual(
+                sorted(path.name for path in cooked.iterdir()),
+                sorted(["README.md", "artifacts", manifest.name]),
+            )
+
     def test_cpu_graphics_pipeline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

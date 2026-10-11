@@ -10,8 +10,6 @@
 #include <string>
 #include <string_view>
 
-extern "C" VernonStatus vernonRegisterStructuredAggregateAutodiffFixture(void);
-
 namespace {
 
 std::string lastError(VernonRuntimeContext *context) {
@@ -20,7 +18,6 @@ std::string lastError(VernonRuntimeContext *context) {
 }
 
 TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjectivePullback) {
-    ASSERT_EQ(vernonRegisterStructuredAggregateAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);

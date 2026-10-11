@@ -436,7 +436,6 @@ TEST_P(LanguageContractCpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAs
     const vernon::tests::BackendTestRow backend = backendFor(fixture);
     ASSERT_FALSE(backend.name.empty());
     const vernon::tests::BackendTestRequirements requirements = requirementsFor(fixture);
-    ASSERT_EQ(fixture.prepare(), VERNON_STATUS_OK);
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     const vernon::tests::BackendProbeResult runtimeProbe =

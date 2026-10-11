@@ -82,6 +82,18 @@ bool canonicalComputeClosure(const llvm::json::Array &rawValues, const llvm::jso
     return true;
 }
 
+llvm::json::Object programTargetImplementation(const CanonicalProgramStage &compiled, llvm::json::Array endpoints,
+                                               const ProgramModuleMetadataCarriers &metadataCarriers) {
+    llvm::json::Object implementation{
+        {"target", compiled.targetImplementation.target},
+        {"metadata", copyJsonObject(compiled.targetImplementation.metadata)},
+        {"endpoints", std::move(endpoints)},
+    };
+    if (!metadataCarriers.empty())
+        implementation["metadata_carriers"] = physicalProgramMetadataCarriers(metadataCarriers);
+    return implementation;
+}
+
 } // namespace
 
 bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::vector<CanonicalProgramGraph> &graphs,
@@ -128,14 +140,10 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
                     return false;
                 const std::string contractHash = canonicalJsonSha256(llvm::json::Value(copyJsonObject(stageContract)));
                 plan.stageContracts[requestId] = std::move(stageContract);
-                if (!graphicsPlan.implementationEndpoints.empty() || !compiled.targetImplementation.metadata.empty()) {
-                    llvm::json::Object implementation{
-                        {"target", compiled.targetImplementation.target},
-                        {"metadata", copyJsonObject(compiled.targetImplementation.metadata)},
-                    };
-                    implementation["endpoints"] = graphicsPlan.implementationEndpoints.take();
-                    plan.targetImplementations[requestId] = std::move(implementation);
-                }
+                if (!graphicsPlan.implementationEndpoints.empty() || !compiled.targetImplementation.metadata.empty() ||
+                    !graphicsPlan.metadataCarriers.empty())
+                    plan.targetImplementations[requestId] = programTargetImplementation(
+                        compiled, graphicsPlan.implementationEndpoints.take(), graphicsPlan.metadataCarriers);
                 plan.stages[requestId] = llvm::json::Object{{"operation", "graphics"}, {"contract_hash", contractHash}};
 
                 llvm::json::Array operands;
@@ -170,22 +178,14 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
                 return false;
             llvm::json::Object stageContract;
             if (!buildCanonicalComputeStageContract(compiledEntry, compiledReflection, computePlan.endpoints.take(),
-                                                    std::move(computePlan.semanticMetadataCarrier), stageContract,
-                                                    error))
+                                                    computePlan.metadataCarriers, stageContract, error))
                 return false;
             const std::string contractHash = canonicalJsonSha256(llvm::json::Value(copyJsonObject(stageContract)));
             plan.stageContracts[requestId] = std::move(stageContract);
             if (!computePlan.implementationEndpoints.empty() || !compiled.targetImplementation.metadata.empty() ||
-                computePlan.physicalMetadataCarrier) {
-                llvm::json::Object implementation{
-                    {"target", compiled.targetImplementation.target},
-                    {"metadata", copyJsonObject(compiled.targetImplementation.metadata)},
-                };
-                implementation["endpoints"] = computePlan.implementationEndpoints.take();
-                if (computePlan.physicalMetadataCarrier)
-                    implementation["metadata_carrier"] = std::move(*computePlan.physicalMetadataCarrier);
-                plan.targetImplementations[requestId] = std::move(implementation);
-            }
+                !computePlan.metadataCarriers.empty())
+                plan.targetImplementations[requestId] = programTargetImplementation(
+                    compiled, computePlan.implementationEndpoints.take(), computePlan.metadataCarriers);
             plan.stages[requestId] = llvm::json::Object{{"operation", "compute"}, {"contract_hash", contractHash}};
             llvm::json::Array operands;
             llvm::json::Array results;

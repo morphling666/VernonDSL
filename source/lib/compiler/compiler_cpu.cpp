@@ -59,6 +59,8 @@ void *registeredCpuHelperAddress(const VernonCpuRuntimeHelpers *helpers, llvm::S
     return nullptr;
 }
 
+VernonStatus ignoreJitStaticCpuEntries(const VernonStaticCpuEntry *, size_t) { return VERNON_STATUS_OK; }
+
 } // namespace
 
 namespace vernon::compiler {
@@ -253,9 +255,13 @@ std::string cpuObjectFilename(const llvm::Triple &triple) {
     return triple.isOSBinFormatCOFF() ? "module.obj" : "module.o";
 }
 
-bool emitCpuObject(llvm::Module &module, llvm::TargetMachine &targetMachine, std::string &object,
-                   std::string &diagnostics) {
+bool emitCpuObject(llvm::Module &module, const std::vector<vernon::CpuAbiWrapperMetadata> &entries,
+                   llvm::TargetMachine &targetMachine, std::string &object, std::string &diagnostics) {
     std::unique_ptr<llvm::Module> codegenModule = llvm::CloneModule(module);
+    if (llvm::Error error = vernon::emitCpuStaticRegistration(*codegenModule, entries)) {
+        diagnostics = llvm::toString(std::move(error));
+        return false;
+    }
     llvm::SmallVector<char> bytes;
     llvm::raw_svector_ostream stream(bytes);
     llvm::legacy::PassManager passManager;
@@ -386,7 +392,7 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         return CpuCompileResult::CodegenFailure;
     }
     std::string object;
-    if (!emitCpuObject(*llvmModule, *objectTargetMachine, object, diagnostics))
+    if (!emitCpuObject(*llvmModule, entries, *objectTargetMachine, object, diagnostics))
         return CpuCompileResult::CodegenFailure;
 
     CpuExecutionStatePtr nextExecution;
@@ -417,6 +423,9 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
         llvm::orc::SymbolMap helperSymbols;
+        for (const char *registry : {vernon::cpuStaticRegistrationSymbol, vernon::cpuStaticUnregistrationSymbol})
+            helperSymbols[nextExecution->jit->mangleAndIntern(registry)] = {
+                llvm::orc::ExecutorAddr::fromPtr(&ignoreJitStaticCpuEntries), llvm::JITSymbolFlags::Exported};
         if (parsedTriple.isOSWindows()) {
             static int windowsFltused;
             helperSymbols[nextExecution->jit->mangleAndIntern("_fltused")] = {

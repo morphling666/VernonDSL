@@ -464,15 +464,21 @@ private:
         Value laneOffset = arith::MulIOp::create(builder, function.getLoc(), physicalLaneLinear, tapeStride);
         Value plannedLaneBase = arith::AddIOp::create(builder, function.getLoc(), tapeBase, laneOffset);
         Value laneEnd = arith::AddIOp::create(builder, function.getLoc(), plannedLaneBase, tapeStride);
-        Value linearIsZero = arith::CmpIOp::create(builder, function.getLoc(), arith::CmpIPredicate::eq,
-                                                   physicalLaneLinear, i32Constant(builder, function.getLoc(), 0));
-        Value checkedDivisor = arith::SelectOp::create(builder, function.getLoc(), linearIsZero,
-                                                       i32Constant(builder, function.getLoc(), 1), physicalLaneLinear);
-        Value offsetValid = arith::OrIOp::create(
-            builder, function.getLoc(), linearIsZero,
-            arith::CmpIOp::create(builder, function.getLoc(), arith::CmpIPredicate::eq,
-                                  arith::DivUIOp::create(builder, function.getLoc(), laneOffset, checkedDivisor),
-                                  tapeStride));
+        uint64_t maxLaneLinear = 0;
+        for (unsigned dimension = 0; dimension < 3; ++dimension) {
+            int32_t extent = workgroup.asArrayRef()[dimension];
+            if (extent <= 0)
+                return function.emitError("GPU Tape replay requires a positive workgroup size");
+            maxLaneLinear = dimension == 0 ? static_cast<uint64_t>(extent) : maxLaneLinear * extent;
+        }
+        --maxLaneLinear;
+        Value offsetValid =
+            maxLaneLinear == 0
+                ? arith::ConstantIntOp::create(builder, function.getLoc(), 1, 1).getResult()
+                : arith::CmpIOp::create(
+                      builder, function.getLoc(), arith::CmpIPredicate::ule, tapeStride,
+                      i32Constant(builder, function.getLoc(), std::numeric_limits<uint32_t>::max() / maxLaneLinear))
+                      .getResult();
         Value baseValid =
             arith::CmpIOp::create(builder, function.getLoc(), arith::CmpIPredicate::uge, plannedLaneBase, tapeBase);
         Value endValid =

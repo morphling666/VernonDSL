@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
 find_package(
     Python 3.11...<3.15
@@ -30,149 +30,11 @@ project(
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR
-    ""
-    CACHE PATH "Cooked native or wasm CPU fractal bundle")
-set(VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR
-    ""
-    CACHE PATH "Cooked OpenGL or OpenGL ES Mandelbulb bundle")
-if(NOT VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR OR NOT VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR)
-    message(FATAL_ERROR "Set VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR and VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR")
-endif()
-get_filename_component(VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}" ABSOLUTE)
-get_filename_component(VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR "${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}"
-                       ABSOLUTE)
-
-function(vernon_find_single_manifest directory output)
-    file(
-        GLOB
-        manifests
-        CONFIGURE_DEPENDS
-        "${directory}/*.program.json")
-    list(LENGTH manifests manifest_count)
-    if(NOT
-       manifest_count
-       EQUAL
-       1)
-        message(FATAL_ERROR "${directory} must contain exactly one Program manifest")
-    endif()
-    list(
-        GET
-        manifests
-        0
-        manifest)
-    set(${output}
-        "${manifest}"
-        PARENT_SCOPE)
-endfunction()
-
-vernon_find_single_manifest("${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}" _vernon_cpu_manifest)
-vernon_find_single_manifest("${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}" _vernon_graphics_manifest)
-file(READ "${_vernon_cpu_manifest}" VERNON_EXTERNAL_ENGINE_CPU_MANIFEST)
-file(READ "${_vernon_graphics_manifest}" _vernon_graphics_external_manifest)
-
-string(
-    JSON
-    _vernon_cpu_target_kind
-    GET
-    "${VERNON_EXTERNAL_ENGINE_CPU_MANIFEST}"
-    target
-    kind)
-if(NOT
-   _vernon_cpu_target_kind
-   STREQUAL
-   "cpu")
-    message(FATAL_ERROR "The CPU bundle must target cpu")
-endif()
-string(
-    JSON
-    _vernon_cpu_target_triple
-    GET
-    "${VERNON_EXTERNAL_ENGINE_CPU_MANIFEST}"
-    target
-    options
-    triple)
-string(
-    JSON
-    _vernon_graphics_target_kind
-    GET
-    "${_vernon_graphics_external_manifest}"
-    target
-    kind)
-
-file(
-    GLOB
-    _vernon_registration_sources
-    CONFIGURE_DEPENDS
-    "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}/vernon_cpu_registration_*.c")
-file(
-    GLOB
-    _vernon_registration_headers
-    CONFIGURE_DEPENDS
-    "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}/vernon_cpu_registration_*.h")
-file(
-    GLOB
-    _vernon_cpu_objects
-    CONFIGURE_DEPENDS
-    "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}/artifacts/*.o"
-    "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}/artifacts/*.obj")
-list(LENGTH _vernon_registration_sources _vernon_registration_source_count)
-list(LENGTH _vernon_registration_headers _vernon_registration_header_count)
-if(NOT
-   _vernon_registration_source_count
-   EQUAL
-   1
-   OR NOT
-      _vernon_registration_header_count
-      EQUAL
-      1
-   OR NOT _vernon_cpu_objects)
-    message(FATAL_ERROR "The CPU bundle requires registration source/header and relocatable objects")
-endif()
-list(
-    GET
-    _vernon_registration_sources
-    0
-    _vernon_registration_source)
-list(
-    GET
-    _vernon_registration_headers
-    0
-    _vernon_registration_header)
-file(READ "${_vernon_registration_header}" _vernon_registration_declaration)
-string(
-    REGEX MATCH
-          "VernonStatus[ \t\r\n]+(vernonRegisterCpuArtifacts_[0-9a-f]+)\\(void\\)"
-          _vernon_registration_match
-          "${_vernon_registration_declaration}")
-if(NOT CMAKE_MATCH_1)
-    message(FATAL_ERROR "Could not identify the generated CPU registration function")
-endif()
-set(_vernon_registration_function "${CMAKE_MATCH_1}")
-set_source_files_properties(${_vernon_cpu_objects} PROPERTIES EXTERNAL_OBJECT TRUE)
-
 if(EMSCRIPTEN)
-    if(NOT
-       _vernon_cpu_target_triple
-       STREQUAL
-       "wasm32-unknown-emscripten"
-       OR NOT
-          _vernon_graphics_target_kind
-          STREQUAL
-          "opengles")
-        message(FATAL_ERROR "Emscripten requires wasm CPU and OpenGL ES bundles")
-    endif()
     set(_vernon_runtime_profile web)
     add_compile_options("-fexceptions")
     add_link_options("-sDISABLE_EXCEPTION_CATCHING=0")
 else()
-    if(_vernon_cpu_target_triple MATCHES "^wasm"
-       OR NOT
-          _vernon_graphics_target_kind
-          STREQUAL
-          "opengl")
-        message(FATAL_ERROR "Desktop requires native CPU and OpenGL bundles")
-    endif()
     set(_vernon_runtime_profile desktop)
     include(FetchContent)
     set(GLFW_BUILD_DOCS
@@ -194,57 +56,6 @@ else()
         GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(glfw)
 endif()
-
-set(VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST "${_vernon_graphics_external_manifest}")
-if(EMSCRIPTEN)
-    set(VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR "/vernon-cpu-bundle")
-    set(VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR "/vernon-graphics-bundle")
-else()
-    set(VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
-    set(VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}")
-endif()
-
-function(
-    vernon_chunk_raw_string
-    input_variable
-    delimiter
-    output_variable)
-    set(content "${${input_variable}}")
-    set(literal)
-    set(first_chunk TRUE)
-    string(LENGTH "${content}" remaining)
-    while(remaining GREATER 0)
-        if(remaining GREATER 12000)
-            set(chunk_size 12000)
-        else()
-            set(chunk_size "${remaining}")
-        endif()
-        string(
-            SUBSTRING "${content}"
-                      0
-                      "${chunk_size}"
-                      chunk)
-        if(NOT first_chunk)
-            string(APPEND literal ")${delimiter}\"\n    R\"${delimiter}(")
-        endif()
-        string(APPEND literal "${chunk}")
-        set(first_chunk FALSE)
-        string(
-            SUBSTRING "${content}"
-                      "${chunk_size}"
-                      -1
-                      content)
-        string(LENGTH "${content}" remaining)
-    endwhile()
-    set(${output_variable}
-        "${literal}"
-        PARENT_SCOPE)
-endfunction()
-
-vernon_chunk_raw_string(VERNON_EXTERNAL_ENGINE_CPU_MANIFEST vernon_cpu VERNON_EXTERNAL_ENGINE_CPU_MANIFEST_LITERAL)
-vernon_chunk_raw_string(VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST vernon_graphics
-                        VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST_LITERAL)
-configure_file(embedded_bundles.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_bundles.h" @ONLY)
 
 set(VERNON_RUNTIME_PROFILE
     "${_vernon_runtime_profile}"
@@ -270,20 +81,90 @@ set(BUILD_TESTING
 message(STATUS "Using VernonRuntime sources from installed wheel: ${VERNON_RUNTIME_SOURCE_DIR}")
 add_subdirectory("${VERNON_RUNTIME_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vernon-runtime")
 
+# The DSL sources import the repository's examples packages; vernon_dsl itself comes from the installed wheel.
+get_filename_component(_vernon_repository_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+vernon_configure_program_cooker(
+    PYTHON
+    "${Python_EXECUTABLE}"
+    PYTHON_PATH
+    "${_vernon_repository_root}")
+
+set(_vernon_cooked_root "${CMAKE_CURRENT_BINARY_DIR}/cooked")
+if(EMSCRIPTEN)
+    set(_vernon_cpu_cook_options --cpu-triple wasm32-unknown-emscripten)
+    set(_vernon_graphics_target opengles)
+    set(_vernon_graphics_cook_options --opengl-version 300)
+else()
+    set(_vernon_cpu_cook_options)
+    set(_vernon_graphics_target opengl)
+    set(_vernon_graphics_cook_options --opengl-version 330)
+endif()
+vernon_add_program_asset(
+    vernon-external-engine-fractal
+    SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/fractal_pipeline.py:asset"
+    TARGET
+    cpu
+    OUTPUT_DIRECTORY
+    "${_vernon_cooked_root}/fractal"
+    COOK_OPTIONS
+    ${_vernon_cpu_cook_options}
+    DEPENDS
+    "${_vernon_repository_root}/examples/fractal.py"
+    MANIFEST_VARIABLE
+    _vernon_cpu_manifest)
+vernon_add_program_asset(
+    vernon-external-engine-mandelbulb
+    SOURCE
+    "${_vernon_repository_root}/examples/shader_lib/mandelbulb.py:mandelbulb_asset"
+    TARGET
+    ${_vernon_graphics_target}
+    OUTPUT_DIRECTORY
+    "${_vernon_cooked_root}/mandelbulb"
+    COOK_OPTIONS
+    ${_vernon_graphics_cook_options}
+    DEPENDS
+    "${_vernon_repository_root}/examples/shader_lib/fullscreen.py"
+    MANIFEST_VARIABLE
+    _vernon_graphics_manifest)
+
+if(EMSCRIPTEN)
+    set(_vernon_cpu_runtime_dir "/vernon-cpu-bundle")
+    set(_vernon_graphics_runtime_dir "/vernon-graphics-bundle")
+else()
+    set(_vernon_cpu_runtime_dir "${_vernon_cooked_root}/fractal")
+    set(_vernon_graphics_runtime_dir "${_vernon_cooked_root}/mandelbulb")
+endif()
+set(_vernon_embedded_bundles "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_bundles.h")
+add_custom_command(
+    OUTPUT "${_vernon_embedded_bundles}"
+    COMMAND
+        "${CMAKE_COMMAND}" "-DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/embedded_bundles.h.in"
+        "-DOUTPUT=${_vernon_embedded_bundles}" "-DCPU_MANIFEST=${_vernon_cpu_manifest}"
+        "-DCPU_RUNTIME_DIR=${_vernon_cpu_runtime_dir}" "-DGRAPHICS_MANIFEST=${_vernon_graphics_manifest}"
+        "-DGRAPHICS_RUNTIME_DIR=${_vernon_graphics_runtime_dir}" -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_bundles.cmake"
+    DEPENDS "${_vernon_cpu_manifest}"
+            "${_vernon_graphics_manifest}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/embedded_bundles.h.in"
+            "${CMAKE_CURRENT_SOURCE_DIR}/embed_bundles.cmake"
+    COMMENT "Embedding cooked Program manifests"
+    VERBATIM)
+
 add_executable(
     vernon-external-engine
-    "${_vernon_registration_source}"
-    ${_vernon_cpu_objects}
+    "${_vernon_embedded_bundles}"
     cpu_fractal.cpp
     graphics_host.cpp
     main.cpp
     mandelbulb.cpp
     split_screen.cpp)
-target_include_directories(vernon-external-engine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
-                                                          "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
-target_compile_definitions(vernon-external-engine
-                           PRIVATE "VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION=${_vernon_registration_function}")
-target_link_libraries(vernon-external-engine PRIVATE VernonRuntime Vernon::RHI)
+target_include_directories(vernon-external-engine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(
+    vernon-external-engine
+    PRIVATE VernonRuntime
+            Vernon::RHI
+            vernon-external-engine-fractal
+            vernon-external-engine-mandelbulb)
 if(NOT EMSCRIPTEN)
     target_link_libraries(vernon-external-engine PRIVATE glfw)
 endif()
@@ -298,8 +179,8 @@ if(EMSCRIPTEN)
         "-sENVIRONMENT=web,node"
         "-sFULL_ES3=1"
         "-sUSE_GLFW=3"
-        "--embed-file=${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}@${VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR}"
-        "--embed-file=${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}@${VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR}")
+        "--embed-file=${_vernon_cooked_root}/fractal@${_vernon_cpu_runtime_dir}"
+        "--embed-file=${_vernon_cooked_root}/mandelbulb@${_vernon_graphics_runtime_dir}")
     add_custom_command(
         TARGET vernon-external-engine
         POST_BUILD

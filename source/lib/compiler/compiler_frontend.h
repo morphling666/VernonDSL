@@ -4,6 +4,7 @@
 #include "compiler_internal.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGraphicsBindings.h"
 #include "mlir/IR/BuiltinOps.h"
 
 #include <cstddef>
@@ -143,6 +144,8 @@ void destroyCompilerFrontend(CompilerFrontend *frontend);
 mlir::MLIRContext &compilerMlirContext(CompilerFrontend &frontend);
 mlir::LogicalResult preparePortableTargetModule(mlir::ModuleOp module, TargetPreparationProvenance &provenance);
 mlir::FailureOr<TargetPreparationResult> prepareTargetModule(PreparedModule &prepared, const TargetPreparer &preparer);
+mlir::FailureOr<mlir::vernon::GraphicsBindingRequests> collectPreparedGraphicsBindingRequests(PreparedModule &prepared,
+                                                                                              std::string &diagnostics);
 
 VernonStatus verifyMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, std::string &diagnostics);
 

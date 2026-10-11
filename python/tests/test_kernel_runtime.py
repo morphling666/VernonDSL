@@ -224,6 +224,75 @@ def conditional_select(
     output[x] = left[x] if x % 2 == 0 else right[x]
 
 
+@vd.kernel(workgroup_size=(4, 1, 1))
+def unsigned_comparisons(
+    output: vd.TensorView[vd.u32, (vd.dyn,), vd.write],
+    left: vd.TensorView[vd.u32, (vd.dyn,), vd.read],
+    right: vd.TensorView[vd.u32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    base = x * vd.u32(6)
+    output[base] = vd.u32(1) if left[x] < right[x] else vd.u32(0)
+    output[base + vd.u32(1)] = vd.u32(1) if left[x] <= right[x] else vd.u32(0)
+    output[base + vd.u32(2)] = vd.u32(1) if left[x] > right[x] else vd.u32(0)
+    output[base + vd.u32(3)] = vd.u32(1) if left[x] >= right[x] else vd.u32(0)
+    output[base + vd.u32(4)] = vd.u32(1) if left[x] == right[x] else vd.u32(0)
+    output[base + vd.u32(5)] = vd.u32(1) if left[x] != right[x] else vd.u32(0)
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def unsigned_multiply_overflow_checks(
+    output: vd.TensorView[vd.u32, (vd.dyn,), vd.write],
+    counts: vd.TensorView[vd.u32, (vd.dyn,), vd.read],
+    strides: vd.TensorView[vd.u32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    count = counts[x] if counts[x] != vd.u32(0) else vd.u32(1)
+    stride = strides[x]
+    output[x * vd.u32(2)] = vd.u32(1) if (count * stride) // count == stride else vd.u32(0)
+    output[x * vd.u32(2) + vd.u32(1)] = vd.u32(1) if stride <= vd.u32(4294967295) // count else vd.u32(0)
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def signed_multiply_overflow_check(
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    counts: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    strides: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    count = counts[x] if counts[x] != 0 else 1
+    stride = strides[x]
+    output[x] = 1 if (count * stride) // count == stride else 0
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def signed_floor_division(
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    dividends: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    divisors: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    remainder = dividends[x]
+    remainder %= divisors[x]
+    output[x * vd.u32(2)] = dividends[x] // divisors[x]
+    output[x * vd.u32(2) + vd.u32(1)] = remainder
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def floored_float_remainder(
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    dividends: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    divisors: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    output[x] = dividends[x] % divisors[x]
+
+
 @vd.func
 def sum_odds_until_break(limit: vd.i32) -> vd.i32:
     index = 0
@@ -794,6 +863,121 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             grid=(1, 1, 1),
         )
         np.testing.assert_array_equal(output.to_numpy(), expected)
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_unsigned_comparisons_backend_parity(self, backend: BackendRow) -> None:
+        values = np.array((0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF), dtype=np.uint32)
+        left, right = (axis.ravel() for axis in np.meshgrid(values, values))
+        left = np.concatenate((left, left[:3]))
+        right = np.concatenate((right, right[:3]))
+        expected = np.stack(
+            (left < right, left <= right, left > right, left >= right, left == right, left != right), axis=1
+        ).astype(np.uint32)
+        output = vd.storage.zeros(dtype=vd.u32, shape=(expected.size,))
+        unsigned_comparisons(
+            output,
+            vd.storage.from_numpy(left),
+            vd.storage.from_numpy(right),
+            grid=(left.size // 4, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), expected.ravel())
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_unsigned_multiply_overflow_checks_backend_parity(self, backend: BackendRow) -> None:
+        edges = np.array(
+            (1, 2, 3, 0xFFFE, 0xFFFF, 0x10000, 0x10001, 0x2E000000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF),
+            dtype=np.uint32,
+        )
+        edge_counts, edge_strides = (axis.ravel() for axis in np.meshgrid(edges, edges))
+        generator = np.random.default_rng(20261011)
+        bit_lengths = generator.integers(1, 33, size=(2, 256 - edge_counts.size), dtype=np.uint64)
+        random_pairs = generator.integers(1, np.left_shift(np.uint64(1), bit_lengths), dtype=np.uint64)
+        counts = np.concatenate((edge_counts, random_pairs[0].astype(np.uint32)))
+        strides = np.concatenate((edge_strides, random_pairs[1].astype(np.uint32)))
+        fits = (counts.astype(np.uint64) * strides <= np.iinfo(np.uint32).max).astype(np.uint32)
+        output = vd.storage.zeros(dtype=vd.u32, shape=(2 * counts.size,))
+        unsigned_multiply_overflow_checks(
+            output,
+            vd.storage.from_numpy(counts),
+            vd.storage.from_numpy(strides),
+            grid=(counts.size // 4, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), np.repeat(fits, 2))
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_signed_multiply_overflow_check_backend_parity(self, backend: BackendRow) -> None:
+        limits = np.iinfo(np.int32)
+        edges = np.array(
+            (1, -1, 2, -2, 0xFFFF, -0xFFFF, 0x10000, -0x10000, 46340, 46341, -46341, limits.max, limits.min),
+            dtype=np.int32,
+        )
+        edge_counts, edge_strides = (axis.ravel() for axis in np.meshgrid(edges, edges))
+        defined = ~((edge_counts == -1) & (edge_strides == limits.min))
+        edge_counts, edge_strides = edge_counts[defined], edge_strides[defined]
+        generator = np.random.default_rng(20261011)
+        bit_lengths = generator.integers(1, 32, size=(2, 256 - edge_counts.size), dtype=np.int64)
+        magnitudes = generator.integers(1, np.left_shift(np.int64(1), bit_lengths), dtype=np.int64)
+        signs = generator.choice(np.array((-1, 1), dtype=np.int64), size=magnitudes.shape)
+        counts = np.concatenate((edge_counts, (magnitudes[0] * signs[0]).astype(np.int32)))
+        strides = np.concatenate((edge_strides, (magnitudes[1] * signs[1]).astype(np.int32)))
+        products = counts.astype(np.int64) * strides
+        fits = ((products >= limits.min) & (products <= limits.max)).astype(np.int32)
+        output = vd.storage.zeros(dtype=vd.i32, shape=(counts.size,))
+        signed_multiply_overflow_check(
+            output,
+            vd.storage.from_numpy(counts),
+            vd.storage.from_numpy(strides),
+            grid=(counts.size // 4, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), fits)
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_signed_floor_division_matches_python(self, backend: BackendRow) -> None:
+        limits = np.iinfo(np.int32)
+        dividends_edges = np.array((0, 1, -1, 6, -6, 7, -7, limits.max, limits.min, limits.min + 1), dtype=np.int32)
+        divisor_edges = np.array((1, -1, 2, -2, 3, -3, 7, -7, limits.max, limits.min), dtype=np.int32)
+        dividends, divisors = (axis.ravel() for axis in np.meshgrid(dividends_edges, divisor_edges))
+        defined = ~((dividends == limits.min) & (divisors == -1))
+        dividends, divisors = dividends[defined], divisors[defined]
+        generator = np.random.default_rng(20261011)
+        random_count = 256 - dividends.size
+        random_divisors = generator.integers(1, 1 << 16, size=random_count) * generator.choice((-1, 1), random_count)
+        dividends = np.concatenate((dividends, generator.integers(limits.min + 1, limits.max, size=random_count)))
+        divisors = np.concatenate((divisors, random_divisors)).astype(np.int32)
+        dividends = dividends.astype(np.int32)
+        wide_dividends, wide_divisors = dividends.astype(np.int64), divisors.astype(np.int64)
+        expected = np.stack((wide_dividends // wide_divisors, wide_dividends % wide_divisors), axis=1)
+        output = vd.storage.zeros(dtype=vd.i32, shape=(2 * dividends.size,))
+        signed_floor_division(
+            output,
+            vd.storage.from_numpy(dividends),
+            vd.storage.from_numpy(divisors),
+            grid=(dividends.size // 4, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), expected.astype(np.int32).ravel())
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_floored_float_remainder_matches_python(self, backend: BackendRow) -> None:
+        # Shading-language fmod goes through approximate division (D3D12 even computes frac(x / y) * y), so
+        # non-power-of-two divisors only pair with small quotients far from an integer; the sign rules are what
+        # must agree on every backend.
+        dividend_edges = np.array((7.5, -7.5, 0.0, -0.0, 0.25, -0.25), dtype=np.float32)
+        exact = np.meshgrid(np.append(dividend_edges, (6.0, -6.0, 1.0e6, -1.0e6)), np.array((2.0, -2.0, 0.5, -0.5)))
+        inexact = np.meshgrid(dividend_edges, np.array((3.0, -3.0, 5.0, -5.0)))
+        dividends, divisors = (
+            np.concatenate((exact[axis].ravel(), inexact[axis].ravel())).astype(np.float32) for axis in range(2)
+        )
+        output = vd.storage.zeros(dtype=vd.f32, shape=(dividends.size,))
+        floored_float_remainder(
+            output,
+            vd.storage.from_numpy(dividends),
+            vd.storage.from_numpy(divisors),
+            grid=(dividends.size // 4, 1, 1),
+        )
+        actual = output.to_numpy()
+        expected = np.mod(dividends, divisors)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_break_continue_backend_parity(self, backend: BackendRow) -> None:

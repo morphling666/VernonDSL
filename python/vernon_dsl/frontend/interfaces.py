@@ -16,9 +16,9 @@ class InterfaceContext(Protocol):
 
 @dataclass(frozen=True)
 class ImplicitSamplerPlan:
+    """An implicit sampler argument; its set and binding are assigned by the compiler's graphics binding planner."""
+
     texture_name: str
-    descriptor_set: int
-    binding: int
 
 
 @dataclass(frozen=True)
@@ -36,16 +36,6 @@ def plan_generated_interface(
 ) -> GeneratedInterfacePlan:
     argument_types = {
         argument.arg: annotation.type for argument, annotation in zip(node.args.args, argument_annotations, strict=True)
-    }
-    argument_metadata = {
-        argument.arg: annotation.metadata
-        for argument, annotation in zip(node.args.args, argument_annotations, strict=True)
-    }
-    used_bindings = {
-        (int(item.arguments[0]), int(item.arguments[1]))
-        for metadata in argument_metadata.values()
-        for item in metadata
-        if item.kind in {"resource", "uniform"} and len(item.arguments) == 2
     }
     implicit_textures: set[str] = set()
     generated_apis: set[str] = set()
@@ -88,18 +78,8 @@ def plan_generated_interface(
         if not sampling.explicit_sampler:
             implicit_textures.add(texture_name)
 
-    sampler_plans: list[ImplicitSamplerPlan] = []
-    for texture_name in sorted(implicit_textures):
-        resource = next((item for item in argument_metadata[texture_name] if item.kind == "resource"), None)
-        descriptor_set = int(resource.arguments[0]) if resource is not None else 0
-        binding = 0
-        while (descriptor_set, binding) in used_bindings:
-            binding += 1
-        used_bindings.add((descriptor_set, binding))
-        sampler_plans.append(ImplicitSamplerPlan(texture_name, descriptor_set, binding))
-
     return GeneratedInterfacePlan(
-        tuple(sampler_plans),
+        tuple(ImplicitSamplerPlan(texture_name) for texture_name in sorted(implicit_textures)),
         tuple(name for name in GENERATED_INTERFACE_CONTRACTS if name in generated_apis),
         sampler_modes,
     )

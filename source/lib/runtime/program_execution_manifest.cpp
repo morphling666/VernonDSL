@@ -1829,7 +1829,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
 
         const auto &reflection = row["reflection"];
         std::vector<std::string> reflectedFeatures;
-        if (!exactObject(reflection, {"required_features", "endpoints", operation}, {"metadata_carrier"}, diagnostic,
+        if (!exactObject(reflection, {"required_features", "endpoints", operation}, {"metadata_carriers"}, diagnostic,
                          path + "/reflection") ||
             !reflection["endpoints"].is_array() ||
             !stringArray(reflection["required_features"], reflectedFeatures, diagnostic,
@@ -1838,14 +1838,20 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
         if (reflectedFeatures != stage.requiredFeatures)
             return fail(diagnostic, "PROGRAM_RUNTIME_REQUIREMENTS", "parse", path + "/runtime_requirements/features",
                         "Runtime requirements must equal reflected features");
-        if (reflection.contains("metadata_carrier")) {
-            if (operation != "compute")
-                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/reflection/metadata_carrier",
-                            "graphics reflection cannot declare a compute metadata carrier");
-            stage.metadataCarrier.emplace();
-            if (!parseSemanticMetadataCarrier(reflection["metadata_carrier"], *stage.metadataCarrier, diagnostic,
-                                              path + "/reflection/metadata_carrier"))
-                return false;
+        if (reflection.contains("metadata_carriers")) {
+            const auto &carriers = reflection["metadata_carriers"];
+            const std::string carriersPath = path + "/reflection/metadata_carriers";
+            if (!carriers.is_object() || carriers.empty())
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", carriersPath,
+                            "metadata carriers must be a non-empty object keyed by module role");
+            for (const auto &[role, carrierValue] : carriers.items()) {
+                if (!moduleRoles.count(role))
+                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", carriersPath + "/" + role,
+                                "metadata carrier names a module the artifact does not contain");
+                if (!parseSemanticMetadataCarrier(carrierValue, stage.metadataCarriers[role], diagnostic,
+                                                  carriersPath + "/" + role))
+                    return false;
+            }
         }
         for (size_t endpointIndex = 0; endpointIndex < reflection["endpoints"].size(); ++endpointIndex) {
             const auto &endpointValue = reflection["endpoints"][endpointIndex];
@@ -2115,35 +2121,44 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
             }
             stage.endpoints.push_back(std::move(endpoint));
         }
-        std::vector<vernon::runtime::MetadataFieldIdentity> expectedMetadataFields;
-        std::vector<const ReflectedEndpoint *> descriptorEndpoints;
-        for (const ReflectedEndpoint &endpoint : stage.endpoints)
-            if (endpoint.viewDescriptor)
-                descriptorEndpoints.push_back(&endpoint);
-        std::sort(
-            descriptorEndpoints.begin(), descriptorEndpoints.end(),
-            [](const ReflectedEndpoint *left, const ReflectedEndpoint *right) { return left->index < right->index; });
-        for (const ReflectedEndpoint *endpoint : descriptorEndpoints) {
-            expectedMetadataFields.push_back(
-                {endpoint->index, vernon::runtime::MetadataFieldKind::Offset, std::nullopt});
-            for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
-                expectedMetadataFields.push_back(
-                    {endpoint->index, vernon::runtime::MetadataFieldKind::Extent, dimension});
-            for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
-                expectedMetadataFields.push_back(
-                    {endpoint->index, vernon::runtime::MetadataFieldKind::Stride, dimension});
-        }
-        const auto sameField = [](const vernon::runtime::MetadataFieldIdentity &left,
-                                  const vernon::runtime::MetadataFieldIdentity &right) {
-            return left.argument == right.argument && left.kind == right.kind && left.dimension == right.dimension;
+        const auto expectedMetadataFields = [&](const std::string &module) {
+            std::vector<vernon::runtime::MetadataFieldIdentity> fields;
+            std::vector<const ReflectedEndpoint *> descriptorEndpoints;
+            for (const ReflectedEndpoint &endpoint : stage.endpoints)
+                if (endpoint.viewDescriptor && endpoint.module == module)
+                    descriptorEndpoints.push_back(&endpoint);
+            std::sort(descriptorEndpoints.begin(), descriptorEndpoints.end(),
+                      [](const ReflectedEndpoint *left, const ReflectedEndpoint *right) {
+                          return left->index < right->index;
+                      });
+            for (const ReflectedEndpoint *endpoint : descriptorEndpoints) {
+                fields.push_back({endpoint->index, vernon::runtime::MetadataFieldKind::Offset, std::nullopt});
+                for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
+                    fields.push_back({endpoint->index, vernon::runtime::MetadataFieldKind::Extent, dimension});
+                for (uint32_t dimension = 0; dimension < endpoint->viewRank; ++dimension)
+                    fields.push_back({endpoint->index, vernon::runtime::MetadataFieldKind::Stride, dimension});
+            }
+            return fields;
         };
-        if (expectedMetadataFields.empty() != !stage.metadataCarrier ||
-            (stage.metadataCarrier &&
-             (stage.metadataCarrier->fields.size() != expectedMetadataFields.size() ||
-              !std::equal(stage.metadataCarrier->fields.begin(), stage.metadataCarrier->fields.end(),
-                          expectedMetadataFields.begin(), sameField))))
-            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/reflection/metadata_carrier",
-                        "entry metadata fields are not the canonical argument/kind/dimension sequence");
+        const auto canonicalCarrier = [](const vernon::runtime::MetadataCarrier *carrier,
+                                         const std::vector<vernon::runtime::MetadataFieldIdentity> &expected) {
+            const auto sameField = [](const vernon::runtime::MetadataFieldIdentity &left,
+                                      const vernon::runtime::MetadataFieldIdentity &right) {
+                return left.argument == right.argument && left.kind == right.kind && left.dimension == right.dimension;
+            };
+            if (!carrier)
+                return expected.empty();
+            return carrier->fields.size() == expected.size() &&
+                   std::equal(carrier->fields.begin(), carrier->fields.end(), expected.begin(), sameField);
+        };
+        for (const std::string &role : moduleRoles) {
+            const auto carrier = stage.metadataCarriers.find(role);
+            if (!canonicalCarrier(carrier == stage.metadataCarriers.end() ? nullptr : &carrier->second,
+                                  expectedMetadataFields(role)))
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                            path + "/reflection/metadata_carriers/" + role,
+                            "module metadata fields are not the canonical argument/kind/dimension sequence");
+        }
         std::vector<uint32_t> allSlots;
         for (const ReflectedEndpoint &endpoint : stage.endpoints) {
             for (const EndpointAbiBinding &binding : endpoint.abiBindings) {
@@ -2158,7 +2173,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
         if (row.contains("implementation")) {
             const auto &implementation = row["implementation"];
             const std::string implementationPath = path + "/implementation";
-            if (!exactObject(implementation, {"target", "metadata", "endpoints"}, {"metadata_carrier"}, diagnostic,
+            if (!exactObject(implementation, {"target", "metadata", "endpoints"}, {"metadata_carriers"}, diagnostic,
                              implementationPath) ||
                 !implementation["target"].is_string() || implementation["target"] != stage.backend ||
                 !implementation["metadata"].is_object() || !implementation["endpoints"].is_array())
@@ -2169,22 +2184,29 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
             if (!parseTargetImplementationMetadata(stage.backend, metadata, stage.nativeSlots, targetError))
                 return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", implementationPath + "/metadata",
                             std::move(targetError));
-            if (stage.metadataCarrier) {
-                if (!implementation.contains("metadata_carrier") ||
-                    !parsePhysicalMetadataCarrier(implementation["metadata_carrier"], *stage.metadataCarrier,
-                                                  diagnostic, implementationPath + "/metadata_carrier"))
-                    return false;
+            const std::string carriersPath = implementationPath + "/metadata_carriers";
+            if (stage.metadataCarriers.empty() != !implementation.contains("metadata_carriers"))
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", carriersPath,
+                            "compiled metadata carriers must match the reflected module carriers");
+            if (!stage.metadataCarriers.empty()) {
+                const auto &carriers = implementation["metadata_carriers"];
+                if (!carriers.is_object() || carriers.size() != stage.metadataCarriers.size())
+                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", carriersPath,
+                                "compiled metadata carriers must match the reflected module carriers");
                 const std::string expectedProfile = stage.backend == "cpu"    ? "host_metadata"
                                                     : stage.backend == "cuda" ? "cuda_kernel_metadata_i64"
                                                                               : "portable_shader_metadata_i32";
-                if (stage.metadataCarrier->profile != expectedProfile)
-                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
-                                implementationPath + "/metadata_carrier/profile",
-                                "compiled metadata profile does not match the artifact target");
-            } else if (implementation.contains("metadata_carrier")) {
-                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
-                            implementationPath + "/metadata_carrier",
-                            "compiled metadata carrier has no semantic entry carrier");
+                for (auto &[role, carrier] : stage.metadataCarriers) {
+                    if (!carriers.contains(role))
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", carriersPath + "/" + role,
+                                    "reflected metadata carrier has no compiled physical carrier");
+                    if (!parsePhysicalMetadataCarrier(carriers[role], carrier, diagnostic, carriersPath + "/" + role))
+                        return false;
+                    if (carrier.profile != expectedProfile)
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                    carriersPath + "/" + role + "/profile",
+                                    "compiled metadata profile does not match the artifact target");
+                }
             }
             for (size_t index = 0; index < implementation["endpoints"].size(); ++index) {
                 const auto &rowValue = implementation["endpoints"][index];
@@ -2192,7 +2214,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                 CompiledEndpointAbi compiled;
                 if (!exactObject(rowValue, {"module", "interface", "index"},
                                  {"builtin", "value_transport", "set", "binding", "interface_plan",
-                                  "packed_frame_offset", "element_layout", "sampled_image_bindings"},
+                                  "packed_frame_offset", "element_layout", "sampled_image_bindings", "storage_leaves"},
                                  diagnostic, endpointPath) ||
                     !rowValue["module"].is_string() || !rowValue["interface"].is_string() ||
                     !uint32Value(rowValue["index"], compiled.index))
@@ -2259,12 +2281,36 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                         compiled.sampledImageBindings.push_back({descriptorSet, descriptorBinding});
                     }
                 }
+                if (rowValue.contains("storage_leaves")) {
+                    const auto &leaves = rowValue["storage_leaves"];
+                    if (!leaves.is_array() || leaves.empty())
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                    endpointPath + "/storage_leaves", "storage leaves must be a non-empty array");
+                    for (size_t leafIndex = 0; leafIndex < leaves.size(); ++leafIndex) {
+                        const auto &leaf = leaves[leafIndex];
+                        const std::string leafPath = endpointPath + "/storage_leaves/" + std::to_string(leafIndex);
+                        uint64_t elementSize{};
+                        uint64_t byteOffset{};
+                        uint32_t binding{};
+                        if (!exactObject(leaf, {"binding", "byte_offset", "element_size"}, {}, diagnostic, leafPath) ||
+                            !uint32Value(leaf["binding"], binding) || !uint64Value(leaf["byte_offset"], byteOffset) ||
+                            !uint64Value(leaf["element_size"], elementSize) || !elementSize ||
+                            elementSize > std::numeric_limits<size_t>::max() ||
+                            byteOffset > std::numeric_limits<size_t>::max())
+                            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", leafPath,
+                                        "storage leaf requires a binding, byte offset, and nonzero element size");
+                        compiled.storageLeaves.push_back(
+                            {static_cast<size_t>(elementSize), static_cast<size_t>(byteOffset), binding});
+                    }
+                }
                 stage.compiledAbi.push_back(std::move(compiled));
             }
         }
-        if (stage.metadataCarrier && stage.metadataCarrier->profile.empty())
-            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", path + "/implementation/metadata_carrier",
-                        "semantic metadata carrier has no compiled physical carrier");
+        for (const auto &[role, carrier] : stage.metadataCarriers)
+            if (carrier.profile.empty())
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                            path + "/implementation/metadata_carriers/" + role,
+                            "semantic metadata carrier has no compiled physical carrier");
         if (operation == "graphics") {
             const auto &graphics = reflection["graphics"];
             if (!exactObject(graphics,

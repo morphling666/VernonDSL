@@ -7,12 +7,20 @@
 
 namespace vernon::runtime {
 
-RuntimeResult<void> registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
-    const VernonStatus status = registerStaticCpuEntry(symbol, entryPoint);
+RuntimeResult<void> registerBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count) {
+    const VernonStatus status = registerStaticCpuEntries(entries, count);
     return status == VERNON_STATUS_OK
                ? RuntimeResult<void>{vernon::ok()}
                : RuntimeResult<void>{
-                     vernon::err(vernon::runtimeErrorFromStatus(status, {"register_static_cpu_entry", 0, 0}))};
+                     vernon::err(vernon::runtimeErrorFromStatus(status, {"register_static_cpu_entries", 0, 0}))};
+}
+
+RuntimeResult<void> unregisterBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count) {
+    const VernonStatus status = unregisterStaticCpuEntries(entries, count);
+    return status == VERNON_STATUS_OK
+               ? RuntimeResult<void>{vernon::ok()}
+               : RuntimeResult<void>{
+                     vernon::err(vernon::runtimeErrorFromStatus(status, {"unregister_static_cpu_entries", 0, 0}))};
 }
 
 BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,

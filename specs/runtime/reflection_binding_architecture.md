@@ -185,9 +185,11 @@ at deployment into each StageArtifact `compiled_abi` row:
 - element layout;
 - sampled-image binding provenance.
 
-Compute StageArtifacts with TensorView metadata additionally carry one
-entry-owned semantic `metadata_carrier` and one matching target implementation
-carrier. It is not represented as per-argument descriptor bindings.
+StageArtifacts with TensorView metadata additionally carry
+`metadata_carriers`: one semantic carrier per owning module role in reflection
+and one matching physical carrier per role in the target implementation.
+Compute and graphics use the same map and the same Runtime path. Carriers are
+not represented as per-argument descriptor bindings.
 
 `source/lib/runtime/program_execution_manifest.cpp` parses this object
 fail-closed into `CompiledEndpointAbi`, declared in
@@ -207,8 +209,9 @@ The repository has two intentionally different reflection products:
    entry-level `metadata_carrier`; it is parsed by `pipeline_metadata.cpp`
    into `ReflectedEntry`;
 2. Program StageArtifact reflection uses portable `endpoints[].abi.bindings`
-   plus semantic `reflection.metadata_carrier` and target-selected
-   `implementation.metadata_carrier`; it is parsed by
+   plus semantic `reflection.metadata_carriers` and target-selected
+   `implementation.metadata_carriers`, both keyed by module role; it is
+   parsed by
    `program_execution_manifest.cpp`, merged with Program graph projections,
    and only then projected into `TargetBindingPlan`.
 

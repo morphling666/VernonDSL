@@ -140,7 +140,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("finalize_program_result", &finalizeProgramResult, nb::arg("plan"), nb::arg("kernels"),
              nb::arg("shape_facts") = std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>>{})
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
-             nb::arg("options") = nb::dict());
+             nb::arg("options") = nb::dict(), nb::arg("graphics_binding_layout") = std::string())
+        .def("link_graphics_bindings_result", &linkGraphicsBindingsResult, nb::arg("modules"));
     module.def("_compile_cpu_program_results", &compileCpuProgramResults, nb::arg("modules"),
                nb::arg("options") = nb::dict());
     nb::class_<CompiledProgram>(module, "CompiledProgram")

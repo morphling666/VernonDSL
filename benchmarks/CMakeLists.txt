@@ -5,19 +5,11 @@ if(NOT TARGET VernonRuntime OR NOT TARGET vernon-dsl-native)
     message(FATAL_ERROR "VERNON_BUILD_BENCHMARKS requires Runtime, Compiler, and Python bindings")
 endif()
 
-include("${VERNON_REPOSITORY_ROOT}/cmake/VernonProgramFixture.cmake")
 include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTargetHelpers.cmake")
 if(NOT TARGET nlohmann_json::nlohmann_json)
     include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeNlohmannJson.cmake")
     include_nlohmann_json()
 endif()
-
-file(
-    GLOB_RECURSE
-    VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES
-    CONFIGURE_DEPENDS
-    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/*.py")
-list(APPEND VERNON_PROGRAM_FIXTURE_PYTHON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/workloads.py")
 
 # Keep this matrix aligned with source/tests/CMakeLists.txt. Runtime capability probing still decides whether a compiled
 # backend is usable on this machine.
@@ -53,10 +45,8 @@ set(_vernon_benchmark_assets
     "reduction|reduction_asset"
     "draw_1|draw_1_asset"
     "draw_64|draw_64_asset")
-set(_vernon_benchmark_dependencies)
-set(_vernon_benchmark_cpu_libraries)
+set(_vernon_benchmark_asset_targets)
 set(_vernon_benchmark_manifest_rows)
-set(_vernon_benchmark_registration_declarations)
 
 foreach(_vernon_target_row IN LISTS _vernon_benchmark_targets)
     string(
@@ -96,39 +86,20 @@ foreach(_vernon_target_row IN LISTS _vernon_benchmark_targets)
         endif()
         set(_vernon_asset_reference "${CMAKE_CURRENT_SOURCE_DIR}/workloads.py:${_vernon_asset_symbol}")
         set(_vernon_output_stem "${_vernon_asset_name}_${_vernon_backend}")
-        if(_vernon_backend STREQUAL "cpu")
-            string(MAKE_C_IDENTIFIER "benchmark_${_vernon_asset_name}" _vernon_registration_suffix)
-            set(_vernon_registration "vernonRegisterFixture_${_vernon_registration_suffix}")
-            vernon_add_cpu_program_fixture_library(
-                "benchmark-${_vernon_asset_name}-cpu"
-                "${CMAKE_CURRENT_BINARY_DIR}/${_vernon_output_stem}"
-                "${_vernon_output_stem}.program.json"
-                "${_vernon_asset_reference}"
-                "${_vernon_registration}"
-                "${VERNON_REPOSITORY_ROOT}/source/tests/scripts/prepare_cpu_program_fixture.py"
-                _vernon_manifest
-                _vernon_fixture_target)
-            list(APPEND _vernon_benchmark_cpu_libraries "${_vernon_fixture_target}")
-            string(APPEND _vernon_benchmark_registration_declarations
-                   "extern \"C\" VernonStatus ${_vernon_registration}(void);\n")
-            set(_vernon_registration_expression "&${_vernon_registration}")
-        else()
-            vernon_add_program_asset_bundle(
-                "benchmark-${_vernon_asset_name}-${_vernon_backend}"
-                "${_vernon_architecture}"
-                "${_vernon_asset_reference}"
-                "${CMAKE_CURRENT_BINARY_DIR}"
-                "${_vernon_output_stem}"
-                _vernon_manifest)
-            list(APPEND _vernon_benchmark_dependencies
-                 "vernon-benchmark-${_vernon_asset_name}-${_vernon_backend}-bundle")
-            set(_vernon_registration_expression "nullptr")
-        endif()
-        string(
-            APPEND
-            _vernon_benchmark_manifest_rows
-            "    {\"${_vernon_asset_name}\", \"${_vernon_backend}\", R\"vernon(${_vernon_manifest})vernon\", ${_vernon_registration_expression}},\n"
-        )
+        set(_vernon_asset_target "vernon-benchmark-${_vernon_asset_name}-${_vernon_backend}")
+        vernon_add_program_asset(
+            "${_vernon_asset_target}"
+            SOURCE
+            "${_vernon_asset_reference}"
+            TARGET
+            "${_vernon_architecture}"
+            OUTPUT_DIRECTORY
+            "${CMAKE_CURRENT_BINARY_DIR}/${_vernon_output_stem}"
+            MANIFEST_VARIABLE
+            _vernon_manifest)
+        list(APPEND _vernon_benchmark_asset_targets "${_vernon_asset_target}")
+        string(APPEND _vernon_benchmark_manifest_rows
+               "    {\"${_vernon_asset_name}\", \"${_vernon_backend}\", R\"vernon(${_vernon_manifest})vernon\"},\n")
     endforeach()
 endforeach()
 
@@ -137,10 +108,6 @@ file(
     GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/benchmark_manifest_rows.inc"
     CONTENT "${_vernon_benchmark_manifest_rows}")
-file(
-    GENERATE
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/benchmark_registration_declarations.inc"
-    CONTENT "${_vernon_benchmark_registration_declarations}")
 
 add_executable(VernonBenchmarkDriver driver.cpp)
 set_target_properties(VernonBenchmarkDriver PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/benchmarks")
@@ -155,12 +122,11 @@ target_link_libraries(
     PRIVATE Vernon::Runtime
             Vernon::RHI
             nlohmann_json::nlohmann_json
-            ${_vernon_benchmark_cpu_libraries})
+            ${_vernon_benchmark_asset_targets})
 if(TARGET VernonGlfwContextOwner)
     target_link_libraries(VernonBenchmarkDriver PRIVATE Vernon::GlfwContextOwner)
     target_compile_definitions(VernonBenchmarkDriver PRIVATE VERNON_GLFW_CONTEXT_OWNER_AVAILABLE=1)
 endif()
-add_dependencies(VernonBenchmarkDriver ${_vernon_benchmark_dependencies})
 vernon_stage_target_files(VernonBenchmarkDriver VernonRuntime VernonRHI)
 
 add_custom_target(

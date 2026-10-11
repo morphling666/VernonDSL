@@ -53,7 +53,7 @@
 // SPIRV-COUNT-3: spirv.Load "Uniform"
 // SPIRV: spirv.Load "StorageBuffer"
 
-module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
+module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 2 : i64} {
   func.func @metadata(
       %view: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {
         vernon.interface = "resource",

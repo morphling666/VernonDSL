@@ -111,8 +111,11 @@ def _compile_stage(
     native_target: Any,
     mlir: str,
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
+    graphics_binding_layout: str = "",
 ) -> CompiledStage:
-    result = compiler.compile_program_result(mlir, native_target, **target.native_options)
+    result = compiler.compile_program_result(
+        mlir, native_target, **target.native_options, graphics_binding_layout=graphics_binding_layout
+    )
     compiled = compiled_stage_from_program(
         result,
         module=module_id,
@@ -137,6 +140,19 @@ def _compile_stage(
     if retained_programs is not None:
         retained_programs.append((compiled, result))
     return compiled
+
+
+def _link_graphics_bindings(compiler: Any, modules: list[str], implementation: str) -> list[str]:
+    """Return one canonical layout per shader module of one graphics pipeline, in input order."""
+    linked = compiler.link_graphics_bindings_result(modules)
+    if not bool(linked.ok):
+        raise ProgramCompileError(
+            str(linked.diagnostics) or f"cannot link graphics bindings of Program implementation {implementation!r}"
+        )
+    layouts = parse_reflection_json(linked.reflection).get("layouts")
+    if not isinstance(layouts, list) or len(layouts) != len(modules):
+        raise ProgramCompileError(f"graphics binding link of {implementation!r} returned no layout per module")
+    return [canonical_json(layout) for layout in layouts]
 
 
 def _specialize_program_implementations(
@@ -250,21 +266,24 @@ def _compile_program_variant(
                 if not implementation.graphics_stages:
                     raise ProgramCompileError(f"graphics Program implementation {hint!r} has no shader stages")
                 compiled_graphics: list[CompiledStage] = []
-                for role, entry, stage_mlir in implementation.graphics_stages:
+                layouts = _link_graphics_bindings(
+                    compiler, [stage_mlir for _, _, stage_mlir in implementation.graphics_stages], hint
+                )
+                for (role, entry, stage_mlir), layout in zip(implementation.graphics_stages, layouts, strict=True):
                     module_id = f"{program_id}/{hint}/{entry}"
-                    compiled_graphics.append(
-                        _compile_stage(
-                            module_id,
-                            entry,
-                            role,
-                            variant,
-                            target,
-                            compiler,
-                            native_target,
-                            stage_mlir,
-                            retained_programs,
-                        )
+                    compiled_stage = _compile_stage(
+                        module_id,
+                        entry,
+                        role,
+                        variant,
+                        target,
+                        compiler,
+                        native_target,
+                        stage_mlir,
+                        retained_programs,
+                        layout,
                     )
+                    compiled_graphics.append(compiled_stage)
                 offsets: list[int] = []
                 payload = bytearray()
                 modules: list[dict[str, Any]] = []

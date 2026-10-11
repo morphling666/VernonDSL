@@ -1183,7 +1183,8 @@ class LanguageVersionTests(unittest.TestCase):
             "    return i32(f32(result))\n",
             "natural_range.py",
         )
-        self.assertIn("arith.remsi", natural_output)
+        self.assertIn("arith.floordivsi", natural_output)
+        self.assertNotIn("arith.remsi", natural_output)
         self.assertIn("arith.sitofp", natural_output)
         self.assertIn("arith.fptosi", natural_output)
 

@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGraphicsBindings.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -648,18 +649,9 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
     llvm::json::Array entries;
     std::set<std::string> requiredFeatures(logical.requiredFeatures.begin(), logical.requiredFeatures.end());
     bool invalid = false;
-    uint32_t nextGeneratedBinding = 0;
-    module.walk([&](mlir::func::FuncOp function) {
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
-            if (!attrs)
-                continue;
-            auto descriptorSet = attrs.getAs<mlir::IntegerAttr>("vernon.set");
-            auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding");
-            if (binding && (!descriptorSet || descriptorSet.getInt() == 0))
-                nextGeneratedBinding = std::max(nextGeneratedBinding, static_cast<uint32_t>(binding.getInt() + 1));
-        }
-    });
+    mlir::FailureOr<mlir::vernon::GraphicsBindingPlan> graphicsBindings = mlir::vernon::planGraphicsBindings(module);
+    if (mlir::failed(graphicsBindings))
+        return mlir::failure();
     module.walk([&](mlir::func::FuncOp function) {
         auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
         if (!stage)
@@ -704,7 +696,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         uint64_t argumentOffset = 0;
         std::map<unsigned, uint32_t> generatedUniformBindings;
         std::map<unsigned, InterfaceExtent> physicalValueLayouts;
-        uint64_t inlineUniformSize = 0;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             if (stage.getValue() == "compute")
                 break;
@@ -728,9 +719,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 invalid = true;
                 return;
             }
-            bool requiresBuffer = mlir::isa<mlir::vernon::TensorType>(type);
-            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
-                requiresBuffer = tensor.getRank() > 2;
+            const llvm::SmallVector<uint32_t> *generatedBinding = graphicsBindings->find(function.getSymName(), index);
             if (attrs.get("vernon.binding")) {
                 layout = physicalLayout(type,
                                         mlir::isa<mlir::vernon::TensorType>(type)
@@ -745,10 +734,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 physicalValueLayouts.emplace(index, std::move(*layout));
                 continue;
             }
-            const uint64_t offset = llvm::alignTo(inlineUniformSize, layout->alignment);
-            requiresBuffer = requiresBuffer || offset > 128 || layout->size > 128 - std::min<uint64_t>(offset, 128);
-            if (requiresBuffer) {
-                generatedUniformBindings[index] = nextGeneratedBinding++;
+            if (generatedBinding) {
+                generatedUniformBindings[index] = generatedBinding->front();
                 layout = physicalLayout(type,
                                         mlir::isa<mlir::vernon::TensorType>(type)
                                             ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
@@ -759,8 +746,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     invalid = true;
                     return;
                 }
-            } else {
-                inlineUniformSize = offset + layout->size;
             }
             physicalValueLayouts.emplace(index, std::move(*layout));
         }
@@ -803,10 +788,23 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     metadataCarrierArgumentIndex = index;
                 }
             }
+        } else {
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                if (!function.getArgAttr(index, mlir::vernon::kTensorMetadataCarrierAttrName))
+                    continue;
+                const llvm::SmallVector<uint32_t> *planned = graphicsBindings->find(function.getSymName(), index);
+                if (metadataCarrierBinding || !planned || planned->size() != 1) {
+                    function.emitError("graphics TensorView metadata carrier has no binding plan");
+                    invalid = true;
+                    return;
+                }
+                metadataCarrierBinding = planned->front();
+                metadataCarrierArgumentIndex = index;
+            }
         }
         llvm::json::Object reflectedMetadataCarrier;
         bool hasMetadataCarrier = false;
-        if (stage.getValue() == "compute") {
+        {
             mlir::FailureOr<std::shared_ptr<const mlir::vernon::SemanticMetadataPlan>> semantic =
                 mlir::vernon::getSemanticMetadataPlan(function);
             if (mlir::failed(semantic)) {
@@ -815,6 +813,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 return;
             }
             if (!(*semantic)->empty()) {
+                if (!metadataCarrierBinding && stage.getValue() != "compute" && metadataProfile) {
+                    function.emitError("graphics TensorView arguments have no materialized metadata carrier");
+                    invalid = true;
+                    return;
+                }
                 if (!metadataCarrierBinding)
                     metadataCarrierBinding = nextComputeBinding;
                 hasMetadataCarrier = true;
@@ -1111,6 +1114,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
 
             if (argumentAttrs) {
                 for (mlir::NamedAttribute attr : argumentAttrs) {
+                    if (attr.getName().strref() == mlir::vernon::kGeneratedBindingAttrName)
+                        continue;
                     argument[attr.getName().strref().str()] = attributeToJson(attr.getValue());
                     if (attr.getName().strref() == "vernon.instance_divisor")
                         requiredFeatures.insert("instancing");
@@ -1308,7 +1313,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     argument["sampled_image_bindings"] = std::move(bindings);
                 }
             }
-            if (stage.getValue() == "compute") {
+            const llvm::SmallVector<uint32_t> *graphicsStorageBindings =
+                stage.getValue() == "compute" ? nullptr : graphicsBindings->find(function.getSymName(), index);
+            if (stage.getValue() == "compute" ||
+                (graphicsStorageBindings && mlir::isa<mlir::vernon::TensorViewType>(argumentType))) {
                 auto attrs = function.getArgAttrDict(index);
                 auto builtin = attrs.getAs<mlir::StringAttr>("vernon.builtin");
                 auto sourceDtype = attrs.getAs<mlir::StringAttr>("vernon.dtype");
@@ -1362,6 +1370,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         return;
                     }
                     argument["alignment"] = static_cast<int64_t>(storageLayout->alignment);
+                    if (graphicsStorageBindings && graphicsStorageBindings->size() != storageLayout->leaves.size()) {
+                        function.emitError("graphics TensorView binding plan does not match its storage leaves");
+                        invalid = true;
+                        return;
+                    }
+                    if (graphicsStorageBindings) {
+                        argument["binding_role"] = "storage";
+                        argument["vernon.set"] = int64_t{0};
+                        argument["vernon.binding"] = static_cast<int64_t>(graphicsStorageBindings->front());
+                    }
                     const uint32_t firstBinding =
                         computeBindings[index] ? *computeBindings[index]
                         : attrs.getAs<mlir::IntegerAttr>("vernon.binding")
@@ -1374,9 +1392,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                             static_cast<int64_t>(std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
                         reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
                         reflectedLeaf["binding"] =
-                            static_cast<int64_t>(computeBindings[index] ? firstBinding + leafIndex
-                                                 : leafIndex == 0       ? firstBinding
-                                                                        : nextBinding++);
+                            static_cast<int64_t>(graphicsStorageBindings  ? (*graphicsStorageBindings)[leafIndex]
+                                                 : computeBindings[index] ? firstBinding + leafIndex
+                                                 : leafIndex == 0         ? firstBinding
+                                                                          : nextBinding++);
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);

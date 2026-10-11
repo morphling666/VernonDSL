@@ -11,6 +11,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -22,6 +23,19 @@ namespace {
 
 std::string copyStringView(VernonStringView value) {
     return value.data && value.size ? std::string(value.data, value.size) : std::string();
+}
+
+bool readsGraphicsStorage(mlir::ModuleOp module) {
+    for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+        auto stage = function->getAttrOfType<mlir::StringAttr>(mlir::vernon::kStageAttrName);
+        if (!stage || stage.getValue() == "compute")
+            continue;
+        for (mlir::Type type : function.getArgumentTypes())
+            if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type);
+                view && view.getAddressSpace() == "device")
+                return true;
+    }
+    return false;
 }
 
 bool containsBackendLocalTapeHandle(mlir::Type type) {
@@ -225,7 +239,7 @@ TargetProfile resolveTargetProfile(const CompileOptions &options) {
 
 VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options,
                                  std::string &diagnostics) {
-    if (source.struct_size < sizeof(VernonCompileOptions)) {
+    if (source.struct_size < offsetof(VernonCompileOptions, graphics_binding_layout)) {
         diagnostics = "compile options structure is too small";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
@@ -274,6 +288,12 @@ VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOpti
     return VERNON_STATUS_OK;
 }
 
+VernonStringView graphicsBindingLayout(const VernonCompileOptions &source) {
+    return source.struct_size >= offsetof(VernonCompileOptions, graphics_binding_layout) + sizeof(VernonStringView)
+               ? source.graphics_binding_layout
+               : VernonStringView{nullptr, 0};
+}
+
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
                            std::string &reflection, std::string &diagnostics,
                            const VernonCpuRuntimeHelpers *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
@@ -313,6 +333,18 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
         const VernonMetalPlatform metalPlatform = target == VERNON_TARGET_METAL
                                                       ? std::get<MetalCompileOptions>(options).platform
                                                       : VERNON_METAL_PLATFORM_MACOS;
+        if ((target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) &&
+            readsGraphicsStorage(module.logicalModule())) {
+            const uint32_t minimum = target == VERNON_TARGET_OPENGL ? 430 : 310;
+            const uint32_t effective = glslVersion != 0 ? glslVersion : target == VERNON_TARGET_OPENGL ? 330 : 310;
+            if (effective < minimum) {
+                diagnostics = "PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED: graphics TensorView reads need shader storage "
+                              "buffers, which require GLSL " +
+                              std::to_string(minimum) + " or newer (requested " + std::to_string(effective) + ")";
+                artifacts.clear();
+                return VERNON_STATUS_UNSUPPORTED_TARGET;
+            }
+        }
         std::vector<TargetResourceSlot> targetResourceSlots;
         if (!compileSpirv(module, profile, artifacts, reflection, diagnostics)) {
             artifacts.clear();

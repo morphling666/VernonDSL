@@ -12,14 +12,13 @@ if(NOT LLVM_EXTERNAL_LIT)
 endif()
 
 if(NOT TARGET FileCheck)
-    add_executable(FileCheck EXCLUDE_FROM_ALL
-                   "${VERNON_REPOSITORY_ROOT}/llvm-project/llvm/utils/FileCheck/FileCheck.cpp")
+    add_executable(FileCheck "${VERNON_REPOSITORY_ROOT}/llvm-project/llvm/utils/FileCheck/FileCheck.cpp")
     target_include_directories(FileCheck PRIVATE ${LLVM_INCLUDE_DIRS})
     target_link_directories(FileCheck PRIVATE ${LLVM_LIBRARY_DIRS})
     target_link_libraries(FileCheck PRIVATE VernonCompilerBuildHeaders LLVMFileCheck LLVMSupport)
 endif()
 if(NOT TARGET not)
-    add_executable(not EXCLUDE_FROM_ALL "${VERNON_REPOSITORY_ROOT}/llvm-project/llvm/utils/not/not.cpp")
+    add_executable(not "${VERNON_REPOSITORY_ROOT}/llvm-project/llvm/utils/not/not.cpp")
     target_include_directories(not PRIVATE ${LLVM_INCLUDE_DIRS})
     target_link_directories(not PRIVATE ${LLVM_LIBRARY_DIRS})
     target_link_libraries(not PRIVATE VernonCompilerBuildHeaders LLVMSupport)
@@ -40,3 +39,5 @@ add_lit_testsuite(
     not
     vernon-opt)
 set_target_properties(check-vernon-mlir PROPERTIES FOLDER "Tests")
+
+add_test(NAME VernonMlirLit COMMAND "${Python3_EXECUTABLE}" "${LLVM_EXTERNAL_LIT}" -sv "${VERNON_LIT_CONFIG_DIR}")

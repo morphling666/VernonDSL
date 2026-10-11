@@ -315,12 +315,37 @@ graph embedding does not change Program binding semantics.
 CPU cooking emits:
 
 - one canonical `*.program.json`;
-- a relocatable `.o` or `.obj`;
-- generated static-registration `.c` and `.h` sources.
+- one relocatable `.o` or `.obj` per CPU module.
 
-Applications link the object and registration source before loading the
-manifest. Runtime resolves symbols through the static CPU entry registry and
-does not parse or relocate object files.
+A CPU Program deploys like a PTX or GLSL Program: manifest plus modules, with
+no generated sources. The compiler emits, into the object only (never the JIT
+module), a private `VernonStaticCpuEntry` table and an `llvm.global_ctors`
+constructor that passes it to `vernonRuntimeRegisterStaticCpuEntries`.
+Applications link the objects and load the manifest; Runtime resolves the
+manifest `symbol` through the static registry and does not parse or relocate
+object files. A matching `llvm.global_dtors` destructor passes the same table
+to `vernonRuntimeUnregisterStaticCpuEntries`. Registrations are reference
+counted per symbol and pointer: copies folded within one image share a
+pointer, while copies in separate shared libraries stay distinct, so unloading
+one library withdraws only its own definitions and lookups fall back to the
+oldest live one. The registry is created on first use and intentionally
+leaked, so constructors may run before any other Runtime static initializer
+and destructors may run after Runtime statics are destroyed.
+
+Chosen over cooked registration `.c`/`.h` glue because that glue had to be
+compiled per Program and invoked by the application, which no other backend
+requires. The cost is the usual constructor rule: objects in a static library
+must be linked whole-archive, or the linker drops them with their constructor.
+
+CMake projects cook through one helper, `vernon_add_program_asset` in
+`cmake/VernonProgramAsset.cmake`. The VernonRuntime CMake project includes it,
+and the wheel ships it with the Runtime sources. It cooks at build time into
+the binary tree and returns an INTERFACE target. For CPU, that target links the
+cooked objects as one archive through `$<LINK_LIBRARY:WHOLE_ARCHIVE,...>`.
+Cooked artifacts are specific to one target (CPU objects are native code for
+one triple), so repositories keep only DSL sources. The engine, the
+external-engine example, the benchmarks and the Runtime test fixtures all use
+this helper instead of per-project cook rules.
 
 Interactive CPU execution may use compiler-owned LLJIT. LLVM IR and ORC state
 are not persistent deployment formats.

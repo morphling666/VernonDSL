@@ -62,11 +62,21 @@ enum class PreparedGraphicsBindingSourceKind : uint8_t {
     ExternalSampler,
     ImplicitSampler,
     Resolution,
+    ExternalStorage,
+    ModuleMetadata,
+};
+
+struct PreparedGraphicsMetadataCarrier {
+    MetadataCarrier plan;
+    // Indexed by the module endpoint index that MetadataFieldIdentity::argument
+    // names; UINT32_MAX for endpoints without metadata fields.
+    std::vector<uint32_t> argumentSlots;
 };
 
 struct PreparedGraphicsBindingSource {
     PreparedGraphicsBindingSourceKind kind{PreparedGraphicsBindingSourceKind::ExternalUniform};
     uint32_t externalSlot{};
+    uint32_t metadataCarrier{UINT32_MAX};
     // Canonical shader descriptor identity. This intentionally remains unchanged when a
     // backend remaps the provider layout (for example, Metal argument buffers).
     uint32_t descriptorSet{UINT32_MAX};
@@ -100,6 +110,7 @@ struct PreparedGraphicsBindingPlan {
     std::vector<VernonRuntimeProviderBindingLayoutEntry> layouts;
     std::vector<PreparedGraphicsBindingSource> sources;
     std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
+    std::vector<PreparedGraphicsMetadataCarrier> metadataCarriers;
 
     bool empty() const { return layouts.empty(); }
     size_t size() const { return layouts.size(); }

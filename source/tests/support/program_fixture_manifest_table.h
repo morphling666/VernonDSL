@@ -6,8 +6,6 @@
 #include <ostream>
 #include <string_view>
 
-#include "program_fixture_registration_declarations.inc"
-
 namespace vernon::tests {
 
 struct ProgramFixtureManifest {
@@ -15,9 +13,6 @@ struct ProgramFixtureManifest {
     std::string_view target;
     VernonRuntimeBackend runtime;
     std::string_view manifestPath;
-    VernonStatus (*registerArtifacts)();
-
-    VernonStatus prepare() const { return registerArtifacts ? registerArtifacts() : VERNON_STATUS_OK; }
 };
 
 inline void PrintTo(const ProgramFixtureManifest &fixture, std::ostream *stream) { *stream << fixture.target; }

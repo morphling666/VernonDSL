@@ -12,8 +12,6 @@
 #include <memory>
 #include <string>
 
-extern "C" VernonStatus vernonRegisterStructuredStorageAutodiffFixture(void);
-
 namespace {
 
 std::string lastError(VernonRuntimeContext *context) {
@@ -22,7 +20,6 @@ std::string lastError(VernonRuntimeContext *context) {
 }
 
 TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStorageGradient) {
-    ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -140,7 +137,6 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 }
 
 TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersion) {
-    ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -251,7 +247,6 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 TEST(RuntimeStructuredStorageAutodiff, ZeroTapeBudgetRejectsForwardWithoutPublishing) {
-    ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);

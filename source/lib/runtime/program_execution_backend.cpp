@@ -280,9 +280,16 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
             plan->stageCache.push_back(std::move(child));
         }
         std::vector<NodeEndpointProjection> projections;
-        for (const TargetBinding &binding : node.plan.bindings)
-            if (!internalSource(binding.source))
-                projections.push_back({binding.projection.value, binding.projection.leaf, binding});
+        for (const vernon::runtime::Parameter &parameter :
+             plan->stageCache[cached->second]->bindingProjection.parameters) {
+            if (parameter.targetBinding >= node.plan.bindings.size()) {
+                reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/graphs",
+                       "Stage parameter has no target binding in its Node");
+                return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+            }
+            const TargetBinding &binding = node.plan.bindings[parameter.targetBinding];
+            projections.push_back({binding.projection.value, binding.projection.leaf, binding});
+        }
         const std::optional<GraphDirection> direction = graphDirection(node.graph);
         if (!direction) {
             reject(diagnostic, "PROGRAM_GRAPH_DIRECTION", "/graphs",

@@ -351,6 +351,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     def finalize_program_result(self, *args: object, **kwargs: object) -> object:
                         return self.compiler.finalize_program_result(*args, **kwargs)
 
+                    def link_graphics_bindings_result(self, *args: object, **kwargs: object) -> object:
+                        return self.compiler.link_graphics_bindings_result(*args, **kwargs)
+
                 proxy = SimpleNamespace(
                     Target=native.Target,
                     Compiler=TrackingCompiler,

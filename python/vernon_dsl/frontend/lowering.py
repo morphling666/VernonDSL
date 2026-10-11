@@ -268,7 +268,9 @@ class _FunctionEmitter:
                     if not attribute.startswith(("vernon.interface", "vernon.location"))
                 ]
                 attributes.append('vernon.interface = "resource"')
-                if not has_explicit_binding:
+                # Graphics stages compile separately but link into one pipeline; only the compiler's binding
+                # planner sees the pipeline-wide binding base, so it owns every unannotated graphics binding.
+                if not has_explicit_binding and self.stage not in {"vertex", "fragment"}:
                     attributes.extend(("vernon.set = 0 : i64", f"vernon.binding = {index} : i64"))
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
@@ -377,15 +379,11 @@ class _FunctionEmitter:
             value = Value(f"%arg{index}", DslType("sampler", "Sampler"))
             self.implicit_samplers[self.environment[texture_name].name] = value
             source_name = f"__vernon_implicit_sampler_{texture_name}"
-            binding_attributes = (
-                f", vernon.set = {sampler_plan.descriptor_set} : i64, vernon.binding = {sampler_plan.binding} : i64"
-            )
             arguments.append(
                 f'{value.name}: !vernon.sampler {{vernon.interface = "resource", '
                 f'vernon.source_name = "{source_name}", '
                 f'vernon.implicit = "sampler", '
-                f'vernon.implicit_texture = "{texture_name}"'
-                f"{binding_attributes}}}"
+                f'vernon.implicit_texture = "{texture_name}"}}'
             )
 
         for api in self.interface_plan.generated_apis:

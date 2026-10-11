@@ -61,6 +61,10 @@ struct PlannedComputeLaunch {
 
 bool materializeMetadataCarrier(const MetadataCarrier &carrier, const std::vector<ComputeLaunchArgument> &arguments,
                                 std::vector<uint8_t> &payload, std::string &error);
+// `views` is indexed by MetadataFieldIdentity::argument; entries that no field
+// names may be null.
+bool materializeTensorViewMetadata(const MetadataCarrier &carrier, const std::vector<const VernonTensorView *> &views,
+                                   std::vector<uint8_t> &payload, std::string &error);
 
 bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error);
