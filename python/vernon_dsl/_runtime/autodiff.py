@@ -86,9 +86,11 @@ def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
             kernel,
             transform=expression.transform,
         )
+        # Capability validation must precede the output recipe: forward-only Texture outputs have no recipe.
+        compiled = compile_program_autodiff(parsed, template)
         _, output_recipe = _capture_recipes(capture, invocation.outputs)
         return _CompiledKernelVjp(
-            compile_program_autodiff(parsed, template),
+            compiled,
             invocation,
             parameter_names,
             output_recipe,
@@ -114,9 +116,10 @@ def execute_direct_vjp(
             raise TypeError("grid is required for single-entry structured VJP execution")
         _validate_grid(grid)
         specialization = _compile_kernel_vjp(expression)
-        if len(arguments) != len(specialization.parameter_names):
-            raise TypeError(f"single-entry VJP expects {len(specialization.parameter_names)} launch arguments")
-        inputs = dict(zip(specialization.parameter_names, arguments, strict=True))
+        kernel = expression.program
+        inputs = dict(kernel._launch_leaves(kernel._lower(), arguments))
+        if tuple(inputs) != specialization.parameter_names:
+            raise TypeError(f"single-entry VJP expects launch parameters {specialization.parameter_names}")
         inputs.update(dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True)))
         invocation = dataclasses.replace(
             specialization.invocation,

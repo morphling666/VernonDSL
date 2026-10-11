@@ -23,7 +23,7 @@ namespace vernon::compiler {
 
 class CompilerFrontend;
 
-bool moduleUsesF16(mlir::ModuleOp module);
+bool moduleUsesFloat(mlir::ModuleOp module, unsigned width);
 
 struct LogicalStructLayout {
     std::string name;

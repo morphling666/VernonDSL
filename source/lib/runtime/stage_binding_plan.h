@@ -135,6 +135,9 @@ struct ParameterUse {
     // order. Each leaf binds the whole record buffer.
     std::vector<ReflectedStorageLeaf> storageLeaves;
     std::string transport;
+    // Compute kernels receive ranked Tensor, Struct, and Tuple Values as one buffer; CUDA passes such a Value by
+    // device pointer and every other Value as kernel-parameter bytes.
+    bool bufferValue{};
     TensorRepresentation tensorPacking{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;
     std::optional<InterfacePlan> interfacePlan;

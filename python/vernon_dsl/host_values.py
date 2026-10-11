@@ -11,6 +11,7 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
+from ._markers import dsl_options, is_struct_class
 from .language.scalar_types import SCALAR_TYPES
 from .types import TypeExpr, _Scalar
 
@@ -180,13 +181,13 @@ def tangent_schema(annotation: Any, active_structs: frozenset[type[Any]] = froze
         if any(not isinstance(extent, int) or extent <= 0 for extent in shape):
             raise TypeError("Tensor tangent requires static positive extents")
         return TangentTensor(shape, tangent_schema(element, active_structs))
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+    if is_struct_class(annotation):
         if annotation in active_structs:
             raise TypeError(f"recursive Struct '{annotation.__name__}' has no finite tangent")
         return TangentProduct(
             tuple(
                 (name, tangent_schema(field, active_structs | {annotation}))
-                for name, field in _struct_fields(annotation).items()
+                for name, field in declared_fields(annotation).items()
             )
         )
     raise TypeError(f"{annotation!r} has no tangent schema")
@@ -339,7 +340,12 @@ def unpack_tangent_value(schema: TangentSchema, value: Any) -> Any:
     return TangentValue(MappingProxyType(fields))
 
 
-def _struct_fields(cls: type[Any]) -> MappingProxyType[str, Any]:
+def declared_fields(cls: type[Any]) -> MappingProxyType[str, Any]:
+    """Field annotations of a `@struct` or `@binding_group` class, resolved once at its decoration.
+
+    Resolution must happen while the defining module is importable: a file-loaded Program Asset module leaves
+    `sys.modules` once its source has been evaluated.
+    """
     existing = getattr(cls, "__vernon_fields__", None)
     if existing is not None:
         return existing
@@ -432,12 +438,12 @@ def _consume_native_layout(
         if dtype.itemsize != node.size:
             raise RuntimeError("NumPy cannot represent the native canonical Tensor Value ABI")
         return HostAbiLayout(dtype, node.size, node.alignment)
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+    if is_struct_class(annotation):
         if annotation in active_structs:
             raise TypeError(f"recursive Struct '{annotation.__name__}' has no finite host ABI")
         return _product_abi_layout(
             node,
-            tuple(_struct_fields(annotation).items()),
+            tuple(declared_fields(annotation).items()),
             active_structs | {annotation},
             nodes,
         )
@@ -482,11 +488,11 @@ def _native_value_abi_plan(annotation: Any) -> tuple[_NativeLayoutNode, ...]:
                 f"!vernon.tensor<{element_spelling}, [{shape_text}]>",
                 element_dtypes * int(np.prod(shape, dtype=np.int64)),
             )
-        if isinstance(value, type) and getattr(value, "__vernon_dsl__", (None, {}))[0] == "struct":
+        if is_struct_class(value):
             if value in active:
                 raise TypeError(f"recursive Struct '{value.__name__}' has no finite host ABI")
             field_descriptions = tuple(
-                (name, *describe(field, active | {value})) for name, field in _struct_fields(value).items()
+                (name, *describe(field, active | {value})) for name, field in declared_fields(value).items()
             )
             fields = tuple((name, field_spelling) for name, field_spelling, _ in field_descriptions)
             previous = declarations.setdefault(value.__name__, fields)
@@ -570,8 +576,8 @@ def pack_host_value(annotation: Any, value: Any, field_name: str = "value") -> A
                 for index, (element_type, element) in enumerate(zip(annotation.arguments, value, strict=True))
             )
         return coerce_host_value(annotation, value, field_name)
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
-        fields = _struct_fields(annotation)
+    if is_struct_class(annotation):
+        fields = declared_fields(annotation)
         mapping = value if isinstance(value, Mapping) else None
         if mapping is not None:
             unknown = set(value) - set(fields)
@@ -612,11 +618,11 @@ def unpack_host_value(annotation: Any, value: Any) -> Any:
         result = np.array(value, copy=True)
         result.setflags(write=False)
         return result
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
-        if not getattr(annotation, "__vernon_dsl__", (None, {}))[1].get("shared", False):
+    if is_struct_class(annotation):
+        if not dsl_options(annotation).get("shared", False):
             raise TypeError(f"device-only Struct '{annotation.__name__}' cannot materialize as a host Value")
         return annotation(
-            *(unpack_host_value(field_type, value[name]) for name, field_type in _struct_fields(annotation).items())
+            *(unpack_host_value(field_type, value[name]) for name, field_type in declared_fields(annotation).items())
         )
     raise TypeError(f"{annotation!r} has no host Value representation")
 
@@ -673,7 +679,7 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
             raise TypeError(f"field '{field_name}' requires shape {shape}, got {result.shape}")
         result.setflags(write=False)
         return result
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+    if is_struct_class(annotation):
         if not isinstance(value, annotation):
             raise TypeError(f"field '{field_name}' requires {annotation.__name__}")
         return value
@@ -683,7 +689,7 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
 def make_shared_struct(cls: type[Any]) -> type[Any]:
     if cls.__bases__ != (object,):
         raise TypeError("@struct classes do not support inheritance")
-    annotations = _struct_fields(cls)
+    annotations = declared_fields(cls)
     field_names = tuple(annotations)
     cls.__vernon_fields__ = MappingProxyType(dict(annotations))
 
@@ -716,7 +722,7 @@ def make_shared_struct(cls: type[Any]) -> type[Any]:
 
 
 def forbid_struct_construction(cls: type[Any]) -> type[Any]:
-    _struct_fields(cls)
+    declared_fields(cls)
 
     def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
         del self, args, kwargs

@@ -15,6 +15,7 @@ from .autodiff_types import (
     LaunchPlan,
 )
 from .model import ConcreteType, TypedFunctionInstance
+from .parameter_paths import split_parameter_path
 
 
 @dataclass(frozen=True)
@@ -32,10 +33,6 @@ class DerivativeGroup:
     role: str
     declared_path: str
     leaf_paths: tuple[str, ...]
-
-    @property
-    def parameter_root(self) -> str:
-        return self.declared_path.split(".", 1)[0]
 
 
 def derivative_groups_from_paths(
@@ -234,15 +231,15 @@ def _resolve_path(
     parameters: dict[str, ConcreteType],
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]],
 ) -> ConcreteType:
-    components = path.split(".")
-    value_type = parameters[components[0]]
+    root, projection = split_parameter_path(path, parameters)
+    value_type = parameters[root]
     view_arguments = value_type.arguments[1:] if value_type.kind == "tensor_view" else None
-    if view_arguments is not None and len(components) > 1:
+    if view_arguments is not None and projection:
         element = value_type.arguments[0]
         if not isinstance(element, ConcreteType):
             raise ValueError(f"unresolved TensorView path {path!r}")
         value_type = element
-    for component in components[1:]:
+    for component in projection:
         if value_type.kind == "struct":
             value_type = dict(structs[value_type.name])[component]
         elif value_type.kind == "tuple":
@@ -252,7 +249,7 @@ def _resolve_path(
             value_type = nested
         else:
             raise ValueError(f"path {path!r} does not resolve to an aggregate Value")
-    if view_arguments is not None and len(components) > 1:
+    if view_arguments is not None and projection:
         value_type = ConcreteType("tensor_view", "TensorView", (value_type, *view_arguments))
     return value_type
 
@@ -409,7 +406,7 @@ def build_structured_profile_plan(
         if source.kind != "tensor_view":
             return (AccessPatternEvidence.SHARED_VALUE,), ()
         wrt_path = gradient_group_by_leaf[path]
-        return _tensor_view_evidence(entry, wrt_path.split(".", 1)[0])
+        return _tensor_view_evidence(entry, split_parameter_path(wrt_path, parameters)[0])
 
     def accumulation_plan(wrt_path: str) -> AccumulationPlan:
         source = _resolve_path(wrt_path, parameters, structs)

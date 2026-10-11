@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from . import ad
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import fragment, func, kernel, struct, vertex
+from .decorators import binding_group, fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .host_values import TangentLayout, TangentValue
 from .intrinsics import (
@@ -330,6 +330,7 @@ __all__ = [
     "Tuple",
     "When",
     "attribute",
+    "binding_group",
     "bool",
     "builtin",
     "clamp",

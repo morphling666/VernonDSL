@@ -1004,7 +1004,11 @@ may select the same Value or ResourceAccess.
 Value and resource endpoints may carry `source_name`, the stage-local symbol
 identity retained from `vernon.source_name`. It is distinct from the bound
 Program Value name: an internal Value produced by one node may bind an endpoint
-with a different stage-local name in a later node.
+with a different stage-local name in a later node. A binding-group leaf's
+`source_name` and Program Value name are its dotted path, for example
+`material.albedo`, so a name may contain `.`. Derivative and projection paths
+therefore resolve against the longest Value or parameter name that equals the
+path or is a `.`-separated prefix of it; the remainder is the projection.
 
 `transport` is `by_value`, `resource_handle`, or `device_address`; `access` is
 `read`, `write`, or `read_write`. Reflection

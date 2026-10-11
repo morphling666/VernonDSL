@@ -8,6 +8,9 @@ import operator
 from collections.abc import Mapping
 from typing import Any
 
+from .._markers import dsl_kind
+from ..binding_groups import expand_binding_group_arguments, is_binding_group
+from ..host_values import declared_fields
 from ..module import Module
 from ..operation_graph import (
     GraphBuffer,
@@ -91,7 +94,7 @@ def interpret_module_forward(
     inputs = _symbolic_program_inputs(parameter_types)
     capture = ProgramCapture(module, inputs)
     interpreter = _ForwardInterpreter(capture, module)
-    outputs = interpreter.interpret(module, dict(inputs))
+    outputs = interpreter.interpret(module, type(module)._module_definition.assemble_arguments(inputs))
     return capture, outputs
 
 
@@ -118,6 +121,8 @@ def _contains_graph(value: Any) -> bool:
         return any(_contains_graph(member) for member in value.values())
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return any(_contains_graph(getattr(value, field.name)) for field in dataclasses.fields(value))
+    if is_binding_group(type(value)):
+        return any(_contains_graph(getattr(value, field)) for field in declared_fields(type(value)))
     return False
 
 
@@ -139,7 +144,7 @@ def _parse_forward(module: Module) -> ast.FunctionDef:
 
 
 def _is_kernel(value: Any) -> bool:
-    kind = getattr(value, "__vernon_dsl__", (None,))[0]
+    kind = dsl_kind(value)
     return kind == "compute" and hasattr(value, "_lower") and hasattr(value, "_function")
 
 
@@ -409,12 +414,9 @@ class _ForwardInterpreter:
                     raise TypeError("grid must contain three positive compile-time integers or scalar Program values")
                 grid_value = grid
             specialization_value = _require_comptime(specializations, what="specializations")
-            self.capture.capture_kernel(
-                callee,
-                tuple(args),
-                grid_value,
-                specialization_key(specialization_value),
-            )
+            assignments = specialization_key(specialization_value)
+            leaves = callee._launch_leaves(callee._lower(assignments), tuple(args))
+            self.capture.capture_kernel(callee, tuple(value for _, value in leaves), grid_value, assignments)
             return None
         if _is_pipeline(callee):
             if args:
@@ -445,7 +447,7 @@ class _ForwardInterpreter:
                     raise TypeError("dynamic_state must be a DynamicState or None")
             self.capture.capture_graphics(
                 callee,
-                keywords,
+                expand_binding_group_arguments(keywords),
                 render_pass,
                 draw,
                 dynamic_state,
@@ -464,7 +466,7 @@ class _ForwardInterpreter:
             if keywords:
                 raise TypeError("depth_output does not accept keyword arguments")
             return self.capture.attachment_output(args[0], "depth", None)
-        if dataclasses.is_dataclass(callee) and isinstance(callee, type):
+        if (dataclasses.is_dataclass(callee) and isinstance(callee, type)) or is_binding_group(callee):
             return callee(*args, **keywords)
         if any(_contains_graph(value) for value in (*args, *keywords.values())):
             raise TypeError(

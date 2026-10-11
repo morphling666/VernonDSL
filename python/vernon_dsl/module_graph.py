@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from .diagnostics import CompileError, SourceLocation
 from .frontend.abi import attribute_layout
@@ -16,7 +17,10 @@ from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .source_identity import source_file_digest, source_text_digest
-from .struct_methods import normalize_struct_methods
+from .struct_methods import method_tables, normalize_struct_methods
+
+if TYPE_CHECKING:
+    from .types import SpecializationAssignment
 
 _HOST_MODULES = {
     "__future__",
@@ -32,8 +36,22 @@ _HOST_MODULES = {
     "unittest",
     "vernon_dsl",
 }
+_SPECIALIZATION_SCALARS = frozenset({"bool", "i32", "u32", "f32", "f64"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
+_CLASS_DECORATORS = frozenset({"struct", "binding_group"})
+
+
+def _is_dsl_class(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.ClassDef) and any(
+        _decorator_name(item) in _CLASS_DECORATORS for item in node.decorator_list
+    )
+
+
+def _is_binding_group(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.ClassDef) and any(
+        _decorator_name(item) == "binding_group" for item in node.decorator_list
+    )
 
 
 @dataclass(frozen=True)
@@ -54,10 +72,14 @@ class _Module:
     definitions: dict[str, ast.FunctionDef | ast.ClassDef] = field(default_factory=dict)
     host_functions: set[str] = field(default_factory=set)
     features: dict[str, str] = field(default_factory=dict)
+    scalars: dict[str, tuple[str, str]] = field(default_factory=dict)
     constants: dict[str, int | float | bool] = field(default_factory=dict)
     import_specs: dict[str, _ImportSpec] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module", str]] = field(default_factory=dict)
     module_imports: dict[str, "_Module"] = field(default_factory=dict)
+
+    def declares_specialization(self, name: str) -> bool:
+        return name in self.features or name in self.scalars
 
 
 @dataclass(frozen=True)
@@ -85,13 +107,15 @@ class _ModuleGraphSnapshot:
 
 
 class _ModuleGraphCache:
+    """Caches discovery, which is independent of the specialization key; `ModuleGraph.load` applies the key."""
+
     def __init__(self) -> None:
-        self._entries: dict[tuple[Path, str | None, frozenset[str]], _ModuleGraphSnapshot] = {}
+        self._entries: dict[tuple[Path, str | None], _ModuleGraphSnapshot] = {}
         self._parsed_modules: dict[Path, tuple[str, _Module]] = {}
         self._lock = RLock()
 
     def restore(self, graph: "ModuleGraph") -> bool:
-        key = (graph.input_path, graph.entry, graph.enabled_features)
+        key = (graph.input_path, graph.entry)
         with self._lock:
             snapshot = self._entries.get(key)
         if snapshot is None:
@@ -116,7 +140,7 @@ class _ModuleGraphCache:
             frozenset(graph.reachable_symbols),
             dependencies,
         )
-        key = (graph.input_path, graph.entry, graph.enabled_features)
+        key = (graph.input_path, graph.entry)
         with self._lock:
             self._entries[key] = snapshot
 
@@ -140,12 +164,35 @@ class _ModuleGraphCache:
 _module_graph_cache = _ModuleGraphCache()
 
 
-class _FeatureSpecializer(ast.NodeTransformer):
-    def __init__(self, graph: "ModuleGraph", module: _Module, enabled_features: frozenset[str]):
+_NOT_STATIC = object()
+_STATIC_BINARY_OPERATORS = {
+    ast.Add: lambda left, right: left + right,
+    ast.Sub: lambda left, right: left - right,
+    ast.Mult: lambda left, right: left * right,
+    ast.FloorDiv: lambda left, right: left // right,
+    ast.Mod: lambda left, right: left % right,
+}
+_STATIC_COMPARISONS = {
+    ast.Eq: lambda left, right: left == right,
+    ast.NotEq: lambda left, right: left != right,
+    ast.Lt: lambda left, right: left < right,
+    ast.LtE: lambda left, right: left <= right,
+    ast.Gt: lambda left, right: left > right,
+    ast.GtE: lambda left, right: left >= right,
+}
+
+
+class _Specializer(ast.NodeTransformer):
+    """Applies one specialization key to a definition before method resolution, reachability, and typing.
+
+    A test that references a specialization is decided here, so a discarded branch contributes no callees,
+    resources, or diagnostics; that only holds because this runs before every later frontend stage.
+    """
+
+    def __init__(self, graph: "ModuleGraph", module: _Module, values: dict[str, bool | int | float]):
         self.graph = graph
         self.module = module
-        self.enabled_features = enabled_features
-        self.disabled_arguments: set[str] = set()
+        self.values = values
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         self._infer_interface_locations(node)
@@ -156,22 +203,31 @@ class _FeatureSpecializer(ast.NodeTransformer):
             if conditional is None:
                 kept_arguments.append(argument)
                 continue
-            feature_name, wrapped_type = conditional
-            if feature_name in self.enabled_features:
+            condition, wrapped_type = conditional
+            if self._static_condition(condition, "When condition must be a compile-time expression"):
                 argument.annotation = wrapped_type
                 kept_arguments.append(argument)
             else:
                 disabled.add(argument.arg)
+        for argument in kept_arguments:
+            if argument.annotation is not None:
+                argument.annotation = self.visit(argument.annotation)
+        if node.returns is not None:
+            node.returns = self.visit(node.returns)
         node.args.args = kept_arguments
         node.body = self._specialize_statements(node.body)
         for value in ast.walk(ast.Module(body=node.body, type_ignores=[])):
             if isinstance(value, ast.Name) and value.id in disabled:
-                self.graph._error(self.module, value, f"disabled value '{value.id}' is used outside its feature guard")
+                self.graph._error(
+                    self.module, value, f"disabled value '{value.id}' is used outside its specialization guard"
+                )
         return node
 
     def _infer_interface_locations(self, node: ast.FunctionDef) -> None:
-        if not any(_decorator_name(decorator) in _STAGE_DECORATORS for decorator in node.decorator_list):
+        stages = {_decorator_name(decorator) for decorator in node.decorator_list} & _STAGE_DECORATORS
+        if not stages:
             return
+        vertex = "vertex" in stages
         candidates: list[tuple[ast.arg, ast.expr, int, int | None]] = []
         for argument in node.args.args:
             annotation = argument.annotation
@@ -180,11 +236,15 @@ class _FeatureSpecializer(ast.NodeTransformer):
             interface_type = self._unwrap_when(annotation)
             if self._has_metadata(interface_type, {"builtin", "uniform", "resource"}):
                 continue
+            # Binding-group leaves are uniforms and resources, which never take interface locations.
+            declared_class = self.graph._resolve_class(self.module, interface_type)
+            if declared_class is not None and _is_binding_group(declared_class[1]):
+                continue
             candidates.append(
                 (
                     argument,
                     interface_type,
-                    self._location_span(interface_type),
+                    self._location_span(interface_type, vertex),
                     self._explicit_location(interface_type),
                 )
             )
@@ -305,7 +365,7 @@ class _FeatureSpecializer(ast.NodeTransformer):
         annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
         return annotation
 
-    def _location_span(self, annotation: ast.expr) -> int:
+    def _location_span(self, annotation: ast.expr, vertex: bool) -> int:
         items = self._annotated_items(annotation)
         value = items[0] if items else annotation
         try:
@@ -315,7 +375,8 @@ class _FeatureSpecializer(ast.NodeTransformer):
             constructor_node = value.value if isinstance(value, ast.Subscript) else value
             spelling = (_dotted_name(constructor_node) or "").split(".")[-1]
             scalar = SCALAR_ALIASES.get(spelling, spelling)
-            if spelling in DEVICE_ONLY_TYPE_NAMES or scalar == "bool":
+            # Only vertex inputs are attributes; elsewhere a non-attribute Value takes one location, as in lowering.
+            if not vertex or spelling in DEVICE_ONLY_TYPE_NAMES or scalar == "bool":
                 # These types need typed, stage-specific validation after
                 # feature specialization; they never expand recursively here.
                 return 1
@@ -323,27 +384,103 @@ class _FeatureSpecializer(ast.NodeTransformer):
             raise AssertionError("unreachable") from None
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt]:
-        condition = self._feature_condition(node.test)
-        if condition is None:
+        if not self._references_specialization(node.test):
             return self.generic_visit(node)
-        feature_name, positive = condition
-        enabled = feature_name in self.enabled_features
-        selected = node.body if enabled == positive else node.orelse
+        selected = node.body if self._static_condition(node.test) else node.orelse
         return self._specialize_statements(selected)
 
+    def visit_IfExp(self, node: ast.IfExp) -> ast.expr:
+        if not self._references_specialization(node.test):
+            return self.generic_visit(node)
+        selected = self.visit(node.body if self._static_condition(node.test) else node.orelse)
+        assert isinstance(selected, ast.expr)
+        return selected
+
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        feature_name = self.graph._resolve_feature_name(self.module, node)
-        if feature_name is not None:
-            return ast.copy_location(ast.Constant(value=feature_name in self.enabled_features), node)
+        declaration = self.graph._resolve_specialization(self.module, node)
+        if declaration is not None:
+            return ast.copy_location(ast.Constant(value=self._specialization_value(node, *declaration)), node)
         if isinstance(node.ctx, ast.Load) and node.id in self.module.constants:
             return ast.copy_location(ast.Constant(value=self.module.constants[node.id]), node)
         return node
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
-        feature_name = self.graph._resolve_feature_name(self.module, node)
-        if feature_name is not None:
-            return ast.copy_location(ast.Constant(value=feature_name in self.enabled_features), node)
+        declaration = self.graph._resolve_specialization(self.module, node)
+        if declaration is not None:
+            return ast.copy_location(ast.Constant(value=self._specialization_value(node, *declaration)), node)
         return self.generic_visit(node)
+
+    def _specialization_value(self, node: ast.AST, name: str, scalar: str) -> bool | int | float:
+        if scalar == "bool":
+            return bool(self.values.get(name, False))
+        if name not in self.values:
+            self.graph._error(self.module, node, f"missing specialization '{name}'")
+        return self.values[name]
+
+    def _references_specialization(self, expression: ast.expr) -> bool:
+        return any(
+            isinstance(value, (ast.Name, ast.Attribute))
+            and self.graph._resolve_specialization(self.module, value) is not None
+            for value in ast.walk(expression)
+        )
+
+    def _static_condition(
+        self, expression: ast.expr, message: str = "specialization condition mixes runtime values"
+    ) -> bool:
+        value = self._static_value(expression)
+        if value is _NOT_STATIC:
+            self.graph._error(self.module, expression, message)
+        return bool(value)
+
+    def _static_value(self, node: ast.expr) -> object:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
+            return node.value
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            declaration = self.graph._resolve_specialization(self.module, node)
+            if declaration is not None:
+                return self._specialization_value(node, *declaration)
+            if isinstance(node, ast.Name) and node.id in self.module.constants:
+                return self.module.constants[node.id]
+            return _NOT_STATIC
+        if isinstance(node, ast.UnaryOp):
+            operand = self._static_value(node.operand)
+            if operand is _NOT_STATIC:
+                return _NOT_STATIC
+            if isinstance(node.op, ast.Not):
+                return not operand
+            if isinstance(node.op, ast.USub):
+                return -operand  # type: ignore[operator]
+            if isinstance(node.op, ast.UAdd):
+                return operand
+            return _NOT_STATIC
+        if isinstance(node, ast.BoolOp):
+            values = [self._static_value(value) for value in node.values]
+            if any(value is _NOT_STATIC for value in values):
+                return _NOT_STATIC
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.BinOp):
+            operator = _STATIC_BINARY_OPERATORS.get(type(node.op))
+            left, right = self._static_value(node.left), self._static_value(node.right)
+            if operator is None or left is _NOT_STATIC or right is _NOT_STATIC:
+                return _NOT_STATIC
+            try:
+                return operator(left, right)
+            except ZeroDivisionError:
+                self.graph._error(self.module, node, "division by zero in a compile-time expression")
+        if isinstance(node, ast.Compare):
+            left = self._static_value(node.left)
+            if left is _NOT_STATIC:
+                return _NOT_STATIC
+            for operator_node, comparator in zip(node.ops, node.comparators, strict=True):
+                operator = _STATIC_COMPARISONS.get(type(operator_node))
+                right = self._static_value(comparator)
+                if operator is None or right is _NOT_STATIC:
+                    return _NOT_STATIC
+                if not operator(left, right):
+                    return False
+                left = right
+            return True
+        return _NOT_STATIC
 
     def _specialize_statements(self, statements: list[ast.stmt]) -> list[ast.stmt]:
         result: list[ast.stmt] = []
@@ -358,25 +495,13 @@ class _FeatureSpecializer(ast.NodeTransformer):
                 result.append(transformed)
         return result
 
-    def _conditional_type(self, annotation: ast.expr | None) -> tuple[str, ast.expr] | None:
+    def _conditional_type(self, annotation: ast.expr | None) -> tuple[ast.expr, ast.expr] | None:
         if not isinstance(annotation, ast.Subscript) or (_dotted_name(annotation.value) or "").split(".")[-1] != "When":
             return None
         items = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
         if len(items) != 2:
-            self.graph._error(self.module, annotation, "When requires a feature and a type")
-        feature_name = self.graph._resolve_feature_name(self.module, items[0])
-        if feature_name is None:
-            self.graph._error(self.module, items[0], "When condition must be a declared feature")
-        return feature_name, items[1]
-
-    def _feature_condition(self, expression: ast.expr) -> tuple[str, bool] | None:
-        positive = True
-        value = expression
-        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
-            positive = False
-            value = expression.operand
-        feature_name = self.graph._resolve_feature_name(self.module, value)
-        return (feature_name, positive) if feature_name is not None else None
+            self.graph._error(self.module, annotation, "When requires a condition and a type")
+        return items[0], items[1]
 
 
 class _ReferenceRewriter(ast.NodeTransformer):
@@ -484,10 +609,18 @@ class _ReferenceRewriter(ast.NodeTransformer):
 class ModuleGraph:
     """Loads project-local DSL modules as source without executing Python."""
 
-    def __init__(self, input_path: str | Path, enabled_features: tuple[str, ...] = (), entry: str | None = None):
+    def __init__(
+        self,
+        input_path: str | Path,
+        specializations: tuple[SpecializationAssignment, ...] = (),
+        entry: str | None = None,
+    ):
         self.input_path = Path(input_path).resolve()
         self.project_root = self._project_root(self.input_path.parent)
-        self.enabled_features = frozenset(enabled_features)
+        self.specializations = specializations
+        self.specialization_values: dict[str, bool | int | float] = {
+            assignment.name: assignment.value for assignment in specializations
+        }
         self.entry = entry
         self.modules: dict[Path, _Module] = {}
         self.order: list[_Module] = []
@@ -507,14 +640,25 @@ class ModuleGraph:
                     isinstance(definition, ast.FunctionDef)
                     and any(_decorator_name(item) in _FUNCTION_DECORATORS for item in definition.decorator_list)
                 )
-                or (
-                    isinstance(definition, ast.ClassDef)
-                    and any(_decorator_name(item) == "struct" for item in definition.decorator_list)
-                )
+                or _is_dsl_class(definition)
             )
-        for seed in (*seeds, *root.features):
+        for seed in (*seeds, *root.features, *root.scalars):
             self._touch_symbol(root, seed)
         return root
+
+    def declared_specializations(self) -> dict[str, str]:
+        """Maps every reachable specialization name to its scalar kind; requires `discover`."""
+        declared: dict[str, str] = {}
+        for module in self.modules.values():
+            rows = [(local, (name, "bool")) for local, name in module.features.items()]
+            rows.extend(module.scalars.items())
+            for local, (name, scalar) in rows:
+                if (module.path, local) not in self.reachable_symbols:
+                    continue
+                previous = declared.setdefault(name, scalar)
+                if previous != scalar:
+                    self._error(module, module.tree, f"specialization '{name}' is declared as {previous} and {scalar}")
+        return declared
 
     def _selected_entry_symbol(self, root: _Module) -> tuple[_Module, str] | None:
         if self.entry is None:
@@ -530,15 +674,19 @@ class ModuleGraph:
 
     def load(self) -> LoadedProject:
         root = self.discover()
-        declared_features = {
-            feature
-            for module in self.modules.values()
-            for name, feature in module.features.items()
-            if (module.path, name) in self.reachable_symbols
-        }
-        unknown_features = self.enabled_features - declared_features
-        if unknown_features:
-            self._error(root, root.tree, "requested undeclared feature(s): " + ", ".join(sorted(unknown_features)))
+        declared = self.declared_specializations()
+        declared_features = {name for name, scalar in declared.items() if scalar == "bool"}
+        unknown = sorted(assignment.name for assignment in self.specializations if assignment.name not in declared)
+        if unknown:
+            self._error(root, root.tree, "requested undeclared specialization(s): " + ", ".join(unknown))
+        for assignment in self.specializations:
+            if declared[assignment.name] != assignment.type:
+                self._error(
+                    root,
+                    root.tree,
+                    f"specialization '{assignment.name}' is declared as {declared[assignment.name]}, "
+                    f"not {assignment.type}",
+                )
         emitted_names: dict[tuple[Path, str], str] = {}
         for module in self.order:
             prefix = "" if module is root else self._symbol_prefix(module)
@@ -565,12 +713,10 @@ class ModuleGraph:
                     function_sources[emitted_name] = (module, definition)
                     host_function_names.add(emitted_name)
                     continue
-                if isinstance(definition, ast.ClassDef) and not any(
-                    _decorator_name(decorator) == "struct" for decorator in definition.decorator_list
-                ):
+                if isinstance(definition, ast.ClassDef) and not _is_dsl_class(definition):
                     continue
                 transformed = copy.deepcopy(definition)
-                transformed = _FeatureSpecializer(self, module, self.enabled_features).visit(transformed)
+                transformed = _Specializer(self, module, self.specialization_values).visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if isinstance(transformed, ast.FunctionDef):
                     is_entry = any(
@@ -590,17 +736,23 @@ class ModuleGraph:
                     function_sources[transformed.name] = (module, definition)
                 body.append(transformed)
 
-        normalized = normalize_struct_methods(ast.Module(body=body, type_ignores=[]), str(root.path))
-        body = normalized.body
-        for statement in body:
+        # Analysis runs on hoisted methods so pruning and call-graph checks see calls hidden behind receiver syntax.
+        # The emitted source keeps methods inside their classes: the frontend hoists them again and needs the
+        # method tables to resolve calls on receivers whose type is known only after inference.
+        analysis = normalize_struct_methods(ast.Module(body=copy.deepcopy(body), type_ignores=[]), str(root.path))
+        analysis_body = analysis.body
+        for statement in analysis_body:
             if isinstance(statement, ast.FunctionDef):
                 function_sources.setdefault(statement.name, (root, statement))
-        # Method normalization exposes calls hidden behind receiver syntax.
-        # Entry pruning must see those calls or it can remove helpers that are
-        # reachable only through a struct method.
         if self.entry is not None:
-            body = self._prune_to_entry(body, self.entry, root)
-        self._validate_call_graph(body, function_sources, entry_names, host_function_names)
+            reachable = self._reachable_functions(analysis_body, self.entry, root, method_tables(analysis))
+            analysis_body = [
+                statement
+                for statement in analysis_body
+                if not isinstance(statement, ast.FunctionDef) or statement.name in reachable
+            ]
+            body = self._prune_emitted(body, reachable)
+        self._validate_call_graph(analysis_body, function_sources, entry_names, host_function_names)
         combined = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
         dependency_records = tuple(
             (
@@ -650,7 +802,7 @@ class ModuleGraph:
     def _collect_definitions(self, module: _Module) -> None:
         for node in module.tree.body:
             if isinstance(node, ast.Assign):
-                self._collect_feature(module, node)
+                self._collect_specialization(module, node)
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -661,7 +813,7 @@ class ModuleGraph:
                 continue
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 continue
-            if node.name in module.definitions or node.name in module.features:
+            if node.name in module.definitions or module.declares_specialization(node.name):
                 self._error(module, node, f"duplicate DSL symbol '{node.name}'")
             if isinstance(node, ast.FunctionDef):
                 decorators = [_decorator_name(decorator) for decorator in node.decorator_list]
@@ -676,19 +828,13 @@ class ModuleGraph:
                     )
             module.definitions[node.name] = node
 
-    def _collect_feature(self, module: _Module, node: ast.Assign) -> None:
+    def _collect_specialization(self, module: _Module, node: ast.Assign) -> None:
         if not isinstance(node.value, ast.Call):
             return
         kind = (_dotted_name(node.value.func) or "").split(".")[-1]
-        is_feature = kind == "feature"
-        is_bool_specialization = (
-            kind == "specialization"
-            and len(node.value.args) == 2
-            and (_dotted_name(node.value.args[1]) or "").split(".")[-1] == "bool"
-        )
-        if not is_feature and not is_bool_specialization:
+        if kind not in {"feature", "specialization"}:
             return
-        expected_arguments = 1 if is_feature else 2
+        expected_arguments = 1 if kind == "feature" else 2
         if (
             len(node.targets) != 1
             or not isinstance(node.targets[0], ast.Name)
@@ -700,14 +846,19 @@ class ModuleGraph:
             self._error(
                 module,
                 node,
-                'Boolean specialization declaration must be NAME = feature("NAME") '
-                'or NAME = specialization("NAME", bool)',
+                'specialization declaration must be NAME = feature("NAME") or NAME = specialization("NAME", TYPE)',
             )
+        scalar = "bool" if kind == "feature" else (_dotted_name(node.value.args[1]) or "").split(".")[-1]
+        if scalar not in _SPECIALIZATION_SCALARS:
+            self._error(module, node, "specialization type must be bool, i32, u32, f32, or f64")
         local_name = node.targets[0].id
-        feature_name = node.value.args[0].value
-        if not feature_name or local_name in module.definitions or local_name in module.features:
-            self._error(module, node, f"invalid or duplicate feature declaration '{local_name}'")
-        module.features[local_name] = feature_name
+        specialization_name = node.value.args[0].value
+        if not specialization_name or local_name in module.definitions or module.declares_specialization(local_name):
+            self._error(module, node, f"invalid or duplicate specialization declaration '{local_name}'")
+        if scalar == "bool":
+            module.features[local_name] = specialization_name
+        else:
+            module.scalars[local_name] = (specialization_name, scalar)
 
     def _index_imports(self, module: _Module) -> None:
         for node in module.tree.body:
@@ -737,7 +888,7 @@ class ModuleGraph:
     def _add_import_spec(self, module: _Module, spec: _ImportSpec) -> None:
         if (
             spec.local_name in module.definitions
-            or spec.local_name in module.features
+            or module.declares_specialization(spec.local_name)
             or spec.local_name in module.import_specs
         ):
             self._error(module, spec.node, f"duplicate imported symbol '{spec.local_name}'")
@@ -764,7 +915,7 @@ class ModuleGraph:
         if spec.symbol_name is None:
             self._add_module_import(module, local_name, target, spec.node)
             return target, None
-        if spec.symbol_name not in target.definitions and spec.symbol_name not in target.features:
+        if spec.symbol_name not in target.definitions and not target.declares_specialization(spec.symbol_name):
             self._error(module, spec.node, f"module '{target.name}' has no symbol '{spec.symbol_name}'")
         self._add_symbol_import(module, local_name, target, spec.symbol_name, spec.node)
         return target, spec.symbol_name
@@ -787,12 +938,11 @@ class ModuleGraph:
             definition = module.definitions.get(name)
             if definition is not None:
                 if not (isinstance(definition, ast.FunctionDef) and name in module.host_functions) and not (
-                    isinstance(definition, ast.ClassDef)
-                    and not any(_decorator_name(item) == "struct" for item in definition.decorator_list)
+                    isinstance(definition, ast.ClassDef) and not _is_dsl_class(definition)
                 ):
                     self._follow_references(module, definition)
                 return
-            if name in module.features or name in module.constants:
+            if module.declares_specialization(name) or name in module.constants:
                 return
             imported = self._materialize_import(module, name)
             if imported is not None and imported[1] is not None:
@@ -809,12 +959,12 @@ class ModuleGraph:
                     imported = self._materialize_import(module, root)
                     if imported is not None and imported[1] is None:
                         symbol = remainder.split(".", 1)[0]
-                        if symbol in imported[0].definitions or symbol in imported[0].features:
+                        if symbol in imported[0].definitions or imported[0].declares_specialization(symbol):
                             self._touch_symbol(imported[0], symbol)
             elif isinstance(value, ast.Name) and isinstance(value.ctx, ast.Load):
                 if (
                     value.id in module.definitions
-                    or value.id in module.features
+                    or module.declares_specialization(value.id)
                     or value.id in module.constants
                     or value.id in module.import_specs
                 ):
@@ -841,7 +991,7 @@ class ModuleGraph:
     def _add_symbol_import(self, module: _Module, local_name: str, target: _Module, symbol: str, node: ast.AST) -> None:
         if (
             local_name in module.definitions
-            or local_name in module.features
+            or module.declares_specialization(local_name)
             or local_name in module.symbol_imports
             or local_name in module.module_imports
         ):
@@ -851,29 +1001,36 @@ class ModuleGraph:
     def _add_module_import(self, module: _Module, local_name: str, target: _Module, node: ast.AST) -> None:
         if (
             local_name in module.definitions
-            or local_name in module.features
+            or module.declares_specialization(local_name)
             or local_name in module.symbol_imports
             or local_name in module.module_imports
         ):
             self._error(module, node, f"duplicate imported symbol '{local_name}'")
         module.module_imports[local_name] = target
 
-    def _resolve_feature_name(self, module: _Module, node: ast.AST) -> str | None:
+    def _resolve_specialization(self, module: _Module, node: ast.AST) -> tuple[str, str] | None:
+        """Returns the (name, scalar kind) of the specialization `node` names, if any."""
+
+        def declared(owner: _Module, local: str) -> tuple[str, str] | None:
+            if local in owner.features:
+                return owner.features[local], "bool"
+            return owner.scalars.get(local)
+
         if isinstance(node, ast.Name):
-            if node.id in module.features:
-                return module.features[node.id]
+            local = declared(module, node.id)
+            if local is not None:
+                return local
             imported = module.symbol_imports.get(node.id)
             if imported:
                 target, symbol = imported
-                return target.features.get(symbol)
+                return declared(target, symbol)
             return None
         if isinstance(node, ast.Attribute):
             dotted = _dotted_name(node) or ""
             for alias, target in module.module_imports.items():
                 prefix = alias + "."
                 if dotted.startswith(prefix):
-                    symbol = dotted.removeprefix(prefix)
-                    return target.features.get(symbol)
+                    return declared(target, dotted.removeprefix(prefix))
         return None
 
     def _parse_abi_type(self, module: _Module, node: ast.AST) -> ConcreteType:
@@ -923,19 +1080,21 @@ class ModuleGraph:
         return ConcreteType("tensor", "Tensor", (element, *shape))
 
     def _resolve_struct_type(self, module: _Module, node: ast.AST) -> tuple[_Module, ast.ClassDef] | None:
+        resolved = self._resolve_class(module, node)
+        if resolved is None or not any(_decorator_name(item) == "struct" for item in resolved[1].decorator_list):
+            return None
+        return resolved
+
+    def _resolve_class(self, module: _Module, node: ast.AST) -> tuple[_Module, ast.ClassDef] | None:
         if isinstance(node, ast.Name):
             local = module.definitions.get(node.id)
-            if isinstance(local, ast.ClassDef) and any(
-                _decorator_name(item) == "struct" for item in local.decorator_list
-            ):
+            if isinstance(local, ast.ClassDef):
                 return module, local
             imported = module.symbol_imports.get(node.id)
             if imported is not None:
                 owner, name = imported
                 declaration = owner.definitions.get(name)
-                if isinstance(declaration, ast.ClassDef) and any(
-                    _decorator_name(item) == "struct" for item in declaration.decorator_list
-                ):
+                if isinstance(declaration, ast.ClassDef):
                     return owner, declaration
             return None
         if isinstance(node, ast.Attribute):
@@ -946,9 +1105,7 @@ class ModuleGraph:
                     continue
                 name = dotted.removeprefix(prefix)
                 declaration = owner.definitions.get(name)
-                if isinstance(declaration, ast.ClassDef) and any(
-                    _decorator_name(item) == "struct" for item in declaration.decorator_list
-                ):
+                if isinstance(declaration, ast.ClassDef):
                     return owner, declaration
         return None
 
@@ -973,35 +1130,55 @@ class ModuleGraph:
             return value if isinstance(value, int) and not isinstance(value, bool) else None
         return None
 
-    def _prune_to_entry(self, body: list[ast.stmt], entry: str, root: _Module) -> list[ast.stmt]:
+    def _reachable_functions(
+        self, body: list[ast.stmt], entry: str, root: _Module, methods: dict[str, dict[str, str]]
+    ) -> set[str]:
         functions = {statement.name: statement for statement in body if isinstance(statement, ast.FunctionDef)}
         selected = functions.get(entry)
         if selected is None or not any(
             _decorator_name(decorator) in _STAGE_DECORATORS for decorator in selected.decorator_list
         ):
             self._error(root, root.tree, f"unknown shader entry point '{entry}'")
+        # A method call left on its receiver resolves only after inference, so it keeps every same-named method.
+        helpers_by_method: dict[str, set[str]] = {}
+        for table in methods.values():
+            for method, helper in table.items():
+                helpers_by_method.setdefault(method, set()).add(helper)
         reachable = {entry}
         pending = [entry]
         while pending:
             current = pending.pop()
             for node in ast.walk(functions[current]):
-                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                if not isinstance(node, ast.Call):
                     continue
-                callee = node.func.id
-                if callee in functions and callee not in reachable:
-                    reachable.add(callee)
-                    pending.append(callee)
-        return [
-            statement
-            for statement in body
-            if (
-                (isinstance(statement, ast.FunctionDef) and statement.name in reachable)
-                or (
-                    isinstance(statement, ast.ClassDef)
-                    and any(_decorator_name(decorator) == "struct" for decorator in statement.decorator_list)
-                )
-            )
-        ]
+                if isinstance(node.func, ast.Name):
+                    callees = {node.func.id}
+                elif isinstance(node.func, ast.Attribute):
+                    callees = helpers_by_method.get(node.func.attr, set())
+                else:
+                    continue
+                for callee in callees:
+                    if callee in functions and callee not in reachable:
+                        reachable.add(callee)
+                        pending.append(callee)
+        return reachable
+
+    @staticmethod
+    def _prune_emitted(body: list[ast.stmt], reachable: set[str]) -> list[ast.stmt]:
+        pruned: list[ast.stmt] = []
+        for statement in body:
+            if isinstance(statement, ast.FunctionDef):
+                if statement.name in reachable:
+                    pruned.append(statement)
+            elif _is_dsl_class(statement):
+                assert isinstance(statement, ast.ClassDef)
+                statement.body = [
+                    member
+                    for member in statement.body
+                    if not isinstance(member, ast.FunctionDef) or f"{statement.name}__{member.name}" in reachable
+                ] or [ast.Pass()]
+                pruned.append(statement)
+        return pruned
 
     def _validate_call_graph(
         self,
@@ -1127,9 +1304,9 @@ class ModuleGraph:
 
 
 def _load_project_graph(
-    input_path: str | Path, enabled_features: tuple[str, ...], entry: str | None
+    input_path: str | Path, specializations: tuple[SpecializationAssignment, ...], entry: str | None
 ) -> tuple[ModuleGraph, _Module]:
-    graph = ModuleGraph(input_path, enabled_features, entry)
+    graph = ModuleGraph(input_path, specializations, entry)
     if _module_graph_cache.restore(graph):
         return graph, graph.modules[graph.input_path]
     root = graph.discover()
@@ -1138,10 +1315,18 @@ def _load_project_graph(
 
 
 def load_project(
-    input_path: str | Path, enabled_features: tuple[str, ...] = (), entry: str | None = None
+    input_path: str | Path,
+    specializations: tuple[SpecializationAssignment, ...] = (),
+    entry: str | None = None,
 ) -> LoadedProject:
-    graph, _ = _load_project_graph(input_path, enabled_features, entry)
+    graph, _ = _load_project_graph(input_path, specializations, entry)
     return graph.load()
+
+
+def declared_project_specializations(input_path: str | Path) -> dict[str, str]:
+    """Maps the specializations reachable from a source file to their scalar kinds without applying a key."""
+    graph, _ = _load_project_graph(input_path, (), None)
+    return graph.declared_specializations()
 
 
 def resolve_project_entry(input_path: str | Path, entry: str) -> ProjectEntryResolution | None:

@@ -14,10 +14,18 @@ inline nb::object pythonAdArraySource(const nb::object &source) {
 
 struct PythonAdMetadata {
     std::string path;
+    // The Program input that owns `path`: its name equals `path` or is a dotted prefix of it.
     std::string binding;
     VernonDataType dtype{};
     std::vector<uint64_t> shape;
 };
+
+// Binding-group leaf names contain dots, so the projection inside the binding is what follows the binding's own
+// name, not what follows the first dot of the path.
+inline std::string bindingLeafPath(const PythonAdMetadata &metadata) {
+    return metadata.path.size() > metadata.binding.size() ? metadata.path.substr(metadata.binding.size() + 1)
+                                                          : std::string();
+}
 
 inline size_t pythonAdMetadataBytes(const PythonAdMetadata &metadata) {
     size_t bytes = autodiffDtypeSize(metadata.dtype);
@@ -55,6 +63,8 @@ inline nb::object pythonAdGradientBuffer(const PythonAdMetadata &gradient, const
 PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *executable, const ProgramParameterMetadata &parameter,
                                      size_t leafIndex, VernonProgramValueLeafView *reflected = nullptr);
 
+// The longest input name that equals `leafPath` or is a dotted prefix of it, or empty when none does.
+std::string programInputName(const nb::dict &inputs, const std::string &leafPath);
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
 struct PythonPullback {
@@ -174,9 +184,10 @@ private:
             if (!binding.is_none() && nb::hasattr(binding, "_materialize_gradient")) {
                 nb::object resourceOwner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
                 auto existing = gradientsByOwner.find(resourceOwner.ptr());
+                const std::string leaf = bindingLeafPath(gradient);
                 materialized = existing == gradientsByOwner.end()
-                                   ? binding.attr("_materialize_gradient")(zeros, gradient.path)
-                                   : binding.attr("_materialize_gradient")(zeros, gradient.path, existing->second);
+                                   ? binding.attr("_materialize_gradient")(zeros, leaf)
+                                   : binding.attr("_materialize_gradient")(zeros, leaf, existing->second);
                 if (existing == gradientsByOwner.end())
                     gradientsByOwner.emplace(resourceOwner.ptr(), materialized);
             }
@@ -394,7 +405,7 @@ private:
                 parameter.elementLeaves.front().scalar_count == 1 &&
                 (parameter.elementLeafShapes.empty() || parameter.elementLeafShapes.front().empty()) &&
                 nb::hasattr(binding, "_gradient_device_view")) {
-                source = binding.attr("_gradient_device_view")(metadata.path, source, metadata.shape);
+                source = binding.attr("_gradient_device_view")(bindingLeafPath(metadata), source, metadata.shape);
                 nb::object layout = source.attr("layout");
                 const std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(source.attr("shape"));
                 const std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
@@ -420,7 +431,8 @@ private:
                                  [&](const PythonAdMetadata &candidate) { return candidate.path == path; });
                 if (found == (role == VERNON_AD_DERIVATIVE_COTANGENT ? cotangents : gradients).end())
                     continue;
-                leaves[nb::str(path.c_str())] = binding.attr("_gradient_device_view")(path, source, found->shape);
+                leaves[nb::str(path.c_str())] =
+                    binding.attr("_gradient_device_view")(bindingLeafPath(*found), source, found->shape);
             }
             addBoundary(parameter, packBoundary(parameter, leaves, access == VERNON_ACCESS_WRITE), access);
         };
@@ -470,8 +482,9 @@ private:
                 nb::object binding = derivativeBinding(*found);
                 if (nb::hasattr(source, "_resident_buffer") && !binding.is_none() &&
                     nb::hasattr(binding, "_gradient_device_view")) {
-                    appendDeviceAccess(parameter.slot,
-                                       binding.attr("_gradient_device_view")(path, source, found->shape), "read");
+                    appendDeviceAccess(
+                        parameter.slot,
+                        binding.attr("_gradient_device_view")(bindingLeafPath(*found), source, found->shape), "read");
                     projected = true;
                 }
             }
@@ -487,7 +500,7 @@ private:
             nb::object binding = derivativeBinding(metadata);
             if (nb::hasattr(source, "_resident_buffer") && !binding.is_none() &&
                 nb::hasattr(binding, "_gradient_device_view"))
-                source = binding.attr("_gradient_device_view")(metadata.path, source, metadata.shape);
+                source = binding.attr("_gradient_device_view")(bindingLeafPath(metadata), source, metadata.shape);
             const auto boundary = std::find_if(
                 gradientBoundaries.begin(), gradientBoundaries.end(), [&](const ProgramParameterMetadata &candidate) {
                     const std::string prefix = candidate.name + ".";
@@ -737,7 +750,6 @@ struct PythonProgramExecutable {
                             continue;
                         PythonAdMetadata metadata;
                         metadata.path = expectedPath;
-                        metadata.binding = declaredPath;
                         metadata.dtype = static_cast<VernonDataType>(leaf.value.dtype);
                         if (boundary.rank)
                             metadata.shape.assign(boundary.static_shape, boundary.static_shape + boundary.rank);
@@ -765,17 +777,15 @@ struct PythonProgramExecutable {
             leaf.shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
         };
         for (PythonAdMetadata &leaf : cotangents) {
-            leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path);
-            if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
-                leaf.binding.resize(separator);
+            leaf.binding =
+                programInputName(programBindings, declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path));
             instantiateBoundMetadata(leaf);
         }
         std::vector<PythonAdMetadata> gradients =
             reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_GRADIENT, VERNON_AD_DERIVATIVE_GRADIENT);
         for (PythonAdMetadata &leaf : gradients) {
-            leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path);
-            if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
-                leaf.binding.resize(separator);
+            leaf.binding =
+                programInputName(programBindings, declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path));
             instantiateBoundMetadata(leaf);
         }
         PythonInvocationOutcome outcome = invocation.execute(true);

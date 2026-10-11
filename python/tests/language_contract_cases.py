@@ -80,10 +80,14 @@ class AcceptanceSuite(Enum):
 
 @dataclass(frozen=True)
 class RuntimeOracle:
+    """For SPECIALIZATION_PIXELS, `specialization` names a u32 specialization and `expected` holds one
+    (value, red channel) pair per cooked variant; the runtime resolves and renders each variant."""
+
     kind: RuntimeOracleKind
     expected: tuple[int | float, ...]
     parameter: str = "output"
     grid: tuple[int, int, int] = (1, 1, 1)
+    specialization: str = ""
 
 
 @dataclass(frozen=True)
@@ -2598,7 +2602,7 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
         contract_ids=frozenset({"LANG-SPECIALIZE-001", "LANG-PAIR-004"}),
         asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:specialization_asset",
         requirements=AcceptanceRequirements(graphics=True),
-        oracle=RuntimeOracle(RuntimeOracleKind.SPECIALIZATION_PIXELS, (64, 128)),
+        oracle=RuntimeOracle(RuntimeOracleKind.SPECIALIZATION_PIXELS, (1, 64, 2, 128), specialization="SCALE"),
     ),
     LanguageContractAcceptance(
         id="storage_texture",

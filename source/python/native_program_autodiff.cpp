@@ -93,7 +93,7 @@ PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *executable, const 
     return result;
 }
 
-nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath) {
+std::string programInputName(const nb::dict &inputs, const std::string &leafPath) {
     std::string root;
     nb::list keys(inputs.attr("keys")());
     for (size_t index = 0; index < keys.size(); ++index) {
@@ -105,6 +105,11 @@ nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &le
                 root = key;
         }
     }
+    return root;
+}
+
+nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath) {
+    const std::string root = programInputName(inputs, leafPath);
     if (root.empty())
         throw std::invalid_argument("missing Program autodiff input '" + leafPath + "'");
     nb::object value = nb::borrow<nb::object>(inputs[nb::str(root.c_str())]);

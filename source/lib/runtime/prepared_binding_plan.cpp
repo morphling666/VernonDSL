@@ -219,7 +219,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
 
                 if (backend == VERNON_RUNTIME_CUDA)
                     layout.kind =
-                        use.interfaceKind == "storage" || (use.transport == "storage_buffer" && !use.shape.empty())
+                        use.interfaceKind == "storage" || (use.transport == "storage_buffer" && use.bufferValue)
                             ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                             : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 else
@@ -268,7 +268,8 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                 nativeOrdinal +=
                     existing.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? kCudaRankOneMemRefParameterCount : 1;
             if (nativeOrdinal != carrier.parameterOrdinal) {
-                error = "CUDA metadata carrier parameter ordinal does not match the native kernel ABI";
+                error = "CUDA metadata carrier parameter ordinal " + std::to_string(carrier.parameterOrdinal) +
+                        " does not match the native kernel ABI ordinal " + std::to_string(nativeOrdinal);
                 return false;
             }
         }
@@ -382,14 +383,46 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         maximumExternalSlot = std::max(maximumExternalSlot, parameter.slot);
     uint32_t nextInternalSlot = maximumExternalSlot;
 
+    // D3D12 places external parameters at their parameter slot, so every additional provider slot must come after
+    // the highest parameter slot; sequential backends number every layout entry in order.
+    const auto allocateSlot = [&](uint32_t &slot) {
+        uint32_t &next = usesSequentialGraphicsSlots(options.backend) ? nextProviderSlot : nextInternalSlot;
+        if (next == UINT32_MAX) {
+            error = "graphics binding layout exceeds the provider slot range";
+            return false;
+        }
+        slot = usesSequentialGraphicsSlots(options.backend) ? next++ : ++next;
+        return true;
+    };
     const auto append = [&](VernonRuntimeProviderBindingLayoutEntry layout, PreparedGraphicsBindingSource source,
                             std::vector<VernonRuntimeProviderVertexAttribute> attributes) {
+        // D3D12 builds one root signature per pipeline, so a descriptor that both stages use is one range visible
+        // to both. The link gives equal (kind, set, binding) only to the same Program Value. Inline root constants
+        // are per-stage root parameters and stay separate.
+        if (directX12 && layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+            layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
+            const auto shared = std::find_if(output.layouts.begin(), output.layouts.end(), [&](const auto &existing) {
+                return existing.kind == layout.kind && existing.set == layout.set && existing.binding == layout.binding;
+            });
+            if (shared != output.layouts.end()) {
+                shared->stage_mask |= layout.stage_mask;
+                return true;
+            }
+        }
+        if (std::any_of(output.layouts.begin(), output.layouts.end(),
+                        [&](const auto &existing) { return existing.slot == layout.slot; }) &&
+            !allocateSlot(layout.slot))
+            return false;
         output.layouts.push_back(layout);
         output.sources.push_back(std::move(source));
         output.vertexAttributes.insert(output.vertexAttributes.end(), attributes.begin(), attributes.end());
+        return true;
     };
 
     const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
+        // An explicit sampler binds through the images it samples; a stage that never samples with it has no slot.
+        if (!internal && parameter.kind == "sampler" && use.sampledImageBindings.empty())
+            return true;
         const uint32_t stageMask = graphicsStageMask(use.stage);
         if (!stageMask) {
             error = "graphics parameter references an unsupported stage";
@@ -405,22 +438,11 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         }
 
         VernonRuntimeProviderBindingLayoutEntry layout{};
-        if (usesSequentialGraphicsSlots(options.backend)) {
-            if (nextProviderSlot == UINT32_MAX) {
-                error = "graphics binding layout exceeds the provider slot range";
+        if (usesSequentialGraphicsSlots(options.backend) || internal) {
+            if (!allocateSlot(layout.slot))
                 return false;
-            }
-            layout.slot = nextProviderSlot++;
         } else {
-            if (internal) {
-                if (nextInternalSlot == UINT32_MAX) {
-                    error = "D3D12 graphics binding layout exceeds the provider slot range";
-                    return false;
-                }
-                layout.slot = ++nextInternalSlot;
-            } else {
-                layout.slot = parameter.slot;
-            }
+            layout.slot = parameter.slot;
         }
         layout.argument_index = use.index;
         layout.stage_mask = stageMask;
@@ -443,13 +465,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 }
                 auto samplerLayout = layout;
                 auto samplerSource = source;
-                if (index != 0) {
-                    if (!usesSequentialGraphicsSlots(options.backend) || nextProviderSlot == UINT32_MAX) {
-                        error = "graphics sampler expansion exceeds the provider slot range";
-                        return false;
-                    }
-                    samplerLayout.slot = nextProviderSlot++;
-                }
+                if (index != 0 && !allocateSlot(samplerLayout.slot))
+                    return false;
                 samplerLayout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
                 samplerLayout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 samplerLayout.set = sampledBinding.descriptorSet;
@@ -462,7 +479,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                            sampledBinding.descriptorSet, sampledBinding.binding,
                                                            nullptr, samplerLayout, error))
                     return false;
-                append(samplerLayout, std::move(samplerSource), {});
+                if (!append(samplerLayout, std::move(samplerSource), {}))
+                    return false;
             }
             return true;
         }
@@ -504,8 +522,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 layout.binding = use.binding;
             }
             source.storage.resize(layout.element_size);
-            append(layout, std::move(source), {});
-            return true;
+            return append(layout, std::move(source), {});
         }
 
         if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
@@ -570,8 +587,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                   layout, error))
                     return false;
             }
-            append(layout, std::move(source), {});
-            return true;
+            return append(layout, std::move(source), {});
         }
 
         if (!internal && parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
@@ -605,8 +621,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                       leaf.componentCount, leaf.byteOffset});
             }
             source.kind = PreparedGraphicsBindingSourceKind::ExternalVertex;
-            append(layout, std::move(source), std::move(attributes));
-            return true;
+            return append(layout, std::move(source), std::move(attributes));
         }
 
         if (!internal && parameter.kind == "image" && use.interfaceKind == "resource" && use.binding != UINT32_MAX) {
@@ -630,8 +645,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                   use.binding, nullptr, layout, error))
                     return false;
             }
-            append(layout, std::move(source), {});
-            return true;
+            return append(layout, std::move(source), {});
         }
 
         if (!internal && parameter.kind == "tensor" && use.interfaceKind == "resource" && !use.storageLeaves.empty()) {
@@ -642,13 +656,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                     return false;
                 }
                 auto leafLayout = layout;
-                if (leafIndex != 0) {
-                    if (nextProviderSlot == UINT32_MAX) {
-                        error = "graphics storage leaf expansion exceeds the provider slot range";
-                        return false;
-                    }
-                    leafLayout.slot = nextProviderSlot++;
-                }
+                if (leafIndex != 0 && !allocateSlot(leafLayout.slot))
+                    return false;
                 leafLayout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 leafLayout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 leafLayout.set = use.descriptorSet;
@@ -658,7 +667,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 auto leafSource = source;
                 leafSource.kind = PreparedGraphicsBindingSourceKind::ExternalStorage;
                 leafSource.descriptorBinding = leaf.binding;
-                append(leafLayout, std::move(leafSource), {});
+                if (!append(leafLayout, std::move(leafSource), {}))
+                    return false;
             }
             return true;
         }
@@ -667,20 +677,11 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         return false;
     };
 
-    for (const Parameter &parameter : stagePlan.parameters) {
-        if (directX12 && parameter.uses.size() != 1) {
-            error = "D3D12 graphics parameters must have exactly one stage use";
-            return false;
-        }
+    for (const Parameter &parameter : stagePlan.parameters)
         for (const ParameterUse &use : parameter.uses)
             if (!addUse(parameter, use, false))
                 return false;
-    }
     for (const Parameter &parameter : stagePlan.runtimeParameters) {
-        if (directX12 && parameter.uses.size() != 1) {
-            error = "D3D12 internal graphics parameters must have exactly one stage use";
-            return false;
-        }
         for (const ParameterUse &use : parameter.uses) {
             if (parameter.source == StageParameterSource::ImplicitSampler) {
                 if (parameter.kind != "sampler" || !addUse(parameter, use, true))
@@ -696,8 +697,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
     }
     for (const auto &[stage, carrier] : stagePlan.metadataCarriers) {
         const uint32_t stageMask = graphicsStageMask(stage);
-        if (!stageMask || !usesSequentialGraphicsSlots(options.backend) || nextProviderSlot == UINT32_MAX ||
-            output.metadataCarriers.size() >= UINT32_MAX) {
+        if (!stageMask || output.metadataCarriers.size() >= UINT32_MAX) {
             error = "graphics module metadata carrier cannot be assigned a provider slot";
             return false;
         }
@@ -718,7 +718,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             prepared.argumentSlots[field.argument] = slot;
         }
         VernonRuntimeProviderBindingLayoutEntry layout{};
-        layout.slot = nextProviderSlot++;
+        if (!allocateSlot(layout.slot))
+            return false;
         layout.kind = VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
         layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
         layout.stage_mask = stageMask;
@@ -740,7 +741,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         source.descriptorBinding = carrier.binding;
         source.storage.resize(layout.element_size);
         output.metadataCarriers.push_back(std::move(prepared));
-        append(layout, std::move(source), {});
+        if (!append(layout, std::move(source), {}))
+            return false;
     }
 
     std::vector<size_t> order(output.layouts.size());

@@ -22,6 +22,12 @@ FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module);
 FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module, StringRef tensorViewAccess);
 // Canonical dotted spelling shared by analysis and Program boundary matching.
 std::string appendValueAbiPath(StringRef root, ArrayRef<ValueAbiPathComponent> path);
+// Binding-group leaves are parameters and boundaries whose names contain dots,
+// so a dotted path belongs to every name that equals it or is a dotted prefix
+// of it; callers select the longest such name.
+inline bool isDottedPathPrefix(StringRef name, StringRef path) {
+    return path == name || (path.size() > name.size() && path.starts_with(name) && path[name.size()] == '.');
+}
 // Project primal logical dtypes onto the differentiable ABI leaves, in the
 // same order used by the derivative Value type.
 FailureOr<SmallVector<StringRef>> getAutodiffDerivativeLogicalLeafDtypes(Type primalType, ModuleOp module,

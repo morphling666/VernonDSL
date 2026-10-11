@@ -70,7 +70,8 @@ def main() -> None:
             f'"{acceptance.oracle.kind.value}", '
             f'"{acceptance.oracle.parameter}", '
             f"{acceptance.oracle.grid[0]}, {acceptance.oracle.grid[1]}, {acceptance.oracle.grid[2]}, "
-            f"acceptanceExpected{index}, {len(acceptance.oracle.expected)}"
+            f"acceptanceExpected{index}, {len(acceptance.oracle.expected)}, "
+            f'"{acceptance.oracle.specialization}"'
             "},\n"
         )
     arguments.cpp_output.write_text(

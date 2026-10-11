@@ -17,6 +17,7 @@ enum class Id {
     OpaqueResourceVjp,
     CpuF16,
     GpuF16,
+    SpirvF64,
 };
 
 struct Entry {
@@ -27,7 +28,7 @@ struct Entry {
     std::string_view diagnostic;
 };
 
-inline constexpr std::array<Entry, 10> matrix{{
+inline constexpr std::array<Entry, 11> matrix{{
     {Id::ComputeForward, "compute_forward", true, {}, {}},
     {Id::GraphicsForward, "graphics_forward", true, {}, {}},
     {Id::ComputeTextureBinding, "compute_texture_binding", true, {}, {}},
@@ -40,6 +41,8 @@ inline constexpr std::array<Entry, 10> matrix{{
      "Texture and Sampler are forward-only resources"},
     {Id::CpuF16, "cpu_f16", true, {}, {}},
     {Id::GpuF16, "gpu_f16", false, "PROGRAM_GPU_F16_UNSUPPORTED", "GPU targets do not currently support f16"},
+    {Id::SpirvF64, "spirv_f64", false, "PROGRAM_SPIRV_F64_UNSUPPORTED",
+     "SPIR-V targets (Vulkan, OpenGL, DirectX, Metal) do not currently support f64"},
 }};
 
 constexpr const Entry &get(Id id) {

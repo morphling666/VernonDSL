@@ -49,15 +49,20 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
             collected.stage = function->getAttrOfType<StringAttr>(kStageAttrName).getValue().str();
         uint64_t inlineSize = 0;
         bool readsStorage = false;
+        std::vector<GraphicsBindingRequest> requests;
+        std::vector<std::string> implicitTextures;
         for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
             const unsigned argument = static_cast<unsigned>(index);
             DictionaryAttr dictionary = function.getArgAttrDict(argument);
             InterfaceAttrs attrs = parseInterfaceAttrs(dictionary);
             auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
             const bool generated = dictionary && dictionary.get(kGeneratedBindingAttrName);
+            auto group = dictionary ? dictionary.getAs<StringAttr>(kBindingGroupAttrName) : nullptr;
+            auto implicitTexture = dictionary ? dictionary.getAs<StringAttr>("vernon.implicit_texture") : nullptr;
             const auto request = [&](StringRef requestKind, uint32_t count) {
-                collected.requests.push_back(
-                    {symbol, argument, sourceName(function, argument), requestKind.str(), typeKey(type), count});
+                requests.push_back({symbol, argument, sourceName(function, argument), requestKind.str(), typeKey(type),
+                                    count, group ? group.getValue().str() : std::string()});
+                implicitTextures.push_back(implicitTexture ? implicitTexture.getValue().str() : std::string());
             };
             if (function.getArgAttr(argument, kTensorMetadataCarrierAttrName))
                 continue;
@@ -90,7 +95,8 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
             }
             if (!kind || kind.getValue() != "uniform" || attrs.binding)
                 continue;
-            if (isa<TensorType>(type)) {
+            // Aggregates are not native inline uniforms on OpenGL, OpenGL ES, or Metal, so they always spill.
+            if (isa<TensorType, StructType, TupleType>(type)) {
                 request("uniform_buffer", 1);
                 continue;
             }
@@ -106,6 +112,25 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
             else
                 inlineSize = offset + layout->root->size;
         }
+        // Implicit samplers are generated after every source argument; a group's range is in field order, so each
+        // one follows the texture it samples.
+        for (size_t index = 0; index < requests.size(); ++index) {
+            if (implicitTextures[index].empty())
+                continue;
+            GraphicsBindingRequest sampler = requests[index];
+            auto texture = std::find_if(requests.begin(), requests.end(), [&](const GraphicsBindingRequest &value) {
+                return value.sourceName == implicitTextures[index];
+            });
+            if (texture == requests.end() || texture - requests.begin() > static_cast<std::ptrdiff_t>(index))
+                continue;
+            const size_t target = static_cast<size_t>(texture - requests.begin()) + 1;
+            requests.erase(requests.begin() + static_cast<std::ptrdiff_t>(index));
+            implicitTextures.erase(implicitTextures.begin() + static_cast<std::ptrdiff_t>(index));
+            requests.insert(requests.begin() + static_cast<std::ptrdiff_t>(target), std::move(sampler));
+            implicitTextures.insert(implicitTextures.begin() + static_cast<std::ptrdiff_t>(target), std::string());
+        }
+        collected.requests.insert(collected.requests.end(), std::make_move_iterator(requests.begin()),
+                                  std::make_move_iterator(requests.end()));
         if (readsStorage)
             collected.requests.push_back({symbol, std::nullopt, std::string(), "metadata", std::string(), 1});
     }
@@ -137,13 +162,68 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
         }
 
     using ShareKey = std::tuple<std::string, std::string, std::string, uint32_t>;
+    const auto shareKey = [](const GraphicsBindingRequest &request) {
+        return ShareKey{request.sourceName, request.kind, request.typeKey, request.count};
+    };
+    // A request seen only in a later module, such as an implicit sampler of one stage, joins the group's union
+    // right after the request that precedes it there, which keeps the union in field order.
+    std::map<std::string, std::vector<ShareKey>> groupRequests;
+    for (const GraphicsBindingRequests &module : modules) {
+        std::map<std::string, size_t> cursors;
+        for (const GraphicsBindingRequest &request : module.requests) {
+            if (!request.argument || request.group.empty())
+                continue;
+            std::vector<ShareKey> &keys = groupRequests[request.group];
+            size_t &cursor = cursors[request.group];
+            const ShareKey key = shareKey(request);
+            auto found = std::find(keys.begin(), keys.end(), key);
+            if (found != keys.end()) {
+                cursor = static_cast<size_t>(found - keys.begin()) + 1;
+                continue;
+            }
+            keys.insert(keys.begin() + static_cast<std::ptrdiff_t>(cursor), key);
+            ++cursor;
+        }
+    }
+    std::map<std::string, std::map<ShareKey, SmallVector<uint32_t>>> groupBindings;
+    const auto allocateGroup = [&](const std::string &group) {
+        const std::vector<ShareKey> &keys = groupRequests[group];
+        uint32_t total = 0;
+        for (const ShareKey &key : keys)
+            total += std::get<3>(key);
+        uint32_t base = 0;
+        const auto occupied = [&](uint32_t candidate) {
+            for (uint32_t offset = 0; offset < total; ++offset)
+                if (used.count(candidate + offset))
+                    return true;
+            return false;
+        };
+        while (occupied(base))
+            ++base;
+        std::map<ShareKey, SmallVector<uint32_t>> &assigned = groupBindings[group];
+        uint32_t next = base;
+        for (const ShareKey &key : keys) {
+            SmallVector<uint32_t> &bindings = assigned[key];
+            for (uint32_t index = 0; index < std::get<3>(key); ++index) {
+                used.insert(next);
+                bindings.push_back(next++);
+            }
+        }
+    };
+
     std::map<ShareKey, SmallVector<uint32_t>> shared;
     std::vector<GraphicsBindingLayout> layouts;
     for (const GraphicsBindingRequests &module : modules) {
         GraphicsBindingLayout &layout = layouts.emplace_back();
         for (const GraphicsBindingRequest &request : module.requests) {
+            if (request.argument && !request.group.empty()) {
+                if (!groupBindings.count(request.group))
+                    allocateGroup(request.group);
+                layout.assignments.emplace_back(request, groupBindings[request.group].at(shareKey(request)));
+                continue;
+            }
             const bool shareable = request.argument && !request.sourceName.empty();
-            const ShareKey key{request.sourceName, request.kind, request.typeKey, request.count};
+            const ShareKey key = shareKey(request);
             if (auto found = shareable ? shared.find(key) : shared.end(); found != shared.end()) {
                 layout.assignments.emplace_back(request, found->second);
                 continue;

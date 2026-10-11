@@ -11,17 +11,19 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol, cast
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
+from .._markers import is_struct_class, mark
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..binding_groups import binding_group_leaf_items
 from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
+from ..frontend.runtime_types import resolved_annotations, resolved_leaf_annotations
 from ..host_values import pack_host_value
 from ..types import (
     Specialization,
     SpecializationAssignment,
     TypeExpr,
     _Scalar,
-    specialization_constants,
     specialization_key,
 )
 from ..types import bool as dsl_bool
@@ -76,7 +78,7 @@ class Kernel:
         self.__name__ = function.__name__
         self.__module__ = function.__module__
         self.__doc__ = function.__doc__
-        self.__vernon_dsl__ = ("compute", {"workgroup_size": workgroup_size})
+        mark(self, "compute", workgroup_size=workgroup_size)
         self._function = function
         self._file = Path(inspect.getsourcefile(function) or "")
         self._entry = function.__name__
@@ -176,38 +178,63 @@ class Kernel:
         )
 
     @classmethod
-    def _tensor_view_access(cls, annotation: ast.expr | None) -> str | None:
-        if not isinstance(annotation, ast.Subscript) or cls._annotation_name(annotation.value) != "TensorView":
-            return None
-        arguments = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
-        if len(arguments) != 3:
-            return None
-        access = cls._annotation_name(arguments[2])
-        return access if access in {"read", "write", "read_write"} else None
-
-    @classmethod
     def _is_static_tensor_annotation(cls, annotation: ast.expr | None) -> bool:
         if isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Annotated":
             annotation = annotation.slice.elts[0] if isinstance(annotation.slice, ast.Tuple) else annotation.slice
         return isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Tensor"
 
+    @staticmethod
+    def _typed_entry(lowered: _LoweredKernel) -> Any:
+        entry = next(
+            (
+                function
+                for function in lowered.frontend.typed_functions
+                if function.source.name == lowered.function.name
+            ),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("compiled kernel has no typed entry function")
+        return entry
+
+    @classmethod
+    def _parameter_names(cls, lowered: _LoweredKernel) -> tuple[str, ...]:
+        """Launch parameters of the specialized entry, with each binding group expanded to its dotted leaves.
+
+        `When` parameters disabled by the key are absent.
+        """
+        return tuple(
+            parameter.name
+            for parameter in cls._typed_entry(lowered).parameters
+            if parameter.name not in lowered.builtins
+        )
+
+    def _launch_leaves(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> list[tuple[str, Any]]:
+        """Pairs positional source arguments with the entry's launch parameters, expanding binding groups."""
+        source_parameters = [
+            argument.arg for argument in lowered.function.args.args if argument.arg not in lowered.builtins
+        ]
+        if len(arguments) != len(source_parameters):
+            raise TypeError(f"{self._entry} expects {len(source_parameters)} launch arguments")
+        annotations = resolved_annotations(self._function, lowered.frontend.request.specializations)
+        return [
+            (leaf, leaf_value)
+            for name, value in zip(source_parameters, arguments, strict=True)
+            for leaf, _, leaf_value in binding_group_leaf_items(name, annotations.get(name), value)
+        ]
+
     def _normalize_arguments(
         self,
-        function: ast.FunctionDef,
-        builtins: tuple[str, ...],
+        lowered: _LoweredKernel,
         arguments: tuple[Any, ...],
     ) -> tuple[list[str], tuple[Any, ...]]:
-        user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
-        if len(arguments) != len(user_parameters):
-            raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
-        declared_access = {
-            argument.arg: self._tensor_view_access(argument.annotation)
-            for argument in function.args.args
-            if argument.arg in user_parameters
-        }
+        typed_parameters = {parameter.name: parameter for parameter in self._typed_entry(lowered).parameters}
+        user_parameters: list[str] = []
         normalized: list[Any] = []
-        for name, value in zip(user_parameters, arguments, strict=True):
-            access = declared_access[name]
+        for name, value in self._launch_leaves(lowered, arguments):
+            parameter_type = typed_parameters[name].type
+            access = parameter_type.arguments[2] if parameter_type.kind == "tensor_view" else None
+            user_parameters.append(name)
             normalized.append(value._full_view(access) if isinstance(value, TensorStorage) and access else value)
         return user_parameters, tuple(normalized)
 
@@ -229,7 +256,7 @@ class Kernel:
             "write": {"write", "read_write"},
             "read_write": {"read_write"},
         }
-        annotations = inspect.get_annotations(self._function, eval_str=True)
+        annotations = resolved_leaf_annotations(self._function, frontend.request.specializations)
 
         def dsl_signature(value_type: Any) -> Any:
             if value_type.kind == "scalar":
@@ -266,7 +293,7 @@ class Kernel:
                             runtime_signature(annotation.arguments[0]),
                             tuple(annotation.arguments[1:]),
                         )
-            if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+            if is_struct_class(annotation):
                 return ("struct", annotation.__name__)
             return None
 
@@ -334,7 +361,7 @@ class Kernel:
                 )
 
     def _bind_launch(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> None:
-        user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
+        user_parameters, normalized = self._normalize_arguments(lowered, arguments)
         self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
 
     def _session_target(self) -> tuple[Any, Any, Any]:
@@ -427,18 +454,10 @@ class Kernel:
             if mismatched:
                 detail.append("type mismatch for " + ", ".join(mismatched))
             raise ProgramCompileError("kernel specialization assignment mismatch: " + "; ".join(detail))
-        specialization_bindings = tuple(
-            sorted(
-                (declared_specializations[name][0], name)
-                for name, assignment in supplied_specializations.items()
-                if assignment.type != "bool"
-            )
-        )
         request = FrontendCompileRequest(
             self._file,
             self._entry,
             specializations=specializations,
-            specialization_bindings=specialization_bindings,
             captured_constants=constants,
             workgroup_size=self._workgroup_size,
             autodiff_planning_policy=autodiff_planning_policy,
@@ -454,16 +473,7 @@ class Kernel:
         self,
         specializations: tuple[SpecializationAssignment, ...],
     ) -> dict[str, Any]:
-        annotation_globals = dict(self._function.__globals__)
-        values = dict(specialization_constants(specializations))
-        annotation_globals.update(
-            {
-                local_name: values[value.name]
-                for local_name, value in self._function.__globals__.items()
-                if isinstance(value, Specialization) and value.name in values
-            }
-        )
-        return inspect.get_annotations(self._function, globals=annotation_globals, eval_str=True)
+        return resolved_leaf_annotations(self._function, specializations)
 
     def specialize(
         self,
@@ -517,16 +527,11 @@ class Kernel:
         if target is None:
             raise RuntimeError(f"unsupported kernel architecture {state.arch.name!r}")
         frontend = lowered.frontend
-        entry = next(
-            (function for function in frontend.typed_functions if function.source.name == self._entry),
-            None,
-        )
-        if entry is None or entry.storage_activity is None:
+        entry = self._typed_entry(lowered)
+        if entry.storage_activity is None:
             raise RuntimeError("compiled kernel has no typed storage activity")
         annotations = self._resolved_annotations(key_assignments)
-        parameter_names = tuple(
-            name for name in inspect.signature(self._function).parameters if name not in lowered.builtins
-        )
+        parameter_names = self._parameter_names(lowered)
         from ..frontend.runtime_types import runtime_parameter_descriptor
         from ..program import _one_node_program
 
@@ -572,9 +577,9 @@ class Kernel:
     ) -> None:
         key_assignments = specialization_key(specializations)
         lowered = self._lower(key_assignments)
-        user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
+        user_parameters, normalized = self._normalize_arguments(lowered, arguments)
         self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
-        entry = next(function for function in lowered.frontend.typed_functions if function.source.name == self._entry)
+        entry = self._typed_entry(lowered)
         writable = entry.storage_activity.writable_roots if entry.storage_activity is not None else frozenset()
         if grid is None:
             writable_shapes = {

@@ -25,9 +25,13 @@ inline constexpr llvm::StringLiteral kGraphicsBindingLayoutAttrName = "vernon.gr
 /// materializeGraphicsResourceBindings rather than authored.
 inline constexpr llvm::StringLiteral kGeneratedBindingAttrName = "vernon.generated_binding";
 
+/// Entry argument attribute naming the binding-group occurrence (its entry
+/// parameter path) that a flattened leaf or its implicit sampler belongs to.
+inline constexpr llvm::StringLiteral kBindingGroupAttrName = "vernon.binding_group";
+
 /// One generated set-0 binding request of a graphics entry. `argument` is
 /// empty for the entry's TensorView metadata carrier, which exists only after
-/// target preparation.
+/// target preparation. `group` is the binding-group occurrence, or empty.
 struct GraphicsBindingRequest {
     std::string entry;
     std::optional<unsigned> argument;
@@ -35,6 +39,7 @@ struct GraphicsBindingRequest {
     std::string kind;
     std::string typeKey;
     uint32_t count{};
+    std::string group;
 };
 
 struct GraphicsAuthoredBinding {
@@ -76,6 +81,8 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
 /// endpoints with the same pipeline parameter name. A generated request reuses
 /// the bindings of an earlier module's request with the same parameter name,
 /// kind, type, and count; every other request takes the lowest free bindings.
+/// Each binding-group occurrence takes one consecutive range covering the
+/// union of its requests in every module, so both stages share it.
 FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<GraphicsBindingRequests> modules,
                                                                    std::string &error);
 

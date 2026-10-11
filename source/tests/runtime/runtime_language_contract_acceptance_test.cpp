@@ -323,8 +323,8 @@ void runStructuredViewHostOracle(VernonProgramExecutable *executable, const Acce
     EXPECT_EQ(payloads[0].index, 6);
 }
 
-void runArgumentFreeTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
-                                   const AcceptanceDescriptor &acceptance) {
+void renderArgumentFreeTriangle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+                                std::array<uint8_t, 4> &centerPixel) {
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
     constexpr uint32_t extent = 32;
     vernon::tests::RhiImage target =
@@ -375,17 +375,43 @@ void runArgumentFreeTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, Vernon
     ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), target.handle, &download, pixels.data(), pixels.size()),
               VERNON_RHI_STATUS_OK);
     const size_t center = (extent / 2 * extent + extent / 2) * 4;
-    if (acceptance.oracle == "specialization_pixels") {
-        ASSERT_EQ(acceptance.expectedCount, 2u);
-        EXPECT_NEAR(pixels[center], acceptance.expected[0], 1);
-        EXPECT_LT(pixels[center + 1], 10);
-    } else {
-        ASSERT_EQ(acceptance.expectedCount, 4u);
-        for (size_t channel = 0; channel < 4; ++channel)
-            EXPECT_NEAR(pixels[center + channel], acceptance.expected[channel], 1);
-    }
+    std::copy_n(pixels.begin() + static_cast<std::ptrdiff_t>(center), centerPixel.size(), centerPixel.begin());
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), targetView.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), target.handle), VERNON_RHI_STATUS_OK);
+}
+
+void runGraphicsTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+                               const AcceptanceDescriptor &acceptance) {
+    ASSERT_EQ(acceptance.expectedCount, 4u);
+    std::array<uint8_t, 4> pixel{};
+    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, executable, pixel));
+    for (size_t channel = 0; channel < pixel.size(); ++channel)
+        EXPECT_NEAR(pixel[channel], acceptance.expected[channel], 1);
+}
+
+// `expected` holds (value, red channel) pairs; each value selects one cooked variant through the u32
+// specialization named by the descriptor.
+void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+                                   const AcceptanceDescriptor &acceptance) {
+    ASSERT_FALSE(acceptance.specialization.empty());
+    ASSERT_GT(acceptance.expectedCount, 0u);
+    ASSERT_EQ(acceptance.expectedCount % 2, 0u);
+    for (size_t index = 0; index < acceptance.expectedCount; index += 2) {
+        const auto value = static_cast<uint32_t>(acceptance.expected[index]);
+        SCOPED_TRACE(std::string(acceptance.specialization) + "=" + std::to_string(value));
+        VernonProgramSpecialization specialization{};
+        specialization.struct_size = sizeof(specialization);
+        specialization.name = {acceptance.specialization.data(), acceptance.specialization.size()};
+        specialization.kind = VERNON_PROGRAM_SPECIALIZATION_U32;
+        specialization.value.u32_value = value;
+        const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
+        vernon::tests::OwnedProgramExecutable program(owned.runtime(), std::string(fixture.manifestPath), &selector);
+        ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+        std::array<uint8_t, 4> pixel{};
+        ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel));
+        EXPECT_NEAR(pixel[0], acceptance.expected[index + 1], 1);
+        EXPECT_LT(pixel[1], 10);
+    }
 }
 
 void runSampledTextureOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
@@ -468,12 +494,16 @@ TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAs
     if (skipDirectXWorkgroupAtomicContention(fixture))
         GTEST_SKIP() << "GitHub-hosted Windows virtual graphics does not execute groupshared CAS correctly";
     const AcceptanceDescriptor &acceptance = acceptanceFor(fixture.fixtureId);
+    if (acceptance.oracle == "specialization_pixels") {
+        runSpecializationPixelsOracle(owned(), fixture, acceptance);
+        return;
+    }
     vernon::tests::OwnedProgramExecutable program(runtime().runtime, std::string(fixture.manifestPath));
     ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(runtime().runtime));
     if (acceptance.oracle == "float_buffer")
         runFloatBufferOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "graphics_triangle" || acceptance.oracle == "specialization_pixels")
-        runArgumentFreeTriangleOracle(owned(), program.get(), acceptance);
+    else if (acceptance.oracle == "graphics_triangle")
+        runGraphicsTriangleOracle(owned(), program.get(), acceptance);
     else if (acceptance.oracle == "sampled_pixel")
         runSampledTextureOracle(owned(), program.get(), acceptance);
     else if (acceptance.oracle == "storage_texel")

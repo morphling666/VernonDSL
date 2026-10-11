@@ -1133,6 +1133,79 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
+TEST(RuntimeModuleProgramCppApi, BindingGroupLeavesBindAcrossTypedVariants) {
+    std::ifstream input(VERNON_BINDING_GROUP_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        ASSERT_TRUE(assetResult);
+        auto asset = std::move(assetResult).value();
+        for (const uint32_t extent : {2u, 4u}) {
+            SCOPED_TRACE(extent);
+            vernon::runtime::ProgramVariant variant;
+            ASSERT_TRUE(variant.set("extent", extent));
+            auto executableResult = asset.resolve(variant);
+            ASSERT_TRUE(executableResult);
+            auto executable = std::move(executableResult).value();
+            VernonProgramParameterView group{};
+            EXPECT_NE(vernonRuntimeProgramExecutableFindParameter(executable.get(), {"terms", 5}, &group),
+                      VERNON_STATUS_OK);
+            const VernonProgramParameterView gainParameter = parameter(executable.get(), "terms.gain");
+            const VernonProgramParameterView weightsParameter = parameter(executable.get(), "terms.lookup.weights");
+            const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
+            ASSERT_EQ(outputParameter.rank, 1u);
+            EXPECT_EQ(outputParameter.static_shape[0], static_cast<int64_t>(extent));
+            VernonProgramParameterView publishedOutputParameter{};
+            ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                                       0, &publishedOutputParameter),
+                      VERNON_STATUS_OK);
+            std::array<VernonProgramParameterView, 3> gridParameters{
+                parameter(executable.get(), "__grid_x"),
+                parameter(executable.get(), "__grid_y"),
+                parameter(executable.get(), "__grid_z"),
+            };
+            auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
+            ASSERT_TRUE(instanceResult);
+            auto instance = std::move(instanceResult).value();
+            std::vector<float> weights(extent);
+            for (uint32_t index = 0; index < extent; ++index)
+                weights[index] = static_cast<float>(index + 1);
+            std::vector<float> output(extent);
+            const uint64_t shape[]{extent};
+            float gain = 3.0f;
+            uint32_t gridX = extent;
+            uint32_t one = 1;
+            std::array<VernonProgramArgument, 7> arguments{
+                scalarArgument(gainParameter, gain),
+                tensorArrayArgument(weightsParameter, weights.data(), shape),
+                tensorArrayArgument(outputParameter, output.data(), shape),
+                tensorArrayArgument(publishedOutputParameter, output.data(), shape),
+                scalarArgument(gridParameters[0], gridX),
+                scalarArgument(gridParameters[1], one),
+                scalarArgument(gridParameters[2], one),
+            };
+            auto invocationResult = instance.begin();
+            ASSERT_TRUE(invocationResult);
+            auto invocation = std::move(invocationResult).value();
+            for (size_t index = 0; index < arguments.size(); ++index) {
+                const std::string text = "binding-group-" + std::to_string(extent) + "-" + std::to_string(index);
+                ASSERT_TRUE(
+                    invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
+            }
+            ASSERT_TRUE(invocation.execute(false));
+            auto commitResult = invocation.commit();
+            ASSERT_TRUE(commitResult);
+            EXPECT_FALSE(commitResult.value());
+            for (uint32_t index = 0; index < extent; ++index)
+                EXPECT_FLOAT_EQ(output[index], weights[index] * gain + static_cast<float>(extent));
+        }
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
 TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);

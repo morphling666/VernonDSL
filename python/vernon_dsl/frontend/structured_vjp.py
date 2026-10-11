@@ -15,6 +15,7 @@ from .autodiff_profiles import (
     structured_profile_symbols,
 )
 from .model import AccessMode, ConcreteType, TypedFunctionInstance
+from .parameter_paths import split_parameter_path
 from .request import FrontendCompileResult
 
 
@@ -62,7 +63,7 @@ def _validate_selected_outputs(
     parameters = {parameter.name: parameter for parameter in entry.parameters}
     selected: list[tuple[str, ConcreteType]] = []
     for path in transform.output_cotangents:
-        root = path.split(".", 1)[0]
+        root = split_parameter_path(path, parameters)[0]
         parameter = parameters.get(root)
         if parameter is None:
             raise ValueError(f"VJP output path {path!r} names no entry parameter")
@@ -106,7 +107,7 @@ def is_structured_vjp_abi_eligible(
         _validate_nonoverlapping_paths(transform.wrt, "wrt")
         _validate_nonoverlapping_paths(transform.output_cotangents, "output")
         for path in transform.wrt:
-            root = path.split(".", 1)[0]
+            root = split_parameter_path(path, parameters)[0]
             if root not in parameters or parameters[root].builtin is not None:
                 return False
             value_type = _resolve_path(path, {name: value.type for name, value in parameters.items()}, structs)

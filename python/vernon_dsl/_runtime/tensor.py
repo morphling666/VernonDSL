@@ -9,6 +9,7 @@ import numpy as np
 
 from .. import _native
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
+from .._markers import is_struct_class
 from ..host_values import (
     HostAbiLayout,
     TangentLayout,
@@ -90,7 +91,7 @@ def _matches_logical_value(value: Any, element_type: Any) -> bool:
     if isinstance(element_type, _Scalar):
         return np.isscalar(value) and not isinstance(value, (str, bytes))
     if isinstance(element_type, type):
-        return getattr(element_type, "__vernon_dsl__", (None, {}))[0] == "struct" and isinstance(value, element_type)
+        return is_struct_class(element_type) and isinstance(value, element_type)
     if not isinstance(element_type, TypeExpr):
         return False
     if element_type.name == "Tuple":
@@ -718,11 +719,11 @@ class TensorStorage:
     def _materialize_gradient(
         self,
         gradient: np.ndarray,
-        path: str,
+        leaf_path: str,
         destination: TensorStorage | None = None,
     ) -> TensorStorage:
         if self._element_type is not None:
-            return self._full_view("read")._materialize_gradient(gradient, path, destination)
+            return self._full_view("read")._materialize_gradient(gradient, leaf_path, destination)
         gradient = np.asarray(gradient)
         if destination is None:
             return TensorStorage.from_numpy(gradient)
@@ -734,12 +735,12 @@ class TensorStorage:
 
     def _gradient_device_view(
         self,
-        path: str,
+        leaf_path: str,
         destination: TensorStorage,
         gradient_shape: tuple[int, ...],
     ) -> TensorView:
         gradient_shape = tuple(gradient_shape)
-        return self._full_view("read")._gradient_device_view(path, destination, gradient_shape)
+        return self._full_view("read")._gradient_device_view(leaf_path, destination, gradient_shape)
 
     def _gradient_boundary_layout(
         self,
@@ -1266,14 +1267,12 @@ class TensorView:
     def _materialize_gradient(
         self,
         gradient: np.ndarray,
-        path: str,
+        leaf_path: str,
         destination: TensorStorage | None = None,
     ) -> TensorStorage:
         gradient = np.asarray(gradient)
         if self._element_type is not None and not isinstance(self._element_type, _Scalar):
             layout = tangent_layout(self._element_type)
-            root = path.split(".", 1)[0]
-            leaf_path = path[len(root) + 1 :] if path != root else ""
             leaf = layout.project(leaf_path)
             trailing_shape = leaf.shape
             if (
@@ -1341,15 +1340,13 @@ class TensorView:
 
     def _gradient_device_view(
         self,
-        path: str,
+        leaf_path: str,
         destination: TensorStorage,
         gradient_shape: tuple[int, ...],
     ) -> TensorView:
         gradient_shape = tuple(gradient_shape)
         if self._element_type is not None and not isinstance(self._element_type, _Scalar):
             layout = tangent_layout(self._element_type)
-            root = path.split(".", 1)[0]
-            leaf_path = path[len(root) + 1 :] if path != root else ""
             leaf = layout.project(leaf_path)
             if gradient_shape != (*self.shape, *leaf.shape):
                 raise ValueError("logical gradient shape does not match its aggregate device leaf")

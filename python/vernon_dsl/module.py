@@ -14,6 +14,7 @@ import numpy as np
 
 from ._runtime.session import _SessionArtifactCache
 from ._runtime.tensor import TensorStorage, TensorView
+from .binding_groups import assemble_binding_group, binding_group_leaf_items, is_binding_group
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,27 @@ class ModuleDefinition:
     source_identity: tuple[str, int, str]
     forward_ast: ast.FunctionDef | None
     forward_ast_error: str | None
+
+    def bind_leaves(self, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> list[tuple[str, Any, Any]]:
+        """Binds forward() arguments as `(Program input name, annotation, value)`, one per binding-group leaf."""
+        bound = self.signature.bind(*arguments, **keywords)
+        bound.apply_defaults()
+        return [
+            leaf
+            for name, value in bound.arguments.items()
+            for leaf in binding_group_leaf_items(name, self.resolved_annotations.get(name), value)
+        ]
+
+    def assemble_arguments(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """The inverse of `bind_leaves`: rebuilds each binding-group parameter from its dotted Program inputs."""
+        arguments: dict[str, Any] = {}
+        for name in self.signature.parameters:
+            annotation = self.resolved_annotations.get(name)
+            if is_binding_group(annotation):
+                arguments[name] = assemble_binding_group(name, annotation, inputs)
+            elif name in inputs:
+                arguments[name] = inputs[name]
+        return arguments
 
 
 def _module_definition(function: Any, owner: type[Any]) -> ModuleDefinition:
@@ -199,12 +221,8 @@ class Module:
 
         configuration = module_configuration(self)
         definition = type(self)._module_definition
-        bound = definition.signature.bind(*arguments, **keywords)
-        bound.apply_defaults()
-        annotations = definition.resolved_annotations
 
-        def invocation_signature(name: str, value: Any) -> Any:
-            annotation = annotations.get(name)
+        def invocation_signature(annotation: Any, value: Any) -> Any:
             if annotation is not None:
                 from .frontend.model import SemanticCategory
                 from .frontend.runtime_types import runtime_parameter_descriptor
@@ -231,7 +249,10 @@ class Module:
         return (
             definition.source_identity,
             configuration,
-            tuple((name, invocation_signature(name, value)) for name, value in bound.arguments.items()),
+            tuple(
+                (leaf, invocation_signature(annotation, value))
+                for leaf, annotation, value in definition.bind_leaves(arguments, keywords)
+            ),
             variant,
         )
 

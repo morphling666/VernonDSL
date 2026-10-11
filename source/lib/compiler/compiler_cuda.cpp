@@ -53,7 +53,7 @@ bool compileCuda(PreparedModule &prepared, const TargetProfile &profile, std::ve
     if (mlir::failed(preparedTarget))
         return false;
     mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
-    if (moduleUsesF16(module.get())) {
+    if (moduleUsesFloat(module.get(), 16)) {
         const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
         diagnostics = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
         return false;

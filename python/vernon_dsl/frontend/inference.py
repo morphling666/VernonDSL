@@ -15,6 +15,7 @@ from ..shader_contracts import (
     resource_stage_error,
     texture_sampling_contract,
 )
+from ..struct_methods import method_tables
 from .abi import workgroup_physical_bytes
 from .activity import analyze_storage_activity
 from .model import (
@@ -173,6 +174,7 @@ class _Inference:
         self.error = error
         self.enabled_features = enabled_features
         self.functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+        self.methods = method_tables(module)
         self.structs = {
             node.name: tuple(
                 (field.target.id, self.parse_type(field.annotation))
@@ -1290,7 +1292,29 @@ class _Inference:
             concrete = contextualize(inferred, expected)
             self.expression_records[id(node)] = (source, concrete, operation)
 
+    def _receiver(self, node: ast.expr, environment: dict[str, InferenceType]) -> bool:
+        """Whether `node` is a value expression rather than a module path such as `vd.texture_sample`."""
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        return not isinstance(node, ast.Name) or node.id in environment
+
+    def _resolve_method(self, node: ast.Call, environment: dict[str, InferenceType]) -> bool:
+        if not isinstance(node.func, ast.Attribute) or not self._receiver(node.func.value, environment):
+            return False
+        receiver = self._expression(node.func.value, environment)
+        if not isinstance(receiver, ConcreteType) or receiver.kind != "struct":
+            return False
+        helper = self.methods.get(receiver.name, {}).get(node.func.attr)
+        if helper is None:
+            chain = " -> ".join(key[0] for key in self.active)
+            suffix = f" (in helper specialization {chain})" if chain else ""
+            raise self.error(node.func, f"'{receiver.name}' has no method '{node.func.attr}'{suffix}")
+        node.args = [node.func.value, *node.args]
+        node.func = ast.copy_location(ast.Name(id=helper, ctx=ast.Load()), node.func)
+        return True
+
     def _call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
+        self._resolve_method(node, environment)
         resolved_name = (dotted_name(node.func) or "").split(".")[-1]
         name = getattr(node, "_vernon_generic_name", resolved_name)
         if name in {"Tensor", "Vector", "Matrix"}:

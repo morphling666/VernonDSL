@@ -4,6 +4,8 @@ from collections.abc import Callable
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
+from ._markers import dsl_kind, mark
+
 if TYPE_CHECKING:
     from .runtime import Kernel
 
@@ -12,23 +14,18 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-def _mark(value: _T, kind: str, **options: Any) -> _T:
-    value.__vernon_dsl__ = kind, options
-    return value
-
-
 class ShaderFunction:
     """A declarative shader function that cannot execute as host Python."""
 
     def __init__(self, function: Callable[..., Any], kind: str, *, shared: bool = False):
         self.function = function
-        self.__vernon_dsl__ = (kind, {"shared": shared})
+        mark(self, kind, shared=shared)
         self.shared = shared
         update_wrapper(self, function)
 
     @property
     def kind(self) -> str:
-        return self.__vernon_dsl__[0]
+        return dsl_kind(self)  # type: ignore[return-value]
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.shared:
@@ -95,8 +92,17 @@ def struct(value: _T | None = None, *, shared: bool = False) -> _T | Callable[[_
     def decorate(cls: _T) -> _T:
         from .host_values import forbid_struct_construction, make_shared_struct
 
-        _mark(cls, "struct", shared=shared)
+        mark(cls, "struct", shared=shared)
         transformed = make_shared_struct(cls) if shared else forbid_struct_construction(cls)
         return transformed
 
     return decorate(value) if value is not None else decorate
+
+
+def binding_group(cls: _T) -> _T:
+    """Declare a named group of entry interface items; on the host it is a keyword-only container."""
+
+    from .binding_groups import make_binding_group
+
+    mark(cls, "binding_group")
+    return make_binding_group(cls)  # type: ignore[arg-type,return-value]

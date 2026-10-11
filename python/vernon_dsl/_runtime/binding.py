@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
+from .._markers import is_struct_class
 from ..host_values import host_abi_layout, pack_host_value
 from .residency import _ResourceTransaction
 from .sampler import SamplerState
@@ -217,9 +218,7 @@ class _PersistentBindingTable:
         execution_token = ("execution-value", binding_token) if binding_token is not None else None
         value_type = type(value)
         struct_type = (
-            annotation
-            if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
-            else (value_type if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct" else None)
+            annotation if is_struct_class(annotation) else (value_type if is_struct_class(value_type) else None)
         )
         canonical_annotation = annotation if annotation is not None else struct_type
         if canonical_annotation is not None:

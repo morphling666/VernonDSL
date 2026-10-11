@@ -318,6 +318,27 @@ private:
     DenseMap<Value, ValueAbiLayout> cache;
 };
 
+struct EntryPath {
+    unsigned argument;
+    StringRef root;
+    SmallVector<StringRef> projection;
+};
+
+std::optional<EntryPath> splitEntryPath(func::FuncOp function, StringRef path) {
+    std::optional<EntryPath> found;
+    for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+        auto sourceName = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+        if (!sourceName || !isDottedPathPrefix(sourceName.getValue(), path))
+            continue;
+        StringRef name = sourceName.getValue();
+        if (!found || name.size() > found->root.size())
+            found = EntryPath{index, name, {}};
+    }
+    if (found && path.size() > found->root.size())
+        path.drop_front(found->root.size() + 1).split(found->projection, '.', -1, false);
+    return found;
+}
+
 } // namespace
 
 class AutodiffAnalysisBuilder {
@@ -965,19 +986,13 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
         if (components.empty() || llvm::any_of(components, [](StringRef item) { return item.empty(); }))
             return emitFunctionError(Twine("invalid wrt path '") + requestedPath + "'");
 
-        std::optional<unsigned> argumentIndex;
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            auto sourceName = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
-            if (sourceName && sourceName.getValue() == components.front()) {
-                argumentIndex = index;
-                break;
-            }
-        }
-        if (!argumentIndex)
+        std::optional<EntryPath> entryPath = splitEntryPath(function, requestedPath);
+        if (!entryPath)
             return emitFunctionError(Twine("wrt path '") + requestedPath + "' names no entry parameter");
+        const unsigned argumentIndex = entryPath->argument;
 
-        Value argument = function.getArgument(*argumentIndex);
-        Attribute dtypeMetadata = function.getArgAttr(*argumentIndex, "vernon.abi_leaf_dtypes");
+        Value argument = function.getArgument(argumentIndex);
+        Attribute dtypeMetadata = function.getArgAttr(argumentIndex, "vernon.abi_leaf_dtypes");
         auto dtypeArray = dyn_cast_or_null<ArrayAttr>(dtypeMetadata);
         if (dtypeMetadata && !dtypeArray)
             return emitFunctionError(Twine("wrt path '") + requestedPath + "' has malformed ABI dtype metadata");
@@ -994,7 +1009,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
         Type current = argument.getType();
         if (auto view = dyn_cast<TensorViewType>(current))
             current = view.getElementType();
-        for (StringRef component : ArrayRef<StringRef>(components).drop_front()) {
+        for (StringRef component : entryPath->projection) {
             if (auto structure = dyn_cast<StructType>(current)) {
                 FailureOr<ResolvedStructFields> fields = resolveNamedStructFields(structure, module);
                 if (failed(fields))
@@ -1021,16 +1036,15 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
         for (auto [leafIndex, leaf] : llvm::enumerate(values[*valueIndex].layout.leaves)) {
             if (!hasPathPrefix(leaf.path, prefix) || !isDifferentiable(leaf))
                 continue;
-            const std::string path = appendValueAbiPath(components.front(), leaf.path);
+            const std::string path = appendValueAbiPath(entryPath->root, leaf.path);
             if (!canonicalPaths.insert(path).second)
                 return emitFunctionError(Twine("duplicate canonical wrt leaf '") + path + "'");
             Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
                                                      : static_cast<Type>(RankedTensorType::get(
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
                                                            *getAutodiffDerivativeScalarType(leaf.scalarType)));
-            result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
-                                                    components.front().str(), path, leaf.scalarType, derivativeType,
-                                                    leaf.dtype, leaf.shape});
+            result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex), entryPath->root.str(),
+                                                    path, leaf.scalarType, derivativeType, leaf.dtype, leaf.shape});
             if (isa<TensorViewType>(argument.getType())) {
                 wrtStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
             } else {
@@ -1118,23 +1132,17 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
         path.split(components, '.', -1, false);
         if (components.empty() || llvm::any_of(components, [](StringRef item) { return item.empty(); }))
             return emitFunctionError(Twine("invalid Storage output path '") + path + "'");
-        std::optional<unsigned> argumentIndex;
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            auto sourceName = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
-            if (sourceName && sourceName.getValue() == components.front()) {
-                argumentIndex = index;
-                break;
-            }
-        }
-        if (!argumentIndex)
+        std::optional<EntryPath> entryPath = splitEntryPath(function, path);
+        if (!entryPath)
             return emitFunctionError(Twine("Storage output path '") + path + "' names no entry parameter");
-        Value argument = function.getArgument(*argumentIndex);
+        const unsigned argumentIndex = entryPath->argument;
+        Value argument = function.getArgument(argumentIndex);
         auto view = dyn_cast<TensorViewType>(argument.getType());
         if (!view)
             return emitFunctionError(Twine("Storage output path '") + path + "' is not a TensorView");
         if (view.getAccess() == "read")
             return emitFunctionError(Twine("Storage output path '") + path + "' is not writable");
-        Attribute dtypeMetadata = function.getArgAttr(*argumentIndex, "vernon.abi_leaf_dtypes");
+        Attribute dtypeMetadata = function.getArgAttr(argumentIndex, "vernon.abi_leaf_dtypes");
         auto dtypeArray = dyn_cast_or_null<ArrayAttr>(dtypeMetadata);
         if (dtypeMetadata && !dtypeArray)
             return emitFunctionError(Twine("Storage output path '") + path + "' has malformed ABI dtype metadata");
@@ -1144,7 +1152,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
             return emitFunctionError(Twine("Storage output path '") + path + "' has no canonical Value ABI");
         SmallVector<ValueAbiPathComponent> prefix;
         Type current = view.getElementType();
-        for (StringRef component : ArrayRef<StringRef>(components).drop_front()) {
+        for (StringRef component : entryPath->projection) {
             if (auto structure = dyn_cast<StructType>(current)) {
                 FailureOr<ResolvedStructFields> fields = resolveNamedStructFields(structure, module);
                 if (failed(fields))
@@ -1170,7 +1178,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
         for (auto [leafIndex, leaf] : llvm::enumerate(values[*valueIndex].layout.leaves)) {
             if (!hasPathPrefix(leaf.path, prefix) || !isDifferentiable(leaf))
                 continue;
-            std::string leafPath = appendValueAbiPath(components.front(), leaf.path);
+            std::string leafPath = appendValueAbiPath(entryPath->root, leaf.path);
             if (!canonicalPaths.insert(leafPath).second)
                 return emitFunctionError(Twine("duplicate canonical Storage output leaf '") + leafPath + "'");
             Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
@@ -1178,7 +1186,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
                                                            *getAutodiffDerivativeScalarType(leaf.scalarType)));
             result.activeResultLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
-                                                             components.front().str(), std::move(leafPath),
+                                                             entryPath->root.str(), std::move(leafPath),
                                                              leaf.scalarType, derivativeType, leaf.dtype, leaf.shape});
             resultStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
             ++matches;

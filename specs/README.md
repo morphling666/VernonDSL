@@ -56,8 +56,6 @@ Architecture and tutorials link to the contract instead of redefining fields.
    [`program/graphics_storage_reads.md`](program/graphics_storage_reads.md)
    defines vertex and fragment TensorView reads, per-stage carriers, and
    graphics binding allocation.
-   [`program/function_slots.md`](program/function_slots.md) defines function
-   slots, cook-time composition, and composition enumeration.
 3. [`compiler/design.md`](compiler/design.md) defines compiler layering,
    lowering, reflection, target routing, and artifact cooking.
 4. [`compiler/invocation_index_ownership.md`](compiler/invocation_index_ownership.md)
@@ -93,6 +91,10 @@ Architecture and tutorials link to the contract instead of redefining fields.
   oracles to the supported language surface.
 - [`testing/program_acceptance.md`](testing/program_acceptance.md) defines
   permanent Kernel/Module/Program/VJP regression gates.
+- [`language/static_specialization.md`](language/static_specialization.md)
+  is the accepted design for static specialization branches, `When`
+  predicates, binding groups, typed method resolution, and type-valued
+  specializations.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   lists remaining language-v4 gates.
 - [`future/README.md`](future/README.md) indexes the non-normative future

@@ -1,6 +1,7 @@
 #include "target_binding_plan.h"
 
 #include "VernonProgramCapabilities.h"
+#include "interface_names.h"
 #include "pipeline_metadata.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "shape_layout.h"
@@ -799,7 +800,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     target.storageLeaves = compiled->storageLeaves;
                 }
                 if (!compute && endpoint.viewDescriptor && backend != VERNON_RUNTIME_OPENGL &&
-                    backend != VERNON_RUNTIME_OPENGL_ES && backend != VERNON_RUNTIME_VULKAN)
+                    backend != VERNON_RUNTIME_OPENGL_ES && backend != VERNON_RUNTIME_VULKAN &&
+                    backend != VERNON_RUNTIME_DIRECTX12)
                     return reject(diagnostic, "PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED", "/endpoints",
                                   "graphics TensorView storage reads are not implemented for this backend");
                 if (target.projection.leaf && target.elementLayout.leaves.size() == 1) {
@@ -1074,6 +1076,10 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
             usesWholeValuePacking(binding) ? TensorRepresentation::WholeValue : TensorRepresentation::ElementStream;
         use.shape =
             binding.valueType && binding.valueType->rankedValue ? binding.valueType->innerShape : parameter.shape;
+        use.bufferValue =
+            binding.valueType && (binding.valueType->rankedValue ||
+                                  binding.valueType->semantic.kind == ::vernon::program::SemanticTypeKind::Struct ||
+                                  binding.valueType->semantic.kind == ::vernon::program::SemanticTypeKind::Tuple);
         use.transport = plan.backend == VERNON_RUNTIME_CPU                ? "host_value"
                         : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
                         : binding.carrier == TargetCarrier::InlineValue   ? "push_constant"
@@ -1325,7 +1331,7 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
         if (use.interfaceKind == "resource" && binding.carrier == TargetCarrier::StorageBuffer)
             use.storageLeaves = binding.storageLeaves;
         if (use.interfaceKind != "input")
-            use.uniformName = binding.stageSourceName.empty() ? binding.name : binding.stageSourceName;
+            use.uniformName = sanitizeInterfaceName(binding.stageSourceName, binding.name, false);
         parameter.uses.push_back(std::move(use));
     }
     stagePlan.metadataCarriers = plan.metadataCarriers;

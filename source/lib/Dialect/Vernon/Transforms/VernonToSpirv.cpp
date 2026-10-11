@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
 #include "VernonSpirvMath.h"
+#include "runtime/interface_names.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -329,25 +330,8 @@ std::optional<spirv::BuiltIn> parseBuiltIn(StringRef name) {
 }
 
 std::string sanitizeInterfaceName(StringRef sourceName, StringRef fallback, bool varying) {
-    StringRef input = sourceName.empty() ? fallback : sourceName;
-    std::string result;
-    bool uppercaseNext = varying && input.contains('_');
-    for (char character : input) {
-        if (llvm::isAlnum(character)) {
-            result.push_back(uppercaseNext ? llvm::toUpper(character) : character);
-            uppercaseNext = false;
-        } else if (character == '_' && varying) {
-            uppercaseNext = true;
-        } else {
-            result.push_back('_');
-            uppercaseNext = false;
-        }
-    }
-    if (result.empty())
-        result = "interface_value";
-    if (!llvm::isAlpha(result.front()) && result.front() != '_')
-        result.insert(result.begin(), '_');
-    return result;
+    return ::vernon::runtime::sanitizeInterfaceName(std::string_view(sourceName.data(), sourceName.size()),
+                                                    std::string_view(fallback.data(), fallback.size()), varying);
 }
 
 std::string uniqueInterfaceName(StringRef preferred, StringRef stage, llvm::StringSet<> &usedNames) {
@@ -369,12 +353,40 @@ void appendMemberDecorations(OpBuilder &builder, uint32_t member, Type type, con
     }
 }
 
+bool isBlockWrappedStorageClass(spirv::StorageClass storageClass) {
+    return storageClass == spirv::StorageClass::Uniform || storageClass == spirv::StorageClass::PushConstant ||
+           storageClass == spirv::StorageClass::StorageBuffer;
+}
+
+// The MLIR SPIR-V serializer decorates the pointee of every Uniform, PushConstant, or StorageBuffer struct pointer as
+// Block, so struct members of a block are loaded leaf by leaf. Access-chaining to a whole nested struct would make it
+// a nested Block, which is invalid SPIR-V and makes SPIRV-Cross omit the struct declaration.
+Value loadBlockMember(OpBuilder &builder, Location location, Value block, SmallVectorImpl<Value> &indices, Type type) {
+    auto loadElements = [&](uint32_t count, auto elementType) -> Value {
+        SmallVector<Value> elements;
+        for (uint32_t element = 0; element < count; ++element) {
+            indices.push_back(
+                spirv::ConstantOp::create(builder, location, builder.getI32Type(), builder.getI32IntegerAttr(element)));
+            elements.push_back(loadBlockMember(builder, location, block, indices, elementType(element)));
+            indices.pop_back();
+        }
+        return spirv::CompositeConstructOp::create(builder, location, type, elements);
+    };
+    if (auto structType = dyn_cast<spirv::StructType>(type))
+        return loadElements(structType.getNumElements(),
+                            [&](uint32_t element) { return structType.getElementType(element); });
+    if (auto array = dyn_cast<spirv::ArrayType>(type);
+        array && isa<spirv::StructType, spirv::ArrayType>(array.getElementType()))
+        return loadElements(array.getNumElements(), [&](uint32_t) { return array.getElementType(); });
+    Value pointer = spirv::AccessChainOp::create(builder, location, block, indices);
+    return spirv::LoadOp::create(builder, location, pointer);
+}
+
 spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location location, StringRef name, Type valueType,
                                                 spirv::StorageClass storageClass, DictionaryAttr attributes,
                                                 const ByteTransportNode *layout = nullptr) {
     auto pointerType = spirv::PointerType::get(valueType, storageClass);
-    if (storageClass == spirv::StorageClass::Uniform || storageClass == spirv::StorageClass::PushConstant ||
-        storageClass == spirv::StorageClass::StorageBuffer) {
+    if (isBlockWrappedStorageClass(storageClass)) {
         SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
         if (layout)
             appendMemberDecorations(builder, 0, valueType, *layout, memberDecorations);
@@ -1795,13 +1807,19 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             mapping.map(argument, pointer);
             continue;
         }
-        if (isa<spirv::StructType>(pointerType.getPointeeType())) {
-            Value memberIndex = spirv::ConstantOp::create(bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
-                                                          bodyBuilder.getI32IntegerAttr(member.value_or(0)));
-            pointer = spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), pointer, memberIndex);
-        }
         if (!attribute) {
-            Value loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
+            Value loaded;
+            if (isBlockWrappedStorageClass(pointerType.getStorageClass())) {
+                auto block = cast<spirv::StructType>(pointerType.getPointeeType());
+                const uint32_t memberIndex = member.value_or(0);
+                SmallVector<Value> indices{spirv::ConstantOp::create(bodyBuilder, source.getLoc(),
+                                                                     bodyBuilder.getI32Type(),
+                                                                     bodyBuilder.getI32IntegerAttr(memberIndex))};
+                loaded =
+                    loadBlockMember(bodyBuilder, source.getLoc(), pointer, indices, block.getElementType(memberIndex));
+            } else {
+                loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
+            }
             FailureOr<Type> logicalType = convertValueType(argument.getType(), sourceModule);
             if (failed(logicalType))
                 return source.emitError("cannot reconstruct logical interface value");

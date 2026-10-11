@@ -167,6 +167,66 @@ Type convertStorageLeaf(Type type, bool useSpirvStorage) {
                            spirv::StorageClassAttr::get(type.getContext(), spirv::StorageClass::StorageBuffer));
 }
 
+bool isWordBufferScalar(Type type) {
+    if (!type.isIntOrFloat())
+        return false;
+    const unsigned width = type.getIntOrFloatBitWidth();
+    return width == 1 || width == 8 || width == 16 || width == 32 || width == 64;
+}
+
+// Struct, Tuple, and aggregate Tensor Values reach a GPU kernel as one buffer of 32-bit words holding their
+// canonical bytes, so each scalar is extracted from the words that contain it. Canonical alignment equals scalar
+// size, so a sub-word scalar (bool is one byte) never straddles a word and a 64-bit scalar starts on a word.
+FailureOr<SmallVector<Value>> loadWordBufferScalars(Value words, uint64_t recordByteOffset,
+                                                    const ValueAbiLayout &layout, OpBuilder &builder,
+                                                    Location location) {
+    constexpr uint64_t wordBytes = sizeof(uint32_t);
+    auto loadWord = [&](uint64_t wordIndex) -> Value {
+        Value index = arith::ConstantIndexOp::create(builder, location, static_cast<int64_t>(wordIndex));
+        return memref::LoadOp::create(builder, location, words, index);
+    };
+    SmallVector<Value> scalars;
+    for (const ValueAbiLeaf &leaf : layout.leaves) {
+        if (!isWordBufferScalar(leaf.scalarType))
+            return failure();
+        const unsigned width = leaf.scalarType.getIntOrFloatBitWidth();
+        const uint64_t scalarBytes = std::max<uint64_t>(width / 8, 1);
+        for (uint64_t scalar = 0; scalar < leaf.scalarCount; ++scalar) {
+            const uint64_t byteOffset = recordByteOffset + leaf.byteOffset + scalar * scalarBytes;
+            const uint64_t byteInWord = byteOffset % wordBytes;
+            if (scalarBytes >= wordBytes ? byteInWord != 0 : byteInWord + scalarBytes > wordBytes)
+                return failure();
+            Value bits;
+            if (width == 64) {
+                Type i64 = builder.getI64Type();
+                Value low = arith::ExtUIOp::create(builder, location, i64, loadWord(byteOffset / wordBytes));
+                Value high = arith::ExtUIOp::create(builder, location, i64, loadWord(byteOffset / wordBytes + 1));
+                Value shiftedHigh = arith::ShLIOp::create(builder, location, high,
+                                                          arith::ConstantIntOp::create(builder, location, 32, 64));
+                bits = arith::OrIOp::create(builder, location, shiftedHigh, low);
+            } else {
+                bits = loadWord(byteOffset / wordBytes);
+                if (byteInWord != 0)
+                    bits = arith::ShRUIOp::create(
+                        builder, location, bits,
+                        arith::ConstantIntOp::create(builder, location, static_cast<int64_t>(byteInWord) * 8, 32));
+                if (width == 1) {
+                    Value byte = arith::AndIOp::create(builder, location, bits,
+                                                       arith::ConstantIntOp::create(builder, location, 0xff, 32));
+                    bits = arith::CmpIOp::create(builder, location, arith::CmpIPredicate::ne, byte,
+                                                 arith::ConstantIntOp::create(builder, location, 0, 32));
+                } else if (width < 32) {
+                    bits = arith::TruncIOp::create(builder, location, builder.getIntegerType(width), bits);
+                }
+            }
+            if (isa<FloatType>(leaf.scalarType))
+                bits = arith::BitcastOp::create(builder, location, leaf.scalarType, bits);
+            scalars.push_back(bits);
+        }
+    }
+    return scalars;
+}
+
 struct PhysicalLoadConversion final : OpConversionPattern<PhysicalLoadOp> {
     using OpConversionPattern::OpConversionPattern;
 
@@ -334,7 +394,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             SmallVector<Type> kernelArgumentTypes;
             DenseMap<unsigned, std::pair<unsigned, unsigned>> sourceArgumentRanges;
             SmallVector<InlineTensorArgument> inlineTensorArguments;
-            DenseMap<unsigned, TensorType> aggregateTensorArguments;
+            DenseMap<unsigned, Type> aggregateValueArguments;
             SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>> resourceBindings;
             std::optional<unsigned> metadataSourceIndex;
             std::optional<unsigned> metadataKernelIndex;
@@ -359,24 +419,23 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
                     continue;
                 }
-                if (!attrs.builtin) {
-                    if (auto tensor = dyn_cast<TensorType>(type)) {
-                        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(tensor.getElementType(), module);
-                        if (failed(layout) || layout->leaves.empty() || layout->size % sizeof(uint32_t) != 0 ||
-                            llvm::any_of(layout->leaves, [](const ValueAbiLeaf &leaf) {
-                                return leaf.scalarType.getIntOrFloatBitWidth() != 32 ||
-                                       leaf.byteOffset % sizeof(uint32_t) != 0;
-                            })) {
-                            source.emitError() << "cannot lower aggregate Tensor-by-value argument #" << index;
-                            return signalPassFailure();
-                        }
-                        unsigned kernelIndex = kernelArgumentTypes.size();
-                        kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), useSpirvStorage));
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
-                        sourceArgumentRanges[index] = {kernelIndex, 1};
-                        aggregateTensorArguments[index] = tensor;
-                        continue;
+                if (!attrs.builtin && isa<TensorType, StructType, TupleType>(type)) {
+                    auto tensor = dyn_cast<TensorType>(type);
+                    FailureOr<ValueAbiLayout> layout =
+                        getValueStorageLayout(tensor ? tensor.getElementType() : type, module);
+                    if (failed(layout) || layout->leaves.empty() ||
+                        !llvm::all_of(layout->leaves,
+                                      [](const ValueAbiLeaf &leaf) { return isWordBufferScalar(leaf.scalarType); })) {
+                        source.emitError() << "cannot lower aggregate Value argument #" << index
+                                           << ": its leaves must be bool or 8-, 16-, 32-, or 64-bit scalars";
+                        return signalPassFailure();
                     }
+                    unsigned kernelIndex = kernelArgumentTypes.size();
+                    kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), useSpirvStorage));
+                    resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                    sourceArgumentRanges[index] = {kernelIndex, 1};
+                    aggregateValueArguments[index] = type;
+                    continue;
                 }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
@@ -491,45 +550,39 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             IRMapping mapping;
             for (auto [sourceIndex, range] : sourceArgumentRanges) {
                 Value first = entry->getArgument(range.first);
-                auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
-                if (aggregateTensor != aggregateTensorArguments.end()) {
-                    FailureOr<ValueAbiLayout> layout =
-                        getValueStorageLayout(aggregateTensor->second.getElementType(), module);
-                    if (failed(layout) || layout->size % sizeof(uint32_t) != 0)
+                auto aggregate = aggregateValueArguments.find(sourceIndex);
+                if (aggregate != aggregateValueArguments.end()) {
+                    auto tensor = dyn_cast<TensorType>(aggregate->second);
+                    Type elementType = tensor ? tensor.getElementType() : aggregate->second;
+                    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(elementType, module);
+                    if (failed(layout) || layout->alignment == 0)
                         return signalPassFailure();
-                    Value recordStride = arith::ConstantIndexOp::create(
-                        bodyBuilder, source.getLoc(), static_cast<int64_t>(layout->size / sizeof(uint32_t)));
+                    const uint64_t recordStride = llvm::alignTo(layout->size, layout->alignment);
                     int64_t elementCount = 1;
-                    for (int64_t dimension : aggregateTensor->second.getShape())
-                        elementCount *= dimension;
+                    if (tensor)
+                        for (int64_t dimension : tensor.getShape())
+                            elementCount *= dimension;
                     SmallVector<Value> elements;
                     for (int64_t index = 0; index < elementCount; ++index) {
-                        Value recordIndex = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), index);
-                        Value recordBase =
-                            arith::MulIOp::create(bodyBuilder, source.getLoc(), recordIndex, recordStride);
-                        SmallVector<Value> scalars;
-                        for (const ValueAbiLeaf &leaf : layout->leaves)
-                            for (uint64_t scalar = 0; scalar < leaf.scalarCount; ++scalar) {
-                                const uint64_t word = leaf.byteOffset / sizeof(uint32_t) + scalar;
-                                Value wordOffset = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(),
-                                                                                  static_cast<int64_t>(word));
-                                Value wordIndex =
-                                    arith::AddIOp::create(bodyBuilder, source.getLoc(), recordBase, wordOffset);
-                                Value loaded = memref::LoadOp::create(bodyBuilder, source.getLoc(), first, wordIndex);
-                                if (leaf.scalarType.isF32())
-                                    loaded =
-                                        arith::BitcastOp::create(bodyBuilder, source.getLoc(), leaf.scalarType, loaded);
-                                scalars.push_back(loaded);
-                            }
-                        FailureOr<Value> element = buildAggregateValueFromScalars(
-                            aggregateTensor->second.getElementType(), scalars, module, bodyBuilder, source.getLoc());
-                        if (failed(element))
+                        FailureOr<SmallVector<Value>> scalars = loadWordBufferScalars(
+                            first, static_cast<uint64_t>(index) * recordStride, *layout, bodyBuilder, source.getLoc());
+                        FailureOr<Value> element = failed(scalars)
+                                                       ? FailureOr<Value>(failure())
+                                                       : buildAggregateValueFromScalars(elementType, *scalars, module,
+                                                                                        bodyBuilder, source.getLoc());
+                        if (failed(element)) {
+                            source.emitError() << "cannot rebuild aggregate Value argument #" << sourceIndex;
                             return signalPassFailure();
+                        }
                         elements.push_back(*element);
+                    }
+                    if (!tensor) {
+                        mapping.map(source.getArgument(sourceIndex), elements.front());
+                        continue;
                     }
                     OperationState state(source.getLoc(), IntrinsicOp::getOperationName());
                     state.addOperands(elements);
-                    state.addTypes(aggregateTensor->second);
+                    state.addTypes(tensor);
                     state.addAttribute("name", bodyBuilder.getStringAttr("construct"));
                     mapping.map(source.getArgument(sourceIndex), bodyBuilder.create(state)->getResult(0));
                     continue;

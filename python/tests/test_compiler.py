@@ -553,8 +553,6 @@ def main(value: f32) -> f32:
                         "FLAG:bool=true",
                         "--specialization",
                         "rank:u32=4",
-                        "--specialization-binding",
-                        "RANK=rank",
                     ]
                 ),
                 0,
@@ -798,7 +796,7 @@ def main(
             )
             with self.assertRaisesRegex(CompileError, "disabled value"):
                 compile_file(path)
-            with self.assertRaisesRegex(CompileError, "undeclared feature"):
+            with self.assertRaisesRegex(CompileError, "undeclared specialization"):
                 compile_file(path, specializations=(SpecializationAssignment("SKIN", "bool", True),))
 
     def test_selected_entry_prunes_unrelated_stages(self) -> None:

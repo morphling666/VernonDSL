@@ -395,9 +395,13 @@ compile failure with the stated stable reason, never a runtime skip.
 ### `LANG-SPECIALIZE-001` — deterministic source specialization
 
 - Valid: source imports without execution, deterministic captured constants,
-  `vd.feature`/`When`, and declared ProgramAsset variants.
-- Invalid: arbitrary Python capture/execution, undeclared feature combination,
-  or runtime feature conditions.
+  static branches over every scalar specialization kind, compile-time `When`
+  predicates in Kernels and graphics Pipelines, and declared ProgramAsset
+  variants.
+- Invalid: arbitrary Python capture/execution, undeclared or mistyped
+  specialization assignments, unassigned scalar uses, conditions that mix
+  specializations with runtime values, or disabled values used outside their
+  guard.
 - Capabilities: compile according to entry; runtime matching stage.
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: capture/variant reason; dependencies, constants, features,

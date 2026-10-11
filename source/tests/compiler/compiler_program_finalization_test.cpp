@@ -27,6 +27,8 @@ TEST(ProgramCapabilities, CurrentReleaseUsesStableUnsupportedDecisions) {
     EXPECT_FALSE(get(Id::OpaqueResourceVjp).supported);
     EXPECT_TRUE(get(Id::CpuF16).supported);
     EXPECT_FALSE(get(Id::GpuF16).supported);
+    EXPECT_FALSE(get(Id::SpirvF64).supported);
+    EXPECT_EQ(get(Id::SpirvF64).diagnosticCode, "PROGRAM_SPIRV_F64_UNSUPPORTED");
 }
 
 llvm::json::Value parse(llvm::StringRef text) {

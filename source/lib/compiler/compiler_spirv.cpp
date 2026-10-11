@@ -256,8 +256,11 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
                       "runtime contract violation for step=0";
         return false;
     }
-    if (moduleUsesF16(module.get())) {
-        const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
+    for (const auto &[width, id] :
+         {std::pair{16u, program_capabilities::Id::GpuF16}, std::pair{64u, program_capabilities::Id::SpirvF64}}) {
+        if (!moduleUsesFloat(module.get(), width))
+            continue;
+        const program_capabilities::Entry &capability = program_capabilities::get(id);
         diagnostics = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
         return false;
     }

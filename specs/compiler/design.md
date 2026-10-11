@@ -126,9 +126,12 @@ than passing through CUDA's LLVM intrinsic lowering.
 Vulkan compilation rejects f16 until the runtime queries and enables both
 `shaderFloat16` and the required 16-bit storage features. Emitting f16 SPIR-V
 without enabling those device features can execute silently with incorrect
-loads or arithmetic, so target compilation fails explicitly instead. CPU and
-CUDA retain their independently tested f16/f64 support; Vulkan f64 remains
-covered by execution tests.
+loads or arithmetic, so target compilation fails explicitly instead. SPIR-V
+targets (Vulkan, OpenGL, OpenGL ES, DirectX, Metal) likewise reject f64 with
+`PROGRAM_SPIRV_F64_UNSUPPORTED`. Shader-only SPIR-V has no f64 lowering path
+for the `Float64` capability, and the runtime does not query `shaderFloat64`,
+so this fails at capability validation instead of inside SPIR-V
+legalization. CPU and CUDA retain their independently tested f16/f64 support.
 
 ## Pure bundle planning boundary
 
@@ -203,12 +206,12 @@ does not embed CPython.
 
 Completed frontend requests are cached by the immutable
 `FrontendCompileRequest`, including source path, entry, the canonical typed
-specialization key and its source-name bindings, ordinary captured constants,
+specialization key, ordinary captured constants,
 annotation-static Tensor shapes and TensorView constraints, and workgroup size.
 Concrete dynamic TensorView shape, stride, offset, and extent are invocation
-data and never enter frontend cache identity. Boolean feature pruning is
-derived from the typed key inside compiler orchestration; it is not a second
-request representation. Each hit
+data and never enter frontend cache identity. Static branch and `When`
+evaluation is derived from the typed key inside the module graph; it is not a
+second request representation. Each hit
 rehashes every previously discovered source dependency before returning the
 immutable semantic result. This keeps the hit path independent of Python AST
 objects while invalidating changes to any transitive module; failed requests
@@ -218,12 +221,16 @@ and whole-module `compile_file(entry=None)` are uncached validation/emission
 surfaces because they do not have a complete `FrontendCompileRequest`.
 
 Project module graphs have a separate source-syntax cache keyed by the resolved
-root path. It retains parsed modules, resolved imports, and dependency identity
-only; every stage still deep-copies its reachable definitions before feature
-specialization and semantic analysis. Dependency digests guard reuse, so
+root path and selected entry. Discovery does not depend on the specialization
+key, so the cache retains parsed modules, resolved imports, and dependency
+identity only; every load still deep-copies its reachable definitions before
+applying the key and before semantic analysis. Dependency digests guard reuse, so
 different graphics stages share discovery without sharing mutable specialized
 AST or typed records.
 
+Specialization values are substituted, static branches pruned, and `When`
+parameters removed by the module graph (`module_graph._Specializer`), per
+`specs/language/static_specialization.md` sections 2 and 3.
 Annotation-static shape-constraint and captured-constant substitution lives in
 `frontend.specialization`. It consumes only the immutable compile request and
 project source, before inference, and does not select operations or result
@@ -276,14 +283,14 @@ and the target `vernon-cook-program` tool must pass the same specialized MLIR
 and target options to that C API; none may carry an independent lowering or
 reflection path.
 
-`compile_file(entry=...)` accepts one canonical
-`tuple[SpecializationAssignment, ...]` plus the source-name bindings required
-by non-Boolean assignments. `vernon-compile-python` exposes the same inputs as
-repeatable `--specialization NAME:TYPE=VALUE` and
-`--specialization-binding LOCAL=NAME` options, where `TYPE` is `bool`, `i32`,
-`u32`, `f32`, or `f64`. Whole-module `compile_file(entry=None)` accepts only
-Boolean assignments because non-Boolean substitution requires one selected
-entry. There is no parallel `features=` or `--feature` compile surface.
+`compile_file` accepts one canonical `tuple[SpecializationAssignment, ...]`,
+with or without a selected entry. The module graph resolves every
+specialization reference to its declaration, so assignments are keyed by public
+specialization name only and no source-name binding is needed.
+`vernon-compile-python` exposes the same input as repeatable
+`--specialization NAME:TYPE=VALUE` options, where `TYPE` is `bool`, `i32`,
+`u32`, `f32`, or `f64`. There is no parallel `features=` or `--feature`
+compile surface.
 
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
@@ -496,10 +503,13 @@ ABI description and does not alter Tensor semantic identity.
 
 Graphics lowering supports constants, construction, splats, extraction, and
 elementwise arithmetic over that representation. Each stage has a conservative
-128-byte inline-uniform budget. Unbound values that exceed that budget or use
-recursive arrays receive deterministic internal set-zero bindings and lower as
-uniform blocks; native values within the budget remain push constants or
-target-native inline uniforms. Elementwise operations on native matrices lower
+128-byte inline-uniform budget. Unbound values that exceed that budget, use
+recursive arrays, or are Struct, Tuple, or Tensor aggregates receive
+deterministic internal set-zero bindings and lower as uniform blocks; native
+scalar and vector values within the budget remain push constants or
+target-native inline uniforms. Aggregates always spill because OpenGL, OpenGL
+ES, and Metal have no native inline aggregate uniform, and one policy for every
+target keeps reflection target-independent. Elementwise operations on native matrices lower
 per column vector and reconstruct the matrix; they are distinct from `matmul`.
 
 Compiler reflection is the only source of descriptor `(set, binding)` records.
@@ -629,6 +639,20 @@ are the exception: they use a reflected uniform-buffer binding and SPIRV-Cross
 may address the block member as `model._m0`, which Runtime derives from the same
 reflection. Regression coverage checks both native-inline names and spilled
 block names while retaining Vulkan packed push-constant coverage.
+
+The MLIR SPIR-V serializer decorates the pointee struct of every `Uniform`,
+`PushConstant`, and `StorageBuffer` pointer as `Block`, including a nested
+struct member. Loading a nested struct member whole makes SPIRV-Cross treat
+the inner type as a block and omit its GLSL declaration, so input loads from
+these storage classes access-chain and load each scalar, vector, or matrix
+leaf and reassemble the aggregate.
+
+The GLSL identifier of a non-varying interface is the source name with every
+character outside `[A-Za-z0-9_]` replaced by `_` and a leading `_` added when
+it does not start with a letter or `_`, so binding-group leaf
+`material.albedo` becomes `material_albedo`. The OpenGL-family Runtime binds
+named uniforms and textures by that identifier, and both sides call
+`runtime/interface_names.h` so the spelling has one definition.
 
 Value-yielding graphics `scf.if` lowers to a structured SPIR-V selection with
 explicit header, branch, and merge blocks. Function-local result slots carry
@@ -907,6 +931,19 @@ Loads reconstruct the logical Tensor, Tuple, or Struct Value and stores
 decompose it recursively. Reflection records the generated leaf bindings so
 CPU, CUDA, Vulkan, and OpenGL bind one source argument to every generated
 descriptor without exposing this representation in the language or runtime API.
+
+GPU compute receives an aggregate Value parameter (Struct, Tuple, or
+aggregate Tensor) as one read-only `i32` word buffer holding its canonical
+bytes, recorded as `ParameterUse::bufferValue`. The kernel reloads each
+scalar leaf from its canonical byte offset. Sub-word leaves shift and
+truncate; `bool` compares its byte against zero; 64-bit leaves combine two
+words. The canonical layout aligns each scalar to its size, so a sub-word
+leaf never straddles a word and a 64-bit leaf starts on a word boundary;
+lowering rejects any other placement. The word buffer was chosen over
+per-leaf push constants or uniforms because it reuses the storage-binding
+path every compute backend already has. It needs no per-backend
+aggregate-uniform layout rules, and Struct leaves inside binding groups get
+the same transport.
 
 Autodiff is a deterministic VJP transform of specialized, validated typed
 Program IR. Generated primal, adjoint, and tape objects remain ordinary typed

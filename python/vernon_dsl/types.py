@@ -4,7 +4,7 @@ import builtins
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Self, TypeAlias
+from typing import Any, NoReturn, Self, TypeAlias
 
 import numpy as np
 
@@ -265,8 +265,16 @@ class Specialization:
         if self.type not in {bool, i32, u32, f32, f64}:
             raise TypeError("specialization type must be bool, i32, u32, f32, or f64")
 
-    def __bool__(self) -> builtins.bool:
-        raise TypeError("Vernon specializations are compile-time-only values")
+    def _compile_time_only(self, *_: object) -> NoReturn:
+        raise TypeError(
+            "Vernon specializations are compile-time-only values; a module that uses them in annotation "
+            "expressions such as When[MODE > 1, T] needs `from __future__ import annotations`"
+        )
+
+    # `==` stays the dataclass identity comparison because specializations are mapping keys.
+    __bool__ = __lt__ = __le__ = __gt__ = __ge__ = _compile_time_only
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _compile_time_only
+    __floordiv__ = __rfloordiv__ = __mod__ = __rmod__ = __neg__ = __pos__ = _compile_time_only
 
 
 Feature = Specialization

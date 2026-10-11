@@ -22,7 +22,7 @@ from ..bundle import ProgramCompileError
 from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES
-from ..module_graph import load_project, resolve_project_entry
+from ..module_graph import declared_project_specializations, resolve_project_entry
 from ..types import (
     Specialization,
     SpecializationAssignment,
@@ -242,10 +242,16 @@ def lint_python_program_asset(source: str | Path, descriptor_name: str) -> Progr
     entries = tuple(_resolved_entry(source_path, entry) for entry in _static_entries(tree, program))
 
     variants = _linted_variants(tree, keywords)
-    requested = {assignment.name for variant in variants for assignment in variant if assignment.type == "bool"}
-    undeclared = requested - set(load_project(source_path).features)
+    declared = declared_project_specializations(source_path)
+    requested = {assignment.name: assignment.type for variant in variants for assignment in variant}
+    undeclared = set(requested) - set(declared)
     if undeclared:
-        raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(undeclared)))
+        raise ProgramCompileError("variant requests undeclared specialization(s): " + ", ".join(sorted(undeclared)))
+    mismatched = sorted(name for name, kind in requested.items() if declared[name] != kind)
+    if mismatched:
+        raise ProgramCompileError(
+            "variant specialization type does not match its declaration: " + ", ".join(mismatched)
+        )
     return ProgramAssetLint(identifier, variants, entries)
 
 

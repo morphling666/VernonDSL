@@ -70,9 +70,15 @@ pipeline as a whole, before any of its modules is compiled:
    order: a texture without an authored `resource(set=..., binding=...)` and
    an implicit sampler take one binding each; a uniform spilled to a buffer
    takes one; a TensorView parameter takes one per storage leaf, in leaf
-   order; the module's metadata carrier takes one, after all arguments. Each
-   request carries the parameter's pipeline name, kind, and type. Authored
-   bindings are listed separately.
+   order; the module's metadata carrier takes one, after all arguments. An
+   implicit sampler is listed right after the texture it samples. Each
+   request carries the parameter's pipeline name, kind, type, and outermost
+   binding group, if any. Authored bindings are listed separately.
+
+   A Struct, Tuple, or Tensor uniform always spills to a buffer, because
+   OpenGL, OpenGL ES, and Metal have no native inline uniform for aggregates.
+   Scalar and Vector uniforms stay inline while they fit the 128-byte inline
+   budget.
 2. *Link* (`vernonCompilerLinkGraphicsBindings`). Every authored set-0 binding
    of every module is reserved. Requests are then assigned in module order and,
    within a module, in request order. A request with the same pipeline name,
@@ -80,6 +86,14 @@ pipeline as a whole, before any of its modules is compiled:
    request's bindings, since a pipeline keyword names one Program Value. Every
    other request, including every metadata carrier, takes the lowest free
    bindings.
+
+   Requests of one binding group occurrence are allocated together instead:
+   the link forms the union of the group's requests over all modules, in
+   field order (a request seen only in a later module, such as an implicit
+   sampler of one stage, joins after the request that precedes it there),
+   and assigns the whole union the lowest free consecutive range. Each module
+   takes its own requests' bindings from that range, so both stages agree on
+   every leaf even when one stage uses only some of them.
 3. *Compile.* Each module is compiled with its own layout from the link. The
    compiler checks that the layout covers exactly that module's requests,
    writes texture and sampler bindings onto their arguments before reflection
@@ -103,6 +117,16 @@ these failures.
 
 Backends that build one descriptor layout per pipeline merge a binding that
 several stages use into one descriptor visible to each of those stages.
+
+An explicit `Sampler` parameter binds through the images it samples. A stage
+that declares one but never samples with it, which happens when a stage uses
+only part of a binding group, contributes no sampler slot in that stage. An
+implicit sampler always pairs with its texture.
+
+The OpenGL-family Runtime binds named uniforms and textures by the shader's
+sanitized interface name (`material.albedo` becomes `material_albedo`). The
+compiler and Runtime share one sanitizer (`runtime/interface_names.h`), so the
+two spellings cannot diverge.
 
 ## 4. Manifest representation
 
@@ -166,9 +190,20 @@ rejects these bundles at the version check instead of misreading them.
   render system targets OpenGL 4.5.
 - Vulkan uses the same SPIR-V lowering (StorageBuffer runtime arrays and a
   Uniform carrier block).
-- Other graphics targets reject graphics TensorView bindings when the Stage
-  loads, with `PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED`, until their draw binding
-  is implemented.
+- DirectX 12 compiles every storage block, including the `NonWritable`
+  graphics reads, as `RWByteAddressBuffer` and binds it as a raw UAV. A
+  `NonWritable` block would otherwise become a `t`-register SRV, and the D3D12
+  provider's binding model has one descriptor kind per storage buffer for
+  compute and graphics alike. The root signature is one table visible to all
+  stages, so a descriptor that both stages use is one range (section 3).
+  Inline values stay per-stage root constants. Storage leaves after the first,
+  extra samplers, and metadata carriers take provider slots after the highest
+  parameter slot, because D3D12 places external parameters at their parameter
+  slot.
+- Metal rejects graphics TensorView bindings when the Stage loads, with
+  `PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED`, until its draw binding, meaning
+  per-stage buffer indices for storage leaves and carriers, is implemented
+  and tested on Apple hardware.
 
 ## 7. Acceptance
 

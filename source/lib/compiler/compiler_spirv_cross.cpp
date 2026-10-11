@@ -391,6 +391,9 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     canonicalizeInterface(compiler);
                     spirv_cross::CompilerHLSL::Options options;
                     options.shader_model = hlslShaderModel;
+                    // The D3D12 provider binds every storage buffer as a raw UAV range; a NonWritable block would
+                    // otherwise become a t-register SRV that the root signature does not declare.
+                    options.force_storage_buffer_as_uav = true;
                     compiler.set_hlsl_options(options);
                     source = compiler.compile();
                     extension = "hlsl";

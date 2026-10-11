@@ -345,9 +345,6 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
                 continue;
             }
             if (argument.kind == VERNON_PROGRAM_SAMPLER) {
-                if (use.sampledImageBindings.empty())
-                    return fail(error, "sampler reflection has no paired sampled image "
-                                       "binding");
                 for (const SampledImageBinding &binding : use.sampledImageBindings) {
                     PlannedSampledResource &resource = sampled[{binding.descriptorSet, binding.binding}];
                     if (resource.explicitSampler &&

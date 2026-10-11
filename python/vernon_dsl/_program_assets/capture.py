@@ -9,9 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .._markers import dsl_kind
 from ..diagnostics import ProgramCompileError
 from ..program_frontend import ParsedProgram
-from ..types import SpecializationAssignment, specialization_constants
+from ..types import SpecializationAssignment
 from .declaration import ProgramAssetDeclaration
 
 if TYPE_CHECKING:
@@ -87,8 +88,6 @@ def _capture_pipeline(
             "a Program Asset drives specializations from its variants, so a cooked vd.pipeline(...) must not carry "
             "its own specializations="
         )
-    if any(specialization_constants(key) for key in keys):
-        raise ProgramCompileError("graphics Program specialization values are not implemented")
     return tuple(CapturedProgramVariant(key, _parse_pipeline_program(pipeline, key)) for key in keys)
 
 
@@ -100,7 +99,7 @@ def _capture_kernel_vjp(
     from ..program import _parse_kernel_program
 
     kernel = expression.program
-    if getattr(kernel, "__vernon_dsl__", (None,))[0] != "compute":
+    if dsl_kind(kernel) != "compute":
         raise ProgramCompileError(_capability_diagnostic("graphics_vjp"))
     return tuple(
         CapturedProgramVariant(

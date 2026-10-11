@@ -457,19 +457,9 @@ class VulkanGraphicsStorageRuntimeTests(_GraphicsStorageRuntimeCases, unittest.T
     requirements = BackendRequirements(graphics=True)
 
 
-class DirectXGraphicsStorageRuntimeTests(unittest.TestCase):
-    def setUp(self) -> None:
-        require_available(probe_backend(backend_row(vd.directx), BackendRequirements(graphics=True)))
-
-    def test_graphics_storage_reads_are_rejected_at_preparation(self) -> None:
-        target = vd.Texture.zeros(shape=(8, 8))
-        with self.assertRaisesRegex(RuntimeError, "PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED"):
-            pull_pipeline(
-                positions=vd.storage.from_numpy(_FULL_SCREEN),
-                colors=vd.storage.from_numpy(np.zeros((2, 4), dtype=np.float32)),
-                render_pass=_render_pass(target),
-                draw=vd.draw(vertex_count=3),
-            )
+class DirectXGraphicsStorageRuntimeTests(_GraphicsStorageRuntimeCases, unittest.TestCase):
+    arch = vd.directx
+    requirements = BackendRequirements(graphics=True)
 
 
 def _link(modules: list[str]) -> list[str]:

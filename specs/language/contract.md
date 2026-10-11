@@ -442,29 +442,54 @@ Generated builtin functions are the preferred authoring API.
 same closed stage/direction/type registry. `vd.specialization(name, scalar_type)`
 declares a typed compile-time value; `vd.feature(name)` is its Boolean
 convenience form. `ProgramAsset` explicitly enumerates canonical assignment
-mappings through `variants=`. Compute Kernel and Kernel-VJP assets accept all
-scalar specialization kinds; graphics Pipeline assets accept Boolean
-specializations. Module and Module-VJP assets require the empty variant key
+mappings through `variants=`. Compute Kernel, Kernel-VJP, and graphics
+Pipeline assets accept all scalar specialization kinds; both graphics stages
+share one key. Module and Module-VJP assets require the empty variant key
 because their child specialization choices are authored explicitly in the
 Module graph. There is no independent public
 shader-variant selector. Specialization values and `When` branches are
-compile-time inputs, not runtime Python conditions. Interface locations are
-assigned deterministically before Boolean pruning so disabled fields retain
-stable reservations.
+compile-time inputs, not runtime Python conditions. An `if`, `elif`, or
+conditional expression whose test references a specialization is decided by
+the key, and `When[condition, T]` accepts any compile-time expression;
+`static_specialization.md` sections 2 and 3 define the expression subset and
+diagnostics. Interface locations are assigned deterministically before
+evaluation so disabled fields retain stable reservations. Host annotations
+are evaluated with specialization names bound to the key, so a module that
+uses compound conditions in annotations on Python 3.11 through 3.13 needs
+`from __future__ import annotations`.
 
 Imported DSL declarations are loaded through the source module graph without
 executing Python. Captured constants must belong to the deterministic
-constant-expression subset and are part of specialization identity. Struct
-methods normalize to ordinary typed helper calls before reachability analysis.
+constant-expression subset and are part of specialization identity. A method
+call `x.m(...)` resolves on the inferred Struct or binding-group type of `x`
+during typed helper specialization, so generic helpers may call methods on
+unannotated parameters and unreachable methods are pruned without diagnostics.
+Methods are not first-class values.
+
+A `@vd.binding_group` class aggregates entry interface items: `TensorView`,
+`Texture`, and `Sampler` resources, Values (graphics `uniform()`s, Kernel
+Value parameters), and nested groups, with no per-field interface metadata.
+It is not a Value: it appears only as an entry or helper parameter, a
+forwarded argument, or a field-access or method receiver. Each leaf is an
+entry interface item named by its dotted path (`material.albedo`) in
+reflection, Program parameters, host binding, and derivative paths; on the
+host the class is a plain container. One group occurrence takes one
+consecutive binding range in field order, shared by both stages of a
+pipeline. Kernels, Pipelines, and `Module.forward()` accept groups on every
+backend. A VJP path naming a group root expands to that group's
+differentiable leaves. `static_specialization.md` sections 4 and 5 define the
+rules and diagnostics.
 
 Project processing order is:
 
 1. load and validate source imports;
-2. bind captured constants and the canonical typed specialization key,
-   deriving Boolean feature pruning from that key;
-3. normalize Struct methods and generated builtins;
+2. bind captured constants and the canonical typed specialization key:
+   substitute specialization values, decide static branches, and remove
+   disabled `When` parameters;
+3. normalize generated builtins;
 4. prune to selected entries and validate the call graph;
-5. infer, specialize, and validate typed semantic nodes and effects;
+5. infer, specialize, and validate typed semantic nodes and effects,
+   resolving method calls and flattening binding groups;
 6. lower typed nodes;
 7. validate target capabilities and materialize artifacts.
 

@@ -460,6 +460,12 @@ if(TARGET VernonRuntime)
             typed_specialization_manifest
             typed_specialization_fixture_target)
         vernon_add_cpu_program_fixture(
+            binding-group
+            binding_group_fixture
+            "${VERNON_TEST_ROOT}/fixtures/binding_group_program_asset.py:asset"
+            binding_group_manifest
+            binding_group_fixture_target)
+        vernon_add_cpu_program_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
             "${VERNON_TEST_ROOT}/fixtures/autodiff_native_f16_asset.py:asset"
@@ -572,7 +578,8 @@ if(TARGET VernonRuntime)
                     Vernon::RuntimeTesting
                     nlohmann_json::nlohmann_json
                     ${module_program_cpu_fixture_targets}
-                    ${typed_specialization_fixture_target})
+                    ${typed_specialization_fixture_target}
+                    ${binding_group_fixture_target})
         target_include_directories(
             VernonModuleProgramRuntimeTests
             PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
@@ -581,7 +588,8 @@ if(TARGET VernonRuntime)
             VernonModuleProgramRuntimeTests
             PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cpu_manifest}"
                     VERNON_MODULE_PROGRAM_CPU_FIXTURES_AVAILABLE=1
-                    VERNON_TYPED_SPECIALIZATION_MANIFEST="${typed_specialization_manifest}")
+                    VERNON_TYPED_SPECIALIZATION_MANIFEST="${typed_specialization_manifest}"
+                    VERNON_BINDING_GROUP_MANIFEST="${binding_group_manifest}")
         set_target_properties(VernonModuleProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                          "${CMAKE_BINARY_DIR}/source")
         vernon_discover_gtests(VernonModuleProgramRuntimeTests)

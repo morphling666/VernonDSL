@@ -283,7 +283,12 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
     try {
         auto layout = std::make_unique<PreparedLayout>();
         layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
+        constexpr uint32_t graphicsStages =
+            VERNON_RUNTIME_PROVIDER_STAGE_VERTEX | VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
         for (const auto &entry : layout->entries) {
+            // Descriptor tables are visible to every stage, so a descriptor may serve both shader stages; inline
+            // values become per-stage root constants and must name exactly one stage.
+            const bool graphicsDescriptorStages = entry.stage_mask != 0 && (entry.stage_mask & ~graphicsStages) == 0;
             const bool compute =
                 ((entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
                   entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM && entry.binding != UINT32_MAX) ||
@@ -295,9 +300,7 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                                            entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                            entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) &&
                                           entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
-                                          (entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
-                                           entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) &&
-                                          entry.binding != UINT32_MAX;
+                                          graphicsDescriptorStages && entry.binding != UINT32_MAX;
             const bool graphicsInline = entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                                         entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
                                         (entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
@@ -306,9 +309,8 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
             const bool graphicsUniformBuffer = (entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
                                                 entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) &&
                                                entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
-                                               (entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
-                                                entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) &&
-                                               entry.binding != UINT32_MAX && entry.element_size != 0;
+                                               graphicsDescriptorStages && entry.binding != UINT32_MAX &&
+                                               entry.element_size != 0;
             const bool vertex = entry.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
                                 entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT &&
                                 entry.binding < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT && entry.element_size != 0;

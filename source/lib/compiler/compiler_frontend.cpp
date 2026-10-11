@@ -27,6 +27,9 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -43,15 +46,32 @@ namespace {
 constexpr llvm::StringLiteral kLogicalArgumentOriginAttr = "vernon.internal.logical_argument_origin";
 constexpr llvm::StringLiteral kLogicalResultOriginAttr = "vernon.internal.logical_result_origin";
 
-bool containsF16(mlir::Type type) {
-    if (type.isF16())
-        return true;
+using StructFieldTypes = llvm::StringMap<llvm::SmallVector<mlir::Type>>;
+
+// A struct type names its declaration, so its fields are reached through `structs`; `active` breaks malformed
+// self-referencing declarations, which the verifier reports separately.
+bool containsFloat(mlir::Type type, unsigned width, const StructFieldTypes &structs, llvm::StringSet<> &active) {
+    auto contains = [&](mlir::Type nested) { return containsFloat(nested, width, structs, active); };
+    if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type))
+        return floatType.getWidth() == width;
     if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-        return containsF16(shaped.getElementType());
+        return contains(shaped.getElementType());
+    if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type))
+        return contains(tensor.getElementType());
     if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
-        return containsF16(view.getElementType());
+        return contains(view.getElementType());
+    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type))
+        return llvm::any_of(tuple.getTypes(), contains);
     if (auto function = mlir::dyn_cast<mlir::FunctionType>(type))
-        return llvm::any_of(function.getInputs(), containsF16) || llvm::any_of(function.getResults(), containsF16);
+        return llvm::any_of(function.getInputs(), contains) || llvm::any_of(function.getResults(), contains);
+    if (auto structType = mlir::dyn_cast<mlir::vernon::StructType>(type)) {
+        const auto fields = structs.find(structType.getName());
+        if (fields == structs.end() || !active.insert(structType.getName()).second)
+            return false;
+        const bool found = llvm::any_of(fields->second, contains);
+        active.erase(structType.getName());
+        return found;
+    }
     return false;
 }
 
@@ -64,27 +84,32 @@ const LogicalEntryModel *findLogicalEntry(const LogicalReflectionModel &logical,
 
 } // namespace
 
-bool moduleUsesF16(mlir::ModuleOp module) {
-    bool usesF16 = false;
-    for (mlir::vernon::StructDeclOp declaration : module.getOps<mlir::vernon::StructDeclOp>())
+bool moduleUsesFloat(mlir::ModuleOp module, unsigned width) {
+    // Declarations count only through a used struct type: a module may declare a struct for another target.
+    StructFieldTypes structs;
+    for (mlir::vernon::StructDeclOp declaration : module.getOps<mlir::vernon::StructDeclOp>()) {
+        auto &fields = structs[declaration.getSymName()];
         for (mlir::Attribute fieldAttribute : declaration.getFields()) {
             llvm::StringRef spelling = mlir::cast<mlir::StringAttr>(fieldAttribute).getValue();
             const size_t separator = spelling.find(':');
-            mlir::Type fieldType = separator == llvm::StringRef::npos
-                                       ? mlir::Type{}
-                                       : mlir::parseType(spelling.drop_front(separator + 1), module.getContext());
-            if (fieldType && containsF16(fieldType))
-                return true;
+            if (separator == llvm::StringRef::npos)
+                continue;
+            if (mlir::Type fieldType = mlir::parseType(spelling.drop_front(separator + 1), module.getContext()))
+                fields.push_back(fieldType);
         }
+    }
+    llvm::StringSet<> active;
+    auto contains = [&](mlir::Type type) { return containsFloat(type, width, structs, active); };
+    bool uses = false;
     module.walk([&](mlir::Operation *operation) {
-        usesF16 = usesF16 || llvm::any_of(operation->getOperandTypes(), containsF16) ||
-                  llvm::any_of(operation->getResultTypes(), containsF16);
+        uses = uses || llvm::any_of(operation->getOperandTypes(), contains) ||
+               llvm::any_of(operation->getResultTypes(), contains);
         for (mlir::Region &region : operation->getRegions())
             for (mlir::Block &block : region)
-                usesF16 = usesF16 || llvm::any_of(block.getArgumentTypes(), containsF16);
-        return usesF16 ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
+                uses = uses || llvm::any_of(block.getArgumentTypes(), contains);
+        return uses ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
     });
-    return usesF16;
+    return uses;
 }
 
 class CompilerFrontend {

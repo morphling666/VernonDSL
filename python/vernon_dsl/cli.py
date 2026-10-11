@@ -34,16 +34,6 @@ def _specialization_assignment(value: str) -> SpecializationAssignment:
         raise argparse.ArgumentTypeError(f"invalid {type_name} specialization value {spelling!r}") from None
 
 
-def _specialization_binding(value: str) -> tuple[str, str]:
-    try:
-        local_name, specialization_name = value.split("=", 1)
-    except ValueError:
-        raise argparse.ArgumentTypeError("specialization binding must be LOCAL=NAME") from None
-    if not local_name.isidentifier() or not specialization_name:
-        raise argparse.ArgumentTypeError("specialization binding must contain a Python local name and a public name")
-    return local_name, specialization_name
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vernon-compile-python",
@@ -59,13 +49,6 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         help="bind NAME:TYPE=VALUE for bool, i32, u32, f32, or f64 (repeatable)",
     )
-    parser.add_argument(
-        "--specialization-binding",
-        type=_specialization_binding,
-        action="append",
-        default=[],
-        help="map a non-Boolean source declaration LOCAL to specialization NAME (repeatable)",
-    )
     return parser
 
 
@@ -76,7 +59,6 @@ def main(argv: list[str] | None = None) -> int:
             arguments.input,
             entry=arguments.entry,
             specializations=tuple(arguments.specialization),
-            specialization_bindings=tuple(arguments.specialization_binding),
         )
         arguments.output.write_text(output, encoding="utf-8", newline="\n")
     except (CompileError, OSError, ValueError) as error:

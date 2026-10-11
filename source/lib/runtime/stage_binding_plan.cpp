@@ -515,10 +515,6 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
                 }
             }
             if (parameter.kind == "sampler") {
-                if (use.sampledImageBindings.empty()) {
-                    error = "sampler parameter has no paired sampled image binding";
-                    return false;
-                }
                 for (const SampledImageBinding &binding : use.sampledImageBindings)
                     samplerBindings.emplace_back(use.stage, binding.descriptorSet, binding.binding);
             } else if (!use.sampledImageBindings.empty()) {

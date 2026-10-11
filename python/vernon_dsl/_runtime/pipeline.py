@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast, get_args, get_origin
 
+from .._markers import dsl_kind, is_struct_class
+from ..binding_groups import expand_binding_group_arguments
 from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest
 from ..frontend.runtime_types import (
     RuntimeParameterDescriptor,
+    resolved_leaf_annotations,
     runtime_parameter_descriptor,
 )
 from ..language.stage_registry import validate_graphics_topology
@@ -110,12 +113,10 @@ class Pipeline:
     ):
         kinds = cast(
             tuple[str, ...],
-            tuple(getattr(stage, "__vernon_dsl__", (None,))[0] for stage in stages),
+            tuple(dsl_kind(stage) for stage in stages),
         )
         validate_graphics_topology(kinds)
         self._variant = specialization_key(specializations)
-        if any(assignment.type != "bool" for assignment in self._variant):
-            raise TypeError("graphics pipeline specializations must be Boolean")
         self._graphics_state = graphics_state() if state is None else state
         if not isinstance(self._graphics_state, GraphicsPipelineState):
             raise TypeError("state must be a GraphicsPipelineState")
@@ -195,7 +196,7 @@ class Pipeline:
             )
             if entry is None:
                 raise RuntimeError(f"compiled graphics stage {function.__name__!r} has no typed entry")
-            stage_annotations = inspect.get_annotations(function, eval_str=True)
+            stage_annotations = resolved_leaf_annotations(function, frontend.request.specializations)
             for parameter in entry.parameters:
                 interface = {item.kind for item in parameter.interface}
                 if parameter.builtin is not None or "implicit" in interface:
@@ -247,7 +248,7 @@ class Pipeline:
                 elif getattr(base, "name", None) in {"Vector", "Matrix"}:
                     dtype, *cell_shape = base.arguments
                     cell_shape = tuple(cell_shape)
-                elif isinstance(base, type) and getattr(base, "__vernon_dsl__", (None,))[0] == "struct":
+                elif is_struct_class(base):
                     dtype, cell_shape = base, ()
                 else:
                     raise TypeError(f"vertex storage argument {name!r} has no canonical cell type")
@@ -393,7 +394,7 @@ class Pipeline:
         if dynamic_state is not None and not isinstance(dynamic_state, DynamicState):
             raise TypeError("dynamic_state must be a DynamicState or None")
         with _invocation_context():
-            self._invoke(dict(arguments), render_pass, draw, dynamic_state)
+            self._invoke(expand_binding_group_arguments(arguments), render_pass, draw, dynamic_state)
 
 
 def pipeline(

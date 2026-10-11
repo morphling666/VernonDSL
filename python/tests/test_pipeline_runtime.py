@@ -1128,7 +1128,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             advanced_fragment,
             specializations={vd.feature("UNKNOWN"): True},
         )
-        with self.assertRaisesRegex(vd.CompileError, "undeclared feature"):
+        with self.assertRaisesRegex(vd.CompileError, "undeclared specialization"):
             unknown(
                 position=positions,
                 offset=offsets,

@@ -191,7 +191,7 @@ def reflected_parameters(
             )
             if descriptor_required and ("vernon.set" not in use or "vernon.binding" not in use):
                 raise ProgramCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
-            if row.get("kind") == "sampler" and not use.get("sampled_image_bindings"):
+            if internal_source is not None and row.get("kind") == "sampler" and not use.get("sampled_image_bindings"):
                 raise ProgramCompileError(f"{stage} sampler argument has no reflected sampled image binding")
             backend_name = _backend_name(name)
             if interface_name == "uniform":

@@ -7,7 +7,7 @@ import dataclasses
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 from ._runtime.tensor import TensorStorage, TensorView
 from .operation_graph import (
@@ -25,6 +25,9 @@ from .operation_graph import (
     ProgramControlSource,
 )
 from .types import SpecializationAssignment
+
+if TYPE_CHECKING:
+    from .module import ModuleDefinition
 
 
 def _symbolic_program_inputs(parameter_types: Mapping[str, Any]) -> dict[str, Any]:
@@ -508,10 +511,7 @@ class ProgramTemplate:
             assert isinstance(captured, CapturedKernelCall)
             lowered = captured.kernel._lower(captured.specializations)
             frontend = lowered.frontend
-            builtin_names = lowered.builtins
-            parameter_names = tuple(
-                name for name in inspect.signature(captured.kernel._function).parameters if name not in builtin_names
-            )
+            parameter_names = captured.kernel._parameter_names(lowered)
             if len(parameter_names) != len(captured.arguments):
                 raise TypeError(f"{captured.kernel.__name__} expects {len(parameter_names)} launch arguments")
             entry = next(
@@ -736,14 +736,10 @@ def _capture_module(module: Any, parameter_types: Mapping[str, Any]) -> tuple[Pr
     return interpret_module_forward(module, parameter_types)
 
 
-def _bind_forward_arguments(module: Any, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> dict[str, Any]:
-    bound = type(module)._module_definition.signature.bind(*arguments, **keywords)
-    bound.apply_defaults()
-    return dict(bound.arguments)
-
-
-def _access_name(access: Any) -> str:
-    return str(getattr(access, "name", access))
+def _bind_program_inputs(
+    definition: ModuleDefinition, arguments: tuple[Any, ...], keywords: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {name: value for name, _, value in definition.bind_leaves(arguments, keywords)}
 
 
 def _merge_storage_shapes(
@@ -805,6 +801,7 @@ def _resolve_storage_parameter(
     from .frontend.runtime_types import (
         RuntimeParameterDescriptor,
         StorageParameterConstraint,
+        storage_access,
     )
     from .types import TypeExpr, dyn
 
@@ -814,7 +811,7 @@ def _resolve_storage_parameter(
         if not isinstance(inferred, TypeExpr) or inferred.name != "TensorView" or len(inferred.arguments) != 3:
             raise TypeError(f"invalid reflected Storage type for Module parameter {name!r}")
         dtype, shape, access = inferred.arguments
-        reflected = StorageParameterConstraint(dtype, tuple(shape), _access_name(access), False)
+        reflected = StorageParameterConstraint(dtype, tuple(shape), storage_access(access), False)
     if explicit is None and reflected is None and value_dtype is None:
         return None
 
@@ -945,9 +942,11 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
         function = getattr(target, "_function", None)
         if function is None:
             return None
+        from .frontend.runtime_types import resolved_annotations
+
         try:
-            annotations = inspect.get_annotations(function, eval_str=True)
-        except (NameError, TypeError):
+            annotations = resolved_annotations(function)
+        except TypeError:
             return None
         reflected = {
             name: annotation
@@ -1002,6 +1001,7 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
 
 
 def _module_parameter_types(module: Any) -> dict[str, Any]:
+    from .binding_groups import binding_group_leaf_annotations
     from .frontend.model import SemanticCategory
     from .frontend.runtime_types import runtime_parameter_descriptor
     from .operation_graph import ProgramControlDescriptor
@@ -1009,6 +1009,23 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
     definition = type(module)._module_definition
     annotations = definition.resolved_annotations
     reflected = _reflect_module_parameter_types(module)
+
+    def descriptor(name: str, annotation: Any) -> Any:
+        inferred = reflected.get(name)
+        if _module_storage_constraint(annotation) is not None or inferred is not None:
+            return _resolve_storage_parameter(name, annotation, inferred, require_static=True)
+        if annotation is None:
+            raise TypeError(
+                f"cannot infer Module parameter {name!r}; annotate it as "
+                "TensorStorage[element, (shape,), access] or TensorView[element, (shape,), access], "
+                "use it in a typed Program call, "
+                "or supply an explicit export argument"
+            )
+        result = runtime_parameter_descriptor(annotation)
+        if result.kind is SemanticCategory.STORAGE:
+            raise RuntimeError("Storage annotation bypassed canonical Module constraint resolution")
+        return result
+
     types: dict[str, Any] = {}
     for parameter in definition.signature.parameters.values():
         annotation = annotations.get(parameter.name)
@@ -1018,27 +1035,8 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
             continue
         if parameter.default is not inspect.Parameter.empty:
             continue
-        inferred = reflected.get(parameter.name)
-        explicit_storage = _module_storage_constraint(annotation)
-        if explicit_storage is not None or inferred is not None:
-            types[parameter.name] = _resolve_storage_parameter(
-                parameter.name,
-                annotation,
-                inferred,
-                require_static=True,
-            )
-            continue
-        if annotation is None:
-            raise TypeError(
-                f"cannot infer Module parameter {parameter.name!r}; annotate it as "
-                "TensorStorage[element, (shape,), access] or TensorView[element, (shape,), access], "
-                "use it in a typed Program call, "
-                "or supply an explicit export argument"
-            )
-        descriptor = runtime_parameter_descriptor(annotation)
-        if descriptor.kind is SemanticCategory.STORAGE:
-            raise RuntimeError("Storage annotation bypassed canonical Module constraint resolution")
-        types[parameter.name] = descriptor
+        for name, leaf_annotation in binding_group_leaf_annotations(parameter.name, annotation):
+            types[name] = descriptor(name, leaf_annotation)
     return types
 
 
@@ -1121,11 +1119,10 @@ def _parameter_types_from_values(
             raise TypeError(f"Module.forward() argument {name!r} must be TensorStorage or TensorView")
         return result
 
-    annotations = type(module)._module_definition.resolved_annotations
-    types = {}
-    for name, value in _bind_forward_arguments(module, arguments, keywords).items():
-        types[name] = descriptor(annotations.get(name), value, name)
-    return types
+    return {
+        name: descriptor(annotation, value, name)
+        for name, annotation, value in type(module)._module_definition.bind_leaves(arguments, keywords)
+    }
 
 
 def _program_control_kind(annotation: Any) -> str | None:
@@ -1231,10 +1228,9 @@ def _capture_kernel_program(
     from .frontend.runtime_types import runtime_parameter_descriptor
     from .types import u32
 
-    function = kernel._function
     lowered = kernel._lower(specializations)
     annotations = kernel._resolved_annotations(specializations)
-    parameter_names = tuple(name for name in inspect.signature(function).parameters if name not in lowered.builtins)
+    parameter_names = kernel._parameter_names(lowered)
     parameter_types: dict[str, Any] = {}
     for name in parameter_names:
         annotation = annotations.get(name)
@@ -1358,7 +1354,7 @@ class _TreeRecipe:
             return tuple(member.resolve(inputs, allocations) for member in self.value)
         if self.kind == "list":
             return [member.resolve(inputs, allocations) for member in self.value]
-        if self.kind == "dataclass":
+        if self.kind in {"dataclass", "binding_group"}:
             cls, fields = self.value
             return cls(**{name: member.resolve(inputs, allocations) for name, member in fields})
         raise RuntimeError(f"unknown Program output recipe {self.kind!r}")
@@ -1369,13 +1365,13 @@ class _PrimalSpecialization:
     program: Any
     template: ProgramTemplate
     invocation: ProgramInvocation
-    signature: inspect.Signature
+    definition: ModuleDefinition
     allocations: tuple[_AllocationSpec, ...]
     outputs: _TreeRecipe
     native_program: Any
 
     def invoke(self, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
-        inputs = self.signature.bind(*arguments, **keywords).arguments
+        inputs = _bind_program_inputs(self.definition, arguments, keywords)
         allocation_list: list[TensorStorage] = []
         for spec in self.allocations:
             allocation_list.append(spec.create(inputs, tuple(allocation_list)))
@@ -1397,6 +1393,9 @@ def _capture_recipes(
     tuple[_AllocationSpec, ...],
     _TreeRecipe,
 ]:
+    from .binding_groups import is_binding_group
+    from .host_values import declared_fields
+
     inputs = tuple(capture.inputs.items())
     captured_allocations = tuple(enumerate(capture.allocs))
 
@@ -1449,6 +1448,11 @@ def _capture_recipes(
                     tuple((field.name, tree(getattr(value, field.name))) for field in dataclasses.fields(value)),
                 ),
             )
+        if is_binding_group(type(value)):
+            return _TreeRecipe(
+                "binding_group",
+                (type(value), tuple((name, tree(getattr(value, name))) for name in declared_fields(type(value)))),
+            )
         if isinstance(value, Mapping):
             return _TreeRecipe("mapping", tuple((name, tree(member)) for name, member in value.items()))
         if isinstance(value, tuple):
@@ -1500,7 +1504,7 @@ def _primal_specialization(
         parsed,
         invocation.template,
         invocation,
-        type(module)._module_definition.signature,
+        type(module)._module_definition,
         allocations,
         output_recipe,
         compile_program(parsed, invocation.template),
@@ -1511,7 +1515,7 @@ def _primal_specialization(
 class _VjpSpecialization:
     compiled: Any
     invocation: ProgramInvocation
-    signature: inspect.Signature
+    definition: ModuleDefinition
     allocations: tuple[_AllocationSpec, ...]
     outputs: _TreeRecipe
 
@@ -1531,9 +1535,7 @@ class _VjpSpecialization:
         checkpoint_memory_budget: int | None,
         checkpoint_policy: str,
     ) -> tuple[Any, Any]:
-        bound = self.signature.bind(*arguments, **keywords)
-        bound.apply_defaults()
-        inputs = dict(bound.arguments)
+        inputs = _bind_program_inputs(self.definition, arguments, keywords)
         allocation_list: list[TensorStorage] = []
         for spec in self.allocations:
             allocation_list.append(spec.create(inputs, tuple(allocation_list)))
@@ -1625,7 +1627,7 @@ def _compile_module_vjp_specialization(
     return _VjpSpecialization(
         compiled,
         invocation,
-        type(module)._module_definition.signature,
+        type(module)._module_definition,
         allocations,
         output_recipe,
     )

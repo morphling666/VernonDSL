@@ -19,7 +19,6 @@ class FrontendCompileRequest:
     source_path: Path
     entry: str
     specializations: tuple[SpecializationAssignment, ...] = ()
-    specialization_bindings: tuple[tuple[str, str], ...] = ()
     tensor_shapes: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
     captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
     workgroup_size: tuple[int, int, int] | None = None
@@ -32,13 +31,6 @@ class FrontendCompileRequest:
         if len({assignment.name for assignment in canonical}) != len(canonical):
             raise ValueError("frontend specializations contain duplicate names")
         object.__setattr__(self, "specializations", canonical)
-        bindings = tuple(sorted(self.specialization_bindings))
-        if len({local_name for local_name, _ in bindings}) != len(bindings):
-            raise ValueError("frontend specialization bindings contain duplicate local names")
-        non_boolean = {assignment.name for assignment in canonical if assignment.type != "bool"}
-        if len(bindings) != len(non_boolean) or {name for _, name in bindings} != non_boolean:
-            raise ValueError("frontend specialization bindings must exactly cover non-Boolean specializations")
-        object.__setattr__(self, "specialization_bindings", bindings)
         object.__setattr__(
             self,
             "tensor_shapes",
@@ -77,7 +69,6 @@ class FrontendCompileResult:
             "program_version": PROGRAM_VERSION,
             "entry": self.request.entry,
             "specializations": specialization_key_data(self.request.specializations),
-            "specialization_bindings": [list(binding) for binding in self.request.specialization_bindings],
             "tensor_shapes": [[name, dtype, list(shape)] for name, dtype, shape in self.request.tensor_shapes],
             "captured_constants": [
                 [name, type(value).__name__, value] for name, value in self.request.captured_constants

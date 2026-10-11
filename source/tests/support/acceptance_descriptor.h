@@ -23,6 +23,7 @@ struct AcceptanceDescriptor {
     VernonLaunchSize grid;
     const double *expected;
     size_t expectedCount;
+    std::string_view specialization;
 };
 
 } // namespace vernon::tests

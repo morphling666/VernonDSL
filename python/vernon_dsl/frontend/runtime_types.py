@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .._markers import is_struct_class
+from ..binding_groups import binding_group_leaf_annotations
 from ..host_values import pack_host_value
-from ..types import TypeExpr, _DynamicExtent, _Scalar, dyn
+from ..types import Specialization, SpecializationAssignment, TypeExpr, _DynamicExtent, _Scalar, dyn
+from ..types import bool as dsl_bool
 from .model import ConcreteType, SemanticCategory, is_abi_stable_value, semantic_category
 
 
@@ -109,7 +113,7 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
         return ConcreteType("scalar", "bool")
     if isinstance(annotation, _Scalar):
         return ConcreteType("scalar", annotation.name)
-    if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+    if is_struct_class(annotation):
         return ConcreteType("struct", annotation.__name__)
     if not isinstance(annotation, TypeExpr):
         raise TypeError(f"{annotation!r} is not a Vernon runtime annotation")
@@ -156,7 +160,7 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
             (
                 element,
                 tuple("?" if extent is dyn else extent for extent in shape),
-                _storage_access(access),
+                storage_access(access),
             ),
         )
     if annotation.name == "TensorView":
@@ -169,7 +173,7 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
             (
                 concrete_type_from_annotation(element),
                 tuple("?" if extent is dyn else extent for extent in shape),
-                str(getattr(access, "name", access)),
+                storage_access(access),
                 "device",
             ),
         )
@@ -189,8 +193,8 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
                 (
                     str(dimension),
                     ConcreteType("scalar", "f32"),
-                    str(getattr(format_name, "name", format_name)),
-                    str(getattr(access, "name", access)),
+                    _spelling(format_name),
+                    _spelling(access),
                 ),
             )
         raise TypeError("Texture annotation requires two or three arguments")
@@ -221,8 +225,13 @@ def runtime_parameter_descriptor(annotation: Any) -> RuntimeParameterDescriptor:
     return RuntimeParameterDescriptor.annotated(category, annotation, logical)
 
 
-def _storage_access(value: Any) -> str:
-    access = str(getattr(value, "name", value))
+def _spelling(value: Any) -> str:
+    """Annotation arguments arrive either as DSL symbols carrying `.name` or as plain strings."""
+    return str(getattr(value, "name", value))
+
+
+def storage_access(value: Any) -> str:
+    access = _spelling(value)
     if access not in {"read", "write", "read_write"}:
         raise TypeError("Storage access must be read, write, or read_write")
     return access
@@ -251,7 +260,7 @@ def storage_parameter_constraint(annotation: Any) -> StorageParameterConstraint 
         concrete = concrete_type_from_annotation(dtype)
         if not is_abi_stable_value(concrete):
             raise TypeError("TensorView element must have an ABI-stable Value type")
-        return StorageParameterConstraint(dtype, _storage_shape(shape), _storage_access(access), True)
+        return StorageParameterConstraint(dtype, _storage_shape(shape), storage_access(access), True)
     if len(annotation.arguments) == 1:
         dtype = annotation.arguments[0]
         concrete = concrete_type_from_annotation(dtype)
@@ -263,7 +272,7 @@ def storage_parameter_constraint(annotation: Any) -> StorageParameterConstraint 
         concrete = concrete_type_from_annotation(dtype)
         if not is_abi_stable_value(concrete):
             raise TypeError("TensorStorage element must have an ABI-stable Value type")
-        return StorageParameterConstraint(dtype, _storage_shape(shape), _storage_access(access), False)
+        return StorageParameterConstraint(dtype, _storage_shape(shape), storage_access(access), False)
     raise TypeError("TensorStorage annotation requires element, or element, shape, and access")
 
 
@@ -273,11 +282,71 @@ def validate_host_value(annotation: Any, value: Any, name: str) -> None:
     pack_host_value(annotation, value, name)
 
 
-def resolved_annotations(function: Any) -> dict[str, Any]:
+class _UnassignedSpecialization:
+    """Lets compile-time expressions in annotations evaluate when the key does not assign a scalar.
+
+    The host never reads `When` conditions; the frontend decides them, so any operator result is acceptable.
+    """
+
+    def _absorb(self, *_: object) -> _UnassignedSpecialization:
+        return self
+
+    def __bool__(self) -> bool:
+        return False
+
+    __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = _absorb  # type: ignore[assignment]
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _absorb
+    __floordiv__ = __rfloordiv__ = __mod__ = __rmod__ = __neg__ = __pos__ = _absorb
+    __hash__ = object.__hash__
+
+
+_UNASSIGNED = _UnassignedSpecialization()
+
+
+def resolved_annotations(
+    function: Any,
+    specializations: tuple[SpecializationAssignment, ...] = (),
+    extra_globals: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluates `function` annotations with each declared specialization bound to its value in the key.
+
+    `Specialization` objects refuse `bool()` and operators, so `When[FEATURE and MODE == 2, T]` only evaluates once
+    the names are replaced by values; an unassigned Boolean is false, an unassigned scalar is a placeholder.
+    A `When` annotation resolves to its wrapped type: the frontend decides the condition, so callers must take the
+    parameter set from the specialized entry rather than from these annotations.
+    """
+
+    values = {assignment.name: assignment.value for assignment in specializations}
+    namespace = dict(function.__globals__)
+    for local_name, value in function.__globals__.items():
+        if isinstance(value, Specialization):
+            namespace[local_name] = values.get(value.name, False if value.type is dsl_bool else _UNASSIGNED)
+    namespace.update(extra_globals or {})
     try:
-        return inspect.get_annotations(function, eval_str=True)
+        annotations = inspect.get_annotations(function, globals=namespace, eval_str=True)
     except (NameError, TypeError) as error:
         raise TypeError(f"cannot resolve runtime annotations: {error}") from None
+    return {
+        name: (
+            annotation.arguments[1]
+            if isinstance(annotation, TypeExpr) and annotation.name == "When" and len(annotation.arguments) == 2
+            else annotation
+        )
+        for name, annotation in annotations.items()
+    }
+
+
+def resolved_leaf_annotations(
+    function: Any,
+    specializations: tuple[SpecializationAssignment, ...] = (),
+) -> dict[str, Any]:
+    """`resolved_annotations` with each binding-group parameter replaced by its dotted leaves, as the entry sees it."""
+
+    return {
+        leaf: leaf_annotation
+        for name, annotation in resolved_annotations(function, specializations).items()
+        for leaf, leaf_annotation in binding_group_leaf_annotations(name, annotation)
+    }
 
 
 __all__ = [
@@ -285,8 +354,10 @@ __all__ = [
     "StorageParameterConstraint",
     "concrete_type_from_annotation",
     "resolved_annotations",
+    "resolved_leaf_annotations",
     "runtime_parameter_category",
     "runtime_parameter_descriptor",
+    "storage_access",
     "storage_parameter_constraint",
     "validate_host_value",
 ]

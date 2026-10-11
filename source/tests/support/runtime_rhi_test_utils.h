@@ -75,7 +75,8 @@ private:
 
 class OwnedProgramExecutable {
 public:
-    OwnedProgramExecutable(VernonRuntimeContext *runtime, const std::filesystem::path &manifestPath) {
+    OwnedProgramExecutable(VernonRuntimeContext *runtime, const std::filesystem::path &manifestPath,
+                           const VernonProgramVariantSelector *selector = nullptr) {
         std::ifstream input(manifestPath, std::ios::binary);
         const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
         if (!runtime || manifest.empty())
@@ -86,7 +87,7 @@ public:
         options.bundle_directory = directory.c_str();
         bundle_ = vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
         if (bundle_)
-            executable_ = vernonRuntimeResolveProgram(bundle_, nullptr);
+            executable_ = vernonRuntimeResolveProgram(bundle_, selector);
     }
 
     ~OwnedProgramExecutable() {

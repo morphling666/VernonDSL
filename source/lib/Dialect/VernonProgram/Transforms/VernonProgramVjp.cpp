@@ -1,5 +1,6 @@
 #include "mlir/Dialect/VernonProgram/Transforms/VernonProgramVjp.h"
 
+#include "VernonProgramCapabilities.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -543,6 +544,34 @@ FailureOr<SmallVector<Value>> buildProgramMatmulVjp(IntrinsicOp operation, const
                               reduceSumToType(context.builder, context.location, rightGradient, rightType)};
 }
 
+// Returns the boundary owning `path` and the projection into it.
+std::optional<std::pair<unsigned, StringRef>> findBoundaryPrefix(const llvm::StringMap<unsigned> &boundaries,
+                                                                 StringRef path) {
+    std::optional<std::pair<unsigned, StringRef>> found;
+    size_t foundSize = 0;
+    for (const auto &candidate : boundaries) {
+        StringRef name = candidate.getKey();
+        if (!isDottedPathPrefix(name, path))
+            continue;
+        if (!found || name.size() > foundSize) {
+            found = {candidate.getValue(), path.size() == name.size() ? StringRef{} : path.drop_front(name.size() + 1)};
+            foundSize = name.size();
+        }
+    }
+    return found;
+}
+
+// Checked before wrt resolution and per-kernel autodiff analysis, which would otherwise fail on texture operations
+// with a less specific diagnostic.
+LogicalResult rejectOpaqueBoundaries(func::FuncOp primal) {
+    const auto opaque = [](Type type) { return isa<vernon::TextureType, vernon::SamplerType>(type); };
+    if (llvm::none_of(primal.getArgumentTypes(), opaque) && llvm::none_of(primal.getResultTypes(), opaque))
+        return success();
+    namespace capabilities = ::vernon::program_capabilities;
+    const capabilities::Entry &capability = capabilities::get(capabilities::Id::OpaqueResourceVjp);
+    return primal.emitError() << StringRef(capability.diagnostic.data(), capability.diagnostic.size());
+}
+
 } // namespace
 
 FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp primal,
@@ -558,18 +587,23 @@ FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp p
     llvm::BitVector selected(primal.getNumArguments());
     SmallVector<unsigned> indices;
     for (StringRef path : publicPaths) {
-        auto [root, suffix] = path.split('.');
-        auto boundary = boundaries.find(root);
-        if (path.empty() || root.empty() || boundary == boundaries.end() ||
-            !selectsDifferentiableBoundaryLeaf(primal.getArgument(boundary->second).getType(),
-                                               primal->getParentOfType<ModuleOp>(), suffix)) {
+        std::optional<std::pair<unsigned, StringRef>> boundary = findBoundaryPrefix(boundaries, path);
+        if (!path.empty() && !boundary &&
+            llvm::any_of(boundaries.keys(), [&](StringRef name) { return isDottedPathPrefix(path, name); })) {
+            primal.emitError() << "Program VJP wrt path '" << path
+                               << "' names a binding group; select its leaves by dotted name";
+            return failure();
+        }
+        if (path.empty() || !boundary ||
+            !selectsDifferentiableBoundaryLeaf(primal.getArgument(boundary->first).getType(),
+                                               primal->getParentOfType<ModuleOp>(), boundary->second)) {
             primal.emitError("Program VJP wrt path does not identify a unique primal boundary");
             return failure();
         }
-        if (selected.test(boundary->second))
+        if (selected.test(boundary->first))
             continue;
-        selected.set(boundary->second);
-        indices.push_back(boundary->second);
+        selected.set(boundary->first);
+        indices.push_back(boundary->first);
     }
     return indices;
 }
@@ -587,32 +621,24 @@ FailureOr<SmallVector<unsigned>> resolveProgramCotangentBoundaryIndices(func::Fu
     llvm::BitVector selected(primal.getNumResults());
     SmallVector<unsigned> indices;
     for (StringRef path : publicPaths) {
-        auto boundary = boundaries.end();
-        StringRef suffix;
-        for (auto candidate = boundaries.begin(); candidate != boundaries.end(); ++candidate) {
-            StringRef name = candidate->getKey();
-            if (path != name && !(path.starts_with(name) && path.size() > name.size() && path[name.size()] == '.'))
-                continue;
-            if (boundary == boundaries.end() || name.size() > boundary->getKey().size()) {
-                boundary = candidate;
-                suffix = path.size() == name.size() ? StringRef{} : path.drop_front(name.size() + 1);
-            }
-        }
-        if (path.empty() || boundary == boundaries.end() ||
-            !selectsDifferentiableBoundaryLeaf(primal.getResultTypes()[boundary->second],
-                                               primal->getParentOfType<ModuleOp>(), suffix)) {
+        std::optional<std::pair<unsigned, StringRef>> boundary = findBoundaryPrefix(boundaries, path);
+        if (path.empty() || !boundary ||
+            !selectsDifferentiableBoundaryLeaf(primal.getResultTypes()[boundary->first],
+                                               primal->getParentOfType<ModuleOp>(), boundary->second)) {
             primal.emitError("Program VJP output path does not identify a unique primal boundary");
             return failure();
         }
-        if (selected.test(boundary->second))
+        if (selected.test(boundary->first))
             continue;
-        selected.set(boundary->second);
-        indices.push_back(boundary->second);
+        selected.set(boundary->first);
+        indices.push_back(boundary->first);
     }
     return indices;
 }
 
 LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &options) {
+    if (failed(rejectOpaqueBoundaries(primal)))
+        return failure();
     if (!llvm::hasSingleElement(primal.getBody()))
         return primal.emitError("Program VJP requires one straight-line entry block");
     auto returnOp = dyn_cast<func::ReturnOp>(primal.getBody().front().getTerminator());
@@ -939,6 +965,8 @@ struct VernonProgramVjpPass final : PassWrapper<VernonProgramVjpPass, OperationP
                 "Program VJP requires exactly one function marked vernon_program.graph = \"primal\"");
             return signalPassFailure();
         }
+        if (failed(rejectOpaqueBoundaries(primals.front())))
+            return signalPassFailure();
         if (selected.wrtBoundaryIndices.empty()) {
             SmallVector<StringRef> publicPaths;
             publicPaths.reserve(wrt.size());

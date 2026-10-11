@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from .._markers import dsl_kind
 from .._runtime.kernel import Kernel
 from .._runtime.pipeline import Pipeline
 from ..ad import ProgramExpression
@@ -71,7 +72,7 @@ def program_asset(
         return ProgramAssetDeclaration(id=id, program=program, variants=checked_variants)
     if isinstance(primal, tuple):
         raise TypeError("Program Asset graphics must use vd.pipeline(...), not a tuple of entry functions")
-    if getattr(primal, "__vernon_dsl__", (None,))[0] != "compute":
+    if dsl_kind(primal) != "compute":
         raise TypeError("Program Asset program must be a compute Kernel, Pipeline, Module, or VJP expression")
     assert isinstance(program, (Kernel, ProgramExpression))
     return ProgramAssetDeclaration(id=id, program=program, variants=checked_variants)

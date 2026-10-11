@@ -106,7 +106,7 @@ FailureOr<uint32_t> getCudaMetadataKernelParameterOrdinal(FunctionOpInterface fu
         const bool builtin = function.getArgAttr(index, kBuiltinAttrName) != nullptr;
         auto interfaceKind = function.getArgAttrOfType<StringAttr>(index, kInterfaceAttrName);
         uint64_t arity = 0;
-        if (!builtin && isa<TensorType, RankedTensorType>(type)) {
+        if (!builtin && isa<TensorType, RankedTensorType, StructType, TupleType>(type)) {
             arity = 5;
         } else if (interfaceKind && interfaceKind.getValue() == "resource") {
             if (isa<TextureType>(type)) {

@@ -4,13 +4,15 @@ from typing import Annotated
 
 import vernon_dsl as vd  # pyright: ignore[reportMissingImports]
 
-DOUBLE = vd.feature("DOUBLE")
+SCALE = vd.specialization("SCALE", vd.u32)
 
 
 @vd.func
 def specialize_value(value):
-    if DOUBLE:
+    if SCALE == 2:
         return value * 2.0
+    elif SCALE > 2:
+        return unsupported_scale(value)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
     return value
 
 
@@ -81,5 +83,5 @@ specialization_asset = vd.program_asset(
         specialization_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=({}, {DOUBLE: True}),
+    variants=({SCALE: 1}, {SCALE: 2}),
 )

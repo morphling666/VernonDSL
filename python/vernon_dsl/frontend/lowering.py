@@ -8,6 +8,7 @@ from ..language.syntax import INTRINSIC_METHODS
 from ..shader_contracts import ATOMIC_OPERATION_NAMES, BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
 from .abi import attribute_layout, value_leaves
 from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
+from .binding_groups import binding_group_occurrence
 from .control_flow_lowering import (
     emit_source_block,
     lower_bool_op,
@@ -172,7 +173,9 @@ class _FunctionEmitter:
     def emit(self) -> list[str]:
         emit_value_abi_metadata = self.stage is not None or self.node.name in self.context.shared_functions
         argument_locations: dict[int, int] = {}
-        if self.stage in GRAPHICS_STAGES:
+        # Every entry stage's Value parameters carry locations. The module graph assigns them to source parameters,
+        # but binding-group leaves exist only after flattening, so unlocated leaves take the free locations here.
+        if self.stage is not None:
             candidates: list[tuple[int, AnnotatedType, int, int | None]] = []
 
             def struct_fields(name: str) -> tuple[tuple[str, ConcreteType], ...]:
@@ -187,7 +190,7 @@ class _FunctionEmitter:
                 try:
                     span = attribute_layout(value_type, struct_fields).location_span
                 except ValueError as error:
-                    if self.stage == "fragment":
+                    if self.stage not in GRAPHICS_STAGES or self.stage == "fragment":
                         span = 1
                     else:
                         raise self.context.error(self.node.args.args[index], str(error)) from None
@@ -245,6 +248,9 @@ class _FunctionEmitter:
             ):
                 attributes.append(f"vernon.location = {argument_locations[index]} : i64")
             attributes.append(f'vernon.source_name = "{argument.arg}"')
+            group = binding_group_occurrence(argument)
+            if group is not None and self.stage in GRAPHICS_STAGES:
+                attributes.append(f'vernon.binding_group = "{group}"')
             if annotation.type.kind == "scalar":
                 attributes.append(f'vernon.dtype = "{annotation.type.name}"')
             elif annotation.type.kind == "tensor":
@@ -260,7 +266,7 @@ class _FunctionEmitter:
                 attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
-            if value_type.kind in {"tensor_view", "texture"} and self.stage is not None:
+            if value_type.kind in {"tensor_view", "texture", "sampler"} and self.stage is not None:
                 has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute
@@ -379,11 +385,14 @@ class _FunctionEmitter:
             value = Value(f"%arg{index}", DslType("sampler", "Sampler"))
             self.implicit_samplers[self.environment[texture_name].name] = value
             source_name = f"__vernon_implicit_sampler_{texture_name}"
+            texture_argument = next(argument for argument in self.node.args.args if argument.arg == texture_name)
+            group = binding_group_occurrence(texture_argument)
+            group_attribute = f', vernon.binding_group = "{group}"' if group is not None else ""
             arguments.append(
                 f'{value.name}: !vernon.sampler {{vernon.interface = "resource", '
                 f'vernon.source_name = "{source_name}", '
                 f'vernon.implicit = "sampler", '
-                f'vernon.implicit_texture = "{texture_name}"}}'
+                f'vernon.implicit_texture = "{texture_name}"{group_attribute}}}'
             )
 
         for api in self.interface_plan.generated_apis:

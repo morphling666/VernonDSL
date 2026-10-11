@@ -11,12 +11,14 @@ from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
 from ..types import SpecializationAssignment, enabled_features
 from .autodiff_profiles import AutodiffProfilePlan
+from .binding_groups import flatten_binding_groups
 from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
 from .lowering_types import DslType, FunctionSignature, ModuleContext
 from .model import AccessMode, ConcreteType, StorageEffect, StorageOwnerKind, StorageRegionKind, is_abi_stable_value
 from .monomorphize import infer_and_monomorphize_helpers
+from .parameter_paths import split_parameter_path
 from .request import FrontendCompileRequest, FrontendCompileResult
 from .specialization import specialize_frontend_source
 from .type_parser import AnnotatedType, TypeParser
@@ -47,6 +49,7 @@ class Compiler:
             ) from None
         module = normalize_struct_methods(module, filename)
         context = ModuleContext(filename, runtime_entry=runtime_entry)
+        module = flatten_binding_groups(module, context.error)
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)
@@ -124,7 +127,6 @@ class Compiler:
         input_path: str | Path,
         *,
         specializations: tuple[SpecializationAssignment, ...] = (),
-        specialization_bindings: tuple[tuple[str, str], ...] = (),
         entry: str | None = None,
         program_transform: ProgramTransformSpec | None = None,
     ) -> str:
@@ -137,20 +139,10 @@ class Compiler:
         if entry is None:
             if program_transform is not None:
                 raise ValueError("program transforms require one specialized entry")
-            if any(assignment.type != "bool" for assignment in canonical):
-                raise ValueError("non-Boolean specializations require an entry")
-            if specialization_bindings:
-                raise ValueError("specialization bindings require one specialized entry")
-            project = load_project(path, selected_features, entry)
+            project = load_project(path, canonical, entry)
             return self.compile(project.source, str(path), project.dependencies, project.features, selected_features)
         return self.compile_request(
-            FrontendCompileRequest(
-                path,
-                entry,
-                canonical,
-                specialization_bindings=specialization_bindings,
-                program_transform=program_transform,
-            )
+            FrontendCompileRequest(path, entry, canonical, program_transform=program_transform)
         ).mlir
 
     def compile_request(self, request: FrontendCompileRequest) -> FrontendCompileResult:
@@ -163,7 +155,7 @@ class Compiler:
             return cached
 
         selected_features = enabled_features(request.specializations)
-        project = load_project(request.source_path, selected_features, request.entry)
+        project = load_project(request.source_path, request.specializations, request.entry)
         specialized_source = specialize_frontend_source(project.source, request)
         mlir = self.compile(
             specialized_source,
@@ -239,14 +231,14 @@ class Compiler:
         typed_parameters = {parameter.name: parameter for parameter in function.parameters}
 
         def resolve_path(path: str, *, role: str) -> ConcreteType:
-            components = path.split(".")
-            parameter = typed_parameters.get(components[0])
+            root, projection = split_parameter_path(path, typed_parameters)
+            parameter = typed_parameters.get(root)
             if parameter is None:
                 raise context.error(function.source, f"VJP {role} path '{path}' names no entry parameter")
             if parameter.builtin is not None:
                 raise context.error(function.source, f"VJP {role} path '{path}' names a builtin parameter")
             value_type = parameter.type
-            for component in components[1:]:
+            for component in projection:
                 if value_type.kind == "struct":
                     fields = dict(context.structs[value_type.name])
                     field = fields.get(component)
@@ -276,7 +268,7 @@ class Compiler:
             raise context.error(function.source, "compute VJP requires non-empty writable Storage outputs")
         for path in transform.output_cotangents:
             value_type = resolve_path(path, role="output")
-            parameter = typed_parameters[path.split(".", 1)[0]]
+            parameter = typed_parameters[split_parameter_path(path, typed_parameters)[0]]
             if value_type.kind != "tensor_view":
                 raise context.error(function.source, f"VJP output path '{path}' must resolve to TensorView Storage")
             if parameter.access is AccessMode.READ:
@@ -486,14 +478,12 @@ def compile_file(
     input_path: str | Path,
     *,
     specializations: tuple[SpecializationAssignment, ...] = (),
-    specialization_bindings: tuple[tuple[str, str], ...] = (),
     entry: str | None = None,
     program_transform: ProgramTransformSpec | None = None,
 ) -> str:
     return Compiler().compile_file(
         input_path,
         specializations=specializations,
-        specialization_bindings=specialization_bindings,
         entry=entry,
         program_transform=program_transform,
     )
