@@ -396,12 +396,14 @@ compile failure with the stated stable reason, never a runtime skip.
 
 - Valid: source imports without execution, deterministic captured constants,
   static branches over every scalar specialization kind, compile-time `When`
-  predicates in Kernels and graphics Pipelines, and declared ProgramAsset
-  variants.
+  predicates in Kernels and graphics Pipelines, type-valued specializations
+  bound to declared structs, binding groups, or scalar types (compared with
+  `==`/`!=` only), and declared ProgramAsset variants.
 - Invalid: arbitrary Python capture/execution, undeclared or mistyped
-  specialization assignments, unassigned scalar uses, conditions that mix
-  specializations with runtime values, or disabled values used outside their
-  guard.
+  specialization assignments, unassigned scalar or type uses, type values
+  without a portable identity, type specializations in arithmetic or truth
+  tests, conditions that mix specializations with runtime values, or disabled
+  values used outside their guard.
 - Capabilities: compile according to entry; runtime matching stage.
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: capture/variant reason; dependencies, constants, features,

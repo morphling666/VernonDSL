@@ -55,6 +55,8 @@ def main() -> None:
     for index, acceptance in enumerate(LANGUAGE_CONTRACT_REGISTRY.acceptances):
         values = ", ".join(repr(float(value)) for value in acceptance.oracle.expected)
         expected_arrays.append(f"constexpr double acceptanceExpected{index}[]{{{values or '0.0'}}};\n")
+        type_values = ", ".join(f'"{value}"' for value in acceptance.oracle.type_values) or '""'
+        expected_arrays.append(f"constexpr std::string_view acceptanceTypeValues{index}[]{{{type_values}}};\n")
         descriptors.append(
             "    {"
             f'"{acceptance.suite.value}", '
@@ -71,7 +73,8 @@ def main() -> None:
             f'"{acceptance.oracle.parameter}", '
             f"{acceptance.oracle.grid[0]}, {acceptance.oracle.grid[1]}, {acceptance.oracle.grid[2]}, "
             f"acceptanceExpected{index}, {len(acceptance.oracle.expected)}, "
-            f'"{acceptance.oracle.specialization}"'
+            f'"{acceptance.oracle.specialization}", '
+            f"acceptanceTypeValues{index}, {len(acceptance.oracle.type_values)}"
             "},\n"
         )
     arguments.cpp_output.write_text(

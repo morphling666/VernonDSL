@@ -3,12 +3,14 @@ from __future__ import annotations
 import builtins
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NoReturn, Self, TypeAlias
 
 import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
+from ._markers import declaration_source, is_binding_group, is_struct_class
+from .source_identity import project_module_name, project_root
 
 
 def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
@@ -254,16 +256,28 @@ class f64(np.float64, metaclass=_Scalar):
 Sampler = TypeExpr("Sampler")
 
 
+class _TypeKind:
+    """The kind of a specialization whose value is a `@struct` class, a `@binding_group` class, or a scalar type."""
+
+    name = "type"
+
+    def __repr__(self) -> str:
+        return "vernon_dsl.type"
+
+
+type_kind = _TypeKind()
+
+
 @dataclass(frozen=True)
 class Specialization:
     name: str
-    type: _Scalar
+    type: _Scalar | _TypeKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("specialization name must be a non-empty string")
-        if self.type not in {bool, i32, u32, f32, f64}:
-            raise TypeError("specialization type must be bool, i32, u32, f32, or f64")
+        if self.type not in {bool, i32, u32, f32, f64, type_kind}:
+            raise TypeError("specialization type must be bool, i32, u32, f32, f64, or vd.type")
 
     def _compile_time_only(self, *_: object) -> NoReturn:
         raise TypeError(
@@ -278,18 +292,31 @@ class Specialization:
 
 
 Feature = Specialization
-SpecializationScalar: TypeAlias = builtins.bool | int | float
+SpecializationValue: TypeAlias = builtins.bool | int | float | str
 
 
 @dataclass(frozen=True, order=True)
 class SpecializationAssignment:
+    """One canonical key entry. A `type` assignment's `value` is the canonical type identity.
+
+    `type_value` is the host class or scalar type the identity names. It is absent when the assignment was read
+    statically, and it never takes part in comparison: the identity alone decides which variant a key selects.
+    """
+
     name: str
     type: str
-    value: SpecializationScalar
+    value: SpecializationValue
+    type_value: Any = field(default=None, compare=False, repr=False)
 
     @property
     def manifest(self) -> dict[str, object]:
         return {"name": self.name, "value": {"tag": self.type, "value": self.value}}
+
+    @property
+    def host_value(self) -> object:
+        """The value annotations see: the class or scalar type for a `type` assignment, otherwise the scalar."""
+
+        return self.type_value if self.type == "type" else self.value
 
 
 def specialization_key_data(key: tuple[SpecializationAssignment, ...]) -> list[dict[str, object]]:
@@ -300,13 +327,7 @@ def enabled_features(key: tuple[SpecializationAssignment, ...]) -> tuple[str, ..
     return tuple(assignment.name for assignment in key if assignment.type == "bool" and assignment.value is True)
 
 
-def specialization_constants(
-    key: tuple[SpecializationAssignment, ...],
-) -> tuple[tuple[str, int | float | builtins.bool], ...]:
-    return tuple((assignment.name, assignment.value) for assignment in key if assignment.type != "bool")
-
-
-def specialization(name: str, type: _Scalar) -> Specialization:
+def specialization(name: str, type: _Scalar | _TypeKind) -> Specialization:
     return Specialization(name, type)
 
 
@@ -314,7 +335,32 @@ def feature(name: str) -> Feature:
     return Specialization(name, bool)
 
 
+def type_identity(value: object) -> str:
+    """The canonical identity of a type specialization value.
+
+    A declared type is `<module>:<Class>`, its defining module named relative to the nearest `pyproject.toml` the
+    way the source module graph names it, so the identity does not depend on the checkout location.
+    """
+
+    if isinstance(value, _Scalar):
+        return value.name
+    if not is_struct_class(value) and not is_binding_group(value):
+        raise TypeError(f"type specialization requires a declared type or scalar type, not {value!r}")
+    assert isinstance(value, builtins.type)
+    source = declaration_source(value)
+    root = project_root(source.parent) if source is not None else None
+    module = project_module_name(source, root) if source is not None and root is not None else None
+    if module is None or value.__qualname__ != value.__name__:
+        raise TypeError(
+            f"type value has no portable identity: '{value.__qualname__}' must be a module-level class in a source "
+            "file under a project root (the nearest directory containing pyproject.toml)"
+        )
+    return f"{module}:{value.__name__}"
+
+
 def specialization_assignment(parameter: Specialization, value: object) -> SpecializationAssignment:
+    if parameter.type is type_kind:
+        return SpecializationAssignment(parameter.name, "type", type_identity(value), value)
     if parameter.type is bool:
         if type(value) is not builtins.bool:
             raise TypeError(f"specialization {parameter.name!r} requires a bool value")
@@ -350,7 +396,7 @@ def specialization_key(
 ) -> tuple[SpecializationAssignment, ...]:
     values = {} if supplied is None else supplied
     if not isinstance(values, Mapping) or any(not isinstance(parameter, Specialization) for parameter in values):
-        raise TypeError("specializations must map vd.specialization(...) values to scalar values")
+        raise TypeError("specializations must map vd.specialization(...) declarations to values")
     assignments = tuple(sorted(specialization_assignment(parameter, value) for parameter, value in values.items()))
     if len({assignment.name for assignment in assignments}) != len(assignments):
         raise ValueError("specializations contain duplicate names")

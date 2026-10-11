@@ -439,53 +439,171 @@ topology validation through a versioned compiler contract.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
-same closed stage/direction/type registry. `vd.specialization(name, scalar_type)`
-declares a typed compile-time value; `vd.feature(name)` is its Boolean
-convenience form. `ProgramAsset` explicitly enumerates canonical assignment
-mappings through `variants=`. Compute Kernel, Kernel-VJP, and graphics
-Pipeline assets accept all scalar specialization kinds; both graphics stages
-share one key. Module and Module-VJP assets require the empty variant key
-because their child specialization choices are authored explicitly in the
-Module graph. There is no independent public
-shader-variant selector. Specialization values and `When` branches are
-compile-time inputs, not runtime Python conditions. An `if`, `elif`, or
-conditional expression whose test references a specialization is decided by
-the key, and `When[condition, T]` accepts any compile-time expression;
-`static_specialization.md` sections 2 and 3 define the expression subset and
-diagnostics. Interface locations are assigned deterministically before
-evaluation so disabled fields retain stable reservations. Host annotations
-are evaluated with specialization names bound to the key, so a module that
-uses compound conditions in annotations on Python 3.11 through 3.13 needs
-`from __future__ import annotations`.
+same closed stage/direction/type registry.
 
 Imported DSL declarations are loaded through the source module graph without
 executing Python. Captured constants must belong to the deterministic
-constant-expression subset and are part of specialization identity. A method
-call `x.m(...)` resolves on the inferred Struct or binding-group type of `x`
-during typed helper specialization, so generic helpers may call methods on
-unannotated parameters and unreachable methods are pruned without diagnostics.
-Methods are not first-class values.
+constant-expression subset and are part of specialization identity. A Struct
+keeps its declared class name in emitted source, reflection, and host Values
+whichever module declares it, so two different reachable Structs with one name
+are rejected with `conflicting declarations named`; imported helpers are
+module-qualified. The design rationale for sections 6.1 through 6.6 is in
+[`static_specialization.md`](static_specialization.md).
 
-A `@vd.binding_group` class aggregates entry interface items: `TensorView`,
-`Texture`, and `Sampler` resources, Values (graphics `uniform()`s, Kernel
-Value parameters), and nested groups, with no per-field interface metadata.
-It is not a Value: it appears only as an entry or helper parameter, a
-forwarded argument, or a field-access or method receiver. Each leaf is an
-entry interface item named by its dotted path (`material.albedo`) in
-reflection, Program parameters, host binding, and derivative paths; on the
-host the class is a plain container. One group occurrence takes one
-consecutive binding range in field order, shared by both stages of a
-pipeline. Kernels, Pipelines, and `Module.forward()` accept groups on every
-backend. A VJP path naming a group root expands to that group's
-differentiable leaves. `static_specialization.md` sections 4 and 5 define the
-rules and diagnostics.
+### 6.1 Specializations and variants
+
+`vd.specialization(name, kind)` declares a compile-time value whose kind is
+`bool`, `i32`, `u32`, `f32`, `f64`, or `vd.type` (section 6.6);
+`vd.feature(name)` is the `bool` form. A specialization key binds declared
+names to values. Specialization values and `When` branches are compile-time
+inputs, not runtime Python conditions.
+
+`ProgramAsset` explicitly enumerates canonical keys through `variants=`, whose
+keys may name specializations the asset module declares or imports. Compute
+Kernel, Kernel-VJP, and graphics Pipeline assets accept every kind, and both
+graphics stages share one key. Module and Module-VJP assets require the empty
+key because their child specialization choices are authored explicitly in the
+Module graph. There is no independent public shader-variant selector.
+
+The source module graph is the only authority that checks a key against its
+declarations: a name no reachable declaration has is rejected with
+`requested undeclared specialization`, a kind that differs from the
+declaration with `is declared as`, and a missing value where it is used. An
+unassigned scalar fails with `missing specialization`, an unassigned Boolean is
+false, and a type specialization has no default.
+
+### 6.2 Compile-time expressions and static branches
+
+A compile-time expression contains only literals, captured constants,
+specialization names, and these operators:
+
+- `==` and `!=` on every specialization kind;
+- `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `//`, and `%` on numeric kinds;
+- `and`, `or`, `not`.
+
+A type specialization compares only with `==` and `!=` against a type
+reference: a declared Struct or binding group, a scalar type, or another type
+specialization. Any other use in a compile-time expression fails with
+`a type specialization compares only with == and != against a type reference`.
+
+When the test of an `if`, `elif`, or conditional expression references a
+specialization, the whole test must be a compile-time expression; otherwise
+compilation fails with `specialization condition mixes runtime values`. Such a
+branch is static:
+
+- it is decided when the key is bound, before method resolution,
+  reachability, and typing;
+- only the selected branch remains; discarded branches have no diagnostic
+  obligation and contribute no callees, resources, or reachability;
+- a name bound only in a discarded branch is undefined afterwards.
+
+A module referenced only from a discarded branch is still loaded and recorded
+as a dependency. Any other use of a scalar specialization is a typed constant.
+
+### 6.3 Conditional parameters
+
+`When[condition, T]` accepts any compile-time expression as `condition`. A
+disabled parameter is absent from the entry interface, host call signature,
+reflection, and Program parameters, and using it in a selected branch fails
+with `disabled value`. Attribute and varying locations are assigned before any
+`When` is evaluated, so disabled parameters keep stable reservations. Resource
+bindings are planned after evaluation, so disabled resources take no binding.
+
+The host evaluates annotations with each specialization name bound to its
+value in the key (a type specialization to its class or scalar type), and a
+`When` annotation resolves to its wrapped type; the host's parameter set comes
+from the specialized entry. A `Specialization` object refuses `bool()`,
+ordering, and arithmetic, so on Python 3.11 through 3.13 a module whose
+annotations contain conditions other than `==` and `!=` needs
+`from __future__ import annotations`.
+
+### 6.4 Binding groups
+
+A `@vd.binding_group` class declares a named group of entry interface items.
+Its fields are `TensorView`, `Texture`, and `Sampler` resources; Values,
+including Structs, which bind as immutable uniforms in graphics stages and as
+ordinary Value parameters in Kernels; and nested binding groups. Fields carry
+no `attribute`, `varying`, `builtin`, `set`, or `binding` metadata, so one
+group is valid in every stage. Graphics TensorView fields follow the read-only
+rule of
+[`../program/graphics_storage_reads.md`](../program/graphics_storage_reads.md).
+
+A binding group is not a Value. It appears only as an entry parameter, a
+helper parameter, a forwarded argument, or the receiver of a field access or
+method call. It cannot be constructed in device code, assigned to a local,
+returned, compared, used as a Struct field or a Tensor or TensorView element,
+or passed to `@func(shared=True)` code (`binding group cannot be`). Fields
+cannot declare interface metadata (`binding group field cannot declare`).
+Methods are `@vd.func`, cannot reassign fields, and a group has no `shared`
+option.
+
+Each leaf is an entry interface item named by its dotted path, for example
+`material.noise`, in reflection, Program parameters, host keyword binding, and
+derivative paths. On the host the class is a plain container:
+`Hologram(params=HologramParams(...), noise=texture)` binds leaf by leaf. One
+group occurrence takes one consecutive binding range in field order, including
+spilled uniforms, storage leaves, and nested groups, and the same group under
+the same name in both stages of a pipeline reuses that range. All ranges are in
+descriptor set 0.
+
+Every backend accepts every group leaf kind, including Struct and Tuple Value
+leaves in GPU Kernels; leaf scalar types still follow target capabilities.
+Kernels, Pipelines, and `Module.forward()` accept groups. `Module.forward()`
+group parameters must be annotated, and `forward` may pass a group to the
+Kernels and Pipelines it calls or construct one from leaves it holds.
+
+Differentiation treats a group leaf by leaf under
+[`../autodiff/contract.md`](../autodiff/contract.md) section 3. A VJP `wrt` or
+`outputs` path naming a group root, or a nested group, is shorthand for its
+leaves in field order: for `wrt` every floating Value leaf (Struct and Tuple
+Values expanded to floating fields) and whole floating TensorView leaf, for
+`outputs` the writable floating TensorView leaves. A root with no such leaf
+fails with `names a binding group with no ... leaves`. Expansion happens per
+specialization key, before the paths become the transform identity.
+
+### 6.5 Typed method resolution
+
+`x.m(...)` resolves on the inferred Struct or binding-group type of `x` during
+typed helper specialization, not by syntactic lookup of the receiver. Generic
+helpers may call methods on unannotated parameters, and each helper
+specialization resolves its calls independently. Methods are reachable only
+through resolved calls, so unreachable methods are pruned without diagnostics.
+A missing method fails at the call site with `'T' has no method 'm'` and the
+helper specialization chain. Methods are not first-class values.
+
+### 6.6 Type-valued specializations
+
+`vd.specialization(name, vd.type)` declares a specialization whose value is a
+`@vd.binding_group` class, a `@vd.struct` class, or a scalar type.
+
+- The name is a type wherever a type is allowed: `material: MATERIAL` for a
+  binding group, `Annotated[MATERIAL, uniform()]` for a Struct in a graphics
+  stage, a `TensorView[ELEMENT, ...]` element, or a constructor call
+  `ELEMENT(x)`.
+- At key binding, the module that defines the value joins the source module
+  graph as if imported; the template's own imports are unchanged.
+- `variants=` and Kernel and Pipeline `specializations=` take the class or
+  scalar type itself, for example `{MATERIAL: Hologram}`. The frontend loads
+  the declaration from its defining source and never executes that module.
+- Conformance is checked at each use, not declared.
+
+A declared type's canonical identity is `<module>:<Class>`, where `<module>`
+is its defining source path relative to the project root (the nearest
+directory containing `pyproject.toml`), with `.` separators and no `.py`
+suffix. A scalar type's identity is its scalar name. A class without such a
+module-level path fails with `type value has no portable identity`, and a value
+that is neither fails with
+`type specialization requires a declared type or scalar type`. A missing
+assignment fails where it is used with `missing type specialization`.
+
+### 6.7 Processing order and identity
 
 Project processing order is:
 
 1. load and validate source imports;
 2. bind captured constants and the canonical typed specialization key:
-   substitute specialization values, decide static branches, and remove
-   disabled `When` parameters;
+   substitute specialization values, decide static branches, remove disabled
+   `When` parameters, and load type-valued modules;
 3. normalize generated builtins;
 4. prune to selected entries and validate the call graph;
 5. infer, specialize, and validate typed semantic nodes and effects,
@@ -494,13 +612,14 @@ Project processing order is:
 7. validate target capabilities and materialize artifacts.
 
 Semantic cache identity includes `COMPILER_CONTRACT_VERSION`,
-`PROGRAM_VERSION`, all source dependency
-digests, entry, the typed specialization key, annotation-static shape
-constraints and interfaces, captured constants, workgroup size, helper
-specializations, and derivative-transform identity. Concrete dynamic
-TensorView descriptors remain invocation data as defined in
-[`tensor_view.md`](tensor_view.md). Diagnostics include source path, one-based
-line and column, and a stable reason string.
+`PROGRAM_VERSION`, all source dependency digests (including each type value's
+defining module graph), entry, the typed specialization key (type values by
+canonical identity), annotation-static shape constraints and interfaces,
+captured constants, workgroup size, helper specializations, and
+derivative-transform identity. Two keys that differ only in a type value never
+share frontend results. Concrete dynamic TensorView descriptors remain
+invocation data as defined in [`tensor_view.md`](tensor_view.md). Diagnostics
+include source path, one-based line and column, and a stable reason string.
 
 ## 7. Stable syntax target and deferred ergonomics
 
@@ -667,6 +786,17 @@ The current `COMPILER_CONTRACT_VERSION` may be declared implemented only when:
 - v3 migration diagnostics and compatibility aliases are versioned;
 - unsupported target combinations fail explicitly;
 - cache identity and generated symbols remain deterministic;
+- static specialization meets section 6: an integer static branch prunes the
+  callees and type errors of discarded branches, and a `When` resource
+  disappears from the interface when disabled, for Kernels and graphics
+  stages; graphics Pipeline assets cook and render with integer and type
+  variants; binding groups with every leaf kind work in Kernels and both
+  graphics stages on every backend, reject every misuse with its diagnostic,
+  take one consecutive binding range, and yield dotted-leaf VJP cotangents; one
+  generic helper calls the same method on two binding groups; a template that
+  does not import its material cooks against two binding-group values whose
+  frontend results never alias and whose source edits invalidate only their
+  own keys; manifest keys carry checkout-independent type identities;
 - fluid simulation, PBR/SSR, and first-order autodiff examples compile within
   their stated boundaries.
 

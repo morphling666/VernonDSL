@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import vernon_dsl as vd
@@ -10,6 +13,18 @@ from shared_kernel import (
     evaluate_shared,
     shared_polynomial,
 )
+
+_LIGHTING = """from vernon_dsl import *
+@func(shared=True)
+def boost(value: f32) -> f32:
+    return value + 1.0
+@struct(shared=True)
+class Light:
+    intensity: f32
+    @func(shared=True)
+    def scale(self, value: f32) -> f32:
+        return self.intensity * value
+"""
 
 
 @vd.func(shared=True)
@@ -266,33 +281,79 @@ def sample(image: Texture["2d", f32]) -> f32:
         self.assertIn("func.call @scale", output)
         self.assertIn("func.call @Value__scaled", output)
 
-    def test_imported_shared_method_is_namespaced(self) -> None:
+    def test_imported_struct_keeps_its_declared_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "lighting.py").write_text(
-                "from vernon_dsl import *\n"
-                "@struct(shared=True)\n"
-                "class Light:\n"
-                "    intensity: f32\n"
-                "    @func(shared=True)\n"
-                "    def scale(self, value: f32) -> f32:\n"
-                "        return self.intensity * value\n",
-                encoding="utf-8",
-            )
+            (root / "lighting.py").write_text(_LIGHTING, encoding="utf-8")
             shader = root / "shader.py"
             shader.write_text(
                 "from vernon_dsl import *\n"
-                "from lighting import Light\n"
+                "from lighting import Light, boost\n"
                 "@fragment\n"
                 "def main(light: Light) -> f32:\n"
-                "    return light.scale(2.0)\n",
+                "    return boost(light.scale(2.0))\n",
                 encoding="utf-8",
             )
 
             output = vd.compile_file(shader)
 
-        self.assertIn("func.func private @__vernon_lighting__Light__scale", output)
-        self.assertIn("func.call @__vernon_lighting__Light__scale", output)
+        self.assertIn('!vernon.struct<"Light">', output)
+        self.assertIn("func.call @Light__scale", output)
+        self.assertIn("func.call @__vernon_lighting__boost", output, "imported helpers stay module-qualified")
+
+    def test_structs_sharing_a_name_across_modules_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lighting.py").write_text(_LIGHTING, encoding="utf-8")
+            shader = root / "shader.py"
+            shader.write_text(
+                "from vernon_dsl import *\n"
+                "import lighting\n"
+                "@struct(shared=True)\n"
+                "class Light:\n"
+                "    intensity: f32\n"
+                "@fragment\n"
+                "def main(light: lighting.Light, local: Light) -> f32:\n"
+                "    return light.intensity + local.intensity\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(vd.CompileError, "conflicting declarations named 'Light'"):
+                vd.compile_file(shader, entry="main")
+
+    def test_imported_struct_value_is_a_kernel_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "struct_value_lighting.py").write_text(_LIGHTING, encoding="utf-8")
+            (root / "struct_value_kernel.py").write_text(
+                "from __future__ import annotations\n"
+                "from typing import Annotated\n"
+                "from vernon_dsl import *\n"
+                "from struct_value_lighting import Light\n"
+                "@kernel(workgroup_size=(1, 1, 1))\n"
+                "def lit(\n"
+                "    light: Light,\n"
+                "    output: TensorView[f32, (dyn,), write],\n"
+                '    gid: Annotated[Tensor[u32, (3,)], builtin("global_invocation_id")],\n'
+                ") -> None:\n"
+                "    output[gid[0]] = light.scale(2.0)\n",
+                encoding="utf-8",
+            )
+            lighting = self._import(root / "struct_value_lighting.py")
+            kernel = self._import(root / "struct_value_kernel.py")
+
+            vd.init(arch=vd.cpu)
+            output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+            kernel.lit(lighting.Light(vd.f32(1.5)), output, grid=(1, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), np.array((3.0,), dtype=np.float32))
+
+    def _import(self, path: Path) -> ModuleType:
+        specification = importlib.util.spec_from_file_location(path.stem, path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[path.stem] = module
+        self.addCleanup(sys.modules.pop, path.stem, None)
+        specification.loader.exec_module(module)
+        return module
 
     def test_recursive_methods_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

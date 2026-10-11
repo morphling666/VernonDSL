@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from ..diagnostics import ProgramCompileError
+from ..source_identity import project_root
 from .declaration import ProgramAssetDeclaration
 
 
@@ -43,16 +44,17 @@ def load_program_asset_declaration(source: Path, declaration_name: str) -> Progr
     module = importlib.util.module_from_spec(specification)
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
-    fallback_search_path = module_name.startswith("_vernon_program_asset_")
-    if fallback_search_path:
-        sys.path.insert(0, str(source.parent))
+    # Absolute imports resolve against the roots the source module graph searches, the declaring file's directory
+    # then the project root, so evaluation sees the modules compilation sees whatever the caller's sys.path holds.
+    root = project_root(source.parent)
+    import_roots = list(dict.fromkeys(str(path) for path in (source.parent, root) if path is not None))
+    sys.path[0:0] = import_roots
     try:
         specification.loader.exec_module(module)
     except Exception as error:
         raise ProgramCompileError(f"cannot evaluate Program Asset source {source}: {error}") from error
     finally:
-        if fallback_search_path:
-            sys.path.pop(0)
+        del sys.path[: len(import_roots)]
         if previous_module is None:
             sys.modules.pop(module_name, None)
         else:

@@ -5,9 +5,9 @@ declaration, so nothing here decides a form, builds a transform, or lists stages
 genuinely static avoids a second, partially-correct answer to questions the typed declaration already answers.
 
 Three things are worth checking without running the source: that the id is a literal, that the variant keys are
-canonical and locally declared, and that statically named entries resolve inside the project. The last one earns its
-place because the compiler's own answer is late and obscure -- an entry reached through a module alias fails with
-"unknown shader entry point" long after cooking has begun.
+canonical and name declared specializations, and that statically named entries resolve inside the project. The last
+one earns its place because the compiler's own answer is late and obscure -- an entry reached through a module alias
+fails with "unknown shader entry point" long after cooking has begun.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from ..bundle import ProgramCompileError
 from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES
-from ..module_graph import declared_project_specializations, resolve_project_entry
+from ..module_graph import project_specialization, project_type_identity, resolve_project_entry
 from ..types import (
     Specialization,
     SpecializationAssignment,
@@ -30,6 +30,7 @@ from ..types import (
     f64,
     i32,
     specialization_assignment,
+    type_kind,
     u32,
 )
 from ..types import (
@@ -73,39 +74,18 @@ def _assigned_values(tree: ast.Module, name: str) -> list[ast.expr]:
     return values
 
 
-def _specialization_bindings(tree: ast.Module) -> dict[str, Specialization]:
-    bindings: dict[str, Specialization] = {}
-    scalar_types = {"bool": bool_type, "i32": i32, "u32": u32, "f32": f32, "f64": f64}
-    for statement in tree.body:
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = statement.value
-        if not isinstance(value, ast.Call):
-            continue
-        kind = (dotted_name(value.func) or "").split(".")[-1]
-        if kind not in {"feature", "specialization"}:
-            continue
-        if (
-            value.keywords
-            or not value.args
-            or not isinstance(value.args[0], ast.Constant)
-            or not isinstance(value.args[0].value, str)
-        ):
-            raise ProgramCompileError("Program Asset specialization declarations require a literal name")
-        if kind == "feature":
-            if len(value.args) != 1:
-                raise ProgramCompileError("feature declarations require one string literal")
-            scalar_type = bool_type
-        else:
-            type_name = (dotted_name(value.args[1]) or "").split(".")[-1] if len(value.args) == 2 else ""
-            scalar_type = scalar_types.get(type_name)
-            if scalar_type is None:
-                raise ProgramCompileError("specialization declarations require bool, i32, u32, f32, or f64")
-        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-            raise ProgramCompileError("Program Asset specialization declarations require a simple name")
-        bindings[targets[0].id] = Specialization(value.args[0].value, scalar_type)
-    return bindings
+_SPECIALIZATION_TYPES = {"bool": bool_type, "i32": i32, "u32": u32, "f32": f32, "f64": f64, "type": type_kind}
+
+
+def _variant_parameter(source_path: Path, key: ast.expr) -> Specialization:
+    try:
+        declaration = project_specialization(source_path, key)
+    except CompileError as error:
+        raise ProgramCompileError(str(error)) from None
+    if declaration is None:
+        raise ProgramCompileError("Program Asset variant keys must name a declared or imported specialization")
+    name, kind = declaration
+    return Specialization(name, _SPECIALIZATION_TYPES[kind])
 
 
 def _declaration_call(tree: ast.Module, descriptor_name: str, source_path: Path) -> ast.Call:
@@ -168,28 +148,41 @@ def _resolved_entry(source_path: Path, entry: ast.expr) -> str:
     return entry.id
 
 
+def _linted_assignment(source_path: Path, parameter: Specialization, value: ast.expr) -> SpecializationAssignment:
+    if parameter.type is type_kind:
+        try:
+            identity = project_type_identity(source_path, value)
+        except CompileError as error:
+            raise ProgramCompileError(str(error)) from None
+        if identity is None:
+            raise ProgramCompileError(
+                f"type specialization requires a declared type or scalar type; variant value for "
+                f"'{parameter.name}' must name a @vd.struct or @vd.binding_group class or a scalar type"
+            )
+        return SpecializationAssignment(parameter.name, "type", identity)
+    try:
+        return specialization_assignment(parameter, ast.literal_eval(value))
+    except (ValueError, TypeError, SyntaxError) as error:
+        raise ProgramCompileError(str(error)) from None
+
+
 def _linted_variants(
-    tree: ast.Module, keywords: dict[str, ast.expr]
+    source_path: Path, keywords: dict[str, ast.expr]
 ) -> tuple[tuple[SpecializationAssignment, ...], ...]:
     node = keywords.get("variants")
     if node is None:
         return ((),)
     if not isinstance(node, (ast.Tuple, ast.List)):
         raise ProgramCompileError("program_asset variants must be a tuple or list")
-    specializations = _specialization_bindings(tree)
     parsed: list[tuple[SpecializationAssignment, ...]] = []
     for row in node.elts:
         if not isinstance(row, ast.Dict):
             raise ProgramCompileError("each Program Asset variant must be a specialization mapping")
         assignments: list[SpecializationAssignment] = []
         for parameter, value in zip(row.keys, row.values, strict=True):
-            if not isinstance(parameter, ast.Name) or parameter.id not in specializations:
-                raise ProgramCompileError("Program Asset variant keys must reference locally declared specializations")
-            try:
-                literal = ast.literal_eval(value)
-                assignments.append(specialization_assignment(specializations[parameter.id], literal))
-            except (ValueError, TypeError, SyntaxError) as error:
-                raise ProgramCompileError(str(error)) from None
+            if parameter is None:
+                raise ProgramCompileError("Program Asset variants do not accept expanded mappings")
+            assignments.append(_linted_assignment(source_path, _variant_parameter(source_path, parameter), value))
         key = tuple(sorted(assignments))
         if len({assignment.name for assignment in key}) != len(key):
             raise ProgramCompileError("Program Asset variant contains duplicate specialization names")
@@ -241,18 +234,7 @@ def lint_python_program_asset(source: str | Path, descriptor_name: str) -> Progr
         raise ProgramCompileError("program_asset declaration requires 'program'")
     entries = tuple(_resolved_entry(source_path, entry) for entry in _static_entries(tree, program))
 
-    variants = _linted_variants(tree, keywords)
-    declared = declared_project_specializations(source_path)
-    requested = {assignment.name: assignment.type for variant in variants for assignment in variant}
-    undeclared = set(requested) - set(declared)
-    if undeclared:
-        raise ProgramCompileError("variant requests undeclared specialization(s): " + ", ".join(sorted(undeclared)))
-    mismatched = sorted(name for name, kind in requested.items() if declared[name] != kind)
-    if mismatched:
-        raise ProgramCompileError(
-            "variant specialization type does not match its declaration: " + ", ".join(mismatched)
-        )
-    return ProgramAssetLint(identifier, variants, entries)
+    return ProgramAssetLint(identifier, _linted_variants(source_path, keywords), entries)
 
 
 __all__ = ["ProgramAssetLint", "lint_python_program_asset", "program_asset_reference"]

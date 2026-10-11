@@ -156,11 +156,14 @@ Shader artifact encoding, extension selection, and content-addressed file writes
 live in `_program_assets.artifact_io`. Cooking consumes that implementation
 through the public facade, preserving canonical pipeline bytes while keeping filesystem
 artifact policy independent of descriptor parsing and native compilation.
-Python pipeline descriptor parsing lives in `_program_assets.parsing`; it reads
-source AST and project feature declarations without importing or executing the
-descriptor module. Cooking receives only the validated immutable descriptor,
-so parser diagnostics and variant canonicalization remain testable without a
-native compiler.
+Cooking (`_program_assets.cooking`) evaluates the declaring module through
+`_program_assets.source`, reads the typed `ProgramAssetDeclaration`, captures
+it (`_program_assets.capture`), and compiles the captured variants. The static
+Program Asset lint lives in `_program_assets.parsing`. It reads the source AST
+and resolves names through the source module graph without importing or
+executing the declaring module, so its diagnostics and variant
+canonicalization are testable without a native compiler. Cooking never
+consults it.
 
 Compute source compilation and invocation behavior lives in `_runtime.kernel`.
 The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
@@ -221,16 +224,34 @@ and whole-module `compile_file(entry=None)` are uncached validation/emission
 surfaces because they do not have a complete `FrontendCompileRequest`.
 
 Project module graphs have a separate source-syntax cache keyed by the resolved
-root path and selected entry. Discovery does not depend on the specialization
-key, so the cache retains parsed modules, resolved imports, and dependency
-identity only; every load still deep-copies its reachable definitions before
-applying the key and before semantic analysis. Dependency digests guard reuse, so
+root path, selected entry, and the key's type assignments. Discovery depends on
+the key only through type assignments, whose defining modules join the graph;
+scalar values never change discovery. The cache retains parsed modules,
+resolved imports, and dependency identity only; every load still deep-copies
+its reachable definitions before applying the key and before semantic
+analysis. Dependency digests guard reuse, so
 different graphics stages share discovery without sharing mutable specialized
 AST or typed records.
 
 Specialization values are substituted, static branches pruned, and `When`
 parameters removed by the module graph (`module_graph._Specializer`), per
-`specs/language/static_specialization.md` sections 2 and 3.
+`specs/language/contract.md` sections 6.2 and 6.3. The module graph is also the
+only place a key is checked against declarations. Hosts (`Kernel`, `Pipeline`,
+Program capture) pass keys through unchecked: only the graph knows which
+declarations an entry reaches, and an earlier Kernel pre-check that required
+every loaded non-Boolean specialization rejected valid keys once type values
+brought more modules into the graph.
+
+A Struct is emitted under its declared class name from every module, while
+other imported definitions keep the `__vernon_<module>__` prefix. Host Values,
+`concrete_type_from_annotation`, reflection, and manifests name a Struct by
+its class, and the prefixed name made every imported Struct unbindable from
+the host; the graph instead rejects two reachable Structs with one name.
+
+A VJP over a Kernel keeps its `wrt` and `outputs` selections unexpanded and
+expands binding-group roots per specialization key
+(`ProgramExpression.transform_for`), because a type specialization decides
+which group, and therefore which leaves, a parameter has.
 Annotation-static shape-constraint and captured-constant substitution lives in
 `frontend.specialization`. It consumes only the immutable compile request and
 project source, before inference, and does not select operations or result
@@ -289,8 +310,8 @@ specialization reference to its declaration, so assignments are keyed by public
 specialization name only and no source-name binding is needed.
 `vernon-compile-python` exposes the same input as repeatable
 `--specialization NAME:TYPE=VALUE` options, where `TYPE` is `bool`, `i32`,
-`u32`, `f32`, or `f64`. There is no parallel `features=` or `--feature`
-compile surface.
+`u32`, `f32`, or `f64`, or `NAME:type=IDENTITY` with a canonical type
+identity. There is no parallel `features=` or `--feature` compile surface.
 
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
@@ -319,9 +340,11 @@ must invalidate the corresponding key.
 ## Program Asset declarations
 
 A persistent executable is declared by one module-level
-`program_asset(...)` assignment beside its entry functions. The cooker parses
-the assignment from the source AST and must not import or execute the module.
-`ProgramAsset` applies equally to compute and graphics pipelines.
+`program_asset(...)` assignment beside its entry functions. The cooker
+evaluates the declaring module on the host to obtain the typed declaration;
+the entry functions it names are still compiled from source through the module
+graph, which never executes DSL modules. `ProgramAsset` applies equally to
+compute and graphics pipelines.
 
 `program=` accepts one of these executable source forms:
 
@@ -370,9 +393,19 @@ contract automatically.
 
 `variants=` explicitly enumerates every accepted canonical specialization
 combination, preventing implicit powerset growth. It contains at least one
-mapping from `vd.specialization(...)` or `vd.feature(...)` declarations to
-typed scalar values. Each resulting key is sorted by specialization name,
-contains no duplicate name, and the list contains no duplicate key. `{}` is
+mapping from `vd.specialization(...)` or `vd.feature(...)` declarations, local
+or imported, to typed values: scalars, or a class or scalar type for `vd.type`.
+The static lint resolves each key and type value through the source module
+graph, the same resolution compilation uses, so an asset may name a
+specialization its template declares without importing the template's
+content. Host evaluation of a declaration
+(`load_program_asset_declaration`) resolves absolute imports against the
+roots the module graph searches, the declaring file's directory and then the
+project root, whatever the caller's `sys.path` holds; otherwise a declaration
+importable as a package module could not import its sibling modules.
+
+Each resulting key is sorted by specialization name, contains no duplicate
+name, and the list contains no duplicate key. `{}` is
 the empty specialization key, not an implicit fallback. Stage compilation
 remains cached per entry and specialization key, so unchanged artifacts are
 content-addressed and shared across variants.

@@ -311,12 +311,18 @@ def resolved_annotations(
     """Evaluates `function` annotations with each declared specialization bound to its value in the key.
 
     `Specialization` objects refuse `bool()` and operators, so `When[FEATURE and MODE == 2, T]` only evaluates once
-    the names are replaced by values; an unassigned Boolean is false, an unassigned scalar is a placeholder.
+    the names are replaced by values; a type specialization is bound to its class or scalar type, an unassigned
+    Boolean is false, and any other unassigned specialization, including a type assignment read statically without
+    its host class, is a placeholder.
     A `When` annotation resolves to its wrapped type: the frontend decides the condition, so callers must take the
     parameter set from the specialized entry rather than from these annotations.
     """
 
-    values = {assignment.name: assignment.value for assignment in specializations}
+    values = {
+        assignment.name: assignment.host_value
+        for assignment in specializations
+        if assignment.type != "type" or assignment.type_value is not None
+    }
     namespace = dict(function.__globals__)
     for local_name, value in function.__globals__.items():
         if isinstance(value, Specialization):

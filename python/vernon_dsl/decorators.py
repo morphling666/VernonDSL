@@ -4,7 +4,7 @@ from collections.abc import Callable
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
-from ._markers import dsl_kind, mark
+from ._markers import dsl_kind, mark, record_declaration_source
 
 if TYPE_CHECKING:
     from .runtime import Kernel
@@ -93,6 +93,7 @@ def struct(value: _T | None = None, *, shared: bool = False) -> _T | Callable[[_
         from .host_values import forbid_struct_construction, make_shared_struct
 
         mark(cls, "struct", shared=shared)
+        record_declaration_source(cls)
         transformed = make_shared_struct(cls) if shared else forbid_struct_construction(cls)
         return transformed
 
@@ -105,4 +106,5 @@ def binding_group(cls: _T) -> _T:
     from .binding_groups import make_binding_group
 
     mark(cls, "binding_group")
+    record_declaration_source(cls)
     return make_binding_group(cls)  # type: ignore[arg-type,return-value]

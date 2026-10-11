@@ -268,11 +268,23 @@ Each key entry is exactly:
 ```
 
 Entries are ordered by unique non-empty `name`. `tag` is one of `bool`, `i32`,
-`u32`, `f32`, or `f64`; `value` must have that exact finite scalar domain.
-An `f32` value is rounded to binary32 before key construction. Floating-point
-negative zero is canonicalized to positive zero.
-Boolean feature selection is represented by a typed `bool` assignment rather
-than a parallel feature-key schema. An empty key is `[]`.
+`u32`, `f32`, `f64`, or `type`. For a scalar tag, `value` must have that exact
+finite scalar domain; an `f32` value is rounded to binary32 before key
+construction, and floating-point negative zero is canonicalized to positive
+zero. For `type`, `value` is the non-empty canonical type identity of
+[`../language/contract.md`](../language/contract.md) section 6.6, a declared
+type's `<module>:<Class>` or a scalar type's name:
+
+```json
+{"name":"MATERIAL","value":{"tag":"type","value":"engine.materials.hologram:Hologram"}}
+```
+
+Runtime selects a variant by comparing a `type` selector's identity bytewise;
+an empty selector identity is an invalid argument. The C API carries it as
+`VERNON_PROGRAM_SPECIALIZATION_TYPE` with `type_value`, and
+`ProgramVariant::setType` in the C++ wrapper. Boolean feature selection is
+represented by a typed `bool` assignment rather than a parallel feature-key
+schema. An empty key is `[]`.
 
 The variant artifact system contains exactly its
 aggregate `runtime_requirements` and `artifacts`. Its StageArtifact keys are

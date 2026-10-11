@@ -20,6 +20,7 @@ _RUNTIME_ORACLES_BY_SUITE = {
             RuntimeOracleKind.FLOAT_BUFFER,
             RuntimeOracleKind.SAMPLED_PIXEL,
             RuntimeOracleKind.SPECIALIZATION_PIXELS,
+            RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS,
             RuntimeOracleKind.STORAGE_TEXEL,
             RuntimeOracleKind.STRUCTURED_VIEW,
             RuntimeOracleKind.GRAPHICS_TRIANGLE,

@@ -389,6 +389,17 @@ void runGraphicsTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProg
         EXPECT_NEAR(pixel[channel], acceptance.expected[channel], 1);
 }
 
+void renderSpecializedVariant(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+                              const VernonProgramSpecialization &specialization, double expectedRed) {
+    const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
+    vernon::tests::OwnedProgramExecutable program(owned.runtime(), std::string(fixture.manifestPath), &selector);
+    ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+    std::array<uint8_t, 4> pixel{};
+    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel));
+    EXPECT_NEAR(pixel[0], expectedRed, 1);
+    EXPECT_LT(pixel[1], 10);
+}
+
 // `expected` holds (value, red channel) pairs; each value selects one cooked variant through the u32
 // specialization named by the descriptor.
 void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
@@ -404,13 +415,27 @@ void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const 
         specialization.name = {acceptance.specialization.data(), acceptance.specialization.size()};
         specialization.kind = VERNON_PROGRAM_SPECIALIZATION_U32;
         specialization.value.u32_value = value;
-        const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
-        vernon::tests::OwnedProgramExecutable program(owned.runtime(), std::string(fixture.manifestPath), &selector);
-        ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-        std::array<uint8_t, 4> pixel{};
-        ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel));
-        EXPECT_NEAR(pixel[0], acceptance.expected[index + 1], 1);
-        EXPECT_LT(pixel[1], 10);
+        ASSERT_NO_FATAL_FAILURE(
+            renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index + 1]));
+    }
+}
+
+// `typeValues[i]` is the type identity selecting one cooked variant through the type specialization
+// named by the descriptor, and `expected[i]` is the red channel that variant renders.
+void runTypeSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+                                       const AcceptanceDescriptor &acceptance) {
+    ASSERT_FALSE(acceptance.specialization.empty());
+    ASSERT_GT(acceptance.typeValueCount, 0u);
+    ASSERT_EQ(acceptance.expectedCount, acceptance.typeValueCount);
+    for (size_t index = 0; index < acceptance.typeValueCount; ++index) {
+        const std::string_view identity = acceptance.typeValues[index];
+        SCOPED_TRACE(std::string(acceptance.specialization) + "=" + std::string(identity));
+        VernonProgramSpecialization specialization{};
+        specialization.struct_size = sizeof(specialization);
+        specialization.name = {acceptance.specialization.data(), acceptance.specialization.size()};
+        specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
+        specialization.value.type_value = {identity.data(), identity.size()};
+        ASSERT_NO_FATAL_FAILURE(renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index]));
     }
 }
 
@@ -496,6 +521,10 @@ TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAs
     const AcceptanceDescriptor &acceptance = acceptanceFor(fixture.fixtureId);
     if (acceptance.oracle == "specialization_pixels") {
         runSpecializationPixelsOracle(owned(), fixture, acceptance);
+        return;
+    }
+    if (acceptance.oracle == "type_specialization_pixels") {
+        runTypeSpecializationPixelsOracle(owned(), fixture, acceptance);
         return;
     }
     vernon::tests::OwnedProgramExecutable program(runtime().runtime, std::string(fixture.manifestPath));

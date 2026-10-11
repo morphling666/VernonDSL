@@ -5,6 +5,25 @@ from typing import Annotated
 import vernon_dsl as vd  # pyright: ignore[reportMissingImports]
 
 SCALE = vd.specialization("SCALE", vd.u32)
+SURFACE = vd.specialization("SURFACE", vd.type)
+
+
+@vd.struct
+class Warm:
+    level: vd.f32
+
+    @vd.func
+    def red(self) -> vd.f32:
+        return self.level
+
+
+@vd.struct
+class Cool:
+    level: vd.f32
+
+    @vd.func
+    def red(self) -> vd.f32:
+        return self.level * 0.25
 
 
 @vd.func
@@ -58,6 +77,12 @@ def specialization_fragment() -> vd.Vector[vd.f32, 4]:
     return vd.Vector([specialize_value(0.25), 0.0, 0.0, 1.0])
 
 
+@vd.fragment
+def type_specialization_fragment() -> vd.Vector[vd.f32, 4]:
+    surface = SURFACE(1.0)
+    return vd.Vector([surface.red(), 0.0, 0.0, 1.0])
+
+
 raw_asset = vd.program_asset(
     id="runtime/language-contract-graphics-raw",
     program=vd.pipeline(
@@ -84,4 +109,14 @@ specialization_asset = vd.program_asset(
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
     variants=({SCALE: 1}, {SCALE: 2}),
+)
+
+type_specialization_asset = vd.program_asset(
+    id="runtime/language-contract-type-specialization",
+    program=vd.pipeline(
+        generated_contract_vertex,
+        type_specialization_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=({SURFACE: Warm}, {SURFACE: Cool}),
 )

@@ -204,6 +204,12 @@ The resolver validates, before loading target code:
 - device/context capabilities;
 - workgroup, graphics, resource, and ABI limits.
 
+A `type` key entry is selected by bytewise identity comparison; Runtime never
+interprets the identity as a module path. The C++ wrapper sets it through
+`ProgramVariant::setType` rather than a `set` overload, because a
+`set(name, "literal")` call would bind the `const char *` to the `bool`
+overload.
+
 ## 4. Binding and materialization
 
 Public boundary reflection assigns stable slots. Binding uses

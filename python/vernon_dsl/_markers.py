@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
 _ATTRIBUTE = "__vernon_dsl__"
+_SOURCE_ATTRIBUTE = "__vernon_source__"
 _NO_OPTIONS: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -38,4 +41,29 @@ def is_binding_group(value: Any) -> bool:
     return isinstance(value, type) and dsl_kind(value) == "binding_group"
 
 
-__all__ = ["dsl_kind", "dsl_options", "is_binding_group", "is_struct_class", "mark"]
+def record_declaration_source(cls: type[Any]) -> None:
+    """Records the file that defines `cls`; must run while the class body's module is still in `sys.modules`.
+
+    Program Asset sources are executed under a temporary module entry, so asking `inspect` later can fail.
+    """
+
+    try:
+        source = inspect.getsourcefile(cls)
+    except TypeError:
+        source = None
+    setattr(cls, _SOURCE_ATTRIBUTE, Path(source).resolve() if source is not None else None)
+
+
+def declaration_source(cls: type[Any]) -> Path | None:
+    return getattr(cls, _SOURCE_ATTRIBUTE, None)
+
+
+__all__ = [
+    "declaration_source",
+    "dsl_kind",
+    "dsl_options",
+    "is_binding_group",
+    "is_struct_class",
+    "mark",
+    "record_declaration_source",
+]

@@ -92,9 +92,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
 - [`testing/program_acceptance.md`](testing/program_acceptance.md) defines
   permanent Kernel/Module/Program/VJP regression gates.
 - [`language/static_specialization.md`](language/static_specialization.md)
-  is the accepted design for static specialization branches, `When`
+  records the rationale for static specialization branches, `When`
   predicates, binding groups, typed method resolution, and type-valued
-  specializations.
+  specializations, whose rules are in `language/contract.md` section 6.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   lists remaining language-v4 gates.
 - [`future/README.md`](future/README.md) indexes the non-normative future

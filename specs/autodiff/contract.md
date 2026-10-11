@@ -115,8 +115,8 @@ Values derive gradient structure recursively from floating leaves.
   the leaf's dotted path. A `wrt` or `outputs` path naming a group root is
   shorthand for its differentiable (for `outputs`, writable floating
   TensorView) leaves, expanded before the paths become the transform
-  identity ([`../language/static_specialization.md`](../language/static_specialization.md)
-  section 5).
+  identity ([`../language/contract.md`](../language/contract.md)
+  section 6.4).
 
 The initial gradient accumulation types are:
 

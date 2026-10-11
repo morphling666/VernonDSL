@@ -76,6 +76,7 @@ from .types import (
     varying,
     write,
 )
+from .types import type_kind as type
 
 if TYPE_CHECKING:
     from . import interop, storage
@@ -419,6 +420,7 @@ __all__ = [
     "texture_size",
     "texture_store",
     "triangles",
+    "type",
     "u32",
     "uniform",
     "varying",

@@ -7,10 +7,13 @@ import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ._markers import dsl_kind
 from .bundle import canonical_json
+
+if TYPE_CHECKING:
+    from .types import SpecializationAssignment
 
 _PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
 
@@ -147,8 +150,45 @@ class ProgramTransformSpec:
 
 @dataclass(frozen=True)
 class ProgramExpression:
-    program: object
-    transform: ProgramTransformSpec
+    """A VJP over one Kernel or Pipeline, keeping `wrt` and `outputs` as written.
+
+    A path that names a binding group expands per specialization key, because a type specialization decides which
+    group, and therefore which leaves, a parameter has. Construction expands against the empty key so a selection
+    that no key could satisfy fails at declaration.
+    """
+
+    program: Any
+    wrt: BoundarySelection
+    outputs: BoundarySelection | None
+    planning_policy: str
+
+    def __post_init__(self) -> None:
+        self.transform  # noqa: B018
+
+    @property
+    def transform(self) -> ProgramTransformSpec:
+        """The transform for the empty key, which direct execution always uses."""
+
+        return self.transform_for(())
+
+    def transform_for(self, specializations: tuple[SpecializationAssignment, ...]) -> ProgramTransformSpec:
+        from ._runtime.pipeline import Pipeline
+        from .frontend.runtime_types import resolved_annotations
+
+        # Graphics entries take part in no Program VJP, so only a Kernel's groups expand.
+        annotations = (
+            {} if isinstance(self.program, Pipeline) else resolved_annotations(self.program._function, specializations)
+        )
+        return ProgramTransformSpec(
+            "vjp",
+            self.wrt.expand_binding_groups(annotations, role="wrt").canonical_key,
+            output_cotangents=(
+                self.outputs.expand_binding_groups(annotations, role="outputs").canonical_key
+                if self.outputs is not None
+                else ()
+            ),
+            planning_policy=self.planning_policy,
+        )
 
     def __call__(
         self,
@@ -170,7 +210,6 @@ def vjp(
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
     from ._runtime.pipeline import Pipeline
-    from .frontend.runtime_types import resolved_annotations
     from .module import Module
 
     if isinstance(program, Module):
@@ -195,21 +234,12 @@ def vjp(
             raise TypeError("single-entry VJP program must be a compute Kernel")
         if outputs is None:
             raise ValueError("compute VJP requires non-empty writable Storage outputs")
-    # Graphics entries take part in no Program VJP, so only a Kernel's groups expand.
-    annotations = {} if isinstance(program, Pipeline) else resolved_annotations(program._function)
-    spec = ProgramTransformSpec(
-        "vjp",
-        BoundarySelection.create(wrt, label="wrt").expand_binding_groups(annotations, role="wrt").canonical_key,
-        output_cotangents=(
-            BoundarySelection.create(outputs, label="outputs")
-            .expand_binding_groups(annotations, role="outputs")
-            .canonical_key
-            if outputs is not None
-            else ()
-        ),
-        planning_policy=planning_policy,
+    return ProgramExpression(
+        program,
+        BoundarySelection.create(wrt, label="wrt"),
+        BoundarySelection.create(outputs, label="outputs") if outputs is not None else None,
+        planning_policy,
     )
-    return ProgramExpression(program, spec)
 
 
 __all__ = ["BoundarySelection", "ProgramExpression", "ProgramTransformSpec", "vjp"]

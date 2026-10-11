@@ -1116,6 +1116,9 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
                 }
                 specialization.kind = vernon::runtime::ProgramSpecializationKind::F64;
                 specialization.value = scalar == 0.0 ? 0.0 : scalar;
+            } else if (tag == "type" && value.is_string() && !value.get_ref<const std::string &>().empty()) {
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::Type;
+                specialization.value = value.get<std::string>();
             } else {
                 fail(&context, "Program bundle specialization value does not match its tag", VERNON_STATUS_PARSE_ERROR);
                 return false;
@@ -1232,6 +1235,16 @@ selectProgramDeployment(VernonRuntimeContext &context,
                 }
                 destination.kind = vernon::runtime::ProgramSpecializationKind::F64;
                 destination.value = source.value.f64_value == 0.0 ? 0.0 : source.value.f64_value;
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_TYPE:
+                if (!source.value.type_value.data || !source.value.type_value.size) {
+                    fail(&context, "Program type specialization requires a type identity");
+                    return Result{vernon::err(
+                        vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument,
+                                             {"Program type specialization requires a type identity", 0, 0}})};
+                }
+                destination.kind = vernon::runtime::ProgramSpecializationKind::Type;
+                destination.value = std::string(source.value.type_value.data, source.value.type_value.size);
                 break;
             default:
                 fail(&context, "Program specialization kind is invalid");

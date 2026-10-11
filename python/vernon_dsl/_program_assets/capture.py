@@ -107,7 +107,7 @@ def _capture_kernel_vjp(
             _parse_kernel_program(
                 kernel,
                 specializations=key,
-                transform=expression.transform,
+                transform=expression.transform_for(key),
             ),
         )
         for key in keys

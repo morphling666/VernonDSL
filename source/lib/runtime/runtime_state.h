@@ -128,12 +128,14 @@ enum class ProgramSpecializationKind {
     U32,
     F32,
     F64,
+    Type,
 };
 
 struct ProgramSpecialization {
     std::string name;
     ProgramSpecializationKind kind{ProgramSpecializationKind::Bool};
-    std::variant<bool, int32_t, uint32_t, float, double> value{false};
+    // A Type value holds the canonical type identity string.
+    std::variant<bool, int32_t, uint32_t, float, double, std::string> value{false};
 
     bool operator==(const ProgramSpecialization &other) const {
         return name == other.name && kind == other.kind && value == other.value;

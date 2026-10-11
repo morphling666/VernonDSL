@@ -16,10 +16,15 @@ def _specialization_assignment(value: str) -> SpecializationAssignment:
         name, type_name = name_and_type.split(":", 1)
     except ValueError:
         raise argparse.ArgumentTypeError("specialization must be NAME:TYPE=VALUE") from None
+    if name and type_name == "type":
+        if not spelling:
+            raise argparse.ArgumentTypeError("type specialization requires a type identity value")
+        # The module graph validates the identity when it loads the value's declaration.
+        return SpecializationAssignment(name, "type", spelling)
     types = {"bool": dsl_bool, "i32": i32, "u32": u32, "f32": f32, "f64": f64}
     scalar_type = types.get(type_name)
     if not name or scalar_type is None:
-        raise argparse.ArgumentTypeError("specialization type must be bool, i32, u32, f32, or f64")
+        raise argparse.ArgumentTypeError("specialization type must be bool, i32, u32, f32, f64, or type")
     try:
         if scalar_type is dsl_bool:
             if spelling not in {"true", "false"}:
@@ -47,7 +52,7 @@ def _parser() -> argparse.ArgumentParser:
         type=_specialization_assignment,
         action="append",
         default=[],
-        help="bind NAME:TYPE=VALUE for bool, i32, u32, f32, or f64 (repeatable)",
+        help="bind NAME:TYPE=VALUE for bool, i32, u32, f32, or f64, or NAME:type=IDENTITY (repeatable)",
     )
     return parser
 

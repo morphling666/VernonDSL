@@ -53,6 +53,7 @@ class RuntimeOracleKind(Enum):
     FLOAT_BUFFER = "float_buffer"
     SAMPLED_PIXEL = "sampled_pixel"
     SPECIALIZATION_PIXELS = "specialization_pixels"
+    TYPE_SPECIALIZATION_PIXELS = "type_specialization_pixels"
     STORAGE_TEXEL = "storage_texel"
     STRUCTURED_VIEW = "structured_view"
     SYNCHRONIZATION = "synchronization"
@@ -81,13 +82,23 @@ class AcceptanceSuite(Enum):
 @dataclass(frozen=True)
 class RuntimeOracle:
     """For SPECIALIZATION_PIXELS, `specialization` names a u32 specialization and `expected` holds one
-    (value, red channel) pair per cooked variant; the runtime resolves and renders each variant."""
+    (value, red channel) pair per cooked variant; the runtime resolves and renders each variant.
+    For TYPE_SPECIALIZATION_PIXELS, `specialization` names a type specialization, `type_values` holds
+    the type identity of each cooked variant, and `expected` holds the matching red channels."""
 
     kind: RuntimeOracleKind
     expected: tuple[int | float, ...]
     parameter: str = "output"
     grid: tuple[int, int, int] = (1, 1, 1)
     specialization: str = ""
+    type_values: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.kind is RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS:
+            if not self.type_values or len(self.type_values) != len(self.expected):
+                raise ValueError("type specialization oracle needs one expected red channel per type value")
+        elif self.type_values:
+            raise ValueError(f"{self.kind.value} oracle does not take type values")
 
 
 @dataclass(frozen=True)
@@ -2603,6 +2614,21 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
         asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:specialization_asset",
         requirements=AcceptanceRequirements(graphics=True),
         oracle=RuntimeOracle(RuntimeOracleKind.SPECIALIZATION_PIXELS, (1, 64, 2, 128), specialization="SCALE"),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_type_specialization",
+        contract_ids=frozenset({"LANG-SPECIALIZE-001", "LANG-PAIR-004"}),
+        asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:type_specialization_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(
+            RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS,
+            (255, 64),
+            specialization="SURFACE",
+            type_values=(
+                "source.tests.fixtures.language_contract_graphics_asset:Warm",
+                "source.tests.fixtures.language_contract_graphics_asset:Cool",
+            ),
+        ),
     ),
     LanguageContractAcceptance(
         id="storage_texture",

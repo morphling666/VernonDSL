@@ -14,7 +14,7 @@ from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from .._markers import is_struct_class, mark
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from ..binding_groups import binding_group_leaf_items
-from ..bundle import ProgramCompileError, canonical_json, make_target_options
+from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
 from ..frontend.runtime_types import resolved_annotations, resolved_leaf_annotations
@@ -26,7 +26,6 @@ from ..types import (
     _Scalar,
     specialization_key,
 )
-from ..types import bool as dsl_bool
 from .session import (
     _ArtifactCache,
     _invocation_context,
@@ -422,38 +421,6 @@ class Kernel:
             for name, value in self._globals.items()
             if name in loaded_names and isinstance(value, (int, float, bool))
         )
-        declared_rows = tuple(
-            (name, value)
-            for name, value in self._globals.items()
-            if name in loaded_names and isinstance(value, Specialization)
-        )
-        declared_names = tuple(value.name for _, value in declared_rows)
-        if len(set(declared_names)) != len(declared_names):
-            raise ProgramCompileError("kernel declares duplicate specialization names")
-        declared_specializations = {value.name: (name, value) for name, value in declared_rows}
-        supplied_specializations = {assignment.name: assignment for assignment in specializations}
-        if len(supplied_specializations) != len(specializations):
-            raise ProgramCompileError("kernel specialization assignments contain duplicate names")
-        missing = sorted(
-            name
-            for name, (_, parameter) in declared_specializations.items()
-            if parameter.type is not dsl_bool and name not in supplied_specializations
-        )
-        unknown = sorted(set(supplied_specializations) - set(declared_specializations))
-        mismatched = sorted(
-            name
-            for name in set(supplied_specializations) & set(declared_specializations)
-            if supplied_specializations[name].type != declared_specializations[name][1].type.name
-        )
-        if missing or unknown or mismatched:
-            detail = []
-            if missing:
-                detail.append("missing " + ", ".join(missing))
-            if unknown:
-                detail.append("unknown " + ", ".join(unknown))
-            if mismatched:
-                detail.append("type mismatch for " + ", ".join(mismatched))
-            raise ProgramCompileError("kernel specialization assignment mismatch: " + "; ".join(detail))
         request = FrontendCompileRequest(
             self._file,
             self._entry,

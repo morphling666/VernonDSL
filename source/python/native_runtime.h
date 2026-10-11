@@ -144,9 +144,12 @@ struct Runtime {
         VernonProgramBundleLoadOptions options{};
         options.struct_size = sizeof(options);
         options.bundle_directory = directory.c_str();
+        // Selector rows view these strings, so neither vector may reallocate after the first row.
         std::vector<std::string> names;
+        std::vector<std::string> typeIdentities;
         std::vector<VernonProgramSpecialization> specializations;
         names.reserve(specializationRows.size());
+        typeIdentities.reserve(specializationRows.size());
         specializations.reserve(specializationRows.size());
         for (nb::handle rowHandle : specializationRows) {
             const nb::dict row = nb::cast<nb::dict>(rowHandle);
@@ -175,6 +178,10 @@ struct Runtime {
             } else if (tag == "f64") {
                 specialization.kind = VERNON_PROGRAM_SPECIALIZATION_F64;
                 specialization.value.f64_value = nb::cast<double>(value["value"]);
+            } else if (tag == "type") {
+                typeIdentities.push_back(nb::cast<std::string>(value["value"]));
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
+                specialization.value.type_value = {typeIdentities.back().data(), typeIdentities.back().size()};
             } else {
                 throw std::invalid_argument("Program specialization tag is invalid");
             }

@@ -649,6 +649,8 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
                         uint64_t bits = 0;
                         std::memcpy(&bits, &value, sizeof(bits));
                         appendIdentity(std::to_string(bits));
+                    } else if constexpr (std::is_same_v<T, std::string>) {
+                        appendIdentity(value);
                     } else {
                         appendIdentity(std::to_string(value));
                     }

@@ -111,9 +111,15 @@ public:
             return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramVariant.set"))};
         return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_F64, value);
     }
+    // `identity` is the canonical type identity the asset was cooked with, `<module>:<Class>` or a scalar name.
+    [[nodiscard]] Result<void, RuntimeError> setType(std::string name, std::string identity) noexcept {
+        if (identity.empty())
+            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramVariant.setType"))};
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_TYPE, std::move(identity));
+    }
 
 private:
-    using Value = std::variant<bool, int32_t, uint32_t, float, double>;
+    using Value = std::variant<bool, int32_t, uint32_t, float, double, std::string>;
     struct Entry {
         std::string name;
         VernonProgramSpecializationKind kind{};
@@ -154,8 +160,10 @@ private:
                             specialization.value.u32_value = value;
                         else if constexpr (std::is_same_v<T, float>)
                             specialization.value.f32_value = value;
-                        else
+                        else if constexpr (std::is_same_v<T, double>)
                             specialization.value.f64_value = value;
+                        else
+                            specialization.value.type_value = {value.data(), value.size()};
                     },
                     entry.value);
                 result.push_back(specialization);

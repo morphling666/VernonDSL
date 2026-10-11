@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from .diagnostics import CompileError, SourceLocation
 from .frontend.abi import attribute_layout
@@ -16,7 +16,13 @@ from .language.ast_utils import dotted_name as _dotted_name
 from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
-from .source_identity import source_file_digest, source_text_digest
+from .source_identity import (
+    project_module_name,
+    project_module_path,
+    project_root,
+    source_file_digest,
+    source_text_digest,
+)
 from .struct_methods import method_tables, normalize_struct_methods
 
 if TYPE_CHECKING:
@@ -36,7 +42,7 @@ _HOST_MODULES = {
     "unittest",
     "vernon_dsl",
 }
-_SPECIALIZATION_SCALARS = frozenset({"bool", "i32", "u32", "f32", "f64"})
+_SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
 _CLASS_DECORATORS = frozenset({"struct", "binding_group"})
@@ -46,6 +52,10 @@ def _is_dsl_class(node: ast.AST | None) -> bool:
     return isinstance(node, ast.ClassDef) and any(
         _decorator_name(item) in _CLASS_DECORATORS for item in node.decorator_list
     )
+
+
+def _is_struct_declaration(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.ClassDef) and any(_decorator_name(item) == "struct" for item in node.decorator_list)
 
 
 def _is_binding_group(node: ast.AST | None) -> bool:
@@ -71,15 +81,30 @@ class _Module:
     tree: ast.Module
     definitions: dict[str, ast.FunctionDef | ast.ClassDef] = field(default_factory=dict)
     host_functions: set[str] = field(default_factory=set)
-    features: dict[str, str] = field(default_factory=dict)
-    scalars: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Local name -> (specialization name, kind), where kind is a scalar name or "type".
+    specializations: dict[str, tuple[str, str]] = field(default_factory=dict)
     constants: dict[str, int | float | bool] = field(default_factory=dict)
     import_specs: dict[str, _ImportSpec] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module", str]] = field(default_factory=dict)
     module_imports: dict[str, "_Module"] = field(default_factory=dict)
 
     def declares_specialization(self, name: str) -> bool:
-        return name in self.features or name in self.scalars
+        return name in self.specializations
+
+
+@dataclass(frozen=True)
+class _TypeValue:
+    """A bound type specialization: a scalar type (no declaration) or a declared `@struct`/`@binding_group` class."""
+
+    identity: str
+    declaration: tuple[_Module, ast.ClassDef] | None = None
+
+
+@dataclass(frozen=True)
+class _TypeReference:
+    """A type in a compile-time expression, where it only compares with `==` and `!=` against another type."""
+
+    identity: str
 
 
 @dataclass(frozen=True)
@@ -107,15 +132,23 @@ class _ModuleGraphSnapshot:
 
 
 class _ModuleGraphCache:
-    """Caches discovery, which is independent of the specialization key; `ModuleGraph.load` applies the key."""
+    """Caches discovery; `ModuleGraph.load` applies the specialization key.
+
+    Discovery depends on the key only through its type assignments, whose defining modules join the graph, so the
+    type assignments are part of the cache key and scalar values are not.
+    """
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[Path, str | None], _ModuleGraphSnapshot] = {}
+        self._entries: dict[tuple[Path, str | None, tuple[tuple[str, str], ...]], _ModuleGraphSnapshot] = {}
         self._parsed_modules: dict[Path, tuple[str, _Module]] = {}
         self._lock = RLock()
 
+    @staticmethod
+    def _key(graph: "ModuleGraph") -> tuple[Path, str | None, tuple[tuple[str, str], ...]]:
+        return graph.input_path, graph.entry, tuple(sorted(graph.type_assignments.items()))
+
     def restore(self, graph: "ModuleGraph") -> bool:
-        key = (graph.input_path, graph.entry)
+        key = self._key(graph)
         with self._lock:
             snapshot = self._entries.get(key)
         if snapshot is None:
@@ -140,7 +173,7 @@ class _ModuleGraphCache:
             frozenset(graph.reachable_symbols),
             dependencies,
         )
-        key = (graph.input_path, graph.entry)
+        key = self._key(graph)
         with self._lock:
             self._entries[key] = snapshot
 
@@ -189,10 +222,10 @@ class _Specializer(ast.NodeTransformer):
     resources, or diagnostics; that only holds because this runs before every later frontend stage.
     """
 
-    def __init__(self, graph: "ModuleGraph", module: _Module, values: dict[str, bool | int | float]):
+    def __init__(self, graph: "ModuleGraph", module: _Module, emitted_names: dict[tuple[Path, str], str]):
         self.graph = graph
         self.module = module
-        self.values = values
+        self.emitted_names = emitted_names
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         self._infer_interface_locations(node)
@@ -381,7 +414,6 @@ class _Specializer(ast.NodeTransformer):
                 # feature specialization; they never expand recursively here.
                 return 1
             self.graph._error(self.module, value, str(error))
-            raise AssertionError("unreachable") from None
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt]:
         if not self._references_specialization(node.test):
@@ -399,7 +431,7 @@ class _Specializer(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.expr:
         declaration = self.graph._resolve_specialization(self.module, node)
         if declaration is not None:
-            return ast.copy_location(ast.Constant(value=self._specialization_value(node, *declaration)), node)
+            return self._substituted(node, *declaration)
         if isinstance(node.ctx, ast.Load) and node.id in self.module.constants:
             return ast.copy_location(ast.Constant(value=self.module.constants[node.id]), node)
         return node
@@ -407,15 +439,27 @@ class _Specializer(ast.NodeTransformer):
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
         declaration = self.graph._resolve_specialization(self.module, node)
         if declaration is not None:
-            return ast.copy_location(ast.Constant(value=self._specialization_value(node, *declaration)), node)
+            return self._substituted(node, *declaration)
         return self.generic_visit(node)
 
-    def _specialization_value(self, node: ast.AST, name: str, scalar: str) -> bool | int | float:
-        if scalar == "bool":
-            return bool(self.values.get(name, False))
-        if name not in self.values:
-            self.graph._error(self.module, node, f"missing specialization '{name}'")
-        return self.values[name]
+    def _substituted(self, node: ast.expr, name: str, kind: str) -> ast.expr:
+        if kind != "type":
+            return ast.copy_location(ast.Constant(value=self.graph._scalar_value(self.module, node, name, kind)), node)
+        bound = self.graph._type_value(self.module, node, name)
+        symbol = (
+            bound.identity
+            if bound.declaration is None
+            else self.emitted_names[(bound.declaration[0].path, bound.declaration[1].name)]
+        )
+        substituted = ast.copy_location(ast.Name(id=symbol, ctx=ast.Load()), node)
+        # The symbol is already the emitted name, which `_ReferenceRewriter` must not resolve again in this module.
+        substituted._vernon_emitted = True  # type: ignore[attr-defined]
+        return substituted
+
+    def _specialization_value(self, node: ast.expr, name: str, kind: str) -> object:
+        if kind == "type":
+            return _TypeReference(self.graph._type_value(self.module, node, name).identity)
+        return self.graph._scalar_value(self.module, node, name, kind)
 
     def _references_specialization(self, expression: ast.expr) -> bool:
         return any(
@@ -430,7 +474,14 @@ class _Specializer(ast.NodeTransformer):
         value = self._static_value(expression)
         if value is _NOT_STATIC:
             self.graph._error(self.module, expression, message)
+        self._require_untyped(expression, value)
         return bool(value)
+
+    def _require_untyped(self, node: ast.expr, *values: object) -> None:
+        if any(isinstance(value, _TypeReference) for value in values):
+            self.graph._error(
+                self.module, node, "a type specialization compares only with == and != against a type reference"
+            )
 
     def _static_value(self, node: ast.expr) -> object:
         if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
@@ -441,11 +492,13 @@ class _Specializer(ast.NodeTransformer):
                 return self._specialization_value(node, *declaration)
             if isinstance(node, ast.Name) and node.id in self.module.constants:
                 return self.module.constants[node.id]
-            return _NOT_STATIC
+            identity = self.graph._type_reference(self.module, node)
+            return _TypeReference(identity) if identity is not None else _NOT_STATIC
         if isinstance(node, ast.UnaryOp):
             operand = self._static_value(node.operand)
             if operand is _NOT_STATIC:
                 return _NOT_STATIC
+            self._require_untyped(node, operand)
             if isinstance(node.op, ast.Not):
                 return not operand
             if isinstance(node.op, ast.USub):
@@ -457,12 +510,14 @@ class _Specializer(ast.NodeTransformer):
             values = [self._static_value(value) for value in node.values]
             if any(value is _NOT_STATIC for value in values):
                 return _NOT_STATIC
+            self._require_untyped(node, *values)
             return all(values) if isinstance(node.op, ast.And) else any(values)
         if isinstance(node, ast.BinOp):
             operator = _STATIC_BINARY_OPERATORS.get(type(node.op))
             left, right = self._static_value(node.left), self._static_value(node.right)
             if operator is None or left is _NOT_STATIC or right is _NOT_STATIC:
                 return _NOT_STATIC
+            self._require_untyped(node, left, right)
             try:
                 return operator(left, right)
             except ZeroDivisionError:
@@ -476,6 +531,9 @@ class _Specializer(ast.NodeTransformer):
                 right = self._static_value(comparator)
                 if operator is None or right is _NOT_STATIC:
                     return _NOT_STATIC
+                typed = isinstance(left, _TypeReference), isinstance(right, _TypeReference)
+                if any(typed) and (not all(typed) or not isinstance(operator_node, (ast.Eq, ast.NotEq))):
+                    self._require_untyped(node, left, right)
                 if not operator(left, right):
                     return False
                 left = right
@@ -510,6 +568,8 @@ class _ReferenceRewriter(ast.NodeTransformer):
         self.emitted_names = emitted_names
 
     def _resolve(self, node: ast.expr) -> ast.expr:
+        if getattr(node, "_vernon_emitted", False):
+            return node
         if isinstance(node, ast.Name):
             imported = self.module.symbol_imports.get(node.id)
             if imported:
@@ -616,10 +676,14 @@ class ModuleGraph:
         entry: str | None = None,
     ):
         self.input_path = Path(input_path).resolve()
-        self.project_root = self._project_root(self.input_path.parent)
+        # Type identities are module names relative to the project root, so only a real root makes them portable.
+        # Without one, imports and display paths fall back to the input's directory.
+        self.project_root = project_root(self.input_path.parent)
+        self.search_root = self.project_root or self.input_path.parent
         self.specializations = specializations
-        self.specialization_values: dict[str, bool | int | float] = {
-            assignment.name: assignment.value for assignment in specializations
+        self.specialization_values = {assignment.name: assignment.value for assignment in specializations}
+        self.type_assignments = {
+            assignment.name: str(assignment.value) for assignment in specializations if assignment.type == "type"
         }
         self.entry = entry
         self.modules: dict[Path, _Module] = {}
@@ -642,22 +706,25 @@ class ModuleGraph:
                 )
                 or _is_dsl_class(definition)
             )
-        for seed in (*seeds, *root.features, *root.scalars):
+        for seed in (*seeds, *root.specializations):
             self._touch_symbol(root, seed)
+        # A type value's defining module joins the graph as if imported, so its source is a dependency of the key.
+        for identity in self.type_assignments.values():
+            declaration = self._declared_type(root, root.tree, identity).declaration
+            if declaration is not None:
+                self._touch_symbol(declaration[0], declaration[1].name)
         return root
 
     def declared_specializations(self) -> dict[str, str]:
-        """Maps every reachable specialization name to its scalar kind; requires `discover`."""
+        """Maps every reachable specialization name to its kind; requires `discover`."""
         declared: dict[str, str] = {}
         for module in self.modules.values():
-            rows = [(local, (name, "bool")) for local, name in module.features.items()]
-            rows.extend(module.scalars.items())
-            for local, (name, scalar) in rows:
+            for local, (name, kind) in module.specializations.items():
                 if (module.path, local) not in self.reachable_symbols:
                     continue
-                previous = declared.setdefault(name, scalar)
-                if previous != scalar:
-                    self._error(module, module.tree, f"specialization '{name}' is declared as {previous} and {scalar}")
+                previous = declared.setdefault(name, kind)
+                if previous != kind:
+                    self._error(module, module.tree, f"specialization '{name}' is declared as {previous} and {kind}")
         return declared
 
     def _selected_entry_symbol(self, root: _Module) -> tuple[_Module, str] | None:
@@ -675,7 +742,7 @@ class ModuleGraph:
     def load(self) -> LoadedProject:
         root = self.discover()
         declared = self.declared_specializations()
-        declared_features = {name for name, scalar in declared.items() if scalar == "bool"}
+        declared_features = {name for name, kind in declared.items() if kind == "bool"}
         unknown = sorted(assignment.name for assignment in self.specializations if assignment.name not in declared)
         if unknown:
             self._error(root, root.tree, "requested undeclared specialization(s): " + ", ".join(unknown))
@@ -687,11 +754,7 @@ class ModuleGraph:
                     f"specialization '{assignment.name}' is declared as {declared[assignment.name]}, "
                     f"not {assignment.type}",
                 )
-        emitted_names: dict[tuple[Path, str], str] = {}
-        for module in self.order:
-            prefix = "" if module is root else self._symbol_prefix(module)
-            for symbol in module.definitions:
-                emitted_names[(module.path, symbol)] = f"{prefix}{symbol}" if prefix else symbol
+        emitted_names = self._emitted_names(root)
         selected_entry_symbol = self._selected_entry_symbol(root)
         selected_entry_key = (
             (selected_entry_symbol[0].path, selected_entry_symbol[1]) if selected_entry_symbol is not None else None
@@ -716,7 +779,7 @@ class ModuleGraph:
                 if isinstance(definition, ast.ClassDef) and not _is_dsl_class(definition):
                     continue
                 transformed = copy.deepcopy(definition)
-                transformed = _Specializer(self, module, self.specialization_values).visit(transformed)
+                transformed = _Specializer(self, module, emitted_names).visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if isinstance(transformed, ast.FunctionDef):
                     is_entry = any(
@@ -768,6 +831,30 @@ class ModuleGraph:
             tuple(sorted(declared_features)),
             tuple((path, digest) for path, _, digest in dependency_records),
         )
+
+    def _emitted_names(self, root: _Module) -> dict[tuple[Path, str], str]:
+        """Names definitions in the combined source: imported helpers carry their module prefix, while a Struct keeps
+        its declared name from any module, because host Values, reflection, and manifests name a Struct by its class
+        name. Two reachable Structs with one name therefore conflict."""
+
+        emitted_names: dict[tuple[Path, str], str] = {}
+        owners: dict[str, Path] = {}
+        for module in self.order:
+            prefix = "" if module is root else self._symbol_prefix(module)
+            for symbol, definition in module.definitions.items():
+                emitted = symbol if not prefix or _is_struct_declaration(definition) else f"{prefix}{symbol}"
+                emitted_names[(module.path, symbol)] = emitted
+                if (module.path, symbol) not in self.reachable_symbols:
+                    continue
+                owner = owners.setdefault(emitted, module.path)
+                if owner != module.path:
+                    self._error(
+                        module,
+                        definition,
+                        f"conflicting declarations named '{emitted}' in {self._display_path(owner)} and "
+                        f"{self._display_path(module.path)}; a Struct keeps its declared name across modules",
+                    )
+        return emitted_names
 
     def _load_module(self, path: Path, name: str) -> _Module:
         path = path.resolve()
@@ -831,10 +918,10 @@ class ModuleGraph:
     def _collect_specialization(self, module: _Module, node: ast.Assign) -> None:
         if not isinstance(node.value, ast.Call):
             return
-        kind = (_dotted_name(node.value.func) or "").split(".")[-1]
-        if kind not in {"feature", "specialization"}:
+        declaration = (_dotted_name(node.value.func) or "").split(".")[-1]
+        if declaration not in {"feature", "specialization"}:
             return
-        expected_arguments = 1 if kind == "feature" else 2
+        expected_arguments = 1 if declaration == "feature" else 2
         if (
             len(node.targets) != 1
             or not isinstance(node.targets[0], ast.Name)
@@ -848,17 +935,14 @@ class ModuleGraph:
                 node,
                 'specialization declaration must be NAME = feature("NAME") or NAME = specialization("NAME", TYPE)',
             )
-        scalar = "bool" if kind == "feature" else (_dotted_name(node.value.args[1]) or "").split(".")[-1]
-        if scalar not in _SPECIALIZATION_SCALARS:
-            self._error(module, node, "specialization type must be bool, i32, u32, f32, or f64")
+        kind = "bool" if declaration == "feature" else (_dotted_name(node.value.args[1]) or "").split(".")[-1]
+        if kind not in _SPECIALIZATION_KINDS:
+            self._error(module, node, "specialization type must be bool, i32, u32, f32, f64, or vd.type")
         local_name = node.targets[0].id
         specialization_name = node.value.args[0].value
         if not specialization_name or local_name in module.definitions or module.declares_specialization(local_name):
             self._error(module, node, f"invalid or duplicate specialization declaration '{local_name}'")
-        if scalar == "bool":
-            module.features[local_name] = specialization_name
-        else:
-            module.scalars[local_name] = (specialization_name, scalar)
+        module.specializations[local_name] = (specialization_name, kind)
 
     def _index_imports(self, module: _Module) -> None:
         for node in module.tree.body:
@@ -979,7 +1063,7 @@ class ModuleGraph:
                 base = base.parent
             bases.append(base)
         else:
-            bases.extend((module.path.parent, self.project_root))
+            bases.extend((module.path.parent, self.search_root))
         for base in dict.fromkeys(bases):
             candidate = base.joinpath(*parts)
             paths = (candidate.with_suffix(".py"), candidate / "__init__.py")
@@ -1009,29 +1093,94 @@ class ModuleGraph:
         module.module_imports[local_name] = target
 
     def _resolve_specialization(self, module: _Module, node: ast.AST) -> tuple[str, str] | None:
-        """Returns the (name, scalar kind) of the specialization `node` names, if any."""
-
-        def declared(owner: _Module, local: str) -> tuple[str, str] | None:
-            if local in owner.features:
-                return owner.features[local], "bool"
-            return owner.scalars.get(local)
+        """Returns the (name, kind) of the specialization `node` names, if any."""
 
         if isinstance(node, ast.Name):
-            local = declared(module, node.id)
+            local = module.specializations.get(node.id)
             if local is not None:
                 return local
             imported = module.symbol_imports.get(node.id)
             if imported:
                 target, symbol = imported
-                return declared(target, symbol)
+                return target.specializations.get(symbol)
             return None
         if isinstance(node, ast.Attribute):
             dotted = _dotted_name(node) or ""
             for alias, target in module.module_imports.items():
                 prefix = alias + "."
                 if dotted.startswith(prefix):
-                    return declared(target, dotted.removeprefix(prefix))
+                    return target.specializations.get(dotted.removeprefix(prefix))
         return None
+
+    def _scalar_value(self, module: _Module, node: ast.AST, name: str, kind: str) -> bool | int | float:
+        if kind == "bool":
+            return self.specialization_values.get(name, False) is True
+        value = self.specialization_values.get(name)
+        if value is None:
+            self._error(module, node, f"missing specialization '{name}'")
+        assert isinstance(value, (int, float))
+        return value
+
+    def _type_value(self, module: _Module, node: ast.AST, name: str) -> _TypeValue:
+        identity = self.type_assignments.get(name)
+        if identity is None:
+            self._error(module, node, f"missing type specialization '{name}'")
+        return self._declared_type(module, node, identity)
+
+    def _bound_type(self, module: _Module, node: ast.AST) -> _TypeValue | None:
+        """The type value bound to the type specialization `node` names, if it names one."""
+
+        declaration = self._resolve_specialization(module, node)
+        if declaration is None or declaration[1] != "type":
+            return None
+        return self._type_value(module, node, declaration[0])
+
+    def _declared_type(self, module: _Module, node: ast.AST, identity: str) -> _TypeValue:
+        """Resolves a canonical type identity: a scalar name, or `<module>:<Class>` loaded from its defining source."""
+
+        if identity in SCALAR_TYPES:
+            return _TypeValue(identity)
+        module_name, separator, class_name = identity.partition(":")
+        source = (
+            project_module_path(module_name, self.project_root) if separator and self.project_root is not None else None
+        )
+        if source is None or not source.is_file():
+            self._error(module, node, f"type value has no portable identity: '{identity}' names no source module")
+        owner = self._load_module(source, module_name)
+        declaration = owner.definitions.get(class_name)
+        if not isinstance(declaration, ast.ClassDef) or not _is_dsl_class(declaration):
+            self._error(
+                module, node, f"type specialization requires a declared type or scalar type; '{identity}' is not one"
+            )
+        return _TypeValue(identity, (owner, declaration))
+
+    def _materialize_reference(self, module: _Module, node: ast.AST) -> str:
+        """Materializes the import a dotted reference starts with; returns the spelling after that first name."""
+
+        head, _, member = (_dotted_name(node) or "").partition(".")
+        if head in module.import_specs:
+            self._materialize_import(module, head)
+        return member
+
+    def _type_reference(self, module: _Module, node: ast.AST) -> str | None:
+        """The identity of the scalar type or declared class `node` names, materializing imports on the way."""
+
+        spelling = _dotted_name(node) or ""
+        if spelling.split(".")[-1] in SCALAR_TYPES:
+            return spelling.split(".")[-1]
+        member = self._materialize_reference(module, node)
+        resolved = self._resolve_class(module, node) if "." not in member else None
+        if resolved is None or not _is_dsl_class(resolved[1]):
+            return None
+        owner, declaration = resolved
+        module_name = project_module_name(owner.path, self.project_root) if self.project_root is not None else None
+        if module_name is None:
+            self._error(
+                module,
+                node,
+                f"type value has no portable identity: '{declaration.name}' is not defined under a project root",
+            )
+        return f"{module_name}:{declaration.name}"
 
     def _parse_abi_type(self, module: _Module, node: ast.AST) -> ConcreteType:
         if isinstance(node, ast.Subscript) and (_dotted_name(node.value) or "").split(".")[-1] == "Annotated":
@@ -1044,6 +1193,9 @@ class ModuleGraph:
         scalar = SCALAR_ALIASES.get(spelling, spelling)
         if scalar in SCALAR_TYPES:
             return ConcreteType("scalar", scalar)
+        bound = self._bound_type(module, node)
+        if bound is not None and bound.declaration is None:
+            return ConcreteType("scalar", bound.identity)
         structure = self._resolve_struct_type(module, node)
         if structure is not None:
             owner, declaration = structure
@@ -1081,11 +1233,14 @@ class ModuleGraph:
 
     def _resolve_struct_type(self, module: _Module, node: ast.AST) -> tuple[_Module, ast.ClassDef] | None:
         resolved = self._resolve_class(module, node)
-        if resolved is None or not any(_decorator_name(item) == "struct" for item in resolved[1].decorator_list):
+        if resolved is None or not _is_struct_declaration(resolved[1]):
             return None
         return resolved
 
     def _resolve_class(self, module: _Module, node: ast.AST) -> tuple[_Module, ast.ClassDef] | None:
+        bound = self._bound_type(module, node)
+        if bound is not None:
+            return bound.declaration
         if isinstance(node, ast.Name):
             local = module.definitions.get(node.id)
             if isinstance(local, ast.ClassDef):
@@ -1277,7 +1432,7 @@ class ModuleGraph:
 
     def _display_path(self, path: Path) -> str:
         try:
-            return path.relative_to(self.project_root).as_posix()
+            return path.relative_to(self.search_root).as_posix()
         except ValueError:
             return path.as_posix()
 
@@ -1285,14 +1440,7 @@ class ModuleGraph:
         return self._display_path(path).removesuffix(".py").replace("/", ".")
 
     @staticmethod
-    def _project_root(start: Path) -> Path:
-        for candidate in (start, *start.parents):
-            if (candidate / "pyproject.toml").is_file():
-                return candidate.resolve()
-        return start.resolve()
-
-    @staticmethod
-    def _error(module: _Module, node: ast.AST, message: str) -> None:
+    def _error(module: _Module, node: ast.AST, message: str) -> NoReturn:
         raise CompileError(
             message,
             SourceLocation(
@@ -1323,10 +1471,27 @@ def load_project(
     return graph.load()
 
 
-def declared_project_specializations(input_path: str | Path) -> dict[str, str]:
-    """Maps the specializations reachable from a source file to their scalar kinds without applying a key."""
-    graph, _ = _load_project_graph(input_path, (), None)
-    return graph.declared_specializations()
+def _private_project_root(input_path: str | Path) -> tuple[ModuleGraph, _Module]:
+    """A graph that only `input_path` has joined; resolving through it materializes imports, so it never touches
+    cached discovery state."""
+
+    graph = ModuleGraph(input_path)
+    return graph, graph._load_module(graph.input_path, graph._module_name(graph.input_path))
+
+
+def project_specialization(input_path: str | Path, expression: ast.expr) -> tuple[str, str] | None:
+    """The (name, kind) of the specialization a module-level expression of `input_path` names, local or imported."""
+
+    graph, root = _private_project_root(input_path)
+    graph._materialize_reference(root, expression)
+    return graph._resolve_specialization(root, expression)
+
+
+def project_type_identity(input_path: str | Path, expression: ast.expr) -> str | None:
+    """The canonical identity of the type a module-level expression of `input_path` names, read without running it."""
+
+    graph, root = _private_project_root(input_path)
+    return graph._type_reference(root, expression)
 
 
 def resolve_project_entry(input_path: str | Path, entry: str) -> ProjectEntryResolution | None:

@@ -1206,6 +1206,120 @@ TEST(RuntimeModuleProgramCppApi, BindingGroupLeavesBindAcrossTypedVariants) {
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
+TEST(RuntimeModuleProgramCppApi, TypeVariantsSelectBindingGroupValuesByIdentity) {
+    std::ifstream input(VERNON_TYPE_SPECIALIZATION_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        ASSERT_TRUE(assetResult);
+        auto asset = std::move(assetResult).value();
+
+        vernon::runtime::ProgramVariant empty;
+        EXPECT_TRUE(empty.setType("MATERIAL", "").isErr());
+        vernon::runtime::ProgramVariant unknown;
+        ASSERT_TRUE(unknown.setType("MATERIAL", "source.tests.fixtures.type_specialization_fixture_materials:Lookup"));
+        auto unknownResult = asset.resolve(unknown);
+        ASSERT_TRUE(unknownResult.isErr());
+        EXPECT_EQ(unknownResult.error().code, vernon::RuntimeErrorCode::ParseFailure);
+
+        struct Material {
+            const char *identity;
+            bool glossy;
+        };
+        constexpr uint32_t extent = 3;
+        for (const Material material :
+             {Material{"source.tests.fixtures.type_specialization_fixture_materials:Matte", false},
+              Material{"source.tests.fixtures.type_specialization_fixture_materials:Glossy", true}}) {
+            SCOPED_TRACE(material.identity);
+            vernon::runtime::ProgramVariant variant;
+            ASSERT_TRUE(variant.setType("MATERIAL", material.identity));
+            auto executableResult = asset.resolve(variant);
+            ASSERT_TRUE(executableResult);
+            auto executable = std::move(executableResult).value();
+            VernonProgramParameterView offsetParameter{};
+            const bool hasOffset = vernonRuntimeProgramExecutableFindParameter(
+                                       executable.get(), {"material.offset", 15}, &offsetParameter) == VERNON_STATUS_OK;
+            ASSERT_EQ(hasOffset, material.glossy);
+
+            std::vector<VernonProgramArgument> arguments;
+            float gain = 3.0f;
+            float offset = 0.5f;
+            std::array<float, extent> weights{1.0f, 2.0f, 4.0f};
+            std::array<float, extent> output{};
+            const uint64_t shape[]{extent};
+            uint32_t gridX = extent;
+            uint32_t one = 1;
+            arguments.push_back(scalarArgument(parameter(executable.get(), "material.gain"), gain));
+            if (material.glossy)
+                arguments.push_back(scalarArgument(offsetParameter, offset));
+            arguments.push_back(
+                tensorArrayArgument(parameter(executable.get(), "material.lookup.weights"), weights.data(), shape));
+            arguments.push_back(tensorArrayArgument(parameter(executable.get(), "output"), output.data(), shape));
+            VernonProgramParameterView publishedOutputParameter{};
+            ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                                       0, &publishedOutputParameter),
+                      VERNON_STATUS_OK);
+            arguments.push_back(tensorArrayArgument(publishedOutputParameter, output.data(), shape));
+            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_x"), gridX));
+            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_y"), one));
+            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_z"), one));
+
+            auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
+            ASSERT_TRUE(instanceResult);
+            auto instance = std::move(instanceResult).value();
+            auto invocationResult = instance.begin();
+            ASSERT_TRUE(invocationResult);
+            auto invocation = std::move(invocationResult).value();
+            for (size_t index = 0; index < arguments.size(); ++index) {
+                const std::string text = std::string(material.identity) + "-" + std::to_string(index);
+                ASSERT_TRUE(
+                    invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
+            }
+            ASSERT_TRUE(invocation.execute(false));
+            auto commitResult = invocation.commit();
+            ASSERT_TRUE(commitResult);
+            EXPECT_FALSE(commitResult.value());
+            for (uint32_t index = 0; index < extent; ++index)
+                EXPECT_FLOAT_EQ(output[index], weights[index] * gain + (material.glossy ? offset : 0.0f));
+        }
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCApi, TypeSpecializationSelectorRequiresAnIdentity) {
+    std::ifstream input(VERNON_TYPE_SPECIALIZATION_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    const std::string name = "MATERIAL";
+    VernonProgramSpecialization specialization{};
+    specialization.struct_size = sizeof(specialization);
+    specialization.name = {name.data(), name.size()};
+    specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
+    const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
+    VernonProgramExecutable *executable = nullptr;
+    EXPECT_EQ(vernonRuntimeResolveProgramResult(bundle, &selector, &executable),
+              VERNON_RUNTIME_OPERATION_INVALID_ARGUMENT);
+    EXPECT_EQ(executable, nullptr);
+    EXPECT_EQ(lastError(context), "Program type specialization requires a type identity");
+
+    const std::string identity = "source.tests.fixtures.type_specialization_fixture_materials:Matte";
+    specialization.value.type_value = {identity.data(), identity.size()};
+    ASSERT_EQ(vernonRuntimeResolveProgramResult(bundle, &selector, &executable), VERNON_RUNTIME_OPERATION_OK)
+        << lastError(context);
+    ASSERT_NE(executable, nullptr);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
 TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);

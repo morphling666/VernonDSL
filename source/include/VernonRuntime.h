@@ -203,7 +203,8 @@ typedef enum VernonProgramSpecializationKind {
     VERNON_PROGRAM_SPECIALIZATION_I32 = 1,
     VERNON_PROGRAM_SPECIALIZATION_U32 = 2,
     VERNON_PROGRAM_SPECIALIZATION_F32 = 3,
-    VERNON_PROGRAM_SPECIALIZATION_F64 = 4
+    VERNON_PROGRAM_SPECIALIZATION_F64 = 4,
+    VERNON_PROGRAM_SPECIALIZATION_TYPE = 5
 } VernonProgramSpecializationKind;
 
 typedef union VernonProgramSpecializationValue {
@@ -212,6 +213,8 @@ typedef union VernonProgramSpecializationValue {
     uint32_t u32_value;
     float f32_value;
     double f64_value;
+    /* Canonical type identity, `<module>:<Class>` or a scalar name; compared bytewise. */
+    VernonStringView type_value;
 } VernonProgramSpecializationValue;
 
 typedef struct VernonProgramSpecialization {
@@ -225,7 +228,7 @@ typedef struct VernonProgramSpecialization {
 /*
  * Selects one exact cooked Program variant. Names must be non-empty and
  * unique; order is irrelevant. A null selector selects the empty key.
- * Floating-point values must be finite.
+ * Floating-point values must be finite and type identities non-empty.
  */
 typedef struct VernonProgramVariantSelector {
     uint32_t struct_size;
