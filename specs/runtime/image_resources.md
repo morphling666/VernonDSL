@@ -75,6 +75,26 @@ ImageViewDescriptor
   aspect selection
 ```
 
+Image dimensions are `2D`, `3D`, `CUBE`, `2D_ARRAY`, and `CUBE_ARRAY`. `2D`
+and `3D` have exactly one layer, `CUBE` exactly six, `2D_ARRAY` any positive
+count with depth 1, and `CUBE_ARRAY` a positive multiple of six where layer
+`cube * 6 + face` holds face `face` of cube `cube`. Cube faces are square.
+
+A view reinterprets layers but never crosses the 3D/layered split:
+
+| View | Parent | Layer range |
+|---|---|---|
+| `2D` | any non-3D image | exactly one layer |
+| `2D_ARRAY` | any non-3D image | any |
+| `3D` | `3D` | base 0, count 1 |
+| `CUBE` | `CUBE` or `CUBE_ARRAY` | base a multiple of 6, count 6 |
+| `CUBE_ARRAY` | `CUBE` or `CUBE_ARRAY` | base a multiple of 6, count a multiple of 6 |
+
+These shape and view rules are header-only `constexpr` functions in
+`rhi/image_descriptor_validation.h`, so the backend-agnostic RuntimeCore applies
+the same rules as the RHI without linking it. Shader bindings resolve through
+the view, so dimension checks against reflection use the view dimension.
+
 Views retain their parent image. Destroying a public owner handle invalidates
 that handle immediately, while prepared bindings and recorded commands retain
 the logical resource record until completion. All views of one image share the
@@ -238,6 +258,21 @@ object. Older OpenGL and OpenGL ES otherwise continue to support transfer-region
 slicing without claiming aliased image-view support. D3D12 mip generation uses
 a build-time compiled and embedded utility compute shader; it does not add a
 runtime shader compiler dependency.
+
+Layered dimension mappings with backend-specific constraints:
+
+- D3D12 `TEXTURE2D` and `TEXTURECUBE` views cannot start past layer 0, so a
+  `2D` or `CUBE` view with a nonzero base layer uses the one-element
+  `TEXTURE2DARRAY` or `TEXTURECUBEARRAY` form. RTV and DSV views honour the
+  view's mip and layer range.
+- Vulkan creates `CUBE_ARRAY` images only when the device enables the
+  `imageCubeArray` feature, and reports Unsupported otherwise. SPIR-V modules
+  that sample arrayed cube images declare `SampledCubeArray`, and modules with
+  size queries declare `ImageQuery`; MLIR's capability deduction misses both.
+- OpenGL stores arrays and cube arrays through the 3D storage and sub-image
+  entry points with z = layer, binds storage images as layered unless the
+  dimension is `2D`, and reads one layer back through `framebufferTextureLayer`.
+- Metal uses `MTLTextureTypeCubeArray`, whose `arrayLength` counts cubes.
 
 ## 8. Synchronization and hazards
 

@@ -10,6 +10,22 @@
 
 namespace vernon::rhi::opengl {
 
+inline Enum textureTarget(VernonRhiImageDimension dimension) {
+    switch (dimension) {
+    case VERNON_RHI_IMAGE_2D:
+        return kTexture2D;
+    case VERNON_RHI_IMAGE_3D:
+        return kTexture3D;
+    case VERNON_RHI_IMAGE_CUBE:
+        return kTextureCubeMap;
+    case VERNON_RHI_IMAGE_2D_ARRAY:
+        return kTexture2DArray;
+    case VERNON_RHI_IMAGE_CUBE_ARRAY:
+        return kTextureCubeMapArray;
+    }
+    return 0;
+}
+
 struct Buffer {
     Uint name{};
     bool imported{};
@@ -43,8 +59,9 @@ struct VERNON_RHI_CAPI DeviceState {
     void importImage(Image &image, Uint name);
     void destroyImage(Image &image);
     bool uploadImage2D(const Image &image, Size width, Size height, Enum externalFormat, Enum type, const void *source);
-    bool downloadImage2D(const Image &image, Enum target, Int mipLevel, Int x, Int y, Size width, Size height,
-                         Enum externalFormat, Enum type, void *destination, std::string &error);
+    // `layer` selects the layer of 2D-array and cube-array targets; other targets ignore it.
+    bool downloadImage2D(const Image &image, Enum target, Int mipLevel, Int layer, Int x, Int y, Size width,
+                         Size height, Enum externalFormat, Enum type, void *destination, std::string &error);
     bool downloadImage3D(const Image &image, Int mipLevel, Int x, Int y, Int z, Size width, Size height, Size depth,
                          Enum externalFormat, Enum type, size_t layerSize, void *destination, std::string &error);
 

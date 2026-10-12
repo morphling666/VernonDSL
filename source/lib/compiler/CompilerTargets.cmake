@@ -63,7 +63,7 @@ target_compile_definitions(VernonCompilerEngine PRIVATE VERNON_DSL_COMPILER_STAT
 target_include_directories(
     VernonCompilerEngine
     PUBLIC $<BUILD_INTERFACE:${VERNON_SOURCE_DIR}/include>
-    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include" "${VERNON_SOURCE_DIR}/lib")
 target_link_libraries(
     VernonCompilerEngine
     PUBLIC VernonCompilerBuildHeaders

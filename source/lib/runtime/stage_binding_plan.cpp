@@ -20,6 +20,10 @@ std::optional<VernonTextureDimension> artifactTextureDimension(const std::string
         return VERNON_TEXTURE_3D;
     if (dimension == "cube")
         return VERNON_TEXTURE_CUBE;
+    if (dimension == "2d_array")
+        return VERNON_TEXTURE_2D_ARRAY;
+    if (dimension == "cube_array")
+        return VERNON_TEXTURE_CUBE_ARRAY;
     return std::nullopt;
 }
 
@@ -404,7 +408,7 @@ bool parseArtifactInterfacePlan(const nlohmann::json &value, InterfacePlan &plan
 
 bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) {
     const auto validTextureDimension = [](const std::string &dimension) {
-        return dimension == "2d" || dimension == "3d" || dimension == "cube";
+        return artifactTextureDimension(dimension).has_value();
     };
     if (!std::is_sorted(plan.parameters.begin(), plan.parameters.end(),
                         [](const Parameter &left, const Parameter &right) { return left.slot < right.slot; }) ||

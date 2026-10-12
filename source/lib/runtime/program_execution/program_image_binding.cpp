@@ -1,7 +1,10 @@
 #include "program_image_binding.h"
 
+#include "rhi/image_descriptor_validation.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/provider_image_description.h"
 #include "runtime/runtime_state.h"
+#include "runtime/stage_binding_plan.h"
 
 #include <algorithm>
 #include <array>
@@ -19,14 +22,10 @@ bool decodeImage(uint64_t key, VernonRhiImage &image) {
     return true;
 }
 
-std::optional<VernonRhiImageDimension> dimension(std::string_view value) {
-    if (value == "2d")
-        return VERNON_RHI_IMAGE_2D;
-    if (value == "3d")
-        return VERNON_RHI_IMAGE_3D;
-    if (value == "cube")
-        return VERNON_RHI_IMAGE_CUBE;
-    return std::nullopt;
+std::optional<VernonRhiImageDimension> dimension(const std::string &value) {
+    const std::optional<VernonTextureDimension> parsed = artifactTextureDimension(value);
+    return parsed ? std::optional<VernonRhiImageDimension>(static_cast<VernonRhiImageDimension>(*parsed))
+                  : std::nullopt;
 }
 
 std::optional<VernonRhiFormat> format(std::string_view value) {
@@ -95,8 +94,9 @@ bool resolveBorrowedProgramImage(VernonRuntimeContext &context, const program::S
     const bool genericSampledConstraint =
         storage.image.format == "unknown" &&
         !(expectedUsage & (VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT));
-    if (!expectedDimension || resolved.image.dimension > VERNON_RHI_IMAGE_CUBE ||
-        (!genericSampledConstraint && resolved.image.dimension != *expectedDimension))
+    // Shaders read through the view, so a 2D view of one array layer satisfies a 2D binding.
+    if (!expectedDimension || !rhi::knownImageDimension(resolved.view.dimension) ||
+        (!genericSampledConstraint && resolved.view.dimension != *expectedDimension))
         return error = "Program borrowed image dimension does not match its Storage descriptor", false;
     if ((!genericSampledConstraint && (!expectedFormat || resolved.image.format != *expectedFormat)) ||
         (genericSampledConstraint && resolved.image.format == VERNON_RHI_FORMAT_UNDEFINED))
@@ -127,9 +127,6 @@ bool materializeOwnedProgramImageDescriptor(const program::Storage &storage, con
     const uint32_t imageUsage = usage(storage.image.usage);
     if (!imageDimension || !imageFormat || !imageUsage)
         return error = "owned Program image Storage has an invalid creation descriptor", false;
-    if ((*imageDimension == VERNON_RHI_IMAGE_2D && extent[2] != 1) ||
-        (*imageDimension == VERNON_RHI_IMAGE_CUBE && (extent[0] != extent[1] || extent[2] != 1)))
-        return error = "owned Program image extent does not match its dimension", false;
     descriptor = {};
     descriptor.struct_size = sizeof(descriptor);
     descriptor.dimension = *imageDimension;
@@ -141,6 +138,8 @@ bool materializeOwnedProgramImageDescriptor(const program::Storage &storage, con
     descriptor.array_layers = storage.image.arrayLayers;
     descriptor.sample_count = storage.image.sampleCount;
     descriptor.usage = imageUsage;
+    if (!rhi::validImageShape(descriptor))
+        return error = "owned Program image extent does not match its dimension", false;
     return true;
 }
 

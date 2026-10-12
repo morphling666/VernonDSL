@@ -108,6 +108,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(drawArraysInstanced, "glDrawArraysInstanced");
         LOAD(drawElementsInstanced, "glDrawElementsInstanced");
         LOAD(getUniformLocation, "glGetUniformLocation");
+        LOAD(getUniformBlockIndex, "glGetUniformBlockIndex");
+        LOAD(uniformBlockBinding, "glUniformBlockBinding");
         LOAD(uniform1fv, "glUniform1fv");
         LOAD(uniform2fv, "glUniform2fv");
         LOAD(uniform3fv, "glUniform3fv");

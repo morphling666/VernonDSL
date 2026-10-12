@@ -33,6 +33,7 @@ constexpr GlEnum kFramebufferComplete = 0x8CD5;
 constexpr GlEnum kArrayBuffer = 0x8892;
 constexpr GlEnum kElementArrayBuffer = 0x8893;
 constexpr GlEnum kMaxUniformBlockSize = 0x8A30;
+constexpr GlEnum kActiveUniformBlocks = 0x8A36;
 constexpr GlEnum kInt = 0x1404;
 constexpr GlEnum kUnsignedInt = 0x1405;
 constexpr GlEnum kFloat = 0x1406;
@@ -76,6 +77,8 @@ std::array<float, 16> matrixUpload{};
 std::array<float, 2> resolutionUpload{};
 std::array<GlInt, 4> viewportUpload{};
 std::array<GlInt, 4> scissorUpload{};
+std::vector<std::string> linkedUniformBlocks;
+std::unordered_map<GlUint, GlUint> uniformBlockBindings;
 
 using vernon::tests::RhiImage;
 using vernon::tests::RhiRuntime;
@@ -198,7 +201,11 @@ GlUint GL_CALL createName(GlEnum kind) {
 GlUint GL_CALL createProgram() { return nextName++; }
 void GL_CALL shaderSource(GlUint, GlSize, const char *const *, const GlInt *) {}
 void GL_CALL getShaderiv(GlUint, GlEnum name, GlInt *value) { *value = name == kCompileStatus ? 1 : 0; }
-void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) { *value = name == kLinkStatus ? 1 : 0; }
+void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) {
+    *value = name == kLinkStatus            ? 1
+             : name == kActiveUniformBlocks ? static_cast<GlInt>(linkedUniformBlocks.size())
+                                            : 0;
+}
 void GL_CALL getIntegerv(GlEnum name, GlInt *value) { *value = name == kMaxUniformBlockSize ? 16 * 1024 : 16; }
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
@@ -330,6 +337,11 @@ void GL_CALL scissor(GlInt x, GlInt y, GlSize width, GlSize height) {
     scissorUpload = {x, y, width, height};
 }
 GlInt GL_CALL getUniformLocation(GlUint, const char *) { return 0; }
+GlUint GL_CALL getUniformBlockIndex(GlUint, const char *name) {
+    const auto found = std::find(linkedUniformBlocks.begin(), linkedUniformBlocks.end(), name);
+    return found == linkedUniformBlocks.end() ? 0xFFFFFFFFU : static_cast<GlUint>(found - linkedUniformBlocks.begin());
+}
+void GL_CALL uniformBlockBinding(GlUint, GlUint block, GlUint binding) { uniformBlockBindings[block] = binding; }
 void GL_CALL uniformMatrix4fv(GlInt, GlSize, GlBoolean transpose, const float *data) {
     matrixTranspose = transpose;
     std::copy_n(data, matrixUpload.size(), matrixUpload.begin());
@@ -444,6 +456,8 @@ void *getProcAddress(void *, const char *name) {
     PROC("glStencilMaskSeparate", stencilMaskSeparate);
     PROC("glInvalidateFramebuffer", invalidateFramebuffer);
     PROC("glGetUniformLocation", getUniformLocation);
+    PROC("glGetUniformBlockIndex", getUniformBlockIndex);
+    PROC("glUniformBlockBinding", uniformBlockBinding);
     PROC("glUniform1fv", uniformFvNoop);
     PROC("glUniform2fv", uniform2fv);
     PROC("glUniform3fv", uniformFvNoop);
@@ -1051,6 +1065,53 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     }
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+#endif
+
+#if defined(VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE)
+std::string stageShaderSource(const std::filesystem::path &manifestPath, const char *role) {
+    std::ifstream manifestInput(manifestPath, std::ios::binary);
+    const nlohmann::json manifest = nlohmann::json::parse(manifestInput);
+    const auto &artifact = manifest["variants"][0]["artifact_system"]["artifacts"].begin().value();
+    for (const nlohmann::json &module : artifact["modules"]) {
+        if (module.value("role", "") != role)
+            continue;
+        const std::string blob = module["blob"].get<std::string>();
+        std::ifstream shaderInput(manifestPath.parent_path() /
+                                      manifest["blobs"][blob]["location"]["uri"].get<std::string>(),
+                                  std::ios::binary);
+        return {std::istreambuf_iterator<char>(shaderInput), std::istreambuf_iterator<char>()};
+    }
+    return {};
+}
+
+// The fragment's image and sampler own bindings 0 and 1, so the spilled `model` block must be moved to binding 2.
+TEST(RuntimeExternalGl, PointsSpilledUniformBlocksAtTheirPlannedBinding) {
+    const std::string vertex = stageShaderSource(VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE, "vertex");
+    EXPECT_NE(vertex.find("uniform vernon_uniform_binding_2"), std::string::npos) << vertex;
+    linkedUniformBlocks = {"vernon_uniform_binding_2"};
+    uniformBlockBindings.clear();
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        EXPECT_EQ(uniformBlockBindings, (std::unordered_map<GlUint, GlUint>{{0u, 2u}}));
+    }
+    linkedUniformBlocks.clear();
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, RejectsLinkedUniformBlocksWithoutAPlannedBinding) {
+    linkedUniformBlocks = {"vernon_uniform_binding_2", "vernon_uniform_binding_9"};
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        EXPECT_FALSE(pipeline);
+    }
+    linkedUniformBlocks.clear();
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif

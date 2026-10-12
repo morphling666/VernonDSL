@@ -7,6 +7,7 @@ from typing import Protocol
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
+from .texture_dimensions import STORAGE_TEXTURE_DIMENSIONS, TEXTURE_DIMENSIONS, dimension_list
 
 
 class TypeContext(Protocol):
@@ -110,18 +111,21 @@ class TypeParser:
                     "Texture requires dimension and sample type, or dimension, storage format, and access",
                 )
             dimension = self._string_or_name(items[0], "texture dimension")
-            if dimension not in {"2d", "3d", "cube"}:
+            if dimension not in TEXTURE_DIMENSIONS:
                 raise self.context.error(
                     items[0],
-                    "texture dimension must be one of '2d', '3d', or 'cube'",
+                    f"texture dimension must be one of {dimension_list(TEXTURE_DIMENSIONS)}",
                 )
             if len(items) == 2:
                 element = self.parse_type(items[1])
                 if element.kind != "scalar" or element.name not in {"f32", "i32", "u32"}:
                     raise self.context.error(items[1], "sampled Texture type must be f32, i32, or u32")
                 return ConcreteType("texture", "Texture", (dimension, element, "unknown", "sampled"))
-            if dimension == "cube":
-                raise self.context.error(items[0], "storage Texture dimension must be '2d' or '3d'")
+            if dimension not in STORAGE_TEXTURE_DIMENSIONS:
+                raise self.context.error(
+                    items[0],
+                    f"storage Texture dimension must be one of {dimension_list(STORAGE_TEXTURE_DIMENSIONS)}",
+                )
             format_name = self._string_or_name(items[1], "storage texture format")
             if format_name not in {
                 "r8_unorm",

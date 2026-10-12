@@ -7,6 +7,8 @@
 #if defined(VERNON_HAS_DIRECTX12_RHI)
 
 #include "rhi/directx12_backend.h"
+#include "rhi/image_descriptor_validation.h"
+#include "runtime/interface_names.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +24,15 @@
 
 namespace vernon::runtime::rhi_adapter {
 namespace {
+
+// D3D12 reserves register spaces 0xFFFFFFF0 and above.
+constexpr uint32_t kDescriptorSetLimit = 0xFFFFFFF0U - ::vernon::runtime::kDirectXDescriptorSetRegisterSpaceOffset;
+
+D3D12_DESCRIPTOR_RANGE descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE type,
+                                       const VernonRuntimeProviderBindingLayoutEntry &entry) {
+    return {type, 1, entry.binding, entry.set + ::vernon::runtime::kDirectXDescriptorSetRegisterSpaceOffset,
+            D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+}
 
 struct DirectX12DepthStencilSnapshot {
     uint32_t depthEnable{};
@@ -155,6 +166,106 @@ void restoreBufferState(void *context, uint64_t state) {
 
 void restoreImageState(void *context, uint64_t state) {
     static_cast<rhi::directx12::Image *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
+}
+
+struct ImageSubresourceRange {
+    uint32_t firstMip{};
+    uint32_t mipCount{};
+    uint32_t firstLayer{};
+    uint32_t layerCount{};
+};
+
+// Raw images expose every mip and layer; image views carry their own dimension and subresource range.
+ImageSubresourceRange imageSubresourceRange(const rhi::directx12::Image &image) {
+    if (image.view.struct_size >= sizeof(VernonRhiImageViewDescriptor))
+        return {image.view.base_mip_level, image.view.mip_level_count, image.view.base_array_layer,
+                image.view.array_layer_count};
+    const D3D12_RESOURCE_DESC native = image.resource->GetDesc();
+    return {0, native.MipLevels, 0, image.dimension == VERNON_RHI_IMAGE_3D ? 1u : native.DepthOrArraySize};
+}
+
+// TEXTURE2D and TEXTURECUBE views cannot start past layer 0, so such selections use the one-element array forms,
+// which shaders declaring the non-array resource type read identically.
+D3D12_SHADER_RESOURCE_VIEW_DESC sampledImageView(const rhi::directx12::Image &image) {
+    const ImageSubresourceRange range = imageSubresourceRange(image);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = image.format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT : image.format;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    const bool firstLayerSelected = range.firstLayer != 0;
+    switch (image.dimension) {
+    case VERNON_RHI_IMAGE_3D:
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Texture3D = {range.firstMip, range.mipCount, 0.0f};
+        return view;
+    case VERNON_RHI_IMAGE_CUBE:
+    case VERNON_RHI_IMAGE_CUBE_ARRAY:
+        if (image.dimension == VERNON_RHI_IMAGE_CUBE && !firstLayerSelected) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            view.TextureCube = {range.firstMip, range.mipCount, 0.0f};
+            return view;
+        }
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        view.TextureCubeArray = {range.firstMip, range.mipCount, range.firstLayer,
+                                 range.layerCount / vernon::rhi::cubeFaceCount, 0.0f};
+        return view;
+    case VERNON_RHI_IMAGE_2D:
+        if (!firstLayerSelected) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D = {range.firstMip, range.mipCount, 0, 0.0f};
+            return view;
+        }
+        [[fallthrough]];
+    case VERNON_RHI_IMAGE_2D_ARRAY:
+        break;
+    }
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray = {range.firstMip, range.mipCount, range.firstLayer, range.layerCount, 0, 0.0f};
+    return view;
+}
+
+D3D12_UNORDERED_ACCESS_VIEW_DESC storageImageView(const rhi::directx12::Image &image) {
+    const ImageSubresourceRange range = imageSubresourceRange(image);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = image.format;
+    if (image.dimension == VERNON_RHI_IMAGE_3D) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        view.Texture3D = {range.firstMip, 0, UINT_MAX};
+    } else if (image.dimension == VERNON_RHI_IMAGE_2D && range.firstLayer == 0) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        view.Texture2D = {range.firstMip, 0};
+    } else {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount, 0};
+    }
+    return view;
+}
+
+D3D12_RENDER_TARGET_VIEW_DESC renderTargetView(const rhi::directx12::Image &image) {
+    const ImageSubresourceRange range = imageSubresourceRange(image);
+    D3D12_RENDER_TARGET_VIEW_DESC view{};
+    view.Format = image.format;
+    if (image.dimension == VERNON_RHI_IMAGE_2D && range.firstLayer == 0) {
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        view.Texture2D = {range.firstMip, 0};
+    } else {
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount, 0};
+    }
+    return view;
+}
+
+D3D12_DEPTH_STENCIL_VIEW_DESC depthStencilView(const rhi::directx12::Image &image) {
+    const ImageSubresourceRange range = imageSubresourceRange(image);
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.Format = image.format;
+    if (image.dimension == VERNON_RHI_IMAGE_2D && range.firstLayer == 0) {
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        view.Texture2D = {range.firstMip};
+    } else {
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount};
+    }
+    return view;
 }
 
 RhiAdapterResult<void> transition(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -404,21 +515,21 @@ RhiAdapterResult<void> prepareGraphicsPipelineImplResult(VernonRuntimeRhiAdapter
     std::vector<D3D12_DESCRIPTOR_RANGE> samplerRanges;
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
     for (const auto &entry : layout.entries) {
+        if (entry.set >= kDescriptorSetLimit && entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+            entry.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument,
+                {"d3d12_descriptor_set_exceeds_the_register_space_range", entry.set, kDescriptorSetLimit}})};
         if (entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
-            resourceRanges.push_back(
-                {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            resourceRanges.push_back(descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, entry));
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER)
-            resourceRanges.push_back(
-                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            resourceRanges.push_back(descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, entry));
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
-            resourceRanges.push_back(
-                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            resourceRanges.push_back(descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, entry));
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)
-            resourceRanges.push_back(
-                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            resourceRanges.push_back(descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, entry));
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)
-            samplerRanges.push_back({D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, entry.binding, entry.set,
-                                     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            samplerRanges.push_back(descriptorRange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, entry));
     }
     for (const VernonRuntimeProviderVertexAttribute &attribute : layout.vertexAttributes) {
         const auto binding = std::find_if(layout.entries.begin(), layout.entries.end(), [&](const auto &entry) {
@@ -461,21 +572,19 @@ RhiAdapterResult<void> prepareGraphicsPipelineImplResult(VernonRuntimeRhiAdapter
                 entry.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM && entry.stage_mask == stage)
                 inlineEntries.push_back(&entry);
         std::sort(inlineEntries.begin(), inlineEntries.end(), [](const auto *left, const auto *right) {
-            // HLSL constant-buffer members follow entry argument order, while provider slots are name-sorted.
+            // Push-constant block members follow entry argument order, while provider slots are name-sorted.
             return left->argument_index < right->argument_index;
         });
         for (const auto *entry : inlineEntries) {
-            if (!entry->element_size || entry->element_size % sizeof(uint32_t) != 0)
+            const uint32_t alignment = entry->element_alignment;
+            if (!entry->element_size || entry->element_size % sizeof(uint32_t) != 0 || alignment < sizeof(uint32_t) ||
+                (alignment & (alignment - 1)) != 0)
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"d3d12_inline_uniform_size_is_invalid", 0, 0}})};
-            const bool registerAggregate = entry->element_size > 16;
-            if (registerAggregate || valueSize % 16 + entry->element_size > 16) {
-                if (valueSize > UINT32_MAX - 15)
-                    return RhiAdapterResult<void>{
-                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                          {"d3d12_root_constant_layout_size_overflow", 0, 0}})};
-                valueSize = (valueSize + 15) & ~uint32_t{15};
-            }
+                    vernon::ProviderErrorCode::InvalidArgument, {"d3d12_inline_uniform_layout_is_invalid", 0, 0}})};
+            if (valueSize > UINT32_MAX - (alignment - 1))
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument, {"d3d12_root_constant_layout_size_overflow", 0, 0}})};
+            valueSize = (valueSize + alignment - 1) & ~(alignment - 1);
             rootBlock.members.push_back({entry->slot, valueSize / sizeof(uint32_t), entry->element_size});
             if (entry->element_size > UINT32_MAX - valueSize)
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -485,8 +594,8 @@ RhiAdapterResult<void> prepareGraphicsPipelineImplResult(VernonRuntimeRhiAdapter
         if (valueSize != 0) {
             auto &parameter = parameters.emplace_back();
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-            parameter.Constants.ShaderRegister = 0;
-            parameter.Constants.RegisterSpace = 0;
+            parameter.Constants.ShaderRegister = ::vernon::runtime::kDirectXRootConstantRegister;
+            parameter.Constants.RegisterSpace = ::vernon::runtime::kDirectXRootConstantRegisterSpace;
             parameter.Constants.Num32BitValues = (valueSize + sizeof(uint32_t) - 1) / sizeof(uint32_t);
             parameter.ShaderVisibility = stage == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ? D3D12_SHADER_VISIBILITY_VERTEX
                                                                                        : D3D12_SHADER_VISIBILITY_PIXEL;
@@ -668,10 +777,14 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     try {
         ranges.reserve(layout->entries.size());
         for (const auto &entry : layout->entries) {
-            const D3D12_DESCRIPTOR_RANGE_TYPE rangeType = entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                              ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
-                                                              : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-            ranges.push_back({rangeType, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+            if (entry.set >= kDescriptorSetLimit)
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"d3d12_descriptor_set_exceeds_the_register_space_range", entry.set, kDescriptorSetLimit}})};
+            ranges.push_back(descriptorRange(entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                 ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                                                 : D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                             entry));
         }
     } catch (const std::bad_alloc &) {
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1027,23 +1140,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                         return RhiAdapterResult<void>{vernon::err(
                             vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                   {"d3d12_dispatch_could_not_track_storage_image_state", 0, 0}})};
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                    view.Format = image->format;
-                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
-                    const uint32_t mip = selected ? image->view.base_mip_level : 0;
-                    if (image->dimension == VERNON_RHI_IMAGE_3D) {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-                        view.Texture3D.MipSlice = mip;
-                        view.Texture3D.WSize = UINT_MAX;
-                    } else if (selected && image->view.array_layer_count > 1) {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                        view.Texture2DArray.MipSlice = mip;
-                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
-                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
-                    } else {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                        view.Texture2D.MipSlice = mip;
-                    }
+                    const D3D12_UNORDERED_ACCESS_VIEW_DESC view = storageImageView(*image);
                     device.device->CreateUnorderedAccessView(image->resource, nullptr, &view, cpu);
                 } else {
                     return RhiAdapterResult<void>{vernon::err(
@@ -1207,9 +1304,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                 return RhiAdapterResult<void>{
                     vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                       {"d3d12_draw_could_not_track_color_attachment_state", 0, 0}})};
-            D3D12_RENDER_TARGET_VIEW_DESC view{};
-            view.Format = image->format;
-            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            const D3D12_RENDER_TARGET_VIEW_DESC view = renderTargetView(*image);
             renderTargets[index] = rtv;
             device.device->CreateRenderTargetView(image->resource, &view, rtv);
             rtv.ptr += rtvIncrement;
@@ -1243,9 +1338,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                 return RhiAdapterResult<void>{
                     vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                       {"d3d12_draw_could_not_track_depth_attachment_state", 0, 0}})};
-            D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-            view.Format = image->format;
-            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            const D3D12_DEPTH_STENCIL_VIEW_DESC view = depthStencilView(*image);
             device.device->CreateDepthStencilView(image->resource, &view, dsv);
         }
         std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorTargets{};
@@ -1389,23 +1482,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                         vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                               {"d3d12_dispatch_could_not_track_storage_image_state", 0, 0}})};
                 if (!reuseDescriptors) {
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                    view.Format = image->format;
-                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
-                    const uint32_t mip = selected ? image->view.base_mip_level : 0;
-                    if (image->dimension == VERNON_RHI_IMAGE_3D) {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-                        view.Texture3D.MipSlice = mip;
-                        view.Texture3D.WSize = UINT_MAX;
-                    } else if (selected && image->view.array_layer_count > 1) {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                        view.Texture2DArray.MipSlice = mip;
-                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
-                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
-                    } else {
-                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                        view.Texture2D.MipSlice = mip;
-                    }
+                    const D3D12_UNORDERED_ACCESS_VIEW_DESC view = storageImageView(*image);
                     device.device->CreateUnorderedAccessView(image->resource, nullptr, &view, resourceCpu);
                     resourceCpu.ptr += resourceIncrement;
                 }
@@ -1416,32 +1493,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                         vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                           {"d3d12_draw_could_not_track_sampled_image_state", 0, 0}})};
                 if (!reuseDescriptors) {
-                    const D3D12_RESOURCE_DESC native = image->resource->GetDesc();
-                    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-                    view.Format = image->format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT : image->format;
-                    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
-                    const uint32_t firstMip = selected ? image->view.base_mip_level : 0;
-                    const uint32_t mipCount = selected ? image->view.mip_level_count : native.MipLevels;
-                    if (image->dimension == VERNON_RHI_IMAGE_CUBE) {
-                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                        view.TextureCube.MostDetailedMip = firstMip;
-                        view.TextureCube.MipLevels = mipCount;
-                    } else if (image->dimension == VERNON_RHI_IMAGE_3D) {
-                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-                        view.Texture3D.MostDetailedMip = firstMip;
-                        view.Texture3D.MipLevels = mipCount;
-                    } else if (selected && image->view.array_layer_count > 1) {
-                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                        view.Texture2DArray.MostDetailedMip = firstMip;
-                        view.Texture2DArray.MipLevels = mipCount;
-                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
-                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
-                    } else {
-                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                        view.Texture2D.MostDetailedMip = firstMip;
-                        view.Texture2D.MipLevels = mipCount;
-                    }
+                    const D3D12_SHADER_RESOURCE_VIEW_DESC view = sampledImageView(*image);
                     device.device->CreateShaderResourceView(image->resource, &view, resourceCpu);
                     resourceCpu.ptr += resourceIncrement;
                 }

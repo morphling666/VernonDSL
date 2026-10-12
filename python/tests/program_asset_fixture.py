@@ -22,6 +22,15 @@ def matrix_vertex(
 
 
 @vd.vertex
+def spilled_uniform_vertex(
+    projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    view: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    model: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.matmul(projection, vd.matmul(view, vd.matmul(model, vd.Vector([0.0, 0.0, 0.0, 1.0]))))
+
+
+@vd.vertex
 def signed_uniform_vertex(
     budget: Annotated[vd.i32, vd.uniform()],
 ) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
@@ -167,6 +176,16 @@ explicit_sampler_asset = vd.program_asset(
     id="pipelines/explicit_sampler",
     program=vd.pipeline(
         resource_only_vertex,
+        sampled_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=({},),
+)
+
+spilled_uniform_asset = vd.program_asset(
+    id="pipelines/spilled_uniform",
+    program=vd.pipeline(
+        spilled_uniform_vertex,
         sampled_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),

@@ -90,10 +90,22 @@ LogicalResult mlir::vernon::TensorType::verify(function_ref<InFlightDiagnostic()
     return success();
 }
 
+bool TextureType::isArrayed() const { return getDimension() == "2d_array" || getDimension() == "cube_array"; }
+
+bool TextureType::isCube() const { return getDimension() == "cube" || getDimension() == "cube_array"; }
+
+int64_t TextureType::sampleCoordinateWidth() const {
+    return (getDimension() == "2d" ? 2 : getDimension() == "cube_array" ? 4 : 3);
+}
+
+int64_t TextureType::storageCoordinateWidth() const { return getDimension() == "2d" ? 2 : 3; }
+
+int64_t TextureType::sizeWidth() const { return getDimension() == "3d" || isArrayed() ? 3 : 2; }
+
 LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, StringRef dimension, Type elementType,
                                   StringRef format, StringRef access) {
-    if (dimension != "2d" && dimension != "3d" && dimension != "cube")
-        return emitError() << "Texture dimension must be 2d, 3d, or cube";
+    if (!llvm::is_contained(ArrayRef<StringRef>{"2d", "3d", "cube", "2d_array", "cube_array"}, dimension))
+        return emitError() << "Texture dimension must be 2d, 3d, cube, 2d_array, or cube_array";
     if (!elementType.isF32() && !elementType.isInteger(32))
         return emitError() << "Texture shader element type must be f32, i32, or u32";
     if (access == "sampled" || access == "attachment") {
@@ -105,8 +117,8 @@ LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, 
     }
     if (access != "read" && access != "write" && access != "read_write")
         return emitError() << "Texture access must be sampled, attachment, read, write, or read_write";
-    if (dimension == "cube")
-        return emitError() << "storage Texture dimension must be 2d or 3d";
+    if (dimension == "cube" || dimension == "cube_array")
+        return emitError() << "storage Texture dimension must be 2d, 3d, or 2d_array";
     if (!elementType.isF32())
         return emitError() << "current storage Texture formats require f32 shader elements";
     if (!llvm::is_contained(ArrayRef<StringRef>{"r8_unorm", "r16_float", "r32_float", "rg8_unorm", "rgba8_unorm",

@@ -423,12 +423,14 @@ compile failure with the stated stable reason, never a runtime skip.
 
 ### `LANG-RESOURCE-002` — Texture type regions
 
-- Valid: sampled `Texture[2d|3d|cube, f32|i32|u32]`; storage
-  `Texture[2d|3d, format, read|write|read_write]` with `r8_unorm`,
-  `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`, `rgba16_float`, or
-  `rgba32_float`.
-- Invalid: another dimension/sample type/format/access, cube storage Texture,
-  or malformed type arity.
+- Valid: sampled `Texture[2d|3d|cube|2d_array|cube_array, f32|i32|u32]`;
+  storage `Texture[2d|3d|2d_array, format, read|write|read_write]` with
+  `r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
+  `rgba16_float`, or `rgba32_float`. Arrayed coordinates append the layer as
+  their last component (cube-array layers count cubes) and arrayed
+  `texture_size` appends the layer count.
+- Invalid: another dimension/sample type/format/access, cube or cube-array
+  storage Texture, or malformed type arity.
 - Capabilities: compile/runtime `texture_sampler` for sampled and
   `storage_texture` for storage.
 - Layers: `F`, `I`, `C`, `A`, `R`.

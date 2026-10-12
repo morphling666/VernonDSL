@@ -362,6 +362,13 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             if (spatialRank == 0)
                 spatialRank = *dimension == "3d" ? 3 : 2;
             const bool borrowed = index.argumentSlots.count(root);
+            // Program values carry no layer count, so layered images can only be borrowed; for those the Storage
+            // layer count is the minimum a bound view must expose.
+            const bool cube = *dimension == "cube" || *dimension == "cube_array";
+            if (!borrowed && *dimension != "2d" && *dimension != "3d") {
+                error = "owned Program textures must be 2d or 3d; bind layered textures as Program arguments";
+                return false;
+            }
             llvm::json::Array extent;
             llvm::json::Array dynamicExtents;
             bool hasDynamic = false;
@@ -422,7 +429,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                                             {"format", semantic->parameter},
                                             {"sample_count", int64_t{1}},
                                             {"mip_levels", int64_t{1}},
-                                            {"array_layers", int64_t{1}},
+                                            {"array_layers", int64_t{cube ? 6 : 1}},
                                             {"aspects", llvm::json::Array{depthAttachment ? "depth" : "color"}},
                                             {"usage", std::move(usage)}};
             if (!borrowed)

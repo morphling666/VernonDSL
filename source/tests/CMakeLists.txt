@@ -149,6 +149,11 @@ if(TARGET VernonRuntime)
         target_compile_options(VernonRhiLifecycleCoreTests PRIVATE -fno-exceptions)
     endif()
     vernon_discover_gtests(VernonRhiLifecycleCoreTests)
+    add_executable(VernonRhiImageShapeTests rhi/image_shape_rules_test.cpp)
+    target_include_directories(VernonRhiImageShapeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
+                                                                "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonRhiImageShapeTests PRIVATE GTest::gtest_main)
+    vernon_discover_gtests(VernonRhiImageShapeTests)
     add_executable(VernonRhiDeferredActionTests rhi/rhi_deferred_action_test.cpp)
     target_include_directories(VernonRhiDeferredActionTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
                                                                     "${VERNON_REPOSITORY_ROOT}/source/lib")
@@ -1043,6 +1048,12 @@ if(TARGET VernonRuntime)
             opengl_explicit_sampler_bundle
             opengl_explicit_sampler_manifest)
         vernon_add_program_asset_test_bundle(
+            opengl-spilled-uniform
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:spilled_uniform_asset"
+            opengl_spilled_uniform_bundle
+            opengl_spilled_uniform_manifest)
+        vernon_add_program_asset_test_bundle(
             opengl-indexed-vertex
             opengl
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:indexed_asset"
@@ -1080,6 +1091,7 @@ if(TARGET VernonRuntime)
                     VERNON_OPENGL_SIGNED_UNIFORM_BUNDLE="${opengl_signed_uniform_manifest}"
                     VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE="${opengl_unsigned_uniform_manifest}"
                     VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE="${opengl_explicit_sampler_manifest}"
+                    VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE="${opengl_spilled_uniform_manifest}"
                     VERNON_OPENGL_INDEXED_VERTEX_BUNDLE="${opengl_indexed_vertex_manifest}"
                     VERNON_OPENGL_I32_VERTEX_BUNDLE="${opengl_i32_vertex_manifest}"
                     VERNON_OPENGL_U32_VERTEX_BUNDLE="${opengl_u32_vertex_manifest}"
@@ -1093,6 +1105,7 @@ if(TARGET VernonRuntime)
             vernon-opengl-signed-uniform-test-bundle
             vernon-opengl-unsigned-uniform-test-bundle
             vernon-opengl-explicit-sampler-test-bundle
+            vernon-opengl-spilled-uniform-test-bundle
             vernon-opengl-indexed-vertex-test-bundle
             vernon-opengl-i32-vertex-test-bundle
             vernon-opengl-u32-vertex-test-bundle

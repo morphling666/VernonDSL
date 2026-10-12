@@ -147,7 +147,7 @@ LogicalResult IntrinsicOp::verify() {
             return emitOpError() << getName() << " is incompatible with " << texture.getAccess() << " access";
         if (getNumOperands() != (load ? 2u : 3u) || getNumResults() != (load ? 1u : 0u))
             return emitOpError() << getName() << " has an invalid operand or result count";
-        const int64_t rank = texture.getDimension() == "3d" ? 3 : 2;
+        const int64_t rank = texture.storageCoordinateWidth();
         auto coordinates = shapedWidthAndElement(getOperand(1).getType());
         if (!coordinates || coordinates->first != rank || !coordinates->second.isSignlessInteger(32))
             return emitOpError() << getName() << " coordinates must be a " << rank << "-component i32 vector";
@@ -172,7 +172,7 @@ LogicalResult IntrinsicOp::verify() {
             return emitOpError("texture_size requires a texture and an optional integer lod");
         if (getNumOperands() == 2 && !getOperand(1).getType().isSignlessInteger(32))
             return emitOpError("texture_size lod must be a 32-bit integer scalar");
-        const int64_t expectedResultWidth = texture.getDimension() == "3d" ? 3 : 2;
+        const int64_t expectedResultWidth = texture.sizeWidth();
         auto result = shapedWidthAndElement(getResult().getType());
         if (!result || result->first != expectedResultWidth || !result->second.isSignlessInteger(32))
             return emitOpError() << "texture_size result must be a statically sized rank-one " << expectedResultWidth
@@ -187,7 +187,7 @@ LogicalResult IntrinsicOp::verify() {
         return emitOpError("texture_sample operand #1 must be a Vernon sampler");
 
     std::optional<std::pair<int64_t, Type>> coordinates = shapedWidthAndElement(getOperand(2).getType());
-    const int64_t expectedCoordinateWidth = texture.getDimension() == "2d" ? 2 : 3;
+    const int64_t expectedCoordinateWidth = texture.sampleCoordinateWidth();
     if (!coordinates || coordinates->first != expectedCoordinateWidth ||
         coordinates->second != texture.getElementType() || !isa<FloatType>(coordinates->second))
         return emitOpError() << "texture_sample operand #2 must be a statically sized rank-one "

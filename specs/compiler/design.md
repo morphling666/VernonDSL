@@ -116,6 +116,14 @@ Stage outputs and varyings use the same declaration-order location planning;
 the removed `location()` and `instance()` annotations have no compatibility
 aliases.
 
+The vertex `position` output is always decorated `Invariant` (GLSL
+`invariant gl_Position`). Separately compiled pipelines that share a depth
+buffer, such as a depth prepass followed by an `EQUAL` depth test, need
+bit-identical positions from the same expression; without the decoration a
+driver may contract each stage differently. An opt-in annotation would make
+the failure a silent z-fight in whichever pipeline forgot it, and the cost of
+forbidding contraction on one output per vertex is negligible.
+
 Vulkan compute uses the same shape-based small value-Tensor normalization
 before MLIR GPU-to-SPIR-V conversion. SPIR-V ABI materialization assigns
 storage-buffer descriptors to both Tensor resources and scalar kernel inputs.
@@ -158,7 +166,11 @@ through the public facade, preserving canonical pipeline bytes while keeping fil
 artifact policy independent of descriptor parsing and native compilation.
 Cooking (`_program_assets.cooking`) evaluates the declaring module through
 `_program_assets.source`, reads the typed `ProgramAssetDeclaration`, captures
-it (`_program_assets.capture`), and compiles the captured variants. The static
+it (`_program_assets.capture`), and compiles the captured variants. A caller
+may instead pass an evaluated `ProgramAssetDeclaration`: an engine cooker
+builds declarations from its own asset data (for example the variant set a
+material library needs), and capture does not depend on where the declaration
+was written. The static
 Program Asset lint lives in `_program_assets.parsing`. It reads the source AST
 and resolves names through the source module graph without importing or
 executing the declaring module, so its diagnostics and variant
@@ -526,7 +538,13 @@ translation. AMD/ROCDL remains future work rather than a registered target.
 
 Scalar-element, positive-shape static Tensor Values use target-native SPIR-V
 scalars, 2-4 component vectors, and 2-4 by 2-4 column-major matrices where
-legal. Every other shape is represented by shape-preserving recursive arrays.
+legal. Every other shape is represented by one row-major array of all its
+elements, never by arrays of arrays: GLSL below 4.30 and ESSL below 3.10 have
+none, and `GL_ARB_arrays_of_arrays` is absent on macOS OpenGL 4.1. SPIRV-Cross
+`flatten_multidimensional_arrays` was rejected because it cannot flatten nested
+array constructors or access chains that stop at an inner array. The flat
+array keeps every std140 offset, since each std140 dimension stride is the
+next stride times its extent; lowering rejects any layout where that fails.
 Those arrays use the conservative 16-byte array alignment accepted by Vulkan
 uniform buffers; compute inline-value buffers use the same reflected padding
 instead of defining a second host layout. Reflection records dtype, logical
@@ -537,7 +555,9 @@ ABI description and does not alter Tensor semantic identity.
 Graphics lowering supports constants, construction, splats, extraction, and
 elementwise arithmetic over that representation. Each stage has a conservative
 128-byte inline-uniform budget. Unbound values that exceed that budget, use
-recursive arrays, or are Struct, Tuple, or Tensor aggregates receive
+arrays (any Tensor other than a scalar, a 1-4 element vector, or a 2-4 by 2-4
+f32 matrix, which are the only shapes OpenGL can upload as native uniforms), or
+are Struct, Tuple, or Tensor aggregates receive
 deterministic internal set-zero bindings and lower as uniform blocks; native
 scalar and vector values within the budget remain push constants or
 target-native inline uniforms. Aggregates always spill because OpenGL, OpenGL
@@ -673,12 +693,18 @@ may address the block member as `model._m0`, which Runtime derives from the same
 reflection. Regression coverage checks both native-inline names and spilled
 block names while retaining Vulkan packed push-constant coverage.
 
-The MLIR SPIR-V serializer decorates the pointee struct of every `Uniform`,
-`PushConstant`, and `StorageBuffer` pointer as `Block`, including a nested
-struct member. Loading a nested struct member whole makes SPIRV-Cross treat
-the inner type as a block and omit its GLSL declaration, so input loads from
-these storage classes access-chain and load each scalar, vector, or matrix
-leaf and reassemble the aggregate.
+A Struct or Tuple Value crossing a `Uniform` block, the push-constant block, or
+an aggregate Tensor storage-buffer element is emitted as its scalar leaves, one
+top-level member each, at the planned physical offsets. The entry prologue
+loads every scalar and rebuilds the logical Value with the same row-major leaf
+order as `flattenComposite`. A nested SPIR-V struct cannot carry the canonical
+layout portably: canonical Struct placement is dense (a `mat4` may follow an
+`f32` at offset 4), which neither std140, std430, nor HLSL `packoffset` can
+express for a nested member. A scalar at any 4-byte-aligned offset is valid in
+every target, so the physical layout stays the one Runtime already packs. The
+MLIR SPIR-V serializer also decorates every struct reachable from these
+pointers as `Block`, which makes SPIRV-Cross omit nested GLSL declarations, so
+scalarizing removes that failure mode as well.
 
 The GLSL identifier of a non-varying interface is the source name with every
 character outside `[A-Za-z0-9_]` replaced by `_` and a leading `_` added when

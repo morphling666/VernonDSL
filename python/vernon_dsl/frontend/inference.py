@@ -44,6 +44,7 @@ from .model import (
     is_abi_stable_value,
 )
 from .tensor_shapes import matmul_shape
+from .texture_dimensions import SAMPLE_COORDINATE_RANK, SIZE_RANK, STORAGE_COORDINATE_RANK
 from .type_solver import (
     InferenceType,
     can_convert,
@@ -1476,7 +1477,7 @@ class _Inference:
             if texture.kind != "texture" or texture.arguments[3] == "sampled":
                 raise self.error(node.args[0], f"{name} requires a storage Texture")
             dimension, element, _, access = texture.arguments
-            rank = 3 if dimension == "3d" else 2
+            rank = STORAGE_COORDINATE_RANK[str(dimension)]
             coordinates = arguments[1]
             coordinate_element = (
                 coordinates.arguments[0]
@@ -1521,7 +1522,7 @@ class _Inference:
             element = texture.arguments[1]
             assert isinstance(element, ConcreteType)
             dimension = texture.arguments[0]
-            rank = {"2d": 2, "3d": 3, "cube": 3}.get(str(dimension))
+            rank = SAMPLE_COORDINATE_RANK.get(str(dimension))
             coordinates = arguments[coordinate_index]
             if rank is None or coordinates != ConcreteType("tensor", "Tensor", (element, rank)):
                 raise self.error(
@@ -1533,8 +1534,7 @@ class _Inference:
         if name == "texture_size":
             if not arguments or not isinstance(arguments[0], ConcreteType) or arguments[0].kind != "texture":
                 raise self.error(node, "texture_size requires a texture and optional lod")
-            dimension = arguments[0].arguments[0]
-            rank = 3 if dimension == "3d" else 2
+            rank = SIZE_RANK[str(arguments[0].arguments[0])]
             return ConcreteType("tensor", "Tensor", (_scalar("u32"), rank))
         if name in {
             "sin",

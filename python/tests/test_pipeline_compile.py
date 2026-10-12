@@ -135,7 +135,6 @@ def _physical_layouts(size: int, alignment: int, byte_strides: list[int]) -> dic
             "vulkan_std430_storage_buffer",
             "vulkan_push_constant",
             "opengl_native_uniform",
-            "directx_constant_buffer",
             "metal_constant_buffer",
         )
     }

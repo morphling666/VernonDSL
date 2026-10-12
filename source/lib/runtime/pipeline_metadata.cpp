@@ -181,6 +181,7 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
     case VERNON_RUNTIME_CUDA:
         return "cuda_kernel_parameter";
     case VERNON_RUNTIME_VULKAN:
+    case VERNON_RUNTIME_DIRECTX12:
         if (transport == "push_constant")
             return "vulkan_push_constant";
         if (transport == "uniform_buffer")
@@ -192,10 +193,6 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
             return "opengl_native_uniform";
         if (transport == "uniform_buffer")
             return "vulkan_std140_uniform_buffer";
-        return "vulkan_std430_storage_buffer";
-    case VERNON_RUNTIME_DIRECTX12:
-        if (transport == "uniform_buffer" || transport == "push_constant")
-            return "directx_constant_buffer";
         return "vulkan_std430_storage_buffer";
     case VERNON_RUNTIME_METAL:
         return "metal_constant_buffer";

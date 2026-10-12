@@ -18,10 +18,13 @@ typedef enum VernonTextureFormat {
     VERNON_TEXTURE_D32_FLOAT_S8_UINT = 11
 } VernonTextureFormat;
 
+/* Values and layer rules match VernonRhiImageDimension: a cube-array layer is cube * 6 + face. */
 typedef enum VernonTextureDimension {
     VERNON_TEXTURE_2D = 0,
     VERNON_TEXTURE_3D = 1,
-    VERNON_TEXTURE_CUBE = 2
+    VERNON_TEXTURE_CUBE = 2,
+    VERNON_TEXTURE_2D_ARRAY = 3,
+    VERNON_TEXTURE_CUBE_ARRAY = 4
 } VernonTextureDimension;
 
 typedef enum VernonImageUsageBits {

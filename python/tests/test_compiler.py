@@ -63,11 +63,15 @@ def resources(
     @covers_case("LANG-RESOURCE-002/sampled-2d", layers="FI")
     @covers_case("LANG-RESOURCE-002/sampled-3d", layers="FI")
     @covers_case("LANG-RESOURCE-002/sampled-cube", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-2d_array", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-cube_array", layers="FI")
     def test_texture_dimensions_and_coordinate_ranks(self) -> None:
         cases = (
             case_by_id("LANG-RESOURCE-002/sampled-2d"),
             case_by_id("LANG-RESOURCE-002/sampled-3d"),
             case_by_id("LANG-RESOURCE-002/sampled-cube"),
+            case_by_id("LANG-RESOURCE-002/sampled-2d_array"),
+            case_by_id("LANG-RESOURCE-002/sampled-cube_array"),
         )
         for case in cases:
             output = compile_source(case.source, f"{case.name}.py")
@@ -78,21 +82,38 @@ def resources(
 
     @covers_case("LANG-RESOURCE-002/sampled-dimension", layers="F")
     @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-array-coordinate-rank", layers="F")
     def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
         assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/sampled-dimension"))
         assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-array-coordinate-rank"))
 
-    @covers_case("LANG-TEXTURE-STORAGE/three-dimensional-store", layers="FI")
-    @covers_case("LANG-RESOURCE-002/cube-storage", layers="F")
-    def test_storage_texture_uses_unified_texture_annotation(self) -> None:
-        case = case_by_id("LANG-TEXTURE-STORAGE/three-dimensional-store")
+    @covers_case("LANG-TEXTURE-SIZE/array-layer-count", layers="FI")
+    def test_array_texture_size_appends_layer_count(self) -> None:
+        case = case_by_id("LANG-TEXTURE-SIZE/array-layer-count")
         output = compile_source(case.source, f"{case.name}.py")
         assert_verified_ir(self, output, case)
-        assert isinstance(case.expected, str)
-        self.assertIn(case.expected, output)
-        self.assertIn('name = "texture_store"', output)
+        self.assertEqual(output.count('name = "texture_size"'), 2)
+        self.assertIn('(!vernon.texture<"cube_array", f32, "unknown", "sampled">, i32) -> tensor<3xi32>', output)
+
+    @covers_case("LANG-TEXTURE-STORAGE/three-dimensional-store", layers="FI")
+    @covers_case("LANG-TEXTURE-STORAGE/array-layer-store", layers="FI")
+    @covers_case("LANG-RESOURCE-002/cube-storage", layers="F")
+    @covers_case("LANG-RESOURCE-002/cube-array-storage", layers="F")
+    def test_storage_texture_uses_unified_texture_annotation(self) -> None:
+        cases = (
+            case_by_id("LANG-TEXTURE-STORAGE/three-dimensional-store"),
+            case_by_id("LANG-TEXTURE-STORAGE/array-layer-store"),
+        )
+        for case in cases:
+            output = compile_source(case.source, f"{case.name}.py")
+            assert_verified_ir(self, output, case)
+            assert isinstance(case.expected, str)
+            self.assertIn(case.expected, output)
+            self.assertIn('name = "texture_store"', output)
 
         assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-storage"))
+        assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-array-storage"))
 
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """

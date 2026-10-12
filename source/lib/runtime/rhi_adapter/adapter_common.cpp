@@ -3,6 +3,7 @@
 #include "adapter_internal.h"
 #include "adapter_test_hooks.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/provider_image_description.h"
 
 #include <cstdio>
 #include <new>
@@ -360,9 +361,9 @@ RhiAdapterResult<void> withDescriptorLease(VernonRuntimeRhiAdapter &adapter, ver
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> describeRhiImage(VernonRuntimeRhiAdapter &adapter,
-                                        VernonRuntimeProviderResourceReference resource,
-                                        VernonRhiImageDescriptor &descriptor) noexcept {
+RhiAdapterResult<void> describeRhiImageBinding(VernonRuntimeRhiAdapter &adapter,
+                                               VernonRuntimeProviderResourceReference resource,
+                                               RhiImageBinding &binding) noexcept {
     auto kindResult = resourceKind(adapter, resource);
     if (!kindResult)
         return RhiAdapterResult<void>{vernon::err(std::move(kindResult).error())};
@@ -371,10 +372,12 @@ RhiAdapterResult<void> describeRhiImage(VernonRuntimeRhiAdapter &adapter,
         return withDescriptorLease(
             adapter, kind, resource.resource.value,
             [&](vernon::rhi::RetainedRhiResourceLease &lease) noexcept -> RhiAdapterResult<void> {
+                VernonRhiImageDescriptor descriptor{};
                 auto described =
                     vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor, lease);
                 if (!described)
                     return RhiAdapterResult<void>{vernon::err(providerError(std::move(described).error()))};
+                binding = {descriptor.dimension, descriptor.format};
                 return RhiAdapterResult<void>{vernon::ok()};
             });
     }
@@ -385,11 +388,13 @@ RhiAdapterResult<void> describeRhiImage(VernonRuntimeRhiAdapter &adapter,
         adapter, kind, resource.resource.value,
         [&](vernon::rhi::RetainedRhiResourceLease &lease) noexcept -> RhiAdapterResult<void> {
             VernonRhiImageViewDescriptor view{};
+            VernonRhiImageDescriptor descriptor{};
             uint64_t parentKey = 0;
             auto described = vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, view,
                                                                     descriptor, parentKey, lease);
             if (!described)
                 return RhiAdapterResult<void>{vernon::err(providerError(std::move(described).error()))};
+            binding = {view.dimension, view.format};
             return RhiAdapterResult<void>{vernon::ok()};
         });
 }
@@ -426,9 +431,7 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
         return RhiAdapterResult<void>{vernon::err(
             vernon::ProviderError{vernon::ProviderErrorCode::Unsupported,
                                   {"describe_provider_image_format", static_cast<uint64_t>(source.format), 0}})};
-    const VernonTextureDimension dimension = source.dimension == VERNON_RHI_IMAGE_3D     ? VERNON_TEXTURE_3D
-                                             : source.dimension == VERNON_RHI_IMAGE_CUBE ? VERNON_TEXTURE_CUBE
-                                                                                         : VERNON_TEXTURE_2D;
+    const auto dimension = static_cast<VernonTextureDimension>(source.dimension);
     uint32_t usage = 0;
     usage |= (source.usage & VERNON_RHI_IMAGE_SAMPLED) ? VERNON_IMAGE_SAMPLED : 0;
     usage |= (source.usage & VERNON_RHI_IMAGE_STORAGE) ? VERNON_IMAGE_STORAGE : 0;
@@ -447,10 +450,8 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
                          source.array_layers,
                          source.sample_count,
                          usage};
-    const VernonTextureDimension viewDimension = !view                                         ? dimension
-                                                 : sourceView.dimension == VERNON_RHI_IMAGE_2D ? VERNON_TEXTURE_2D
-                                                 : sourceView.dimension == VERNON_RHI_IMAGE_3D ? VERNON_TEXTURE_3D
-                                                                                               : VERNON_TEXTURE_CUBE;
+    const VernonTextureDimension viewDimension =
+        view ? static_cast<VernonTextureDimension>(sourceView.dimension) : dimension;
     const auto viewFormat = view ? providerTextureFormat(sourceView.format) : format;
     if (!viewFormat)
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{

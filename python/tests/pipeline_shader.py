@@ -187,6 +187,30 @@ def matrix_vertex(
 
 
 @vd.vertex
+def spilled_matrix_vertex(
+    position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    view: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    model: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.matmul(projection, vd.matmul(view, vd.matmul(model, vd.Vector([position, 0.0, 1.0]))))
+
+
+@vd.struct(shared=True)
+class Placement:
+    scale: vd.f32
+    transform: vd.Matrix[vd.f32, 4, 4]
+
+
+@vd.vertex
+def struct_matrix_vertex(
+    position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    placement: Annotated[Placement, vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.matmul(placement.transform, vd.Vector([position * placement.scale, 0.0, 1.0]))
+
+
+@vd.vertex
 def mat2_vertex(
     position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
     transform: Annotated[vd.Matrix[vd.f32, 2, 2], vd.uniform()],
@@ -234,6 +258,33 @@ def volume_coordinate_fragment(
     sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
 ) -> vd.Vector[vd.f32, 4]:
     return vd.texture_sample(image, sampler, coordinate)
+
+
+@vd.fragment
+def array_layer_fragment(
+    coordinate: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    image: Annotated[vd.Texture["2d_array", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, coordinate)
+
+
+@vd.fragment
+def cube_array_fragment(
+    direction: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
+    image: Annotated[vd.Texture["cube_array", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, direction)
+
+
+@vd.fragment
+def flat_coordinate_fragment(
+    uv: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+    image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, uv)
 
 
 @vd.fragment
@@ -291,6 +342,27 @@ def numpy_tensor_fragment(
     broadcasted = broadcast_left + broadcast_right
     product = vd.matmul(matmul_left, matmul_right)
     return vd.Vector([broadcasted[0, 0, 0], broadcasted[7, 7, 3], product[0, 0, 1], product[7, 7, 0]])
+
+
+@vd.fragment
+def array_uniform_fragment(
+    grid: Annotated[vd.Tensor[vd.f32, (5, 6)], vd.uniform()],
+    ramp: Annotated[vd.Tensor[vd.f32, (8,)], vd.uniform()],
+    scale: Annotated[vd.f32, vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([grid[0, 1] * scale, grid[4, 5], ramp[6], ramp[7]])
+
+
+@vd.fragment
+def mixed_inline_uniform_fragment(
+    bias: Annotated[vd.f32, vd.uniform()],
+    tint: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    basis: Annotated[vd.Matrix[vd.f32, 2, 2], vd.uniform()],
+    gain: Annotated[vd.f32, vd.uniform()],
+    shift: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    mixed = vd.matmul(basis, shift)
+    return vd.Vector([bias + tint[0], tint[2] * gain, mixed[0], mixed[1]])
 
 
 @vd.struct

@@ -323,19 +323,27 @@ def resolved_annotations(
         for assignment in specializations
         if assignment.type != "type" or assignment.type_value is not None
     }
+
+    def bound(specialization: Specialization) -> Any:
+        return values.get(specialization.name, False if specialization.type is dsl_bool else _UNASSIGNED)
+
     namespace = dict(function.__globals__)
     for local_name, value in function.__globals__.items():
         if isinstance(value, Specialization):
-            namespace[local_name] = values.get(value.name, False if value.type is dsl_bool else _UNASSIGNED)
+            namespace[local_name] = bound(value)
     namespace.update(extra_globals or {})
     try:
         annotations = inspect.get_annotations(function, globals=namespace, eval_str=True)
     except (NameError, TypeError) as error:
         raise TypeError(f"cannot resolve runtime annotations: {error}") from None
+    # Without `from __future__ import annotations` a bare `name: SPEC` annotation was evaluated at definition time to
+    # the Specialization itself, so the namespace substitution above never sees it.
     return {
         name: (
             annotation.arguments[1]
             if isinstance(annotation, TypeExpr) and annotation.name == "When" and len(annotation.arguments) == 2
+            else bound(annotation)
+            if isinstance(annotation, Specialization)
             else annotation
         )
         for name, annotation in annotations.items()

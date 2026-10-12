@@ -136,9 +136,8 @@ legal for the selected target. Representative profiles are:
 - `cuda_kernel_parameter`;
 - `vulkan_std430_storage_buffer`;
 - `vulkan_std140_uniform_buffer`;
-- `vulkan_push_constant`;
+- `vulkan_push_constant`, also the DirectX root-constant layout;
 - `opengl_native_uniform`;
-- `directx_constant_buffer`;
 - `metal_constant_buffer`.
 
 Entry metadata uses a separate profile family:

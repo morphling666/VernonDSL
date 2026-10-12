@@ -106,9 +106,14 @@ declared bounds, for example
 `vd.specialization("MATERIAL", vd.type, bound=Surface)`.
 
 The canonical identity reuses the module name the source graph already uses
-for imports, relative to the project root, so manifest keys do not depend on
-the checkout location; a value with no such path has no portable identity and
-is rejected rather than given a machine-local one. The `type` tag is part of
+for imports, relative to the value's own project root, so manifest keys do not
+depend on the checkout location; a value with no such path has no portable
+identity and is rejected rather than given a machine-local one. The root is
+the value's and not the template's because an engine library and the content
+that specializes it are separate projects; the key assignment carries the
+declaring file so the graph can find a module outside the template's project,
+and an identity alone (for example from the command line) resolves only
+inside it. The `type` tag is part of
 the unpublished `PROGRAM_VERSION` 2 contract.
 
 A Struct keeps its declared name across modules (instead of the module prefix

@@ -72,6 +72,15 @@ def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
   );
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` $dimension `,` $elementType `,` $format `,` $access `>`";
+  let extraClassDeclaration = [{
+    // Dimensions are 2d, 3d, cube, 2d_array, and cube_array. As in SPIR-V, arrayed coordinates append the
+    // layer as their last component and arrayed sizes append the layer count; cube-array layers count cubes.
+    bool isArrayed() const;
+    bool isCube() const;
+    int64_t sampleCoordinateWidth() const;
+    int64_t storageCoordinateWidth() const;
+    int64_t sizeWidth() const;
+  }];
 }
 
 def Vernon_SamplerType : TypeDef<Vernon_Dialect, "Sampler"> {

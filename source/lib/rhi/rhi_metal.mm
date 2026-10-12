@@ -565,20 +565,12 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
     auto anchor = lookupMetalDevice(handle);
     if (anchor.isErr())
         return Result<VernonRhiImage, RhiError>{err(std::move(anchor).error())};
-    const bool validCube = descriptor && descriptor->dimension == VERNON_RHI_IMAGE_CUBE &&
-                           descriptor->width == descriptor->height && descriptor->depth == 1 &&
-                           descriptor->array_layers == 6;
     constexpr uint32_t allUsages = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
                                    VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_STORAGE |
                                    VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->width == 0 ||
-        descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
-        descriptor->array_layers == 0 || descriptor->sample_count != 1 ||
-        descriptor->dimension > VERNON_RHI_IMAGE_CUBE || (descriptor->usage & ~allUsages) != 0 ||
-        descriptor->mip_levels > maximumMipLevels(*descriptor) ||
-        (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->depth != 1) ||
-        (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers != 1) ||
-        (descriptor->dimension == VERNON_RHI_IMAGE_CUBE && !validCube))
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !vernon::rhi::validImageShape(*descriptor) ||
+        descriptor->mip_levels == 0 || descriptor->sample_count != 1 || (descriptor->usage & ~allUsages) != 0 ||
+        descriptor->mip_levels > maximumMipLevels(*descriptor))
         return Result<VernonRhiImage, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"create_metal_image", 0, 0}})};
     const bool depthFormat =

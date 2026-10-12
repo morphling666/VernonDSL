@@ -22,10 +22,11 @@ from ..bundle import ProgramCompileError
 from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES
-from ..module_graph import project_specialization, project_type_identity, resolve_project_entry
+from ..module_graph import project_specialization, project_type_reference, resolve_project_entry
 from ..types import (
     Specialization,
     SpecializationAssignment,
+    check_type_identity_sources,
     f32,
     f64,
     i32,
@@ -151,15 +152,16 @@ def _resolved_entry(source_path: Path, entry: ast.expr) -> str:
 def _linted_assignment(source_path: Path, parameter: Specialization, value: ast.expr) -> SpecializationAssignment:
     if parameter.type is type_kind:
         try:
-            identity = project_type_identity(source_path, value)
+            reference = project_type_reference(source_path, value)
         except CompileError as error:
             raise ProgramCompileError(str(error)) from None
-        if identity is None:
+        if reference is None:
             raise ProgramCompileError(
                 f"type specialization requires a declared type or scalar type; variant value for "
                 f"'{parameter.name}' must name a @vd.struct or @vd.binding_group class or a scalar type"
             )
-        return SpecializationAssignment(parameter.name, "type", identity)
+        identity, declared_in = reference
+        return SpecializationAssignment(parameter.name, "type", identity, type_source=declared_in)
     try:
         return specialization_assignment(parameter, ast.literal_eval(value))
     except (ValueError, TypeError, SyntaxError) as error:
@@ -186,6 +188,10 @@ def _linted_variants(
         key = tuple(sorted(assignments))
         if len({assignment.name for assignment in key}) != len(key):
             raise ProgramCompileError("Program Asset variant contains duplicate specialization names")
+        try:
+            check_type_identity_sources((*parsed, key))
+        except ValueError as error:
+            raise ProgramCompileError(str(error)) from None
         if key in parsed:
             raise ProgramCompileError("duplicate Program Asset variant")
         parsed.append(key)

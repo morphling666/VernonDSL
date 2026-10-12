@@ -8,6 +8,7 @@ from ..bundle import OpenGLTargetOptions, ProgramCompileError, TargetOptions, ma
 from .artifact_io import write_bundle_artifacts
 from .capture import CapturedProgram, capture_program
 from .compile_orchestration import compile_captured_program
+from .declaration import ProgramAssetDeclaration
 from .parsing import program_asset_reference
 from .source import load_program_asset_declaration
 
@@ -23,12 +24,17 @@ def _validate_captured_target(captured: CapturedProgram, target: TargetOptions) 
 
 def cook_program_asset(
     *,
-    program_asset: str | Path,
+    program_asset: str | Path | ProgramAssetDeclaration,
     output: str | Path,
     target: TargetOptions | str | None = None,
 ) -> Path:
-    source, descriptor_name = program_asset_reference(program_asset)
-    declaration = load_program_asset_declaration(source, descriptor_name)
+    """Cook a `source.py:declaration` reference, or a declaration a caller built from data such as asset files."""
+
+    if isinstance(program_asset, ProgramAssetDeclaration):
+        declaration = program_asset
+    else:
+        source, descriptor_name = program_asset_reference(program_asset)
+        declaration = load_program_asset_declaration(source, descriptor_name)
     captured = capture_program(declaration)
     if target is None:
         target = OpenGLTargetOptions()

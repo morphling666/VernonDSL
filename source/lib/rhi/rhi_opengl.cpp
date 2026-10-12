@@ -293,16 +293,16 @@ bool formatInfo(VernonRhiFormat format, FormatInfo &result) {
     return false;
 }
 
-Enum imageTarget(VernonRhiImageDimension dimension) {
-    switch (dimension) {
-    case VERNON_RHI_IMAGE_2D:
-        return vernon::rhi::opengl::kTexture2D;
-    case VERNON_RHI_IMAGE_3D:
-        return vernon::rhi::opengl::kTexture3D;
-    case VERNON_RHI_IMAGE_CUBE:
-        return vernon::rhi::opengl::kTextureCubeMap;
-    }
-    return 0;
+// OpenGL addresses 3D slices and array layers (cube-array layer-faces included) as the z coordinate of the
+// 3D texture entry points; cube maps instead use one 2D target per face.
+bool volumeTarget(VernonRhiImageDimension dimension) {
+    return dimension == VERNON_RHI_IMAGE_3D || dimension == VERNON_RHI_IMAGE_2D_ARRAY ||
+           dimension == VERNON_RHI_IMAGE_CUBE_ARRAY;
+}
+
+uint32_t volumeDepth(const VernonRhiImageDescriptor &descriptor, uint32_t mip) {
+    return descriptor.dimension == VERNON_RHI_IMAGE_3D ? vernon::rhi::imageMipExtent(descriptor.depth, mip)
+                                                       : descriptor.array_layers;
 }
 
 Int samplerFilter(uint32_t value) {
@@ -627,21 +627,14 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
         return Result<VernonRhiImage, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image", 0, 0}})};
     FormatInfo format;
-    const Enum target = imageTarget(descriptor->dimension);
-    const bool validCube =
-        descriptor->dimension != VERNON_RHI_IMAGE_CUBE ||
-        (descriptor->width == descriptor->height && descriptor->depth == 1 && descriptor->array_layers == 6);
+    const Enum target = vernon::rhi::opengl::textureTarget(descriptor->dimension);
     const bool depthFormat =
         descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT || descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
-    const bool validDimension =
-        (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->depth == 1 && descriptor->array_layers == 1) ||
-        (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers == 1) ||
-        descriptor->dimension == VERNON_RHI_IMAGE_CUBE;
     OpenGLDevice &state = device.value().device();
     const bool requiresImmutableStorage = (descriptor->usage & VERNON_RHI_IMAGE_STORAGE) != 0;
-    if (!target || !formatInfo(descriptor->format, format) || descriptor->width == 0 || descriptor->height == 0 ||
-        descriptor->depth == 0 || descriptor->mip_levels == 0 || descriptor->sample_count != 1 || !validCube ||
-        !validDimension || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+    if (!target || !formatInfo(descriptor->format, format) || !vernon::rhi::validImageShape(*descriptor) ||
+        descriptor->mip_levels == 0 || descriptor->sample_count != 1 ||
+        (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return Result<VernonRhiImage, RhiError>{err(fail(state, "OpenGL RHI image descriptor is invalid"))};
     auto owner = device.value().retainOwner();
@@ -666,7 +659,7 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
         auto &driver = state.state.driver;
         driver.bindTexture(target, slot.image.name);
         const bool immutableStorage =
-            driver.texStorage2D && (descriptor->dimension != VERNON_RHI_IMAGE_3D || driver.texStorage3D);
+            driver.texStorage2D && (!volumeTarget(descriptor->dimension) || driver.texStorage3D);
         if (requiresImmutableStorage && !immutableStorage) {
             driver.bindTexture(target, 0);
             state.state.destroyImage(slot.image);
@@ -674,10 +667,11 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
                 err(fail(state, "OpenGL storage images require immutable texture storage", RhiErrorCode::Unsupported))};
         }
         if (immutableStorage) {
-            if (descriptor->dimension == VERNON_RHI_IMAGE_3D)
+            if (volumeTarget(descriptor->dimension))
                 driver.texStorage3D(target, static_cast<Size>(descriptor->mip_levels),
                                     static_cast<Enum>(format.internal), static_cast<Size>(descriptor->width),
-                                    static_cast<Size>(descriptor->height), static_cast<Size>(descriptor->depth));
+                                    static_cast<Size>(descriptor->height),
+                                    static_cast<Size>(volumeDepth(*descriptor, 0)));
             else
                 driver.texStorage2D(target, static_cast<Size>(descriptor->mip_levels),
                                     static_cast<Enum>(format.internal), static_cast<Size>(descriptor->width),
@@ -686,8 +680,8 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
             for (uint32_t mip = 0; mip < descriptor->mip_levels; ++mip) {
                 const Size mipWidth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->width, mip));
                 const Size mipHeight = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->height, mip));
-                const Size mipDepth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->depth, mip));
-                if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
+                const Size mipDepth = static_cast<Size>(volumeDepth(*descriptor, mip));
+                if (volumeTarget(descriptor->dimension)) {
                     driver.texImage3D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, mipDepth, 0,
                                       format.external, format.allocationType, nullptr);
                 } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
@@ -771,8 +765,7 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const Enum sourceFormat = imageDataFormat(upload.source_format);
-        const bool validLayer =
-            slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE ? upload.array_layer < 6 : upload.array_layer == 0;
+        const bool validLayer = upload.array_layer < slot->descriptor.array_layers;
         const bool validMip = upload.mip_level < slot->descriptor.mip_levels;
         const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(slot->descriptor.width, upload.mip_level) : 0;
         const uint32_t mipHeight =
@@ -802,9 +795,12 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
                           : upload.source_type == VERNON_RHI_IMAGE_DATA_FLOAT32          ? 0x1406
                           : slot->descriptor.format == VERNON_RHI_FORMAT_R11G11B10_FLOAT ? 0x8C3B
                                                                                          : 0x1405;
-        if (slot->descriptor.dimension == VERNON_RHI_IMAGE_3D)
+        if (volumeTarget(slot->descriptor.dimension))
             driver.texSubImage3D(slot->target, static_cast<Int>(upload.mip_level), static_cast<Int>(upload.offset_x),
-                                 static_cast<Int>(upload.offset_y), static_cast<Int>(upload.offset_z),
+                                 static_cast<Int>(upload.offset_y),
+                                 static_cast<Int>(slot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                                      ? upload.offset_z
+                                                      : upload.array_layer),
                                  static_cast<Size>(upload.width), static_cast<Size>(upload.height),
                                  static_cast<Size>(upload.depth), sourceFormat, type, upload.data);
         else
@@ -858,8 +854,9 @@ Result<void, RhiError> downloadImageLocked(OpenGLDevice &state, const ImageSlot 
     const Enum target = slot.descriptor.dimension == VERNON_RHI_IMAGE_CUBE
                             ? vernon::rhi::opengl::kTextureCubeMapPositiveX + download.array_layer
                             : slot.target;
+    const Int layer = static_cast<Int>(download.array_layer);
     if (!packedDepthStencil)
-        return state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level),
+        return state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level), layer,
                                            static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
                                            static_cast<Size>(download.width), static_cast<Size>(download.height),
                                            externalFormat, allocationType, destination, state.error)
@@ -867,7 +864,7 @@ Result<void, RhiError> downloadImageLocked(OpenGLDevice &state, const ImageSlot 
                    : Result<void, RhiError>{
                          err(RhiError{RhiErrorCode::BackendFailure, {"download_opengl_image", 0, 0}})};
     std::vector<uint8_t> native(expected);
-    if (!state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level),
+    if (!state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level), layer,
                                      static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
                                      static_cast<Size>(download.width), static_cast<Size>(download.height),
                                      format.external, format.allocationType, native.data(), state.error))
@@ -1121,9 +1118,6 @@ Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
     if (!vernon::rhi::validImageViewDescriptor(parent->descriptor, *descriptor))
         return Result<VernonRhiImageView, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"create_opengl_image_view", 0, 0}})};
-    if (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->array_layer_count != 1)
-        return Result<VernonRhiImageView, RhiError>{
-            err(RhiError{RhiErrorCode::Unsupported, {"create_opengl_image_view", 0, 0}})};
     auto parentLease = parent->lifecycle.retain({descriptor->image.index, descriptor->image.generation});
     if (parentLease.isErr())
         return Result<VernonRhiImageView, RhiError>{err(std::move(parentLease).error())};
@@ -1161,12 +1155,12 @@ Result<VernonRhiImageView, RhiError> createImageView(VernonRhiDevice handle,
                 err(RhiError{RhiErrorCode::BackendFailure, {"create_opengl_image_view", 0, 0}})};
         }
         owned.image.imported = false;
-        slot.target = imageTarget(descriptor->dimension);
+        slot.target = vernon::rhi::opengl::textureTarget(descriptor->dimension);
         state.state.driver.textureView(owned.image.name, slot.target, parent->image.name, format.internal,
                                        descriptor->base_mip_level, descriptor->mip_level_count,
                                        descriptor->base_array_layer, descriptor->array_layer_count);
     }
-    slot.target = imageTarget(descriptor->dimension);
+    slot.target = vernon::rhi::opengl::textureTarget(descriptor->dimension);
     slot.descriptor = *descriptor;
     slot.imageDescriptor = parent->descriptor;
     slot.parentKey = resourceKey(descriptor->image);

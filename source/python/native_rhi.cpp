@@ -55,6 +55,10 @@ VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
         return VERNON_RHI_IMAGE_3D;
     case VERNON_TEXTURE_CUBE:
         return VERNON_RHI_IMAGE_CUBE;
+    case VERNON_TEXTURE_2D_ARRAY:
+        return VERNON_RHI_IMAGE_2D_ARRAY;
+    case VERNON_TEXTURE_CUBE_ARRAY:
+        return VERNON_RHI_IMAGE_CUBE_ARRAY;
     }
     throw std::invalid_argument("unsupported texture dimension");
 }
@@ -196,15 +200,22 @@ nb::list RhiBuffer::downloadRanges(const nb::list &ranges) const {
 }
 
 RhiImage::RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, uint32_t depth,
-                   VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage)
+                   VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage,
+                   uint32_t arrayLayers)
     : host(std::move(host)), width(width), height(height), depth(depth), format(format), dimension(dimension),
-      mipLevels(mipLevels), usage(usage), layers(dimension == VERNON_TEXTURE_CUBE ? 6u : 1u) {
+      mipLevels(mipLevels), usage(usage), layers(arrayLayers                        ? arrayLayers
+                                                 : dimension == VERNON_TEXTURE_CUBE ? 6u
+                                                                                    : 1u) {
     if (!width || !height || !depth || !mipLevels || !usage)
         throw std::invalid_argument("RHI image extent, mip count, and usage must be non-zero");
     if (dimension != VERNON_TEXTURE_3D && depth != 1)
         throw std::invalid_argument("only a 3D RHI image may have depth greater than one");
-    if (dimension == VERNON_TEXTURE_CUBE && width != height)
+    if ((dimension == VERNON_TEXTURE_CUBE || dimension == VERNON_TEXTURE_CUBE_ARRAY) && width != height)
         throw std::invalid_argument("RHI cube image faces must be square");
+    if ((dimension == VERNON_TEXTURE_2D || dimension == VERNON_TEXTURE_3D) && layers != 1)
+        throw std::invalid_argument("only layered RHI images may have more than one array layer");
+    if ((dimension == VERNON_TEXTURE_CUBE && layers != 6) || (dimension == VERNON_TEXTURE_CUBE_ARRAY && layers % 6))
+        throw std::invalid_argument("RHI cube image layers must be six faces per cube");
     VernonRhiImageDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
     descriptor.dimension = rhiDimension(dimension);
@@ -565,7 +576,7 @@ std::unique_ptr<RhiBuffer> RhiHost::createBuffer(size_t size) { return std::make
 
 std::unique_ptr<RhiImage> RhiHost::createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                                VernonTextureDimension dimension, uint32_t depth, uint32_t mipLevels,
-                                               uint32_t usage) {
+                                               uint32_t usage, uint32_t arrayLayers) {
     if (dimension == VERNON_TEXTURE_3D &&
         (format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT))
         throw std::invalid_argument("3D depth textures are unsupported");
@@ -576,7 +587,7 @@ std::unique_ptr<RhiImage> RhiHost::createImage(uint32_t width, uint32_t height, 
                          ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
                          : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
     }
-    return std::make_unique<RhiImage>(state, width, height, depth, format, dimension, mipLevels, usage);
+    return std::make_unique<RhiImage>(state, width, height, depth, format, dimension, mipLevels, usage, arrayLayers);
 }
 
 std::unique_ptr<RhiImage> RhiHost::createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
@@ -588,7 +599,7 @@ std::unique_ptr<RhiImage> RhiHost::createAttachmentImage(uint32_t width, uint32_
     const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
     if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
         throw std::invalid_argument("attachment image format does not match its usage");
-    return std::make_unique<RhiImage>(state, width, height, 1, format, VERNON_TEXTURE_2D, 1, usage);
+    return std::make_unique<RhiImage>(state, width, height, 1, format, VERNON_TEXTURE_2D, 1, usage, 1);
 }
 
 std::unique_ptr<RhiSampler> RhiHost::createSampler(VernonRhiSamplerAddressMode address) {

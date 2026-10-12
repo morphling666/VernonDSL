@@ -109,7 +109,6 @@ enum class PhysicalAbiProfile {
     VulkanStd430StorageBuffer,
     VulkanPushConstant,
     OpenGLNativeUniform,
-    DirectXConstantBuffer,
     MetalConstantBuffer,
     Count,
 };

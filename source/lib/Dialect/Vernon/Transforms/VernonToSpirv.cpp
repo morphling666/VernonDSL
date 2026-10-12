@@ -35,6 +35,24 @@
 namespace mlir::vernon {
 namespace {
 
+// Tensors that are neither vectors nor matrices lower to one row-major SPIR-V array, never to arrays of arrays: GLSL
+// below 4.30 and ESSL below 3.10 have no arrays of arrays. The flat array keeps every element offset only when each
+// dimension's stride is the next dimension's stride times its extent, as std140 always lays tensors out.
+FailureOr<spirv::ArrayType> getRowMajorTensorArrayType(RankedTensorType tensor, const ByteTransportPlan &layout,
+                                                       Type elementType) {
+    const SmallVector<uint64_t> &strides = layout.root->byteStrides;
+    if (strides.size() != static_cast<size_t>(tensor.getRank()) ||
+        strides.back() > std::numeric_limits<unsigned>::max())
+        return failure();
+    for (int64_t dimension = 0; dimension + 1 < tensor.getRank(); ++dimension)
+        if (strides[dimension] != strides[dimension + 1] * static_cast<uint64_t>(tensor.getDimSize(dimension + 1)))
+            return failure();
+    if (tensor.getNumElements() > std::numeric_limits<unsigned>::max())
+        return failure();
+    return spirv::ArrayType::get(elementType, static_cast<unsigned>(tensor.getNumElements()),
+                                 static_cast<unsigned>(strides.back()));
+}
+
 FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
         !tensor.getElementType().isIntOrFloat())
@@ -55,15 +73,7 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
         auto columnType = mlir::VectorType::get({tensor.getShape()[0]}, elementType);
         return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
     }
-    Type result = elementType;
-    for (size_t dimension = tensor.getRank(); dimension-- > 0;) {
-        uint64_t stride = layout->root->byteStrides[dimension];
-        if (stride > std::numeric_limits<unsigned>::max())
-            return failure();
-        result = spirv::ArrayType::get(result, static_cast<unsigned>(tensor.getDimSize(dimension)),
-                                       static_cast<unsigned>(stride));
-    }
-    return result;
+    return getRowMajorTensorArrayType(tensor, *layout, elementType);
 }
 
 FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, ModuleOp module) {
@@ -108,25 +118,20 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
         }
         result = spirv::StructType::get(fields, offsets);
     }
-    for (size_t dimension = tensor.getRank(); dimension-- > 0;) {
-        const uint64_t stride = layout->root->byteStrides[dimension];
-        if (stride > std::numeric_limits<unsigned>::max())
-            return failure();
-        result = spirv::ArrayType::get(result, static_cast<unsigned>(tensor.getDimSize(dimension)),
-                                       static_cast<unsigned>(stride));
-    }
-    return result;
+    return getRowMajorTensorArrayType(tensor, *layout, result);
 }
 
 FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
     if (auto texture = dyn_cast<TextureType>(type)) {
         std::optional<spirv::Dim> dimension = llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
-                                                  .Case("2d", spirv::Dim::Dim2D)
+                                                  .Cases("2d", "2d_array", spirv::Dim::Dim2D)
                                                   .Case("3d", spirv::Dim::Dim3D)
-                                                  .Case("cube", spirv::Dim::Cube)
+                                                  .Cases("cube", "cube_array", spirv::Dim::Cube)
                                                   .Default(std::nullopt);
         if (!dimension)
             return failure();
+        const spirv::ImageArrayedInfo arrayed =
+            texture.isArrayed() ? spirv::ImageArrayedInfo::Arrayed : spirv::ImageArrayedInfo::NonArrayed;
         if (texture.getAccess() != "sampled") {
             std::optional<spirv::ImageFormat> format =
                 llvm::StringSwitch<std::optional<spirv::ImageFormat>>(texture.getFormat())
@@ -138,14 +143,14 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
                     .Case("rgba16_float", spirv::ImageFormat::Rgba16f)
                     .Case("rgba32_float", spirv::ImageFormat::Rgba32f)
                     .Default(std::nullopt);
-            if (!format || texture.getDimension() == "cube")
+            if (!format || texture.isCube())
                 return failure();
-            return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
-                                         spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
-                                         spirv::ImageSamplerUseInfo::NoSampler, *format);
+            return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth, arrayed,
+                                         spirv::ImageSamplingInfo::SingleSampled, spirv::ImageSamplerUseInfo::NoSampler,
+                                         *format);
         }
         auto image = spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
-                                           spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
+                                           arrayed, spirv::ImageSamplingInfo::SingleSampled,
                                            spirv::ImageSamplerUseInfo::NeedSampler, spirv::ImageFormat::Unknown);
         return spirv::SampledImageType::get(image);
     }
@@ -274,38 +279,48 @@ LogicalResult collectTransportScalarOffsets(const ByteTransportNode &node, uint6
     return success();
 }
 
-FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
-    FailureOr<ValueAbiLayout> elementLayout = getValueStorageLayout(tensor.getElementType(), module);
-    FailureOr<ByteTransportPlan> physicalLayout =
-        getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
-    FailureOr<int64_t> count = getStaticShapeElementCount(tensor.getShape());
-    if (failed(elementLayout) || failed(physicalLayout) || physicalLayout->root->byteStrides.empty() || failed(count) ||
-        *count <= 0 || *count > static_cast<int64_t>(std::numeric_limits<unsigned>::max()))
-        return failure();
-    const ByteTransportNode &element = *physicalLayout->root->children.front();
+struct ScalarBlockMembers {
+    SmallVector<Type> types;
+    SmallVector<uint32_t> offsets;
+};
+
+// Aggregate Values cross buffer interfaces as their scalar leaves at the planned physical offsets, in the leaf order
+// constructComposite consumes. No nested SPIR-V struct layout is portable: std140, std430, HLSL constant-buffer and
+// MSL packing disagree on nested members, and HLSL can only place top-level constant-buffer members explicitly.
+FailureOr<ScalarBlockMembers> getScalarBlockMembers(Type type, ModuleOp module, const ByteTransportNode &physical) {
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
     SmallVector<uint64_t> physicalOffsets;
-    if (failed(collectTransportScalarOffsets(element, 0, physicalOffsets)))
+    if (failed(layout) || failed(collectTransportScalarOffsets(physical, 0, physicalOffsets)))
         return failure();
-    SmallVector<Type> members;
-    for (const ValueAbiLeaf &leaf : elementLayout->leaves) {
+    ScalarBlockMembers members;
+    for (const ValueAbiLeaf &leaf : layout->leaves) {
         FailureOr<Type> scalar = convertValueType(leaf.scalarType, module);
         if (failed(scalar))
             return failure();
-        for (uint64_t index = 0; index < leaf.scalarCount; ++index) {
-            members.push_back(*scalar);
-        }
+        members.types.append(leaf.scalarCount, *scalar);
     }
-    if (members.size() != physicalOffsets.size() ||
+    if (members.types.empty() || members.types.size() != physicalOffsets.size() ||
         llvm::any_of(physicalOffsets, [](uint64_t offset) { return offset > std::numeric_limits<uint32_t>::max(); }))
         return failure();
-    SmallVector<uint32_t> offsets;
-    llvm::transform(physicalOffsets, std::back_inserter(offsets),
+    llvm::transform(physicalOffsets, std::back_inserter(members.offsets),
                     [](uint64_t offset) { return static_cast<uint32_t>(offset); });
-    const uint64_t stride = physicalLayout->root->byteStrides.back();
-    if (members.empty() || stride > std::numeric_limits<unsigned>::max())
+    return members;
+}
+
+FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
+    FailureOr<ByteTransportPlan> physicalLayout =
+        getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+    FailureOr<int64_t> count = getStaticShapeElementCount(tensor.getShape());
+    if (failed(physicalLayout) || physicalLayout->root->byteStrides.empty() || failed(count) || *count <= 0 ||
+        *count > static_cast<int64_t>(std::numeric_limits<unsigned>::max()))
         return failure();
-    Type record = spirv::StructType::get(members, offsets);
-    return spirv::ArrayType::get(record, static_cast<unsigned>(*count), static_cast<unsigned>(stride));
+    FailureOr<ScalarBlockMembers> record =
+        getScalarBlockMembers(tensor.getElementType(), module, *physicalLayout->root->children.front());
+    const uint64_t stride = physicalLayout->root->byteStrides.back();
+    if (failed(record) || stride > std::numeric_limits<unsigned>::max())
+        return failure();
+    return spirv::ArrayType::get(spirv::StructType::get(record->types, record->offsets), static_cast<unsigned>(*count),
+                                 static_cast<unsigned>(stride));
 }
 
 std::optional<spirv::ExecutionModel> parseExecutionModel(StringRef stage) {
@@ -382,17 +397,41 @@ Value loadBlockMember(OpBuilder &builder, Location location, Value block, SmallV
     return spirv::LoadOp::create(builder, location, pointer);
 }
 
+// Literal struct types are uniqued by content, so two blocks with equal members would share one type, and GLSL takes
+// a block's name from its type: one of the blocks would lose the name OpenGL Runtime finds it by. Identified types keep
+// every block distinct. Identifiers are context-wide, so an identifier already holding another body is suffixed.
+spirv::StructType createBlockType(MLIRContext *context, StringRef variableName, ArrayRef<Type> memberTypes,
+                                  ArrayRef<spirv::StructType::OffsetInfo> memberOffsets,
+                                  ArrayRef<spirv::StructType::MemberDecorationInfo> memberDecorations,
+                                  ArrayRef<spirv::StructType::StructDecorationInfo> structDecorations) {
+    std::string identifier = (variableName + "_block").str();
+    for (unsigned suffix = 1;; ++suffix) {
+        auto type = spirv::StructType::getIdentified(context, identifier);
+        if (succeeded(type.trySetBody(memberTypes, memberOffsets, memberDecorations, structDecorations)))
+            return type;
+        identifier = (variableName + "_block_" + Twine(suffix)).str();
+    }
+}
+
 spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location location, StringRef name, Type valueType,
                                                 spirv::StorageClass storageClass, DictionaryAttr attributes,
-                                                const ByteTransportNode *layout = nullptr) {
+                                                const ByteTransportNode *layout = nullptr,
+                                                const ScalarBlockMembers *scalarMembers = nullptr) {
     auto pointerType = spirv::PointerType::get(valueType, storageClass);
     if (isBlockWrappedStorageClass(storageClass)) {
-        SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
-        if (layout)
-            appendMemberDecorations(builder, 0, valueType, *layout, memberDecorations);
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
         structDecorations.emplace_back(spirv::Decoration::Block, builder.getUnitAttr());
-        auto blockType = spirv::StructType::get({valueType}, {0}, memberDecorations, structDecorations);
+        spirv::StructType blockType;
+        if (scalarMembers) {
+            blockType = createBlockType(builder.getContext(), name, scalarMembers->types, scalarMembers->offsets, {},
+                                        structDecorations);
+        } else {
+            SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+            if (layout)
+                appendMemberDecorations(builder, 0, valueType, *layout, memberDecorations);
+            blockType =
+                createBlockType(builder.getContext(), name, {valueType}, {0}, memberDecorations, structDecorations);
+        }
         pointerType = spirv::PointerType::get(blockType, storageClass);
     }
     InterfaceAttrs interface = parseInterfaceAttrs(attributes);
@@ -405,12 +444,20 @@ spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location loc
     IntegerAttr bindingAttr = toI32(interface.binding);
     IntegerAttr setAttr = toI32(interface.descriptorSet);
     StringAttr builtInAttr;
+    std::optional<spirv::BuiltIn> builtIn;
     if (auto spelling = dyn_cast_if_present<StringAttr>(interface.builtin)) {
-        if (auto builtIn = parseBuiltIn(spelling.getValue()))
+        builtIn = parseBuiltIn(spelling.getValue());
+        if (builtIn)
             builtInAttr = builder.getStringAttr(spirv::stringifyBuiltIn(*builtIn));
     }
-    return spirv::GlobalVariableOp::create(builder, location, pointerType, name, FlatSymbolRefAttr(), locationAttr,
-                                           bindingAttr, setAttr, builtInAttr, spirv::LinkageAttributesAttr());
+    auto variable =
+        spirv::GlobalVariableOp::create(builder, location, pointerType, name, FlatSymbolRefAttr(), locationAttr,
+                                        bindingAttr, setAttr, builtInAttr, spirv::LinkageAttributesAttr());
+    // Pipelines sharing a depth buffer (prepass then EQUAL test) need bit-identical positions from separately
+    // compiled vertex stages; without Invariant, drivers may contract the same expression differently.
+    if (builtIn == spirv::BuiltIn::Position && storageClass == spirv::StorageClass::Output)
+        variable->setAttr("invariant", builder.getUnitAttr());
+    return variable;
 }
 
 void flattenComposite(Location location, Value value, OpBuilder &builder, SmallVectorImpl<Value> &leaves) {
@@ -507,13 +554,10 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
 
 FailureOr<Value> unpackStd140TensorInterface(Location location, Value value, RankedTensorType sourceType,
                                              Type logicalType, OpBuilder &builder) {
-    Type carrierType = value.getType();
-    for (int64_t dimension = 0; dimension < sourceType.getRank(); ++dimension) {
-        auto array = dyn_cast<spirv::ArrayType>(carrierType);
-        if (!array)
-            return failure();
-        carrierType = array.getElementType();
-    }
+    auto carrierArray = dyn_cast<spirv::ArrayType>(value.getType());
+    if (!carrierArray || carrierArray.getNumElements() != sourceType.getNumElements())
+        return failure();
+    Type carrierType = carrierArray.getElementType();
     SmallVector<int32_t> carrierIndices;
     while (carrierType != sourceType.getElementType()) {
         if (auto structure = dyn_cast<spirv::StructType>(carrierType)) {
@@ -534,13 +578,7 @@ FailureOr<Value> unpackStd140TensorInterface(Location location, Value value, Ran
     SmallVector<Value> leaves;
     leaves.reserve(sourceType.getNumElements());
     for (int64_t linearIndex = 0; linearIndex < sourceType.getNumElements(); ++linearIndex) {
-        SmallVector<int32_t> indices;
-        int64_t remaining = linearIndex;
-        for (int64_t dimension = sourceType.getRank() - 1; dimension >= 0; --dimension) {
-            indices.push_back(static_cast<int32_t>(remaining % sourceType.getDimSize(dimension)));
-            remaining /= sourceType.getDimSize(dimension);
-        }
-        std::reverse(indices.begin(), indices.end());
+        SmallVector<int32_t> indices{static_cast<int32_t>(linearIndex)};
         indices.append(carrierIndices);
         leaves.push_back(spirv::CompositeExtractOp::create(builder, location, value, indices));
     }
@@ -549,16 +587,14 @@ FailureOr<Value> unpackStd140TensorInterface(Location location, Value value, Ran
 
 Value extractStaticTensorElement(Location location, Value value, RankedTensorType sourceType, int64_t linearIndex,
                                  OpBuilder &builder) {
-    SmallVector<int32_t> indices;
-    int64_t remaining = linearIndex;
-    for (int64_t dimension = sourceType.getRank() - 1; dimension >= 0; --dimension) {
-        indices.push_back(static_cast<int32_t>(remaining % sourceType.getDimSize(dimension)));
-        remaining /= sourceType.getDimSize(dimension);
+    if (sourceType.getRank() == 0)
+        return value;
+    SmallVector<int32_t> indices{static_cast<int32_t>(linearIndex)};
+    if (isa<spirv::MatrixType>(value.getType())) {
+        const int64_t columns = sourceType.getDimSize(1);
+        indices = {static_cast<int32_t>(linearIndex % columns), static_cast<int32_t>(linearIndex / columns)};
     }
-    std::reverse(indices.begin(), indices.end());
-    if (isa<spirv::MatrixType>(value.getType()))
-        std::swap(indices[0], indices[1]);
-    return indices.empty() ? value : spirv::CompositeExtractOp::create(builder, location, value, indices).getResult();
+    return spirv::CompositeExtractOp::create(builder, location, value, indices).getResult();
 }
 
 FailureOr<Value> lowerTensorExtract(tensor::ExtractOp extract, OpBuilder &builder, IRMapping &mapping) {
@@ -1482,9 +1518,10 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 }
 
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder &moduleBuilder,
-                         llvm::StringSet<> &usedInterfaceNames, bool useVulkanInterfaceAbi,
+                         llvm::StringSet<> &usedInterfaceNames, SpirvInterfaceAbi abi,
                          const GraphicsBindingPlan &bindings) {
     ModuleOp sourceModule = source->getParentOfType<ModuleOp>();
+    const bool pushConstantUniforms = abi != SpirvInterfaceAbi::NativeUniforms;
     const auto generatedBinding = [&](unsigned index) -> std::optional<uint32_t> {
         const SmallVector<uint32_t> *planned = bindings.find(source.getSymName(), index);
         if (!planned || planned->size() != 1)
@@ -1498,8 +1535,14 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     if (!executionModel)
         return source.emitError("unsupported SPIR-V execution model");
 
+    // A block-wrapped argument occupies members [first, first + count) of its block; count exceeds one only for an
+    // aggregate Value, whose scalar members are rebuilt into the logical Value on load.
+    struct BlockMemberRange {
+        uint32_t first;
+        uint32_t count;
+    };
     SmallVector<SmallVector<spirv::GlobalVariableOp>> inputs;
-    SmallVector<std::optional<uint32_t>> inputMembers;
+    SmallVector<std::optional<BlockMemberRange>> inputMembers;
     SmallVector<bool> inputAttributes;
     SmallVector<spirv::GlobalVariableOp> outputs;
     SmallVector<Attribute> interfaceSymbols;
@@ -1512,7 +1555,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     SmallVector<PushConstantMember> pushConstantMembers;
     uint32_t pushConstantSize = 0;
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
-        if (!useVulkanInterfaceAbi)
+        if (!pushConstantUniforms)
             break;
         InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
@@ -1527,7 +1570,15 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         if (failed(layout))
             return source.emitError() << "push-constant argument #" << index << " does not have a GPU interface layout";
         pushConstantSize = llvm::alignTo(pushConstantSize, layout->root->alignment);
-        pushConstantMembers.push_back({static_cast<uint32_t>(index), *converted, pushConstantSize, layout->root});
+        if (isa<spirv::StructType>(*converted)) {
+            FailureOr<ScalarBlockMembers> scalars = getScalarBlockMembers(type, sourceModule, *layout->root);
+            if (failed(scalars))
+                return source.emitError() << "push-constant argument #" << index << " has no scalar interface layout";
+            for (auto [scalar, offset] : llvm::zip_equal(scalars->types, scalars->offsets))
+                pushConstantMembers.push_back({static_cast<uint32_t>(index), scalar, pushConstantSize + offset, {}});
+        } else {
+            pushConstantMembers.push_back({static_cast<uint32_t>(index), *converted, pushConstantSize, layout->root});
+        }
         pushConstantSize += layout->root->size;
     }
     spirv::GlobalVariableOp pushConstantBlock;
@@ -1538,8 +1589,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         for (auto [member, value] : llvm::enumerate(pushConstantMembers)) {
             memberTypes.push_back(value.type);
             memberOffsets.push_back(value.offset);
-            appendMemberDecorations(moduleBuilder, static_cast<uint32_t>(member), value.type, *value.layout,
-                                    memberDecorations);
+            if (value.layout)
+                appendMemberDecorations(moduleBuilder, static_cast<uint32_t>(member), value.type, *value.layout,
+                                        memberDecorations);
         }
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
         structDecorations.emplace_back(spirv::Decoration::Block, moduleBuilder.getUnitAttr());
@@ -1562,7 +1614,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                 memberDecorations.emplace_back(member, spirv::Decoration::NonWritable, moduleBuilder.getUnitAttr());
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
         structDecorations.emplace_back(spirv::Decoration::Block, moduleBuilder.getUnitAttr());
-        auto blockType = spirv::StructType::get(memberTypes, memberOffsets, memberDecorations, structDecorations);
+        auto blockType = createBlockType(source.getContext(), name, memberTypes, memberOffsets, memberDecorations,
+                                         structDecorations);
         auto global = spirv::GlobalVariableOp::create(
             moduleBuilder, source.getLoc(), spirv::PointerType::get(blockType, storageClass), name, FlatSymbolRefAttr(),
             IntegerAttr(), moduleBuilder.getI32IntegerAttr(binding), moduleBuilder.getI32IntegerAttr(0), StringAttr(),
@@ -1657,23 +1710,26 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return source.emitError() << "argument #" << index << " has no Vernon interface kind";
         PhysicalAbiProfile profile = kind.getValue() == "uniform" && isa<TensorType>(type)
                                          ? PhysicalAbiProfile::VulkanStd430StorageBuffer
-                                     : kind.getValue() == "uniform" && useVulkanInterfaceAbi && !attrs.binding
+                                     : kind.getValue() == "uniform" && pushConstantUniforms && !attrs.binding
                                          ? PhysicalAbiProfile::VulkanPushConstant
                                          : PhysicalAbiProfile::VulkanStd140UniformBuffer;
         FailureOr<ByteTransportPlan> physicalLayout = getByteTransportPlan(type, sourceModule, profile);
         spirv::StorageClass storageClass = isa<TextureType>(type)         ? spirv::StorageClass::UniformConstant
                                            : kind.getValue() == "input"   ? spirv::StorageClass::Input
-                                           : kind.getValue() == "uniform" ? (attrs.binding || useVulkanInterfaceAbi
+                                           : kind.getValue() == "uniform" ? (attrs.binding || pushConstantUniforms
                                                                                  ? spirv::StorageClass::Uniform
                                                                                  : spirv::StorageClass::UniformConstant)
                                                                           : spirv::StorageClass::StorageBuffer;
-        if (useVulkanInterfaceAbi && kind.getValue() == "uniform" && !attrs.binding) {
-            auto member = llvm::find_if(pushConstantMembers,
-                                        [&](const PushConstantMember &value) { return value.argumentIndex == index; });
-            if (member == pushConstantMembers.end())
+        if (pushConstantUniforms && kind.getValue() == "uniform" && !attrs.binding) {
+            auto argumentMember = [&](const PushConstantMember &value) { return value.argumentIndex == index; };
+            auto first = llvm::find_if(pushConstantMembers, argumentMember);
+            if (first == pushConstantMembers.end())
                 return source.emitError("push-constant member layout is inconsistent");
+            const auto count = std::distance(first, std::find_if_not(first, pushConstantMembers.end(), argumentMember));
             inputs.push_back({pushConstantBlock});
-            inputMembers.push_back(static_cast<uint32_t>(std::distance(pushConstantMembers.begin(), member)));
+            inputMembers.push_back(
+                BlockMemberRange{static_cast<uint32_t>(std::distance(pushConstantMembers.begin(), first)),
+                                 static_cast<uint32_t>(count)});
             inputAttributes.push_back(false);
             continue;
         }
@@ -1697,6 +1753,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             continue;
         }
         SmallVector<spirv::GlobalVariableOp> globals;
+        std::optional<BlockMemberRange> memberRange;
         auto location = dyn_cast_if_present<IntegerAttr>(attrs.location);
         const bool vertexAttribute =
             stage.getValue() == "vertex" && kind.getValue() == "input" && !attrs.builtin && location;
@@ -1734,19 +1791,30 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             Type interfaceType = convertedType;
             if (auto tensor = dyn_cast<RankedTensorType>(type); tensor && tensor.getRank() > 2 &&
                                                                 kind.getValue() == "uniform" && attrs.binding &&
-                                                                useVulkanInterfaceAbi) {
+                                                                abi == SpirvInterfaceAbi::Vulkan) {
                 FailureOr<Type> physicalType = convertStd140TensorInterfaceType(tensor, sourceModule);
                 if (failed(physicalType))
                     return source.emitError() << "cannot lower rank-" << tensor.getRank()
                                               << " std140 Tensor interface argument #" << index;
                 interfaceType = *physicalType;
             }
+            std::optional<ScalarBlockMembers> scalars;
+            if (isBlockWrappedStorageClass(storageClass) && isa<spirv::StructType>(interfaceType)) {
+                FailureOr<ScalarBlockMembers> members =
+                    succeeded(physicalLayout) ? getScalarBlockMembers(type, sourceModule, *physicalLayout->root)
+                                              : FailureOr<ScalarBlockMembers>(failure());
+                if (failed(members))
+                    return source.emitError() << "uniform argument #" << index << " has no scalar interface layout";
+                scalars = std::move(*members);
+            }
             globals.push_back(createInterfaceVariable(
                 moduleBuilder, source.getLoc(), name, interfaceType, storageClass, argumentAttrs,
-                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr));
+                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr, scalars ? &*scalars : nullptr));
+            if (scalars)
+                memberRange = BlockMemberRange{0, static_cast<uint32_t>(scalars->types.size())};
         }
         inputs.push_back(globals);
-        inputMembers.push_back(std::nullopt);
+        inputMembers.push_back(memberRange);
         inputAttributes.push_back(vertexAttribute);
         for (spirv::GlobalVariableOp global : globals)
             interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
@@ -1808,21 +1876,37 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             continue;
         }
         if (!attribute) {
-            Value loaded;
-            if (isBlockWrappedStorageClass(pointerType.getStorageClass())) {
-                auto block = cast<spirv::StructType>(pointerType.getPointeeType());
-                const uint32_t memberIndex = member.value_or(0);
-                SmallVector<Value> indices{spirv::ConstantOp::create(bodyBuilder, source.getLoc(),
-                                                                     bodyBuilder.getI32Type(),
-                                                                     bodyBuilder.getI32IntegerAttr(memberIndex))};
-                loaded =
-                    loadBlockMember(bodyBuilder, source.getLoc(), pointer, indices, block.getElementType(memberIndex));
-            } else {
-                loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
-            }
             FailureOr<Type> logicalType = convertValueType(argument.getType(), sourceModule);
             if (failed(logicalType))
                 return source.emitError("cannot reconstruct logical interface value");
+            const bool blockWrapped = isBlockWrappedStorageClass(pointerType.getStorageClass());
+            const BlockMemberRange range = member.value_or(BlockMemberRange{0, 1});
+            const auto memberIndex = [&](uint32_t index) -> Value {
+                return spirv::ConstantOp::create(bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
+                                                 bodyBuilder.getI32IntegerAttr(index));
+            };
+            if (blockWrapped && isa<spirv::StructType>(*logicalType)) {
+                SmallVector<Value> scalars;
+                for (uint32_t index = range.first; index < range.first + range.count; ++index) {
+                    Value scalarPointer =
+                        spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), pointer, memberIndex(index));
+                    scalars.push_back(spirv::LoadOp::create(bodyBuilder, source.getLoc(), scalarPointer));
+                }
+                FailureOr<Value> value = constructComposite(source.getLoc(), *logicalType, scalars, bodyBuilder);
+                if (failed(value))
+                    return source.emitError("cannot reconstruct logical aggregate interface value");
+                mapping.map(argument, *value);
+                continue;
+            }
+            Value loaded;
+            if (blockWrapped) {
+                auto block = cast<spirv::StructType>(pointerType.getPointeeType());
+                SmallVector<Value> indices{memberIndex(range.first)};
+                loaded =
+                    loadBlockMember(bodyBuilder, source.getLoc(), pointer, indices, block.getElementType(range.first));
+            } else {
+                loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
+            }
             if (loaded.getType() != *logicalType) {
                 if (auto tensor = dyn_cast<RankedTensorType>(argument.getType()); tensor && tensor.getRank() > 2) {
                     FailureOr<Value> unpacked =
@@ -1933,7 +2017,7 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToSPIRVPass)
 
     VernonToSPIRVPass() = default;
-    explicit VernonToSPIRVPass(bool useVulkanInterfaceAbi) : useVulkanInterfaceAbi(useVulkanInterfaceAbi) {}
+    explicit VernonToSPIRVPass(SpirvInterfaceAbi abi) : abi(abi) {}
 
     StringRef getArgument() const final { return "vernon-to-spirv"; }
     StringRef getDescription() const final { return "Lower Vernon graphics and Vulkan compute entries to SPIR-V"; }
@@ -1969,8 +2053,7 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
                 if (intrinsic.getName() == "texture_size")
                     ++expectedImageQueryCount;
             });
-            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, useVulkanInterfaceAbi,
-                                  *generatedBindings))) {
+            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, abi, *generatedBindings))) {
                 target.erase();
                 return signalPassFailure();
             }
@@ -1978,13 +2061,13 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
         target->setAttr(kImageQueryExpectedCountAttr, builder.getI64IntegerAttr(expectedImageQueryCount));
     }
 
-    bool useVulkanInterfaceAbi = true;
+    SpirvInterfaceAbi abi = SpirvInterfaceAbi::Vulkan;
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonToSPIRVPass(bool useVulkanInterfaceAbi) {
-    return std::make_unique<VernonToSPIRVPass>(useVulkanInterfaceAbi);
+std::unique_ptr<Pass> createVernonToSPIRVPass(SpirvInterfaceAbi abi) {
+    return std::make_unique<VernonToSPIRVPass>(abi);
 }
 
 void registerVernonToSPIRVPass() { PassRegistration<VernonToSPIRVPass>(); }

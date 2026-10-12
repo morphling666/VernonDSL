@@ -46,7 +46,8 @@ struct RhiImageView;
 
 struct RhiImage {
     RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, uint32_t depth,
-             VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage);
+             VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage,
+             uint32_t arrayLayers);
     ~RhiImage();
 
     void upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ,
@@ -132,9 +133,11 @@ struct RhiHost {
                                                          uint16_t apiMajor, uint16_t apiMinor);
     static std::unique_ptr<RhiHost> createOwnedOpenGL(VernonRhiBackend backend, uint16_t apiMajor, uint16_t apiMinor);
     std::unique_ptr<RhiBuffer> createBuffer(size_t size);
+    // `arrayLayers` counts layers, so a cube array of N cubes takes 6 * N; zero selects the dimension's
+    // single-element layer count (6 for a cube, 1 otherwise).
     std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                           VernonTextureDimension dimension, uint32_t depth, uint32_t mipLevels,
-                                          uint32_t usage);
+                                          uint32_t usage, uint32_t arrayLayers);
     std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                                     uint32_t usage);
     std::unique_ptr<RhiSampler> createSampler(VernonRhiSamplerAddressMode address);

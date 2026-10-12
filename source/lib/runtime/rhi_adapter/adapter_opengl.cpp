@@ -1,6 +1,7 @@
 #include "adapter_common.h"
 #include "rhi/opengl_backend.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/interface_names.h"
 #include "runtime/vertex_attribute_capabilities.h"
 
 #include <algorithm>
@@ -606,6 +607,27 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
                     activeTextureBindings.push_back(entry.layout.binding);
             }
         }
+        // A block left unassigned silently reads binding point 0, so every active block must have a planned binding.
+        auto &driver = openGLState(adapter).device->driver;
+        std::vector<rhi::opengl::Uint> assignedBlocks;
+        for (const auto &entry : layout->entries) {
+            if (entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
+                continue;
+            const std::string blockName = ::vernon::runtime::openGLUniformBlockName(entry.layout.binding);
+            const rhi::opengl::Uint block = driver.getUniformBlockIndex(pipeline->native->program, blockName.c_str());
+            if (block == rhi::opengl::kInvalidIndex)
+                continue;
+            driver.uniformBlockBinding(pipeline->native->program, block, entry.layout.binding);
+            if (std::find(assignedBlocks.begin(), assignedBlocks.end(), block) == assignedBlocks.end())
+                assignedBlocks.push_back(block);
+        }
+        rhi::opengl::Int activeBlocks = 0;
+        driver.getProgramiv(pipeline->native->program, rhi::opengl::kActiveUniformBlocks, &activeBlocks);
+        if (activeBlocks < 0 || assignedBlocks.size() < static_cast<size_t>(activeBlocks))
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument,
+                {"opengl_uniform_block_has_no_planned_binding", static_cast<uint32_t>(std::max(activeBlocks, 0)),
+                 static_cast<uint32_t>(assignedBlocks.size())}})};
         for (size_t index = 0; index < layout->entries.size(); ++index) {
             const auto &entry = layout->entries[index];
             const rhi::opengl::Int location = locations[index];
@@ -663,7 +685,7 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
     std::vector<size_t> valueIndices(bindings.slots.size());
     std::vector<uint8_t> seenSlots(bindings.slots.size());
     std::vector<uint64_t> resolvedValues(bindings.slots.size());
-    std::vector<VernonRhiImageDescriptor> resolvedImageDescriptors(bindings.slots.size());
+    std::vector<RhiImageBinding> resolvedImageBindings(bindings.slots.size());
     for (size_t index = 0; index < valueCount; ++index) {
         const auto found = slotIndices.find(values[index].slot);
         if (found == slotIndices.end() || seenSlots[found->second])
@@ -734,13 +756,11 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                         vernon::ProviderErrorCode::InvalidArgument, {"opengl_buffer_range_binding_is_invalid", 0, 0}})};
             }
             if (imageBinding) {
-                VernonRhiImageDescriptor imageDescriptor{};
                 if (!defaultResource) {
-                    auto described = describeRhiImage(adapter, resource, imageDescriptor);
+                    auto described = describeRhiImageBinding(adapter, resource, resolvedImageBindings[index]);
                     if (!described)
                         return RhiAdapterResult<void>{vernon::err(std::move(described).error())};
                 }
-                resolvedImageDescriptors[index] = imageDescriptor;
             }
             resolvedValues[index] = native;
         }
@@ -775,8 +795,8 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
             slot.resourceStride = value->payload.buffer.stride;
             if (slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                 slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
-                slot.resourceTarget = resolvedImageDescriptors[index].dimension;
-                slot.textureFormat = resolvedImageDescriptors[index].format;
+                slot.resourceTarget = resolvedImageBindings[index].dimension;
+                slot.textureFormat = resolvedImageBindings[index].format;
             }
         }
         slot.flags = value->flags;
@@ -917,7 +937,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                                              : binding.access == 2 ? rhi::opengl::kWriteOnly
                                                                    : rhi::opengl::kReadWrite;
             device.driver.bindImageTexture(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource), 0,
-                                           slot.resourceTarget == VERNON_RHI_IMAGE_3D, 0, access, *format);
+                                           slot.resourceTarget != VERNON_RHI_IMAGE_2D, 0, access, *format);
         } else {
             const rhi::opengl::Enum target = binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
                                                  ? rhi::opengl::kUniformBuffer
@@ -1117,9 +1137,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             bindIndexedBuffer(driver, rhi::opengl::kShaderStorageBuffer, binding.binding, slot);
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto target = slot.resourceTarget == VERNON_RHI_IMAGE_2D   ? rhi::opengl::kTexture2D
-                                : slot.resourceTarget == VERNON_RHI_IMAGE_3D ? rhi::opengl::kTexture3D
-                                                                             : rhi::opengl::kTextureCubeMap;
+            const auto target = rhi::opengl::textureTarget(slot.resourceTarget);
             driver.activeTexture(rhi::opengl::kTexture0 + binding.binding);
             driver.bindTexture(target, static_cast<rhi::opengl::Uint>(slot.resource));
             driver.uniform1i(binding.location, static_cast<rhi::opengl::Int>(binding.binding));

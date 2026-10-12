@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import re
 import struct
 import unittest
 
@@ -367,6 +368,75 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(len(program.artifacts), 2)
         self.assertEqual(len({name for name, _ in program.artifacts}), 2)
         self.assertTrue(all(name.endswith(".glsl") for name, _ in program.artifacts))
+
+    def test_opengl_uniform_interface_is_portable_across_glsl_versions(self) -> None:
+        # `first` and `second` have identical block types, `grid` is a rank-2 non-matrix array, and `local` is a
+        # rank-3 function-local value; every one must lower without arrays of arrays.
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(\n"
+            "    first: Annotated[Tensor[f32, (3, 2, 4)], uniform()],\n"
+            "    second: Annotated[Tensor[f32, (3, 2, 4)], uniform()],\n"
+            "    grid: Annotated[Tensor[f32, (5, 6)], uniform()],\n"
+            "    scale: Annotated[f32, uniform()],\n"
+            ") -> Vector[f32, 4]:\n"
+            "    local = first * scale\n"
+            "    return Vector([local[2, 1, 3], second[1, 0, 2], grid[4, 5], 1.0])\n",
+            "portable_uniform_interface.py",
+        )
+        block = re.compile(
+            r"layout\((?:binding = (\d+), )?std140\) uniform (\w+)\s*\{\s*(?:highp )?float \w+\[(\d+)\];\s*\}"
+        )
+        plain_uniform = re.compile(r"^uniform (?:highp )?(\w+) (\w+)(\[\d+\])?;", re.MULTILINE)
+        for target, version, declares_binding in (
+            (native.Target.OPENGL, 330, False),
+            (native.Target.OPENGL, 410, False),
+            (native.Target.OPENGL, 460, True),
+            (native.Target.OPENGL_ES, 300, False),
+            (native.Target.OPENGL_ES, 310, True),
+        ):
+            with self.subTest(target=target, version=version):
+                program = native.Compiler().compile_program_result(module, target, {"version": version})
+                self.assertTrue(program.ok, program.diagnostics)
+                source = "".join(bytes(artifact).decode() for _, artifact in program.artifacts)
+                self.assertNotIn("#extension", source)
+                self.assertNotIn("][", source)
+                self.assertEqual(
+                    block.findall(source),
+                    [
+                        ("0" if declares_binding else "", "vernon_uniform_binding_0", "24"),
+                        ("1" if declares_binding else "", "vernon_uniform_binding_1", "24"),
+                        ("2" if declares_binding else "", "vernon_uniform_binding_2", "30"),
+                    ],
+                )
+                self.assertEqual(plain_uniform.findall(source), [("float", "scale", "")])
+
+    def test_vertex_position_is_invariant(self) -> None:
+        compiler = native.Compiler()
+        glsl = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, {"version": 330})
+        self.assertTrue(glsl.ok, glsl.diagnostics)
+        sources = [bytes(artifact).decode() for _, artifact in glsl.artifacts]
+        self.assertEqual(sum("invariant gl_Position;" in source for source in sources), 1)
+
+        spirv = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.VULKAN)
+        self.assertTrue(spirv.ok, spirv.diagnostics)
+        op_decorate, builtin, invariant, position = 71, 11, 18, 0
+        decorated_positions = 0
+        for name, artifact in spirv.artifacts:
+            words = struct.unpack(f"<{len(artifact) // 4}I", bytes(artifact))
+            decorations: dict[int, set[tuple[int, ...]]] = {}
+            offset = 5
+            while offset < len(words):
+                count, opcode = words[offset] >> 16, words[offset] & 0xFFFF
+                if opcode == op_decorate:
+                    decorations.setdefault(words[offset + 1], set()).add(tuple(words[offset + 2 : offset + count]))
+                offset += count
+            positions = [target for target, values in decorations.items() if (builtin, position) in values]
+            with self.subTest(artifact=name):
+                self.assertTrue(all((invariant,) in decorations[target] for target in positions))
+            decorated_positions += len(positions)
+        self.assertEqual(decorated_positions, 1)
 
     def test_cpu_entry_reflection_and_result_lifetime(self) -> None:
 

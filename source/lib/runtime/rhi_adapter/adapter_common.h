@@ -122,9 +122,15 @@ RhiAdapterResult<uint64_t> resolveRhiResource(VernonRuntimeRhiAdapter &adapter,
 RhiAdapterResult<uint64_t> resolveCommandRhiResource(VernonRuntimeRhiAdapter &adapter,
                                                      VernonRuntimeProviderObject encoder,
                                                      VernonRuntimeProviderResourceReference resource) noexcept;
-RhiAdapterResult<void> describeRhiImage(VernonRuntimeRhiAdapter &adapter,
-                                        VernonRuntimeProviderResourceReference resource,
-                                        VernonRhiImageDescriptor &descriptor) noexcept;
+struct RhiImageBinding {
+    VernonRhiImageDimension dimension{VERNON_RHI_IMAGE_2D};
+    VernonRhiFormat format{VERNON_RHI_FORMAT_UNDEFINED};
+};
+
+// The dimension and format shaders observe: an image view's own, or the image's for a raw image.
+RhiAdapterResult<void> describeRhiImageBinding(VernonRuntimeRhiAdapter &adapter,
+                                               VernonRuntimeProviderResourceReference resource,
+                                               RhiImageBinding &binding) noexcept;
 RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
                                              VernonRuntimeProviderResourceReference resource,
                                              VernonRuntimeProviderImageDescription &description) noexcept;

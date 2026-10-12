@@ -9,7 +9,7 @@ from .._runtime.pipeline import Pipeline
 from ..ad import ProgramExpression
 from ..module import Module
 from ..program import ModuleVjpExpression
-from ..types import Specialization, SpecializationAssignment, specialization_assignment
+from ..types import Specialization, SpecializationAssignment, check_type_identity_sources, specialization_assignment
 
 VARIANT_CAP = 16
 ProgramAssetProgram = Kernel | Pipeline | Module | ProgramExpression | ModuleVjpExpression
@@ -45,6 +45,7 @@ def _validated_variants(
         raise ValueError("a Program Asset must declare at least one variant")
     if len(canonical) > VARIANT_CAP:
         raise ValueError(f"a Program Asset declares {len(canonical)} variants, exceeding variant cap {VARIANT_CAP}")
+    check_type_identity_sources(canonical)
     if len(set(canonical)) != len(canonical):
         raise ValueError("Program Asset variants contain duplicate canonical keys")
     return canonical

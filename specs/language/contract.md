@@ -299,9 +299,10 @@ allocation, failure, and synchronization policies remain explicit.
 ## 4. Resource types
 
 `Texture` and `Sampler` are opaque Resource handles. A sampled texture is
-`Texture[dimension, sample_type]`, where `dimension` is `2d`, `3d`, or `cube`
-and `sample_type` is `f32`, `i32`, or `u32`. A storage texture is
-`Texture[dimension, format, access]`, where `dimension` is `2d` or `3d`,
+`Texture[dimension, sample_type]`, where `dimension` is `2d`, `3d`, `cube`,
+`2d_array`, or `cube_array` and `sample_type` is `f32`, `i32`, or `u32`. A
+storage texture is `Texture[dimension, format, access]`, where `dimension` is
+`2d`, `3d`, or `2d_array`,
 `access` is `read`, `write`, or `read_write`, and format is one of
 `r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
 `rgba16_float`, or `rgba32_float`.
@@ -326,7 +327,18 @@ The supported texture operation regions are:
   coordinates and enforce the declared read/write access.
 
 Sampling coordinates are floating Tensor Values with rank determined by the
-Texture dimension, and sampling LOD is a floating Scalar. One Texture entry
+Texture dimension, and sampling LOD is a floating Scalar. Arrayed dimensions
+follow SPIR-V: the layer is the last coordinate component and `texture_size`
+appends the layer count. A `cube_array` layer selects a whole cube.
+
+| Dimension | Sample coordinates | Storage coordinates | `texture_size` |
+|---|---|---|---|
+| `2d` | `(u, v)` | `(x, y)` | `(w, h)` |
+| `3d` | `(u, v, w)` | `(x, y, z)` | `(w, h, d)` |
+| `cube` | `(x, y, z)` direction | — | `(w, h)` |
+| `2d_array` | `(u, v, layer)` | `(x, y, layer)` | `(w, h, layers)` |
+| `cube_array` | `(x, y, z, cube)` | — | `(w, h, cubes)` |
+ One Texture entry
 parameter cannot mix implicit and explicit sampler forms in the same stage.
 Implicit sampling creates a deterministic sampler interface binding.
 
@@ -588,9 +600,17 @@ helper specialization chain. Methods are not first-class values.
 - Conformance is checked at each use, not declared.
 
 A declared type's canonical identity is `<module>:<Class>`, where `<module>`
-is its defining source path relative to the project root (the nearest
-directory containing `pyproject.toml`), with `.` separators and no `.py`
-suffix. A scalar type's identity is its scalar name. A class without such a
+is its defining source path relative to that source's own project root (the
+nearest directory containing `pyproject.toml`), with `.` separators and no
+`.py` suffix. The type may belong to a different project than the template it
+specializes: the graph loads it from its declaring file, and its modules
+import absolutely from their own project root before the template's. Two
+modules of different projects with the same relative path fail with
+`share the project module path`, because the path names their emitted
+symbols. Variant keys are scoped to one Program, so identities need only be
+unique among one Program's variants: types from two files with one identity
+in the same Program fail with `share the identity`. A scalar type's identity is
+its scalar name. A class without such a
 module-level path fails with `type value has no portable identity`, and a value
 that is neither fails with
 `type specialization requires a declared type or scalar type`. A missing

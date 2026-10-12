@@ -20,8 +20,8 @@ extern "C" VernonRhiDevice vernonRhiCreateDevice(const VernonRhiOwnedDeviceDescr
     return vernon::rhi::publicHandleBoundary([&] { return vernon::rhi::createDeviceImpl(descriptor); }, invalid);
 }
 
-extern "C" void vernonRhiDestroyDevice(VernonRhiDevice device) {
-    vernon::rhi::publicDestroyBoundary([&] { return vernon::rhi::destroyDeviceImpl(device); });
+extern "C" VernonRhiStatus vernonRhiDestroyDevice(VernonRhiDevice device) {
+    return vernon::rhi::publicStatusBoundary([&] { return vernon::rhi::destroyDeviceImpl(device); });
 }
 
 extern "C" VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device) {

@@ -38,18 +38,13 @@ def _physical_value_profile(target: object, transport: object) -> tuple[str, str
         raise ProgramCompileError("packed value argument is missing its reflected transport")
     if transport == "storage_buffer":
         return "vulkan_std430_storage_buffer", transport
-    if target == "vulkan":
-        if transport == "uniform_buffer":
-            return "vulkan_std140_uniform_buffer", transport
-        if transport == "push_constant":
+    if target in {"vulkan", "directx", "opengl", "opengles"} and transport == "uniform_buffer":
+        return "vulkan_std140_uniform_buffer", transport
+    if transport == "push_constant":
+        if target in {"vulkan", "directx"}:
             return "vulkan_push_constant", transport
-    if target in {"opengl", "opengles"}:
-        if transport == "uniform_buffer":
-            return "vulkan_std140_uniform_buffer", transport
-        if transport == "push_constant":
+        if target in {"opengl", "opengles"}:
             return "opengl_native_uniform", "native_uniform"
-    if target == "directx" and transport in {"uniform_buffer", "push_constant"}:
-        return "directx_constant_buffer", transport
     raise ProgramCompileError(f"unsupported physical value transport {transport!r} for target {target!r}")
 
 

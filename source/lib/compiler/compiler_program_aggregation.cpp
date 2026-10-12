@@ -19,19 +19,22 @@ bool appendPortableFeatures(llvm::json::Object &portable, const llvm::json::Obje
     const llvm::json::Array *incoming = reflection.getArray("required_features");
     if (!incoming)
         return true;
-    std::set<std::string> known;
+    std::set<std::string> merged;
     for (const llvm::json::Value &feature : features)
         if (const std::optional<llvm::StringRef> name = feature.getAsString())
-            known.insert(name->str());
+            merged.insert(name->str());
     for (const llvm::json::Value &feature : *incoming) {
         const std::optional<llvm::StringRef> name = feature.getAsString();
         if (!name || name->empty()) {
             error = "compiled Program module has an invalid required feature";
             return false;
         }
-        if (known.insert(name->str()).second)
-            features.emplace_back(name->str());
+        merged.insert(name->str());
     }
+    // The manifest accepts only a canonical feature set, and each module's own set is sorted only within itself.
+    features.clear();
+    for (const std::string &feature : merged)
+        features.emplace_back(feature);
     return true;
 }
 

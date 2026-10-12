@@ -162,10 +162,14 @@ typedef enum VernonRhiFormat {
     VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT = 14
 } VernonRhiFormat;
 
+/* Layered dimensions (2D_ARRAY, CUBE, CUBE_ARRAY) address layers through array_layer; a cube-array layer is
+ * cube * 6 + face. CUBE images hold exactly 6 layers and CUBE_ARRAY images a nonzero multiple of 6. */
 typedef enum VernonRhiImageDimension {
     VERNON_RHI_IMAGE_2D = 0,
     VERNON_RHI_IMAGE_3D = 1,
-    VERNON_RHI_IMAGE_CUBE = 2
+    VERNON_RHI_IMAGE_CUBE = 2,
+    VERNON_RHI_IMAGE_2D_ARRAY = 3,
+    VERNON_RHI_IMAGE_CUBE_ARRAY = 4
 } VernonRhiImageDimension;
 
 typedef enum VernonRhiImageDataType {
@@ -630,7 +634,9 @@ VERNON_RHI_CAPI uint32_t vernonRhiGetApiVersion(void);
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateDevice(const VernonRhiOwnedDeviceDescriptor *descriptor);
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
                                                             uint32_t embedded_profile);
-VERNON_RHI_CAPI void vernonRhiDestroyDevice(VernonRhiDevice device);
+// Returns VERNON_RHI_STATUS_INVALID_ARGUMENT, leaving the device valid, while
+// the device still owns child resources or is retained by a Runtime context.
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDestroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
                                                                 const VernonRhiCommandLimits *limits);

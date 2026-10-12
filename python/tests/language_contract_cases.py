@@ -582,6 +582,33 @@ def bad(image: Texture["cube", rgba32_float, write]) -> None:
         capabilities=frozenset({"compute", "storage_texture"}),
     ),
     _invalid_source(
+        "LANG-RESOURCE-002",
+        "cube-array-storage",
+        'Texture["cube_array", rgba32_float, write]',
+        """
+from vernon_dsl import *
+@kernel
+def bad(image: Texture["cube_array", rgba32_float, write]) -> None:
+    pass
+""",
+        "storage Texture dimension",
+        capabilities=frozenset({"compute", "storage_texture"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-SAMPLE-EXPLICIT",
+        "cube-array-coordinate-rank",
+        "texture_sample cube_array coordinates",
+        """
+from vernon_dsl import *
+@fragment
+def sample(image: Texture["cube_array", f32], sampler: Sampler,
+           direction: Vector[f32, 3]) -> Vector[f32, 4]:
+    return texture_sample(image, sampler, direction)
+""",
+        "4-component",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
         "LANG-TEXTURE-SAMPLE-IMPLICIT",
         "vertex-without-lod",
         "texture_sample(texture, coordinates)",
@@ -679,8 +706,41 @@ def sample(
         capabilities=frozenset({"graphics", "texture_sampler"}),
         expected=f'!vernon.texture<"{dimension}", f32, "unknown", "sampled">',
     )
-    for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3))
+    for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3), ("2d_array", 3), ("cube_array", 4))
 ) + (
+    _valid_source(
+        "LANG-TEXTURE-STORAGE",
+        "array-layer-store",
+        "texture_store(write_array_texture, coordinate_and_layer, value)",
+        """
+from vernon_dsl import *
+
+@kernel
+def store(
+    image: Annotated[Texture["2d_array", rgba32_float, write], resource(set=0, binding=0)],
+    coordinate: Vector[i32, 3],
+    value: Vector[f32, 4],
+) -> None:
+    texture_store(image, coordinate, value)
+""",
+        valid_regions=frozenset({"compute"}),
+        capabilities=frozenset({"compute", "storage_texture"}),
+        expected='!vernon.texture<"2d_array", f32, "rgba32_float", "write">',
+    ),
+    _valid_source(
+        "LANG-TEXTURE-SIZE",
+        "array-layer-count",
+        "texture_size(array_texture)",
+        """
+from vernon_dsl import *
+@fragment
+def main(layers: Texture["2d_array", f32], cubes: Texture["cube_array", f32]) -> Vector[u32, 3]:
+    return texture_size(layers) + texture_size(cubes, 1)
+""",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+        expected="-> tensor<3xi32>",
+    ),
     _valid_source(
         "LANG-TEXTURE-STORAGE",
         "three-dimensional-store",

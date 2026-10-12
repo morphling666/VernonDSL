@@ -412,6 +412,28 @@ provider owns device, queue, allocators, fences, resources, descriptor heaps,
 and transient upload/readback storage. Tests may select WARP through an
 internal facility; normal creation selects hardware adapters.
 
+Inline uniforms lower to the same SPIR-V push-constant block as on Vulkan, in
+the `vulkan_push_constant` layout. SPIRV-Cross emits that block as an explicit
+`cbuffer` at b0 space0 with `packoffset` taken from the SPIR-V member offsets,
+and the root signature declares the same register as one 32-bit root-constant
+parameter per stage (`kDirectXRootConstantRegister` in
+`runtime/interface_names.h`). The adapter places each value at its running
+offset aligned to the reflected element alignment, the rule the SPIR-V
+lowering uses, so every byte offset is decided by the compiler-owned layout.
+Loose HLSL globals were rejected: DXC packs them into an implicit `$Globals`
+buffer with its own packing rules and auto-assigns its register, so the
+runtime would have to mirror HLSL packing and the binding would depend on
+which registers were free. Push-constant matrix columns use a 16-byte stride on
+every target, because an HLSL `cbuffer` starts each matrix column at a register
+and `packoffset` cannot express the tighter std430 stride of 2-row matrices.
+
+Descriptor set N uses register space N + 1
+(`kDirectXDescriptorSetRegisterSpaceOffset`): the compiler shifts every
+resource before emitting HLSL, and the adapter shifts every descriptor range,
+so space 0 holds only the root constants. Otherwise the uniform block planned
+at set 0 binding 0 would also take b0 space0. A constant-buffer block takes its
+layout from the std140 SPIR-V interface decorations, as on every other backend.
+
 ### Metal
 
 Metal consumes cooked MSL on supported Apple platforms. Runtime validates MSL,
@@ -427,6 +449,18 @@ link a window-system library.
 Each backend accepts only artifacts for its matching GLSL profile. Compute
 requires OpenGL 4.3+ or OpenGL ES 3.1+. Capabilities that depend on API version
 are queried after context creation.
+
+Graphics GLSL targets 3.30, which cannot declare `layout(binding)` on a uniform
+block, so every block links at binding point 0. The compiler names each GLSL
+uniform block from its SPIR-V binding (`openGLUniformBlockName`, shared through
+`runtime/interface_names.h`). After linking, the adapter looks up each
+uniform-buffer entry's block by its planned binding and calls
+`glUniformBlockBinding`. Pipeline creation fails if any active block is left
+unassigned, because that block would silently read binding point 0. Names come
+from the binding rather than the source name because source names are
+sanitized, uniqued per stage, or generated (TensorView metadata carriers). The
+`GL_ARB_shading_language_420pack` alternative was rejected because macOS
+OpenGL 4.1 does not expose it.
 
 The context owner outlives RHI and Runtime children. All GL allocation,
 transfer, deletion, and invocation operations first make the associated
@@ -504,7 +538,14 @@ admission and remains alive until its final invocation is destroyed. Context
 close therefore rejects live direct or transitive work without relying on raw
 pointer counts. Device-backed contexts and their RHI adapters each retain an
 explicit RHI device-child lease, so an attempted device destroy cannot
-invalidate adapter state.
+invalidate adapter state. `vernonRhiDestroyDevice` then returns
+`VERNON_RHI_STATUS_INVALID_ARGUMENT` and leaves the device published; the owner
+must release its children and destroy again, because a device still published
+at process exit aborts in the device registry's destructor. Every destroy
+failure is reported rather than aborting. A backend teardown failure rolls the
+registry's close and destroy guards back, returns
+`VERNON_RHI_STATUS_INTERNAL_ERROR`, and also leaves the device published and
+retryable.
 
 RuntimeCore publishes an immutable binding revision containing the provider
 object, retained resources, and canonical value snapshot. Replacement

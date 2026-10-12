@@ -651,16 +651,20 @@ Python launch shape into the descriptor.
 `alignment` is a positive power of two. `memory` and `usage` use enums defined
 in Appendix B.
 
-Image `dimension` is REQUIRED and is `1d`, `2d`, `3d`, or `cube`. Owned image
+Image `dimension` is REQUIRED and is `2d`, `3d`, `cube`, `2d_array`, or
+`cube_array`. Owned image Storage is `2d` or `3d`, because Program values carry
+no layer count; layered images are borrowed. Owned image
 Storage MUST contain `extent` with exactly three positive literal or
 ControlExpr components; it is allocation authority. Borrowed image Storage
 MUST omit `extent`: its concrete extent is taken from the image view bound to
 the current invocation. Zero, negative, null, empty-array, and other
 placeholder image extents are invalid. Canonical owned static shapes are
-`1d = [W,1,1]`, `2d = [W,H,1]`, `cube = [W,H,1]` with `W = H`, and
-`3d = [W,H,D]`.
-Format, sample count, mip levels, array layers, aspects, and usage are exact
-creation or provider requirements. Opaque contract identity is exact; opaque
+`2d = [W,H,1]` and `3d = [W,H,D]`.
+Format, sample count, mip levels, aspects, and usage are exact
+creation or provider requirements. `array_layers` is exact for owned Storage;
+for borrowed Storage it is the minimum layer count of the bound view (6 for
+`cube` and `cube_array`, otherwise 1). A borrowed binding is checked against
+the bound view's dimension, so a `2d` view of one array layer satisfies `2d`. Opaque contract identity is exact; opaque
 storage has no byte range, image subresource, or ValueLayout.
 
 For owned Storage, the descriptor is exact runtime creation authority. The

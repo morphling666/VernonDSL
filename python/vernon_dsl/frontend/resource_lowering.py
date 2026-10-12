@@ -7,6 +7,7 @@ from ..language.stage_registry import GRAPHICS_STAGES
 from ..shader_contracts import resource_stage_error, texture_sampling_contract
 from .interfaces import GeneratedInterfacePlan
 from .lowering_types import DslType, ModuleContext, Value
+from .texture_dimensions import SAMPLE_COORDINATE_RANK
 
 
 class ResourceEmitter(Protocol):
@@ -63,7 +64,7 @@ def lower_texture_sample(
     element = texture.type.arguments[1]
     assert isinstance(element, DslType)
     dimension = texture.type.arguments[0]
-    coordinate_rank = {"2d": 2, "3d": 3, "cube": 3}[dimension]
+    coordinate_rank = SAMPLE_COORDINATE_RANK[dimension]
     if (
         coordinates.type.kind != "tensor"
         or coordinates.type.arguments != (element, coordinate_rank)

@@ -1,5 +1,6 @@
 #include "metal_backend.h"
 #include "image_data_layout.h"
+#include "image_descriptor_validation.h"
 #include "sampler_filter.h"
 
 #import <Foundation/Foundation.h>
@@ -12,6 +13,22 @@
 
 namespace vernon::rhi::metal {
 namespace {
+
+MTLTextureType metalTextureType(VernonRhiImageDimension dimension) {
+    switch (dimension) {
+    case VERNON_RHI_IMAGE_3D:
+        return MTLTextureType3D;
+    case VERNON_RHI_IMAGE_CUBE:
+        return MTLTextureTypeCube;
+    case VERNON_RHI_IMAGE_2D_ARRAY:
+        return MTLTextureType2DArray;
+    case VERNON_RHI_IMAGE_CUBE_ARRAY:
+        return MTLTextureTypeCubeArray;
+    case VERNON_RHI_IMAGE_2D:
+        break;
+    }
+    return MTLTextureType2D;
+}
 
 void setCommandError(std::string &error, id<MTLCommandBuffer> commandBuffer, const char *operation) {
     NSString *description = commandBuffer.error.localizedDescription;
@@ -342,19 +359,11 @@ bool DeviceState::createImage(Image &image, const VernonRhiImageDescriptor &desc
         native.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     if (descriptor.usage & (VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT))
         native.usage |= MTLTextureUsageRenderTarget;
-    if (descriptor.dimension == VERNON_RHI_IMAGE_3D) {
-        native.textureType = MTLTextureType3D;
-        native.arrayLength = 1;
-    } else if (descriptor.dimension == VERNON_RHI_IMAGE_CUBE) {
-        native.textureType = MTLTextureTypeCube;
-        native.arrayLength = 1;
-    } else if (descriptor.array_layers > 1) {
-        native.textureType = MTLTextureType2DArray;
-        native.arrayLength = descriptor.array_layers;
-    } else {
-        native.textureType = MTLTextureType2D;
-        native.arrayLength = 1;
-    }
+    native.textureType = metalTextureType(descriptor.dimension);
+    native.arrayLength = descriptor.dimension == VERNON_RHI_IMAGE_3D ? 1
+                         : vernon::rhi::cubeImageDimension(descriptor.dimension)
+                             ? descriptor.array_layers / vernon::rhi::cubeFaceCount
+                             : descriptor.array_layers;
     image.texture = [device newTextureWithDescriptor:native];
     if (image.texture)
         return true;
@@ -820,14 +829,8 @@ bool DeviceState::generateImageMipmaps(const Image &image, uint32_t mipLevels, s
 bool DeviceState::createImageView(ImageView &view, const Image &image,
                                   const VernonRhiImageViewDescriptor &descriptor, std::string &error) {
     const MTLPixelFormat format = static_cast<MTLPixelFormat>(pixelFormat(descriptor.format));
-    const MTLTextureType textureType =
-        descriptor.dimension == VERNON_RHI_IMAGE_3D
-            ? MTLTextureType3D
-        : descriptor.dimension == VERNON_RHI_IMAGE_CUBE ? MTLTextureTypeCube
-        : descriptor.array_layer_count > 1                 ? MTLTextureType2DArray
-                                                           : MTLTextureType2D;
     view.texture = [image.texture newTextureViewWithPixelFormat:format
-                                                   textureType:textureType
+                                                   textureType:metalTextureType(descriptor.dimension)
                                                         levels:NSMakeRange(descriptor.base_mip_level,
                                                                            descriptor.mip_level_count)
                                                         slices:NSMakeRange(descriptor.base_array_layer,

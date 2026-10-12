@@ -45,7 +45,8 @@ TEST(CudaRhiAdapter, BorrowsOwnedRhiDeviceAndReferencesGenerationalBuffer) {
     EXPECT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, buffer, 0, 16, &reference),
               VERNON_STATUS_INVALID_ARGUMENT);
     vernonRuntimeRhiAdapterDestroy(adapter);
-    vernonRhiDestroyDevice(device);
+    EXPECT_EQ(vernonRhiDestroyDevice(device), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDestroyDevice(device), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
 TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {

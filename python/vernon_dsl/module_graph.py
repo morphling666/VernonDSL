@@ -5,7 +5,7 @@ import copy
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import TYPE_CHECKING, NoReturn
 
 from .diagnostics import CompileError, SourceLocation
@@ -122,6 +122,23 @@ class ProjectEntryResolution:
     decorators: frozenset[str]
 
 
+class _AbsentFiles:
+    """Source paths a lookup probed and missed. Graphs restored from one snapshot record into it concurrently."""
+
+    def __init__(self) -> None:
+        self._paths: set[Path] = set()
+        self._lock = Lock()
+
+    def add(self, path: Path) -> None:
+        with self._lock:
+            self._paths.add(path)
+
+    def any_created(self) -> bool:
+        with self._lock:
+            paths = tuple(self._paths)
+        return any(path.is_file() for path in paths)
+
+
 @dataclass(frozen=True)
 class _ModuleGraphSnapshot:
     modules: dict[Path, _Module]
@@ -129,23 +146,41 @@ class _ModuleGraphSnapshot:
     abi_structs: dict[str, tuple[_Module, ast.ClassDef]]
     reachable_symbols: frozenset[tuple[Path, str]]
     dependencies: tuple[tuple[Path, str], ...]
+    # Shared with the graphs restored from this snapshot, not copied: they keep resolving imports lazily into the
+    # same shared modules, so their misses must reach the snapshot too.
+    absent_files: _AbsentFiles
+
+
+_CacheKey = tuple[Path, Path | None, str | None, tuple[tuple[str, str, str], ...]]
 
 
 class _ModuleGraphCache:
     """Caches discovery; `ModuleGraph.load` applies the specialization key.
 
     Discovery depends on the key only through its type assignments, whose defining modules join the graph, so the
-    type assignments are part of the cache key and scalar values are not.
+    type assignments are part of the cache key and scalar values are not. A snapshot is valid while every file it
+    read is unchanged and every file a lookup probed and missed is still absent, since such a file would now win
+    import or project-root resolution.
     """
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[Path, str | None, tuple[tuple[str, str], ...]], _ModuleGraphSnapshot] = {}
+        self._entries: dict[_CacheKey, _ModuleGraphSnapshot] = {}
         self._parsed_modules: dict[Path, tuple[str, _Module]] = {}
         self._lock = RLock()
 
     @staticmethod
-    def _key(graph: "ModuleGraph") -> tuple[Path, str | None, tuple[tuple[str, str], ...]]:
-        return graph.input_path, graph.entry, tuple(sorted(graph.type_assignments.items()))
+    def _key(graph: "ModuleGraph") -> _CacheKey:
+        return (
+            graph.input_path,
+            graph.project_root,
+            graph.entry,
+            tuple(
+                sorted(
+                    (name, identity, str(graph.type_sources.get(name, "")))
+                    for name, identity in graph.type_assignments.items()
+                )
+            ),
+        )
 
     def restore(self, graph: "ModuleGraph") -> bool:
         key = self._key(graph)
@@ -153,7 +188,10 @@ class _ModuleGraphCache:
             snapshot = self._entries.get(key)
         if snapshot is None:
             return False
-        if not all(source_file_digest(path) == digest for path, digest in snapshot.dependencies):
+        if (
+            not all(source_file_digest(path) == digest for path, digest in snapshot.dependencies)
+            or snapshot.absent_files.any_created()
+        ):
             with self._lock:
                 if self._entries.get(key) is snapshot:
                     self._entries.pop(key)
@@ -162,6 +200,7 @@ class _ModuleGraphCache:
         graph.order = list(snapshot.order)
         graph._abi_structs = snapshot.abi_structs.copy()
         graph.reachable_symbols = set(snapshot.reachable_symbols)
+        graph.absent_files = snapshot.absent_files
         return True
 
     def store(self, graph: "ModuleGraph") -> None:
@@ -172,6 +211,7 @@ class _ModuleGraphCache:
             graph._abi_structs.copy(),
             frozenset(graph.reachable_symbols),
             dependencies,
+            graph.absent_files,
         )
         key = self._key(graph)
         with self._lock:
@@ -492,8 +532,8 @@ class _Specializer(ast.NodeTransformer):
                 return self._specialization_value(node, *declaration)
             if isinstance(node, ast.Name) and node.id in self.module.constants:
                 return self.module.constants[node.id]
-            identity = self.graph._type_reference(self.module, node)
-            return _TypeReference(identity) if identity is not None else _NOT_STATIC
+            reference = self.graph._type_reference(self.module, node)
+            return _TypeReference(reference[0]) if reference is not None else _NOT_STATIC
         if isinstance(node, ast.UnaryOp):
             operand = self._static_value(node.operand)
             if operand is _NOT_STATIC:
@@ -685,12 +725,41 @@ class ModuleGraph:
         self.type_assignments = {
             assignment.name: str(assignment.value) for assignment in specializations if assignment.type == "type"
         }
+        self.type_sources = {
+            assignment.name: assignment.type_source.resolve()
+            for assignment in specializations
+            if assignment.type == "type" and assignment.type_source is not None
+        }
         self.entry = entry
         self.modules: dict[Path, _Module] = {}
         self.order: list[_Module] = []
         self._abi_structs: dict[str, tuple[_Module, ast.ClassDef]] = {}
         self.reachable_symbols: set[tuple[Path, str]] = set()
         self._resolving_symbols: list[tuple[Path, str]] = []
+        self.absent_files = _AbsentFiles()
+
+    def _is_file(self, path: Path) -> bool:
+        """Probes a candidate source; a miss is recorded because creating that file would change the resolution."""
+
+        if path.is_file():
+            return True
+        self.absent_files.add(path.absolute())
+        return False
+
+    def _project_root(self, start: Path) -> Path | None:
+        """`source_identity.project_root`, with every missed `pyproject.toml` recorded."""
+
+        for candidate in (start, *start.parents):
+            if self._is_file(candidate / "pyproject.toml"):
+                return candidate.resolve()
+        return None
+
+    def _project_module_name(self, path: Path) -> str | None:
+        """The module name a type identity uses for `path`: relative to the file's own project root, as
+        `vd.types.type_identity` names it."""
+
+        root = self._project_root(path.parent)
+        return project_module_name(path, root) if root is not None else None
 
     def discover(self) -> _Module:
         root = self._load_module(self.input_path, self._module_name(self.input_path))
@@ -709,8 +778,8 @@ class ModuleGraph:
         for seed in (*seeds, *root.specializations):
             self._touch_symbol(root, seed)
         # A type value's defining module joins the graph as if imported, so its source is a dependency of the key.
-        for identity in self.type_assignments.values():
-            declaration = self._declared_type(root, root.tree, identity).declaration
+        for name, identity in self.type_assignments.items():
+            declaration = self._declared_type(root, root.tree, identity, self.type_sources.get(name)).declaration
             if declaration is not None:
                 self._touch_symbol(declaration[0], declaration[1].name)
         return root
@@ -860,6 +929,14 @@ class ModuleGraph:
         path = path.resolve()
         if path in self.modules:
             return self.modules[path]
+        # Display paths name emitted symbols, so two projects defining the same module path would collide.
+        display = self._display_path(path)
+        clash = next((other for other in self.modules if self._display_path(other) == display), None)
+        if clash is not None:
+            raise CompileError(
+                f"modules {clash.as_posix()} and {path.as_posix()} share the project module path '{display}'",
+                SourceLocation(str(path), 1, 1),
+            )
         cached = _module_graph_cache.restore_parsed_module(path)
         if cached is not None:
             cached.name = name
@@ -1063,12 +1140,14 @@ class ModuleGraph:
                 base = base.parent
             bases.append(base)
         else:
-            bases.extend((module.path.parent, self.search_root))
+            # A module from another project (a type value's) imports absolutely from its own project root first.
+            own_root = self._project_root(module.path.parent)
+            bases.extend((module.path.parent, *((own_root,) if own_root is not None else ()), self.search_root))
         for base in dict.fromkeys(bases):
             candidate = base.joinpath(*parts)
             paths = (candidate.with_suffix(".py"), candidate / "__init__.py")
             for path in paths:
-                if path.is_file():
+                if self._is_file(path):
                     return path.resolve()
         return None
 
@@ -1125,7 +1204,7 @@ class ModuleGraph:
         identity = self.type_assignments.get(name)
         if identity is None:
             self._error(module, node, f"missing type specialization '{name}'")
-        return self._declared_type(module, node, identity)
+        return self._declared_type(module, node, identity, self.type_sources.get(name))
 
     def _bound_type(self, module: _Module, node: ast.AST) -> _TypeValue | None:
         """The type value bound to the type specialization `node` names, if it names one."""
@@ -1135,16 +1214,31 @@ class ModuleGraph:
             return None
         return self._type_value(module, node, declaration[0])
 
-    def _declared_type(self, module: _Module, node: ast.AST, identity: str) -> _TypeValue:
-        """Resolves a canonical type identity: a scalar name, or `<module>:<Class>` loaded from its defining source."""
+    def _declared_type(
+        self, module: _Module, node: ast.AST, identity: str, declared_in: Path | None = None
+    ) -> _TypeValue:
+        """Resolves a canonical type identity: a scalar name, or `<module>:<Class>` loaded from its defining source.
+
+        `declared_in` is the file the caller found the type in. Without it, the module is looked up under this
+        program's project root, which only finds types of the same project.
+        """
 
         if identity in SCALAR_TYPES:
             return _TypeValue(identity)
         module_name, separator, class_name = identity.partition(":")
-        source = (
-            project_module_path(module_name, self.project_root) if separator and self.project_root is not None else None
-        )
-        if source is None or not source.is_file():
+        if not separator:
+            self._error(module, node, f"type value has no portable identity: '{identity}' is not '<module>:<Class>'")
+        if declared_in is not None:
+            if self._project_module_name(declared_in) != module_name:
+                self._error(
+                    module,
+                    node,
+                    f"type value '{identity}' does not name its declaring module {declared_in.as_posix()}",
+                )
+            source: Path | None = declared_in
+        else:
+            source = project_module_path(module_name, self.project_root) if self.project_root is not None else None
+        if source is None or not self._is_file(source):
             self._error(module, node, f"type value has no portable identity: '{identity}' names no source module")
         owner = self._load_module(source, module_name)
         declaration = owner.definitions.get(class_name)
@@ -1162,25 +1256,26 @@ class ModuleGraph:
             self._materialize_import(module, head)
         return member
 
-    def _type_reference(self, module: _Module, node: ast.AST) -> str | None:
-        """The identity of the scalar type or declared class `node` names, materializing imports on the way."""
+    def _type_reference(self, module: _Module, node: ast.AST) -> tuple[str, Path | None] | None:
+        """The identity of the scalar type or declared class `node` names and the file declaring a class,
+        materializing imports on the way."""
 
         spelling = _dotted_name(node) or ""
         if spelling.split(".")[-1] in SCALAR_TYPES:
-            return spelling.split(".")[-1]
+            return spelling.split(".")[-1], None
         member = self._materialize_reference(module, node)
         resolved = self._resolve_class(module, node) if "." not in member else None
         if resolved is None or not _is_dsl_class(resolved[1]):
             return None
         owner, declaration = resolved
-        module_name = project_module_name(owner.path, self.project_root) if self.project_root is not None else None
+        module_name = self._project_module_name(owner.path)
         if module_name is None:
             self._error(
                 module,
                 node,
                 f"type value has no portable identity: '{declaration.name}' is not defined under a project root",
             )
-        return f"{module_name}:{declaration.name}"
+        return f"{module_name}:{declaration.name}", owner.path
 
     def _parse_abi_type(self, module: _Module, node: ast.AST) -> ConcreteType:
         if isinstance(node, ast.Subscript) and (_dotted_name(node.value) or "").split(".")[-1] == "Annotated":
@@ -1431,10 +1526,20 @@ class ModuleGraph:
         return f"__vernon_{normalized}__"
 
     def _display_path(self, path: Path) -> str:
+        """The checkout-independent name of a module file: relative to this program's root, or for a module of
+        another project (a type value's), relative to that project's root."""
+
         try:
             return path.relative_to(self.search_root).as_posix()
         except ValueError:
-            return path.as_posix()
+            pass
+        own_root = self._project_root(path.parent)
+        if own_root is not None:
+            try:
+                return path.relative_to(own_root).as_posix()
+            except ValueError:
+                pass
+        return path.as_posix()
 
     def _module_name(self, path: Path) -> str:
         return self._display_path(path).removesuffix(".py").replace("/", ".")
@@ -1487,8 +1592,9 @@ def project_specialization(input_path: str | Path, expression: ast.expr) -> tupl
     return graph._resolve_specialization(root, expression)
 
 
-def project_type_identity(input_path: str | Path, expression: ast.expr) -> str | None:
-    """The canonical identity of the type a module-level expression of `input_path` names, read without running it."""
+def project_type_reference(input_path: str | Path, expression: ast.expr) -> tuple[str, Path | None] | None:
+    """The canonical identity of the type a module-level expression of `input_path` names and the file declaring it,
+    read without running it."""
 
     graph, root = _private_project_root(input_path)
     return graph._type_reference(root, expression)

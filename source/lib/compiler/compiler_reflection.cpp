@@ -1106,7 +1106,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                               "vulkan_std430_storage_buffer");
             addPhysicalLayout(mlir::vernon::PhysicalAbiProfile::VulkanPushConstant, "vulkan_push_constant");
             addPhysicalLayout(mlir::vernon::PhysicalAbiProfile::OpenGLNativeUniform, "opengl_native_uniform");
-            addPhysicalLayout(mlir::vernon::PhysicalAbiProfile::DirectXConstantBuffer, "directx_constant_buffer");
             addPhysicalLayout(mlir::vernon::PhysicalAbiProfile::MetalConstantBuffer, "metal_constant_buffer");
             argument["physical_layouts"] = std::move(physicalLayouts);
             if (graphicsStorage)
@@ -1575,10 +1574,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 mlir::succeeded(plan))
                 physicalLayouts["opengl_native_uniform"] = reflectPhysicalPlan(*plan, "opengl_native_uniform");
             if (mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
-                    resultType, module, mlir::vernon::PhysicalAbiProfile::DirectXConstantBuffer, logicalDtypes);
-                mlir::succeeded(plan))
-                physicalLayouts["directx_constant_buffer"] = reflectPhysicalPlan(*plan, "directx_constant_buffer");
-            if (mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
                     resultType, module, mlir::vernon::PhysicalAbiProfile::MetalConstantBuffer, logicalDtypes);
                 mlir::succeeded(plan))
                 physicalLayouts["metal_constant_buffer"] = reflectPhysicalPlan(*plan, "metal_constant_buffer");
@@ -1633,8 +1628,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
              llvm::json::Object{{"profile", "vulkan_push_constant"}, {"packing", "push_constants"}}},
             {"opengl_native_uniform",
              llvm::json::Object{{"profile", "opengl_native_uniform"}, {"packing", "native_uniforms"}}},
-            {"directx_constant_buffer",
-             llvm::json::Object{{"profile", "directx_constant_buffer"}, {"packing", "constant_buffer"}}},
             {"metal_constant_buffer",
              llvm::json::Object{{"profile", "metal_constant_buffer"}, {"packing", "constant_buffer"}}},
         };
@@ -1826,8 +1819,9 @@ bool selectTargetPhysicalLayouts(std::string &reflection, VernonTarget target, s
         allowed.emplace("opengl_native_uniform");
         break;
     case VERNON_TARGET_DIRECTX:
+        allowed.emplace("vulkan_std140_uniform_buffer");
         allowed.emplace("vulkan_std430_storage_buffer");
-        allowed.emplace("directx_constant_buffer");
+        allowed.emplace("vulkan_push_constant");
         break;
     case VERNON_TARGET_METAL:
         allowed.emplace("vulkan_std430_storage_buffer");
@@ -1864,18 +1858,13 @@ bool selectTargetPhysicalLayouts(std::string &reflection, VernonTarget target, s
             transport = "storage_buffer";
         if (transport == "storage_buffer")
             return "vulkan_std430_storage_buffer";
-        if (target == VERNON_TARGET_VULKAN) {
-            if (transport == "uniform_buffer")
-                return "vulkan_std140_uniform_buffer";
-            if (transport == "push_constant")
-                return "vulkan_push_constant";
-        } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
-            if (transport == "uniform_buffer")
-                return "vulkan_std140_uniform_buffer";
+        if (transport == "uniform_buffer")
+            return "vulkan_std140_uniform_buffer";
+        if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
             if (transport == "push_constant" || transport == "native_uniform")
                 return "opengl_native_uniform";
-        } else if (target == VERNON_TARGET_DIRECTX && (transport == "uniform_buffer" || transport == "push_constant")) {
-            return "directx_constant_buffer";
+        } else if (transport == "push_constant") {
+            return "vulkan_push_constant";
         }
         return std::nullopt;
     };

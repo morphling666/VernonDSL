@@ -89,29 +89,26 @@ TEST(RhiPublicHandleBoundaryTest, UnknownExceptionUsesBoundedEmergencyDiagnostic
     EXPECT_EQ(std::string(diagnostic.data, diagnostic.size), "RHI device creation failed at the C boundary");
 }
 
-TEST(RhiPublicDestroyBoundaryTest, AdmissionRefusalsDoNotViolateContract) {
-    EXPECT_NO_FATAL_FAILURE(vernon::rhi::publicDestroyBoundary([] {
-        return vernon::Result<void, vernon::RhiError>{
-            vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"destroy_test_device", 0, 0}})};
-    }));
-    EXPECT_NO_FATAL_FAILURE(vernon::rhi::publicDestroyBoundary([] {
-        return vernon::Result<void, vernon::RhiError>{
-            vernon::err(vernon::RhiError{vernon::RhiErrorCode::LifecycleFailure, {"destroy_test_device", 0, 0}})};
-    }));
+vernon::Result<void, vernon::RhiError> failedDestroy(vernon::RhiErrorCode code) {
+    return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{code, {"destroy_test_device", 0, 0}})};
 }
 
-TEST(RhiPublicDestroyBoundaryTest, BackendTeardownFailureViolatesContract) {
-    EXPECT_DEATH(vernon::rhi::publicDestroyBoundary([] {
-                     return vernon::Result<void, vernon::RhiError>{vernon::err(
-                         vernon::RhiError{vernon::RhiErrorCode::BackendFailure, {"destroy_test_device", 0, 0}})};
-                 }),
-                 "");
+TEST(RhiPublicStatusBoundaryTest, DestroyAdmissionRefusalsReportInvalidArgument) {
+    EXPECT_EQ(vernon::rhi::publicStatusBoundary([] { return failedDestroy(vernon::RhiErrorCode::InvalidArgument); }),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::rhi::publicStatusBoundary([] { return failedDestroy(vernon::RhiErrorCode::LifecycleFailure); }),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
-TEST(RhiPublicDestroyBoundaryTest, EscapingExceptionViolatesContract) {
-    EXPECT_DEATH(vernon::rhi::publicDestroyBoundary(
-                     []() -> vernon::Result<void, vernon::RhiError> { throw std::runtime_error("teardown escaped"); }),
-                 "");
+TEST(RhiPublicStatusBoundaryTest, DestroyTeardownFailureReportsInternalError) {
+    EXPECT_EQ(vernon::rhi::publicStatusBoundary([] { return failedDestroy(vernon::RhiErrorCode::BackendFailure); }),
+              VERNON_RHI_STATUS_INTERNAL_ERROR);
+}
+
+TEST(RhiPublicStatusBoundaryTest, EscapingExceptionReportsInternalError) {
+    EXPECT_EQ(vernon::rhi::publicStatusBoundary(
+                  []() -> vernon::Result<void, vernon::RhiError> { throw std::runtime_error("teardown escaped"); }),
+              VERNON_RHI_STATUS_INTERNAL_ERROR);
 }
 
 } // namespace

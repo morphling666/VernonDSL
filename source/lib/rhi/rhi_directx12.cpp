@@ -575,9 +575,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImageBusiness(
                                                    : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     const uint32_t expectedDepthOrLayers =
         descriptor->image.dimension == VERNON_RHI_IMAGE_3D ? descriptor->image.depth : descriptor->image.array_layers;
-    const bool validCube = descriptor->image.dimension != VERNON_RHI_IMAGE_CUBE ||
-                           (descriptor->image.width == descriptor->image.height &&
-                            descriptor->image.array_layers == 6 && descriptor->image.depth == 1);
+    const bool validShape = vernon::rhi::validImageShape(descriptor->image);
     const bool validFormat =
         native.Format == format || (format == DXGI_FORMAT_D32_FLOAT && native.Format == DXGI_FORMAT_R32_TYPELESS &&
                                     (descriptor->image.usage & VERNON_RHI_IMAGE_SAMPLED) != 0 &&
@@ -585,7 +583,7 @@ static VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowedImageBusiness(
     if (format == DXGI_FORMAT_UNKNOWN || native.Dimension != dimension || !validFormat ||
         native.Width != descriptor->image.width || native.Height != descriptor->image.height ||
         native.DepthOrArraySize != expectedDepthOrLayers || native.MipLevels != descriptor->image.mip_levels ||
-        native.SampleDesc.Count != descriptor->image.sample_count || !validCube)
+        native.SampleDesc.Count != descriptor->image.sample_count || !validShape)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const auto state = directX12ResourceState(descriptor->state);
     const size_t subresourceCount = static_cast<size_t>(descriptor->image.mip_levels) * descriptor->image.array_layers *
@@ -1106,8 +1104,8 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
     const bool depthFormat = descriptor && (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ||
                                             descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT);
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || format == DXGI_FORMAT_UNKNOWN ||
-        descriptor->width == 0 || descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
-        descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+        !vernon::rhi::validImageShape(*descriptor) || descriptor->mip_levels == 0 || descriptor->sample_count != 1 ||
+        (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return Result<VernonRhiImage, RhiError>{err(invalidArgument("create_directx12_image"))};
     auto reservation = reserveResource(device);
@@ -1188,9 +1186,7 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     if (!slot || !slot->image.owned)
         return invalidResult("upload_directx12_image", image.index, image.generation);
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
-    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_3D &&
-         descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
-        (descriptor.dimension != VERNON_RHI_IMAGE_3D && descriptor.depth != 1))
+    if (!vernon::rhi::validImageShape(descriptor))
         return invalidResult("upload_directx12_image", image.index, image.generation);
     auto &state = device->state;
     const D3D12_RESOURCE_DESC native = slot->image.resource->GetDesc();
@@ -1208,9 +1204,7 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     UINT64 required = 0;
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
-        const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
-                                    ? upload.array_layer < descriptor.array_layers
-                                    : upload.array_layer == 0;
+        const bool validLayer = upload.array_layer < descriptor.array_layers;
         const bool validMip = upload.mip_level < descriptor.mip_levels;
         const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
         const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;

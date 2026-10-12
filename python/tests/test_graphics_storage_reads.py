@@ -4,7 +4,7 @@ import dataclasses
 import json
 import unittest
 from importlib import import_module
-from typing import Annotated, Any, Callable, Mapping
+from typing import Annotated, Any, Callable, Iterator, Mapping
 
 import numpy as np
 import vernon_dsl as vd
@@ -46,6 +46,26 @@ class PullProgram(vd.Module):
         render_pass: vd.RenderPass,
     ) -> None:
         pull_pipeline(positions=positions, colors=colors, render_pass=render_pass)
+
+
+@vd.fragment
+def textured_fragment(image: vd.Texture["2d", vd.f32]) -> vd.Vector[vd.f32, 4]:  # noqa: F722
+    return vd.texture_sample(image, vd.Vector([0.5, 0.5]))
+
+
+textured_pull_pipeline = vd.pipeline(
+    pull_vertex, textured_fragment, targets=vd.target_formats(colors={0: vd.rgba8_unorm})
+)
+
+
+class TexturedPullProgram(vd.Module):
+    def forward(
+        self,
+        positions: vd.TensorView[vd.f32, (vd.dyn, 2), vd.read],
+        image: vd.Texture["2d", vd.f32],  # noqa: F722
+        render_pass: vd.RenderPass,
+    ) -> None:
+        textured_pull_pipeline(positions=positions, image=image, render_pass=render_pass)
 
 
 @vd.vertex
@@ -99,6 +119,18 @@ def _pull_parameter_types() -> dict[str, Any]:
     }
 
 
+def _required_features(node: Any) -> Iterator[list[str]]:
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if key == "required_features":
+                yield list(value)
+            else:
+                yield from _required_features(value)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _required_features(value)
+
+
 def _descriptor_bindings(implementation: Mapping[str, Any]) -> dict[tuple[str, int], list[int]]:
     bindings: dict[tuple[str, Any], list[int]] = {}
     for endpoint in implementation["endpoints"]:
@@ -143,6 +175,24 @@ class GraphicsStorageReadCookTests(unittest.TestCase):
 
     def test_vertex_and_fragment_views_cook_for_vulkan(self) -> None:
         self._assert_per_stage_storage(_cook(PullProgram(), _pull_parameter_types(), "vulkan"))
+
+    def test_stage_features_merge_into_a_canonical_set(self) -> None:
+        texture = vd.Texture["2d", vd.f32]
+        parameter_types = {
+            "positions": RuntimeParameterDescriptor.storage(vd.f32, (vd.dyn, 2), "read", True),
+            "image": RuntimeParameterDescriptor.annotated(
+                SemanticCategory.RESOURCE, texture, concrete_type_from_annotation(texture)
+            ),
+            "render_pass": ProgramControlDescriptor("render_pass", vd.RenderPass, None),
+        }
+        for target in ("opengl", "vulkan"):
+            with self.subTest(target=target):
+                metadata = _cook(TexturedPullProgram(), parameter_types, target)
+                feature_sets = list(_required_features(metadata))
+                self.assertTrue(feature_sets)
+                for features in feature_sets:
+                    self.assertEqual(features, sorted(set(features)))
+                self.assertIn(["samplers", "tensor_views", "textures"], feature_sets)
 
     def test_opengl_below_430_is_rejected(self) -> None:
         with self.assertRaisesRegex(ProgramCompileError, "PROGRAM_GRAPHICS_STORAGE_UNSUPPORTED.*GLSL 430"):

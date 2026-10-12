@@ -300,6 +300,49 @@ asset = vd.program_asset(
             self.assertIn("def fullscreen_vertex(", promoted.source)
             self.assertIn("fullscreen.py", dict(promoted.dependencies))
 
+    def test_discovery_follows_files_created_where_a_lookup_missed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text("[project]\nname = 'shadowing'\n", encoding="utf-8")
+            game = root / "game"
+            game.mkdir()
+            helper = """
+import vernon_dsl as vd
+
+@vd.func
+def tint() -> vd.f32:
+    return {value}
+"""
+            (root / "helpers.py").write_text(helper.format(value="0.25"), encoding="utf-8")
+            source = game / "main.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+from helpers import tint
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([tint(), 0.0, 0.0, 1.0])
+""",
+                encoding="utf-8",
+            )
+
+            first = load_project(source, entry="fragment_main")
+            self.assertIn("helpers.py", dict(first.dependencies))
+            self.assertIn("0.25", first.source)
+
+            # The importer's own directory is searched before the project root, so this file now wins.
+            (game / "helpers.py").write_text(helper.format(value="0.75"), encoding="utf-8")
+            shadowed = load_project(source, entry="fragment_main")
+            self.assertIn("game/helpers.py", dict(shadowed.dependencies))
+            self.assertIn("0.75", shadowed.source)
+            self.assertNotIn("0.25", shadowed.source)
+
+            # A nearer pyproject.toml makes game/ the project root, so the module paths are relative to it.
+            (game / "pyproject.toml").write_text("[project]\nname = 'game'\n", encoding="utf-8")
+            rerooted = load_project(source, entry="fragment_main")
+            self.assertEqual(set(dict(rerooted.dependencies)), {"main.py", "helpers.py"})
+
     def test_program_asset_rejects_unsupported_import_entry_forms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

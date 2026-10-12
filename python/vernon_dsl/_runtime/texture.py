@@ -104,6 +104,48 @@ _TEXTURE_USAGES = frozenset(
 )
 
 
+_TEXTURE_DIMENSIONS = ("2d", "3d", "cube", "2d_array", "cube_array")
+# Layered Textures keep a leading layer axis in host arrays; a cube-array layer is cube * 6 + face.
+_LAYERED_DIMENSIONS = frozenset({"cube", "2d_array", "cube_array"})
+_CUBE_DIMENSIONS = frozenset({"cube", "cube_array"})
+_CUBE_FACES = 6
+_NATIVE_DIMENSION_NAMES = {
+    "2d": "TEXTURE_2D",
+    "3d": "TEXTURE_3D",
+    "cube": "CUBE",
+    "2d_array": "TEXTURE_2D_ARRAY",
+    "cube_array": "CUBE_ARRAY",
+}
+
+
+def _checked_dimension(dimension: str) -> str:
+    if dimension not in _TEXTURE_DIMENSIONS:
+        raise ValueError(f"Texture dimension must be one of {', '.join(map(repr, _TEXTURE_DIMENSIONS))}")
+    return dimension
+
+
+def _checked_layer_count(dimension: str, layers: int | None, shape: tuple[int, ...]) -> int:
+    if layers is None:
+        if dimension in {"2d_array", "cube_array"}:
+            raise ValueError(f"{dimension} Texture requires an explicit array_layers count")
+        layers = _CUBE_FACES if dimension == "cube" else 1
+    if not isinstance(layers, int) or isinstance(layers, bool) or layers <= 0:
+        raise ValueError("Texture array_layers must be a positive integer")
+    if dimension in {"2d", "3d"} and layers != 1:
+        raise ValueError(f"{dimension} Texture has exactly one array layer")
+    if dimension == "cube" and layers != _CUBE_FACES:
+        raise ValueError("cube Texture has exactly six faces")
+    if dimension == "cube_array" and layers % _CUBE_FACES:
+        raise ValueError("cube_array Texture layers must be a multiple of six faces")
+    if dimension in _CUBE_DIMENSIONS and shape[0] != shape[1]:
+        raise ValueError(f"{dimension} Texture faces must be square")
+    return layers
+
+
+def _native_dimension(state: Any, dimension: str) -> Any:
+    return getattr(state.native.TextureDimension, _NATIVE_DIMENSION_NAMES[dimension])
+
+
 def _checked_texture_shape(shape: tuple[int, ...], dimension: str) -> tuple[int, ...]:
     expected_rank = 3 if dimension == "3d" else 2
     if (
@@ -131,19 +173,25 @@ class Texture(_TextureResource):
             raise ValueError("Texture storage must be a NumPy array")
         if format not in _TEXTURE_FORMAT_SET:
             raise ValueError("unsupported Texture format")
-        if dimension not in {"2d", "3d", "cube"}:
-            raise ValueError("Texture dimension must be '2d', '3d', or 'cube'")
-        logical_rank = 3 if dimension in {"3d", "cube"} else 2
+        _checked_dimension(dimension)
+        layered = dimension in _LAYERED_DIMENSIONS
+        logical_rank = 3 if dimension == "3d" or layered else 2
         channel_rank = 0 if format.channels == 1 else 1
         valid = array.dtype == format.dtype and array.ndim == logical_rank + channel_rank
         if channel_rank:
             valid = valid and array.shape[-1] == format.channels
         if dimension == "cube":
-            valid = valid and array.shape[0] == 6 and array.shape[1] == array.shape[2]
+            valid = valid and array.shape[0] == _CUBE_FACES
+        if dimension == "cube_array":
+            valid = valid and array.shape[0] % _CUBE_FACES == 0
+        if dimension in _CUBE_DIMENSIONS:
+            valid = valid and array.shape[1] == array.shape[2]
         expected_shape = {
             "2d": "(height, width)",
             "3d": "(depth, height, width)",
             "cube": "(6, size, size)",
+            "2d_array": "(layers, height, width)",
+            "cube_array": "(6 * cubes, size, size)",
         }[dimension]
         if channel_rank:
             expected_shape = f"{expected_shape[:-1]}, {format.channels})"
@@ -151,7 +199,8 @@ class Texture(_TextureResource):
         if not isinstance(array, np.ndarray) or not valid or not array.flags.c_contiguous:
             raise ValueError(f"Texture storage must be {expected}")
         logical_shape = self._logical_shape(array.shape, dimension, format.channels)
-        resolved_usage = self._validate_configuration(logical_shape, format, dimension, mip_levels, usage)
+        layers = array.shape[0] if layered else 1
+        resolved_usage = self._validate_configuration(logical_shape, format, dimension, mip_levels, usage, layers)
         self._initialize(
             logical_shape,
             format,
@@ -159,6 +208,7 @@ class Texture(_TextureResource):
             mip_levels,
             resolved_usage,
             np.array(array, copy=True, order="C"),
+            layers,
         )
 
     @staticmethod
@@ -168,14 +218,15 @@ class Texture(_TextureResource):
         dimension: str,
         mip_levels: int,
         usage: tuple[str, ...] | None,
+        layers: int,
     ) -> frozenset[str]:
         if format not in _TEXTURE_FORMAT_SET:
             raise ValueError("unsupported Texture format")
-        if dimension not in {"2d", "3d", "cube"}:
-            raise ValueError("Texture dimension must be '2d', '3d', or 'cube'")
+        _checked_dimension(dimension)
         expected_rank = 3 if dimension == "3d" else 2
         if len(shape) != expected_rank or any(value <= 0 for value in shape):
             raise ValueError(f"{dimension} Texture shape must contain {expected_rank} positive dimensions")
+        _checked_layer_count(dimension, layers, shape)
         if not isinstance(mip_levels, int) or isinstance(mip_levels, bool) or mip_levels <= 0:
             raise ValueError("Texture mip_levels must be a positive integer")
         max_mip_levels = max(shape).bit_length()
@@ -191,9 +242,10 @@ class Texture(_TextureResource):
             resolved_usage = set(usage)
         if "storage" in resolved_usage and not format.storage:
             raise ValueError(f"Texture format {format.name!r} does not support storage usage")
-        if "color_attachment" in resolved_usage and (dimension != "2d" or format.aspects != frozenset({"color"})):
+        planar = dimension in {"2d", "2d_array"}
+        if "color_attachment" in resolved_usage and (not planar or format.aspects != frozenset({"color"})):
             raise ValueError("color_attachment usage requires a two-dimensional color Texture")
-        if "depth_stencil_attachment" in resolved_usage and (dimension != "2d" or "depth" not in format.aspects):
+        if "depth_stencil_attachment" in resolved_usage and (not planar or "depth" not in format.aspects):
             raise ValueError("depth_stencil_attachment usage requires a two-dimensional depth Texture")
         if {"color_attachment", "depth_stencil_attachment"}.issubset(resolved_usage):
             raise ValueError("Texture cannot be both a color and depth/stencil attachment")
@@ -207,15 +259,17 @@ class Texture(_TextureResource):
         mip_levels: int,
         usage: frozenset[str],
         host_array: np.ndarray | None,
+        layers: int,
     ) -> None:
         self._shape = shape
         self._array = host_array
         self._mip_arrays: dict[int, np.ndarray] = {} if host_array is None else {0: host_array}
         self._format = format
         self._dimension = dimension
+        self._layered = dimension in _LAYERED_DIMENSIONS
+        self._layers = layers
         self._mip_levels = mip_levels
         self._usage = usage
-        layers = 6 if dimension == "cube" else 1
         self._region = _ImageRegion(
             frozenset(
                 (aspect, mip_level, layer)
@@ -243,7 +297,7 @@ class Texture(_TextureResource):
     @staticmethod
     def _logical_shape(array_shape: tuple[int, ...], dimension: str, channels: int) -> tuple[int, ...]:
         shape = array_shape[:-1] if channels != 1 else array_shape
-        return shape[1:] if dimension == "cube" else shape
+        return shape[1:] if dimension in _LAYERED_DIMENSIONS else shape
 
     def _mip_shape(self, mip_level: int) -> tuple[int, ...]:
         if not isinstance(mip_level, int) or isinstance(mip_level, bool) or not 0 <= mip_level < self._mip_levels:
@@ -251,9 +305,8 @@ class Texture(_TextureResource):
         return tuple(max(1, extent >> mip_level) for extent in self.shape)
 
     def _mip_region(self, mip_level: int) -> _ImageRegion:
-        layers = 6 if self._dimension == "cube" else 1
         return _ImageRegion(
-            frozenset((aspect, mip_level, layer) for aspect in self._format.aspects for layer in range(layers))
+            frozenset((aspect, mip_level, layer) for aspect in self._format.aspects for layer in range(self._layers))
         )
 
     @staticmethod
@@ -299,8 +352,8 @@ class Texture(_TextureResource):
 
     def _array_shape(self, mip_level: int) -> tuple[int, ...]:
         logical = self._mip_shape(mip_level)
-        if self._dimension == "cube":
-            logical = (6, *logical)
+        if self._layered:
+            logical = (self._layers, *logical)
         return (*logical, self._format.channels) if self._format.channels != 1 else logical
 
     def _download_device_region(
@@ -334,9 +387,9 @@ class Texture(_TextureResource):
             requests: list[dict[str, object]] = []
             groups: list[tuple[int, int, frozenset[str], tuple[int, ...], np.dtype[Any]]] = []
             for aspects, dirty_layers in self._aspect_layer_groups(dirty_subresources, mip_level):
-                layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                layer_groups = self._contiguous_layers(dirty_layers) if self._layered else ((0, 1),)
                 for base_layer, layer_count in layer_groups:
-                    downloaded_shape = ((layer_count, *shape) if self._dimension == "cube" else shape) + (
+                    downloaded_shape = ((layer_count, *shape) if self._layered else shape) + (
                         () if self._format.channels == 1 else (self._format.channels,)
                     )
                     transfer_dtype = (
@@ -377,7 +430,7 @@ class Texture(_TextureResource):
                 spatial_slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
                 for base_layer, layer_count, aspects, downloaded in downloaded_groups:
                     slices = spatial_slices
-                    if self._dimension == "cube":
+                    if self._layered:
                         slices = (slice(base_layer, base_layer + layer_count), *slices)
                     if self._format.channels != 1:
                         slices = (*slices, slice(None))
@@ -408,23 +461,27 @@ class Texture(_TextureResource):
         dimension: str = "2d",
         mip_levels: int = 1,
         usage: tuple[str, ...] | None = None,
+        array_layers: int | None = None,
     ) -> Texture:
-        """Allocate a device-only Texture without creating a host mirror."""
-        if dimension not in {"2d", "3d"}:
-            raise ValueError("Texture.device dimension must be '2d' or '3d'")
+        """Allocate a device-only Texture without creating a host mirror.
+
+        ``shape`` is spatial; layered dimensions take ``array_layers`` (6 * cubes for cube_array).
+        """
+        _checked_dimension(dimension)
         shape = _checked_texture_shape(shape, dimension)
         if format not in _TEXTURE_FORMAT_SET:
             raise ValueError("unsupported Texture format")
+        layers = _checked_layer_count(dimension, array_layers, shape)
         if usage is None:
-            if dimension != "2d":
+            if dimension not in {"2d", "2d_array"}:
                 usage = ("sampled",)
             elif "depth" in format.aspects:
                 usage = ("sampled", "depth_stencil_attachment")
             else:
                 usage = ("sampled", "color_attachment")
-        resolved_usage = cls._validate_configuration(shape, format, dimension, mip_levels, usage)
+        resolved_usage = cls._validate_configuration(shape, format, dimension, mip_levels, usage, layers)
         texture = cls.__new__(cls)
-        texture._initialize(shape, format, dimension, mip_levels, resolved_usage, None)
+        texture._initialize(shape, format, dimension, mip_levels, resolved_usage, None, layers)
         return texture
 
     @classmethod
@@ -436,13 +493,15 @@ class Texture(_TextureResource):
         dimension: str = "2d",
         mip_levels: int = 1,
         usage: tuple[str, ...] | None = None,
+        array_layers: int | None = None,
     ) -> Texture:
-        if dimension not in {"2d", "3d"}:
-            raise ValueError("Texture.zeros dimension must be '2d' or '3d'")
+        _checked_dimension(dimension)
         shape = _checked_texture_shape(shape, dimension)
         if format not in _TEXTURE_FORMAT_SET:
             raise ValueError("unsupported Texture format")
-        array_shape = (*shape, format.channels) if format.channels != 1 else shape
+        layers = _checked_layer_count(dimension, array_layers, shape)
+        array_shape = (layers, *shape) if dimension in _LAYERED_DIMENSIONS else shape
+        array_shape = (*array_shape, format.channels) if format.channels != 1 else array_shape
         return cls(
             np.zeros(array_shape, dtype=format.dtype),
             format=format,
@@ -480,6 +539,29 @@ class Texture(_TextureResource):
     ) -> Texture:
         return cls(faces, format=format, dimension="cube", mip_levels=mip_levels, usage=usage)
 
+    @classmethod
+    def array(
+        cls,
+        layers: np.ndarray,
+        *,
+        format: TextureFormat = rgba8_unorm,
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
+    ) -> Texture:
+        return cls(layers, format=format, dimension="2d_array", mip_levels=mip_levels, usage=usage)
+
+    @classmethod
+    def cube_array(
+        cls,
+        faces: np.ndarray,
+        *,
+        format: TextureFormat = rgba8_unorm,
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
+    ) -> Texture:
+        """Create a cube array from ``(6 * cubes, size, size[, channels])`` faces ordered cube-major."""
+        return cls(faces, format=format, dimension="cube_array", mip_levels=mip_levels, usage=usage)
+
     @property
     def shape(self) -> tuple[int, ...]:
         return self._shape
@@ -495,6 +577,10 @@ class Texture(_TextureResource):
     @property
     def mip_levels(self) -> int:
         return self._mip_levels
+
+    @property
+    def array_layers(self) -> int:
+        return self._layers
 
     @property
     def usage(self) -> frozenset[str]:
@@ -544,12 +630,12 @@ class Texture(_TextureResource):
         ):
             raise ValueError(f"Texture upload origin must contain {len(mip_shape)} non-negative integers")
         channel_rank = 0 if self._format.channels == 1 else 1
-        layer_rank = 1 if self._dimension == "cube" else 0
+        layer_rank = 1 if self._layered else 0
         if (
             not isinstance(array, np.ndarray)
             or array.dtype != self._format.dtype
             or array.ndim != len(mip_shape) + channel_rank + layer_rank
-            or (layer_rank and array.shape[0] != 6)
+            or (layer_rank and array.shape[0] != self._layers)
             or (channel_rank and array.shape[-1] != self._format.channels)
             or not array.flags.c_contiguous
         ):
@@ -625,7 +711,7 @@ class Texture(_TextureResource):
             if array is None:
                 raise RuntimeError("Texture mip level has not been initialized")
             slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
-            if self._dimension == "cube":
+            if self._layered:
                 slices = (slice(None), *slices)
             if self._format.channels != 1:
                 slices = (*slices, slice(None))
@@ -728,9 +814,9 @@ class Texture(_TextureResource):
                         np.zeros(self._array_shape(mip_level), dtype=self._format.dtype),
                     ).copy()
                     for aspects, dirty_layers in self._aspect_layer_groups(dirty_device, mip_level):
-                        layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                        layer_groups = self._contiguous_layers(dirty_layers) if self._layered else ((0, 1),)
                         for base_layer, layer_count in layer_groups:
-                            downloaded_shape = ((layer_count, *shape) if self._dimension == "cube" else shape) + (
+                            downloaded_shape = ((layer_count, *shape) if self._layered else shape) + (
                                 () if self._format.channels == 1 else (self._format.channels,)
                             )
                             transfer_dtype = (
@@ -770,7 +856,7 @@ class Texture(_TextureResource):
                         if self._format is d32_float_s8_uint and len(aspects) == 1
                         else target
                     )
-                    if self._dimension == "cube":
+                    if self._layered:
                         destination[base_layer : base_layer + layer_count] = values
                     else:
                         destination[...] = values
@@ -782,19 +868,15 @@ class Texture(_TextureResource):
                     height, width = self.shape
                     depth = 1
                 native_format = getattr(state.native.TextureFormat, self._format._native_name)
-                native_dimension = {
-                    "2d": state.native.TextureDimension.TEXTURE_2D,
-                    "3d": state.native.TextureDimension.TEXTURE_3D,
-                    "cube": state.native.TextureDimension.CUBE,
-                }[self._dimension]
                 texture = state.rhi_host.create_image(
                     width,
                     height,
                     native_format,
-                    native_dimension,
+                    _native_dimension(state, self._dimension),
                     depth,
                     self._mip_levels,
                     self._native_usage(state),
+                    self._layers,
                 )
                 dirty_host.update(
                     subresource for mip_level in arrays for subresource in self._mip_region(mip_level).subresources
@@ -808,10 +890,10 @@ class Texture(_TextureResource):
                 shape = self._mip_shape(mip_level)
                 depth, height, width = shape if self._dimension == "3d" else (1, *shape)
                 for aspects, dirty_layers in self._aspect_layer_groups(dirty_host, mip_level):
-                    layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                    layer_groups = self._contiguous_layers(dirty_layers) if self._layered else ((0, 1),)
                     for base_layer, layer_count in layer_groups:
                         array = arrays[mip_level]
-                        if self._dimension == "cube":
+                        if self._layered:
                             array = array[base_layer : base_layer + layer_count]
                         if self._format is d32_float_s8_uint and len(aspects) == 1:
                             array = np.ascontiguousarray(array[next(iter(aspects))])
@@ -865,7 +947,7 @@ class Texture(_TextureResource):
             0,
             self._mip_levels,
             0,
-            6 if self._dimension == "cube" else 1,
+            self._layers,
             self._format.aspects,
         )
 
@@ -900,11 +982,7 @@ class Texture(_TextureResource):
         try:
             state = context.session
             native_format = getattr(state.native.TextureFormat, format._native_name)
-            native_dimension = {
-                "2d": state.native.TextureDimension.TEXTURE_2D,
-                "3d": state.native.TextureDimension.TEXTURE_3D,
-                "cube": state.native.TextureDimension.CUBE,
-            }[dimension]
+            native_dimension = _native_dimension(state, dimension)
             aspect_names = {
                 "color": "IMAGE_ASPECT_COLOR",
                 "depth": "IMAGE_ASPECT_DEPTH",
@@ -971,14 +1049,21 @@ class TextureView(_TextureResource):
             raise TypeError("TextureView owner must be a Texture")
         format = owner.format if format is None else format
         dimension = owner.dimension if dimension is None else dimension
-        if format not in _TEXTURE_FORMAT_SET or dimension not in {"2d", "3d", "cube"}:
+        if format not in _TEXTURE_FORMAT_SET or dimension not in _TEXTURE_DIMENSIONS:
             raise ValueError("TextureView format or dimension is unsupported")
         if format != owner.format and {format, owner.format} != {
             rgba8_unorm,
             rgba8_srgb,
         }:
             raise ValueError("TextureView format is incompatible with its owner")
-        if dimension != owner.dimension and not (owner.dimension == "cube" and dimension == "2d"):
+        # Views reinterpret layers, never the 3D/layered split: planar views select layers of any non-3D owner and
+        # cube views select whole cubes of a cube or cube_array owner.
+        compatible_dimension = (
+            dimension == owner.dimension
+            or (dimension in {"2d", "2d_array"} and owner.dimension != "3d")
+            or (dimension in _CUBE_DIMENSIONS and owner.dimension in _CUBE_DIMENSIONS)
+        )
+        if not compatible_dimension:
             raise ValueError("TextureView dimension is incompatible with its owner")
         if (
             not isinstance(base_mip_level, int)
@@ -987,7 +1072,7 @@ class TextureView(_TextureResource):
         ):
             raise ValueError("TextureView base_mip_level is out of range")
         mip_level_count = owner.mip_levels - base_mip_level if mip_level_count is None else mip_level_count
-        owner_layers = 6 if owner.dimension == "cube" else 1
+        owner_layers = owner.array_layers
         if (
             not isinstance(base_array_layer, int)
             or isinstance(base_array_layer, bool)
@@ -1010,8 +1095,12 @@ class TextureView(_TextureResource):
             raise ValueError("2D TextureView must select exactly one array layer")
         if dimension == "3d" and (base_array_layer != 0 or array_layer_count != 1):
             raise ValueError("3D TextureView cannot select array layers")
-        if dimension == "cube" and (base_array_layer != 0 or array_layer_count != 6):
+        if dimension in _CUBE_DIMENSIONS and base_array_layer % _CUBE_FACES:
+            raise ValueError("cube TextureView must start at the first face of a cube")
+        if dimension == "cube" and array_layer_count != _CUBE_FACES:
             raise ValueError("cube TextureView must select all six faces")
+        if dimension == "cube_array" and array_layer_count % _CUBE_FACES:
+            raise ValueError("cube_array TextureView must select whole cubes")
         if aspects is None:
             aspects = tuple(sorted(format.aspects))
         if (

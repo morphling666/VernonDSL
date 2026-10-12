@@ -90,27 +90,6 @@ Value publicQueryBoundary(Function &&function, Value fallback = {}) noexcept {
     }
 }
 
-template <typename Function> void publicDestroyBoundary(Function &&function) noexcept {
-    try {
-        auto result = std::forward<Function>(function)();
-        if (result.isOk())
-            return;
-        switch (result.error().code) {
-        case RhiErrorCode::InvalidArgument:
-        case RhiErrorCode::LifecycleFailure:
-            // The legacy void destroy API cannot report admission refusals.
-            return;
-        case RhiErrorCode::Unsupported:
-        case RhiErrorCode::ResourceExhausted:
-        case RhiErrorCode::SynchronizationFailure:
-        case RhiErrorCode::BackendFailure:
-            resultContractViolation();
-        }
-    } catch (...) {
-        resultContractViolation();
-    }
-}
-
 } // namespace vernon::rhi
 
 #endif

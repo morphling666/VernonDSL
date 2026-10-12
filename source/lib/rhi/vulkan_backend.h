@@ -109,6 +109,7 @@ struct VERNON_RHI_CAPI DeviceState {
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
     bool shaderBufferFloat32AtomicAdd{};
+    bool imageCubeArray{};
     bool portabilityEnumeration{};
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};

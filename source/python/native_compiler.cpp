@@ -84,7 +84,9 @@ void bindNativeCompiler(nb::module_ &module) {
     nb::enum_<VernonTextureDimension>(module, "TextureDimension")
         .value("TEXTURE_2D", VERNON_TEXTURE_2D)
         .value("TEXTURE_3D", VERNON_TEXTURE_3D)
-        .value("CUBE", VERNON_TEXTURE_CUBE);
+        .value("CUBE", VERNON_TEXTURE_CUBE)
+        .value("TEXTURE_2D_ARRAY", VERNON_TEXTURE_2D_ARRAY)
+        .value("CUBE_ARRAY", VERNON_TEXTURE_CUBE_ARRAY);
     nb::enum_<VernonRhiSamplerAddressMode>(module, "SamplerAddressMode")
         .value("REPEAT", VERNON_RHI_ADDRESS_REPEAT)
         .value("CLAMP_TO_EDGE", VERNON_RHI_ADDRESS_CLAMP_TO_EDGE)
@@ -161,7 +163,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("create_buffer", &RhiHost::createBuffer)
         .def("create_image", &RhiHost::createImage, nb::arg("width"), nb::arg("height"),
              nb::arg("format") = VERNON_TEXTURE_RGBA8_UNORM, nb::arg("dimension") = VERNON_TEXTURE_2D,
-             nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0)
+             nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0, nb::arg("array_layers") = 0)
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
         .def("create_runtime", &createRhiRuntime);
@@ -176,6 +178,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
         .def_prop_ro("depth", [](const RhiImage &value) { return value.depth; })
         .def_prop_ro("mip_levels", [](const RhiImage &value) { return value.mipLevels; })
+        .def_prop_ro("array_layers", [](const RhiImage &value) { return value.layers; })
         .def("upload", &RhiImage::upload, nb::arg("data"), nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
              nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
              nb::arg("depth") = 0, nb::arg("base_array_layer") = 0, nb::arg("array_layer_count") = 0,

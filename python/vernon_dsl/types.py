@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import builtins
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NoReturn, Self, TypeAlias
 
 import numpy as np
@@ -301,12 +302,17 @@ class SpecializationAssignment:
 
     `type_value` is the host class or scalar type the identity names. It is absent when the assignment was read
     statically, and it never takes part in comparison: the identity alone decides which variant a key selects.
+
+    `type_source` is the file that declares a type value. An identity names its module relative to that file's own
+    project root, which need not be the root of the program it specializes, so the module graph resolves the
+    identity through this file when it is known.
     """
 
     name: str
     type: str
     value: SpecializationValue
     type_value: Any = field(default=None, compare=False, repr=False)
+    type_source: Path | None = field(default=None, compare=False, repr=False)
 
     @property
     def manifest(self) -> dict[str, object]:
@@ -325,6 +331,27 @@ def specialization_key_data(key: tuple[SpecializationAssignment, ...]) -> list[d
 
 def enabled_features(key: tuple[SpecializationAssignment, ...]) -> tuple[str, ...]:
     return tuple(assignment.name for assignment in key if assignment.type == "bool" and assignment.value is True)
+
+
+def check_type_identity_sources(keys: Iterable[tuple[SpecializationAssignment, ...]]) -> None:
+    """Rejects one type identity naming classes from two files among a Program's variant keys.
+
+    Identities are relative to each type's own project root, so two projects with the same module path collide.
+    Variant keys are scoped to one Program, so only collisions within its keys can select the wrong variant.
+    """
+
+    sources: dict[str, Path] = {}
+    for key in keys:
+        for assignment in key:
+            if assignment.type != "type" or assignment.type_source is None:
+                continue
+            source = assignment.type_source.resolve()
+            known = sources.setdefault(str(assignment.value), source)
+            if known != source:
+                raise ValueError(
+                    f"types declared in {known.as_posix()} and {source.as_posix()} share the identity "
+                    f"'{assignment.value}'; give their modules distinct project module paths"
+                )
 
 
 def specialization(name: str, type: _Scalar | _TypeKind) -> Specialization:
@@ -360,7 +387,8 @@ def type_identity(value: object) -> str:
 
 def specialization_assignment(parameter: Specialization, value: object) -> SpecializationAssignment:
     if parameter.type is type_kind:
-        return SpecializationAssignment(parameter.name, "type", type_identity(value), value)
+        source = declaration_source(value) if is_struct_class(value) or is_binding_group(value) else None
+        return SpecializationAssignment(parameter.name, "type", type_identity(value), value, source)
     if parameter.type is bool:
         if type(value) is not builtins.bool:
             raise TypeError(f"specialization {parameter.name!r} requires a bool value")

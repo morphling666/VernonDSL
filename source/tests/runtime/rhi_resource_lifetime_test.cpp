@@ -220,14 +220,14 @@ TEST_P(RhiResourceLifetime, CommandChildrenKeepDevicePublishedUntilExplicitDestr
     VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
 
-    vernonRhiDestroyDevice(device);
+    EXPECT_EQ(vernonRhiDestroyDevice(device), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_TRUE(vernon::rhi::deviceExists(device));
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
     VernonRhiCompletion completion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
 
-    vernonRhiDestroyDevice(device);
+    EXPECT_EQ(vernonRhiDestroyDevice(device), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_TRUE(vernon::rhi::deviceExists(device));
     ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
     EXPECT_TRUE(vernon::rhi::deviceExists(device));
@@ -346,7 +346,7 @@ TEST_P(RhiResourceLifetime, SubmitMovesRetainedLeaseAndCompletionKeepsOnlyDevice
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(recycled.index, retained.index);
     EXPECT_NE(recycled.generation, retained.generation);
-    vernonRhiDestroyDevice(device);
+    EXPECT_EQ(vernonRhiDestroyDevice(device), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_TRUE(vernon::rhi::deviceExists(device));
     EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, whileRetained), VERNON_RHI_STATUS_OK);
@@ -616,14 +616,14 @@ TEST_P(RhiResourceLifetime, RuntimeContextAndAdapterRetainTheirRhiDevice) {
     const VernonRhiDevice retainedDevice = device();
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(retainedDevice, *backend.rhi);
     ASSERT_NE(adapter, nullptr);
-    vernonRhiDestroyDevice(retainedDevice);
+    EXPECT_EQ(vernonRhiDestroyDevice(retainedDevice), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
     vernonRuntimeRhiAdapterDestroy(adapter);
 
     VernonRuntimeContext *context = vernonRuntimeCreateForRhiDevice(backend.runtime, retainedDevice);
     ASSERT_NE(context, nullptr);
 
-    vernonRhiDestroyDevice(retainedDevice);
+    EXPECT_EQ(vernonRhiDestroyDevice(retainedDevice), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
     EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));

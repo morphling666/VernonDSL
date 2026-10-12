@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <initializer_list>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
@@ -142,6 +143,23 @@ std::string artifacts(const VernonCompileResult *result) {
         output.append(artifact.data, artifact.size);
     }
     return output;
+}
+
+bool declaresArrayOfArrays(const std::vector<uint32_t> &words) {
+    constexpr uint16_t opTypeArray = 28;
+    std::vector<uint32_t> arrays;
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        if (wordCount == 0 || cursor + wordCount > words.size())
+            return true;
+        if (static_cast<uint16_t>(words[cursor]) == opTypeArray && wordCount == 4) {
+            if (std::find(arrays.begin(), arrays.end(), words[cursor + 2]) != arrays.end())
+                return true;
+            arrays.push_back(words[cursor + 1]);
+        }
+        cursor += wordCount;
+    }
+    return false;
 }
 
 void expectPackedPushConstants(std::string_view artifact) {
@@ -659,6 +677,170 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompilerDestroy(compiler);
 }
 
+namespace {
+
+struct ArrayedImageTypes {
+    bool image2D{};
+    bool imageCube{};
+    bool sampledCubeArrayCapability{};
+    bool imageQueryCapability{};
+};
+
+ArrayedImageTypes arrayedSpirvImageTypes(const std::string &output) {
+    constexpr uint16_t opCapability = 17;
+    constexpr uint16_t opTypeImage = 25;
+    constexpr uint32_t dim2D = 1;
+    constexpr uint32_t dimCube = 3;
+    constexpr uint32_t sampledCubeArray = 45;
+    constexpr uint32_t imageQuery = 50;
+    ArrayedImageTypes types;
+    std::vector<uint32_t> words(output.size() / sizeof(uint32_t));
+    std::memcpy(words.data(), output.data(), words.size() * sizeof(uint32_t));
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t instructionWords = static_cast<uint16_t>(words[cursor] >> 16);
+        if (instructionWords == 0 || cursor + instructionWords > words.size())
+            return {};
+        if (static_cast<uint16_t>(words[cursor]) == opCapability && instructionWords == 2) {
+            types.sampledCubeArrayCapability |= words[cursor + 1] == sampledCubeArray;
+            types.imageQueryCapability |= words[cursor + 1] == imageQuery;
+        }
+        // OpTypeImage operands: result, sampled type, Dim, Depth, Arrayed, MS, Sampled, Format.
+        if (static_cast<uint16_t>(words[cursor]) == opTypeImage && instructionWords >= 9 && words[cursor + 5] == 1) {
+            types.image2D |= words[cursor + 3] == dim2D;
+            types.imageCube |= words[cursor + 3] == dimCube;
+        }
+        cursor += instructionWords;
+    }
+    return types;
+}
+
+void expectArrayedTextureLowering(std::string_view mlir, const vernon::tests::BackendTestRequirements &requirements,
+                                  std::initializer_list<std::string_view> reflectedDimensions,
+                                  std::initializer_list<std::string_view> glslTypes, bool expectCube,
+                                  bool expectSizeQuery) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, mlir.data(), mlir.size(), target);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << backend.name << ": " << std::string_view(diagnostics.data, diagnostics.size);
+        const VernonStringView reflection = vernonCompileResultGetReflection(result);
+        const std::string_view reflectionView(reflection.data, reflection.size);
+        for (std::string_view dimension : reflectedDimensions)
+            EXPECT_NE(reflectionView.find("\"dimension\":\"" + std::string(dimension) + "\""), std::string_view::npos)
+                << backend.name << " " << dimension;
+        const std::string output = artifacts(result);
+        if (target == VERNON_TARGET_VULKAN) {
+            ASSERT_EQ(output.size() % sizeof(uint32_t), 0u);
+            const ArrayedImageTypes types = arrayedSpirvImageTypes(output);
+            EXPECT_TRUE(types.image2D);
+            EXPECT_EQ(types.imageCube, expectCube);
+            EXPECT_EQ(types.sampledCubeArrayCapability, expectCube);
+            EXPECT_EQ(types.imageQueryCapability, expectSizeQuery);
+        } else {
+            for (std::string_view type : glslTypes)
+                EXPECT_NE(output.find(type), std::string::npos) << type;
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+} // namespace
+
+TEST(CompilerGraphicsOutput, LowersSampledArrayTexturesWithLayerCoordinates) {
+    constexpr std::string_view arrayModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @array_fragment(
+      %layers: !vernon.texture<"2d_array", f32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64,
+        vernon.binding = 0 : i64, vernon.source_name = "layers"
+      },
+      %cubes: !vernon.texture<"cube_array", f32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64,
+        vernon.binding = 1 : i64, vernon.source_name = "cubes"
+      },
+      %sampler: !vernon.sampler {
+        vernon.interface = "resource", vernon.set = 0 : i64,
+        vernon.binding = 2 : i64, vernon.source_name = "sampler"
+      },
+      %uvLayer: tensor<3xf32> {
+        vernon.interface = "uniform", vernon.source_name = "uv_layer"
+      },
+      %directionCube: tensor<4xf32> {
+        vernon.interface = "uniform", vernon.source_name = "direction_cube"
+      }) -> (
+        tensor<4xf32> {
+          vernon.interface = "output", vernon.location = 0 : i64
+        },
+        tensor<3xi32> {
+          vernon.interface = "output", vernon.location = 1 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
+        },
+        tensor<3xi32> {
+          vernon.interface = "output", vernon.location = 2 : i64,
+          vernon.abi_leaf_dtypes = ["u32"]
+        }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %layerColor = "vernon.intrinsic"(%layers, %sampler, %uvLayer) {name = "texture_sample"} :
+        (!vernon.texture<"2d_array", f32, "unknown", "sampled">, !vernon.sampler, tensor<3xf32>) -> tensor<4xf32>
+    %cubeColor = "vernon.intrinsic"(%cubes, %sampler, %directionCube) {name = "texture_sample"} :
+        (!vernon.texture<"cube_array", f32, "unknown", "sampled">, !vernon.sampler, tensor<4xf32>) -> tensor<4xf32>
+    %color = arith.addf %layerColor, %cubeColor : tensor<4xf32>
+    %layerSize = "vernon.intrinsic"(%layers) {name = "texture_size"} :
+        (!vernon.texture<"2d_array", f32, "unknown", "sampled">) -> tensor<3xi32>
+    %cubeSize = "vernon.intrinsic"(%cubes) {name = "texture_size"} :
+        (!vernon.texture<"cube_array", f32, "unknown", "sampled">) -> tensor<3xi32>
+    return %color, %layerSize, %cubeSize : tensor<4xf32>, tensor<3xi32>, tensor<3xi32>
+  }
+})mlir";
+
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    requirements.textureSamplerOperations = true;
+    expectArrayedTextureLowering(arrayModule, requirements, {"2d_array", "cube_array"},
+                                 {"sampler2DArray", "samplerCubeArray"}, true, true);
+}
+
+TEST(CompilerGraphicsOutput, LowersStorageArrayTextureWithLayerCoordinate) {
+    constexpr std::string_view arrayModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @array_store(
+      %image: !vernon.texture<"2d_array", f32, "rgba32_float", "write"> {
+        vernon.interface = "resource", vernon.set = 0 : i64,
+        vernon.binding = 0 : i64, vernon.source_name = "image"
+      },
+      %coordinate: tensor<3xi32> {
+        vernon.interface = "uniform", vernon.source_name = "coordinate",
+        vernon.abi_leaf_dtypes = ["i32"]
+      },
+      %value: tensor<4xf32> {
+        vernon.interface = "uniform", vernon.source_name = "value"
+      }) attributes {
+        vernon.entry, vernon.stage = "compute", vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    "vernon.intrinsic"(%image, %coordinate, %value) {name = "texture_store"} :
+        (!vernon.texture<"2d_array", f32, "rgba32_float", "write">, tensor<3xi32>, tensor<4xf32>) -> ()
+    return
+  }
+})mlir";
+
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    requirements.storageTexture = true;
+    expectArrayedTextureLowering(arrayModule, requirements, {"2d_array"}, {"image2DArray"}, false, false);
+}
+
 TEST(CompilerGraphicsOutput, LowersRecursiveStaticTensorValuesAndReflectsPhysicalLayout) {
     constexpr std::string_view tensorModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
@@ -731,8 +913,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             arrayStrides.push_back(words[cursor + 3]);
         cursor += wordCount;
     }
-    for (uint32_t stride : {16u, 80u, 240u})
-        EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+    EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), 16u), arrayStrides.end());
+    for (uint32_t stride : {80u, 240u})
+        EXPECT_EQ(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+    EXPECT_FALSE(declaresArrayOfArrays(words));
 
     const VernonStringView reflection = vernonCompileResultGetReflection(result);
     const std::string_view reflected(reflection.data, reflection.size);
@@ -837,8 +1021,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             cursor += wordCount;
         }
         EXPECT_TRUE(hasFourComponentCarrier);
-        for (uint32_t stride : {16u, tailWidth * 16u, tailWidth * 32u})
-            EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+        EXPECT_FALSE(arrayStrides.empty());
+        EXPECT_TRUE(
+            std::all_of(arrayStrides.begin(), arrayStrides.end(), [](uint32_t stride) { return stride == 16u; }));
+        EXPECT_FALSE(declaresArrayOfArrays(words));
 
         const VernonStringView reflected = vernonCompileResultGetReflection(result);
         const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
@@ -933,7 +1119,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_EQ(reflected.find("\"profile\":\"host_value\""), std::string_view::npos);
         EXPECT_EQ(reflected.find("\"profile\":\"metal_constant_buffer\"") != std::string_view::npos,
                   target == VERNON_TARGET_METAL);
-        EXPECT_EQ(reflected.find("\"profile\":\"directx_constant_buffer\""), std::string_view::npos);
         EXPECT_EQ(reflected.find("\"profile\":\"opengl_native_uniform\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"size\":32"), std::string_view::npos);
@@ -1224,8 +1409,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
               "strided_memref_storage_leaves");
     EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("resource_kind"),
               "descriptor_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("resource_kind"),
+    EXPECT_EQ(argument.at("physical_layouts").at("metal_constant_buffer").at("resource_kind"),
               "descriptor_storage_leaves");
+    EXPECT_FALSE(argument.at("physical_layouts").contains("directx_constant_buffer"));
     EXPECT_FALSE(argument.at("physical_layouts").at("cuda_kernel_parameter").contains("element_layout_hash"));
     EXPECT_EQ(argument.at("element_layout").at("byte_size"), 20);
     EXPECT_EQ(argument.at("element_layout").at("alignment"), 4);

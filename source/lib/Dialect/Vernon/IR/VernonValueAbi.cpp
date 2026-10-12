@@ -550,18 +550,6 @@ FailureOr<NodeProjection> projectNode(const CanonicalAbiNode &canonical, Physica
         return NodeProjection{rows * columns * elementSize, elementSize, {elementSize, rows * elementSize}};
     }
 
-    if (profile == PhysicalAbiProfile::DirectXConstantBuffer) {
-        if (isRankedTensor(canonical) && canonical.shape.size() == 2) {
-            const uint64_t elementSize = std::max<uint64_t>(scalarBitWidth(canonical) / 8, 1);
-            const uint64_t rows = canonical.shape[0];
-            const uint64_t columns = canonical.shape[1];
-            FailureOr<uint64_t> rowStride = checkedAlign(columns * elementSize, 16);
-            if (failed(rowStride))
-                return failure();
-            return NodeProjection{rows * *rowStride, 16, {*rowStride, elementSize}};
-        }
-    }
-
     const bool std430 = profile == PhysicalAbiProfile::VulkanStd430StorageBuffer ||
                         profile == PhysicalAbiProfile::VulkanPushConstant ||
                         profile == PhysicalAbiProfile::MetalConstantBuffer;
@@ -580,7 +568,9 @@ FailureOr<NodeProjection> projectNode(const CanonicalAbiNode &canonical, Physica
             const uint64_t rows = canonical.shape[0];
             const uint64_t columns = canonical.shape[1];
             const uint64_t vectorAlignment = (rows == 2 ? 2 : 4) * elementSize;
-            const uint64_t columnAlignment = std430 ? vectorAlignment : std::max<uint64_t>(vectorAlignment, 16);
+            // DirectX uploads the push-constant block as an HLSL cbuffer, where every matrix column starts a register.
+            const bool packedColumns = std430 && profile != PhysicalAbiProfile::VulkanPushConstant;
+            const uint64_t columnAlignment = packedColumns ? vectorAlignment : std::max<uint64_t>(vectorAlignment, 16);
             FailureOr<uint64_t> stride = checkedAlign(rows * elementSize, columnAlignment);
             if (failed(stride))
                 return failure();
@@ -696,7 +686,6 @@ FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleO
         case PhysicalAbiProfile::VulkanStd430StorageBuffer:
         case PhysicalAbiProfile::VulkanPushConstant:
         case PhysicalAbiProfile::OpenGLNativeUniform:
-        case PhysicalAbiProfile::DirectXConstantBuffer:
         case PhysicalAbiProfile::MetalConstantBuffer:
             return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsStorageLeaves, 0, 0}};
         case PhysicalAbiProfile::Count:

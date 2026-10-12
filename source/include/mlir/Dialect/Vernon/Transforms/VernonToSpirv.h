@@ -4,7 +4,15 @@
 
 namespace mlir::vernon {
 
-std::unique_ptr<Pass> createVernonToSPIRVPass(bool useVulkanInterfaceAbi = true);
+enum class SpirvInterfaceAbi {
+    Vulkan,
+    // Inline uniforms share the Vulkan push-constant block, which SPIRV-Cross emits as the root-constant cbuffer.
+    DirectX,
+    // Inline uniforms stay loose UniformConstant variables, which OpenGL and Metal bind natively.
+    NativeUniforms,
+};
+
+std::unique_ptr<Pass> createVernonToSPIRVPass(SpirvInterfaceAbi abi = SpirvInterfaceAbi::Vulkan);
 
 void registerVernonToSPIRVPass();
 

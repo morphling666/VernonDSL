@@ -212,7 +212,9 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         hasShaderAtomicFloat && shaderAtomicFloatFeatures.shaderBufferFloat32AtomicAdd == VK_TRUE;
     if (canUseDynamicRendering)
         dynamicRendering = dynamicRenderingFeatures.dynamicRendering == VK_TRUE;
+    imageCubeArray = features.features.imageCubeArray == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.imageCubeArray = features.features.imageCubeArray;
     deviceInfo.pEnabledFeatures = &enabledFeatures;
     std::vector<const char *> deviceExtensions;
     void *enabledFeatureChain = nullptr;

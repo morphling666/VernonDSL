@@ -296,7 +296,10 @@ RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diag
                                                     : "no usable Vernon RHI device was found";
             return runtimeFailure(RuntimeErrorCode::RhiFailure, "probe_backend");
         }
-        vernonRhiDestroyDevice(device);
+        if (vernonRhiDestroyDevice(device) != VERNON_RHI_STATUS_OK) {
+            diagnostic = "the probed Vernon RHI device could not be destroyed";
+            return runtimeFailure(RuntimeErrorCode::RhiFailure, "probe_backend_destroy");
+        }
         return RuntimeResult<void>{ok()};
     };
     switch (backend) {

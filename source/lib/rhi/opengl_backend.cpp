@@ -191,8 +191,8 @@ bool DeviceState::uploadImage2D(const Image &image, Size width, Size height, Enu
     return true;
 }
 
-bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel, Int x, Int y, Size width, Size height,
-                                  Enum externalFormat, Enum type, void *destination, std::string &error) {
+bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel, Int layer, Int x, Int y, Size width,
+                                  Size height, Enum externalFormat, Enum type, void *destination, std::string &error) {
     if (!image.name || !destination)
         return false;
     makeCurrent();
@@ -207,7 +207,10 @@ bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel,
     const bool depthStencil = externalFormat == 0x84F9;
     const bool depthOnly = externalFormat == 0x1902;
     const Enum attachment = depthStencil ? kDepthStencilAttachment : depthOnly ? kDepthAttachment : kColorAttachment0;
-    driver.framebufferTexture2D(kFramebuffer, attachment, target, image.name, mipLevel);
+    if (target == kTexture2DArray || target == kTextureCubeMapArray)
+        driver.framebufferTextureLayer(kFramebuffer, attachment, image.name, mipLevel, layer);
+    else
+        driver.framebufferTexture2D(kFramebuffer, attachment, target, image.name, mipLevel);
     if (depthStencil || depthOnly) {
         const Enum none = kNone;
         driver.drawBuffers(1, &none);

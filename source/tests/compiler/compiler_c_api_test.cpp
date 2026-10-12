@@ -719,7 +719,7 @@ module {
     EXPECT_EQ(contract.at("reflection").at("graphics").at("topology"), "triangle_list");
     EXPECT_EQ(contract.at("reflection").at("graphics").at("fragment_outputs").at(0).at("location"), 0);
     EXPECT_EQ(contract.at("reflection").at("required_features"),
-              nlohmann::json::array({"vertex_feature", "fragment_feature"}));
+              nlohmann::json::array({"fragment_feature", "vertex_feature"}));
     EXPECT_EQ(canonical.at("stages").at(requestId).at("contract_hash"), canonical_sha256(contract));
     EXPECT_EQ(result.at("target_implementations").at(requestId).at("target"), "metal");
     EXPECT_EQ(result.at("target_implementations").at(requestId).at("metadata").at("resource_slots").size(), 2u);

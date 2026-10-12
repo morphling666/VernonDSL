@@ -241,6 +241,22 @@ void restoreVulkanImageLayout(void *context, uint64_t layout) {
     static_cast<vernon::rhi::vulkan::Image *>(context)->layout = static_cast<VkImageLayout>(layout);
 }
 
+VkImageViewType vulkanViewType(VernonRhiImageDimension dimension) {
+    switch (dimension) {
+    case VERNON_RHI_IMAGE_3D:
+        return VK_IMAGE_VIEW_TYPE_3D;
+    case VERNON_RHI_IMAGE_CUBE:
+        return VK_IMAGE_VIEW_TYPE_CUBE;
+    case VERNON_RHI_IMAGE_2D_ARRAY:
+        return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    case VERNON_RHI_IMAGE_CUBE_ARRAY:
+        return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    case VERNON_RHI_IMAGE_2D:
+        break;
+    }
+    return VK_IMAGE_VIEW_TYPE_2D;
+}
+
 VkFormat vulkanFormat(VernonRhiFormat format) {
     constexpr VkFormat formats[] = {
         VK_FORMAT_UNDEFINED,           VK_FORMAT_R8_UNORM,
@@ -702,16 +718,11 @@ static VernonRhiStatus vernonRhiVulkanDeviceImportBorrowedImageBusiness(
                                    VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_STORAGE |
                                    VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
     auto device = lookupVulkanDevice(handle);
-    const bool validCube =
-        descriptor && (descriptor->descriptor.dimension != VERNON_RHI_IMAGE_CUBE ||
-                       (descriptor->descriptor.width == descriptor->descriptor.height &&
-                        descriptor->descriptor.depth == 1 && descriptor->descriptor.array_layers == 6));
     if (device.isErr() || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->image ||
         descriptor->descriptor.struct_size < sizeof(descriptor->descriptor) ||
-        vulkanFormat(descriptor->descriptor.format) == VK_FORMAT_UNDEFINED || !descriptor->descriptor.width ||
-        !descriptor->descriptor.height || !descriptor->descriptor.depth || !descriptor->descriptor.mip_levels ||
-        !descriptor->descriptor.array_layers || !descriptor->descriptor.sample_count ||
-        (descriptor->descriptor.usage & ~allUsages) != 0 || !validCube || !output)
+        vulkanFormat(descriptor->descriptor.format) == VK_FORMAT_UNDEFINED ||
+        !vernon::rhi::validImageShape(descriptor->descriptor) || !descriptor->descriptor.mip_levels ||
+        !descriptor->descriptor.sample_count || (descriptor->descriptor.usage & ~allUsages) != 0 || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     VulkanInteropDevice &context = device.value().device();
     auto owner = device.value().retainOwner();
@@ -911,10 +922,7 @@ vernon::Result<VernonRhiImageView, vernon::RhiError> createImageView(VernonRhiDe
     aspectMask |= (descriptor->aspects & VERNON_RHI_IMAGE_ASPECT_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0;
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.image = image->image.image;
-    info.viewType = descriptor->dimension == VERNON_RHI_IMAGE_3D     ? VK_IMAGE_VIEW_TYPE_3D
-                    : descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
-                    : descriptor->array_layer_count > 1              ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                                                                     : VK_IMAGE_VIEW_TYPE_2D;
+    info.viewType = vulkanViewType(descriptor->dimension);
     info.format = vulkanFormat(descriptor->format);
     info.subresourceRange = {aspectMask, descriptor->base_mip_level, descriptor->mip_level_count,
                              descriptor->base_array_layer, descriptor->array_layer_count};
@@ -1418,10 +1426,13 @@ vernon::Result<VernonRhiImage, vernon::RhiError> createImage(VernonRhiDevice han
     const bool depthFormat = descriptor && (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ||
                                             descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT);
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || format == VK_FORMAT_UNDEFINED ||
-        descriptor->width == 0 || descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
-        descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+        !vernon::rhi::validImageShape(*descriptor) || descriptor->mip_levels == 0 || descriptor->sample_count != 1 ||
+        (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return vernon::Result<VernonRhiImage, vernon::RhiError>{vernon::err(invalidResource("create_vulkan_image"))};
+    if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE_ARRAY && !device->state.imageCubeArray)
+        return vernon::Result<VernonRhiImage, vernon::RhiError>{
+            vernon::err(unsupported("create_vulkan_image", descriptor->format))};
     auto owner = device.value().retainOwner();
     if (owner.isErr())
         return vernon::Result<VernonRhiImage, vernon::RhiError>{vernon::err(std::move(owner).error())};
@@ -1452,8 +1463,9 @@ vernon::Result<VernonRhiImage, vernon::RhiError> createImage(VernonRhiDevice han
     }
     VulkanImageSlot &slot = *reserved.value();
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-                      (descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+    imageInfo.flags =
+        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+        (vernon::rhi::cubeImageDimension(descriptor->dimension) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
     imageInfo.imageType = descriptor->dimension == VERNON_RHI_IMAGE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     imageInfo.format = format;
     imageInfo.extent = {descriptor->width, descriptor->height, descriptor->depth};
@@ -1472,9 +1484,7 @@ vernon::Result<VernonRhiImage, vernon::RhiError> createImage(VernonRhiDevice han
         imageInfo.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.viewType = descriptor->dimension == VERNON_RHI_IMAGE_3D     ? VK_IMAGE_VIEW_TYPE_3D
-                        : descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
-                                                                         : VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = vulkanViewType(descriptor->dimension);
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = vernon::rhi::vulkan::imageAspectMask(format);
     viewInfo.subresourceRange.levelCount = descriptor->mip_levels;
@@ -1520,17 +1530,13 @@ vernon::Result<void, vernon::RhiError> uploadImage(VernonRhiDevice handle, Verno
     if (!slot || !slot->image.owned)
         return invalidResult("upload_vulkan_image");
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
-    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_3D &&
-         descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
-        (descriptor.dimension != VERNON_RHI_IMAGE_3D && descriptor.depth != 1))
+    if (!vernon::rhi::validImageShape(descriptor))
         return invalidResult("upload_vulkan_image");
     size_t totalSize = 0;
     std::vector<size_t> uploadSizes(uploadCount);
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
-        const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
-                                    ? upload.array_layer < descriptor.array_layers
-                                    : upload.array_layer == 0;
+        const bool validLayer = upload.array_layer < descriptor.array_layers;
         const bool validMip = upload.mip_level < descriptor.mip_levels;
         const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
         const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;

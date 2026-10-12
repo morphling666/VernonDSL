@@ -1,6 +1,7 @@
 #include "prepared_binding_plan.h"
 
 #include "runtime/autodiff/tape_allocator_abi.h"
+#include "runtime/interface_names.h"
 
 #include <algorithm>
 #include <cstring>
@@ -79,19 +80,15 @@ bool hostSize(uint64_t value, size_t &result) {
 bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
                                      OpenGLNativeUniformShape &result) {
     result = {};
-    if (shape.empty()) {
-        result.scalarCount = 1;
-        return dtype == "f32" || dtype == "i32" || dtype == "u32";
-    }
-    if (shape.size() == 1 && shape[0] >= 1 && shape[0] <= 4) {
-        result.scalarCount = static_cast<uint32_t>(shape[0]);
-        return dtype == "f32" || dtype == "i32" || dtype == "u32";
-    }
-    if (dtype != "f32" || shape.size() != 2 || shape[0] < 2 || shape[0] > 4 || shape[1] < 2 || shape[1] > 4)
+    if (!isNativeUniformShape(shape.data(), shape.size(), dtype == "f32"))
         return false;
-    result.scalarCount = static_cast<uint32_t>(shape[0] * shape[1]);
-    result.matrixColumns = static_cast<uint32_t>(shape[1]);
-    return true;
+    if (shape.size() == 2) {
+        result.scalarCount = static_cast<uint32_t>(shape[0] * shape[1]);
+        result.matrixColumns = static_cast<uint32_t>(shape[1]);
+        return true;
+    }
+    result.scalarCount = shape.empty() ? 1 : static_cast<uint32_t>(shape[0]);
+    return dtype == "f32" || dtype == "i32" || dtype == "u32";
 }
 
 bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const ReflectedEntry &reflection,

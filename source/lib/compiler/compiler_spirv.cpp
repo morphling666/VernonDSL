@@ -29,11 +29,13 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -223,6 +225,39 @@ struct AttachSpirvTargetPass
     bool requireF32AtomicAdd{};
 };
 
+// Must run after SPIRVUpdateVCE, which rewrites the triple from MLIR's type and op capability interfaces. Those
+// interfaces miss sampled arrayed cube images, and OpImageQuerySizeLod is only materialized after serialization.
+struct RequireImageCapabilitiesPass
+    : public mlir::PassWrapper<RequireImageCapabilitiesPass, mlir::OperationPass<mlir::spirv::ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RequireImageCapabilitiesPass)
+
+    void runOnOperation() override {
+        mlir::spirv::ModuleOp module = getOperation();
+        std::optional<mlir::spirv::VerCapExtAttr> triple = module.getVceTriple();
+        if (!triple) {
+            module.emitError("SPIR-V module has no version/capability/extension triple");
+            return signalPassFailure();
+        }
+        llvm::SetVector<mlir::spirv::Capability> capabilities(triple->getCapabilities().begin(),
+                                                              triple->getCapabilities().end());
+        module.walk([&](mlir::spirv::GlobalVariableOp variable) {
+            auto pointer = mlir::dyn_cast<mlir::spirv::PointerType>(variable.getType());
+            auto sampled = pointer ? mlir::dyn_cast<mlir::spirv::SampledImageType>(pointer.getPointeeType()) : nullptr;
+            auto image = sampled ? mlir::dyn_cast<mlir::spirv::ImageType>(sampled.getImageType()) : nullptr;
+            if (image && image.getDim() == mlir::spirv::Dim::Cube &&
+                image.getArrayedInfo() == mlir::spirv::ImageArrayedInfo::Arrayed)
+                capabilities.insert(mlir::spirv::Capability::SampledCubeArray);
+        });
+        if (auto count = module->getAttrOfType<mlir::IntegerAttr>(mlir::vernon::kImageQueryExpectedCountAttr);
+            count && count.getInt() > 0)
+            capabilities.insert(mlir::spirv::Capability::ImageQuery);
+        const llvm::SmallVector<mlir::spirv::Extension> extensions(triple->getExtensions().begin(),
+                                                                   triple->getExtensions().end());
+        module.setVceTripleAttr(mlir::spirv::VerCapExtAttr::get(triple->getVersion(), capabilities.getArrayRef(),
+                                                                extensions, module.getContext()));
+    }
+};
+
 } // namespace
 
 bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
@@ -286,10 +321,14 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
         passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerMulOverflowChecksPass());
         passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonExpandFloorCeilDivisionPass());
         passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
-        passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));
+        passManager.addPass(mlir::vernon::createVernonToSPIRVPass(
+            target == VERNON_TARGET_VULKAN    ? mlir::vernon::SpirvInterfaceAbi::Vulkan
+            : target == VERNON_TARGET_DIRECTX ? mlir::vernon::SpirvInterfaceAbi::DirectX
+                                              : mlir::vernon::SpirvInterfaceAbi::NativeUniforms));
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>(requireF32AtomicAdd));
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVUpdateVCEPass());
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<RequireImageCapabilitiesPass>());
         if (mlir::failed(passManager.run(*module)))
             return false;
     }

@@ -196,10 +196,10 @@ struct AtomicRMWToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> 
 };
 
 FailureOr<Type> convertStorageTextureType(TextureType texture) {
-    if (texture.getAccess() == "sampled" || texture.getDimension() == "cube")
+    if (texture.getAccess() == "sampled" || texture.isCube())
         return failure();
     std::optional<spirv::Dim> dimension = llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
-                                              .Case("2d", spirv::Dim::Dim2D)
+                                              .Cases("2d", "2d_array", spirv::Dim::Dim2D)
                                               .Case("3d", spirv::Dim::Dim3D)
                                               .Default(std::nullopt);
     std::optional<spirv::ImageFormat> format =
@@ -214,9 +214,10 @@ FailureOr<Type> convertStorageTextureType(TextureType texture) {
             .Default(std::nullopt);
     if (!dimension || !format)
         return failure();
-    Type image = spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
-                                       spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
-                                       spirv::ImageSamplerUseInfo::NoSampler, *format);
+    Type image = spirv::ImageType::get(
+        texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
+        texture.isArrayed() ? spirv::ImageArrayedInfo::Arrayed : spirv::ImageArrayedInfo::NonArrayed,
+        spirv::ImageSamplingInfo::SingleSampled, spirv::ImageSamplerUseInfo::NoSampler, *format);
     return spirv::PointerType::get(image, spirv::StorageClass::UniformConstant);
 }
 

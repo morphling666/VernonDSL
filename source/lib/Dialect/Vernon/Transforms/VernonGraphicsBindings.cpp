@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/Builders.h"
+#include "runtime/interface_names.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -30,6 +31,13 @@ std::string typeKey(Type type) {
 std::string sourceName(func::FuncOp function, unsigned index) {
     auto name = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
     return name ? name.getValue().str() : std::string();
+}
+
+bool isNativeUniformShape(RankedTensorType tensor) {
+    if (!tensor.hasStaticShape())
+        return false;
+    SmallVector<uint64_t> shape(tensor.getShape().begin(), tensor.getShape().end());
+    return ::vernon::runtime::isNativeUniformShape(shape.data(), shape.size(), tensor.getElementType().isF32());
 }
 
 } // namespace
@@ -105,8 +113,9 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
             if (failed(layout))
                 return function.emitError() << "cannot plan graphics inline layout for argument #" << index;
             const uint64_t offset = llvm::alignTo(inlineSize, layout->root->alignment);
-            const bool spill = (isa<RankedTensorType>(type) && cast<RankedTensorType>(type).getRank() > 2) ||
-                               offset > 128 || layout->root->size > 128 - std::min<uint64_t>(offset, 128);
+            auto tensor = dyn_cast<RankedTensorType>(type);
+            const bool spill = (tensor && !isNativeUniformShape(tensor)) || offset > 128 ||
+                               layout->root->size > 128 - std::min<uint64_t>(offset, 128);
             if (spill)
                 request("uniform_buffer", 1);
             else

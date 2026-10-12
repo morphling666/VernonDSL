@@ -91,6 +91,20 @@ class TypeIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "no portable identity"):
             type_identity(Local)
 
+    def test_variants_reject_types_of_two_projects_sharing_one_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            modules = []
+            for project in ("first", "second"):
+                root = Path(directory) / project
+                (root / "lib").mkdir(parents=True)
+                (root / "pyproject.toml").write_text(f'[project]\nname = "{project}"\n', encoding="utf-8")
+                (root / "lib" / "materials.py").write_text(_MATTE, encoding="utf-8")
+                modules.append(_import_file(root / "lib" / "materials.py"))
+            first, second = (module.Matte for module in modules)
+            self.assertEqual(type_identity(first), type_identity(second))
+            with self.assertRaisesRegex(ValueError, "share the identity 'lib.materials:Matte'"):
+                vd.program_asset(id="tests/clash", program=shade, variants=({MATERIAL: first}, {MATERIAL: second}))
+
     def test_class_outside_a_project_root_has_no_portable_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rootless.py"
@@ -264,6 +278,153 @@ class TypeSpecializationAssetTests(unittest.TestCase):
             for variant in document["variants"]
         }
         self.assertEqual(len(deployed), 2)
+
+    def test_kernel_cooks_type_specialization_without_postponed_annotations(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        source = (
+            "from typing import Annotated\n"
+            "import vernon_dsl as vd\n"
+            'OPERATOR = vd.specialization("OPERATOR", vd.type)\n'
+            "@vd.binding_group\n"
+            "class Gain:\n"
+            "    gain: vd.f32\n"
+            "    @vd.func\n"
+            "    def apply(self, x: vd.f32) -> vd.f32:\n"
+            "        return x * self.gain\n"
+            "@vd.kernel(workgroup_size=(1, 1, 1))\n"
+            "def run(\n"
+            "    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write],\n"
+            "    operator: OPERATOR,\n"
+            '    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],\n'
+            ") -> None:\n"
+            "    values[gid[0]] = operator.apply(values[gid[0]])\n"
+            'asset = vd.program_asset(id="tests/eager", program=run, variants=({OPERATOR: Gain},))\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text('[project]\nname = "assets"\n', encoding="utf-8")
+            (root / "eager.py").write_text(source, encoding="utf-8")
+            manifest = cook_program_asset(program_asset=f"{root / 'eager.py'}:asset", output=root / "out", target="cpu")
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+        (variant,) = document["variants"]
+        self.assertEqual(variant["key"], [{"name": "OPERATOR", "value": {"tag": "type", "value": "eager:Gain"}}])
+        self.assertIn("operator.gain", [slot["path"] for slot in variant["program"]["abi"]["boundary_slots"]])
+
+    def test_type_value_from_another_project_specializes_a_library_template(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        library_ops = (
+            "from typing import Annotated\n"
+            "import vernon_dsl as vd\n"
+            'OPERATOR = vd.specialization("OPERATOR", vd.type)\n'
+            "@vd.struct(shared=True)\n"
+            "class Scale:\n"
+            "    factor: vd.f32\n"
+            "@vd.kernel(workgroup_size=(1, 1, 1))\n"
+            "def run(\n"
+            "    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write],\n"
+            "    operator: OPERATOR,\n"
+            '    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],\n'
+            ") -> None:\n"
+            "    values[gid[0]] = operator.apply(values[gid[0]])\n"
+        )
+        boost = (
+            "import vernon_dsl as vd\n"
+            "from lib.ops import Scale\n"
+            "from game.helpers import twice\n"
+            "@vd.binding_group\n"
+            "class Boost:\n"
+            "    scale: Scale\n"
+            "    @vd.func\n"
+            "    def apply(self, x: vd.f32) -> vd.f32:\n"
+            "        return twice(x * self.scale.factor)\n"
+        )
+        helpers = "import vernon_dsl as vd\n@vd.func\ndef twice(x: vd.f32) -> vd.f32:\n    return x * 2.0\n"
+        asset = (
+            "import vernon_dsl as vd\n"
+            "from lib.ops import OPERATOR, run\n"
+            "from game.boost import Boost\n"
+            'asset = vd.program_asset(id="game/boost", program=run, variants=({OPERATOR: Boost},))\n'
+        )
+        expected_key = [{"name": "OPERATOR", "value": {"tag": "type", "value": "game.boost:Boost"}}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library, content, clash = root / "library", root / "content", root / "clash"
+            for project, files in (
+                (library, {"lib/ops.py": library_ops}),
+                (content, {"game/boost.py": boost, "game/helpers.py": helpers, "game/asset.py": asset}),
+                (
+                    clash,
+                    {
+                        "lib/ops.py": library_ops,
+                        "arcade/helpers.py": helpers,
+                        "arcade/boost.py": boost.replace("game.", "arcade."),
+                        "arcade/asset.py": asset.replace("game", "arcade"),
+                    },
+                ),
+            ):
+                (project / "pyproject.toml").parent.mkdir(parents=True, exist_ok=True)
+                (project / "pyproject.toml").write_text(f'[project]\nname = "{project.name}"\n', encoding="utf-8")
+                for relative, text in files.items():
+                    (project / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (project / relative).write_text(text, encoding="utf-8")
+            sys.path[:0] = [str(library), str(content), str(clash)]
+            try:
+                static = cook_program_asset(
+                    program_asset=f"{content / 'game' / 'asset.py'}:asset", output=root / "static", target="vulkan"
+                )
+                ops = importlib.import_module("lib.ops")
+                declaration = vd.program_asset(
+                    id="game/boost",
+                    program=ops.run,
+                    variants=({ops.OPERATOR: importlib.import_module("game.boost").Boost},),
+                )
+                evaluated = cook_program_asset(program_asset=declaration, output=root / "evaluated", target="vulkan")
+                documents = [path.read_text(encoding="utf-8") for path in (static, evaluated)]
+
+                # The clashing project's own lib/ops.py shadows the library's for its modules.
+                with self.assertRaisesRegex(Exception, "share the project module path 'lib/ops.py'"):
+                    cook_program_asset(
+                        program_asset=f"{clash / 'arcade' / 'asset.py'}:asset", output=root / "out", target="vulkan"
+                    )
+            finally:
+                for package in ("lib", "game", "arcade"):
+                    for name in [name for name in sys.modules if name == package or name.startswith(f"{package}.")]:
+                        sys.modules.pop(name)
+                del sys.path[:3]
+            for document in documents:
+                self.assertNotIn(root.as_posix(), document.replace("\\\\", "/"))
+                (variant,) = json.loads(document)["variants"]
+                self.assertEqual(variant["key"], expected_key)
+                self.assertIn("operator.scale", [slot["path"] for slot in variant["program"]["abi"]["boundary_slots"]])
+            self.assertEqual(json.loads(documents[0])["content_hash"], json.loads(documents[1])["content_hash"])
+
+    def test_declaration_object_cooks_caller_selected_variants(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        path = _FIXTURES / "language_contract_graphics_asset.py"
+        specification = importlib.util.spec_from_file_location("_language_contract_graphics_asset", path)
+        assert specification is not None and specification.loader is not None
+        fixture = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = fixture
+        try:
+            specification.loader.exec_module(fixture)
+            authored = fixture.type_specialization_asset
+            declaration = vd.program_asset(
+                id="runtime/caller-selected", program=authored.program, variants=({fixture.SURFACE: fixture.Warm},)
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                manifest = cook_program_asset(program_asset=declaration, output=Path(directory), target="vulkan")
+                document = json.loads(manifest.read_text(encoding="utf-8"))
+        finally:
+            sys.modules.pop(specification.name, None)
+        self.assertEqual(document["id"], "runtime/caller-selected")
+        warm = "source.tests.fixtures.language_contract_graphics_asset:Warm"
+        self.assertEqual(
+            [variant["key"] for variant in document["variants"]],
+            [[{"name": "SURFACE", "value": {"tag": "type", "value": warm}}]],
+        )
 
 
 def _assert_surface_pipeline_renders(test: unittest.TestCase) -> None:

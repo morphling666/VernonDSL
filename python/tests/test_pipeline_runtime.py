@@ -27,8 +27,12 @@ from aggregate_vertex_shader import (
 from backend_test_matrix import BackendRequirements, backend_row, probe_backend, require_available
 from pipeline_shader import (
     OPTIONAL_IMAGE,
+    Placement,
+    array_layer_fragment,
+    array_uniform_fragment,
     colored_fragment,
     copy_static_tensor_value,
+    cube_array_fragment,
     cube_direction_fragment,
     depth_fragment,
     depth_vertex,
@@ -36,6 +40,7 @@ from pipeline_shader import (
     f16_attribute_vertex,
     f32_attribute_vertex,
     f64_attribute_vertex,
+    flat_coordinate_fragment,
     heightmap_fragment,
     heightmap_vertex,
     i32_attribute_vertex,
@@ -43,6 +48,7 @@ from pipeline_shader import (
     mat2_vertex,
     matrix_elementwise_fragment,
     matrix_vertex,
+    mixed_inline_uniform_fragment,
     mixed_uniform_fragment,
     non_square_attribute_vertex,
     numpy_tensor_fragment,
@@ -51,7 +57,9 @@ from pipeline_shader import (
     oversized_tensor_attribute_vertex,
     rank_three_tensor_attribute_vertex,
     solid_fragment,
+    spilled_matrix_vertex,
     static_tensor_fragment,
+    struct_matrix_vertex,
     translate_vertices,
     translated_vertex,
     triangle_vertex,
@@ -477,6 +485,44 @@ def assert_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     test.assertEqual(tuple(pixels[32, 16]), (0, 0, 0, 0))
 
 
+def assert_spilled_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    model = np.eye(4, dtype=np.float32)
+    model[0, 3] = 0.65
+    target = vd.Texture.zeros(shape=(64, 64))
+
+    vd.pipeline(spilled_matrix_vertex, solid_fragment)(
+        position=positions,
+        projection=np.eye(4, dtype=np.float32),
+        view=np.eye(4, dtype=np.float32),
+        model=model,
+        render_pass=render_target(target),
+    )
+
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[32, 48, 0]), 240)
+    test.assertEqual(tuple(pixels[32, 16]), (0, 0, 0, 0))
+
+
+def assert_struct_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    transform = np.eye(4, dtype=np.float32)
+    transform[0, 3] = 0.65
+    target = vd.Texture.zeros(shape=(64, 64))
+
+    vd.pipeline(struct_matrix_vertex, solid_fragment)(
+        position=positions,
+        placement=Placement(vd.f32(0.5), transform),
+        render_pass=render_target(target),
+    )
+
+    # The halved triangle spans x in [0.275, 1.025] only when the translation is read from row 0, column 3.
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[32, 48, 0]), 240)
+    test.assertEqual(tuple(pixels[32, 36]), (0, 0, 0, 0))
+    test.assertEqual(tuple(pixels[32, 16]), (0, 0, 0, 0))
+
+
 def assert_mixed_uniform_layout_renders(test: unittest.TestCase) -> None:
     positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
     target = vd.Texture.zeros(shape=(32, 32))
@@ -580,6 +626,60 @@ def assert_three_dimensional_texture_samples(test: unittest.TestCase) -> None:
             render_pass=render_target(target),
         )
         np.testing.assert_allclose(target.to_numpy()[4, 4], color, atol=1)
+
+
+def assert_array_textures_sample_layers(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    sampler = vd.sampler(address="clamp_to_edge")
+    colors = np.array(((255, 32, 16, 255), (24, 64, 255, 255), (16, 200, 40, 255)), dtype=np.uint8)
+    layers = np.broadcast_to(colors[:, None, None, :], (3, 2, 2, 4)).copy()
+    image = vd.Texture.array(layers)
+    test.assertEqual((image.shape, image.array_layers), ((2, 2), 3))
+    np.testing.assert_array_equal(image.to_numpy(), layers)
+
+    render_array = vd.pipeline(triangle_vertex, array_layer_fragment)
+    render_flat = vd.pipeline(triangle_vertex, flat_coordinate_fragment)
+    for layer, color in enumerate(colors):
+        target = vd.Texture.zeros(shape=(8, 8))
+        render_array(
+            position=positions,
+            coordinate=np.array((0.5, 0.5, float(layer)), dtype=np.float32),
+            image=image,
+            sampler=sampler,
+            render_pass=render_target(target),
+        )
+        np.testing.assert_array_equal(target.to_numpy()[4, 4], color)
+
+        target = vd.Texture.zeros(shape=(8, 8))
+        render_flat(
+            position=positions,
+            uv=np.array((0.5, 0.5), dtype=np.float32),
+            image=image.view(dimension="2d", base_array_layer=layer, array_layer_count=1),
+            sampler=sampler,
+            render_pass=render_target(target),
+        )
+        np.testing.assert_array_equal(target.to_numpy()[4, 4], color)
+
+    # Face 0 is +X; cube c owns layers 6c..6c+5.
+    faces = np.zeros((12, 2, 2, 4), dtype=np.uint8)
+    faces[0] = colors[0]
+    faces[6] = colors[1]
+    cubes = vd.Texture.cube_array(faces)
+    test.assertEqual((cubes.shape, cubes.array_layers), ((2, 2), 12))
+    render_cubes = vd.pipeline(triangle_vertex, cube_array_fragment)
+    for cube, color in enumerate(colors[:2]):
+        target = vd.Texture.zeros(shape=(8, 8))
+        render_cubes(
+            position=positions,
+            direction=np.array((1.0, 0.0, 0.0, float(cube)), dtype=np.float32),
+            image=cubes,
+            sampler=sampler,
+            render_pass=render_target(target),
+        )
+        np.testing.assert_array_equal(target.to_numpy()[4, 4], color)
+
+    with test.assertRaisesRegex(ValueError, r"\(6 \* cubes, size, size, 4\)"):
+        vd.Texture.cube_array(np.zeros((7, 2, 2, 4), dtype=np.uint8))
 
 
 def assert_vertex_heightmap_sampling(test: unittest.TestCase) -> None:
@@ -730,6 +830,60 @@ def assert_numpy_tensor_fragment_renders(test: unittest.TestCase) -> None:
         (broadcasted[0, 0, 0], broadcasted[7, 7, 3], product[0, 0, 1], product[7, 7, 0]),
         dtype=np.float32,
     )
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.rint(expected * 255.0).astype(np.uint8),
+        rtol=0.0,
+        atol=1,
+    )
+
+
+def assert_array_uniform_fragment_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    grid = np.linspace(0.1, 0.9, 30, dtype=np.float32).reshape(5, 6)
+    ramp = np.linspace(0.2, 0.6, 8, dtype=np.float32)
+    scale = np.float32(0.5)
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, array_uniform_fragment)(
+        position=positions,
+        grid=grid,
+        ramp=ramp,
+        scale=scale,
+        render_pass=render_target(target),
+    )
+
+    expected = np.array((grid[0, 1] * scale, grid[4, 5], ramp[6], ramp[7]), dtype=np.float32)
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.rint(expected * 255.0).astype(np.uint8),
+        rtol=0.0,
+        atol=1,
+    )
+
+
+def assert_mixed_inline_uniforms_render(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    bias = np.float32(0.1)
+    tint = np.array((0.2, 0.9, 0.3), dtype=np.float32)
+    basis = np.array(((0.5, 0.1), (0.2, 0.4)), dtype=np.float32)
+    gain = np.float32(2.0)
+    shift = np.array((0.6, 0.8), dtype=np.float32)
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, mixed_inline_uniform_fragment)(
+        position=positions,
+        bias=bias,
+        tint=tint,
+        basis=basis,
+        gain=gain,
+        shift=shift,
+        render_pass=render_target(target),
+    )
+
+    # The 2x2 matrix needs 16-byte columns and the vec3 starts a new 16-byte register, so loose HLSL packing,
+    # tight std430 matrix columns, or a transposed matrix each change at least one channel.
+    expected = np.concatenate(((bias + tint[0], tint[2] * gain), basis @ shift)).astype(np.float32)
     np.testing.assert_allclose(
         target.to_numpy()[16, 16],
         np.rint(expected * 255.0).astype(np.uint8),
@@ -995,6 +1149,12 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
+    def test_spilled_matrix_uniform_transforms_vertices(self) -> None:
+        assert_spilled_matrix_uniform_transforms_vertices(self)
+
+    def test_struct_matrix_uniform_transforms_vertices(self) -> None:
+        assert_struct_matrix_uniform_transforms_vertices(self)
+
     def test_mixed_uniform_layout_renders(self) -> None:
         assert_mixed_uniform_layout_renders(self)
 
@@ -1003,6 +1163,9 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
+
+    def test_array_textures_sample_layers(self) -> None:
+        assert_array_textures_sample_layers(self)
 
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
@@ -1024,6 +1187,12 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_numpy_tensor_fragment_renders(self) -> None:
         assert_numpy_tensor_fragment_renders(self)
+
+    def test_array_uniform_fragment_renders(self) -> None:
+        assert_array_uniform_fragment_renders(self)
+
+    def test_mixed_inline_uniforms_render(self) -> None:
+        assert_mixed_inline_uniforms_render(self)
 
     def test_static_tensor_compute_argument(self) -> None:
         assert_static_tensor_compute_argument(self)
@@ -1259,6 +1428,12 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
+    def test_spilled_matrix_uniform_transforms_vertices(self) -> None:
+        assert_spilled_matrix_uniform_transforms_vertices(self)
+
+    def test_struct_matrix_uniform_transforms_vertices(self) -> None:
+        assert_struct_matrix_uniform_transforms_vertices(self)
+
     def test_mixed_uniform_layout_renders(self) -> None:
         assert_mixed_uniform_layout_renders(self)
 
@@ -1267,6 +1442,9 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
+
+    def test_array_textures_sample_layers(self) -> None:
+        assert_array_textures_sample_layers(self)
 
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
@@ -1288,6 +1466,12 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_numpy_tensor_fragment_renders(self) -> None:
         assert_numpy_tensor_fragment_renders(self)
+
+    def test_array_uniform_fragment_renders(self) -> None:
+        assert_array_uniform_fragment_renders(self)
+
+    def test_mixed_inline_uniforms_render(self) -> None:
+        assert_mixed_inline_uniforms_render(self)
 
     def test_static_tensor_compute_argument(self) -> None:
         assert_static_tensor_compute_argument(self)
@@ -1392,6 +1576,12 @@ class DirectXPipelineTests(unittest.TestCase):
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
+    def test_spilled_matrix_uniform_transforms_vertices(self) -> None:
+        assert_spilled_matrix_uniform_transforms_vertices(self)
+
+    def test_struct_matrix_uniform_transforms_vertices(self) -> None:
+        assert_struct_matrix_uniform_transforms_vertices(self)
+
     def test_mixed_uniform_layout_renders(self) -> None:
         assert_mixed_uniform_layout_renders(self)
 
@@ -1400,6 +1590,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
+
+    def test_array_textures_sample_layers(self) -> None:
+        assert_array_textures_sample_layers(self)
 
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
@@ -1421,6 +1614,12 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_numpy_tensor_fragment_renders(self) -> None:
         assert_numpy_tensor_fragment_renders(self)
+
+    def test_array_uniform_fragment_renders(self) -> None:
+        assert_array_uniform_fragment_renders(self)
+
+    def test_mixed_inline_uniforms_render(self) -> None:
+        assert_mixed_inline_uniforms_render(self)
 
     def test_static_tensor_compute_argument(self) -> None:
         assert_static_tensor_compute_argument(self)

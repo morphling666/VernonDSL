@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 #include <memory>
+#include <vector>
 
 TEST(VernonValueAbi, SignlessI32RequiresExplicitLanguageDtype) {
     std::unique_ptr<vernon::compiler::CompilerFrontend, decltype(&vernon::compiler::destroyCompilerFrontend)> frontend(
@@ -63,4 +64,40 @@ TEST(VernonValueAbi, FloatStorageIsUnambiguousLanguageDtype) {
     mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(f32, *module);
     ASSERT_TRUE(mlir::succeeded(layout));
     EXPECT_EQ(layout->leaves.front().dtype, "f32");
+}
+
+TEST(VernonValueAbi, PushConstantMatrixColumnsStartRegisters) {
+    std::unique_ptr<vernon::compiler::CompilerFrontend, decltype(&vernon::compiler::destroyCompilerFrontend)> frontend(
+        vernon::compiler::createCompilerFrontend(), vernon::compiler::destroyCompilerFrontend);
+    ASSERT_NE(frontend, nullptr);
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    auto module = mlir::parseSourceString<mlir::ModuleOp>("module {}", &context);
+    ASSERT_TRUE(module);
+    const auto plan = [&](llvm::ArrayRef<int64_t> shape, mlir::vernon::PhysicalAbiProfile profile) {
+        return mlir::vernon::getByteTransportPlan(mlir::RankedTensorType::get(shape, mlir::Float32Type::get(&context)),
+                                                  *module, profile);
+    };
+    for (int64_t columns = 2; columns <= 4; ++columns) {
+        mlir::FailureOr<mlir::vernon::ByteTransportPlan> push =
+            plan({2, columns}, mlir::vernon::PhysicalAbiProfile::VulkanPushConstant);
+        mlir::FailureOr<mlir::vernon::ByteTransportPlan> storage =
+            plan({2, columns}, mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer);
+        ASSERT_TRUE(mlir::succeeded(push));
+        ASSERT_TRUE(mlir::succeeded(storage));
+        EXPECT_EQ(push->root->alignment, 16u);
+        EXPECT_EQ(push->root->size, 16u * static_cast<uint64_t>(columns));
+        EXPECT_EQ(push->root->byteStrides, (llvm::SmallVector<uint64_t>{4, 16}));
+        EXPECT_EQ(storage->root->byteStrides, (llvm::SmallVector<uint64_t>{4, 8}));
+    }
+    const std::vector<std::vector<int64_t>> unpaddedShapes{{}, {3}};
+    for (const std::vector<int64_t> &shape : unpaddedShapes) {
+        mlir::FailureOr<mlir::vernon::ByteTransportPlan> push =
+            plan(shape, mlir::vernon::PhysicalAbiProfile::VulkanPushConstant);
+        mlir::FailureOr<mlir::vernon::ByteTransportPlan> storage =
+            plan(shape, mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer);
+        ASSERT_TRUE(mlir::succeeded(push));
+        ASSERT_TRUE(mlir::succeeded(storage));
+        EXPECT_EQ(push->root->size, storage->root->size);
+        EXPECT_EQ(push->root->alignment, storage->root->alignment);
+    }
 }

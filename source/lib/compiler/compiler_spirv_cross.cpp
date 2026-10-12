@@ -1,5 +1,6 @@
 #include "compiler_spirv_cross.h"
 
+#include "runtime/interface_names.h"
 #include "spirv_glsl.hpp"
 #include "spirv_hlsl.hpp"
 #include "spirv_msl.hpp"
@@ -283,6 +284,27 @@ void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entr
         compiler.add_msl_resource_binding(resource.second);
 }
 
+void bindDirectXRootConstants(spirv_cross::CompilerHLSL &compiler, spv::ExecutionModel stage) {
+    spirv_cross::HLSLResourceBinding binding;
+    binding.stage = stage;
+    binding.desc_set = spirv_cross::ResourceBindingPushConstantDescriptorSet;
+    binding.binding = spirv_cross::ResourceBindingPushConstantBinding;
+    binding.cbv.register_binding = ::vernon::runtime::kDirectXRootConstantRegister;
+    binding.cbv.register_space = ::vernon::runtime::kDirectXRootConstantRegisterSpace;
+    compiler.add_hlsl_resource_binding(binding);
+}
+
+void shiftDirectXDescriptorSets(spirv_cross::Compiler &compiler) {
+    const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+    for (const auto *list : {&resources.uniform_buffers, &resources.storage_buffers, &resources.storage_images,
+                             &resources.sampled_images, &resources.separate_images, &resources.separate_samplers})
+        for (const spirv_cross::Resource &resource : *list)
+            if (compiler.has_decoration(resource.id, spv::DecorationBinding))
+                compiler.set_decoration(resource.id, spv::DecorationDescriptorSet,
+                                        compiler.get_decoration(resource.id, spv::DecorationDescriptorSet) +
+                                            ::vernon::runtime::kDirectXDescriptorSetRegisterSpaceOffset);
+}
+
 } // namespace
 
 bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostics, VernonTarget target,
@@ -389,6 +411,8 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     spirv_cross::CompilerHLSL compiler(words);
                     compiler.set_entry_point(entry.name, entry.execution_model);
                     canonicalizeInterface(compiler);
+                    shiftDirectXDescriptorSets(compiler);
+                    bindDirectXRootConstants(compiler, entry.execution_model);
                     spirv_cross::CompilerHLSL::Options options;
                     options.shader_model = hlslShaderModel;
                     // The D3D12 provider binds every storage buffer as a raw UAV range; a NonWritable block would
@@ -432,6 +456,15 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     // fragment inputs. Prefer the source-derived vertex output name;
                     // vertex inputs and fragment outputs retain their own source names.
                     canonicalizeInterface(compiler);
+                    for (const spirv_cross::Resource &uniform : compiler.get_shader_resources().uniform_buffers) {
+                        if (!compiler.has_decoration(uniform.id, spv::DecorationBinding)) {
+                            diagnostics = "OpenGL uniform block '" + compiler.get_name(uniform.id) + "' has no binding";
+                            return false;
+                        }
+                        compiler.set_name(uniform.base_type_id,
+                                          ::vernon::runtime::openGLUniformBlockName(
+                                              compiler.get_decoration(uniform.id, spv::DecorationBinding)));
+                    }
                     spirv_cross::CompilerGLSL::Options options;
                     options.es = target == VERNON_TARGET_OPENGL_ES;
                     options.version = glslVersion != 0                                        ? glslVersion
