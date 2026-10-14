@@ -135,6 +135,31 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
 
     VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
     ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *asynchronous = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(asynchronous, nullptr);
+    ASSERT_EQ(
+        vernonRuntimeProgramInvocationBind(asynchronous, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(asynchronous, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    const VernonProgramInvocationOptions asynchronousOptions{sizeof(VernonProgramInvocationOptions),
+                                                             VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
+                                                             VERNON_COMPLETION_ASYNCHRONOUS,
+                                                             {}};
+    ASSERT_EQ(vernonRuntimeProgramInvocationSetOptions(asynchronous, &asynchronousOptions), VERNON_STATUS_OK);
+    resetOutcome();
+    EXPECT_EQ(vernonRuntimeProgramInvocationExecute(asynchronous, 1, &mutationOutcome), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(lastError(context), "PROGRAM_SUBMISSION_REQUIRES_WAIT at /abi/boundary_slots/" +
+                                      std::to_string(outputParameter.slot) +
+                                      "/publication: a commit-after-success boundary is published after a host wait");
+    EXPECT_EQ(mutationOutcome.submission, VERNON_INVOCATION_NOT_SUBMITTED);
+    EXPECT_EQ(mutationState(outputParameter.slot), VERNON_BOUNDARY_MUTATION_UNCHANGED);
+    VernonSubmission *submission = nullptr;
+    EXPECT_NE(vernonRuntimeProgramInvocationTakeSubmission(asynchronous, &submission), VERNON_STATUS_OK);
+    EXPECT_EQ(submission, nullptr);
+    vernonRuntimeProgramInvocationRollback(asynchronous);
+    vernonRuntimeProgramInvocationDestroy(asynchronous);
+
     VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
     ASSERT_NE(invocation, nullptr);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),

@@ -5,10 +5,13 @@
 
 namespace vernon::runtime::program_execution {
 
+class SubmissionRecord;
+
 VernonStatus executePublicationInitialization(VernonRuntimeContext &context, const PublicationTransaction &transaction,
-                                              std::string &error);
+                                              SubmissionRecord &submission, std::string &error);
 VernonStatus executePublicationCommit(VernonRuntimeContext &context, PublicationTransaction &transaction,
-                                      const ProgramInvocationState &state, std::string &error);
+                                      const ProgramInvocationState &state, SubmissionRecord &submission,
+                                      std::string &error);
 
 } // namespace vernon::runtime::program_execution
 

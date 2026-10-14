@@ -204,18 +204,6 @@ Option<VernonStringView> lastError(VernonRhiDevice handle) {
     return Option<VernonStringView>{some(VernonStringView{device.error.data(), device.error.size()})};
 }
 
-Result<void, RhiError> synchronize(VernonRhiDevice handle) noexcept {
-    auto anchored = lookupCudaDevice(handle);
-    if (anchored.isErr())
-        return Result<void, RhiError>{err(std::move(anchored).error())};
-    CudaDevice &device = anchored.value().device();
-    std::lock_guard<std::mutex> guard(device.mutex);
-    const auto status = device.state.synchronize();
-    if (status == vernon::rhi::cuda::kSuccess)
-        return Result<void, RhiError>{ok()};
-    return Result<void, RhiError>{err(backendFailure(device, status, "cuStreamSynchronize"))};
-}
-
 Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
         descriptor->size > (std::numeric_limits<size_t>::max)() ||
@@ -431,10 +419,42 @@ Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint6
         return Result<CommandSubmission, RhiError>{err(invalidArgument("submit_cuda_commands", native, handle.index))};
     CudaDevice &device = anchored.value().device();
     std::lock_guard<std::mutex> guard(device.mutex);
-    const auto status = device.state.synchronize();
+    vernon::rhi::cuda::Event completion{};
+    const auto status = device.state.recordCompletion(completion);
     if (status != vernon::rhi::cuda::kSuccess)
-        return Result<CommandSubmission, RhiError>{err(backendFailure(device, status, "cuStreamSynchronize"))};
-    return Result<CommandSubmission, RhiError>{ok(CommandSubmission{true, false})};
+        return Result<CommandSubmission, RhiError>{err(backendFailure(device, status, "cuEventRecord"))};
+    return Result<CommandSubmission, RhiError>{
+        ok(CommandSubmission{false, false, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(completion))})};
+}
+
+Result<CommandPoll, RhiError> pollCommands(VernonRhiDevice handle, uint64_t retirement) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr() || !retirement)
+        return Result<CommandPoll, RhiError>{ok(CommandPoll{true, false})};
+    CudaDevice &device = anchored.value().device();
+    const auto status =
+        device.state.queryCompletion(reinterpret_cast<vernon::rhi::cuda::Event>(static_cast<uintptr_t>(retirement)));
+    if (status == vernon::rhi::cuda::kNotReady)
+        return Result<CommandPoll, RhiError>{ok(CommandPoll{false, false})};
+    if (status != vernon::rhi::cuda::kSuccess) {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        (void)backendFailure(device, status, "cuEventQuery");
+        return Result<CommandPoll, RhiError>{ok(CommandPoll{true, false})};
+    }
+    return Result<CommandPoll, RhiError>{ok(CommandPoll{true, true})};
+}
+
+Result<void, RhiError> completeCommands(VernonRhiDevice handle, uint64_t retirement) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr() || !retirement)
+        return Result<void, RhiError>{err(invalidArgument("complete_cuda_commands", retirement, handle.index))};
+    CudaDevice &device = anchored.value().device();
+    const auto status =
+        device.state.waitCompletion(reinterpret_cast<vernon::rhi::cuda::Event>(static_cast<uintptr_t>(retirement)));
+    if (status == vernon::rhi::cuda::kSuccess)
+        return Result<void, RhiError>{ok()};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return Result<void, RhiError>{err(backendFailure(device, status, "cuEventSynchronize"))};
 }
 
 Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const VernonRhiBarrier *,
@@ -530,11 +550,11 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
     static const BackendDispatch dispatch = [] {
         BackendDispatch result{};
         result.backend = VERNON_RHI_BACKEND_CUDA;
+        result.commandCapabilities = BackendCommandConcurrentSubmission;
         result.ownsDevice = ownsDevice;
         result.createOwnedDevice = createOwnedDevice;
         result.destroyDevice = destroyDevice;
         result.lastError = lastError;
-        result.synchronize = synchronize;
         result.deviceState = deviceStateForBackend;
         result.commandState = commandState;
         result.createBuffer = createBuffer;
@@ -550,6 +570,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         result.resolveRetainedResource = resolveResource;
         result.beginCommands = beginCommands;
         result.submitCommands = submitCommands;
+        result.pollCommands.emplace(pollCommands);
+        result.completeCommands.emplace(completeCommands);
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         return result;

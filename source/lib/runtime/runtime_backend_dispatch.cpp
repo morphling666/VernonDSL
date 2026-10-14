@@ -1,5 +1,7 @@
 #include "runtime_dispatch.h"
 
+#include "VernonRuntimeCore.h"
+
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 #include "rhi/cuda_backend.h"
 #endif
@@ -35,6 +37,18 @@ namespace {
 
 RuntimeResult<void> runtimeFailure(RuntimeErrorCode code, const char *operation) noexcept {
     return RuntimeResult<void>{err(RuntimeError{code, {operation, 0, 0}})};
+}
+
+RuntimeResult<void> renderingResult(VernonRuntimeContext &context, const VernonRuntimeRhiAdapter &adapter,
+                                    VernonStatus status, const char *operation, std::string_view failure) {
+    if (status == VERNON_STATUS_OK)
+        return RuntimeResult<void>{ok()};
+    std::string &diagnostic = invocationDiagnostic(context);
+    diagnostic.assign(failure);
+    const VernonStringView detail = vernonRuntimeRhiAdapterGetLastError(&adapter);
+    if (detail.data && detail.size)
+        diagnostic.append(": ").append(detail.data, detail.size);
+    return RuntimeResult<void>{err(runtimeErrorFromStatus(status, {operation, 0, 0}))};
 }
 
 } // namespace
@@ -282,6 +296,26 @@ RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(Vernon
     return status == VERNON_STATUS_OK ? RuntimeResult<VernonRuntimeProviderObject>{ok(output)}
                                       : RuntimeResult<VernonRuntimeProviderObject>{
                                             err(runtimeErrorFromStatus(status, {"reference_command_encoder", 0, 0}))};
+}
+
+RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder,
+                                          const VernonRuntimeProviderRenderingDescriptor &descriptor) {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    if (!adapter)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "begin_backend_rendering");
+    return renderingResult(
+        context, *adapter,
+        vernonRuntimeCoreBeginRendering(vernonRuntimeRhiAdapterGetProvider(adapter), encoder, &descriptor),
+        "begin_backend_rendering", "failed to begin rendering");
+}
+
+RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder) {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    if (!adapter)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "end_backend_rendering");
+    return renderingResult(context, *adapter,
+                           vernonRuntimeCoreEndRendering(vernonRuntimeRhiAdapterGetProvider(adapter), encoder),
+                           "end_backend_rendering", "failed to end rendering");
 }
 
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {

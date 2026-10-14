@@ -1,4 +1,5 @@
 #include "graphics_invocation_planner.h"
+#include "VernonFormats.hpp"
 #include "pipeline_metadata.h"
 #include "provider_image_description.h"
 #include "tensor_bridge.h"
@@ -156,6 +157,101 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
     prepared = {};
 }
 
+bool planRenderTargets(const VernonRenderPass *source, DescribeImageResource describeImage, void *describeImageUserData,
+                       PlannedRenderTargets &targets, std::string &error) {
+    targets = {};
+    if (!source || source->struct_size < sizeof(VernonRenderPass))
+        return fail(error, "RenderPass control is missing or incomplete");
+    const VernonRenderPass &renderPass = *source;
+    if ((renderPass.color_attachment_count && !renderPass.color_attachments) ||
+        (!renderPass.color_attachment_count && !renderPass.depth_attachment))
+        return fail(error, "graphics pipeline requires a color or depth attachment");
+    if (!describeImage)
+        return fail(error, "graphics image descriptor resolver is missing");
+    for (size_t index = 0; index < renderPass.color_attachment_count; ++index) {
+        const VernonColorAttachment &attachment = renderPass.color_attachments[index];
+        if (!attachment.view.identity || !attachment.view.resource.value)
+            return fail(error, "render target is invalid");
+        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
+            return fail(error, "render target attachment operation is invalid");
+        targets.attachments.push_back(&attachment);
+    }
+    std::sort(targets.attachments.begin(), targets.attachments.end(),
+              [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
+                  return left->location < right->location;
+              });
+    if (std::adjacent_find(targets.attachments.begin(), targets.attachments.end(),
+                           [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
+                               return left->location == right->location;
+                           }) != targets.attachments.end())
+        return fail(error, "render target locations are duplicated");
+    for (size_t index = 0; index < targets.attachments.size(); ++index)
+        if (targets.attachments[index]->location != index)
+            return fail(error, "render target locations must be contiguous from zero");
+    targets.attachmentFormats.reserve(targets.attachments.size());
+    for (const VernonColorAttachment *attachment : targets.attachments) {
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        if (describeImage(describeImageUserData, attachment->view, &description) != VERNON_STATUS_OK ||
+            !providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
+            description.view.dimension != VERNON_TEXTURE_2D ||
+            !(description.image.usage & VERNON_IMAGE_COLOR_ATTACHMENT) ||
+            description.view.subresources.aspects != VERNON_IMAGE_ASPECT_COLOR)
+            return fail(error, "render target view is incompatible");
+        const uint32_t width =
+            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
+        const uint32_t height =
+            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
+        if (!targets.attachmentWidth) {
+            targets.attachmentWidth = width;
+            targets.attachmentHeight = height;
+        } else if (targets.attachmentWidth != width || targets.attachmentHeight != height) {
+            return fail(error, "render target extents differ");
+        }
+        targets.attachmentFormats.push_back(description.view.format);
+        targets.attachmentSubresources.push_back(providerImageSubresources(description));
+    }
+    if (renderPass.depth_attachment) {
+        const VernonDepthAttachment &attachment = *renderPass.depth_attachment;
+        if (!attachment.view.identity || !attachment.view.resource.value)
+            return fail(error, "depth attachment is invalid");
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        if (describeImage(describeImageUserData, attachment.view, &description) != VERNON_STATUS_OK ||
+            !providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW)
+            return fail(error, "depth attachment is stale");
+        const VernonTextureFormat format = description.view.format;
+        const uint32_t width =
+            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
+        const uint32_t height =
+            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
+        const bool firstAttachment = !targets.attachmentWidth;
+        if (description.view.dimension != VERNON_TEXTURE_2D ||
+            !(description.image.usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT) || !width || !height ||
+            (!firstAttachment && (width != targets.attachmentWidth || height != targets.attachmentHeight)) ||
+            !vernon::formats::hasDepth(format))
+            return fail(error, "depth attachment must be D32 or D32S8 with the render-target extent");
+        if (firstAttachment) {
+            targets.attachmentWidth = width;
+            targets.attachmentHeight = height;
+        }
+        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+            !std::isfinite(attachment.clear_depth) || attachment.clear_depth < 0.0f || attachment.clear_depth > 1.0f ||
+            attachment.stencil_load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.stencil_store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+            attachment.clear_stencil > 0xff || (!vernon::formats::hasStencil(format) && attachment.clear_stencil != 0))
+            return fail(error, "depth attachment operation is invalid");
+        targets.depthAttachment = &attachment;
+        targets.depthFormat = format;
+        targets.attachmentSubresources.push_back(providerImageSubresources(description));
+    }
+    return true;
+}
+
 bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &source,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
@@ -227,90 +323,8 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
     if (graphicsState.topology > VERNON_TOPOLOGY_POINT_LIST)
         return fail(error, "graphics pipeline topology is invalid");
     plan.topology = graphicsState.topology;
-    if ((renderPass.color_attachment_count && !renderPass.color_attachments) ||
-        (!renderPass.color_attachment_count && !renderPass.depth_attachment))
-        return fail(error, "graphics pipeline requires a color or depth attachment");
-    if (!describeImage)
-        return fail(error, "graphics image descriptor resolver is missing");
-    for (size_t index = 0; index < renderPass.color_attachment_count; ++index) {
-        const VernonColorAttachment &attachment = renderPass.color_attachments[index];
-        if (!attachment.view.identity || !attachment.view.resource.value)
-            return fail(error, "render target is invalid");
-        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
-            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
-            return fail(error, "render target attachment operation is invalid");
-        plan.attachments.push_back(&attachment);
-    }
-    std::sort(plan.attachments.begin(), plan.attachments.end(),
-              [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
-                  return left->location < right->location;
-              });
-    if (std::adjacent_find(plan.attachments.begin(), plan.attachments.end(),
-                           [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
-                               return left->location == right->location;
-                           }) != plan.attachments.end())
-        return fail(error, "render target locations are duplicated");
-    for (size_t index = 0; index < plan.attachments.size(); ++index)
-        if (plan.attachments[index]->location != index)
-            return fail(error, "render target locations must be contiguous from zero");
-    plan.attachmentFormats.reserve(plan.attachments.size());
-    for (const VernonColorAttachment *attachment : plan.attachments) {
-        VernonRuntimeProviderImageDescription description{};
-        description.struct_size = sizeof(description);
-        if (describeImage(describeImageUserData, attachment->view, &description) != VERNON_STATUS_OK ||
-            !providerImageDescriptionIsCanonical(description) ||
-            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
-            description.view.dimension != VERNON_TEXTURE_2D ||
-            !(description.image.usage & VERNON_IMAGE_COLOR_ATTACHMENT) ||
-            description.view.subresources.aspects != VERNON_IMAGE_ASPECT_COLOR)
-            return fail(error, "render target view is incompatible");
-        const uint32_t width =
-            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
-        const uint32_t height =
-            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
-        if (!plan.attachmentWidth) {
-            plan.attachmentWidth = width;
-            plan.attachmentHeight = height;
-        } else if (plan.attachmentWidth != width || plan.attachmentHeight != height) {
-            return fail(error, "render target extents differ");
-        }
-        plan.attachmentFormats.push_back(description.view.format);
-    }
-    if (renderPass.depth_attachment) {
-        const VernonDepthAttachment &attachment = *renderPass.depth_attachment;
-        if (!attachment.view.identity || !attachment.view.resource.value)
-            return fail(error, "depth attachment is invalid");
-        VernonRuntimeProviderImageDescription description{};
-        description.struct_size = sizeof(description);
-        if (describeImage(describeImageUserData, attachment.view, &description) != VERNON_STATUS_OK ||
-            !providerImageDescriptionIsCanonical(description) ||
-            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW)
-            return fail(error, "depth attachment is stale");
-        const VernonTextureFormat format = description.view.format;
-        const uint32_t width =
-            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
-        const uint32_t height =
-            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
-        const bool firstAttachment = !plan.attachmentWidth;
-        if (description.view.dimension != VERNON_TEXTURE_2D ||
-            !(description.image.usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT) || !width || !height ||
-            (!firstAttachment && (width != plan.attachmentWidth || height != plan.attachmentHeight)) ||
-            (format != VERNON_TEXTURE_D32_FLOAT && format != VERNON_TEXTURE_D32_FLOAT_S8_UINT))
-            return fail(error, "depth attachment must be D32 or D32S8 with the render-target extent");
-        if (firstAttachment) {
-            plan.attachmentWidth = width;
-            plan.attachmentHeight = height;
-        }
-        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
-            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
-            !std::isfinite(attachment.clear_depth) || attachment.clear_depth < 0.0f || attachment.clear_depth > 1.0f ||
-            attachment.stencil_load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
-            attachment.stencil_store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
-            attachment.clear_stencil > 0xff || (format == VERNON_TEXTURE_D32_FLOAT && attachment.clear_stencil != 0))
-            return fail(error, "depth attachment operation is invalid");
-        plan.depthAttachment = &attachment;
-        plan.depthFormat = format;
-    }
+    if (!planRenderTargets(source.render_pass, describeImage, describeImageUserData, plan, error))
+        return false;
     const uint32_t *dynamicViewport = source.dynamic_state ? source.dynamic_state->viewport : nullptr;
     const uint32_t *dynamicScissor = source.dynamic_state ? source.dynamic_state->scissor : nullptr;
     const bool hasViewport = dynamicViewport && dynamicViewport[2] && dynamicViewport[3];
@@ -325,6 +339,7 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
     plan.resolution = {static_cast<float>(plan.viewport[2]), static_cast<float>(plan.viewport[3])};
     plan.vertexCount = draw.vertex_count;
     plan.instanceCount = draw.instance_count;
+    plan.firstInstance = draw.first_instance;
 
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampled;
     for (const Parameter &parameter : stagePlan.parameters) {
@@ -376,14 +391,16 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
             const bool instanced = use.divisor != 0;
             uint32_t &inferred = instanced ? plan.instanceCount : plan.vertexCount;
             const uint32_t divisor = instanced ? std::max(use.divisor, 1u) : 1u;
+            const uint64_t base = instanced ? plan.firstInstance : 0;
             if (inferred) {
-                const uint32_t requiredRecords = (inferred - 1) / divisor + 1;
-                if (requiredRecords != leading)
+                const uint64_t requiredRecords = (base + inferred - 1) / divisor + 1;
+                if (base ? requiredRecords > leading : requiredRecords != leading)
                     return fail(error, "graphics Tensor leading dimensions conflict");
             } else {
-                if (leading > std::numeric_limits<uint32_t>::max() / divisor)
-                    return fail(error, "graphics inferred draw count is too large");
-                inferred = leading * divisor;
+                const uint64_t records = static_cast<uint64_t>(leading) * divisor;
+                if (records < base || records - base > std::numeric_limits<uint32_t>::max())
+                    return fail(error, "graphics inferred draw count is out of range");
+                inferred = static_cast<uint32_t>(records - base);
             }
             uint64_t expectedStride = tensor.element_layout.byte_size;
             for (uint32_t dimension = tensor.rank; dimension-- > 1;) {
@@ -415,10 +432,16 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
             }
         }
     }
-    for (const auto &[binding, resource] : sampled) {
+    for (auto &[binding, resource] : sampled) {
         if (!resource.imageView.resource.value ||
             (!resource.samplerResource.resource.value && !resource.implicitSampler))
             return fail(error, "sampled image requires paired image view and sampler");
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        if (describeImage(describeImageUserData, resource.imageView, &description) != VERNON_STATUS_OK ||
+            !providerImageDescriptionIsCanonical(description) || !(description.image.usage & VERNON_IMAGE_SAMPLED))
+            return fail(error, "sampled image is stale or lacks sampled usage");
+        resource.subresources = providerImageSubresources(description);
         plan.sampledResources.emplace(binding, resource);
     }
 

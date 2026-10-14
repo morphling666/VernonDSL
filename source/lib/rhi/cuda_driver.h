@@ -20,6 +20,8 @@ using Event = struct EventOpaque *;
 using Result = int;
 
 constexpr Result kSuccess = 0;
+constexpr Result kNotReady = 600;
+constexpr unsigned kEventDisableTiming = 0x2;
 
 struct VERNON_RHI_CAPI Driver {
     using Init = Result (*)(unsigned);
@@ -29,15 +31,12 @@ struct VERNON_RHI_CAPI Driver {
     using PrimaryContextRetain = Result (*)(Context *, Device);
     using PrimaryContextRelease = Result (*)(Device);
     using ContextSetCurrent = Result (*)(Context);
-    using ContextSynchronize = Result (*)();
     using ErrorName = Result (*)(Result, const char **);
     using ErrorString = Result (*)(Result, const char **);
     using MemoryAllocate = Result (*)(DevicePointer *, size_t);
     using MemoryFree = Result (*)(DevicePointer);
     using HostAllocate = Result (*)(void **, size_t, unsigned);
     using HostFree = Result (*)(void *);
-    using CopyHostToDevice = Result (*)(DevicePointer, const void *, size_t);
-    using CopyDeviceToHost = Result (*)(void *, DevicePointer, size_t);
     using CopyHostToDeviceAsync = Result (*)(DevicePointer, const void *, size_t, Stream);
     using CopyDeviceToHostAsync = Result (*)(void *, DevicePointer, size_t, Stream);
     using CopyDeviceToDeviceAsync = Result (*)(DevicePointer, DevicePointer, size_t, Stream);
@@ -50,6 +49,7 @@ struct VERNON_RHI_CAPI Driver {
     using EventCreate = Result (*)(Event *, unsigned);
     using EventDestroy = Result (*)(Event);
     using EventRecord = Result (*)(Event, Stream);
+    using EventQuery = Result (*)(Event);
     using EventSynchronize = Result (*)(Event);
     using LaunchKernel = Result (*)(Function, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                     Stream, void **, void **);
@@ -68,15 +68,12 @@ struct VERNON_RHI_CAPI Driver {
     PrimaryContextRetain primaryContextRetain{};
     PrimaryContextRelease primaryContextRelease{};
     ContextSetCurrent contextSetCurrent{};
-    ContextSynchronize contextSynchronize{};
     ErrorName errorName{};
     ErrorString errorString{};
     MemoryAllocate memoryAllocate{};
     MemoryFree memoryFree{};
     HostAllocate hostAllocate{};
     HostFree hostFree{};
-    CopyHostToDevice copyHostToDevice{};
-    CopyDeviceToHost copyDeviceToHost{};
     CopyHostToDeviceAsync copyHostToDeviceAsync{};
     CopyDeviceToHostAsync copyDeviceToHostAsync{};
     CopyDeviceToDeviceAsync copyDeviceToDeviceAsync{};
@@ -89,6 +86,7 @@ struct VERNON_RHI_CAPI Driver {
     EventCreate eventCreate{};
     EventDestroy eventDestroy{};
     EventRecord eventRecord{};
+    EventQuery eventQuery{};
     EventSynchronize eventSynchronize{};
     LaunchKernel launchKernel{};
 };

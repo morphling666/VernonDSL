@@ -1,8 +1,10 @@
 #include "vulkan_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <string_view>
 #include <vector>
 
@@ -249,51 +251,12 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     dynamicRendering = dynamicRendering && api.cmdBeginRendering && api.cmdEndRendering;
     api.getDeviceQueue(device, queueFamily, 0, &queue);
     api.getPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
-    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = queueFamily;
     CommandFrame initialFrame;
-    if (!check(api.createCommandPool(device, &poolInfo, nullptr, &initialFrame.pool), "vkCreateCommandPool", error)) {
+    if (!createCommandFrame(initialFrame, error)) {
         shutdown();
         return false;
     }
-    VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    commandAllocation.commandPool = initialFrame.pool;
-    commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandAllocation.commandBufferCount = 1;
-    if (!check(api.allocateCommandBuffers(device, &commandAllocation, &initialFrame.command),
-               "vkAllocateCommandBuffers", error)) {
-        api.destroyCommandPool(device, initialFrame.pool, nullptr);
-        shutdown();
-        return false;
-    }
-    ++commandBufferAllocations;
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (!check(api.createFence(device, &fenceInfo, nullptr, &initialFrame.fence), "vkCreateFence", error)) {
-        api.destroyCommandPool(device, initialFrame.pool, nullptr);
-        shutdown();
-        return false;
-    }
-    availableCommandFrames.push_back(initialFrame);
-    const VkDescriptorPoolSize descriptorSizes[] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, 256},
-    };
-    VkDescriptorPoolCreateInfo descriptorPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    descriptorPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    descriptorPoolInfo.maxSets = 256;
-    descriptorPoolInfo.poolSizeCount = static_cast<uint32_t>(std::size(descriptorSizes));
-    descriptorPoolInfo.pPoolSizes = descriptorSizes;
-    if (!check(api.createDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool),
-               "vkCreateDescriptorPool", error)) {
-        shutdown();
-        return false;
-    }
-    ++descriptorPoolCreations;
+    availableCommandFrames.push_back(std::move(initialFrame));
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -342,39 +305,43 @@ bool DeviceState::initializeBorrowed(VkInstance borrowedInstance, VkPhysicalDevi
 
 void DeviceState::shutdown() {
     Driver &api = driver();
+    if (device) {
+        // A borrowed device's host has executed the borrowed command buffer before it destroys this state.
+        retireBorrowedCommands(borrowedSubmissions);
+        destroyCommandFrame(borrowedCommandFrame);
+    }
     if (device && !nativeObjectsBorrowed) {
         if (api.deviceWaitIdle)
             api.deviceWaitIdle(device);
-        for (StagingRing *ring : {&uploadRing, &readbackRing}) {
-            if (ring->mapped && ring->buffer.memory)
-                api.unmapMemory(device, ring->buffer.memory);
-            ring->mapped = nullptr;
-            destroyBuffer(ring->buffer);
-            ring->capacity = 0;
-            ring->cursor = 0;
-        }
+        destroyDeferred(true);
         destroySampler(defaultImplicitSampler);
-        if (descriptorPool && api.destroyDescriptorPool)
-            api.destroyDescriptorPool(device, descriptorPool, nullptr);
-        const auto destroyFrame = [&](CommandFrame &frame) {
-            if (frame.fence && api.destroyFence)
-                api.destroyFence(device, frame.fence, nullptr);
-            if (frame.pool && api.destroyCommandPool)
-                api.destroyCommandPool(device, frame.pool, nullptr);
-            frame = {};
-        };
         for (CommandFrame &frame : availableCommandFrames)
-            destroyFrame(frame);
-        for (auto &entry : activeCommandFrames)
-            destroyFrame(entry.second);
-        availableCommandFrames.clear();
-        activeCommandFrames.clear();
-        if (api.destroyDevice)
-            api.destroyDevice(device, nullptr);
+            destroyCommandFrame(frame);
+        for (auto &entry : recordingCommandFrames)
+            destroyCommandFrame(entry.second);
+        for (CommandFrame &frame : inFlightCommandFrames)
+            destroyCommandFrame(frame);
     }
+    if (device) {
+        for (StagingPool<StagingChunk> *pool : {&uploadStaging, &readbackStaging})
+            pool->clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
+        for (VkDescriptorPool pool : descriptorPools)
+            api.destroyDescriptorPool(device, pool, nullptr);
+    }
+    descriptorPools.clear();
+    currentDescriptorPool = 0;
+    if (device && !nativeObjectsBorrowed && api.destroyDevice)
+        api.destroyDevice(device, nullptr);
+    availableCommandFrames.clear();
+    recordingCommandFrames.clear();
+    inFlightCommandFrames.clear();
+    borrowedSubmissions = 0;
+    deferredDestructions.clear();
+    submittedSerial = 0;
+    completedSerial = 0;
+    deviceLost = false;
     if (instance && !nativeObjectsBorrowed && api.destroyInstance)
         api.destroyInstance(instance, nullptr);
-    descriptorPool = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
     device = VK_NULL_HANDLE;
     physicalDevice = VK_NULL_HANDLE;
@@ -399,100 +366,354 @@ void DeviceState::shutdown() {
 bool DeviceState::synchronize(std::string &error) {
     if (nativeObjectsBorrowed)
         return true;
-    return device && check(driver().deviceWaitIdle(device), "vkDeviceWaitIdle", error);
+    if (!device || !check(driver().deviceWaitIdle(device), "vkDeviceWaitIdle", error))
+        return false;
+    return retireCommandFrames(submittedSerial, error);
 }
+
+bool DeviceState::createCommandFrame(CommandFrame &frame, std::string &error) {
+    Driver &api = driver();
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = queueFamily;
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (!check(api.createCommandPool(device, &poolInfo, nullptr, &frame.pool), "vkCreateCommandPool", error))
+        return false;
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = frame.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 1;
+    if (!check(api.allocateCommandBuffers(device, &allocation, &frame.command), "vkAllocateCommandBuffers", error) ||
+        !check(api.createFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence", error)) {
+        destroyCommandFrame(frame);
+        return false;
+    }
+    ++commandBufferAllocations;
+    return true;
+}
+
+void DeviceState::destroyCommandFrame(CommandFrame &frame) {
+    Driver &api = driver();
+    retireStaging(frame);
+    if (frame.fence && api.destroyFence)
+        api.destroyFence(device, frame.fence, nullptr);
+    if (frame.pool && api.destroyCommandPool)
+        api.destroyCommandPool(device, frame.pool, nullptr);
+    frame = {};
+}
+
+void DeviceState::recycleCommandFrame(CommandFrame frame) {
+    frame.serial = 0;
+    frame.imageLayouts.clear();
+    retireStaging(frame);
+    availableCommandFrames.push_back(std::move(frame));
+}
+
+DeviceState::CommandFrame *DeviceState::recordingFrame(VkCommandBuffer command) {
+    if (nativeObjectsBorrowed)
+        return command && command == borrowedCommandBuffer ? &borrowedCommandFrame : nullptr;
+    const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(command));
+    return found == recordingCommandFrames.end() ? nullptr : &found->second;
+}
+
+bool DeviceState::moveImageLayout(VkCommandBuffer command, Image &owner, size_t subresource, VkImageLayout layout,
+                                  std::optional<VkImageLayout> &from, std::string &error) {
+    CommandFrame *frame = recordingFrame(command);
+    if (!frame || subresource >= owner.subresourceLayouts.size()) {
+        error = "Vulkan image layout change requires an active recording and an image subresource";
+        return false;
+    }
+    try {
+        ImageLayoutUse &use = frame->imageLayouts[&owner];
+        if (use.current.empty()) {
+            use.initial.assign(owner.subresourceLayouts.size(), kUnusedLayout);
+            use.current.assign(owner.subresourceLayouts.size(), kUnusedLayout);
+        }
+        VkImageLayout &current = use.current[subresource];
+        if (current == kUnusedLayout)
+            use.initial[subresource] = nativeObjectsBorrowed ? owner.subresourceLayouts[subresource] : layout;
+        from = current != kUnusedLayout ? std::optional<VkImageLayout>{current}
+               : nativeObjectsBorrowed  ? std::optional<VkImageLayout>{use.initial[subresource]}
+                                        : std::nullopt;
+        current = layout;
+    } catch (const std::bad_alloc &) {
+        error = "Vulkan image layout tracking ran out of memory";
+        return false;
+    }
+    return true;
+}
+
+VkImageLayout DeviceState::recordedImageLayout(VkCommandBuffer command, Image &owner, size_t subresource) {
+    if (CommandFrame *frame = recordingFrame(command)) {
+        const auto found = frame->imageLayouts.find(&owner);
+        if (found != frame->imageLayouts.end() && found->second.current[subresource] != kUnusedLayout)
+            return found->second.current[subresource];
+    }
+    return owner.subresourceLayouts[subresource];
+}
+
+bool DeviceState::recordLayoutPrologue(CommandFrame &frame, bool &recorded, std::string &error) {
+    recorded = false;
+    std::vector<VkImageMemoryBarrier> barriers;
+    try {
+        for (const auto &[image, use] : frame.imageLayouts)
+            for (size_t subresource = 0; subresource < use.initial.size(); ++subresource) {
+                const VkImageLayout layout = use.initial[subresource];
+                if (layout == kUnusedLayout || layout == image->subresourceLayouts[subresource])
+                    continue;
+                VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barrier.oldLayout = image->subresourceLayouts[subresource];
+                barrier.newLayout = layout;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = image->image;
+                barrier.subresourceRange = {imageAspectMask(image->format),
+                                            static_cast<uint32_t>(subresource % image->mipLevels), 1,
+                                            static_cast<uint32_t>(subresource / image->mipLevels), 1};
+                barriers.push_back(barrier);
+            }
+    } catch (const std::bad_alloc &) {
+        error = "Vulkan layout prologue ran out of memory";
+        return false;
+    }
+    if (barriers.empty())
+        return true;
+    Driver &api = driver();
+    if (!frame.prologue) {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = frame.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        if (!check(api.allocateCommandBuffers(device, &allocation, &frame.prologue), "vkAllocateCommandBuffers", error))
+            return false;
+        ++commandBufferAllocations;
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (!check(api.resetCommandBuffer(frame.prologue, 0), "vkResetCommandBuffer", error) ||
+        !check(api.beginCommandBuffer(frame.prologue, &begin), "vkBeginCommandBuffer", error))
+        return false;
+    api.cmdPipelineBarrier(frame.prologue, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                           nullptr, 0, nullptr, static_cast<uint32_t>(barriers.size()), barriers.data());
+    if (!check(api.endCommandBuffer(frame.prologue), "vkEndCommandBuffer", error))
+        return false;
+    recorded = true;
+    return true;
+}
+
+void DeviceState::commitImageLayouts(CommandFrame &frame) {
+    for (auto &[image, use] : frame.imageLayouts) {
+        for (size_t subresource = 0; subresource < use.current.size(); ++subresource)
+            if (use.current[subresource] != kUnusedLayout)
+                image->subresourceLayouts[subresource] = use.current[subresource];
+        const VkImageLayout shared = image->subresourceLayouts.front();
+        if (std::all_of(image->subresourceLayouts.begin(), image->subresourceLayouts.end(),
+                        [shared](VkImageLayout layout) { return layout == shared; }))
+            image->layout = shared;
+    }
+    frame.imageLayouts.clear();
+}
+
+void DeviceState::retireStaging(CommandFrame &frame) {
+    uploadStaging.retire(frame.upload);
+    readbackStaging.retire(frame.readback);
+}
+
+namespace {
+
+// Submissions do not wait for each other on the host, so every recording first orders itself after all work recorded
+// or submitted before it on the queue. Barriers recorded later only order work within the recording.
+void recordQueueOrder(VkCommandBuffer command) {
+    VkMemoryBarrier queueOrder{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    queueOrder.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    queueOrder.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    driver().cmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                                &queueOrder, 0, nullptr, 0, nullptr);
+}
+
+} // namespace
 
 bool DeviceState::beginCommands(VkCommandBuffer &command, std::string &error) {
     if (nativeObjectsBorrowed) {
         command = borrowedCommandBuffer;
-        return command != VK_NULL_HANDLE;
+        if (!command)
+            return false;
+        recordQueueOrder(command);
+        return true;
     }
+    if (deviceLost) {
+        error = "Vulkan device was lost";
+        return false;
+    }
+    if (!retireCommandFrames(completedSerial, error))
+        return false;
+    if (inFlightCommandFrames.size() >= maxFramesInFlight &&
+        !waitForSerial(inFlightCommandFrames.front().serial, error))
+        return false;
     Driver &api = driver();
     CommandFrame frame;
     if (!availableCommandFrames.empty()) {
-        frame = availableCommandFrames.back();
+        frame = std::move(availableCommandFrames.back());
         availableCommandFrames.pop_back();
-    } else {
-        VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        poolInfo.queueFamilyIndex = queueFamily;
-        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocation.commandBufferCount = 1;
-        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        if (!check(api.createCommandPool(device, &poolInfo, nullptr, &frame.pool), "vkCreateCommandPool", error)) {
-            return false;
-        }
-        allocation.commandPool = frame.pool;
-        if (!check(api.allocateCommandBuffers(device, &allocation, &frame.command), "vkAllocateCommandBuffers",
-                   error) ||
-            !check(api.createFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence", error)) {
-            if (frame.fence && api.destroyFence)
-                api.destroyFence(device, frame.fence, nullptr);
-            if (frame.pool && api.destroyCommandPool)
-                api.destroyCommandPool(device, frame.pool, nullptr);
-            return false;
-        }
-        ++commandBufferAllocations;
-    }
-    if (!check(api.resetFences(device, 1, &frame.fence), "vkResetFences", error) ||
-        !check(api.resetCommandBuffer(frame.command, 0), "vkResetCommandBuffer", error)) {
-        availableCommandFrames.push_back(frame);
+    } else if (!createCommandFrame(frame, error)) {
         return false;
     }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command = frame.command;
-    if (!check(api.beginCommandBuffer(command, &begin), "vkBeginCommandBuffer", error)) {
-        availableCommandFrames.push_back(frame);
+    if (!check(api.resetFences(device, 1, &frame.fence), "vkResetFences", error) ||
+        !check(api.resetCommandBuffer(frame.command, 0), "vkResetCommandBuffer", error) ||
+        !check(api.beginCommandBuffer(frame.command, &begin), "vkBeginCommandBuffer", error)) {
+        recycleCommandFrame(std::move(frame));
         return false;
     }
-    if (!activeCommandFrames.emplace(reinterpret_cast<uintptr_t>(command), frame).second) {
+    recordQueueOrder(frame.command);
+    command = frame.command;
+    if (!recordingCommandFrames.emplace(reinterpret_cast<uintptr_t>(command), std::move(frame)).second) {
         error = "Vulkan command buffer is already recording";
-        availableCommandFrames.push_back(frame);
         return false;
     }
     return true;
 }
 
-bool DeviceState::submitCommands(VkCommandBuffer command, std::string &error) {
-    if (nativeObjectsBorrowed)
-        return command == borrowedCommandBuffer;
+bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std::string &error) {
+    serial = 0;
+    if (nativeObjectsBorrowed) {
+        if (command != borrowedCommandBuffer)
+            return false;
+        commitImageLayouts(borrowedCommandFrame);
+        serial = ++borrowedSubmissions;
+        borrowedStaging.push_back(
+            {serial, std::exchange(borrowedCommandFrame.upload, {}), std::exchange(borrowedCommandFrame.readback, {})});
+        return true;
+    }
     Driver &api = driver();
-    const auto found = activeCommandFrames.find(reinterpret_cast<uintptr_t>(command));
-    if (found == activeCommandFrames.end()) {
+    const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(command));
+    if (found == recordingCommandFrames.end()) {
         error = "Vulkan command buffer does not belong to an active recording";
         return false;
     }
-    const CommandFrame frame = found->second;
-    const bool recorded = check(api.endCommandBuffer(command), "vkEndCommandBuffer", error);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command;
-    const bool submitted = recorded && check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error);
-    const bool completed =
-        submitted && check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error);
-    activeCommandFrames.erase(found);
-    availableCommandFrames.push_back(frame);
-    if (!completed)
+    CommandFrame frame = std::move(found->second);
+    recordingCommandFrames.erase(found);
+    bool prologue = false;
+    if (!check(api.endCommandBuffer(command), "vkEndCommandBuffer", error) ||
+        !recordLayoutPrologue(frame, prologue, error)) {
+        recycleCommandFrame(std::move(frame));
         return false;
-    // RuntimeCore caches binding sets across invocations. Resetting the shared
-    // pool here would invalidate those live descriptor-set handles.
-    uploadRing.cursor = 0;
-    readbackRing.cursor = 0;
+    }
+    const std::array<VkCommandBuffer, 2> batch{frame.prologue, command};
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = prologue ? 2 : 1;
+    submit.pCommandBuffers = prologue ? batch.data() : batch.data() + 1;
+    if (!check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error)) {
+        recycleCommandFrame(std::move(frame));
+        return false;
+    }
+    commitImageLayouts(frame);
+    frame.serial = ++submittedSerial;
+    serial = frame.serial;
+    inFlightCommandFrames.push_back(std::move(frame));
     return true;
 }
 
+bool DeviceState::retireCommandFrames(uint64_t through, std::string &error) {
+    Driver &api = driver();
+    while (!inFlightCommandFrames.empty()) {
+        CommandFrame &frame = inFlightCommandFrames.front();
+        const VkResult state = frame.serial <= through ? api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX)
+                                                       : api.getFenceStatus(device, frame.fence);
+        if (state == VK_NOT_READY)
+            break;
+        if (!check(state, frame.serial <= through ? "vkWaitForFences" : "vkGetFenceStatus", error)) {
+            deviceLost = true;
+            return false;
+        }
+        completedSerial = frame.serial;
+        recycleCommandFrame(std::move(frame));
+        inFlightCommandFrames.pop_front();
+    }
+    destroyDeferred(false);
+    return true;
+}
+
+bool DeviceState::waitForSerial(uint64_t serial, std::string &error) {
+    if (serial > submittedSerial) {
+        error = "Vulkan serial was never submitted";
+        return false;
+    }
+    if (!retireCommandFrames(serial, error))
+        return false;
+    if (deviceLost) {
+        error = "Vulkan device was lost";
+        return false;
+    }
+    return true;
+}
+
+bool DeviceState::pollSerial(uint64_t serial, bool &completed, std::string &error) {
+    completed = false;
+    if (serial > submittedSerial) {
+        error = "Vulkan serial was never submitted";
+        return false;
+    }
+    if (!retireCommandFrames(0, error))
+        return false;
+    completed = serial <= completedSerial;
+    return true;
+}
+
+void DeviceState::retireBorrowedCommands(uint64_t serial) {
+    while (!borrowedStaging.empty() && borrowedStaging.front().serial <= serial) {
+        uploadStaging.retire(borrowedStaging.front().upload);
+        readbackStaging.retire(borrowedStaging.front().readback);
+        borrowedStaging.pop_front();
+    }
+}
+
 void DeviceState::abandonCommands(VkCommandBuffer command) {
-    if (nativeObjectsBorrowed || !command)
+    if (!command)
         return;
-    const auto found = activeCommandFrames.find(reinterpret_cast<uintptr_t>(command));
-    if (found == activeCommandFrames.end())
+    // The host executes whatever was recorded into its command buffer, including the abandoned recording's transitions.
+    if (nativeObjectsBorrowed) {
+        if (command == borrowedCommandBuffer)
+            commitImageLayouts(borrowedCommandFrame);
+        return;
+    }
+    const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(command));
+    if (found == recordingCommandFrames.end())
         return;
     (void)driver().resetCommandBuffer(command, 0);
-    availableCommandFrames.push_back(found->second);
-    activeCommandFrames.erase(found);
+    recycleCommandFrame(std::move(found->second));
+    recordingCommandFrames.erase(found);
+}
+
+void DeviceState::destroyAfterSubmittedWork(DeferredDestruction destruction) {
+    destruction.serial = submittedSerial;
+    if (destruction.serial <= completedSerial) {
+        destroyNow(destruction);
+        return;
+    }
+    deferredDestructions.push_back(std::move(destruction));
+}
+
+void DeviceState::destroyDeferred(bool all) {
+    const auto retired = std::stable_partition(
+        deferredDestructions.begin(), deferredDestructions.end(),
+        [&](const DeferredDestruction &destruction) { return !all && destruction.serial > completedSerial; });
+    for (auto destruction = retired; destruction != deferredDestructions.end(); ++destruction)
+        destroyNow(*destruction);
+    deferredDestructions.erase(retired, deferredDestructions.end());
+}
+
+void DeviceState::destroyNow(DeferredDestruction &destruction) {
+    destroyBuffer(destruction.buffer);
+    destroyImage(destruction.image);
+    if (destruction.view)
+        driver().destroyImageView(device, destruction.view, nullptr);
+    destruction.view = VK_NULL_HANDLE;
+    destroySampler(destruction.sampler);
 }
 
 std::optional<uint32_t> DeviceState::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
@@ -611,78 +832,109 @@ void DeviceState::destroySampler(Sampler &sampler) {
     sampler = {};
 }
 
-bool DeviceState::acquireStaging(bool upload, VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer,
-                                 VkDeviceSize &offset, uint8_t *&mapped, std::string &error) {
+bool DeviceState::acquireStaging(VkCommandBuffer command, bool upload, VkDeviceSize size, VkDeviceSize alignment,
+                                 VkBuffer &buffer, VkDeviceSize &offset, uint8_t *&mapped, std::string &error) {
     if (!size || !alignment || (alignment & (alignment - 1)) != 0 ||
         size > (std::numeric_limits<VkDeviceSize>::max)() - (alignment - 1)) {
         error = "Vulkan staging allocation request is invalid";
         return false;
     }
-    StagingRing &ring = upload ? uploadRing : readbackRing;
-    const VkDeviceSize alignedCursor = (ring.cursor + alignment - 1) & ~(alignment - 1);
-    if (!ring.buffer.buffer || alignedCursor > ring.capacity || size > ring.capacity - alignedCursor) {
-        if (ring.cursor != 0) {
-            error = "Vulkan staging ring was exhausted before command submission";
-            return false;
-        }
-        if (ring.buffer.buffer) {
-            if (ring.mapped)
-                driver().unmapMemory(device, ring.buffer.memory);
-            ring.mapped = nullptr;
-            destroyBuffer(ring.buffer);
-        }
-        // Keep the first allocation modest. MoltenVK maps host-visible Vulkan
-        // memory to Metal buffers, and CI's virtualized devices can reject the
-        // old 1 MiB minimum even for uploads that are only a few bytes.
-        VkDeviceSize capacity = 64 * 1024;
-        while (capacity < size) {
-            if (capacity > (std::numeric_limits<VkDeviceSize>::max)() / 2) {
-                error = "Vulkan staging ring capacity overflow";
-                return false;
-            }
-            capacity *= 2;
-        }
-        if (!createBuffer(ring.buffer, capacity,
-                          upload ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, error,
-                          upload ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
-            return false;
-        ++stagingBufferAllocations;
-        if (!check(
-                driver().mapMemory(device, ring.buffer.memory, 0, capacity, 0, reinterpret_cast<void **>(&ring.mapped)),
-                "vkMapMemory", error)) {
-            destroyBuffer(ring.buffer);
-            return false;
-        }
-        ring.capacity = capacity;
+    CommandFrame *frame = recordingFrame(command);
+    if (!frame) {
+        error = "Vulkan staging requires an active recording";
+        return false;
     }
-    offset = (ring.cursor + alignment - 1) & ~(alignment - 1);
-    buffer = ring.buffer.buffer;
-    mapped = ring.mapped + offset;
-    ring.cursor = offset + size;
+    StagingChunk *chunk = (upload ? uploadStaging : readbackStaging)
+                              .acquire(upload ? frame->upload : frame->readback, size, alignment, offset,
+                                       [&](VkDeviceSize capacity, StagingChunk &created) {
+                                           return createStagingChunk(upload, capacity, created, error);
+                                       });
+    if (!chunk)
+        return false;
+    buffer = chunk->buffer.buffer;
+    mapped = chunk->buffer.mapped + offset;
     return true;
 }
 
-bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, VkDescriptorSet &set, std::string &error) {
-    if (!layout || !descriptorPool) {
+bool DeviceState::createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error) {
+    chunk.capacity = capacity;
+    if (!createBuffer(chunk.buffer, capacity,
+                      upload ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, error,
+                      upload ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        return false;
+    ++stagingBufferAllocations;
+    if (!check(driver().mapMemory(device, chunk.buffer.memory, 0, capacity, 0,
+                                  reinterpret_cast<void **>(&chunk.buffer.mapped)),
+               "vkMapMemory", error)) {
+        destroyBuffer(chunk.buffer);
+        return false;
+    }
+    return true;
+}
+
+bool DeviceState::createDescriptorPool(std::string &error) {
+    // Each pool doubles the last, up to 16 times the first, so many live binding sets need few pools.
+    const uint32_t scale = uint32_t{1} << (std::min)(descriptorPools.size(), size_t{4});
+    const VkDescriptorPoolSize sizes[] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024 * scale},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256 * scale},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 * scale},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256 * scale},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 256 * scale},
+    };
+    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    info.maxSets = 256 * scale;
+    info.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
+    info.pPoolSizes = sizes;
+    VkDescriptorPool pool{};
+    if (!check(driver().createDescriptorPool(device, &info, nullptr, &pool), "vkCreateDescriptorPool", error))
+        return false;
+    descriptorPools.push_back(pool);
+    currentDescriptorPool = descriptorPools.size() - 1;
+    ++descriptorPoolCreations;
+    return true;
+}
+
+bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, DescriptorSet &set, std::string &error) {
+    if (!layout || !device) {
         error = "Vulkan descriptor allocation state is incomplete";
         return false;
     }
     std::lock_guard<std::mutex> guard(descriptorMutex);
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocation.descriptorPool = descriptorPool;
     allocation.descriptorSetCount = 1;
     allocation.pSetLayouts = &layout;
-    return check(driver().allocateDescriptorSets(device, &allocation, &set), "vkAllocateDescriptorSets", error);
+    // Freed sets return space to the pools they came from, so every pool is tried before the chain grows.
+    const size_t poolCount = descriptorPools.size();
+    for (size_t attempt = 0; attempt < poolCount; ++attempt) {
+        const size_t index = (currentDescriptorPool + attempt) % poolCount;
+        allocation.descriptorPool = descriptorPools[index];
+        const VkResult result = driver().allocateDescriptorSets(device, &allocation, &set.set);
+        if (result == VK_SUCCESS) {
+            currentDescriptorPool = index;
+            set.pool = descriptorPools[index];
+            return true;
+        }
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)
+            return check(result, "vkAllocateDescriptorSets", error);
+    }
+    if (!createDescriptorPool(error))
+        return false;
+    allocation.descriptorPool = descriptorPools.back();
+    if (!check(driver().allocateDescriptorSets(device, &allocation, &set.set), "vkAllocateDescriptorSets", error))
+        return false;
+    set.pool = descriptorPools.back();
+    return true;
 }
 
-bool DeviceState::freeDescriptorSet(VkDescriptorSet set, std::string &error) {
-    if (!set || !descriptorPool) {
-        error = "Vulkan descriptor release state is incomplete";
-        return false;
+void DeviceState::freeDescriptorSet(DescriptorSet &set) {
+    if (set.set && set.pool && device) {
+        std::lock_guard<std::mutex> guard(descriptorMutex);
+        (void)driver().freeDescriptorSets(device, set.pool, 1, &set.set);
     }
-    std::lock_guard<std::mutex> guard(descriptorMutex);
-    return check(driver().freeDescriptorSets(device, descriptorPool, 1, &set), "vkFreeDescriptorSets", error);
+    set = {};
 }
 
 } // namespace vernon::rhi::vulkan

@@ -32,30 +32,11 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 
 DXGI_FORMAT directX12TextureFormat(VernonTextureFormat format) {
     switch (format) {
-    case VERNON_TEXTURE_RGBA8_UNORM:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case VERNON_TEXTURE_R8_UNORM:
-        return DXGI_FORMAT_R8_UNORM;
-    case VERNON_TEXTURE_R16_FLOAT:
-        return DXGI_FORMAT_R16_FLOAT;
-    case VERNON_TEXTURE_R32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    case VERNON_TEXTURE_RG8_UNORM:
-        return DXGI_FORMAT_R8G8_UNORM;
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        return DXGI_FORMAT_R11G11B10_FLOAT;
-    case VERNON_TEXTURE_D32_FLOAT:
-        return DXGI_FORMAT_D32_FLOAT;
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    case VERNON_TEXTURE_RGB8_UNORM:
-        return DXGI_FORMAT_UNKNOWN;
+#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+                      vulkan, dxgi, ...)                                                                               \
+    case VERNON_TEXTURE_##NAME:                                                                                        \
+        return dxgi;
+#include "VernonFormats.def"
     }
     return DXGI_FORMAT_UNKNOWN;
 }
@@ -219,11 +200,8 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
             return fail(*pipeline.context, "D3D12 RHI color attachment format is unsupported");
         formats.push_back(static_cast<uint32_t>(format));
     }
-    const uint32_t depthFormat = !plan.depthAttachment
-                                     ? 0
-                                     : static_cast<uint32_t>(plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                                                                 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                                                                 : DXGI_FORMAT_D32_FLOAT);
+    const uint32_t depthFormat =
+        !plan.depthAttachment ? 0 : static_cast<uint32_t>(directX12TextureFormat(plan.depthFormat));
     PreparedGraphicsDraw prepared;
     if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
                              state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))

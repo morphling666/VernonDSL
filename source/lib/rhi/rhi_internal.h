@@ -6,13 +6,10 @@
 
 namespace vernon::rhi {
 
-enum class CommandRenderingClaim : uint8_t { Existing, Acquired };
-
 VERNON_RHI_CAPI Result<VernonRhiDevice, RhiError> createDeviceImpl(const VernonRhiOwnedDeviceDescriptor *descriptor);
 VERNON_RHI_CAPI VernonStringView deviceCreationError() noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> destroyDeviceImpl(VernonRhiDevice device);
 VERNON_RHI_CAPI Result<Option<VernonStringView>, RhiError> deviceLastError(VernonRhiDevice device);
-VERNON_RHI_CAPI Result<void, RhiError> synchronizeDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI bool deviceExists(VernonRhiDevice device);
 VERNON_RHI_CAPI uint32_t deviceCommandCapabilities(VernonRhiDevice device);
 VERNON_RHI_CAPI bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
@@ -62,56 +59,32 @@ VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderKey(VernonRhiDevice dev
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderNative(VernonRhiDevice device, uint64_t key,
                                                                 VernonRhiBackend backend) noexcept;
 VERNON_RHI_CAPI Result<bool, RhiError> commandEncoderRendering(VernonRhiDevice device, uint64_t key) noexcept;
-VERNON_RHI_CAPI Result<bool, RhiError> commandEncoderHasRenderingDescriptor(VernonRhiDevice device,
-                                                                            uint64_t key) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> commandColorOperations(VernonRhiDevice device, uint64_t key, size_t index,
-                                                              VernonRhiLoadOperation &load,
-                                                              VernonRhiStoreOperation &store, float clear[4]) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError>
-commandDepthOperations(VernonRhiDevice device, uint64_t key, VernonRhiLoadOperation &depth_load,
-                       VernonRhiStoreOperation &depth_store, VernonRhiLoadOperation &stencil_load,
-                       VernonRhiStoreOperation &stencil_store, float &clear_depth, uint32_t &clear_stencil) noexcept;
-VERNON_RHI_CAPI Result<CommandRenderingClaim, RhiError> claimCommandRendering(VernonRhiDevice device, uint64_t key,
-                                                                              uint32_t backend_kind) noexcept;
-VERNON_RHI_CAPI void rollbackCommandRenderingClaim(VernonRhiDevice device, uint64_t key,
-                                                   uint32_t backend_kind) noexcept;
-VERNON_RHI_CAPI Result<Option<uint64_t>, RhiError> commandRenderingObject(VernonRhiDevice device, uint64_t key,
-                                                                          Option<uint64_t> candidate) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> installCommandRenderingObject(VernonRhiDevice device, uint64_t key,
-                                                                     uint64_t candidate, const uint64_t *colors,
-                                                                     const uint64_t *resources, size_t color_count,
-                                                                     uint64_t depth, uint64_t depth_resource) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> beginProviderRendering(VernonRhiDevice device,
-                                                              VernonRhiCommandEncoder encoder) noexcept;
+// The rendering scope of `vernonRhiCommandEncoderBeginRendering`/`EndRendering` for an encoder key, with attachments
+// as image view resource keys; `beginEncoderRendering` fills their formats and stencil flags. `reads` are the sampled
+// images of the scope's draws, which the native scope makes readable when it opens.
+VERNON_RHI_CAPI Result<void, RhiError> beginEncoderRendering(VernonRhiDevice device, uint64_t key, RenderingScope scope,
+                                                             const RenderingRead *reads, size_t readCount) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> endEncoderRendering(VernonRhiDevice device, uint64_t key) noexcept;
+// Opens the native scope of the encoder's rendering scope unless it is open, and returns it. Draws open it before
+// recording; `EndRendering` opens a scope that no draw opened so that its load operations apply.
+VERNON_RHI_CAPI Result<OpenedRendering, RhiError> openCommandRendering(VernonRhiDevice device, uint64_t key) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> recordProviderCommand(VernonRhiDevice device, uint64_t key, bool draw) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> recordCommandWriteResource(VernonRhiDevice device, uint64_t key,
                                                                   ResourceKind kind, uint64_t resource_key) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> retainCommandResource(VernonRhiDevice device, uint64_t key, ResourceKind kind,
-                                                             uint64_t resource_key) noexcept;
-VERNON_RHI_CAPI Result<uint64_t, RhiError> resolveCommandResource(VernonRhiDevice device, uint64_t key,
-                                                                  ResourceKind kind, uint64_t resource_key) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> deferCommandCleanup(VernonRhiDevice device, uint64_t key, void *context,
-                                                           uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> deferCommandRollback(VernonRhiDevice device, uint64_t key, void *context,
-                                                            uint64_t object,
-                                                            void (*rollback)(void *, uint64_t)) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> setCommandRenderingTargets(VernonRhiDevice device, uint64_t key,
-                                                                  const uint64_t *colors, const uint64_t *resources,
-                                                                  size_t color_count, uint64_t depth,
-                                                                  uint64_t depth_resource) noexcept;
+VERNON_RHI_CAPI Result<OpenedRendering, RhiError> beginCommandRendering(VernonRhiDevice device, uint64_t key,
+                                                                        uint64_t native, const RenderingScope &scope,
+                                                                        const RenderingRead *reads,
+                                                                        size_t readCount) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> endCommandRendering(VernonRhiDevice device, uint64_t native,
-                                                           VernonRhiBackend backend, uint32_t backend_kind,
-                                                           uint32_t color_discard_mask, uint32_t depth_stencil_discard,
-                                                           const uint64_t *color_resources, size_t color_count,
-                                                           uint64_t depth_resource, uint64_t rendering_object) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError>
-clearCommandColor(VernonRhiDevice device, uint64_t native, VernonRhiBackend backend, uint32_t backend_kind,
-                  uint64_t rendering_object, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
-                  uint64_t target, uint32_t location, const float color[4]) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError>
-clearCommandDepthStencil(VernonRhiDevice device, uint64_t native, VernonRhiBackend backend, uint32_t backend_kind,
-                         uint64_t rendering_object, int32_t x, int32_t y, uint32_t width, uint32_t height,
-                         uint32_t layers, uint64_t target, float depth, uint32_t stencil, uint32_t aspects) noexcept;
+                                                           const RenderingScope &scope,
+                                                           const OpenedRendering &opened) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> clearCommandColor(VernonRhiDevice device, uint64_t native,
+                                                         const RenderingScope &scope, const OpenedRendering &opened,
+                                                         uint32_t location, const VernonClearColor &color) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> clearCommandDepthStencil(VernonRhiDevice device, uint64_t native,
+                                                                const RenderingScope &scope,
+                                                                const OpenedRendering &opened, float depth,
+                                                                uint32_t stencil, uint32_t aspects) noexcept;
 #if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
 VERNON_RHI_CAPI uint32_t metalTexturePixelFormat(VernonTextureFormat format);
 #endif

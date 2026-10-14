@@ -263,7 +263,13 @@ class BarrierEffect:
     scope: EffectScope
 
 
-TypedEffect = StorageEffect | ResourceEffect | AtomicEffect | BarrierEffect
+@dataclass(frozen=True)
+class FragmentDiscardEffect:
+    """The statement may terminate its fragment invocation; it propagates to callers so that only fragment entries
+    may reach it."""
+
+
+TypedEffect = StorageEffect | ResourceEffect | AtomicEffect | BarrierEffect | FragmentDiscardEffect
 
 
 class Termination(Enum):
@@ -271,6 +277,7 @@ class Termination(Enum):
     BREAK = "break"
     CONTINUE = "continue"
     RETURN = "return"
+    DISCARD = "discard"
 
 
 @dataclass(frozen=True)
@@ -314,7 +321,7 @@ class TypedStatement:
         nested_effects = self._nested_effects()
         storage_effects = tuple(effect for effect in nested_effects if isinstance(effect, StorageEffect))
         if any(effect.kind is StorageEffectKind.WRITE for effect in storage_effects) or any(
-            isinstance(effect, (AtomicEffect, BarrierEffect)) for effect in nested_effects
+            isinstance(effect, (AtomicEffect, BarrierEffect, FragmentDiscardEffect)) for effect in nested_effects
         ):
             return Effect.WRITE
         if any(effect.kind is StorageEffectKind.READ for effect in storage_effects):

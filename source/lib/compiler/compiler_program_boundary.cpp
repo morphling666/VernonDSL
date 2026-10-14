@@ -9,9 +9,7 @@
 namespace vernon::compiler {
 namespace {
 
-ProgramBoundaryAccess forwardResourceAccess(const llvm::json::Array &graphs, int64_t storageId) {
-    bool reads = false;
-    bool writes = false;
+template <typename Visit> void forEachForwardAccess(const llvm::json::Array &graphs, int64_t storageId, Visit visit) {
     for (const llvm::json::Value &graphRow : graphs) {
         const llvm::json::Object *graph = graphRow.getAsObject();
         if (!graph || graph->getString("direction") != "forward")
@@ -26,18 +24,37 @@ ProgramBoundaryAccess forwardResourceAccess(const llvm::json::Array &graphs, int
                 continue;
             for (const llvm::json::Value &accessRow : *accesses) {
                 const llvm::json::Object *access = accessRow.getAsObject();
-                if (!access || access->getInteger("storage") != storageId)
-                    continue;
-                const llvm::StringRef mode = access->getString("access").value_or("");
-                const llvm::StringRef tag = access->getString("tag").value_or("");
-                reads |= mode == "read" || mode == "read_write" || tag == "read" || tag == "attachment";
-                writes |= mode == "write" || mode == "read_write" || tag == "initialize" || tag == "write" ||
-                          tag == "attachment";
+                if (access && access->getInteger("storage") == storageId)
+                    visit(access->getString("tag").value_or(""), access->getString("access").value_or(""));
             }
         }
     }
+}
+
+ProgramBoundaryAccess forwardResourceAccess(const llvm::json::Array &graphs, int64_t storageId) {
+    bool reads = false;
+    bool writes = false;
+    forEachForwardAccess(graphs, storageId, [&](llvm::StringRef tag, llvm::StringRef mode) {
+        reads |= mode == "read" || mode == "read_write" || tag == "read" || tag == "attachment";
+        writes |=
+            mode == "write" || mode == "read_write" || tag == "initialize" || tag == "write" || tag == "attachment";
+    });
     return writes ? (reads ? ProgramBoundaryAccess::ReadWrite : ProgramBoundaryAccess::Write)
                   : ProgramBoundaryAccess::Read;
+}
+
+// Render passes write a caller's attachments in place; outputs written by compute keep commit-after-success.
+ProgramBoundaryPublication outputPublication(const llvm::json::Object &storage, const llvm::json::Array &graphs,
+                                             int64_t storageId) {
+    bool attachment = false;
+    bool otherWrite = false;
+    forEachForwardAccess(graphs, storageId, [&](llvm::StringRef tag, llvm::StringRef) {
+        attachment |= tag == "attachment";
+        otherWrite |= tag == "initialize" || tag == "write";
+    });
+    return storage.getString("ownership") == "borrowed" && attachment && !otherWrite
+               ? ProgramBoundaryPublication::InPlace
+               : ProgramBoundaryPublication::CommitAfterSuccess;
 }
 
 bool appendProgramBoundaries(const llvm::json::Object &signature, llvm::StringRef field, ProgramBoundaryRole role,
@@ -95,12 +112,14 @@ bool appendProgramBoundaries(const llvm::json::Object &signature, llvm::StringRe
             slot.storageDescriptor = copyJsonObject(*descriptor);
             slot.access = direction == ProgramBoundaryDirection::Input ? forwardResourceAccess(graphs, *storageId)
                                                                        : ProgramBoundaryAccess::Write;
+            if (direction == ProgramBoundaryDirection::Output)
+                slot.publication = outputPublication(*storage, graphs, *storageId);
         } else {
             slot.access = direction == ProgramBoundaryDirection::Input ? ProgramBoundaryAccess::Read
                                                                        : ProgramBoundaryAccess::Write;
+            if (direction == ProgramBoundaryDirection::Output)
+                slot.publication = ProgramBoundaryPublication::CommitAfterSuccess;
         }
-        if (direction == ProgramBoundaryDirection::Output)
-            slot.publication = ProgramBoundaryPublication::CommitAfterSuccess;
         plan.slots.push_back(std::move(slot));
     }
     return true;

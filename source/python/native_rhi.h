@@ -1,6 +1,7 @@
 #ifndef VERNON_PYTHON_NATIVE_RHI_H
 #define VERNON_PYTHON_NATIVE_RHI_H
 
+#include "VernonFormats.hpp"
 #include "VernonOpenGLContext.h"
 #include "VernonRHI.h"
 #include "VernonTextureTypes.h"

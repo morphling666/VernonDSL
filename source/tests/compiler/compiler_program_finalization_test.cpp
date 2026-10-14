@@ -234,6 +234,50 @@ TEST(CompilerProgramBoundaryPlanner, SerializesExactStorageBoundaryContract) {
                                .getAsArray());
 }
 
+TEST(CompilerProgramBoundaryPlanner, PublishesBorrowedAttachmentOutputsInPlace) {
+    using namespace vernon::compiler;
+    llvm::json::Value document = parse(R"({
+      "signature": {
+        "inputs": [],
+        "outputs": [{"path": "color", "value": 1}, {"path": "owned", "value": 3}, {"path": "computed", "value": 5}],
+        "cotangents": [],
+        "gradients": []
+      },
+      "values": [
+        {"id": 1, "type": "image<rgba8_unorm>", "storage": 0},
+        {"id": 3, "type": "image<rgba8_unorm>", "storage": 1},
+        {"id": 5, "type": "image<rgba8_unorm>", "storage": 2}
+      ],
+      "storages": [
+        {"id": 0, "ownership": "borrowed", "descriptor": {"tag": "image"}},
+        {"id": 1, "ownership": "owned", "descriptor": {"tag": "image"}},
+        {"id": 2, "ownership": "borrowed", "descriptor": {"tag": "image"}}
+      ],
+      "graphs": [{
+        "direction": "forward",
+        "nodes": [
+          {"accesses": [{"tag": "write", "storage": 2, "before": 4, "after": 6, "access": "write"}]},
+          {"accesses": [
+            {"tag": "attachment", "storage": 0, "before": 0, "after": 1},
+            {"tag": "attachment", "storage": 1, "before": 2, "after": 3},
+            {"tag": "attachment", "storage": 2, "before": 6, "after": 5}
+          ]}
+        ]
+      }]
+    })");
+    llvm::json::Object *root = document.getAsObject();
+    ASSERT_NE(root, nullptr);
+    ProgramBoundaryPlan boundaries;
+    std::string error;
+    ASSERT_TRUE(planProgramBoundaries(*root->getObject("signature"), *root->getArray("values"),
+                                      *root->getArray("storages"), *root->getArray("graphs"), boundaries, error))
+        << error;
+    ASSERT_EQ(boundaries.slots.size(), 3u);
+    EXPECT_EQ(boundaries.slots[0].publication, ProgramBoundaryPublication::InPlace);
+    EXPECT_EQ(boundaries.slots[1].publication, ProgramBoundaryPublication::CommitAfterSuccess);
+    EXPECT_EQ(boundaries.slots[2].publication, ProgramBoundaryPublication::CommitAfterSuccess);
+}
+
 TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
     using namespace vernon::compiler;
     llvm::json::Value values = parse(R"([

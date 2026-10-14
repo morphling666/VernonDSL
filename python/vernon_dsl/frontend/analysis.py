@@ -9,6 +9,7 @@ from .model import (
     BranchMerge,
     Effect,
     EffectScope,
+    FragmentDiscardEffect,
     LValue,
     MemoryOrdering,
     ResourceEffect,
@@ -59,6 +60,8 @@ def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
             "ordering": effect.ordering.value,
             "scope": effect.scope.value,
         }
+    if isinstance(effect, FragmentDiscardEffect):
+        return {"kind": "fragment_discard"}
     return {
         "kind": "barrier",
         "ordering": effect.ordering.value,
@@ -135,6 +138,7 @@ __all__ = [
     "BranchMerge",
     "Effect",
     "EffectScope",
+    "FragmentDiscardEffect",
     "LValue",
     "MemoryOrdering",
     "ResourceEffect",

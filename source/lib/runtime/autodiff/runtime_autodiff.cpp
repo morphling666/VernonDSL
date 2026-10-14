@@ -187,10 +187,12 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 namespace vernon::runtime::program_execution {
 
-VernonStatus forwardProgramInvocation(
-    VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments, size_t argumentCount,
-    VernonPullback *&pullback, InvocationMutationOutcome &outcome, const ProgramInvocationContext *programContext,
-    std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks, bool retainPullback) {
+VernonStatus
+forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
+                         size_t argumentCount, VernonPullback *&pullback, InvocationMutationOutcome &outcome,
+                         SubmissionRecord &submission, const ProgramInvocationContext *programContext,
+                         std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks,
+                         bool retainPullback) {
     pullback = nullptr;
     outcome = {};
     const auto *autodiff = canonicalProgramAutodiff(&pipeline);
@@ -200,8 +202,8 @@ VernonStatus forwardProgramInvocation(
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     std::unique_ptr<ad::PullbackExecution> execution;
-    const ad::ForwardExecutionTarget target{arguments,     argumentCount,  programContext,
-                                            nodePullbacks, retainPullback, outcome};
+    const ad::ForwardExecutionTarget target{arguments,      argumentCount, programContext, nodePullbacks,
+                                            retainPullback, outcome,       submission};
     const VernonStatus status = executable->forward(target, execution);
     if (status != VERNON_STATUS_OK)
         return status;

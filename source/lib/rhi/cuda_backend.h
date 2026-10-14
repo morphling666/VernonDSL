@@ -9,6 +9,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace vernon::rhi::cuda {
 
@@ -17,6 +18,8 @@ struct VERNON_RHI_CAPI DeviceState {
         void *data{};
         size_t size{};
         bool inUse{};
+        // Recorded after the stream work that reads the block; the block is reusable once it completes.
+        Event retirement{};
     };
 
     ~DeviceState();
@@ -25,6 +28,12 @@ struct VERNON_RHI_CAPI DeviceState {
     void shutdown();
     Result makeCurrent() const;
     Result synchronize() const;
+    // Completes after all work enqueued on the stream before it. Every recorded completion must be passed to
+    // waitCompletion exactly once.
+    Result recordCompletion(Event &completion);
+    // kSuccess, kNotReady, or the error of the work it covers.
+    Result queryCompletion(Event completion) const;
+    Result waitCompletion(Event completion);
     Result allocate(DevicePointer &pointer, size_t size) const;
     Result free(DevicePointer pointer) const;
     Result upload(DevicePointer destination, const void *source, size_t size);
@@ -43,9 +52,14 @@ struct VERNON_RHI_CAPI DeviceState {
 private:
     PinnedBlock *acquirePinned(size_t size, Result &status);
     void releasePinned(PinnedBlock &block);
+    // Keeps `block` in use until the stream work enqueued so far completes.
+    Result retirePinned(PinnedBlock &block);
+    Result acquireEvent(Event &event);
+    void recycleEvent(Event event, bool reusable);
 
-    std::mutex stagingMutex;
+    std::mutex poolMutex;
     std::deque<PinnedBlock> stagingPool;
+    std::vector<Event> eventPool;
 };
 
 struct VERNON_RHI_CAPI PreparedFunction {

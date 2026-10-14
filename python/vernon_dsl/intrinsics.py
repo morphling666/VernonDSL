@@ -157,6 +157,10 @@ def storage_barrier() -> None:
     _raise_device_only("storage_barrier")
 
 
+def discard_fragment() -> None:
+    _raise_device_only("discard_fragment")
+
+
 def resolution() -> Any:
     return _raise_device_only("resolution")
 

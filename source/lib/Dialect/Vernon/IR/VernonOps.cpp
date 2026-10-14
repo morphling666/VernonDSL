@@ -385,6 +385,18 @@ LogicalResult BarrierOp::verify() {
     return success();
 }
 
+LogicalResult DiscardFragmentOp::verify() {
+    for (Operation *parent = (*this)->getParentOp(); parent; parent = parent->getParentOp()) {
+        auto stage = parent->getAttrOfType<StringAttr>("vernon.stage");
+        if (!stage)
+            continue;
+        if (stage.getValue() != "fragment")
+            return emitOpError("is valid only in fragment entries");
+        return success();
+    }
+    return success();
+}
+
 namespace {
 
 AdCaptureOp enclosingCapture(Operation *operation) { return operation->getParentOfType<AdCaptureOp>(); }

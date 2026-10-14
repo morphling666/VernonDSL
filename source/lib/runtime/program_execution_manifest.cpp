@@ -1,5 +1,6 @@
 #include "program_execution_manifest.h"
 
+#include "VernonFormats.hpp"
 #include "content_hash.h"
 #include "shape_layout.h"
 #include "target_implementation_metadata.h"
@@ -235,10 +236,12 @@ bool parseGraphicsPipelineState(const nlohmann::json &value, GraphicsPipelineSta
 }
 
 bool parseTextureFormat(const nlohmann::json &value, VernonTextureFormat &format) {
-    return enumName(value,
-                    {"rgba8_unorm", "rgba8_srgb", "rgba16_float", "rgba32_float", "r8_unorm", "r16_float", "r32_float",
-                     "rg8_unorm", "rgb8_unorm", "r11g11b10_float", "depth32_float", "depth32_float_stencil8"},
-                    format);
+    const vernon::formats::Format *entry =
+        value.is_string() ? vernon::formats::find(std::string_view(value.get_ref<const std::string &>())) : nullptr;
+    if (!entry)
+        return false;
+    format = entry->texture;
+    return true;
 }
 
 bool parseAttachmentSignature(const nlohmann::json &value, bool color, GraphicsAttachmentSignature &signature,

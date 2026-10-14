@@ -470,6 +470,51 @@ inline Result<ProgramNodeBinding, RuntimeError> ProgramNode::boundary(VernonProg
     return Result<ProgramNodeBinding, RuntimeError>{ok(result)};
 }
 
+struct ProgramInvocationOptions {
+    VernonCompletionMode completionMode{VERNON_COMPLETION_WAIT};
+};
+
+class Submission {
+public:
+    Submission() = default;
+    explicit Submission(VernonSubmission *handle) noexcept : handle_(handle) {}
+    Submission(const Submission &) = delete;
+    Submission &operator=(const Submission &) = delete;
+    Submission(Submission &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    Submission &operator=(Submission &&other) noexcept {
+        if (this != &other) {
+            vernonSubmissionDestroy(handle_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+    ~Submission() { vernonSubmissionDestroy(handle_); }
+
+    [[nodiscard]] Result<VernonSubmissionState, RuntimeError> state() const noexcept {
+        if (!handle_)
+            return Result<VernonSubmissionState, RuntimeError>{err(detail::invalidArgument("Submission.state"))};
+        VernonSubmissionState state = VERNON_SUBMISSION_PENDING;
+        const VernonStatus status = vernonSubmissionGetState(handle_, &state);
+        if (status != VERNON_STATUS_OK)
+            return Result<VernonSubmissionState, RuntimeError>{err(detail::runtimeError(status, "Submission.state"))};
+        return Result<VernonSubmissionState, RuntimeError>{ok(state)};
+    }
+
+    [[nodiscard]] Result<void, RuntimeError> wait() noexcept {
+        if (!handle_)
+            return Result<void, RuntimeError>{err(detail::invalidArgument("Submission.wait"))};
+        const VernonStatus status = vernonSubmissionWait(handle_);
+        if (status != VERNON_STATUS_OK)
+            return Result<void, RuntimeError>{err(detail::runtimeError(status, "Submission.wait"))};
+        return Result<void, RuntimeError>{ok()};
+    }
+
+    VernonSubmission *get() const noexcept { return handle_; }
+
+private:
+    VernonSubmission *handle_{};
+};
+
 class ProgramInvocation {
 public:
     ProgramInvocation() = default;
@@ -553,6 +598,30 @@ public:
             return Result<void, RuntimeError>{
                 err(detail::runtimeError(status, "ProgramInvocation.setAutodiffOptions"))};
         return Result<void, RuntimeError>{ok()};
+    }
+
+    [[nodiscard]] Result<void, RuntimeError> setOptions(const ProgramInvocationOptions &invocationOptions) noexcept {
+        if (!handle_)
+            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.setOptions"))};
+        const VernonProgramInvocationOptions options{sizeof(VernonProgramInvocationOptions),
+                                                     VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
+                                                     invocationOptions.completionMode,
+                                                     {}};
+        const VernonStatus status = vernonRuntimeProgramInvocationSetOptions(handle_, &options);
+        if (status != VERNON_STATUS_OK)
+            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.setOptions"))};
+        return Result<void, RuntimeError>{ok()};
+    }
+
+    [[nodiscard]] Result<Submission, RuntimeError> takeSubmission() noexcept {
+        if (!handle_)
+            return Result<Submission, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.takeSubmission"))};
+        VernonSubmission *submission = nullptr;
+        const VernonStatus status = vernonRuntimeProgramInvocationTakeSubmission(handle_, &submission);
+        if (status != VERNON_STATUS_OK)
+            return Result<Submission, RuntimeError>{
+                err(detail::runtimeError(status, "ProgramInvocation.takeSubmission"))};
+        return Result<Submission, RuntimeError>{ok(Submission(submission))};
     }
 
     [[nodiscard]] Result<void, RuntimeError> execute(bool retainPullback = true) noexcept {

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
+#include "VernonSpirvImageFormat.h"
 #include "VernonSpirvMath.h"
 #include "runtime/interface_names.h"
 
@@ -133,16 +134,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
         const spirv::ImageArrayedInfo arrayed =
             texture.isArrayed() ? spirv::ImageArrayedInfo::Arrayed : spirv::ImageArrayedInfo::NonArrayed;
         if (texture.getAccess() != "sampled") {
-            std::optional<spirv::ImageFormat> format =
-                llvm::StringSwitch<std::optional<spirv::ImageFormat>>(texture.getFormat())
-                    .Case("r8_unorm", spirv::ImageFormat::R8)
-                    .Case("r16_float", spirv::ImageFormat::R16f)
-                    .Case("r32_float", spirv::ImageFormat::R32f)
-                    .Case("rg8_unorm", spirv::ImageFormat::Rg8)
-                    .Case("rgba8_unorm", spirv::ImageFormat::Rgba8)
-                    .Case("rgba16_float", spirv::ImageFormat::Rgba16f)
-                    .Case("rgba32_float", spirv::ImageFormat::Rgba32f)
-                    .Default(std::nullopt);
+            std::optional<spirv::ImageFormat> format = spirvStorageImageFormat(texture.getFormat());
             if (!format || texture.isCube())
                 return failure();
             return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth, arrayed,
@@ -1292,7 +1284,30 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
     return failure();
 }
 
+void translateDiscardFragment(Location location, OpBuilder &builder) {
+    // OpKill must end its block, yet the enclosing structured block still needs its own branch to its merge or
+    // continue target. The kill therefore sits in a selection whose condition is always true, which keeps every
+    // later block, back edge, and merge structurally reachable without ever executing them.
+    Value always = spirv::ConstantOp::create(builder, location, builder.getI1Type(), builder.getBoolAttr(true));
+    auto selection = spirv::SelectionOp::create(builder, location, spirv::SelectionControl::None);
+    OpBuilder::InsertionGuard guard(builder);
+    Region &body = selection.getBody();
+    Block *header = builder.createBlock(&body, body.end());
+    Block *killBlock = builder.createBlock(&body, body.end());
+    Block *mergeBlock = builder.createBlock(&body, body.end());
+    builder.setInsertionPointToEnd(header);
+    spirv::BranchConditionalOp::create(builder, location, always, killBlock, ValueRange{}, mergeBlock, ValueRange{});
+    builder.setInsertionPointToEnd(killBlock);
+    spirv::KillOp::create(builder, location);
+    builder.setInsertionPointToEnd(mergeBlock);
+    spirv::MergeOp::create(builder, location);
+}
+
 LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping) {
+    if (isa<DiscardFragmentOp>(operation)) {
+        translateDiscardFragment(operation.getLoc(), builder);
+        return success();
+    }
     auto intrinsic = dyn_cast<IntrinsicOp>(operation);
     if (!intrinsic || intrinsic.getName() != "texture_store" || intrinsic.getNumOperands() != 3)
         return failure();

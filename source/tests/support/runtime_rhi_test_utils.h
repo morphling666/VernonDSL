@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -393,6 +394,51 @@ inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiComma
     return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
 }
 
+// The statuses of downloading a buffer and a 4x4 RGBA8 image that the device creates for it; an empty result means the
+// device could not create them.
+inline std::optional<std::array<VernonRhiStatus, 2>> hostReadStatuses(VernonRhiDevice device) {
+    constexpr uint32_t extent = 4;
+    std::array<uint8_t, extent * extent * 4> destination{};
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = destination.size();
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = extent;
+    imageDescriptor.height = extent;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiBuffer buffer{};
+    VernonRhiImage image{};
+    if (vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer) != VERNON_RHI_STATUS_OK)
+        return std::nullopt;
+    if (vernonRhiDeviceCreateImage(device, &imageDescriptor, &image) != VERNON_RHI_STATUS_OK) {
+        vernonRhiDeviceDestroyBuffer(device, buffer);
+        return std::nullopt;
+    }
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    download.width = extent;
+    download.height = extent;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    const std::array<VernonRhiStatus, 2> statuses{
+        vernonRhiDeviceDownloadBuffer(device, buffer, 0, destination.data(), destination.size()),
+        vernonRhiDeviceDownloadImage(device, image, &download, destination.data(), destination.size())};
+    vernonRhiDeviceDestroyImage(device, image);
+    vernonRhiDeviceDestroyBuffer(device, buffer);
+    return statuses;
+}
+
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
     switch (backend) {
     case VERNON_RUNTIME_CUDA:
@@ -428,7 +474,7 @@ inline RhiRuntime createRhiRuntime(VernonRuntimeBackend backend,
         result.device = vernonRhiCreateDevice(&descriptor);
     }
     if (result.device.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-        result.runtime = vernonRuntimeCreateForRhiDevice(backend, result.device);
+        result.runtime = vernonRuntimeCreateForRhiDevice(backend, result.device, nullptr);
     return result;
 }
 

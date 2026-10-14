@@ -42,25 +42,16 @@ typedef struct VernonRuntimeCoreDrawInvocation {
     VernonRuntimeProviderObject command_encoder;
     uint32_t vertex_count;
     uint32_t instance_count;
-    uint32_t first_vertex;
     uint32_t first_instance;
-    const VernonRuntimeProviderColorAttachment *color_attachments;
-    size_t color_attachment_count;
-    VernonRuntimeProviderResourceReference depth_stencil_view;
-    VernonRuntimeProviderLoadOperation depth_load_operation;
-    VernonRuntimeProviderStoreOperation depth_store_operation;
-    float clear_depth;
+    /* Indexed draws only: added to each index before vertex fetch. */
+    int32_t base_vertex;
     uint32_t viewport[4];
     uint32_t scissor[4];
     uint32_t topology;
     VernonRuntimeProviderResourceReference index_buffer;
     uint32_t index_count;
     uint32_t index_type;
-    VernonRuntimeProviderLoadOperation stencil_load_operation;
-    VernonRuntimeProviderStoreOperation stencil_store_operation;
-    uint32_t clear_stencil;
     uint32_t stencil_reference;
-    uint32_t render_area[4];
 } VernonRuntimeCoreDrawInvocation;
 
 typedef struct VernonRuntimeCorePipelineDescriptor {
@@ -114,6 +105,16 @@ VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDispatch(const Vern
                                                                       const uint32_t group_count[3],
                                                                       const void *push_constants,
                                                                       size_t push_constant_size);
+/*
+ * Draw invocations are encoded between these calls and render into the
+ * rendering descriptor's attachments, which Core validates against each other
+ * and the render area.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBeginRendering(
+    const VernonRuntimeDeviceProvider *provider, VernonRuntimeProviderObject command_encoder,
+    const VernonRuntimeProviderRenderingDescriptor *descriptor);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEndRendering(const VernonRuntimeDeviceProvider *provider,
+                                                                    VernonRuntimeProviderObject command_encoder);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDrawInvocation(
     const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
     const VernonRuntimeCoreDrawInvocation *invocation);

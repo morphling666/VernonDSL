@@ -1,11 +1,14 @@
 #include "VernonRHI.h"
+#include "rhi/directx12_backend.h"
 #include "rhi/rhi_internal.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <gtest/gtest.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <vector>
 
 namespace {
@@ -143,6 +146,8 @@ TEST(DirectX12NativeInterop, BorrowsObjectsWithoutChangingTheirLifetime) {
     uint64_t nativeImage = 0;
     EXPECT_EQ(vernonRhiDeviceGetImageNativeHandle(device, importedImage, &nativeImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(reinterpret_cast<void *>(nativeImage), image.Get());
+    EXPECT_EQ(vernon::tests::hostReadStatuses(device),
+              (std::array<VernonRhiStatus, 2>{VERNON_RHI_STATUS_UNSUPPORTED, VERNON_RHI_STATUS_UNSUPPORTED}));
 
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};
     encoderDescriptor.struct_size = sizeof(encoderDescriptor);
@@ -181,6 +186,45 @@ TEST(DirectX12NativeInterop, BorrowsObjectsWithoutChangingTheirLifetime) {
     descriptorHeap->Release();
 }
 
+TEST(DirectX12NativeInterop, BorrowedStorageRetiresOnlyThroughTheCompletedSubmission) {
+    std::string error;
+    vernon::rhi::directx12::DeviceState owner;
+    if (!owner.initialize(0, true, error))
+        GTEST_SKIP() << error;
+    ASSERT_TRUE(owner.beginCommands(error)) << error;
+    {
+        vernon::rhi::directx12::DeviceState borrowed;
+        ASSERT_TRUE(borrowed.initializeBorrowed(owner.device, owner.queue, owner.commandList(), error)) << error;
+        // Each request fills a whole chunk, so a request takes any free chunk before it creates one.
+        const auto stage = [&] {
+            ID3D12Resource *resource{};
+            size_t offset{};
+            uint8_t *mapped{};
+            EXPECT_TRUE(borrowed.acquireStaging(
+                true, vernon::rhi::StagingPool<vernon::rhi::directx12::DeviceState::StagingChunk>::minimumCapacity, 16,
+                resource, offset, mapped, error))
+                << error;
+            return resource;
+        };
+        uint64_t first{};
+        uint64_t second{};
+        stage();
+        ASSERT_TRUE(borrowed.submitCommands(first, error)) << error;
+        ID3D12Resource *const unexecuted = stage();
+        ASSERT_TRUE(borrowed.submitCommands(second, error)) << error;
+        ASSERT_LT(first, second);
+
+        borrowed.abandonCommands();
+        borrowed.retireBorrowedCommands(first);
+        EXPECT_NE(stage(), unexecuted);
+        EXPECT_NE(stage(), unexecuted);
+        borrowed.retireBorrowedCommands(second);
+    }
+    uint64_t value{};
+    ASSERT_TRUE(owner.submitCommands(value, error)) << error;
+    ASSERT_TRUE(owner.waitForValue(value, error)) << error;
+}
+
 TEST(DirectX12NativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
     VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
     deviceDescriptor.struct_size = sizeof(deviceDescriptor);
@@ -214,6 +258,77 @@ TEST(DirectX12NativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
 
     for (VernonRhiBuffer buffer : buffers)
         EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(DirectX12NativeInterop, ImageViewsTrackTheStatesOfTheirImage) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_DIRECTX12;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "DirectX 12 device is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = 4;
+    imageDescriptor.height = 4;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 2;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+    const auto createView = [&](uint32_t baseMip) {
+        VernonRhiImageViewDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.image = image;
+        descriptor.dimension = VERNON_RHI_IMAGE_2D;
+        descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+        descriptor.base_mip_level = baseMip;
+        descriptor.mip_level_count = 1;
+        descriptor.array_layer_count = 1;
+        descriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+        VernonRhiImageView view{};
+        EXPECT_EQ(vernonRhiDeviceCreateImageView(device, &descriptor, &view), VERNON_RHI_STATUS_OK);
+        return view;
+    };
+    const VernonRhiImageView target = createView(0);
+    const VernonRhiImageView sampled = createView(1);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    const uint64_t key = vernon::rhi::commandEncoderKey(device, encoder).value();
+    const uint64_t targetKey = vernon::rhi::imageViewResource(device, target).value();
+    vernon::rhi::RenderingScope scope;
+    scope.colorCount = 1;
+    scope.colors[0].view = targetKey;
+    scope.width = 4;
+    scope.height = 4;
+    scope.layers = 1;
+    const vernon::rhi::RenderingRead read{vernon::rhi::ResourceKind::ImageView,
+                                          vernon::rhi::imageViewResource(device, sampled).value()};
+    ASSERT_TRUE(vernon::rhi::beginEncoderRendering(device, key, scope, &read, 1).isOk());
+    ASSERT_TRUE(vernon::rhi::openCommandRendering(device, key).isOk());
+    const auto *view = reinterpret_cast<const vernon::rhi::directx12::Image *>(static_cast<uintptr_t>(
+        vernon::rhi::resolveCommandResource(device, key, vernon::rhi::ResourceKind::ImageView, targetKey).value()));
+    const vernon::rhi::directx12::Image &owner = *view->stateOwner;
+    ASSERT_EQ(owner.subresourceStates.size(), 2u);
+    EXPECT_EQ(owner.subresourceStates[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    EXPECT_EQ(owner.subresourceStates[1], D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    ASSERT_TRUE(vernon::rhi::endEncoderRendering(device, key).isOk());
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(owner.subresourceStates[0], D3D12_RESOURCE_STATE_COMMON);
+    EXPECT_EQ(owner.subresourceStates[1], D3D12_RESOURCE_STATE_COMMON);
+    for (VernonRhiImageView created : {target, sampled})
+        EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, created), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }
 

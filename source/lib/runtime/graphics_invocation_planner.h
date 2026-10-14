@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
+#include "provider_image_description.h"
 #include "resolved_stage_types.h"
 #include "stage_binding_plan.h"
 
@@ -24,6 +25,7 @@ enum PlannedShaderStage : uint32_t { PLANNED_STAGE_VERTEX = 1u << 0, PLANNED_STA
 
 struct PlannedSampledResource {
     VernonRuntimeProviderResourceReference imageView{};
+    ProviderImageSubresources subresources{};
     VernonRuntimeProviderResourceReference samplerResource{};
     bool implicitSampler{};
     bool explicitSampler{};
@@ -36,19 +38,26 @@ struct PlannedVertexInput {
     bool instanced{};
 };
 
-struct PlannedGraphicsInvocation {
-    PipelineArgumentMap arguments;
+// `attachments` are sorted by location, and locations are contiguous from zero. `attachmentSubresources` holds the
+// subresources of the color attachments in that order, followed by those of the depth attachment.
+struct PlannedRenderTargets {
     std::vector<const VernonColorAttachment *> attachments;
     std::vector<VernonTextureFormat> attachmentFormats;
+    std::vector<ProviderImageSubresources> attachmentSubresources;
     const VernonDepthAttachment *depthAttachment{};
     VernonTextureFormat depthFormat{};
+    uint32_t attachmentWidth{};
+    uint32_t attachmentHeight{};
+};
+
+struct PlannedGraphicsInvocation : PlannedRenderTargets {
+    PipelineArgumentMap arguments;
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampledResources;
     std::vector<PlannedVertexInput> vertexInputs;
     std::array<float, 2> resolution{};
-    uint32_t attachmentWidth{};
-    uint32_t attachmentHeight{};
     uint32_t vertexCount{};
     uint32_t instanceCount{};
+    uint32_t firstInstance{};
     const VernonIndexBinding *indexBinding{};
     VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
     uint32_t viewport[4]{};
@@ -70,6 +79,8 @@ struct PreparedGraphicsVariant {
     VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
+bool planRenderTargets(const VernonRenderPass *renderPass, DescribeImageResource describeImage,
+                       void *describeImageUserData, PlannedRenderTargets &targets, std::string &error);
 bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error);

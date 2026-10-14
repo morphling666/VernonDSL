@@ -119,7 +119,7 @@ TEST(ExecutionCommandModel, ComposesOwnedRhiCommandPlans) {
         node.kind = CommandNodeKind::Transfer;
         node.accesses = {bufferAccess(aliasDomain, 0, 16, AccessMode::Write)};
         result.commands.nodes.push_back(std::move(node));
-        result.encoders.push_back({encodeCommand, nullptr, nullptr});
+        result.encoders.push_back({encodeCommand, nullptr});
         result.bindings.push_back({aliasDomain, ResourceKind::Buffer, buffer, {}});
         result.initialAccesses.push_back(bufferAccess(aliasDomain, 0, 16, AccessMode::ReadWrite));
         return result;
@@ -144,7 +144,7 @@ TEST(ExecutionCommandModel, PreservesDisjointInitialRangesAndRejectsAmbiguousOve
         node.kind = CommandNodeKind::Transfer;
         node.accesses = {bufferAccess(1, accessOffset, 16, AccessMode::Write)};
         result.commands.nodes.push_back(std::move(node));
-        result.encoders.push_back({encodeCommand, nullptr, nullptr});
+        result.encoders.push_back({encodeCommand, nullptr});
         result.bindings.push_back({1, ResourceKind::Buffer, buffer, {}});
         result.initialAccesses.push_back(bufferAccess(1, initialOffset, initialBytes, AccessMode::ReadWrite));
         return result;

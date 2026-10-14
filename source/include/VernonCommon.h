@@ -21,7 +21,9 @@ typedef enum VernonStatus {
     VERNON_STATUS_PARSE_ERROR = 2,
     VERNON_STATUS_VERIFICATION_ERROR = 3,
     VERNON_STATUS_UNSUPPORTED_TARGET = 4,
-    VERNON_STATUS_INTERNAL_ERROR = 5
+    VERNON_STATUS_INTERNAL_ERROR = 5,
+    /* The queried result belongs to work that has not completed; retry after it completes. */
+    VERNON_STATUS_NOT_READY = 6
 } VernonStatus;
 
 // CPU entry points are emitted by the compiler but invoked by the standalone

@@ -24,7 +24,7 @@ bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const pr
 /// one signature cannot draw into a target with another. The manifest records the compatible formats per attachment;
 /// this rejects a target outside that set instead of leaving the mismatch to the backend.
 bool checkProgramGraphicsAttachmentSignature(const program::GraphicsOperation &graphics,
-                                             const PlannedGraphicsInvocation &plan, std::string &error);
+                                             const PlannedRenderTargets &plan, std::string &error);
 
 } // namespace vernon::runtime
 

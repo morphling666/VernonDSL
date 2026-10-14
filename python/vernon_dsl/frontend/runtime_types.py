@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .._formats import TEXTURE_FORMATS_BY_NAME
 from .._markers import is_struct_class
 from ..binding_groups import binding_group_leaf_annotations
 from ..host_values import pack_host_value
@@ -187,13 +188,16 @@ def concrete_type_from_annotation(annotation: Any) -> ConcreteType:
             )
         if len(annotation.arguments) == 3:
             dimension, format_name, access = annotation.arguments
+            texture_format = TEXTURE_FORMATS_BY_NAME.get(name := _spelling(format_name))
+            if texture_format is None or not texture_format.storage:
+                raise TypeError(f"unsupported storage Texture format {name!r}")
             return ConcreteType(
                 "texture",
                 "Texture",
                 (
                     str(dimension),
-                    ConcreteType("scalar", "f32"),
-                    _spelling(format_name),
+                    ConcreteType("scalar", texture_format.shader_scalar),
+                    texture_format.name,
                     _spelling(access),
                 ),
             )

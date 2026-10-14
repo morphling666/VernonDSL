@@ -269,39 +269,6 @@ VernonRhiStatus encodePipelinePlanCommand(void *opaque, VernonRhiCommandEncoder 
 
 VernonRhiStatus encodeNoopCommand(void *, VernonRhiCommandEncoder) { return VERNON_RHI_STATUS_OK; }
 
-class WaitFailureCompletion final : public execution::detail::RhiCommandCompletion {
-public:
-    explicit WaitFailureCompletion(VernonRuntimeContext &context)
-        : context_(context), failureDiagnostic_("injected GPU command DAG wait failure") {}
-
-    bool validationPhase() const override { return true; }
-
-    VernonRhiStatus complete(bool succeeded, const execution::detail::RhiCommandDagExecutionStats &) noexcept override {
-        if (!succeeded || !injectFailure(FailureBoundary::Completion))
-            return VERNON_RHI_STATUS_OK;
-        invocationDiagnostic(context_).swap(failureDiagnostic_);
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    VernonRuntimeContext &context_;
-    std::string failureDiagnostic_;
-};
-
-struct EncodeFailureContext {
-    VernonRuntimeContext &runtime;
-    execution::detail::RhiCommandNodeEncoder original;
-};
-
-VernonRhiStatus encodeWithFailureBoundary(void *opaque, VernonRhiCommandEncoder encoder) {
-    auto &context = *static_cast<EncodeFailureContext *>(opaque);
-    if (injectFailure(FailureBoundary::Submission)) {
-        invocationDiagnostic(context.runtime) = "injected GPU command DAG encoding failure";
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-    return context.original.encode(context.original.context, encoder);
-}
-
 } // namespace
 
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
@@ -317,92 +284,6 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
     return encodeResolvedStage(provider.value(), &pipeline, &invocation);
-}
-
-VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
-                                       const execution::detail::RhiCommandExecutionPlan &plan,
-                                       ExecutionControlPlaneUsage *telemetry,
-                                       execution::detail::RhiCommandPlanSink *sink, bool flush,
-                                       SubmissionState *submission) {
-    if (submission)
-        *submission = SubmissionState::NotSubmitted;
-    if (sink) {
-        execution::detail::RhiCommandExecutionPlan deferred = plan;
-        const auto firstCommand =
-            std::find_if(deferred.encoders.begin(), deferred.encoders.end(),
-                         [](const execution::detail::RhiCommandNodeEncoder &encoder) { return encoder.encode; });
-        if (firstCommand == deferred.encoders.end())
-            return fail(context, "GPU command program has no encodable command", VERNON_STATUS_INTERNAL_ERROR);
-        auto encodeContext = std::make_shared<EncodeFailureContext>(EncodeFailureContext{context, *firstCommand});
-        *firstCommand = {encodeWithFailureBoundary, encodeContext.get(), nullptr};
-        deferred.retainedContexts.push_back(std::move(encodeContext));
-        if (sink->append(std::move(deferred)) != VERNON_RHI_STATUS_OK)
-            return fail(context, "GPU command program failed", VERNON_STATUS_INTERNAL_ERROR);
-        sink->onCompletion(std::make_shared<WaitFailureCompletion>(context));
-        if (flush) {
-            if (sink->flush() != VERNON_RHI_STATUS_OK) {
-                if (submission)
-                    *submission = SubmissionState::Indeterminate;
-                return fail(context, "GPU command program failed", VERNON_STATUS_INTERNAL_ERROR);
-            }
-            if (submission)
-                *submission = SubmissionState::Completed;
-        }
-        return VERNON_STATUS_OK;
-    }
-    if (injectFailure(FailureBoundary::Submission))
-        return fail(context, "injected GPU command DAG encoding failure", VERNON_STATUS_INTERNAL_ERROR);
-    const uint32_t requiredCapabilities =
-        std::any_of(plan.commands.nodes.begin(), plan.commands.nodes.end(),
-                    [](const auto &node) { return node.queue == execution::detail::CommandQueueClass::Graphics; })
-            ? VERNON_RHI_QUEUE_GRAPHICS
-            : VERNON_RHI_QUEUE_COMPUTE;
-    execution::detail::RhiCommandDagExecutionStats stats;
-    const VernonRhiStatus status =
-        execution::detail::executeRhiCommandPlanAndWait(context.rhiDevice, requiredCapabilities, plan, &stats);
-    if (telemetry) {
-        telemetry->submissions += stats.submissions;
-        telemetry->waits += stats.waits;
-        telemetry->deviceWaitNanoseconds += stats.deviceWaitNanoseconds;
-    }
-    if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Completion)) {
-        if (submission)
-            *submission = SubmissionState::Indeterminate;
-        return fail(context, "injected GPU command DAG wait failure", VERNON_STATUS_INTERNAL_ERROR);
-    }
-    if (status == VERNON_RHI_STATUS_OK) {
-        if (submission)
-            *submission = SubmissionState::Completed;
-        return VERNON_STATUS_OK;
-    }
-    if (submission && stats.submissions)
-        *submission = SubmissionState::Indeterminate;
-    std::string detail = invocationDiagnostic(context);
-    if (detail.empty()) {
-        const VernonStringView backendError = vernonRhiDeviceGetLastError(context.rhiDevice);
-        if (backendError.data && backendError.size)
-            detail.assign(backendError.data, backendError.size);
-    }
-    return fail(context, detail.empty() ? "GPU command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
-}
-
-VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies) {
-    return executeDeviceCopiesAndWait(context, copies, {});
-}
-
-VernonStatus executeDeviceCopiesAndWait(VernonRuntimeContext &context,
-                                        const std::vector<DeviceBufferCopy> &bufferCopies,
-                                        const std::vector<DeviceImageCopy> &imageCopies) {
-    if (bufferCopies.empty() && imageCopies.empty())
-        return VERNON_STATUS_OK;
-    execution::detail::RhiCommandExecutionPlan plan;
-    if (const VernonStatus status = buildDeviceTransferCommandPlan(context, bufferCopies, imageCopies, {}, plan);
-        status != VERNON_STATUS_OK)
-        return status;
-    std::string error;
-    if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
-        return fail(context, std::move(error));
-    return executeCommandPlanAndWait(context, plan);
 }
 
 VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,

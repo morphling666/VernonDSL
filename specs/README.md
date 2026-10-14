@@ -84,6 +84,21 @@ Architecture and tutorials link to the contract instead of redefining fields.
   records the implemented prepared-binding architecture.
 - [`runtime/tensor_view_metadata_abi_plan.md`](runtime/tensor_view_metadata_abi_plan.md)
   records the implemented aggregate TensorView metadata ABI.
+- [`program/recorded_draws.md`](program/recorded_draws.md) proposes graphics
+  Nodes whose draws, pipelines, and per-draw parameter bindings are recorded
+  per invocation.
+- [`program/fragment_discard.md`](program/fragment_discard.md) proposes the
+  `vd.discard_fragment()` statement for masked raster.
+- [`program/integer_targets.md`](program/integer_targets.md) proposes a
+  single format table, `r32_uint`/`rg32_uint` color targets, interpolation
+  qualifiers, `2d_ms` reads, and typed clear values.
+- [`runtime/pipelined_submission.md`](runtime/pipelined_submission.md)
+  specifies asynchronous submission for graphics, compute and autodiff:
+  every Execute returns after submission and completion effects belong to
+  the submission. Phase 1, asynchronous plans whose writes are all in
+  place, is implemented.
+- [`runtime/gpu_profiling.md`](runtime/gpu_profiling.md) proposes per-Node
+  and recorded debug groups and opt-in timed scopes.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)
   tracks contract-driven, capability-based language test normalization.
 - [`testing/language_feature_inventory.md`](testing/language_feature_inventory.md)

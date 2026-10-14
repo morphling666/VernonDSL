@@ -1,4 +1,5 @@
 #include "stage_binding_plan.h"
+#include "VernonFormats.hpp"
 #include "content_hash.h"
 #include "pipeline_metadata.h"
 
@@ -27,22 +28,11 @@ std::optional<VernonTextureDimension> artifactTextureDimension(const std::string
     return std::nullopt;
 }
 
-std::optional<VernonTextureFormat> artifactTextureFormat(const std::string &format) {
-    if (format == "r8_unorm")
-        return VERNON_TEXTURE_R8_UNORM;
-    if (format == "r16_float")
-        return VERNON_TEXTURE_R16_FLOAT;
-    if (format == "r32_float")
-        return VERNON_TEXTURE_R32_FLOAT;
-    if (format == "rg8_unorm")
-        return VERNON_TEXTURE_RG8_UNORM;
-    if (format == "rgba8_unorm")
-        return VERNON_TEXTURE_RGBA8_UNORM;
-    if (format == "rgba16_float")
-        return VERNON_TEXTURE_RGBA16_FLOAT;
-    if (format == "rgba32_float")
-        return VERNON_TEXTURE_RGBA32_FLOAT;
-    return std::nullopt;
+std::optional<VernonTextureFormat> artifactStorageFormat(const std::string &format) {
+    const vernon::formats::Format *entry = vernon::formats::find(std::string_view(format));
+    if (!entry || !entry->allows(VERNON_RHI_FORMAT_STORAGE))
+        return std::nullopt;
+    return entry->texture;
 }
 
 namespace {

@@ -335,6 +335,7 @@ void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::
     EXPECT_EQ(control.readbacks, 2u);
     EXPECT_EQ(control.atomicPublications, 2u);
     EXPECT_GT(control.temporaryAllocationBytes, 0u);
+    EXPECT_GT(control.deviceWaitNanoseconds, 0u);
 
     gradient.fill(0.0f);
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)

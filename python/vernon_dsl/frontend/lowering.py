@@ -5,7 +5,13 @@ from typing import Iterable
 
 from ..language.stage_registry import GRAPHICS_STAGES
 from ..language.syntax import INTRINSIC_METHODS
-from ..shader_contracts import ATOMIC_OPERATION_NAMES, BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
+from ..shader_contracts import (
+    ATOMIC_OPERATION_NAMES,
+    BUILTIN_CONTRACTS,
+    FRAGMENT_DISCARD_OPERATION,
+    GENERATED_INTERFACE_CONTRACTS,
+    TypeContract,
+)
 from .abi import attribute_layout, value_leaves
 from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
 from .binding_groups import binding_group_occurrence
@@ -727,6 +733,13 @@ class _FunctionEmitter:
                 raise self.context.error(node, "barriers are supported only in compute kernels")
             scope = "workgroup" if name == "workgroup_barrier" else "device"
             self._line(f'"vernon.barrier"() {{ordering = "acquire_release", scope = "{scope}"}} : () -> ()')
+            return Value("", typed_call.type)
+        if name == FRAGMENT_DISCARD_OPERATION:
+            if self.node.name in self.context.shared_functions:
+                raise self.context.error(
+                    node, f"shared function '{self.node.name}' uses device-only operation '{name}'"
+                )
+            self._line(f'"vernon.{name}"() : () -> ()')
             return Value("", typed_call.type)
         if name in {"Tensor", "Vector", "Matrix"}:
             return lower_aggregate_constructor(self, node, name)

@@ -60,10 +60,16 @@ void DeviceState::shutdown() {
         api.streamDestroy(stream);
         stream = nullptr;
     }
-    for (PinnedBlock &block : stagingPool)
+    for (PinnedBlock &block : stagingPool) {
+        if (block.retirement)
+            api.eventDestroy(block.retirement);
         if (block.data)
             api.hostFree(block.data);
+    }
     stagingPool.clear();
+    for (Event event : eventPool)
+        api.eventDestroy(event);
+    eventPool.clear();
     if (context)
         api.primaryContextRelease(device);
     context = nullptr;
@@ -75,6 +81,57 @@ Result DeviceState::makeCurrent() const { return context ? driver().contextSetCu
 Result DeviceState::synchronize() const {
     Result status = makeCurrent();
     return status == kSuccess ? driver().streamSynchronize(stream) : status;
+}
+
+Result DeviceState::acquireEvent(Event &event) {
+    {
+        std::lock_guard<std::mutex> guard(poolMutex);
+        if (!eventPool.empty()) {
+            event = eventPool.back();
+            eventPool.pop_back();
+            return kSuccess;
+        }
+    }
+    return driver().eventCreate(&event, kEventDisableTiming);
+}
+
+void DeviceState::recycleEvent(Event event, bool reusable) {
+    if (reusable) {
+        std::lock_guard<std::mutex> guard(poolMutex);
+        try {
+            eventPool.push_back(event);
+            return;
+        } catch (const std::bad_alloc &) {
+        }
+    }
+    driver().eventDestroy(event);
+}
+
+Result DeviceState::recordCompletion(Event &completion) {
+    Result status = makeCurrent();
+    if (status == kSuccess)
+        status = acquireEvent(completion);
+    if (status != kSuccess)
+        return status;
+    status = driver().eventRecord(completion, stream);
+    if (status != kSuccess) {
+        recycleEvent(completion, false);
+        completion = nullptr;
+    }
+    return status;
+}
+
+Result DeviceState::queryCompletion(Event completion) const {
+    Result status = makeCurrent();
+    return status == kSuccess ? driver().eventQuery(completion) : status;
+}
+
+Result DeviceState::waitCompletion(Event completion) {
+    Result status = makeCurrent();
+    if (status == kSuccess)
+        status = driver().eventSynchronize(completion);
+    recycleEvent(completion, status == kSuccess);
+    return status;
 }
 
 Result DeviceState::allocate(DevicePointer &pointer, size_t size) const {
@@ -90,7 +147,25 @@ Result DeviceState::free(DevicePointer pointer) const {
 }
 
 DeviceState::PinnedBlock *DeviceState::acquirePinned(size_t size, Result &status) {
-    std::lock_guard<std::mutex> guard(stagingMutex);
+    std::lock_guard<std::mutex> guard(poolMutex);
+    for (PinnedBlock &block : stagingPool) {
+        if (!block.retirement)
+            continue;
+        const Result retired = driver().eventQuery(block.retirement);
+        if (retired == kNotReady)
+            continue;
+        if (retired != kSuccess) {
+            status = retired;
+            return nullptr;
+        }
+        try {
+            eventPool.push_back(block.retirement);
+        } catch (const std::bad_alloc &) {
+            driver().eventDestroy(block.retirement);
+        }
+        block.retirement = nullptr;
+        block.inUse = false;
+    }
     auto available = std::min_element(
         stagingPool.begin(), stagingPool.end(), [size](const PinnedBlock &left, const PinnedBlock &right) {
             const size_t leftSize = !left.inUse && left.size >= size ? left.size : SIZE_MAX;
@@ -117,8 +192,21 @@ DeviceState::PinnedBlock *DeviceState::acquirePinned(size_t size, Result &status
 }
 
 void DeviceState::releasePinned(PinnedBlock &block) {
-    std::lock_guard<std::mutex> guard(stagingMutex);
+    std::lock_guard<std::mutex> guard(poolMutex);
     block.inUse = false;
+}
+
+Result DeviceState::retirePinned(PinnedBlock &block) {
+    Event retirement{};
+    const Result status = recordCompletion(retirement);
+    if (status != kSuccess) {
+        driver().streamSynchronize(stream);
+        releasePinned(block);
+        return status;
+    }
+    std::lock_guard<std::mutex> guard(poolMutex);
+    block.retirement = retirement;
+    return kSuccess;
 }
 
 Result DeviceState::upload(DevicePointer destination, const void *source, size_t size) {
@@ -132,10 +220,11 @@ Result DeviceState::upload(DevicePointer destination, const void *source, size_t
         return status;
     std::memcpy(staging->data, source, size);
     status = driver().copyHostToDeviceAsync(destination, staging->data, size, stream);
-    if (status == kSuccess)
-        status = driver().streamSynchronize(stream);
-    releasePinned(*staging);
-    return status;
+    if (status != kSuccess) {
+        releasePinned(*staging);
+        return status;
+    }
+    return retirePinned(*staging);
 }
 
 Result DeviceState::uploadRanges(DevicePointer destination, const VernonRhiBufferUploadRange *ranges,
@@ -164,11 +253,12 @@ Result DeviceState::uploadRanges(DevicePointer destination, const VernonRhiBuffe
             break;
         stagingOffset += size;
     }
-    const Result synchronizationStatus = driver().streamSynchronize(stream);
-    if (status == kSuccess)
-        status = synchronizationStatus;
-    releasePinned(*staging);
-    return status;
+    if (status != kSuccess) {
+        driver().streamSynchronize(stream);
+        releasePinned(*staging);
+        return status;
+    }
+    return retirePinned(*staging);
 }
 
 Result DeviceState::download(void *destination, DevicePointer source, size_t size) {

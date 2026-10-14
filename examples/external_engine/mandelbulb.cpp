@@ -56,9 +56,9 @@ public:
         if (!graphics_)
             return false;
 #if defined(__EMSCRIPTEN__)
-        runtime_ = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_OPENGL_ES, graphics_->device());
+        runtime_ = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_OPENGL_ES, graphics_->device(), nullptr);
 #else
-        runtime_ = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_OPENGL, graphics_->device());
+        runtime_ = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_OPENGL, graphics_->device(), nullptr);
 #endif
         if (!runtime_)
             return false;

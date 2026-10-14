@@ -68,6 +68,13 @@ and physical types coexist. After conversion:
   language semantics from physical types;
 - shape specialization remains a separate invocation-time axis.
 
+Graphics Program attachments are `!vernon.texture` values with `attachment`
+access and their concrete target format, which must be renderable in
+`VernonFormats.def`. Typing them as `read_write` storage would make the storage
+format check admit depth formats, which are never storage images; the
+per-use `attachment` tag, not the type's access, carries their read and write
+effects.
+
 ## Backend split
 
 SPIR-V is not the universal backend IR. Target lowering branches from typed

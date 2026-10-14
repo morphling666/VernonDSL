@@ -254,6 +254,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_materializer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_implementation_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/prepared_graphics_draw.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/recorded_graphics.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/stage_artifact.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/stage_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graph_linker.cpp
@@ -320,6 +321,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_transaction.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/resolved_transfer_executor.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/submission_queue.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/submission_record.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/device_buffer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/failure_injection.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/physical_buffer_view.cpp
@@ -500,6 +503,8 @@ function(vernon_add_runtime)
     install(
         FILES ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonFormats.def
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonFormats.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonResult.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonError.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonLifecycle.hpp

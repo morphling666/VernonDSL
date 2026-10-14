@@ -6,6 +6,7 @@
 #include "sampler_filter.h"
 
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -93,18 +94,6 @@ vernon::Result<Handle, vernon::RhiError> decodeResourceKey(uint64_t key, const c
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, key, 0}})};
     return vernon::Result<Handle, vernon::RhiError>{
         vernon::ok(Handle{static_cast<uint32_t>(encodedIndex - 1), generation})};
-}
-
-uint32_t maximumMipLevels(const VernonRhiImageDescriptor &descriptor) {
-    uint32_t extent = descriptor.width > descriptor.height ? descriptor.width : descriptor.height;
-    if (descriptor.dimension == VERNON_RHI_IMAGE_3D && descriptor.depth > extent)
-        extent = descriptor.depth;
-    uint32_t levels = 1;
-    while (extent > 1) {
-        extent >>= 1;
-        ++levels;
-    }
-    return levels;
 }
 
 bool supportsBufferState(const VernonRhiBufferDescriptor &descriptor, VernonRhiResourceState state) {
@@ -350,18 +339,6 @@ Option<VernonStringView> lastError(VernonRhiDevice handle) {
     return Option<VernonStringView>{some(VernonStringView{device.error.data(), device.error.size()})};
 }
 
-Result<void, RhiError> synchronize(VernonRhiDevice handle) {
-    auto anchor = lookupMetalDevice(handle);
-    if (anchor.isErr())
-        return Result<void, RhiError>{err(std::move(anchor).error())};
-    MetalDevice &device = anchor.value().device();
-    std::lock_guard<std::mutex> guard(device.mutex);
-    return device.state.synchronize(device.error)
-               ? Result<void, RhiError>{ok()}
-               : Result<void, RhiError>{
-                     err(RhiError{RhiErrorCode::SynchronizationFailure, {"synchronize_metal_device", 0, 0}})};
-}
-
 Result<void *, RhiError> deviceStateForBackend(VernonRhiDevice handle) {
     auto anchor = lookupMetalDevice(handle);
     if (anchor.isErr())
@@ -565,19 +542,7 @@ Result<VernonRhiImage, RhiError> createImage(VernonRhiDevice handle, const Verno
     auto anchor = lookupMetalDevice(handle);
     if (anchor.isErr())
         return Result<VernonRhiImage, RhiError>{err(std::move(anchor).error())};
-    constexpr uint32_t allUsages = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
-                                   VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_STORAGE |
-                                   VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !vernon::rhi::validImageShape(*descriptor) ||
-        descriptor->mip_levels == 0 || descriptor->sample_count != 1 || (descriptor->usage & ~allUsages) != 0 ||
-        descriptor->mip_levels > maximumMipLevels(*descriptor))
-        return Result<VernonRhiImage, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"create_metal_image", 0, 0}})};
-    const bool depthFormat =
-        descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT || descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
-    if ((depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
-        (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)) ||
-        (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT && (descriptor->usage & VERNON_RHI_IMAGE_STORAGE)))
+    if (vernon::formats::hasStencil(descriptor->format) && (descriptor->usage & VERNON_RHI_IMAGE_STORAGE))
         return Result<VernonRhiImage, RhiError>{
             err(RhiError{RhiErrorCode::Unsupported, {"create_metal_image", descriptor->format, descriptor->usage}})};
     if (vernon::rhi::metal::pixelFormat(descriptor->format) == MTLPixelFormatInvalid)
@@ -806,8 +771,7 @@ Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiIma
     std::lock_guard<std::mutex> guard(device.mutex);
     if (payload.descriptor.mip_levels < 2 || !(payload.descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
         !(payload.descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
-        payload.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
-        payload.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
+        vernon::formats::hasDepth(payload.descriptor.format))
         return Result<void, RhiError>{err(
             RhiError{RhiErrorCode::InvalidArgument, {"generate_metal_image_mipmaps", image.generation, image.index}})};
     return device.state.generateImageMipmaps(payload.native, payload.descriptor.mip_levels, device.error)
@@ -849,12 +813,32 @@ Result<uint64_t, RhiError> getImageNativeHandle(VernonRhiDevice handle, VernonRh
         return Result<uint64_t, RhiError>{err(std::move(anchor).error())};
     MetalDevice &device = anchor.value().device();
     auto pinned =
-        pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "get_image_native_handle");
+        pinPayload(device, device.images, ImageHandle{image.index, image.generation},         "get_image_native_handle");
     if (pinned.isErr())
         return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
     std::lock_guard<std::mutex> guard(device.mutex);
     return Result<uint64_t, RhiError>{
         ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)pinned.value().first->native.texture)))};
+}
+
+// Metal reports no per-format features; only 32-bit float color filtering and multisampling vary between devices.
+Result<uint32_t, RhiError> formatCapabilities(VernonRhiDevice handle, VernonRhiFormat format) {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return Result<uint32_t, RhiError>{err(std::move(anchor).error())};
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    if (!entry || vernon::rhi::metal::pixelFormat(format) == MTLPixelFormatInvalid)
+        return Result<uint32_t, RhiError>{ok(0u)};
+    uint32_t result = entry->baseline;
+    const bool float32Color = entry->aspects() == VERNON_RHI_IMAGE_ASPECT_COLOR &&
+                              entry->componentClass == vernon::formats::ComponentClass::Float &&
+                              entry->dataType == VERNON_RHI_IMAGE_DATA_FLOAT32;
+    id<MTLDevice> native = anchor.value().device().state.device;
+    if (float32Color && !native.supports32BitFloatFiltering)
+        result &= ~VERNON_RHI_FORMAT_FILTERABLE;
+    if (float32Color && !native.supports32BitMSAA)
+        result &= ~(VERNON_RHI_FORMAT_MULTISAMPLE | VERNON_RHI_FORMAT_RESOLVABLE);
+    return Result<uint32_t, RhiError>{ok(result)};
 }
 
 Result<VernonRhiSampler, RhiError> createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor) {
@@ -1268,160 +1252,240 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
     }
 }
 
-bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, int32_t x, int32_t y,
-                      uint32_t width, uint32_t height, uint32_t layers, int32_t colorLocation, const float *clearColor,
-                      float clearDepth, uint32_t clearStencil, uint32_t aspects) {
-    if (!native || !rendering.encoder || x != 0 || y != 0 || layers != 1)
-        return false;
-    id<MTLTexture> target = colorLocation >= 0 ? rendering.colorTextures[colorLocation] : rendering.depthStencilTexture;
-    if (!target || width != target.width || height != target.height)
-        return false;
-    if ((aspects & VERNON_RHI_ATTACHMENT_STENCIL) && target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8)
-        return false;
-    for (size_t index = 0; index < rendering.colorTextures.size(); ++index)
-        if (rendering.colorTextures[index])
-            [rendering.encoder setColorStoreAction:MTLStoreActionStore atIndex:index];
-    if (rendering.depthStencilTexture) {
-        [rendering.encoder setDepthStoreAction:MTLStoreActionStore];
-        if (rendering.depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
-            [rendering.encoder setStencilStoreAction:MTLStoreActionStore];
+bool renderAreaCoversMetalTexture(id<MTLTexture> texture, const RenderingScope &scope) {
+    return scope.x == 0 && scope.y == 0 && scope.width == texture.width && scope.height == texture.height;
+}
+
+// Metal has no render area: load and store actions apply to the whole texture. A discard outside the render area
+// must not reach its texels, so it becomes a load or store there; a clear has no such equivalent.
+bool metalLoadAction(VernonRhiLoadOperation operation, bool covers, MTLLoadAction &action) {
+    if (operation == VERNON_RHI_LOAD_CLEAR)
+        action = MTLLoadActionClear;
+    else
+        action = operation == VERNON_RHI_LOAD_DISCARD && covers ? MTLLoadActionDontCare : MTLLoadActionLoad;
+    return operation != VERNON_RHI_LOAD_CLEAR || covers;
+}
+
+MTLStoreAction metalStoreAction(VernonRhiStoreOperation operation, bool covers) {
+    return operation == VERNON_RHI_STORE_DISCARD && covers ? MTLStoreActionDontCare : MTLStoreActionStore;
+}
+
+// Metal converts the double components to the attachment's format; a double holds every 32-bit integer exactly.
+MTLClearColor metalClearColor(const VernonClearColor &color, VernonRhiFormat format) {
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    const auto componentClass = entry ? entry->componentClass : vernon::formats::ComponentClass::Float;
+    if (componentClass == vernon::formats::ComponentClass::Uint)
+        return MTLClearColorMake(color.u32[0], color.u32[1], color.u32[2], color.u32[3]);
+    if (componentClass == vernon::formats::ComponentClass::Sint)
+        return MTLClearColorMake(color.i32[0], color.i32[1], color.i32[2], color.i32[3]);
+    return MTLClearColorMake(color.f32[0], color.f32[1], color.f32[2], color.f32[3]);
+}
+
+// Passes are created with MTLStoreActionUnknown so that ending the scope, or restarting it for a clear, chooses the
+// store actions.
+id<MTLRenderCommandEncoder> beginMetalPass(uint64_t native, MTLRenderPassDescriptor *pass, const RenderingScope &scope) {
+    if (scope.layers > 1)
+        pass.renderTargetArrayLength = scope.layers;
+    id<MTLCommandBuffer> commandBuffer =
+        (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
+    return [commandBuffer renderCommandEncoderWithDescriptor:pass];
+}
+
+void endMetalPass(const vernon::rhi::metal::RenderingState &rendering, const RenderingScope &scope, bool final) {
+    for (size_t index = 0; index < scope.colorCount; ++index) {
+        const uint32_t location = scope.colors[index].location;
+        const bool covers = renderAreaCoversMetalTexture(rendering.colorTextures[location], scope);
+        [rendering.encoder setColorStoreAction:final ? metalStoreAction(scope.colors[index].store, covers)
+                                                     : MTLStoreActionStore
+                                       atIndex:location];
+    }
+    if (scope.hasDepth) {
+        const bool covers = renderAreaCoversMetalTexture(rendering.depthStencilTexture, scope);
+        [rendering.encoder
+            setDepthStoreAction:final ? metalStoreAction(scope.depth.depthStore, covers) : MTLStoreActionStore];
+        if (scope.depth.stencil)
+            [rendering.encoder
+                setStencilStoreAction:final ? metalStoreAction(scope.depth.stencilStore, covers) : MTLStoreActionStore];
     }
     [rendering.encoder endEncoding];
+}
 
+// A clear inside the scope restarts the pass with a clear load action on the cleared attachment, so callers require
+// the render area to cover it.
+bool restartMetalRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, const RenderingScope &scope,
+                           int32_t colorLocation, const VernonClearColor *clearColor, float clearDepth,
+                           uint32_t clearStencil,
+                           uint32_t aspects) {
+    id<MTLTexture> target = colorLocation >= 0 ? rendering.colorTextures[colorLocation] : rendering.depthStencilTexture;
+    if (!rendering.encoder || !target)
+        return false;
+    endMetalPass(rendering, scope, false);
+    rendering.encoder = nil;
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    for (size_t index = 0; index < rendering.colorTextures.size(); ++index) {
-        id<MTLTexture> texture = rendering.colorTextures[index];
-        if (!texture)
-            continue;
-        auto *attachment = pass.colorAttachments[index];
-        attachment.texture = texture;
-        attachment.loadAction = static_cast<int32_t>(index) == colorLocation ? MTLLoadActionClear : MTLLoadActionLoad;
-        attachment.storeAction = MTLStoreActionStore;
-        if (static_cast<int32_t>(index) == colorLocation)
-            attachment.clearColor = MTLClearColorMake(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+    for (size_t index = 0; index < scope.colorCount; ++index) {
+        const uint32_t location = scope.colors[index].location;
+        auto *attachment = pass.colorAttachments[location];
+        attachment.texture = rendering.colorTextures[location];
+        attachment.loadAction = static_cast<int32_t>(location) == colorLocation ? MTLLoadActionClear : MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionUnknown;
+        if (static_cast<int32_t>(location) == colorLocation)
+            attachment.clearColor = metalClearColor(*clearColor, scope.colors[index].format);
     }
-    if (rendering.depthStencilTexture) {
+    if (scope.hasDepth) {
         pass.depthAttachment.texture = rendering.depthStencilTexture;
-        pass.depthAttachment.loadAction =
-            aspects & VERNON_RHI_ATTACHMENT_DEPTH ? MTLLoadActionClear : MTLLoadActionLoad;
-        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        pass.depthAttachment.loadAction = aspects & VERNON_RHI_ATTACHMENT_DEPTH ? MTLLoadActionClear : MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionUnknown;
         pass.depthAttachment.clearDepth = clearDepth;
-        if (rendering.depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+        if (scope.depth.stencil) {
             pass.stencilAttachment.texture = rendering.depthStencilTexture;
             pass.stencilAttachment.loadAction =
                 aspects & VERNON_RHI_ATTACHMENT_STENCIL ? MTLLoadActionClear : MTLLoadActionLoad;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
             pass.stencilAttachment.clearStencil = clearStencil;
         }
     }
-    id<MTLCommandBuffer> commandBuffer =
-        (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
-    rendering.encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    rendering.encoder = beginMetalPass(native, pass, scope);
     return rendering.encoder != nil;
 }
 
-Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
-                                    uint32_t backendKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
-                                    const uint64_t *, size_t, uint64_t, uint64_t renderingObject) noexcept {
+Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                                 const RenderingScope &scope, const RenderingRead *, size_t) noexcept {
     @try {
         try {
             auto anchor = lookupMetalDevice(handle);
-            if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
-                backendKind != vernon::rhi::CommandRenderingDynamic || !renderingObject)
-                return anchor.isErr()
-                           ? Result<void, RhiError>{err(std::move(anchor).error())}
-                           : Result<void, RhiError>{err(
-                                 RhiError{RhiErrorCode::InvalidArgument, {"endRendering_metal", native, backendKind}})};
-            auto *rendering =
-                reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingObject));
-            for (size_t index = 0; index < rendering->colorTextures.size(); ++index)
-                if (rendering->colorTextures[index])
-                    [rendering->encoder
-                        setColorStoreAction:(colorDiscardMask & (uint32_t{1} << index)) ? MTLStoreActionDontCare
-                                                                                        : MTLStoreActionStore
-                                    atIndex:index];
-            if (rendering->depthStencilTexture) {
-                [rendering->encoder setDepthStoreAction:(depthStencilDiscard & VERNON_RHI_ATTACHMENT_DEPTH)
-                                                            ? MTLStoreActionDontCare
-                                                            : MTLStoreActionStore];
-                if (rendering->depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
-                    [rendering->encoder setStencilStoreAction:(depthStencilDiscard & VERNON_RHI_ATTACHMENT_STENCIL)
-                                                                  ? MTLStoreActionDontCare
-                                                                  : MTLStoreActionStore];
+            if (anchor.isErr())
+                return Result<OpenedRendering, RhiError>{err(std::move(anchor).error())};
+            if (!native)
+                return Result<OpenedRendering, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"beginRendering_metal", native, 0}})};
+            auto rendering = std::make_unique<vernon::rhi::metal::RenderingState>();
+            OpenedRendering opened{vernon::rhi::CommandRenderingDynamic};
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            for (size_t index = 0; index < scope.attachmentCount(); ++index) {
+                auto resolved = retainResolvedCommandResource(handle, encoderKey, ResourceKind::ImageView,
+                                                              scope.attachmentView(index));
+                if (resolved.isErr())
+                    return Result<OpenedRendering, RhiError>{err(std::move(resolved).error())};
+                id<MTLTexture> texture =
+                    (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(resolved.value())));
+                const bool covers = renderAreaCoversMetalTexture(texture, scope);
+                MTLLoadAction load{};
+                if (index < scope.colorCount) {
+                    const auto &attachment = scope.colors[index];
+                    auto *target = pass.colorAttachments[attachment.location];
+                    if (!metalLoadAction(attachment.load, covers, load))
+                        return Result<OpenedRendering, RhiError>{err(RhiError{
+                            RhiErrorCode::Unsupported, {"beginRendering_metal_partial_clear", attachment.location, 0}})};
+                    target.texture = texture;
+                    target.loadAction = load;
+                    target.storeAction = MTLStoreActionUnknown;
+                    target.clearColor = metalClearColor(attachment.clear, attachment.format);
+                    rendering->colorTextures[attachment.location] = texture;
+                    opened.colorTargets[attachment.location] = resolved.value();
+                    opened.colorResources[attachment.location] = resolved.value();
+                    continue;
+                }
+                if (!metalLoadAction(scope.depth.depthLoad, covers, load))
+                    return Result<OpenedRendering, RhiError>{
+                        err(RhiError{RhiErrorCode::Unsupported, {"beginRendering_metal_partial_clear", 0, 1}})};
+                pass.depthAttachment.texture = texture;
+                pass.depthAttachment.loadAction = load;
+                pass.depthAttachment.storeAction = MTLStoreActionUnknown;
+                pass.depthAttachment.clearDepth = scope.depth.clearDepth;
+                if (scope.depth.stencil) {
+                    if (!metalLoadAction(scope.depth.stencilLoad, covers, load))
+                        return Result<OpenedRendering, RhiError>{
+                            err(RhiError{RhiErrorCode::Unsupported, {"beginRendering_metal_partial_clear", 0, 2}})};
+                    pass.stencilAttachment.texture = texture;
+                    pass.stencilAttachment.loadAction = load;
+                    pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
+                    pass.stencilAttachment.clearStencil = scope.depth.clearStencil;
+                }
+                rendering->depthStencilTexture = texture;
+                opened.depthTarget = resolved.value();
+                opened.depthResource = resolved.value();
             }
-            [rendering->encoder endEncoding];
-            delete rendering;
-            return Result<void, RhiError>{ok()};
+            rendering->encoder = beginMetalPass(native, pass, scope);
+            if (!rendering->encoder)
+                return Result<OpenedRendering, RhiError>{
+                    err(RhiError{RhiErrorCode::BackendFailure, {"beginRendering_metal", native, 0}})};
+            opened.object = reinterpret_cast<uintptr_t>(rendering.release());
+            return Result<OpenedRendering, RhiError>{ok(opened)};
         } catch (const std::bad_alloc &) {
-            return Result<void, RhiError>{
-                err(RhiError{RhiErrorCode::ResourceExhausted, {"endRendering_metal", native, 0}})};
+            return Result<OpenedRendering, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"beginRendering_metal", native, 0}})};
         }
+    } @catch (NSException *) {
+        return Result<OpenedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"beginRendering_metal_exception", native, 0}})};
+    }
+}
+
+Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
+                                    const OpenedRendering &opened) noexcept {
+    @try {
+        if (opened.kind != vernon::rhi::CommandRenderingDynamic || !opened.object)
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"endRendering_metal", native, opened.kind}})};
+        // The scope ends here even when ending it fails, so the state is released on every path.
+        std::unique_ptr<vernon::rhi::metal::RenderingState> rendering(
+            reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(opened.object)));
+        auto anchor = lookupMetalDevice(handle);
+        if (anchor.isErr())
+            return Result<void, RhiError>{err(std::move(anchor).error())};
+        // A failed restart leaves no encoder.
+        if (rendering->encoder)
+            endMetalPass(*rendering, scope, true);
+        return Result<void, RhiError>{ok()};
     } @catch (NSException *) {
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::BackendFailure, {"endRendering_metal_exception", native, 0}})};
     }
 }
 
-Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
-                                  uint32_t backendKind, uint64_t renderingObject, int32_t x, int32_t y, uint32_t width,
-                                  uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
-                                  const float color[4]) noexcept {
+Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
+                                  const OpenedRendering &opened, uint32_t location,
+                                  const VernonClearColor &color) noexcept {
     @try {
-        try {
-            auto anchor = lookupMetalDevice(handle);
-            if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
-                backendKind != vernon::rhi::CommandRenderingDynamic || !target || location >= 8 || !color)
-                return anchor.isErr() ? Result<void, RhiError>{err(std::move(anchor).error())}
-                                      : Result<void, RhiError>{err(RhiError{
-                                            RhiErrorCode::InvalidArgument, {"clearColor_metal", native, backendKind}})};
-            id<MTLTexture> texture =
-                (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
-            auto *rendering =
-                reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingObject));
-            if (!rendering || rendering->colorTextures[location] != texture ||
-                !restartRendering(native, *rendering, x, y, width, height, layers, static_cast<int32_t>(location),
-                                  color, 1.0f, 0, 0))
-                return Result<void, RhiError>{
-                    err(RhiError{RhiErrorCode::BackendFailure, {"clearColor_metal", native, location}})};
-            return Result<void, RhiError>{ok()};
-        } catch (const std::bad_alloc &) {
+        auto anchor = lookupMetalDevice(handle);
+        if (anchor.isErr())
+            return Result<void, RhiError>{err(std::move(anchor).error())};
+        auto *rendering = reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(opened.object));
+        if (opened.kind != vernon::rhi::CommandRenderingDynamic || !rendering ||
+            location >= VERNON_RHI_MAX_COLOR_ATTACHMENTS || !opened.colorTargets[location])
             return Result<void, RhiError>{
-                err(RhiError{RhiErrorCode::ResourceExhausted, {"clearColor_metal", native, 0}})};
-        }
+                err(RhiError{RhiErrorCode::InvalidArgument, {"clearColor_metal", native, location}})};
+        if (!renderAreaCoversMetalTexture(rendering->colorTextures[location], scope))
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::Unsupported, {"clearColor_metal_partial", native, location}})};
+        if (!restartMetalRendering(native, *rendering, scope, static_cast<int32_t>(location), &color, 1.0f, 0, 0))
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::BackendFailure, {"clearColor_metal", native, location}})};
+        return Result<void, RhiError>{ok()};
     } @catch (NSException *) {
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::BackendFailure, {"clearColor_metal_exception", native, 0}})};
     }
 }
 
-Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
-                                         uint32_t backendKind, uint64_t renderingObject, int32_t x, int32_t y,
-                                         uint32_t width, uint32_t height, uint32_t layers, uint64_t target, float depth,
-                                         uint32_t stencil, uint32_t aspects) noexcept {
+Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
+                                         const OpenedRendering &opened, float depth, uint32_t stencil,
+                                         uint32_t aspects) noexcept {
     @try {
-        try {
-            auto anchor = lookupMetalDevice(handle);
-            if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
-                backendKind != vernon::rhi::CommandRenderingDynamic || !target ||
-                (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)) || !aspects)
-                return anchor.isErr()
-                           ? Result<void, RhiError>{err(std::move(anchor).error())}
-                           : Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument,
-                                                                 {"clearDepthStencil_metal", native, aspects}})};
-            id<MTLTexture> texture =
-                (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
-            auto *rendering =
-                reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingObject));
-            if (!rendering || rendering->depthStencilTexture != texture ||
-                !restartRendering(native, *rendering, x, y, width, height, layers, -1, nullptr, depth, stencil,
-                                  aspects))
-                return Result<void, RhiError>{
-                    err(RhiError{RhiErrorCode::BackendFailure, {"clearDepthStencil_metal", native, aspects}})};
-            return Result<void, RhiError>{ok()};
-        } catch (const std::bad_alloc &) {
+        auto anchor = lookupMetalDevice(handle);
+        if (anchor.isErr())
+            return Result<void, RhiError>{err(std::move(anchor).error())};
+        auto *rendering = reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(opened.object));
+        if (opened.kind != vernon::rhi::CommandRenderingDynamic || !rendering || !opened.depthTarget)
             return Result<void, RhiError>{
-                err(RhiError{RhiErrorCode::ResourceExhausted, {"clearDepthStencil_metal", native, 0}})};
-        }
+                err(RhiError{RhiErrorCode::InvalidArgument, {"clearDepthStencil_metal", native, aspects}})};
+        if (!renderAreaCoversMetalTexture(rendering->depthStencilTexture, scope))
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::Unsupported, {"clearDepthStencil_metal_partial", native, aspects}})};
+        if (!restartMetalRendering(native, *rendering, scope, -1, nullptr, depth, stencil, aspects))
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::BackendFailure, {"clearDepthStencil_metal", native, aspects}})};
+        return Result<void, RhiError>{ok()};
     } @catch (NSException *) {
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::BackendFailure, {"clearDepthStencil_metal_exception", native, 0}})};
@@ -1457,7 +1521,7 @@ Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint6
         if (!device.state.submitCommands(native, device.error))
             return Result<CommandSubmission, RhiError>{
                 err(RhiError{RhiErrorCode::BackendFailure, {"submit_metal_commands", native, 0}})};
-        return Result<CommandSubmission, RhiError>{ok(CommandSubmission{false, false})};
+        return Result<CommandSubmission, RhiError>{ok(CommandSubmission{false, false, native})};
     } @catch (NSException *) {
         return Result<CommandSubmission, RhiError>{
             err(RhiError{RhiErrorCode::BackendFailure, {"submit_metal_commands_exception", native, 0}})};
@@ -1483,7 +1547,7 @@ Result<CommandPoll, RhiError> pollCommands(VernonRhiDevice handle, uint64_t nati
     }
 }
 
-Result<void, RhiError> completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) noexcept {
+Result<void, RhiError> completeCommands(VernonRhiDevice handle, uint64_t native) noexcept {
     @try {
         auto anchor = lookupMetalDevice(handle);
         if (anchor.isErr())
@@ -1503,46 +1567,8 @@ Result<void, RhiError> completeBorrowedCommands(VernonRhiDevice handle, uint64_t
 } // namespace vernon::rhi::metal_api
 
 uint32_t vernon::rhi::metalTexturePixelFormat(VernonTextureFormat format) {
-    VernonRhiFormat rhiFormat{};
-    switch (format) {
-    case VERNON_TEXTURE_RGBA8_UNORM:
-        rhiFormat = VERNON_RHI_FORMAT_RGBA8_UNORM;
-        break;
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        rhiFormat = VERNON_RHI_FORMAT_RGBA8_SRGB;
-        break;
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_RGBA16_FLOAT;
-        break;
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_RGBA32_FLOAT;
-        break;
-    case VERNON_TEXTURE_R8_UNORM:
-        rhiFormat = VERNON_RHI_FORMAT_R8_UNORM;
-        break;
-    case VERNON_TEXTURE_R16_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_R16_FLOAT;
-        break;
-    case VERNON_TEXTURE_R32_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_R32_FLOAT;
-        break;
-    case VERNON_TEXTURE_RG8_UNORM:
-        rhiFormat = VERNON_RHI_FORMAT_RG8_UNORM;
-        break;
-    case VERNON_TEXTURE_RGB8_UNORM:
-        rhiFormat = VERNON_RHI_FORMAT_RGB8_UNORM;
-        break;
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_R11G11B10_FLOAT;
-        break;
-    case VERNON_TEXTURE_D32_FLOAT:
-        rhiFormat = VERNON_RHI_FORMAT_D32_FLOAT;
-        break;
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        rhiFormat = VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
-        break;
-    }
-    return static_cast<uint32_t>(vernon::rhi::metal::pixelFormat(rhiFormat));
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    return static_cast<uint32_t>(entry ? vernon::rhi::metal::pixelFormat(entry->rhi) : MTLPixelFormatInvalid);
 }
 
 const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
@@ -1555,7 +1581,6 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.createOwnedDevice = createOwnedDevice;
         result.destroyDevice = destroyDevice;
         result.lastError = lastError;
-        result.synchronize = synchronize;
         result.deviceState = deviceStateForBackend;
         result.commandState = commandState;
         result.createBuffer = createBuffer;
@@ -1574,6 +1599,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.destroyImage.emplace(destroyImage);
         result.isImageValid.emplace(isImageValid);
         result.getImageNativeHandle.emplace(getImageNativeHandle);
+        result.formatCapabilities.emplace(formatCapabilities);
         result.createSampler.emplace(createSampler);
         result.destroySampler.emplace(destroySampler);
         result.isSamplerValid.emplace(isSamplerValid);
@@ -1586,11 +1612,12 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.beginCommands = beginCommands;
         result.submitCommands = submitCommands;
         result.pollCommands.emplace(pollCommands);
-        result.completeBorrowedCommands.emplace(completeBorrowedCommands);
+        result.completeCommands.emplace(completeCommands);
         result.abandonCommands.emplace(abandonCommands);
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
+        result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
         result.clearDepthStencil.emplace(clearDepthStencil);

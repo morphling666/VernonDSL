@@ -356,7 +356,21 @@ Typed semantic nodes record effects independently from types:
 - `write(owner, region)`;
 - `atomic(owner, region, ordering, scope)`;
 - `barrier(ordering, scope)`;
+- `fragment_discard`;
 - Resource-specific query/sample effects.
+
+`discard_fragment()` is a no-argument statement intrinsic returning nothing
+(distinct from `vd.discard`, the attachment load operation). It is valid in a
+`@fragment` entry and in helpers reachable only from fragment entries; its
+`fragment_discard` effect propagates to callers, and a vertex or compute entry
+that reaches it fails with `discard_fragment() is not available in this shader
+stage`. It may appear in non-uniform control flow any number of times. It
+terminates the fragment invocation: no later statement runs and the fragment
+writes no color, depth, or stencil output, so statements after it in the same
+block are unreachable and are neither typed nor lowered. Derivatives and
+implicit-LOD sampling after a `discard_fragment()` reached non-uniformly within
+a quad are undefined; sample before discarding. It never enters a derivative
+path. Lowering is [`../program/fragment_discard.md`](../program/fragment_discard.md).
 
 `atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` accept i32/u32
 writable `TensorView` elements. `atomic_add` additionally accepts f32/f64 when

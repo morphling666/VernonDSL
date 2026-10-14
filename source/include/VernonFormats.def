@@ -1,0 +1,73 @@
+/* The image format table. Every per-format fact the RHI, Runtime, compiler and Python package use is a column
+ * here; tools/generate_formats.py writes python/vernon_dsl/_formats.py from it and a test fails when that file
+ * is stale.
+ *
+ * Define VERNON_FORMAT before including this file; it is undefined at the end.
+ *
+ * VERNON_FORMAT(name, NAME, rhi, texture, component_class, pixel_bytes, data_format, data_type, baseline,
+ *               gl_internal_format, gl_format, gl_type, vulkan, dxgi, metal, spirv_storage)
+ *
+ *   name, NAME          Canonical manifest/Python name and the enumerator suffix of VernonRhiFormat and
+ *                       VernonTextureFormat.
+ *   rhi, texture        Fixed ABI values of VERNON_RHI_FORMAT_<NAME> and VERNON_TEXTURE_<NAME>.
+ *   component_class     "float", "unorm", "uint" or "sint"; the shader-visible result class.
+ *   pixel_bytes         Bytes per texel; depth-stencil uploads use the packed 8-byte layout.
+ *   data_format,        VERNON_RHI_IMAGE_DATA_<data_format> and VERNON_RHI_IMAGE_DATA_<data_type> of a whole-texel
+ *   data_type           transfer. data_format DEPTH or DEPTH_STENCIL gives the depth and stencil aspects; any
+ *                       other gives the color aspect.
+ *   baseline            Space-separated capabilities the format class allows: renderable, blendable, filterable,
+ *                       storage, resolvable, multisample and copyable. Devices only narrow this set.
+ *   gl_*                OpenGL internal format, and the format and type of a whole-texel transfer; that pair also
+ *                       allocates the image.
+ *   vulkan, dxgi, metal Native formats; VK_FORMAT_UNDEFINED, DXGI_FORMAT_UNKNOWN and MTLPixelFormatInvalid mark a
+ *                       format the backend cannot create.
+ *   spirv_storage       spirv::ImageFormat of a storage image; Unknown exactly when baseline lacks storage.
+ *
+ * Rows are only appended: rhi and texture values are ABI. */
+
+VERNON_FORMAT(r8_unorm, R8_UNORM, 1, 4, "unorm", 1, RED, UINT8,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x8229, 0x1903, 0x1401,
+              VK_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM, MTLPixelFormatR8Unorm, R8)
+VERNON_FORMAT(rg8_unorm, RG8_UNORM, 2, 7, "unorm", 2, RG, UINT8,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x822B, 0x8227, 0x1401,
+              VK_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_UNORM, MTLPixelFormatRG8Unorm, Rg8)
+VERNON_FORMAT(rgba8_unorm, RGBA8_UNORM, 3, 0, "unorm", 4, RGBA, UINT8,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x8058, 0x1908, 0x1401,
+              VK_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, MTLPixelFormatRGBA8Unorm, Rgba8)
+VERNON_FORMAT(rgba8_srgb, RGBA8_SRGB, 4, 1, "unorm", 4, RGBA, UINT8,
+              "renderable blendable filterable resolvable multisample copyable", 0x8C43, 0x1908, 0x1401,
+              VK_FORMAT_R8G8B8A8_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, MTLPixelFormatRGBA8Unorm_sRGB, Unknown)
+VERNON_FORMAT(r16_float, R16_FLOAT, 5, 5, "float", 2, RED, FLOAT16,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x822D, 0x1903, 0x140B,
+              VK_FORMAT_R16_SFLOAT, DXGI_FORMAT_R16_FLOAT, MTLPixelFormatR16Float, R16f)
+VERNON_FORMAT(rgba16_float, RGBA16_FLOAT, 6, 2, "float", 8, RGBA, FLOAT16,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x881A, 0x1908, 0x140B,
+              VK_FORMAT_R16G16B16A16_SFLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, MTLPixelFormatRGBA16Float, Rgba16f)
+VERNON_FORMAT(r32_float, R32_FLOAT, 7, 6, "float", 4, RED, FLOAT32,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x822E, 0x1903, 0x1406,
+              VK_FORMAT_R32_SFLOAT, DXGI_FORMAT_R32_FLOAT, MTLPixelFormatR32Float, R32f)
+VERNON_FORMAT(rgba32_float, RGBA32_FLOAT, 8, 3, "float", 16, RGBA, FLOAT32,
+              "renderable blendable filterable storage resolvable multisample copyable", 0x8814, 0x1908, 0x1406,
+              VK_FORMAT_R32G32B32A32_SFLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, MTLPixelFormatRGBA32Float, Rgba32f)
+VERNON_FORMAT(d32_float, D32_FLOAT, 9, 10, "float", 4, DEPTH, FLOAT32, "renderable filterable multisample copyable",
+              0x8CAC, 0x1902, 0x1406, VK_FORMAT_D32_SFLOAT, DXGI_FORMAT_D32_FLOAT, MTLPixelFormatDepth32Float,
+              Unknown)
+VERNON_FORMAT(rgb8_unorm, RGB8_UNORM, 10, 8, "unorm", 3, RGB, UINT8, "filterable copyable", 0x8051, 0x1907, 0x1401,
+              VK_FORMAT_R8G8B8_UNORM, DXGI_FORMAT_UNKNOWN, MTLPixelFormatInvalid, Unknown)
+VERNON_FORMAT(rg32_float, RG32_FLOAT, 11, 12, "float", 8, RG, FLOAT32,
+              "renderable blendable filterable resolvable multisample copyable", 0x8230, 0x8227, 0x1406,
+              VK_FORMAT_R32G32_SFLOAT, DXGI_FORMAT_R32G32_FLOAT, MTLPixelFormatRG32Float, Unknown)
+VERNON_FORMAT(rgb32_float, RGB32_FLOAT, 12, 13, "float", 12, RGB, FLOAT32, "filterable copyable", 0x8815, 0x1907,
+              0x1406, VK_FORMAT_R32G32B32_SFLOAT, DXGI_FORMAT_R32G32B32_FLOAT, MTLPixelFormatInvalid, Unknown)
+VERNON_FORMAT(r11g11b10_float, R11G11B10_FLOAT, 13, 9, "float", 4, RGB, UINT32,
+              "renderable blendable filterable resolvable multisample copyable", 0x8C3A, 0x1907, 0x8C3B,
+              VK_FORMAT_B10G11R11_UFLOAT_PACK32, DXGI_FORMAT_R11G11B10_FLOAT, MTLPixelFormatRG11B10Float, Unknown)
+VERNON_FORMAT(d32_float_s8_uint, D32_FLOAT_S8_UINT, 14, 11, "float", 8, DEPTH_STENCIL, FLOAT32,
+              "renderable filterable multisample copyable", 0x8CAD, 0x84F9, 0x8DAD, VK_FORMAT_D32_SFLOAT_S8_UINT,
+              DXGI_FORMAT_D32_FLOAT_S8X24_UINT, MTLPixelFormatDepth32Float_Stencil8, Unknown)
+VERNON_FORMAT(r32_uint, R32_UINT, 15, 14, "uint", 4, RED, UINT32, "renderable storage multisample copyable", 0x8236,
+              0x8D94, 0x1405, VK_FORMAT_R32_UINT, DXGI_FORMAT_R32_UINT, MTLPixelFormatR32Uint, R32ui)
+VERNON_FORMAT(rg32_uint, RG32_UINT, 16, 15, "uint", 8, RG, UINT32, "renderable storage multisample copyable", 0x823C,
+              0x8228, 0x1405, VK_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_UINT, MTLPixelFormatRG32Uint, Rg32ui)
+
+#undef VERNON_FORMAT

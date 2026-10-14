@@ -104,6 +104,7 @@ bool Driver::loadInstance(VkInstance instance) {
     VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
     VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties");
     VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceFormatProperties, "vkGetPhysicalDeviceFormatProperties");
+    VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceImageFormatProperties, "vkGetPhysicalDeviceImageFormatProperties");
     VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2");
     VERNON_LOAD_VULKAN_INSTANCE(enumerateDeviceExtensionProperties, "vkEnumerateDeviceExtensionProperties");
     VERNON_LOAD_VULKAN_INSTANCE(createDevice, "vkCreateDevice");
@@ -135,6 +136,7 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(destroyFence, "vkDestroyFence");
     VERNON_LOAD_VULKAN_DEVICE(waitForFences, "vkWaitForFences");
     VERNON_LOAD_VULKAN_DEVICE(resetFences, "vkResetFences");
+    VERNON_LOAD_VULKAN_DEVICE(getFenceStatus, "vkGetFenceStatus");
     VERNON_LOAD_VULKAN_DEVICE(createBuffer, "vkCreateBuffer");
     VERNON_LOAD_VULKAN_DEVICE(destroyBuffer, "vkDestroyBuffer");
     VERNON_LOAD_VULKAN_DEVICE(getBufferMemoryRequirements, "vkGetBufferMemoryRequirements");

@@ -45,9 +45,7 @@ void recordRenderPassMutations(const program::Graph &graph, program_execution::S
                                program_execution::InvocationMutationOutcome &outcome) {
     if (submission == program_execution::SubmissionState::NotSubmitted)
         return;
-    const VernonBoundaryMutationState state = submission == program_execution::SubmissionState::Completed
-                                                  ? VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED
-                                                  : VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+    const VernonBoundaryMutationState state = program_execution::inPlaceMutationState(submission);
     for (const program::Node &node : graph.nodes)
         if (program::executionKind(node) == program::ExecutionKind::Graphics)
             outcome.set(VERNON_MUTATION_RENDER_PASS_CONTROL, program::graphicsOperation(node).renderPassControl, state);
@@ -195,6 +193,7 @@ public:
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
             return fail(*context_, "injected Program pullback submission failure");
+        program_execution::SubmissionRecord submission(*context_);
         if (replay) {
             if (device) {
                 std::vector<ProgramTapeState> tapeStates;
@@ -204,7 +203,7 @@ public:
                 for (;;) {
                     program_execution::SubmissionState replaySubmission;
                     const VernonStatus replayStatus = executePipelineProgramGraph(
-                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, submission, replaySubmission);
                     publication.noteSubmission(replaySubmission);
                     if (replayStatus != VERNON_STATUS_OK)
                         return replayStatus;
@@ -214,7 +213,7 @@ public:
                     if (!retry)
                         break;
                     ResolvedTransferExecutor transfers(*context_, values);
-                    if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
+                    if (!transfers.restoreForRetry(program::GraphDirection::Forward, submission, error))
                         return fail(*context_, error);
                     if (!state_->importInto(values, tapeScratch, false, error))
                         return fail(*context_, error);
@@ -225,7 +224,7 @@ public:
             } else {
                 program_execution::SubmissionState replaySubmission;
                 const VernonStatus replayStatus = executePipelineProgramGraph(
-                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, submission, replaySubmission);
                 publication.noteSubmission(replaySubmission);
                 if (replayStatus != VERNON_STATUS_OK)
                     return replayStatus;
@@ -234,8 +233,8 @@ public:
             }
         }
         program_execution::SubmissionState backwardSubmission;
-        const VernonStatus status = executePipelineProgramGraph(*context_, *topology_, *backward, values,
-                                                                resolvePhysicalEndpoint, backwardSubmission);
+        const VernonStatus status = executePipelineProgramGraph(
+            *context_, *topology_, *backward, values, resolvePhysicalEndpoint, submission, backwardSubmission);
         publication.noteInPlaceSubmission(backwardSubmission);
         if (status != VERNON_STATUS_OK)
             return status;
@@ -248,7 +247,7 @@ public:
             ++usage_.readbacks;
         }
         if (const VernonStatus publicationStatus =
-                program_execution::executePublicationCommit(*context_, publication, values, error);
+                program_execution::executePublicationCommit(*context_, publication, values, submission, error);
             publicationStatus != VERNON_STATUS_OK) {
             return error.empty() ? publicationStatus : fail(*context_, error);
         }
@@ -256,6 +255,7 @@ public:
         ++usage_.waits;
         ++usage_.atomicPublications;
         usage_.temporaryAllocationBytes += temporaryBytes;
+        usage_.deviceWaitNanoseconds += submission.deviceWaitNanoseconds();
         return VERNON_STATUS_OK;
     }
 
@@ -466,6 +466,22 @@ public:
             return fail(*context_, signatureError_);
         if (!topology || !forward)
             return fail(*context_, "Program autodiff forward requires a live Program");
+        if (target.submission.asynchronous()) {
+            const auto requiresWait = [&](const std::string &path, const std::string &reason) {
+                return fail(*context_, "PROGRAM_SUBMISSION_REQUIRES_WAIT at " + path + ": " + reason);
+            };
+            if (topology->waitRequirement)
+                return requiresWait(topology->waitRequirement->path, topology->waitRequirement->reason);
+            const bool retainsNodePullbacks = target.nodePullbacks && nodeAutodiff_ && !nodeAutodiff_->empty();
+            if ((hasBackward && target.retainPullback) || retainsNodePullbacks) {
+                const std::string_view retained = hasBackward ? "backward" : "forward";
+                const auto graph =
+                    std::find_if(execution->graphs.begin(), execution->graphs.end(),
+                                 [&](const program::Graph &candidate) { return candidate.direction == retained; });
+                return requiresWait("/graphs/" + std::to_string(graph - execution->graphs.begin()),
+                                    "a retained pullback is published after a host wait");
+            }
+        }
         auto *workspace = target.programContext
                               ? static_cast<ProgramForwardWorkspace *>(target.programContext->executionWorkspace)
                               : nullptr;
@@ -496,7 +512,7 @@ public:
         if (allocatedImages.isErr())
             return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
         if (const VernonStatus initialization =
-                program_execution::executePublicationInitialization(*context_, publication, error);
+                program_execution::executePublicationInitialization(*context_, publication, target.submission, error);
             initialization != VERNON_STATUS_OK)
             return error.empty() ? initialization : fail(*context_, error);
         const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
@@ -525,11 +541,11 @@ public:
                                           error))
                 return fail(*context_, error);
             for (;;) {
-                program_execution::SubmissionState submission;
-                const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
-                                                                        resolvePhysicalEndpoint, submission);
-                publication.noteInPlaceSubmission(submission);
-                recordRenderPassMutations(*forward, submission, target.outcome);
+                program_execution::SubmissionState step;
+                const VernonStatus status = executePipelineProgramGraph(
+                    *context_, *topology, *forward, arena, resolvePhysicalEndpoint, target.submission, step);
+                publication.noteInPlaceSubmission(step);
+                recordRenderPassMutations(*forward, step, target.outcome);
                 if (status != VERNON_STATUS_OK)
                     return status;
                 bool retry = false;
@@ -538,18 +554,18 @@ public:
                 if (!retry)
                     break;
                 ResolvedTransferExecutor transfers(*context_, arena);
-                if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
+                if (!transfers.restoreForRetry(program::GraphDirection::Forward, target.submission, error))
                     return fail(*context_, error);
                 for (ProgramTapeState &state : tapeStates)
                     if (!allocateProgramTapeState(tapeScratch, *context_, state, error))
                         return fail(*context_, error);
             }
         } else {
-            program_execution::SubmissionState submission;
-            const VernonStatus status =
-                executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint, submission);
-            publication.noteInPlaceSubmission(submission);
-            recordRenderPassMutations(*forward, submission, target.outcome);
+            program_execution::SubmissionState step;
+            const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
+                                                                    resolvePhysicalEndpoint, target.submission, step);
+            publication.noteInPlaceSubmission(step);
+            recordRenderPassMutations(*forward, step, target.outcome);
             if (status != VERNON_STATUS_OK)
                 return status;
             if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
@@ -629,7 +645,7 @@ public:
                 return fail(*context_, error);
         }
         if (const VernonStatus publicationStatus =
-                program_execution::executePublicationCommit(*context_, publication, arena, error);
+                program_execution::executePublicationCommit(*context_, publication, arena, target.submission, error);
             publicationStatus != VERNON_STATUS_OK) {
             return error.empty() ? publicationStatus : fail(*context_, error);
         }

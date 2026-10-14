@@ -36,10 +36,12 @@ struct MaterializedNodeFrame {
 
 using ResolvePhysicalEndpoint = std::function<const VernonProgramArgument *(uint32_t, const program::TargetBinding &)>;
 
+// When `materializedParameters` is given, Stage parameters whose entry is zero get an empty placeholder argument
+// carrying only their slot, so arguments stay index-aligned with the Stage parameters.
 bool materializeNodeFrame(const ProgramInvocationState &invocation, const program::Program &program,
                           const program::Node &node, const program::ResolvedNodePlan &nodePlan,
                           const ResolvePhysicalEndpoint &resolvePhysicalEndpoint, MaterializedNodeFrame &output,
-                          std::string &error);
+                          std::string &error, const std::vector<char> *materializedParameters = nullptr);
 
 } // namespace vernon::runtime::program_execution
 

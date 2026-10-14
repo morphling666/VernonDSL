@@ -28,30 +28,11 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 
 VkFormat vulkanTextureFormat(VernonTextureFormat format) {
     switch (format) {
-    case VERNON_TEXTURE_RGBA8_UNORM:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        return VK_FORMAT_R8G8B8A8_SRGB;
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        return VK_FORMAT_R16G16B16A16_SFLOAT;
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        return VK_FORMAT_R32G32B32A32_SFLOAT;
-    case VERNON_TEXTURE_R8_UNORM:
-        return VK_FORMAT_R8_UNORM;
-    case VERNON_TEXTURE_R16_FLOAT:
-        return VK_FORMAT_R16_SFLOAT;
-    case VERNON_TEXTURE_R32_FLOAT:
-        return VK_FORMAT_R32_SFLOAT;
-    case VERNON_TEXTURE_RG8_UNORM:
-        return VK_FORMAT_R8G8_UNORM;
-    case VERNON_TEXTURE_RGB8_UNORM:
-        return VK_FORMAT_R8G8B8_UNORM;
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    case VERNON_TEXTURE_D32_FLOAT:
-        return VK_FORMAT_D32_SFLOAT;
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+                      vulkan, ...)                                                                                     \
+    case VERNON_TEXTURE_##NAME:                                                                                        \
+        return vulkan;
+#include "VernonFormats.def"
     }
     return VK_FORMAT_UNDEFINED;
 }
@@ -214,10 +195,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
         formats.push_back(static_cast<uint32_t>(format));
     }
     const uint32_t depthFormat =
-        !plan.depthAttachment
-            ? 0
-            : static_cast<uint32_t>(plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT ? VK_FORMAT_D32_SFLOAT_S8_UINT
-                                                                                         : VK_FORMAT_D32_SFLOAT);
+        !plan.depthAttachment ? 0 : static_cast<uint32_t>(vulkanTextureFormat(plan.depthFormat));
     PreparedGraphicsDraw prepared;
     if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
                              state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))
@@ -231,8 +209,6 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
                                        : "failed to prepare Vulkan RHI graphics variant",
                     status);
     }
-    prepared.invocation.render_area[2] = plan.attachmentWidth;
-    prepared.invocation.render_area[3] = plan.attachmentHeight;
     status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
                                                                   state.rhiGraphicsBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {

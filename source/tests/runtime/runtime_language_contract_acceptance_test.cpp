@@ -1,6 +1,7 @@
 #include "../support/acceptance_descriptor.h"
 #include "../support/program_fixture_runtime_test.h"
 #include "../support/sampled_texture_runtime_oracle.h"
+#include "../support/vernon_test_support.h"
 
 #include <gtest/gtest.h>
 
@@ -73,6 +74,9 @@ vernon::tests::BackendTestRequirements requirementsFor(const ProgramFixtureManif
     requirements.textureSamplerOperations = acceptance.textureSamplerOperations;
     requirements.programVjp = acceptance.programVjp;
     if (requirements.compute)
+        vernon::tests::setOpenGLComputeApiRequirement(requirements, fixture.runtime);
+    // The oracle downloads depth and stencil, which OpenGL ES reads through a compute pass.
+    if (acceptance.oracle == "fragment_discard" && fixture.runtime == VERNON_RUNTIME_OPENGL_ES)
         vernon::tests::setOpenGLComputeApiRequirement(requirements, fixture.runtime);
     return requirements;
 }
@@ -340,7 +344,7 @@ void renderArgumentFreeTriangle(vernon::tests::OwnedRhiRuntime &owned, VernonPro
     attachment.view = targetView.reference;
     attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
     attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    attachment.clear_color[3] = 1.0f;
+    attachment.clear_color.f32[3] = 1.0f;
     vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
     graphics.renderPass.render_area[2] = extent;
     graphics.renderPass.render_area[3] = extent;
@@ -387,6 +391,124 @@ void runGraphicsTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProg
     ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, executable, pixel));
     for (size_t channel = 0; channel < pixel.size(); ++channel)
         EXPECT_NEAR(pixel[channel], acceptance.expected[channel], 1);
+}
+
+// The asset covers the target with one triangle and discards fragments whose (x + y) parity is odd. Backends differ
+// in framebuffer row origin, which flips the parity of a downloaded row, so the oracle requires an exact checkerboard
+// of one phase rather than a fixed phase.
+void runFragmentDiscardOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+                              const AcceptanceDescriptor &acceptance) {
+    ASSERT_EQ(acceptance.expectedCount, 4u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
+    constexpr uint32_t extent = 32;
+    constexpr uint32_t stencilReference = 7;
+    vernon::tests::RhiImage target =
+        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, extent, extent,
+                                   1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    vernon::tests::RhiImageView targetView =
+        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    vernon::tests::RhiImage depthImage =
+        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, extent,
+                                   extent, 1, VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    ASSERT_NE(depthImage.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    vernon::tests::RhiImageView depthView = vernon::tests::createImageView(
+        owned.context(), depthImage, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 1, 1,
+        VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
+    ASSERT_NE(depthView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+
+    VernonColorAttachment attachment{};
+    attachment.location = 0;
+    attachment.view = targetView.reference;
+    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    VernonDepthAttachment depthAttachment{};
+    depthAttachment.view = depthView.reference;
+    depthAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depthAttachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    depthAttachment.clear_depth = 1.0f;
+    depthAttachment.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depthAttachment.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    depthAttachment.clear_stencil = 0;
+    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    graphics.renderPass.depth_attachment = &depthAttachment;
+    graphics.renderPass.render_area[2] = extent;
+    graphics.renderPass.render_area[3] = extent;
+    graphics.dynamic.viewport[2] = extent;
+    graphics.dynamic.viewport[3] = extent;
+    graphics.dynamic.scissor[2] = extent;
+    graphics.dynamic.scissor[3] = extent;
+    graphics.dynamic.stencil_reference = stencilReference;
+
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    VernonProgramGraphicsControlsView controls{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls), VERNON_STATUS_OK);
+    ASSERT_EQ(graphics.bind(invocation, controls), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
+        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+
+    std::vector<uint8_t> pixels(extent * extent * 4);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    download.width = extent;
+    download.height = extent;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), target.handle, &download, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
+    std::vector<float> depth(extent * extent);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), depthImage.handle, &download, depth.data(),
+                                           depth.size() * sizeof(float)),
+              VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(owned.device()));
+    std::vector<uint8_t> stencil(extent * extent);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_STENCIL;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_STENCIL;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(owned.device(), depthImage.handle, &download, stencil.data(), stencil.size()),
+        VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(owned.device()));
+
+    const uint32_t keptParity = pixels[3] == 0 ? 1u : 0u;
+    size_t kept = 0;
+    for (uint32_t y = 0; y < extent; ++y) {
+        for (uint32_t x = 0; x < extent; ++x) {
+            SCOPED_TRACE("pixel " + std::to_string(x) + "," + std::to_string(y));
+            const size_t index = static_cast<size_t>(y) * extent + x;
+            const uint8_t *pixel = pixels.data() + index * 4;
+            if ((x + y) % 2 == keptParity) {
+                ++kept;
+                for (size_t channel = 0; channel < 4; ++channel)
+                    ASSERT_NEAR(pixel[channel], acceptance.expected[channel], 1);
+                ASSERT_LT(depth[index], 1.0f);
+                ASSERT_EQ(stencil[index], stencilReference);
+            } else {
+                for (size_t channel = 0; channel < 4; ++channel)
+                    ASSERT_EQ(pixel[channel], 0);
+                ASSERT_EQ(depth[index], 1.0f);
+                ASSERT_EQ(stencil[index], 0);
+            }
+        }
+    }
+    EXPECT_EQ(kept, extent * extent / 2);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), depthView.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), depthImage.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), targetView.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), target.handle), VERNON_RHI_STATUS_OK);
 }
 
 void renderSpecializedVariant(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
@@ -533,6 +655,8 @@ TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAs
         runFloatBufferOracle(owned(), program.get(), acceptance);
     else if (acceptance.oracle == "graphics_triangle")
         runGraphicsTriangleOracle(owned(), program.get(), acceptance);
+    else if (acceptance.oracle == "fragment_discard")
+        runFragmentDiscardOracle(owned(), program.get(), acceptance);
     else if (acceptance.oracle == "sampled_pixel")
         runSampledTextureOracle(owned(), program.get(), acceptance);
     else if (acceptance.oracle == "storage_texel")

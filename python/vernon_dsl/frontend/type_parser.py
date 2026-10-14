@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass
 from typing import Protocol
 
+from .._formats import TEXTURE_FORMATS_BY_NAME
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
@@ -127,20 +128,13 @@ class TypeParser:
                     f"storage Texture dimension must be one of {dimension_list(STORAGE_TEXTURE_DIMENSIONS)}",
                 )
             format_name = self._string_or_name(items[1], "storage texture format")
-            if format_name not in {
-                "r8_unorm",
-                "r16_float",
-                "r32_float",
-                "rg8_unorm",
-                "rgba8_unorm",
-                "rgba16_float",
-                "rgba32_float",
-            }:
+            texture_format = TEXTURE_FORMATS_BY_NAME.get(format_name)
+            if texture_format is None or not texture_format.storage:
                 raise self.context.error(items[1], "unsupported storage texture format")
             access = self._string_or_name(items[2], "storage Texture access")
             if access not in {"read", "write", "read_write"}:
                 raise self.context.error(items[2], "storage Texture access must be read, write, or read_write")
-            element = ConcreteType("scalar", "f32")
+            element = ConcreteType("scalar", texture_format.shader_scalar)
             return ConcreteType("texture", "Texture", (dimension, element, format_name, access))
         raise self.context.error(node, f"unknown DSL type constructor '{constructor}'")
 

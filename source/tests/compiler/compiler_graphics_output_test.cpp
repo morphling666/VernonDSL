@@ -1424,3 +1424,145 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
+
+static size_t countOccurrences(std::string_view text, std::string_view token) {
+    size_t count = 0;
+    for (size_t offset = 0; (offset = text.find(token, offset)) != std::string_view::npos; offset += token.size())
+        ++count;
+    return count;
+}
+
+TEST(CompilerGraphicsOutput, LowersFragmentDiscardInBranchesLoopsAndHelpersForEveryGraphicsTarget) {
+    constexpr std::string_view discardModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func private @drop(%opacity: f32 {vernon.source_name = "opacity", vernon.dtype = "f32"}) {
+    %cutoff = arith.constant 0.25 : f32
+    %below = arith.cmpf olt, %opacity, %cutoff : f32
+    scf.if %below {
+      "vernon.discard_fragment"() : () -> ()
+      scf.yield
+    } else {
+      scf.yield
+    }
+    func.return
+  }
+
+  func.func @discard_fragment_main(
+      %fragCoord: tensor<4xf32> {
+        vernon.interface = "input", vernon.builtin = "frag_coord"
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.location = 0 : i64
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %x = "vernon.swizzle"(%fragCoord) {mask = "x"} : (tensor<4xf32>) -> f32
+    %lower = arith.constant 0 : index
+    %upper = arith.constant 3 : index
+    %step = arith.constant 1 : index
+    scf.for %index = %lower to %upper step %step {
+      %ordinal = arith.index_cast %index : index to i32
+      %bound = arith.sitofp %ordinal : i32 to f32
+      %hit = arith.cmpf olt, %x, %bound : f32
+      scf.if %hit {
+        "vernon.discard_fragment"() : () -> ()
+        scf.yield
+      } else {
+        scf.yield
+      }
+      scf.yield
+    }
+    func.call @drop(%x) : (f32) -> ()
+    %one = arith.constant 1.0 : f32
+    %zero = arith.constant 0.0 : f32
+    %color = "vernon.intrinsic"(%one, %zero, %zero, %one) {name = "construct"} :
+        (f32, f32, f32, f32) -> tensor<4xf32>
+    func.return %color : tensor<4xf32>
+  }
+
+  func.func @covering_vertex(
+      %position: tensor<4xf32> {
+        vernon.interface = "input", vernon.location = 0 : i64
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.builtin = "position"
+      }) attributes {vernon.entry, vernon.stage = "vertex"} {
+    func.return %position : tensor<4xf32>
+  }
+})mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    size_t compiledTargets = 0;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_CUDA)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
+        SCOPED_TRACE(backend.name);
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, discardModule.data(), discardModule.size(), target);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data, diagnostics.size);
+        const std::string output = artifacts(result);
+        if (target == VERNON_TARGET_VULKAN) {
+            constexpr uint16_t opKill = 252;
+            ASSERT_EQ(output.size() % sizeof(uint32_t), 0u);
+            std::vector<uint32_t> words(output.size() / sizeof(uint32_t));
+            std::memcpy(words.data(), output.data(), output.size());
+            size_t kills = 0;
+            for (size_t cursor = 5; cursor < words.size();) {
+                const uint16_t instructionWords = static_cast<uint16_t>(words[cursor] >> 16);
+                ASSERT_GT(instructionWords, 0u);
+                ASSERT_LE(cursor + instructionWords, words.size());
+                if (static_cast<uint16_t>(words[cursor]) == opKill)
+                    ++kills;
+                cursor += instructionWords;
+            }
+            EXPECT_EQ(kills, 2u);
+        } else if (target == VERNON_TARGET_METAL) {
+            EXPECT_EQ(countOccurrences(output, "discard_fragment()"), 2u);
+        } else if (target == VERNON_TARGET_DIRECTX) {
+            // DXIL is char6-encoded bitcode with no greppable operation names; the fragment discard runtime
+            // acceptance observes its discards.
+        } else {
+            EXPECT_EQ(countOccurrences(output, "discard;"), 2u);
+        }
+        ++compiledTargets;
+        vernonCompileResultDestroy(result);
+    }
+    EXPECT_GT(compiledTargets, 0u);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, RejectsFragmentDiscardOutsideFragmentEntries) {
+    constexpr std::string_view vertexModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @discarding_vertex(
+      %position: tensor<4xf32> {
+        vernon.interface = "input", vernon.location = 0 : i64
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.builtin = "position"
+      }) attributes {vernon.entry, vernon.stage = "vertex"} {
+    "vernon.discard_fragment"() : () -> ()
+    func.return %position : tensor<4xf32>
+  }
+})mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, vertexModule.data(), vertexModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("is valid only in fragment entries"),
+              std::string_view::npos)
+        << std::string_view(diagnostics.data, diagnostics.size);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}

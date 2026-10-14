@@ -107,6 +107,14 @@ typedef struct VernonColorBlendState {
     uint32_t write_mask;
 } VernonColorBlendState;
 
+/* A color clear value. The attachment format's component class selects the member read: f32 for float and unorm,
+ * u32 for uint, i32 for sint. Integer clears are exact on every backend. */
+typedef union VernonClearColor {
+    float f32[4];
+    uint32_t u32[4];
+    int32_t i32[4];
+} VernonClearColor;
+
 #ifdef __cplusplus
 }
 #endif

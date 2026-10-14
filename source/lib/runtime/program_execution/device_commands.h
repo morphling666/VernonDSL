@@ -2,9 +2,7 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_DEVICE_COMMANDS_H
 
 #include "VernonRuntime.h"
-#include "execution_control_plane.h"
 #include "execution_graph/execution_command_model.h"
-#include "invocation_outcome.h"
 #include "runtime/resolved_stage_types.h"
 
 #include <cstddef>
@@ -15,7 +13,6 @@
 struct VernonRuntimeContext;
 
 namespace vernon::execution::detail {
-class RhiCommandPlanSink;
 struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
@@ -52,15 +49,10 @@ struct DeviceImageCopy {
     std::vector<VernonRhiImageCopyRegion> regions;
 };
 
-using GpuCommandCompletionCallback = VernonRhiStatus (*)(void *context);
-
 bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                         const std::vector<DeviceBufferCopy> &copies);
 bool encodeImageCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                        const std::vector<DeviceImageCopy> &copies);
-VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies);
-VernonStatus executeDeviceCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &buffers,
-                                        const std::vector<DeviceImageCopy> &images);
 VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,
                                             const std::vector<DeviceBufferCopy> &bufferCopies,
                                             const std::vector<DeviceImageCopy> &imageCopies,
@@ -72,11 +64,6 @@ VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                    VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                    VernonLaunchSize grid);
-VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
-                                       const execution::detail::RhiCommandExecutionPlan &plan,
-                                       ExecutionControlPlaneUsage *telemetry = nullptr,
-                                       execution::detail::RhiCommandPlanSink *sink = nullptr, bool flush = false,
-                                       SubmissionState *submission = nullptr);
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
                                       VernonStageExecutable &pipeline,

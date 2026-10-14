@@ -67,6 +67,7 @@ enum class RuntimeErrorCode : std::uint8_t {
     RhiFailure = 6,
     LifecycleFailure = 7,
     InternalFailure = 8,
+    NotReady = 9,
 };
 
 struct RuntimeError {
@@ -215,6 +216,8 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
         return {RuntimeErrorCode::VerificationFailure, context};
     case VERNON_STATUS_UNSUPPORTED_TARGET:
         return {RuntimeErrorCode::Unsupported, context};
+    case VERNON_STATUS_NOT_READY:
+        return {RuntimeErrorCode::NotReady, context};
     case VERNON_STATUS_INTERNAL_ERROR:
     case VERNON_STATUS_OK:
         return {RuntimeErrorCode::InternalFailure, context};
@@ -260,6 +263,7 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
     case RuntimeErrorCode::ParseFailure:
     case RuntimeErrorCode::VerificationFailure:
     case RuntimeErrorCode::LifecycleFailure:
+    case RuntimeErrorCode::NotReady:
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     case RuntimeErrorCode::Unsupported:
         return VERNON_RHI_STATUS_UNSUPPORTED;
@@ -286,6 +290,8 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
         return VERNON_STATUS_VERIFICATION_ERROR;
     case RuntimeErrorCode::Unsupported:
         return VERNON_STATUS_UNSUPPORTED_TARGET;
+    case RuntimeErrorCode::NotReady:
+        return VERNON_STATUS_NOT_READY;
     case RuntimeErrorCode::ResourceExhausted:
     case RuntimeErrorCode::RhiFailure:
     case RuntimeErrorCode::LifecycleFailure:

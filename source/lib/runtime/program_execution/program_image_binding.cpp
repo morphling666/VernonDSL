@@ -1,5 +1,6 @@
 #include "program_image_binding.h"
 
+#include "VernonFormats.hpp"
 #include "rhi/image_descriptor_validation.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/provider_image_description.h"
@@ -29,25 +30,8 @@ std::optional<VernonRhiImageDimension> dimension(const std::string &value) {
 }
 
 std::optional<VernonRhiFormat> format(std::string_view value) {
-    constexpr std::array<std::pair<std::string_view, VernonRhiFormat>, 14> values{{
-        {"r8_unorm", VERNON_RHI_FORMAT_R8_UNORM},
-        {"rg8_unorm", VERNON_RHI_FORMAT_RG8_UNORM},
-        {"rgba8_unorm", VERNON_RHI_FORMAT_RGBA8_UNORM},
-        {"rgba8_srgb", VERNON_RHI_FORMAT_RGBA8_SRGB},
-        {"r16_float", VERNON_RHI_FORMAT_R16_FLOAT},
-        {"rgba16_float", VERNON_RHI_FORMAT_RGBA16_FLOAT},
-        {"r32_float", VERNON_RHI_FORMAT_R32_FLOAT},
-        {"rgba32_float", VERNON_RHI_FORMAT_RGBA32_FLOAT},
-        {"depth32_float", VERNON_RHI_FORMAT_D32_FLOAT},
-        {"rgb8_unorm", VERNON_RHI_FORMAT_RGB8_UNORM},
-        {"rg32_float", VERNON_RHI_FORMAT_RG32_FLOAT},
-        {"rgb32_float", VERNON_RHI_FORMAT_RGB32_FLOAT},
-        {"r11g11b10_float", VERNON_RHI_FORMAT_R11G11B10_FLOAT},
-        {"depth32_float_stencil8", VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT},
-    }};
-    const auto found =
-        std::find_if(values.begin(), values.end(), [&](const auto &entry) { return entry.first == value; });
-    return found == values.end() ? std::nullopt : std::optional<VernonRhiFormat>(found->second);
+    const vernon::formats::Format *entry = vernon::formats::find(value);
+    return entry ? std::optional<VernonRhiFormat>(entry->rhi) : std::nullopt;
 }
 
 uint32_t aspects(const std::vector<std::string> &values) {

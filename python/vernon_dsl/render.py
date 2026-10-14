@@ -11,6 +11,7 @@ import numpy as np
 
 from ._runtime.tensor import TensorStorage, TensorView
 from ._runtime.texture import RenderTarget, TextureView
+from ._texture_format import TextureFormat
 
 
 class LoadOperation(Enum):
@@ -218,8 +219,6 @@ class GraphicsTargetFormats:
     samples: int = 1
 
     def __post_init__(self) -> None:
-        from ._runtime.texture import TextureFormat
-
         locations = tuple(location for location, _ in self.colors)
         if locations != tuple(sorted(set(locations))):
             raise ValueError("color target locations must be unique and sorted")
@@ -287,6 +286,40 @@ def _graphics_pipeline_state_data(value: GraphicsPipelineState) -> dict[str, Any
     return normalize(value)
 
 
+_INTEGER_CLEAR_RANGES = {"uint": (0, 2**32 - 1), "sint": (-(2**31), 2**31 - 1)}
+
+
+def _validate_color_clear_value(value: Any, texture_format: TextureFormat | None) -> None:
+    """Clear values follow the target's component class: integers for uint/sint formats, finite numbers otherwise."""
+    components = list(value) if isinstance(value, (tuple, list, np.ndarray)) else None
+    integer_range = _INTEGER_CLEAR_RANGES.get(texture_format.component_class) if texture_format else None
+    if integer_range is not None:
+        low, high = integer_range
+        if (
+            components is None
+            or len(components) != 4
+            or any(
+                not isinstance(component, (int, np.integer))
+                or isinstance(component, bool)
+                or not low <= int(component) <= high
+                for component in components
+            )
+        ):
+            raise ValueError(f"{texture_format.name} clear values must contain four integers in [{low}, {high}]")
+        return
+    if (
+        components is None
+        or len(components) != 4
+        or any(
+            not isinstance(component, (int, float, np.integer, np.floating))
+            or isinstance(component, bool)
+            or not np.isfinite(float(component))
+            for component in components
+        )
+    ):
+        raise ValueError("color clear values must contain four finite numbers")
+
+
 @dataclass(frozen=True)
 class AttachmentOperation:
     load: LoadOperation
@@ -318,18 +351,12 @@ class RenderPass:
             or self.render_area[3] == 0
         ):
             raise ValueError("render_area must contain x, y, non-zero width, and non-zero height")
-        for _, operation in self.colors:
+        formats = {location: view.format for location, view in self.target._color_attachments()}
+        for location, operation in self.colors:
             if not isinstance(operation, AttachmentOperation):
                 raise TypeError("color attachments require AttachmentOperation values")
-            if operation.load is LoadOperation.CLEAR and (
-                not isinstance(operation.clear_value, (tuple, list, np.ndarray))
-                or len(operation.clear_value) != 4
-                or any(
-                    not isinstance(value, (int, float)) or isinstance(value, bool) or not np.isfinite(float(value))
-                    for value in operation.clear_value
-                )
-            ):
-                raise ValueError("color clear values must contain four finite numbers")
+            if operation.load is LoadOperation.CLEAR:
+                _validate_color_clear_value(operation.clear_value, formats.get(location))
         if self.depth is not None:
             if not isinstance(self.depth, AttachmentOperation):
                 raise TypeError("depth attachment requires an AttachmentOperation")

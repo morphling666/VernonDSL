@@ -14,6 +14,10 @@ typedef void *(*VernonOpenGLGetProcAddressFn)(void *user_data, const char *name)
  * OpenGL context ownership is intentionally outside the RHI. Python context
  * owners and host engines provide the same callbacks; their origin is not
  * observable by the OpenGL backend.
+ *
+ * A device created from these callbacks is bound to the thread that owns the
+ * context: every call on the device, including submission and completion
+ * queries, must come from that thread.
  */
 typedef struct VernonOpenGLContextCallbacks {
     uint32_t struct_size;

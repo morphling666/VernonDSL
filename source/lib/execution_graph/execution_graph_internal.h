@@ -68,12 +68,10 @@ inline void releaseExecutionResourceRecords(ExecutionProvider provider, VernonRh
 using CpuPassExecutor = VernonRhiStatus (*)(void *context, uint32_t scheduleOffset, ComputePass &pass,
                                             ComputeEncoder &encoder, const ExecutionResources &resources);
 using RhiCommandListEncoder = VernonRhiStatus (*)(void *context, VernonRhiCommandEncoder encoder);
-using RhiCommandCompletionCallback = VernonRhiStatus (*)(void *context);
 
 struct RhiCommandNodeEncoder {
     RhiCommandListEncoder encode{};
     void *context{};
-    RhiCommandCompletionCallback complete{};
 };
 
 struct RhiCommandResourceBinding {
@@ -127,34 +125,12 @@ inline void appendRhiImageBinding(std::vector<RhiCommandResourceBinding> &bindin
     bindings.push_back({identity, ResourceKind::Image, {}, image});
 }
 
-struct RhiCommandDagExecutionStats {
-    uint64_t submissions{};
-    uint64_t waits{};
-    uint64_t deviceWaitNanoseconds{};
-};
-
 struct RhiCommandExecutionPlan {
     CommandDag commands;
     std::vector<RhiCommandNodeEncoder> encoders;
     std::vector<RhiCommandResourceBinding> bindings;
     std::vector<std::shared_ptr<void>> retainedContexts;
     std::vector<CommandResourceAccess> initialAccesses;
-};
-
-class RhiCommandCompletion {
-public:
-    virtual ~RhiCommandCompletion() = default;
-    virtual bool validationPhase() const { return false; }
-    virtual VernonRhiStatus complete(bool succeeded, const RhiCommandDagExecutionStats &stats) noexcept = 0;
-};
-
-class RhiCommandPlanSink {
-public:
-    virtual ~RhiCommandPlanSink() = default;
-    virtual VernonRhiStatus append(RhiCommandExecutionPlan plan) = 0;
-    virtual void retain(std::shared_ptr<void> context) = 0;
-    virtual void onCompletion(std::shared_ptr<RhiCommandCompletion> completion) = 0;
-    virtual VernonRhiStatus flush() = 0;
 };
 
 using RhiCommandPlanExtension = VernonRhiStatus (*)(void *context, uint32_t offset, uint32_t predecessor,
@@ -170,18 +146,8 @@ VernonRhiStatus submitRhiCommandDag(VernonRhiDevice device, uint32_t requiredCap
                                     const std::vector<RhiCommandNodeEncoder> &encoders,
                                     VernonRhiCompletion *outputCompletion,
                                     const std::vector<RhiCommandResourceBinding> *resourceBindings = nullptr);
-VernonRhiStatus executeRhiCommandDagAndWait(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                            const CommandDag &dag, const std::vector<RhiCommandNodeEncoder> &encoders,
-                                            RhiCommandDagExecutionStats *stats = nullptr,
-                                            const std::vector<RhiCommandResourceBinding> *resourceBindings = nullptr,
-                                            const std::vector<CommandResourceAccess> *initialAccesses = nullptr);
-VernonRhiStatus executeRhiCommandPlanAndWait(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                             const RhiCommandExecutionPlan &plan,
-                                             RhiCommandDagExecutionStats *stats = nullptr);
-VernonRhiStatus submitRhiCommandList(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                     RhiCommandListEncoder encode, void *context,
-                                     VernonRhiCompletion *outputCompletion);
-
+VernonRhiStatus submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
+                                     const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion);
 VernonRhiStatus executeCpuScheduleRange(VernonRhiDevice device, const std::vector<GraphResource> &resources,
                                         const std::vector<std::unique_ptr<ExecutionPass>> &passes,
                                         const std::vector<uint32_t> &schedule,

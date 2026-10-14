@@ -260,6 +260,29 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     EXPECT_EQ(fixture.plan.publications.transactions[1].mode, PublicationCommitMode::InPlace);
 }
 
+TEST(ResolvedExecutionPlan, NamesTheFirstEffectThatNeedsACompletionWait) {
+    PlanFixture fixture;
+    Program &program = fixture.resolved->program;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(fixture.plan.waitRequirement);
+    EXPECT_EQ(fixture.plan.waitRequirement->path, "/abi/boundary_slots/0/publication");
+
+    program.abi.boundarySlots.erase(program.abi.boundarySlots.begin());
+    program.abi.publication.targets.clear();
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    ASSERT_TRUE(fixture.plan.waitRequirement);
+    EXPECT_EQ(fixture.plan.waitRequirement->path, "/abi/tape_plans/0");
+
+    program.abi.tapePlans.clear();
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    EXPECT_FALSE(fixture.plan.waitRequirement);
+
+    fixture.plan.waitRequirement = ResolvedWaitRequirement{"/abi/tape_plans/0", "forged"};
+    EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
+    EXPECT_EQ(diagnostic.path, "/publications");
+}
+
 TEST(ResolvedExecutionPlan, GroupsAdjacentVersionContinuousGraphicsNodesIntoOneScope) {
     PlanFixture fixture;
     Program &program = fixture.resolved->program;

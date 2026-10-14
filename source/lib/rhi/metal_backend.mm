@@ -83,40 +83,15 @@ size_t alignedTextureRowSize(size_t size) { return (size + 255u) & ~size_t{255u}
 
 uint32_t pixelFormat(VernonRhiFormat format) {
     switch (format) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return MTLPixelFormatR8Unorm;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-        return MTLPixelFormatRG8Unorm;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-        return MTLPixelFormatRGBA8Unorm;
-    case VERNON_RHI_FORMAT_RGBA8_SRGB:
-        return MTLPixelFormatRGBA8Unorm_sRGB;
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return MTLPixelFormatR16Float;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-        return MTLPixelFormatRGBA16Float;
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-        return MTLPixelFormatR32Float;
-    case VERNON_RHI_FORMAT_RG32_FLOAT:
-        return MTLPixelFormatRG32Float;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return MTLPixelFormatRGBA32Float;
-    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
-        return MTLPixelFormatRG11B10Float;
-    case VERNON_RHI_FORMAT_D32_FLOAT:
-        return MTLPixelFormatDepth32Float;
-    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
-        return MTLPixelFormatDepth32Float_Stencil8;
-    default:
-        return MTLPixelFormatInvalid;
+#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+                      vulkan, dxgi, metal, ...)                                                                        \
+    case VERNON_RHI_FORMAT_##NAME:                                                                                     \
+        return metal;
+#include "VernonFormats.def"
+    case VERNON_RHI_FORMAT_UNDEFINED:
+        break;
     }
-}
-
-size_t bytesPerPixel(VernonRhiFormat format) { return vernon::rhi::imageFormatPixelSize(format); }
-
-bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
-                         VernonRhiImageDataType sourceType) {
-    return vernon::rhi::uploadLayoutMatches(destination, sourceFormat, sourceType);
+    return MTLPixelFormatInvalid;
 }
 
 bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
@@ -407,7 +382,7 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
             error = "Metal image upload layout is unsupported";
             return false;
         }
-        if (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+        if (vernon::formats::hasStencil(descriptor.format)) {
             const bool copyDepth = (upload.aspect & VERNON_RHI_IMAGE_ASPECT_DEPTH) != 0;
             const bool copyStencil = (upload.aspect & VERNON_RHI_IMAGE_ASPECT_STENCIL) != 0;
             const size_t depthRowSize = sizeof(float) * upload.width;
@@ -535,7 +510,7 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         error = "Metal image readback destination is too small";
         return false;
     }
-    if (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+    if (vernon::formats::hasStencil(descriptor.format)) {
         if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.depth != 1) {
             error = "Metal depth/stencil readback only supports 2D images";
             return false;
@@ -680,7 +655,7 @@ bool DeviceState::downloadImageBatch(const Image &image, const VernonRhiImageDes
     }
     for (size_t index = 0; index < downloadCount; ++index) {
         const VernonRhiImageDownloadDescriptor &download = downloads[index].descriptor;
-        if (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+        if (vernon::formats::hasStencil(descriptor.format)) {
             if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.depth != 1) {
                 error = "Metal depth/stencil readback only supports 2D images";
                 return false;
@@ -779,7 +754,7 @@ bool DeviceState::downloadImageBatch(const Image &image, const VernonRhiImageDes
         auto *output = static_cast<uint8_t *>(downloads[index].destination);
         const Readback &readback = readbacks[index];
         const auto *source = static_cast<const uint8_t *>(readback.primary.contents);
-        if (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+        if (vernon::formats::hasStencil(descriptor.format)) {
             const auto *stencil = static_cast<const uint8_t *>(readback.stencil.contents);
             if (readback.copyDepth && readback.copyStencil) {
                 for (uint32_t y = 0; y < download.height; ++y)

@@ -3,6 +3,7 @@
 #include "failure_injection.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
+#include "submission_queue.h"
 
 #include <utility>
 
@@ -19,6 +20,8 @@ DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, size_t size) : context
     if (!size || injectFailure(FailureBoundary::Allocation) ||
         vernonRhiDeviceCreateBuffer(context.rhiDevice, &descriptor, &handle_) != VERNON_RHI_STATUS_OK)
         handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    else
+        TransientAllocationMeter::charge(context, size);
 }
 
 DeviceBuffer::DeviceBuffer(DeviceBuffer &&other) noexcept

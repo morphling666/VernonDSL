@@ -68,7 +68,7 @@ inline void runSampledTextureRuntimeOracle(OwnedRhiRuntime &owned, VernonProgram
     attachment.view = targetView.reference;
     attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
     attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    attachment.clear_color[3] = 1.0f;
+    attachment.clear_color.f32[3] = 1.0f;
     CanonicalGraphicsControls graphics(&attachment, 1, 3);
     graphics.renderPass.render_area[2] = extent;
     graphics.renderPass.render_area[3] = extent;

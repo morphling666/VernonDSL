@@ -41,6 +41,9 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(deleteProgram, "glDeleteProgram");
         LOAD(useProgram, "glUseProgram");
         LOAD(getIntegerv, "glGetIntegerv");
+        LOAD(getStringi, "glGetStringi");
+        driver.getInternalformativ = reinterpret_cast<decltype(driver.getInternalformativ)>(
+            callbacks.get_proc_address(callbacks.user_data, "glGetInternalformativ"));
         LOAD(genBuffers, "glGenBuffers");
         LOAD(deleteBuffers, "glDeleteBuffers");
         LOAD(bindBuffer, "glBindBuffer");
@@ -77,6 +80,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
             callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
         LOAD(clearBufferfv, "glClearBufferfv");
         LOAD(clearBufferiv, "glClearBufferiv");
+        LOAD(clearBufferuiv, "glClearBufferuiv");
         LOAD(clearBufferfi, "glClearBufferfi");
         LOAD(enable, "glEnable");
         LOAD(disable, "glDisable");
@@ -102,11 +106,12 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         driver.colorMaski = reinterpret_cast<decltype(driver.colorMaski)>(
             callbacks.get_proc_address(callbacks.user_data, "glColorMaski"));
         LOAD(viewport, "glViewport");
-        driver.scissor =
-            reinterpret_cast<decltype(driver.scissor)>(callbacks.get_proc_address(callbacks.user_data, "glScissor"));
+        LOAD(scissor, "glScissor");
         LOAD(drawArrays, "glDrawArrays");
         LOAD(drawArraysInstanced, "glDrawArraysInstanced");
         LOAD(drawElementsInstanced, "glDrawElementsInstanced");
+        driver.drawElementsInstancedBaseVertex = reinterpret_cast<decltype(driver.drawElementsInstancedBaseVertex)>(
+            callbacks.get_proc_address(callbacks.user_data, "glDrawElementsInstancedBaseVertex"));
         LOAD(getUniformLocation, "glGetUniformLocation");
         LOAD(getUniformBlockIndex, "glGetUniformBlockIndex");
         LOAD(uniformBlockBinding, "glUniformBlockBinding");
@@ -157,6 +162,9 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(samplerParameteri, "glSamplerParameteri");
         LOAD(bindSampler, "glBindSampler");
         LOAD(finish, "glFinish");
+        LOAD(fenceSync, "glFenceSync");
+        LOAD(clientWaitSync, "glClientWaitSync");
+        LOAD(deleteSync, "glDeleteSync");
 #undef LOAD
         driver.dispatchCompute = reinterpret_cast<decltype(driver.dispatchCompute)>(
             callbacks.get_proc_address(callbacks.user_data, "glDispatchCompute"));

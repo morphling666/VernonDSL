@@ -10,6 +10,9 @@
 #include "runtime_state.h"
 #include "target_binding_plan.h"
 
+#include "VernonFormats.hpp"
+#include "VernonRHI.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -121,6 +124,90 @@ bool loadModuleBytes(const ArtifactSystem &artifacts, const std::string &artifac
     return loadCodeModuleBytes(artifacts, artifactId, bundleRoot, stage->second.modules.front(), bytes, diagnostic);
 }
 
+// A context without an RHI device has no images, so the table baseline stands in for it.
+uint32_t deviceFormatCapabilities(const VernonRuntimeContext &context, const vernon::formats::Format &format) {
+    uint32_t capabilities = format.baseline;
+    if (context.rhiDevice.index != VERNON_RHI_INVALID_HANDLE_INDEX &&
+        vernonRhiDeviceGetFormatCapabilities(context.rhiDevice, format.rhi, &capabilities) != VERNON_RHI_STATUS_OK)
+        capabilities = 0;
+    return capabilities;
+}
+
+bool validateImageStorageFormats(const Program &program, const FormatCapabilityQuery &capabilities,
+                                 Diagnostic &diagnostic) {
+    for (size_t index = 0; index < program.storages.size(); ++index) {
+        const Storage &storage = program.storages[index];
+        if (storage.descriptorKind != StorageDescriptorKind::Image)
+            continue;
+        uint32_t required = storage.image.sampleCount > 1 ? VERNON_RHI_FORMAT_MULTISAMPLE : 0u;
+        for (const std::string &usage : storage.image.usage)
+            if (usage == "storage")
+                required |= VERNON_RHI_FORMAT_STORAGE;
+            else if (usage == "color_attachment" || usage == "depth_stencil_attachment")
+                required |= VERNON_RHI_FORMAT_RENDERABLE;
+        // Sampled-only images may leave their format unknown until binding.
+        if (!required)
+            continue;
+        const vernon::formats::Format *format = vernon::formats::find(std::string_view(storage.image.format));
+        if (!format || (capabilities(*format) & required) != required)
+            return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED",
+                          "/storages/" + std::to_string(index) + "/descriptor/format",
+                          "device does not support image format " + storage.image.format + " for its usage");
+    }
+    return true;
+}
+
+// An attachment lists the formats and sample counts its target may have, so one supported combination suffices.
+bool validateAttachmentFormats(const GraphicsAttachmentSignature &attachment, bool blended,
+                               const FormatCapabilityQuery &capabilities, const std::string &path,
+                               Diagnostic &diagnostic) {
+    const bool singleSampled =
+        std::find(attachment.sampleCounts.begin(), attachment.sampleCounts.end(), 1u) != attachment.sampleCounts.end();
+    const uint32_t required = VERNON_RHI_FORMAT_RENDERABLE | (blended ? VERNON_RHI_FORMAT_BLENDABLE : 0u) |
+                              (singleSampled ? 0u : VERNON_RHI_FORMAT_MULTISAMPLE);
+    bool integer = !attachment.formats.empty();
+    for (VernonTextureFormat texture : attachment.formats) {
+        const vernon::formats::Format *format = vernon::formats::find(texture);
+        if (!format)
+            continue;
+        if ((capabilities(*format) & required) == required)
+            return true;
+        integer = integer && format->integer();
+    }
+    return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", path,
+                  blended && integer ? "integer color targets cannot blend"
+                  : blended          ? "device cannot render and blend any format of this attachment"
+                                     : "device cannot render any format of this attachment");
+}
+
+bool validateGraphicsTargetFormats(const Program &program, const FormatCapabilityQuery &capabilities,
+                                   Diagnostic &diagnostic) {
+    for (size_t graphIndex = 0; graphIndex < program.graphs.size(); ++graphIndex) {
+        const Graph &graph = program.graphs[graphIndex];
+        for (size_t nodeIndex = 0; nodeIndex < graph.nodes.size(); ++nodeIndex) {
+            const Node &node = graph.nodes[nodeIndex];
+            if (executionKind(node) != ExecutionKind::Graphics)
+                continue;
+            const GraphicsOperation &graphics = graphicsOperation(node);
+            const std::string renderPass = "/graphs/" + std::to_string(graphIndex) + "/nodes/" +
+                                           std::to_string(nodeIndex) + "/operation/render_pass";
+            for (size_t location = 0; location < graphics.colorAttachments.size(); ++location) {
+                const auto blend = graphics.pipelineState.colorBlends.find(static_cast<uint32_t>(location));
+                const bool blended =
+                    blend != graphics.pipelineState.colorBlends.end() && blend->second.blend_enabled != 0;
+                if (!validateAttachmentFormats(graphics.colorAttachments[location], blended, capabilities,
+                                               renderPass + "/colors/" + std::to_string(location), diagnostic))
+                    return false;
+            }
+            if (graphics.depthStencilAttachment &&
+                !validateAttachmentFormats(*graphics.depthStencilAttachment, false, capabilities,
+                                           renderPass + "/depth_stencil", diagnostic))
+                return false;
+        }
+    }
+    return true;
+}
+
 StageLoadResult loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
                                             const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot,
                                             const Node &node, const ResolvedStage &resolvedStage,
@@ -230,6 +317,11 @@ StageLoadResult loadComputeNodePipeline(VernonRuntimeContext &context, const Art
 
 } // namespace
 
+bool validateTargetFormats(const Program &program, const FormatCapabilityQuery &capabilities, Diagnostic &diagnostic) {
+    return validateImageStorageFormats(program, capabilities, diagnostic) &&
+           validateGraphicsTargetFormats(program, capabilities, diagnostic);
+}
+
 ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
                                              std::shared_ptr<const ResolvedProgram> program,
                                              const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot,
@@ -246,7 +338,11 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
         return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     }
     ResolvedExecutablePlan executable;
-    if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
+    if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic) ||
+        !validateTargetFormats(
+            program->program,
+            [&context](const vernon::formats::Format &format) { return deviceFormatCapabilities(context, format); },
+            diagnostic))
         return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     auto plan = std::make_shared<ResolvedExecutionPlan>();
     plan->resolvedProgram = std::move(program);

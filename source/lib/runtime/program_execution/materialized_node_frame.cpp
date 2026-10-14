@@ -99,11 +99,12 @@ bool MaterializedNodeFrame::commitHost(std::string &error) const {
 bool materializeNodeFrame(const ProgramInvocationState &invocation, const program::Program &program,
                           const program::Node &node, const program::ResolvedNodePlan &nodePlan,
                           const ResolvePhysicalEndpoint &resolvePhysicalEndpoint, MaterializedNodeFrame &output,
-                          std::string &error) {
+                          std::string &error, const std::vector<char> *materializedParameters) {
     if (!nodePlan.stage)
         return error = "resolved Program stage has no physical implementation", false;
     const VernonStageExecutable &stage = *nodePlan.stage;
-    if (nodePlan.projections.size() != stage.bindingProjection.parameters.size())
+    if (nodePlan.projections.size() != stage.bindingProjection.parameters.size() ||
+        (materializedParameters && materializedParameters->size() != nodePlan.projections.size()))
         return error = "resolved Program stage has an invalid endpoint plan", false;
     output.reset(nodePlan.projections.size());
     output.arguments.reserve(nodePlan.projections.size());
@@ -131,6 +132,12 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
     for (size_t parameterIndex = 0; parameterIndex < nodePlan.projections.size(); ++parameterIndex) {
         const Parameter &parameter = stage.bindingProjection.parameters[parameterIndex];
         const program::NodeEndpointProjection &binding = nodePlan.projections[parameterIndex];
+        if (materializedParameters && !(*materializedParameters)[parameterIndex]) {
+            VernonProgramArgument placeholder{};
+            placeholder.slot = parameter.slot;
+            output.arguments.push_back(placeholder);
+            continue;
+        }
         if (binding.value >= invocation.arguments().size() || binding.value >= program.values.size())
             return error = "resolved Program endpoint exceeds invocation Values", false;
 

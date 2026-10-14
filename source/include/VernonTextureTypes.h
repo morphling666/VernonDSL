@@ -4,18 +4,8 @@
 #include <stdint.h>
 
 typedef enum VernonTextureFormat {
-    VERNON_TEXTURE_RGBA8_UNORM = 0,
-    VERNON_TEXTURE_RGBA8_SRGB = 1,
-    VERNON_TEXTURE_RGBA16_FLOAT = 2,
-    VERNON_TEXTURE_RGBA32_FLOAT = 3,
-    VERNON_TEXTURE_R8_UNORM = 4,
-    VERNON_TEXTURE_R16_FLOAT = 5,
-    VERNON_TEXTURE_R32_FLOAT = 6,
-    VERNON_TEXTURE_RG8_UNORM = 7,
-    VERNON_TEXTURE_RGB8_UNORM = 8,
-    VERNON_TEXTURE_R11G11B10_FLOAT = 9,
-    VERNON_TEXTURE_D32_FLOAT = 10,
-    VERNON_TEXTURE_D32_FLOAT_S8_UINT = 11
+#define VERNON_FORMAT(name, NAME, rhi, texture, ...) VERNON_TEXTURE_##NAME = texture,
+#include "VernonFormats.def"
 } VernonTextureFormat;
 
 /* Values and layer rules match VernonRhiImageDimension: a cube-array layer is cube * 6 + face. */

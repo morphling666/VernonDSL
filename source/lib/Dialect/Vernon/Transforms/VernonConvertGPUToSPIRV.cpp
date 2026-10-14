@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 
+#include "VernonSpirvImageFormat.h"
 #include "VernonSpirvMath.h"
 
 #include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
@@ -202,16 +203,7 @@ FailureOr<Type> convertStorageTextureType(TextureType texture) {
                                               .Cases("2d", "2d_array", spirv::Dim::Dim2D)
                                               .Case("3d", spirv::Dim::Dim3D)
                                               .Default(std::nullopt);
-    std::optional<spirv::ImageFormat> format =
-        llvm::StringSwitch<std::optional<spirv::ImageFormat>>(texture.getFormat())
-            .Case("r8_unorm", spirv::ImageFormat::R8)
-            .Case("r16_float", spirv::ImageFormat::R16f)
-            .Case("r32_float", spirv::ImageFormat::R32f)
-            .Case("rg8_unorm", spirv::ImageFormat::Rg8)
-            .Case("rgba8_unorm", spirv::ImageFormat::Rgba8)
-            .Case("rgba16_float", spirv::ImageFormat::Rgba16f)
-            .Case("rgba32_float", spirv::ImageFormat::Rgba32f)
-            .Default(std::nullopt);
+    std::optional<spirv::ImageFormat> format = spirvStorageImageFormat(texture.getFormat());
     if (!dimension || !format)
         return failure();
     Type image = spirv::ImageType::get(

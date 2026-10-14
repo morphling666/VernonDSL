@@ -33,6 +33,7 @@ constexpr GlEnum kFramebufferComplete = 0x8CD5;
 constexpr GlEnum kArrayBuffer = 0x8892;
 constexpr GlEnum kElementArrayBuffer = 0x8893;
 constexpr GlEnum kMaxUniformBlockSize = 0x8A30;
+constexpr GlEnum kNumExtensions = 0x821D;
 constexpr GlEnum kActiveUniformBlocks = 0x8A36;
 constexpr GlEnum kInt = 0x1404;
 constexpr GlEnum kUnsignedInt = 0x1405;
@@ -45,6 +46,7 @@ constexpr GlEnum kOneMinusSourceAlpha = 0x0303;
 constexpr GlEnum kAdd = 0x8006;
 constexpr GlEnum kColorAttachment0 = 0x8CE0;
 constexpr GlEnum kStencilAttachment = 0x8D20;
+constexpr GlEnum kAlreadySignaled = 0x911A;
 
 GlUint nextName = 1;
 uint32_t drawCount = 0;
@@ -52,6 +54,8 @@ uint32_t dispatchCount = 0;
 uint32_t storageBindingCount = 0;
 uint32_t memoryBarrierCount = 0;
 uint32_t lastMemoryBarrierBits = 0;
+uint32_t createdSyncCount = 0;
+uint32_t deletedSyncCount = 0;
 uint32_t clearCount = 0;
 uint32_t invalidateCount = 0;
 uint32_t programBindCount = 0;
@@ -206,7 +210,10 @@ void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) {
              : name == kActiveUniformBlocks ? static_cast<GlInt>(linkedUniformBlocks.size())
                                             : 0;
 }
-void GL_CALL getIntegerv(GlEnum name, GlInt *value) { *value = name == kMaxUniformBlockSize ? 16 * 1024 : 16; }
+void GL_CALL getIntegerv(GlEnum name, GlInt *value) {
+    *value = name == kMaxUniformBlockSize ? 16 * 1024 : name == kNumExtensions ? 0 : 16;
+}
+const unsigned char *GL_CALL getStringi(GlEnum, GlUint) { return nullptr; }
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
         *names++ = nextName++;
@@ -240,6 +247,12 @@ void GL_CALL memoryBarrier(unsigned bits) {
     ++memoryBarrierCount;
     lastMemoryBarrierBits = bits;
 }
+void *GL_CALL fenceSync(GlEnum, unsigned) {
+    ++createdSyncCount;
+    return &createdSyncCount;
+}
+GlEnum GL_CALL clientWaitSync(void *, unsigned, uint64_t) { return kAlreadySignaled; }
+void GL_CALL deleteSync(void *) { ++deletedSyncCount; }
 void GL_CALL vertexAttribPointer(GlUint location, GlInt components, GlEnum type, GlBoolean, GlSize stride,
                                  const void *offset) {
     vertexAttributeArray = boundVertexArray;
@@ -309,6 +322,7 @@ void GL_CALL clearBufferfv(GlEnum, GlInt drawBuffer, const float *value) {
     std::copy_n(value, clearColor.size(), clearColor.begin());
 }
 void GL_CALL clearBufferiv(GlEnum, GlInt, const GlInt *) {}
+void GL_CALL clearBufferuiv(GlEnum, GlInt, const GlUint *) {}
 void GL_CALL clearBufferfi(GlEnum, GlInt, float, GlInt) {}
 void GL_CALL readBuffer(GlEnum) {}
 void GL_CALL depthMask(GlBoolean value) { depthWrite = value; }
@@ -384,6 +398,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGetProgramInfoLog", infoLogNoop);
     PROC("glDeleteProgram", objectNoop);
     PROC("glGetIntegerv", getIntegerv);
+    PROC("glGetStringi", getStringi);
     PROC("glGenVertexArrays", genNames);
     PROC("glDeleteVertexArrays", deleteNamesNoop);
     PROC("glBindVertexArray", bindVertexArray);
@@ -434,6 +449,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glDrawElementsInstanced", drawElementsInstanced);
     PROC("glClearBufferfv", clearBufferfv);
     PROC("glClearBufferiv", clearBufferiv);
+    PROC("glClearBufferuiv", clearBufferuiv);
     PROC("glClearBufferfi", clearBufferfi);
     PROC("glReadBuffer", readBuffer);
     PROC("glDepthMask", depthMask);
@@ -487,6 +503,9 @@ void *getProcAddress(void *, const char *name) {
     PROC("glScissor", scissor);
     PROC("glDispatchCompute", dispatchCompute);
     PROC("glMemoryBarrier", memoryBarrier);
+    PROC("glFenceSync", fenceSync);
+    PROC("glClientWaitSync", clientWaitSync);
+    PROC("glDeleteSync", deleteSync);
 #undef PROC
     return nullptr;
 }
@@ -1126,6 +1145,8 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     vertexAttributeArray = 0;
     vertexAttributeLocation = UINT32_MAX;
     capturedVertexAttributeDivisor = 0;
+    createdSyncCount = 0;
+    deletedSyncCount = 0;
     VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
     ASSERT_TRUE(gl);
     {
@@ -1180,6 +1201,8 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
         EXPECT_EQ(vertexAttributeOffset, 0u);
         EXPECT_EQ(indexedDrawCount, 3);
         EXPECT_EQ(drawCount, 1u);
+        EXPECT_GT(createdSyncCount, 0u);
+        EXPECT_EQ(deletedSyncCount, createdSyncCount);
 
         ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);

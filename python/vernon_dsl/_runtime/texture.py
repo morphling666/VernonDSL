@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from .._formats import TEXTURE_FORMATS, d32_float_s8_uint, rgba8_srgb, rgba8_unorm
+from .._texture_format import TextureFormat
 from ..types import TypeExpr
 from .residency import _ImageRegion, _ResidencySet, _resource_transaction_scope, _ResourceControlBlock
 from .session import _invocation_context, _InvocationContext
@@ -32,66 +34,7 @@ class _TextureResource:
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
-class TextureFormat:
-    name: str
-    _native_name: str
-    dtype: np.dtype[Any]
-    channels: int
-    storage: bool = True
-    aspects: frozenset[str] = frozenset({"color"})
-
-
-rgba8_unorm = TextureFormat("rgba8_unorm", "RGBA8_UNORM", np.dtype(np.uint8), 4)
-rgba8_srgb = TextureFormat("rgba8_srgb", "RGBA8_SRGB", np.dtype(np.uint8), 4, False)
-rgba16_float = TextureFormat("rgba16_float", "RGBA16_FLOAT", np.dtype(np.float16), 4)
-rgba32_float = TextureFormat("rgba32_float", "RGBA32_FLOAT", np.dtype(np.float32), 4)
-r8_unorm = TextureFormat("r8_unorm", "R8_UNORM", np.dtype(np.uint8), 1)
-r16_float = TextureFormat("r16_float", "R16_FLOAT", np.dtype(np.float16), 1)
-r32_float = TextureFormat("r32_float", "R32_FLOAT", np.dtype(np.float32), 1)
-rg8_unorm = TextureFormat("rg8_unorm", "RG8_UNORM", np.dtype(np.uint8), 2)
-rgb8_unorm = TextureFormat("rgb8_unorm", "RGB8_UNORM", np.dtype(np.uint8), 3, False)
-r11g11b10_float = TextureFormat("r11g11b10_float", "R11G11B10_FLOAT", np.dtype(np.uint32), 1, False)
-d32_float = TextureFormat(
-    "d32_float",
-    "D32_FLOAT",
-    np.dtype(np.float32),
-    1,
-    False,
-    frozenset({"depth"}),
-)
-_DEPTH_STENCIL_DTYPE = np.dtype(
-    {
-        "names": ("depth", "stencil"),
-        "formats": (np.float32, np.uint8),
-        "offsets": (0, 4),
-        "itemsize": 8,
-    }
-)
-d32_float_s8_uint = TextureFormat(
-    "d32_float_s8_uint",
-    "D32_FLOAT_S8_UINT",
-    _DEPTH_STENCIL_DTYPE,
-    1,
-    False,
-    frozenset({"depth", "stencil"}),
-)
-
-_TEXTURE_FORMATS = (
-    rgba8_unorm,
-    rgba8_srgb,
-    rgba16_float,
-    rgba32_float,
-    r8_unorm,
-    r16_float,
-    r32_float,
-    rg8_unorm,
-    rgb8_unorm,
-    r11g11b10_float,
-    d32_float,
-    d32_float_s8_uint,
-)
-_TEXTURE_FORMAT_SET = frozenset(_TEXTURE_FORMATS)
+_TEXTURE_FORMAT_SET = frozenset(TEXTURE_FORMATS)
 _TEXTURE_USAGES = frozenset(
     {
         "sampled",

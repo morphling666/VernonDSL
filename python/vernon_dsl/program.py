@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_args
 
+from ._formats import TEXTURE_FORMATS_BY_NAME
 from ._runtime.tensor import TensorStorage, TensorView
 from .operation_graph import (
     AttachmentProjection,
@@ -189,11 +190,8 @@ def _graphics_attachments(
         existing = cache.get(projection)
         if existing is not None:
             return existing
-        logical = ConcreteType(
-            "texture",
-            "Texture",
-            ("2d", ConcreteType("scalar", "f32"), description.format_name, "read_write"),
-        )
+        element = ConcreteType("scalar", TEXTURE_FORMATS_BY_NAME[description.format_name].shader_scalar)
+        logical = ConcreteType("texture", "Texture", ("2d", element, description.format_name, "attachment"))
         control_name = (
             str(control.identifier)
             if control.source is ProgramControlSource.ARGUMENT

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import importlib.util
 import types
 import unittest
 import weakref
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -108,6 +110,22 @@ class RenderTargetTests(unittest.TestCase):
         self.assertFalse(hasattr(target, "attach_depth"))
         with self.assertRaisesRegex(TypeError, "either color or colors"):
             vd.render_pass(target, color=vd.load(), colors={0: vd.load()})
+
+    def test_color_clear_values_follow_the_target_component_class(self) -> None:
+        target = vd.RenderTarget.create(shape=(4, 4), color_formats={0: vd.rgba8_unorm, 1: vd.r32_uint})
+        identifiers = (0xFFFFFFFF, 2**24 + 1, np.uint32(7), 0)
+        use = vd.render_pass(target, colors={0: vd.clear((0.0, 0.0, 0.0, 1.0)), 1: vd.clear(identifiers)})
+        self.assertEqual(use.colors[1][1].clear_value, identifiers)
+        for invalid in ((0.5, 0, 0, 0), (2**32, 0, 0, 0), (-1, 0, 0, 0), (True, 0, 0, 0), (0, 0, 0)):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(
+                    ValueError, r"r32_uint clear values must contain four integers in \[0, 4294967295\]"
+                ),
+            ):
+                vd.render_pass(target, colors={1: vd.clear(invalid)})
+        with self.assertRaisesRegex(ValueError, "four finite numbers"):
+            vd.render_pass(target, colors={0: vd.clear((float("nan"), 0.0, 0.0, 1.0))})
 
     def test_graphics_values_are_typed_and_immutable(self) -> None:
         state = vd.graphics_state(
@@ -293,6 +311,49 @@ def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
     pixel = target.to_numpy()[16, 16]
     test.assertGreater(int(pixel[0]), 240)
     test.assertLess(int(pixel[1]), 10)
+
+
+def _fragment_discard_fixture() -> types.ModuleType:
+    path = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "fragment_discard_asset.py"
+    spec = importlib.util.spec_from_file_location("fragment_discard_asset", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def assert_fragment_discard_keeps_cleared_attachments(test: unittest.TestCase) -> None:
+    """Backends differ in framebuffer row origin, which flips the (x + y) parity of a downloaded row, so the dropped
+    pixels must form an exact checkerboard of either phase."""
+    fixture = _fragment_discard_fixture()
+    for name in ("checker_asset", "loop_and_helper_asset", "unreachable_asset"):
+        with test.subTest(asset=name):
+            color = vd.Texture.zeros(shape=(32, 32))
+            depth = vd.Texture.device(
+                shape=(32, 32),
+                format=vd.d32_float_s8_uint,
+                usage=("depth_stencil_attachment", "transfer_source"),
+            )
+            getattr(fixture, name).program(
+                render_pass=vd.render_pass(
+                    vd.RenderTarget.from_attachments(colors={0: color}, depth=depth),
+                    color=vd.clear((0.0, 0.0, 0.0, 0.0)),
+                    depth=vd.clear_depth(1.0),
+                ),
+                draw=vd.draw(vertex_count=3),
+                dynamic_state=vd.dynamic_state(stencil_reference=7),
+            )
+            pixels = color.to_numpy()
+            depth_stencil = depth.to_numpy()
+            rows, columns = np.indices((32, 32))
+            kept_parity = 1 if pixels[0, 0, 3] == 0 else 0
+            kept = (rows + columns) % 2 == kept_parity
+            np.testing.assert_array_equal(pixels[kept], np.broadcast_to((255, 64, 0, 255), (512, 4)))
+            np.testing.assert_array_equal(pixels[~kept], np.zeros((512, 4), dtype=np.uint8))
+            test.assertTrue(np.all(depth_stencil["depth"][kept] < 1.0))
+            np.testing.assert_array_equal(depth_stencil["depth"][~kept], np.ones(512, dtype=np.float32))
+            np.testing.assert_array_equal(depth_stencil["stencil"][kept], np.full(512, 7, dtype=np.uint8))
+            np.testing.assert_array_equal(depth_stencil["stencil"][~kept], np.zeros(512, dtype=np.uint8))
 
 
 def assert_rank_three_tensor_attribute_renders(test: unittest.TestCase) -> None:
@@ -1146,6 +1207,9 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_depth_attachment_selects_nearest_fragment(self) -> None:
         assert_depth_attachment_selects_nearest(self)
 
+    def test_fragment_discard_keeps_cleared_attachments(self) -> None:
+        assert_fragment_discard_keeps_cleared_attachments(self)
+
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
@@ -1349,6 +1413,9 @@ class OpenGLESPipelineTests(unittest.TestCase):
             )
         )
 
+    def test_fragment_discard_keeps_cleared_attachments(self) -> None:
+        assert_fragment_discard_keeps_cleared_attachments(self)
+
     def test_rank_three_tensor_attribute_arithmetic_renders(self) -> None:
         assert_rank_three_tensor_attribute_renders(self)
 
@@ -1424,6 +1491,9 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_depth_attachment_selects_nearest_fragment(self) -> None:
         assert_depth_attachment_selects_nearest(self)
+
+    def test_fragment_discard_keeps_cleared_attachments(self) -> None:
+        assert_fragment_discard_keeps_cleared_attachments(self)
 
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
@@ -1572,6 +1642,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def setUp(self) -> None:
         require_available(probe_backend(backend_row(vd.directx), BackendRequirements(graphics=True)))
+
+    def test_fragment_discard_keeps_cleared_attachments(self) -> None:
+        assert_fragment_discard_keeps_cleared_attachments(self)
 
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)

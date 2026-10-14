@@ -83,6 +83,8 @@ GENERATED_INTERFACE_CONTRACTS = {
     "instance_id": GeneratedInterfaceContract("vertex", U32, "input", "instance_index"),
 }
 
+FRAGMENT_DISCARD_OPERATION = "discard_fragment"
+
 ATOMIC_OPERATION_NAMES = frozenset(
     {
         "atomic_add",
@@ -106,6 +108,7 @@ DEVICE_ONLY_OPERATION_NAMES = frozenset(
     {
         *GENERATED_INTERFACE_CONTRACTS,
         *ATOMIC_OPERATION_NAMES,
+        FRAGMENT_DISCARD_OPERATION,
         "storage_barrier",
         "texture_sample",
         "texture_load",

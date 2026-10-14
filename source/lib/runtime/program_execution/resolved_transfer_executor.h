@@ -9,6 +9,8 @@ struct RhiCommandExecutionPlan;
 
 namespace vernon::runtime::program_execution {
 
+class SubmissionRecord;
+
 class ResolvedTransferExecutor {
 public:
     ResolvedTransferExecutor(VernonRuntimeContext &context, ProgramInvocationState &state)
@@ -18,7 +20,7 @@ public:
     VernonStatus appendBeforeConsumer(program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
                                       vernon::execution::detail::RhiCommandExecutionPlan &commands,
                                       bool &commandsAppended, std::string &error);
-    bool restoreForRetry(program::GraphDirection graph, std::string &error);
+    bool restoreForRetry(program::GraphDirection graph, SubmissionRecord &submission, std::string &error);
     bool readbackBoundaryValues(const std::vector<char> &values, std::string &error) const;
 
 private:

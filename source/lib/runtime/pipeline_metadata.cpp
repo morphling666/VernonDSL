@@ -687,7 +687,7 @@ bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProvid
     }
     if (parameter.bindingRole != "storage")
         return false;
-    const auto format = artifactTextureFormat(parameter.exactStorageFormat);
+    const auto format = artifactStorageFormat(parameter.exactStorageFormat);
     if (!format)
         return false;
     layout.storage_image_format = *format;

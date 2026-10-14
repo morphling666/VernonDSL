@@ -215,9 +215,16 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.pipelineLayoutCreations, 1u);
     EXPECT_EQ(firstStats.graphicsPipelineCreations, 1u);
     EXPECT_EQ(firstStats.bindingSnapshotCreations, 1u);
-    EXPECT_EQ(firstStats.commandBufferAllocations, 1u);
+    // The sampled-image upload may still be in flight when the draw begins recording, so command frames and staging
+    // are bounded by the two recordings in flight together rather than fixed.
+    constexpr size_t maxConcurrentRecordings = 2;
+    // Each frame holds its recording and the layout prologue submitted ahead of it.
+    constexpr size_t maxCommandBuffers = maxConcurrentRecordings * 2;
+    EXPECT_GE(firstStats.commandBufferAllocations, 1u);
+    EXPECT_LE(firstStats.commandBufferAllocations, maxCommandBuffers);
     EXPECT_EQ(firstStats.descriptorPoolCreations, 1u);
     EXPECT_GT(firstStats.stagingBufferAllocations, 0u);
+    EXPECT_LE(firstStats.stagingBufferAllocations, maxConcurrentRecordings);
     EXPECT_EQ(firstStats.renderPassCreations, firstStats.dynamicRendering ? 0u : 1u);
     EXPECT_TRUE(firstStats.lastDrawIndexed);
 
@@ -240,9 +247,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.pipelineLayoutCreations, firstStats.pipelineLayoutCreations);
     EXPECT_EQ(secondStats.graphicsPipelineCreations, firstStats.graphicsPipelineCreations);
     EXPECT_EQ(secondStats.bindingSnapshotCreations, firstStats.bindingSnapshotCreations);
-    EXPECT_EQ(secondStats.commandBufferAllocations, firstStats.commandBufferAllocations);
+    EXPECT_LE(secondStats.commandBufferAllocations, maxCommandBuffers);
     EXPECT_EQ(secondStats.descriptorPoolCreations, firstStats.descriptorPoolCreations);
-    EXPECT_EQ(secondStats.stagingBufferAllocations, firstStats.stagingBufferAllocations);
+    EXPECT_LE(secondStats.stagingBufferAllocations, maxConcurrentRecordings);
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
     ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments, std::size(arguments), graphics),
@@ -255,9 +262,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(warmStats.pipelineLayoutCreations, secondStats.pipelineLayoutCreations);
     EXPECT_EQ(warmStats.graphicsPipelineCreations, secondStats.graphicsPipelineCreations);
     EXPECT_EQ(warmStats.bindingSnapshotCreations, secondStats.bindingSnapshotCreations);
-    EXPECT_EQ(warmStats.commandBufferAllocations, secondStats.commandBufferAllocations);
+    EXPECT_LE(warmStats.commandBufferAllocations, maxCommandBuffers);
     EXPECT_EQ(warmStats.descriptorPoolCreations, secondStats.descriptorPoolCreations);
-    EXPECT_EQ(warmStats.stagingBufferAllocations, secondStats.stagingBufferAllocations);
+    EXPECT_LE(warmStats.stagingBufferAllocations, maxConcurrentRecordings);
     EXPECT_EQ(warmStats.renderPassCreations, secondStats.renderPassCreations);
     EXPECT_TRUE(warmStats.lastDrawIndexed);
 

@@ -27,6 +27,75 @@ std::string programLog(Driver &driver, Uint program) {
     return result;
 }
 
+int depthStencilCopyTargetIndex(Enum target) {
+    switch (target) {
+    case kTexture2D:
+        return 0;
+    case kTexture2DArray:
+        return 1;
+    case kTextureCubeMap:
+        return 2;
+    case kTextureCubeMapArray:
+        return 3;
+    default:
+        return -1;
+    }
+}
+
+// Cube targets have no texelFetch, so their copies sample the texel's center through a nearest-filtering sampler,
+// which selects exactly that texel. cubeDirection inverts the face selection of the OpenGL specification's cube map
+// table for face `layer % 6`.
+std::string depthStencilCopySource(Enum target, DepthStencilAspect aspect, const char *version,
+                                   bool cubeArrayExtension) {
+    const bool stencil = aspect == DepthStencilAspect::Stencil;
+    const char *samplerType = "sampler2D";
+    const char *fetch = "texelFetch(source, texel, level).r";
+    if (target == kTexture2DArray) {
+        samplerType = "sampler2DArray";
+        fetch = "texelFetch(source, ivec3(texel, layer), level).r";
+    } else if (target == kTextureCubeMap) {
+        samplerType = "samplerCube";
+        fetch = "textureLod(source, cubeDirection(texel), float(level)).r";
+    } else if (target == kTextureCubeMapArray) {
+        samplerType = "samplerCubeArray";
+        fetch = "textureLod(source, vec4(cubeDirection(texel), float(layer / 6)), float(level)).r";
+    }
+    const bool cube = target == kTextureCubeMap || target == kTextureCubeMapArray;
+    std::string source = std::string("#version ") + version + "\n";
+    if (target == kTextureCubeMapArray && cubeArrayExtension)
+        source += "#extension GL_EXT_texture_cube_map_array : require\n";
+    source += "precision highp float;\n"
+              "precision highp int;\n"
+              "layout(local_size_x = 8, local_size_y = 8) in;\n"
+              "uniform highp ";
+    source += std::string(stencil ? "u" : "") + samplerType + " source;\n";
+    source += "uniform ivec4 region;\n"
+              "uniform int level;\n"
+              "uniform int layer;\n"
+              "layout(std430, binding = 0) writeonly buffer Texels { uint texels[]; };\n";
+    if (cube)
+        source += "vec3 cubeDirection(ivec2 texel) {\n"
+                  "    vec2 c = (vec2(texel) + 0.5) / vec2(textureSize(source, level).xy) * 2.0 - 1.0;\n"
+                  "    switch (layer % 6) {\n"
+                  "    case 0: return vec3(1.0, -c.y, -c.x);\n"
+                  "    case 1: return vec3(-1.0, -c.y, c.x);\n"
+                  "    case 2: return vec3(c.x, 1.0, c.y);\n"
+                  "    case 3: return vec3(c.x, -1.0, -c.y);\n"
+                  "    case 4: return vec3(c.x, -c.y, 1.0);\n"
+                  "    default: return vec3(-c.x, -c.y, -1.0);\n"
+                  "    }\n"
+                  "}\n";
+    source += "void main() {\n"
+              "    ivec2 offset = ivec2(gl_GlobalInvocationID.xy);\n"
+              "    if (offset.x >= region.z || offset.y >= region.w)\n"
+              "        return;\n"
+              "    ivec2 texel = region.xy + offset;\n"
+              "    texels[offset.y * region.z + offset.x] = ";
+    source += stencil ? std::string(fetch) : "floatBitsToUint(" + std::string(fetch) + ")";
+    source += ";\n}\n";
+    return source;
+}
+
 } // namespace
 
 bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallbacks, bool isEmbeddedProfile,
@@ -35,9 +104,13 @@ bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallback
     embeddedProfile = isEmbeddedProfile;
     if (!loadDriver(callbacks, driver, error))
         return false;
-    if (!embeddedProfile &&
-        (callbacks.api_version_major > 3 || (callbacks.api_version_major == 3 && callbacks.api_version_minor >= 2))) {
-        makeCurrent();
+    makeCurrent();
+    Int extensionCount = 0;
+    driver.getIntegerv(kNumExtensions, &extensionCount);
+    for (Int index = 0; index < extensionCount; ++index)
+        if (const unsigned char *name = driver.getStringi(kExtensions, static_cast<Uint>(index)))
+            extensions.emplace_back(reinterpret_cast<const char *>(name));
+    if (!embeddedProfile && apiVersionAtLeast(3, 2)) {
         // Desktop GL otherwise clamps linear filtering at each cube face,
         // exposing discontinuities that Vulkan and D3D12 filter across.
         driver.enable(kTextureCubeMapSeamless);
@@ -58,10 +131,16 @@ bool DeviceState::makeCurrent() const noexcept {
 }
 
 bool DeviceState::supportsCompute() const {
-    return embeddedProfile ? (callbacks.api_version_major > 3 ||
-                              (callbacks.api_version_major == 3 && callbacks.api_version_minor >= 1))
-                           : (callbacks.api_version_major > 4 ||
-                              (callbacks.api_version_major == 4 && callbacks.api_version_minor >= 3));
+    return embeddedProfile ? apiVersionAtLeast(3, 1) : apiVersionAtLeast(4, 3);
+}
+
+bool DeviceState::apiVersionAtLeast(uint32_t major, uint32_t minor) const {
+    return callbacks.api_version_major > major ||
+           (callbacks.api_version_major == major && callbacks.api_version_minor >= minor);
+}
+
+bool DeviceState::hasExtension(std::string_view name) const {
+    return std::find(extensions.begin(), extensions.end(), name) != extensions.end();
 }
 
 bool DeviceState::createBuffer(Buffer &buffer, size_t size, std::string &error) {
@@ -204,7 +283,8 @@ bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel,
     }
     driver.bindFramebuffer(kFramebuffer, framebuffer);
     ++framebufferGeneration;
-    const bool depthStencil = externalFormat == 0x84F9;
+    // Stencil is only ever read from a packed depth-stencil image, which must attach at the depth-stencil point.
+    const bool depthStencil = externalFormat == 0x84F9 || externalFormat == 0x1901;
     const bool depthOnly = externalFormat == 0x1902;
     const Enum attachment = depthStencil ? kDepthStencilAttachment : depthOnly ? kDepthAttachment : kColorAttachment0;
     if (target == kTexture2DArray || target == kTextureCubeMapArray)
@@ -258,6 +338,93 @@ bool DeviceState::downloadImage3D(const Image &image, Int mipLevel, Int x, Int y
     }
     driver.deleteFramebuffers(1, &framebuffer);
     return true;
+}
+
+Uint DeviceState::depthStencilCopyProgram(Enum target, DepthStencilAspect aspect, std::string &error) {
+    const int targetIndex = depthStencilCopyTargetIndex(target);
+    if (targetIndex < 0) {
+        error = "OpenGL depth and stencil copies read 2D, 2D-array, cube and cube-array textures";
+        return 0;
+    }
+    if (!supportsCompute()) {
+        error = embeddedProfile ? "OpenGL ES depth and stencil copies require OpenGL ES 3.1"
+                                : "OpenGL depth and stencil copies require OpenGL 4.3";
+        return 0;
+    }
+    Uint &program = depthStencilCopyPrograms[aspect == DepthStencilAspect::Stencil ? 1 : 0][targetIndex];
+    if (program)
+        return program;
+    const bool embedded32 = embeddedProfile && apiVersionAtLeast(3, 2);
+    const char *version = !embeddedProfile ? "430 core" : embedded32 ? "320 es" : "310 es";
+    const Uint shader = compileShader(
+        kComputeShader, depthStencilCopySource(target, aspect, version, embeddedProfile && !embedded32), error);
+    if (shader)
+        program = linkProgram({shader}, error);
+    return program;
+}
+
+bool DeviceState::copyDepthStencilToBuffer(const Image &image, Enum target, DepthStencilAspect aspect, Int mipLevel,
+                                           Int layer, Int x, Int y, Size width, Size height, const Buffer &destination,
+                                           std::string &error) {
+    if (!image.name || !destination.name || width <= 0 || height <= 0) {
+        error = "invalid OpenGL depth or stencil copy";
+        return false;
+    }
+    makeCurrent();
+    const Uint program = depthStencilCopyProgram(target, aspect, error);
+    if (!program)
+        return false;
+    constexpr Enum textureMagFilter = 0x2800;
+    constexpr Enum textureMinFilter = 0x2801;
+    constexpr Int nearest = 0x2600;
+    // Without a mipmap filter, cube sampling reads the base level whatever textureLod requests.
+    constexpr Int nearestMipmapNearest = 0x2700;
+    if (!depthStencilCopySampler) {
+        driver.genSamplers(1, &depthStencilCopySampler);
+        if (!depthStencilCopySampler) {
+            error = "OpenGL depth and stencil copy sampler creation failed";
+            return false;
+        }
+        driver.samplerParameteri(depthStencilCopySampler, textureMinFilter, nearestMipmapNearest);
+        driver.samplerParameteri(depthStencilCopySampler, textureMagFilter, nearest);
+    }
+    constexpr Enum depthStencilTextureMode = 0x90EA;
+    constexpr Int stencilIndex = 0x1901;
+    constexpr Int depthComponent = 0x1902;
+    const Int region[] = {x, y, width, height};
+    driver.useProgram(program);
+    driver.uniform1i(driver.getUniformLocation(program, "source"), 0);
+    driver.uniform4iv(driver.getUniformLocation(program, "region"), 1, region);
+    driver.uniform1i(driver.getUniformLocation(program, "level"), mipLevel);
+    driver.uniform1i(driver.getUniformLocation(program, "layer"), layer);
+    driver.activeTexture(kTexture0);
+    driver.bindTexture(target, image.name);
+    driver.bindSampler(0, depthStencilCopySampler);
+    if (aspect == DepthStencilAspect::Stencil)
+        driver.texParameteri(target, depthStencilTextureMode, stencilIndex);
+    driver.bindBufferBase(kShaderStorageBuffer, 0, destination.name);
+    driver.dispatchCompute(static_cast<Uint>(width + 7) / 8, static_cast<Uint>(height + 7) / 8, 1);
+    driver.memoryBarrier(kBufferUpdateBarrierBit);
+    if (aspect == DepthStencilAspect::Stencil)
+        driver.texParameteri(target, depthStencilTextureMode, depthComponent);
+    driver.bindBufferBase(kShaderStorageBuffer, 0, 0);
+    driver.bindSampler(0, 0);
+    driver.bindTexture(target, 0);
+    driver.useProgram(0);
+    ++drawStateGeneration;
+    return true;
+}
+
+void DeviceState::destroyDepthStencilCopyObjects() {
+    makeCurrent();
+    for (auto &programs : depthStencilCopyPrograms)
+        for (Uint &program : programs) {
+            destroyProgram(program);
+            program = 0;
+        }
+    if (depthStencilCopySampler)
+        driver.deleteSamplers(1, &depthStencilCopySampler);
+    depthStencilCopySampler = 0;
 }
 
 bool DeviceState::createSampler(Sampler &sampler, Int wrapU, Int wrapV, Int wrapW, Int minFilter, Int magFilter,
@@ -342,25 +509,34 @@ void DeviceState::destroyProgram(Uint program) {
     driver.deleteProgram(program);
 }
 
-bool DeviceState::createGraphicsObjects(Uint &vertexArray, Uint &framebuffer, std::string &error) {
+bool DeviceState::createVertexArray(Uint &vertexArray, std::string &error) {
     makeCurrent();
     driver.genVertexArrays(1, &vertexArray);
-    driver.genFramebuffers(1, &framebuffer);
-    if (vertexArray && framebuffer)
+    if (vertexArray)
         return true;
-    error = "OpenGL graphics object creation failed";
-    destroyGraphicsObjects(vertexArray, framebuffer);
-    vertexArray = 0;
-    framebuffer = 0;
+    error = "OpenGL vertex array creation failed";
     return false;
 }
 
-void DeviceState::destroyGraphicsObjects(Uint vertexArray, Uint framebuffer) {
+void DeviceState::destroyVertexArray(Uint vertexArray) {
+    makeCurrent();
+    if (vertexArray)
+        driver.deleteVertexArrays(1, &vertexArray);
+}
+
+bool DeviceState::createFramebuffer(Uint &framebuffer, std::string &error) {
+    makeCurrent();
+    driver.genFramebuffers(1, &framebuffer);
+    if (framebuffer)
+        return true;
+    error = "OpenGL framebuffer creation failed";
+    return false;
+}
+
+void DeviceState::destroyFramebuffer(Uint framebuffer) {
     makeCurrent();
     if (framebuffer)
         driver.deleteFramebuffers(1, &framebuffer);
-    if (vertexArray)
-        driver.deleteVertexArrays(1, &vertexArray);
 }
 
 } // namespace vernon::rhi::opengl

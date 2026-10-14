@@ -509,19 +509,33 @@ struct ProgramInvocationBuilder {
 
     ProgramInvocationBuilder &rhiColorAttachment(uint32_t location, const nb::object &viewObject,
                                                  uint32_t loadOperation, uint32_t storeOperation,
-                                                 const std::array<float, 4> &clearColor) {
+                                                 const nb::list &clearColor) {
         auto *view = nb::cast<RhiImageView *>(viewObject);
-        if (!view || !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
-            (view->format == VERNON_TEXTURE_D32_FLOAT || view->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
-            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
+        if (!view)
             throw std::invalid_argument("RHI color attachment is null");
+        const vernon::formats::Format *format = vernon::formats::find(view->format);
+        if (!format || vernon::formats::hasDepth(view->format) ||
+            !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT))
+            throw std::invalid_argument("RHI color attachment must be a color-attachment view with a color format");
+        if (loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
+            throw std::invalid_argument("RHI color attachment has an invalid load or store operation");
+        if (nb::len(clearColor) != 4)
+            throw std::invalid_argument("RHI color clear value must have four components");
         VernonColorAttachment attachment{};
+        const vernon::formats::ComponentClass componentClass = format->componentClass;
+        for (size_t index = 0; index < 4; ++index) {
+            if (componentClass == vernon::formats::ComponentClass::Uint)
+                attachment.clear_color.u32[index] = nb::cast<uint32_t>(clearColor[index]);
+            else if (componentClass == vernon::formats::ComponentClass::Sint)
+                attachment.clear_color.i32[index] = nb::cast<int32_t>(clearColor[index]);
+            else
+                attachment.clear_color.f32[index] = nb::cast<float>(clearColor[index]);
+        }
         attachment.location = location;
         if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &attachment.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI color attachment belongs to another Runtime device");
         attachment.load_operation = static_cast<VernonRuntimeProviderLoadOperation>(loadOperation);
         attachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
-        std::copy(clearColor.begin(), clearColor.end(), attachment.clear_color);
         attachments.push_back(attachment);
         renderResourceOwners.push_back(viewObject);
         return *this;
@@ -530,11 +544,16 @@ struct ProgramInvocationBuilder {
     ProgramInvocationBuilder &rhiDepthAttachment(const nb::object &viewObject, uint32_t loadOperation,
                                                  uint32_t storeOperation, float clearDepth) {
         auto *view = nb::cast<RhiImageView *>(viewObject);
-        if (!view || !(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            (view->format != VERNON_TEXTURE_D32_FLOAT && view->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
-            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
-            clearDepth > 1.0f)
-            throw std::invalid_argument("RHI depth attachment must use D32 format");
+        if (!view)
+            throw std::invalid_argument("RHI depth attachment is null");
+        if (!(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
+            !vernon::formats::hasDepth(view->format))
+            throw std::invalid_argument(
+                "RHI depth attachment must be a depth-stencil-attachment view with a depth format");
+        if (loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
+            throw std::invalid_argument("RHI depth attachment has an invalid load or store operation");
+        if (clearDepth < 0.0f || clearDepth > 1.0f)
+            throw std::invalid_argument("RHI depth clear value must be in [0, 1]");
         depthAttachment = {};
         if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &depthAttachment.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI depth attachment belongs to another Runtime device");

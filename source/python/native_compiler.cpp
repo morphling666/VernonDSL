@@ -1,5 +1,6 @@
 #include "native_compiler.h"
 
+#include "VernonFormats.hpp"
 #include "VernonProgramCapabilities.h"
 #include "native_runtime.h"
 #include "runtime/dirty_range_set.h"
@@ -48,7 +49,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .value("PARSE_ERROR", VERNON_STATUS_PARSE_ERROR)
         .value("VERIFICATION_ERROR", VERNON_STATUS_VERIFICATION_ERROR)
         .value("UNSUPPORTED_TARGET", VERNON_STATUS_UNSUPPORTED_TARGET)
-        .value("INTERNAL_ERROR", VERNON_STATUS_INTERNAL_ERROR);
+        .value("INTERNAL_ERROR", VERNON_STATUS_INTERNAL_ERROR)
+        .value("NOT_READY", VERNON_STATUS_NOT_READY);
     nb::enum_<VernonRuntimeBackend>(module, "RuntimeBackend")
         .value("CPU", VERNON_RUNTIME_CPU)
         .value("CUDA", VERNON_RUNTIME_CUDA)
@@ -68,19 +70,9 @@ void bindNativeCompiler(nb::module_ &module) {
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)
         .value("POINT_LIST", VERNON_TOPOLOGY_POINT_LIST);
-    nb::enum_<VernonTextureFormat>(module, "TextureFormat")
-        .value("RGBA8_UNORM", VERNON_TEXTURE_RGBA8_UNORM)
-        .value("RGBA8_SRGB", VERNON_TEXTURE_RGBA8_SRGB)
-        .value("RGBA16_FLOAT", VERNON_TEXTURE_RGBA16_FLOAT)
-        .value("RGBA32_FLOAT", VERNON_TEXTURE_RGBA32_FLOAT)
-        .value("R8_UNORM", VERNON_TEXTURE_R8_UNORM)
-        .value("R16_FLOAT", VERNON_TEXTURE_R16_FLOAT)
-        .value("R32_FLOAT", VERNON_TEXTURE_R32_FLOAT)
-        .value("RG8_UNORM", VERNON_TEXTURE_RG8_UNORM)
-        .value("RGB8_UNORM", VERNON_TEXTURE_RGB8_UNORM)
-        .value("R11G11B10_FLOAT", VERNON_TEXTURE_R11G11B10_FLOAT)
-        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT)
-        .value("D32_FLOAT_S8_UINT", VERNON_TEXTURE_D32_FLOAT_S8_UINT);
+    nb::enum_<VernonTextureFormat> textureFormat(module, "TextureFormat");
+#define VERNON_FORMAT(name, NAME, ...) textureFormat.value(#NAME, VERNON_TEXTURE_##NAME);
+#include "VernonFormats.def"
     nb::enum_<VernonTextureDimension>(module, "TextureDimension")
         .value("TEXTURE_2D", VERNON_TEXTURE_2D)
         .value("TEXTURE_3D", VERNON_TEXTURE_3D)
@@ -203,10 +195,7 @@ void bindNativeCompiler(nb::module_ &module) {
                 mipLevelCount = mipLevelCount ? mipLevelCount : image.mipLevels - baseMipLevel;
                 arrayLayerCount = arrayLayerCount ? arrayLayerCount : image.layers - baseArrayLayer;
                 if (!aspects)
-                    aspects = image.format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
-                              : image.format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                                  ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
-                                  : VERNON_RHI_IMAGE_ASPECT_COLOR;
+                    aspects = vernon::formats::aspects(image.format);
                 return std::make_unique<RhiImageView>(&image, viewFormat, viewDimension, baseMipLevel, mipLevelCount,
                                                       baseArrayLayer, arrayLayerCount, aspects);
             },

@@ -1,6 +1,7 @@
 #ifndef VERNON_RHI_IMAGE_DATA_LAYOUT_H
 #define VERNON_RHI_IMAGE_DATA_LAYOUT_H
 
+#include "VernonFormats.hpp"
 #include "VernonRHI.h"
 
 #include <cstring>
@@ -12,40 +13,15 @@ namespace vernon::rhi {
 inline constexpr size_t packedDepthStencilPixelSize = 8;
 
 inline constexpr size_t imageFormatPixelSize(VernonRhiFormat format) {
-    switch (format) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return 1;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return 2;
-    case VERNON_RHI_FORMAT_RGB8_UNORM:
-        return 3;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-    case VERNON_RHI_FORMAT_RGBA8_SRGB:
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
-    case VERNON_RHI_FORMAT_D32_FLOAT:
-        return 4;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-    case VERNON_RHI_FORMAT_RG32_FLOAT:
-    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
-        return 8;
-    case VERNON_RHI_FORMAT_RGB32_FLOAT:
-        return 12;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return 16;
-    default:
-        return 0;
-    }
+    const formats::Format *entry = formats::find(format);
+    return entry ? entry->pixelBytes : 0;
 }
 
 inline constexpr uint32_t imageMipExtent(uint32_t extent, uint32_t mipLevel) {
     return (extent >> mipLevel) ? extent >> mipLevel : 1;
 }
 
-inline std::optional<size_t> imageRegionByteSize(VernonRhiFormat format, uint32_t width, uint32_t height,
-                                                 uint32_t depth = 1) {
-    const size_t pixelSize = imageFormatPixelSize(format);
+inline std::optional<size_t> regionByteSize(size_t pixelSize, uint32_t width, uint32_t height, uint32_t depth) {
     if (!pixelSize || !width || !height || !depth || width > (std::numeric_limits<size_t>::max)() / height)
         return std::nullopt;
     size_t pixels = static_cast<size_t>(width) * height;
@@ -55,6 +31,11 @@ inline std::optional<size_t> imageRegionByteSize(VernonRhiFormat format, uint32_
     if (pixels > (std::numeric_limits<size_t>::max)() / pixelSize)
         return std::nullopt;
     return pixels * pixelSize;
+}
+
+inline std::optional<size_t> imageRegionByteSize(VernonRhiFormat format, uint32_t width, uint32_t height,
+                                                 uint32_t depth = 1) {
+    return regionByteSize(imageFormatPixelSize(format), width, height, depth);
 }
 
 inline std::optional<size_t> imageMipByteSize(const VernonRhiImageDescriptor &descriptor, uint32_t mipLevel) {
@@ -65,45 +46,30 @@ inline std::optional<size_t> imageMipByteSize(const VernonRhiImageDescriptor &de
         descriptor.dimension == VERNON_RHI_IMAGE_3D ? imageMipExtent(descriptor.depth, mipLevel) : descriptor.depth);
 }
 
+inline std::optional<size_t> imageByteSize(const VernonRhiImageDescriptor &descriptor) {
+    size_t layer = 0;
+    for (uint32_t mipLevel = 0; mipLevel < descriptor.mip_levels; ++mipLevel) {
+        const std::optional<size_t> mip = imageMipByteSize(descriptor, mipLevel);
+        if (!mip || *mip > (std::numeric_limits<size_t>::max)() - layer)
+            return std::nullopt;
+        layer += *mip;
+    }
+    const size_t layers = descriptor.array_layers ? descriptor.array_layers : 1;
+    if (!layer || layer > (std::numeric_limits<size_t>::max)() / layers)
+        return std::nullopt;
+    return layer * layers;
+}
+
 inline constexpr bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
                                           VernonRhiImageDataType sourceType) {
-    switch (destination) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RED && sourceType == VERNON_RHI_IMAGE_DATA_UINT8;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RG && sourceType == VERNON_RHI_IMAGE_DATA_UINT8;
-    case VERNON_RHI_FORMAT_RGB8_UNORM:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGB && sourceType == VERNON_RHI_IMAGE_DATA_UINT8;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-    case VERNON_RHI_FORMAT_RGBA8_SRGB:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGBA && sourceType == VERNON_RHI_IMAGE_DATA_UINT8;
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RED && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT16;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGBA && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT16;
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RED && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    case VERNON_RHI_FORMAT_RG32_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RG && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    case VERNON_RHI_FORMAT_RGB32_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGB && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGBA && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_RGB && sourceType == VERNON_RHI_IMAGE_DATA_UINT32;
-    case VERNON_RHI_FORMAT_D32_FLOAT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_DEPTH && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
-        return sourceFormat == VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL && sourceType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    default:
-        return false;
-    }
+    const formats::Format *entry = formats::find(destination);
+    return entry && entry->dataFormat == sourceFormat && entry->dataType == sourceType;
 }
 
 inline constexpr bool imageTransferAspectMatches(VernonRhiFormat format, uint32_t aspect,
                                                  VernonRhiImageDataFormat dataFormat, VernonRhiImageDataType dataType) {
     if (!uploadLayoutMatches(format, dataFormat, dataType)) {
-        if (format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
+        if (!formats::hasDepth(format) || !formats::hasStencil(format))
             return false;
         if (aspect == VERNON_RHI_IMAGE_ASPECT_DEPTH)
             return dataFormat == VERNON_RHI_IMAGE_DATA_DEPTH && dataType == VERNON_RHI_IMAGE_DATA_FLOAT32;
@@ -111,15 +77,11 @@ inline constexpr bool imageTransferAspectMatches(VernonRhiFormat format, uint32_
             return dataFormat == VERNON_RHI_IMAGE_DATA_STENCIL && dataType == VERNON_RHI_IMAGE_DATA_UINT8;
         return false;
     }
-    if (format == VERNON_RHI_FORMAT_D32_FLOAT)
-        return aspect == VERNON_RHI_IMAGE_ASPECT_DEPTH;
-    if (format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
-        return aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
-    return aspect == VERNON_RHI_IMAGE_ASPECT_COLOR;
+    return aspect == formats::aspects(format);
 }
 
 inline constexpr size_t imageTransferPixelSize(VernonRhiFormat format, uint32_t aspect) {
-    if (format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+    if (formats::hasDepth(format) && formats::hasStencil(format)) {
         if (aspect == VERNON_RHI_IMAGE_ASPECT_DEPTH)
             return sizeof(float);
         if (aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL)
@@ -130,16 +92,7 @@ inline constexpr size_t imageTransferPixelSize(VernonRhiFormat format, uint32_t 
 
 inline std::optional<size_t> imageTransferRegionByteSize(VernonRhiFormat format, uint32_t aspect, uint32_t width,
                                                          uint32_t height, uint32_t depth = 1) {
-    const size_t pixelSize = imageTransferPixelSize(format, aspect);
-    if (!pixelSize || !width || !height || !depth || width > (std::numeric_limits<size_t>::max)() / height)
-        return std::nullopt;
-    size_t pixels = static_cast<size_t>(width) * height;
-    if (pixels > (std::numeric_limits<size_t>::max)() / depth)
-        return std::nullopt;
-    pixels *= depth;
-    if (pixels > (std::numeric_limits<size_t>::max)() / pixelSize)
-        return std::nullopt;
-    return pixels * pixelSize;
+    return regionByteSize(imageTransferPixelSize(format, aspect), width, height, depth);
 }
 
 inline std::optional<size_t> imageDownloadByteSize(const VernonRhiImageDescriptor &image,

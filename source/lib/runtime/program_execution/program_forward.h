@@ -20,6 +20,8 @@ struct InvocationSnapshot;
 
 namespace vernon::runtime::program_execution {
 
+class SubmissionRecord;
+
 enum class PullbackTransferError {
     LifecycleUnavailable,
     AllocationFailure,
@@ -28,7 +30,7 @@ enum class PullbackTransferError {
 VernonStatus
 forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
                          size_t argumentCount, VernonPullback *&pullback, InvocationMutationOutcome &outcome,
-                         const ProgramInvocationContext *programContext = nullptr,
+                         SubmissionRecord &submission, const ProgramInvocationContext *programContext = nullptr,
                          std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks = nullptr,
                          bool retainPullback = true);
 void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const program::InvocationSnapshot> snapshot);

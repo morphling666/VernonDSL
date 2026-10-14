@@ -26,6 +26,7 @@ _RUNTIME_ORACLES_BY_SUITE = {
             RuntimeOracleKind.GRAPHICS_TRIANGLE,
             RuntimeOracleKind.FAN_OUT_VJP,
             RuntimeOracleKind.SIGNED_STRIDE_VJP,
+            RuntimeOracleKind.FRAGMENT_DISCARD,
         }
     ),
     AcceptanceSuite.SYNCHRONIZATION: frozenset({RuntimeOracleKind.SYNCHRONIZATION}),

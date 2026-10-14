@@ -227,8 +227,41 @@ typedef struct VernonRuntimeProviderColorAttachment {
     VernonRuntimeProviderResourceReference view;
     VernonRuntimeProviderLoadOperation load_operation;
     VernonRuntimeProviderStoreOperation store_operation;
-    float clear_color[4];
+    VernonClearColor clear_color;
 } VernonRuntimeProviderColorAttachment;
+
+typedef struct VernonRuntimeProviderDepthStencilAttachment {
+    VernonRuntimeProviderResourceReference view;
+    VernonRuntimeProviderLoadOperation depth_load_operation;
+    VernonRuntimeProviderStoreOperation depth_store_operation;
+    float clear_depth;
+    VernonRuntimeProviderLoadOperation stencil_load_operation;
+    VernonRuntimeProviderStoreOperation stencil_store_operation;
+    uint32_t clear_stencil;
+} VernonRuntimeProviderDepthStencilAttachment;
+
+/*
+ * The attachments that draws between begin_rendering and end_rendering render
+ * into. Load operations apply when the scope begins and store operations when
+ * it ends; render_area is {x, y, width, height}.
+ *
+ * sampled_images lists the images and image views the scope's draws sample;
+ * they must not overlap an attachment. The provider makes them readable
+ * before the scope opens, because backends such as Vulkan cannot change an
+ * image's layout inside a render pass: a draw may fail when it samples an
+ * image that is not listed and not already readable.
+ */
+typedef struct VernonRuntimeProviderRenderingDescriptor {
+    uint32_t struct_size;
+    const VernonRuntimeProviderColorAttachment *color_attachments;
+    size_t color_attachment_count;
+    const VernonRuntimeProviderDepthStencilAttachment *depth_stencil_attachment;
+    uint32_t render_area[4];
+    uint32_t layers;
+    const VernonRuntimeProviderResourceReference *sampled_images;
+    size_t sampled_image_count;
+    uint32_t reserved[4];
+} VernonRuntimeProviderRenderingDescriptor;
 
 typedef struct VernonRuntimeProviderDrawDescriptor {
     uint32_t struct_size;
@@ -236,31 +269,24 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
     VernonRuntimeProviderObject bindings;
     uint32_t vertex_count;
     uint32_t instance_count;
-    uint32_t first_vertex;
     uint32_t first_instance;
-    const VernonRuntimeProviderColorAttachment *color_attachments;
-    size_t color_attachment_count;
-    VernonRuntimeProviderResourceReference depth_stencil_view;
-    VernonRuntimeProviderLoadOperation depth_load_operation;
-    VernonRuntimeProviderStoreOperation depth_store_operation;
-    float clear_depth;
+    /* Indexed draws only: added to each index before vertex fetch. */
+    int32_t base_vertex;
     uint32_t viewport[4];
     uint32_t scissor[4];
     uint32_t topology;
     VernonRuntimeProviderResourceReference index_buffer;
     uint32_t index_count;
     uint32_t index_type;
-    VernonRuntimeProviderLoadOperation stencil_load_operation;
-    VernonRuntimeProviderStoreOperation stencil_store_operation;
-    uint32_t clear_stencil;
     uint32_t stencil_reference;
-    uint32_t render_area[4];
 } VernonRuntimeProviderDrawDescriptor;
 
 /*
- * Preparation callbacks may allocate. encode_dispatch and encode_draw are the
- * invocation hot path and must not parse, perform name lookup, create stable
- * objects, or make unbounded heap allocations.
+ * Preparation callbacks may allocate. encode_dispatch, encode_draw and the
+ * rendering callbacks are the invocation hot path and must not parse, perform
+ * name lookup, create stable objects, or make unbounded heap allocations.
+ * encode_draw is called only inside a rendering scope, and a scope may contain
+ * no draws.
  */
 typedef struct VernonRuntimeDeviceProvider {
     uint32_t struct_size;
@@ -289,6 +315,9 @@ typedef struct VernonRuntimeDeviceProvider {
                                     const VernonRuntimeProviderDispatchDescriptor *descriptor);
     VernonStatus (*encode_draw)(void *user_data, VernonRuntimeProviderObject command_encoder,
                                 const VernonRuntimeProviderDrawDescriptor *descriptor);
+    VernonStatus (*begin_rendering)(void *user_data, VernonRuntimeProviderObject command_encoder,
+                                    const VernonRuntimeProviderRenderingDescriptor *descriptor);
+    VernonStatus (*end_rendering)(void *user_data, VernonRuntimeProviderObject command_encoder);
 
     void (*destroy_shader)(void *user_data, VernonRuntimeProviderObject shader);
     void (*destroy_pipeline_layout)(void *user_data, VernonRuntimeProviderObject layout);

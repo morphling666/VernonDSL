@@ -16,6 +16,15 @@ using Size = int;
 using SizePtr = std::intptr_t;
 using IntPtr = std::intptr_t;
 using Uint = unsigned int;
+using Uint64 = std::uint64_t;
+using Sync = struct OpaqueSync *;
+
+constexpr Enum kSyncGpuCommandsComplete = 0x9117;
+constexpr Bitfield kSyncFlushCommandsBit = 0x00000001;
+constexpr Enum kAlreadySignaled = 0x911A;
+constexpr Enum kTimeoutExpired = 0x911B;
+constexpr Enum kConditionSatisfied = 0x911C;
+constexpr Uint64 kTimeoutIgnored = ~Uint64{0};
 
 constexpr Enum kArrayBuffer = 0x8892;
 constexpr Enum kElementArrayBuffer = 0x8893;
@@ -53,6 +62,10 @@ constexpr Enum kTexture2DArray = 0x8C1A;
 constexpr Enum kTextureCubeMapArray = 0x9009;
 constexpr Enum kTextureCubeMapPositiveX = 0x8515;
 constexpr Enum kTextureCubeMapSeamless = 0x884F;
+constexpr Enum kExtensions = 0x1F03;
+constexpr Enum kNumExtensions = 0x821D;
+constexpr Enum kRenderbuffer = 0x8D41;
+constexpr Enum kNumSampleCounts = 0x9380;
 constexpr Enum kTexture0 = 0x84C0;
 constexpr Enum kFramebuffer = 0x8D40;
 constexpr Enum kReadFramebuffer = 0x8CA8;
@@ -75,6 +88,8 @@ constexpr Enum kStencilTest = 0x0B90;
 constexpr Enum kCullFace = 0x0B44;
 constexpr Enum kBlend = 0x0BE2;
 constexpr Enum kScissorTest = 0x0C11;
+constexpr Enum kFront = 0x0404;
+constexpr Enum kBack = 0x0405;
 constexpr Enum kLess = 0x0201;
 constexpr Enum kTriangles = 0x0004;
 constexpr Enum kLines = 0x0001;
@@ -115,6 +130,9 @@ struct Driver {
     void(VERNON_GL_CALL *deleteProgram)(Uint){};
     void(VERNON_GL_CALL *useProgram)(Uint){};
     void(VERNON_GL_CALL *getIntegerv)(Enum, Int *){};
+    const unsigned char *(VERNON_GL_CALL *getStringi)(Enum, Uint){};
+    // Null below OpenGL 4.2; OpenGL ES 3.0 has it.
+    void(VERNON_GL_CALL *getInternalformativ)(Enum, Enum, Enum, Size, Int *){};
     void(VERNON_GL_CALL *genBuffers)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteBuffers)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindBuffer)(Enum, Uint){};
@@ -147,6 +165,7 @@ struct Driver {
     void(VERNON_GL_CALL *invalidateFramebuffer)(Enum, Size, const Enum *){};
     void(VERNON_GL_CALL *clearBufferfv)(Enum, Int, const float *){};
     void(VERNON_GL_CALL *clearBufferiv)(Enum, Int, const Int *){};
+    void(VERNON_GL_CALL *clearBufferuiv)(Enum, Int, const Uint *){};
     void(VERNON_GL_CALL *clearBufferfi)(Enum, Int, float, Int){};
     void(VERNON_GL_CALL *enable)(Enum){};
     void(VERNON_GL_CALL *disable)(Enum){};
@@ -171,6 +190,7 @@ struct Driver {
     void(VERNON_GL_CALL *drawArrays)(Enum, Int, Size){};
     void(VERNON_GL_CALL *drawArraysInstanced)(Enum, Int, Size, Size){};
     void(VERNON_GL_CALL *drawElementsInstanced)(Enum, Size, Enum, const void *, Size){};
+    void(VERNON_GL_CALL *drawElementsInstancedBaseVertex)(Enum, Size, Enum, const void *, Size, Int){};
     Int(VERNON_GL_CALL *getUniformLocation)(Uint, const char *) {};
     Uint(VERNON_GL_CALL *getUniformBlockIndex)(Uint, const char *) {};
     void(VERNON_GL_CALL *uniformBlockBinding)(Uint, Uint, Uint){};
@@ -219,6 +239,9 @@ struct Driver {
     void(VERNON_GL_CALL *dispatchCompute)(Uint, Uint, Uint){};
     void(VERNON_GL_CALL *memoryBarrier)(unsigned){};
     void(VERNON_GL_CALL *finish)(){};
+    Sync(VERNON_GL_CALL *fenceSync)(Enum, Bitfield) {};
+    Enum(VERNON_GL_CALL *clientWaitSync)(Sync, Bitfield, Uint64) {};
+    void(VERNON_GL_CALL *deleteSync)(Sync){};
 };
 
 #undef VERNON_GL_CALL

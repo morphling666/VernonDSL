@@ -13,9 +13,6 @@
 namespace vernon::rhi::metal {
 
 uint32_t pixelFormat(VernonRhiFormat format);
-size_t bytesPerPixel(VernonRhiFormat format);
-bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
-                         VernonRhiImageDataType sourceType);
 
 struct Buffer {
     id<MTLBuffer> buffer;
@@ -33,29 +30,11 @@ struct Sampler {
     id<MTLSamplerState> sampler;
 };
 
-struct RenderAttachmentSignature {
-    uint64_t identity{};
-    uint64_t resource{};
-    uint32_t location{};
-    uint32_t format{};
-    uint32_t load{};
-    uint32_t store{};
-    uint32_t sampleCount{};
-
-    bool operator==(const RenderAttachmentSignature &other) const {
-        return identity == other.identity && resource == other.resource && location == other.location &&
-               format == other.format && load == other.load && store == other.store && sampleCount == other.sampleCount;
-    }
-};
-
+// The open scope's encoder, which a clear inside the scope replaces; textures are indexed by location.
 struct RenderingState {
     id<MTLRenderCommandEncoder> encoder;
     std::array<id<MTLTexture>, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTextures{};
     id<MTLTexture> depthStencilTexture;
-    std::array<RenderAttachmentSignature, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
-    RenderAttachmentSignature depth{};
-    size_t colorCount{};
-    bool hasDepth{};
 };
 
 struct VERNON_RHI_CAPI DeviceState {

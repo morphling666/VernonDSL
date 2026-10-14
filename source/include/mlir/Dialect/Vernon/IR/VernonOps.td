@@ -160,6 +160,18 @@ def Vernon_BarrierOp : Vernon_Op<"barrier"> {
   let hasVerifier = 1;
 }
 
+def Vernon_DiscardFragmentOp : Vernon_Op<"discard_fragment"> {
+  let summary = "Terminate the fragment invocation without writing any output";
+  let description = [{
+    No later operation of the invocation executes, and the fragment writes no
+    color, depth, or stencil output. It is not an MLIR terminator because the
+    structured region that contains it still ends with its own yield; target
+    lowering ends the target block at this operation. Valid only in a fragment
+    entry or in a helper that is inlined into one.
+  }];
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Internal logical autodiff protocol
 //===----------------------------------------------------------------------===//

@@ -1,5 +1,6 @@
 #include "runtime_pipeline_backend.h"
 
+#include "VernonFormats.hpp"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_opengl.h"
 #include "compute_launch_planner.h"
@@ -239,10 +240,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
     formats.reserve(plan.attachments.size());
     for (VernonTextureFormat format : plan.attachmentFormats)
         formats.push_back(static_cast<uint32_t>(format));
-    const uint32_t depthFormat = !plan.depthAttachment ? 0
-                                 : plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                                     ? rhi::opengl::kDepth32fStencil8
-                                     : rhi::opengl::kDepthComponent32f;
+    const vernon::formats::Format *depth = plan.depthAttachment ? vernon::formats::find(plan.depthFormat) : nullptr;
+    const uint32_t depthFormat = depth ? depth->glInternalFormat : 0;
     PreparedGraphicsDraw prepared;
     if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
                              state.rhiValues, prepared, invocationDiagnostic(*pipeline.context)))

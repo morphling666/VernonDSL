@@ -15,7 +15,6 @@ enum class CommandNodeKind : uint8_t {
     Transfer,
     Checkpoint,
     Replay,
-    Status,
     Derivative,
 };
 

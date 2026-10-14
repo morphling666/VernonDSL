@@ -10,6 +10,8 @@ from unittest import mock
 import vernon_dsl as vd
 from language_contract_cases import (
     ENTRY_SIGNATURE_INVALID_CASES,
+    FRAGMENT_DISCARD_INVALID_CASES,
+    FRAGMENT_DISCARD_VALID_CASES,
     FRONTEND_BOUNDARY_CASES,
     FRONTEND_IR_SOURCE_CASES,
     HELPER_SPECIALIZATION_INVALID_CASES,
@@ -23,7 +25,12 @@ from language_contract_cases import (
     TUPLE_INDEX_INVALID_CASES,
     case_by_id,
 )
-from language_contract_runner import assert_frontend_ir, assert_frontend_rejects, assert_verified_ir
+from language_contract_runner import (
+    assert_frontend_ir,
+    assert_frontend_rejects,
+    assert_verified_ir,
+    contract_oracle,
+)
 from language_contract_traceability import covers_case, covers_case_group
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
@@ -37,6 +44,7 @@ from vernon_dsl.frontend.model import (
     ConcreteType,
     Effect,
     EffectScope,
+    FragmentDiscardEffect,
     MemoryOrdering,
     ResourceEffect,
     StorageEffect,
@@ -731,6 +739,44 @@ class LanguageVersionTests(unittest.TestCase):
             with self.subTest(atomic_kind=atomic_kind):
                 self.assertEqual(output.count(f'atomic_kind = "{atomic_kind}"'), 1)
         self.assertEqual(output.count('"vernon.barrier"'), 2)
+
+    @covers_case_group("FRAGMENT_DISCARD_VALID_CASES", layers="FI")
+    def test_fragment_discard_lowers_to_the_dialect_operation(self) -> None:
+        for case in FRAGMENT_DISCARD_VALID_CASES:
+            assert_frontend_ir(self, case)
+
+    @covers_case_group("FRAGMENT_DISCARD_INVALID_CASES", layers="F")
+    def test_fragment_discard_rejects_non_fragment_reachability(self) -> None:
+        for case in FRAGMENT_DISCARD_INVALID_CASES:
+            assert_frontend_rejects(self, case)
+
+    @covers_case("LANG-DISCARD-002/loop-and-helper", layers="FI")
+    @covers_case("LANG-DISCARD-003/unreachable-statements", layers="F")
+    def test_fragment_discard_effect_propagates_and_terminates_the_block(self) -> None:
+        helper_case = case_by_id("LANG-DISCARD-002/loop-and-helper")
+        unreachable_case = case_by_id("LANG-DISCARD-003/unreachable-statements")
+        with tempfile.TemporaryDirectory() as directory:
+            helper_path = Path(directory) / "helper.py"
+            helper_path.write_text(helper_case.source, encoding="utf-8")
+            helper_result = Compiler().compile_request(FrontendCompileRequest(helper_path, "main"))
+            unreachable_path = Path(directory) / "unreachable.py"
+            unreachable_path.write_text(unreachable_case.source, encoding="utf-8")
+            unreachable_result = Compiler().compile_request(FrontendCompileRequest(unreachable_path, "main"))
+
+        assert_verified_ir(self, helper_result.mlir, helper_case)
+        functions = {function.qualified_name: function for function in helper_result.typed_functions}
+        self.assertIn(FragmentDiscardEffect(), functions["drop"].effects)
+        self.assertIn(FragmentDiscardEffect(), functions["main"].effects)
+        self.assertEqual(typed_effect_data(FragmentDiscardEffect()), {"kind": "fragment_discard"})
+
+        branch = unreachable_result.typed_functions[0].body[1]
+        self.assertEqual(
+            [statement.termination for statement in branch.children],
+            [Termination.DISCARD],
+        )
+        self.assertEqual(branch.termination, Termination.FALLTHROUGH)
+        with contract_oracle(unreachable_case):
+            self.assertNotIn("7.0", unreachable_result.mlir)
 
     @covers_case("LANG-WORKGROUP-001/rank-zero", layers="FI")
     def test_rank_zero_workgroup_storage_models_one_scalar(self) -> None:

@@ -240,7 +240,7 @@ struct StageBindingPlan {
 const MetadataCarrier *stageMetadataCarrier(const StageBindingPlan &plan, const std::string &module);
 
 std::optional<VernonTextureDimension> artifactTextureDimension(const std::string &dimension);
-std::optional<VernonTextureFormat> artifactTextureFormat(const std::string &format);
+std::optional<VernonTextureFormat> artifactStorageFormat(const std::string &format);
 
 bool parseArtifactValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 bool parseArtifactInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);

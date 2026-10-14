@@ -1,5 +1,7 @@
 #include "prepared_graphics_draw.h"
 
+#include "VernonFormats.hpp"
+
 #include <algorithm>
 
 namespace vernon::runtime {
@@ -15,18 +17,7 @@ bool prepareGraphicsDraw(const VernonStageInvocationDescriptor &source, const Pl
         return false;
     }
     prepared = {};
-    for (size_t index = 0; index < plan.attachments.size(); ++index) {
-        const VernonColorAttachment &attachment = *plan.attachments[index];
-        auto &target = prepared.attachments[index];
-        target.location = attachment.location;
-        target.view = attachment.view;
-        target.load_operation = attachment.load_operation;
-        target.store_operation = attachment.store_operation;
-        std::copy(std::begin(attachment.clear_color), std::end(attachment.clear_color), target.clear_color);
-    }
-    if (plan.depthAttachment)
-        prepared.depthAttachment = plan.depthAttachment->view;
-    const bool hasStencil = plan.depthAttachment && plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    const bool hasStencil = plan.depthAttachment && vernon::formats::hasStencil(plan.depthFormat);
     if (!planGraphicsState(source, attachmentFormats.size(), plan.depthAttachment != nullptr, hasStencil,
                            prepared.graphicsState, error))
         return false;
@@ -52,28 +43,25 @@ bool prepareGraphicsDraw(const VernonStageInvocationDescriptor &source, const Pl
     draw.command_encoder = source.command_encoder;
     draw.vertex_count = plan.vertexCount;
     draw.instance_count = plan.instanceCount;
-    draw.color_attachments = prepared.attachments.data();
-    draw.color_attachment_count = plan.attachments.size();
-    draw.depth_stencil_view = prepared.depthAttachment;
-    draw.depth_load_operation =
-        plan.depthAttachment ? plan.depthAttachment->load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
-    draw.depth_store_operation =
-        plan.depthAttachment ? plan.depthAttachment->store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
-    draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
-    draw.stencil_load_operation =
-        hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
-    draw.stencil_store_operation =
-        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
-    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
+    draw.first_instance = plan.firstInstance;
     draw.stencil_reference = prepared.graphicsState.stencilReference;
     std::copy(std::begin(plan.viewport), std::end(plan.viewport), draw.viewport);
     std::copy(std::begin(plan.scissor), std::end(plan.scissor), draw.scissor);
     draw.topology = plan.topology;
     if (plan.indexBinding) {
-        draw.index_buffer = plan.indexBinding->resource;
-        draw.index_buffer.offset += plan.indexBinding->offset;
-        draw.index_count = plan.indexBinding->index_count;
-        draw.index_type = plan.indexBinding->type;
+        const VernonIndexBinding &index = *plan.indexBinding;
+        const uint64_t indexBytes = static_cast<uint64_t>(index.index_count) * sizeof(uint32_t);
+        if (index.offset > index.resource.size || indexBytes > index.resource.size - index.offset ||
+            index.resource.offset > UINT64_MAX - index.offset) {
+            error = "index binding exceeds its index buffer";
+            return false;
+        }
+        draw.index_buffer = index.resource;
+        draw.index_buffer.offset += index.offset;
+        draw.index_buffer.size -= index.offset;
+        draw.index_count = index.index_count;
+        draw.index_type = index.type;
+        draw.base_vertex = index.base_vertex;
     }
     return true;
 }

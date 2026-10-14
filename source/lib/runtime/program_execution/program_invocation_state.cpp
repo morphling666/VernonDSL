@@ -1,6 +1,8 @@
 #include "program_invocation_state.h"
 
+#include "rhi/image_data_layout.h"
 #include "runtime/runtime_state.h"
+#include "submission_queue.h"
 
 #include <algorithm>
 #include <array>
@@ -276,6 +278,7 @@ ProgramInvocationResult<void> ProgramInvocationState::allocateOwnedImageStorages
                                 {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}};
         if (vernonRhiDeviceCreateImage(imageDevice_, &imageDescriptor, &owned.image) != VERNON_RHI_STATUS_OK)
             return ProgramInvocationResult<void>{vernon::err(ProgramInvocationError::ImageStorageAllocationFailed)};
+        TransientAllocationMeter::charge(context, rhi::imageByteSize(imageDescriptor).value_or(0));
         VernonRhiImageViewDescriptor viewDescriptor{};
         viewDescriptor.struct_size = sizeof(viewDescriptor);
         viewDescriptor.image = owned.image;

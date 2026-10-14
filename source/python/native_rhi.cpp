@@ -18,33 +18,10 @@ namespace {
 std::string stringView(VernonStringView view) { return view.data ? std::string(view.data, view.size) : std::string(); }
 
 VernonRhiFormat rhiFormat(VernonTextureFormat format) {
-    switch (format) {
-    case VERNON_TEXTURE_RGBA8_UNORM:
-        return VERNON_RHI_FORMAT_RGBA8_UNORM;
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        return VERNON_RHI_FORMAT_RGBA8_SRGB;
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        return VERNON_RHI_FORMAT_RGBA16_FLOAT;
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        return VERNON_RHI_FORMAT_RGBA32_FLOAT;
-    case VERNON_TEXTURE_R8_UNORM:
-        return VERNON_RHI_FORMAT_R8_UNORM;
-    case VERNON_TEXTURE_R16_FLOAT:
-        return VERNON_RHI_FORMAT_R16_FLOAT;
-    case VERNON_TEXTURE_R32_FLOAT:
-        return VERNON_RHI_FORMAT_R32_FLOAT;
-    case VERNON_TEXTURE_RG8_UNORM:
-        return VERNON_RHI_FORMAT_RG8_UNORM;
-    case VERNON_TEXTURE_RGB8_UNORM:
-        return VERNON_RHI_FORMAT_RGB8_UNORM;
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
-    case VERNON_TEXTURE_D32_FLOAT:
-        return VERNON_RHI_FORMAT_D32_FLOAT;
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
-    }
-    throw std::invalid_argument("unsupported attachment image format");
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    if (!entry)
+        throw std::invalid_argument("unsupported attachment image format");
+    return entry->rhi;
 }
 
 VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
@@ -252,10 +229,7 @@ void RhiImage::upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX
         arrayLayerCount > layers - baseArrayLayer)
         throw std::invalid_argument("RHI image upload region is out of range");
     if (!aspects)
-        aspects = format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
-                  : format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                      ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
-                      : VERNON_RHI_IMAGE_ASPECT_COLOR;
+        aspects = vernon::formats::aspects(format);
     const Layout layout = dataLayout(format, aspects);
     const size_t layerSize = checkedByteSize(uploadWidth, uploadHeight, uploadDepth, layout.pixelSize);
     if (data.size() != layerSize * arrayLayerCount)
@@ -328,10 +302,7 @@ nb::bytes RhiImage::download(uint32_t mipLevel, uint32_t offsetX, uint32_t offse
         arrayLayerCount > layers - baseArrayLayer)
         throw std::invalid_argument("RHI image download region is out of range");
     if (!aspects)
-        aspects = format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
-                  : format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                      ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
-                      : VERNON_RHI_IMAGE_ASPECT_COLOR;
+        aspects = vernon::formats::aspects(format);
     const Layout layout = dataLayout(format, aspects);
     const size_t layerSize = checkedByteSize(downloadWidth, downloadHeight, downloadDepth, layout.pixelSize);
     std::string data(layerSize * arrayLayerCount, '\0');
@@ -415,40 +386,18 @@ uint32_t RhiImage::mipExtent(uint32_t extent, uint32_t level) {
 }
 
 RhiImage::Layout RhiImage::dataLayout(VernonTextureFormat format, uint32_t aspects) {
-    if (format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) {
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    if (!entry)
+        throw std::invalid_argument("unsupported RHI image data layout");
+    if (vernon::formats::hasDepth(format) && vernon::formats::hasStencil(format)) {
         if (aspects == VERNON_RHI_IMAGE_ASPECT_DEPTH)
-            return {4, VERNON_RHI_IMAGE_DATA_DEPTH, VERNON_RHI_IMAGE_DATA_FLOAT32};
+            return {sizeof(float), VERNON_RHI_IMAGE_DATA_DEPTH, VERNON_RHI_IMAGE_DATA_FLOAT32};
         if (aspects == VERNON_RHI_IMAGE_ASPECT_STENCIL)
-            return {1, VERNON_RHI_IMAGE_DATA_STENCIL, VERNON_RHI_IMAGE_DATA_UINT8};
+            return {sizeof(uint8_t), VERNON_RHI_IMAGE_DATA_STENCIL, VERNON_RHI_IMAGE_DATA_UINT8};
         if (aspects != (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL))
             throw std::invalid_argument("unsupported depth/stencil transfer aspects");
     }
-    switch (format) {
-    case VERNON_TEXTURE_R8_UNORM:
-        return {1, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_UINT8};
-    case VERNON_TEXTURE_RG8_UNORM:
-        return {2, VERNON_RHI_IMAGE_DATA_RG, VERNON_RHI_IMAGE_DATA_UINT8};
-    case VERNON_TEXTURE_RGB8_UNORM:
-        return {3, VERNON_RHI_IMAGE_DATA_RGB, VERNON_RHI_IMAGE_DATA_UINT8};
-    case VERNON_TEXTURE_RGBA8_UNORM:
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        return {4, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_UINT8};
-    case VERNON_TEXTURE_R16_FLOAT:
-        return {2, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_FLOAT16};
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        return {8, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_FLOAT16};
-    case VERNON_TEXTURE_R32_FLOAT:
-        return {4, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_FLOAT32};
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        return {16, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_FLOAT32};
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        return {4, VERNON_RHI_IMAGE_DATA_RGB, VERNON_RHI_IMAGE_DATA_UINT32};
-    case VERNON_TEXTURE_D32_FLOAT:
-        return {4, VERNON_RHI_IMAGE_DATA_DEPTH, VERNON_RHI_IMAGE_DATA_FLOAT32};
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return {8, VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL, VERNON_RHI_IMAGE_DATA_FLOAT32};
-    }
-    throw std::invalid_argument("unsupported RHI image data layout");
+    return {entry->pixelBytes, entry->dataFormat, entry->dataType};
 }
 
 size_t RhiImage::checkedByteSize(uint32_t width, uint32_t height, uint32_t depth, size_t pixelSize) {
@@ -577,15 +526,13 @@ std::unique_ptr<RhiBuffer> RhiHost::createBuffer(size_t size) { return std::make
 std::unique_ptr<RhiImage> RhiHost::createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                                VernonTextureDimension dimension, uint32_t depth, uint32_t mipLevels,
                                                uint32_t usage, uint32_t arrayLayers) {
-    if (dimension == VERNON_TEXTURE_3D &&
-        (format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT))
+    if (dimension == VERNON_TEXTURE_3D && vernon::formats::hasDepth(format))
         throw std::invalid_argument("3D depth textures are unsupported");
     if (!usage) {
         usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
         if (dimension != VERNON_TEXTURE_3D)
-            usage |= format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                         ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                         : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+            usage |= vernon::formats::hasDepth(format) ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                                                       : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
     }
     return std::make_unique<RhiImage>(state, width, height, depth, format, dimension, mipLevels, usage, arrayLayers);
 }
@@ -595,7 +542,7 @@ std::unique_ptr<RhiImage> RhiHost::createAttachmentImage(uint32_t width, uint32_
     constexpr uint32_t attachmentUsages = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
     if (!usage || (usage & ~attachmentUsages))
         throw std::invalid_argument("attachment image usage must contain only attachment roles");
-    const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    const bool depthFormat = vernon::formats::hasDepth(format);
     const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
     if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
         throw std::invalid_argument("attachment image format does not match its usage");

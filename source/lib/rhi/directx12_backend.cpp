@@ -3,8 +3,10 @@
 #if defined(_WIN32)
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace vernon::rhi::directx12 {
 namespace {
@@ -39,14 +41,24 @@ D3D12_RESOURCE_DESC bufferDescription(size_t size, bool unorderedAccess) {
     return result;
 }
 
-bool waitForFence(DeviceState &device, uint64_t value, std::string &error) {
-    if (value == 0 || device.fence->GetCompletedValue() >= value)
-        return true;
-    if (!check(device.fence->SetEventOnCompletion(value, device.fenceEvent), "ID3D12Fence::SetEventOnCompletion",
-               error))
-        return false;
-    WaitForSingleObject(device.fenceEvent, INFINITE);
-    return true;
+void destroyStagingChunk(DeviceState::StagingChunk &chunk) {
+    if (chunk.buffer.resource && chunk.mapped)
+        chunk.buffer.resource->Unmap(0, nullptr);
+    release(chunk.buffer.resource);
+}
+
+void releaseDescriptorRing(DeviceState::DescriptorRing &ring) {
+    release(ring.heap);
+    for (ID3D12DescriptorHeap *heap : ring.retiredHeaps)
+        release(heap);
+    ring.retiredHeaps.clear();
+    ring.capacity = 0;
+    ring.cursor = 0;
+}
+
+std::array<DeviceState::DescriptorRing *, 5> descriptorRings(DeviceState::CommandFrame &frame) {
+    return {&frame.resourceDescriptors, &frame.stagedResourceDescriptors, &frame.samplerDescriptors,
+            &frame.rtvDescriptors, &frame.dsvDescriptors};
 }
 
 void queryCapabilities(DeviceState &device) {
@@ -154,15 +166,12 @@ bool DeviceState::initialize(uint32_t deviceIndex, bool forceWarp, std::string &
         shutdown();
         return false;
     }
-    if (!check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)),
-               "ID3D12Device::CreateCommandAllocator", error) ||
-        !check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame.allocator, nullptr,
-                                         IID_PPV_ARGS(&frame.commands)),
-               "ID3D12Device::CreateCommandList", error) ||
-        !check(frame.commands->Close(), "ID3D12GraphicsCommandList::Close", error)) {
+    CommandFrame frame;
+    if (!createCommandFrame(frame, error)) {
         shutdown();
         return false;
     }
+    availableFrames.push_back(std::move(frame));
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent) {
         error = "CreateEventW failed for the D3D12 fence";
@@ -195,28 +204,23 @@ void DeviceState::shutdown() {
     if (fenceEvent)
         CloseHandle(fenceEvent);
     fenceEvent = nullptr;
-    for (StagingRing *ring : {&uploadRing, &readbackRing}) {
-        if (ring->buffer.resource && ring->mapped)
-            ring->buffer.resource->Unmap(0, nullptr);
-        ring->mapped = nullptr;
-        destroyBuffer(ring->buffer);
-        ring->capacity = 0;
-        ring->cursor = 0;
-    }
-    for (DescriptorRing *ring :
-         {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing, &dsvDescriptorRing}) {
-        release(ring->heap);
-        for (ID3D12DescriptorHeap *heap : ring->retiredHeaps)
-            release(heap);
-        ring->retiredHeaps.clear();
-        ring->capacity = 0;
-        ring->cursor = 0;
-    }
+    releaseDeferred(true);
+    for (CommandFrame &frame : availableFrames)
+        destroyCommandFrame(frame);
+    for (CommandFrame &frame : inFlightFrames)
+        destroyCommandFrame(frame);
+    destroyCommandFrame(recordingFrame);
+    destroyCommandFrame(borrowedFrame);
+    uploadStaging.clear(destroyStagingChunk);
+    readbackStaging.clear(destroyStagingChunk);
+    availableFrames.clear();
+    inFlightFrames.clear();
+    recording = false;
+    submittedValue = 0;
+    completedValue = 0;
+    deviceLost = false;
     release(fence);
     borrowedCommands = nullptr;
-    release(frame.commands);
-    release(frame.allocator);
-    frame.completionValue = 0;
     if (nativeObjectsBorrowed) {
         queue = nullptr;
         device = nullptr;
@@ -226,7 +230,6 @@ void DeviceState::shutdown() {
     }
     release(adapter);
     release(factory);
-    fenceValue = 0;
     nativeObjectsBorrowed = false;
 }
 
@@ -239,12 +242,55 @@ bool DeviceState::synchronize(std::string &error) {
         error = "D3D12 device synchronization state is incomplete";
         return false;
     }
-    const uint64_t value = ++fenceValue;
-    if (!check(queue->Signal(fence, value), "ID3D12CommandQueue::Signal", error))
-        return false;
-    return waitForFence(*this, value, error);
+    return retireCommandFrames(submittedValue, error);
 }
 
+bool DeviceState::createCommandFrame(CommandFrame &frame, std::string &error) {
+    if (!check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)),
+               "ID3D12Device::CreateCommandAllocator", error) ||
+        !check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame.allocator, nullptr,
+                                         IID_PPV_ARGS(&frame.commands)),
+               "ID3D12Device::CreateCommandList", error) ||
+        !check(frame.commands->Close(), "ID3D12GraphicsCommandList::Close", error)) {
+        destroyCommandFrame(frame);
+        return false;
+    }
+    return true;
+}
+
+void DeviceState::destroyCommandFrame(CommandFrame &frame) {
+    uploadStaging.retire(frame.upload);
+    readbackStaging.retire(frame.readback);
+    for (DescriptorRing *ring : descriptorRings(frame))
+        releaseDescriptorRing(*ring);
+    release(frame.commands);
+    release(frame.allocator);
+    frame.completionValue = 0;
+}
+
+void DeviceState::recycleCommandFrame(CommandFrame frame) {
+    resetFrameStorage(frame);
+    availableFrames.push_back(std::move(frame));
+}
+
+void DeviceState::resetFrameStorage(CommandFrame &frame) {
+    frame.completionValue = 0;
+    uploadStaging.retire(frame.upload);
+    readbackStaging.retire(frame.readback);
+    for (DescriptorRing *ring : descriptorRings(frame)) {
+        for (ID3D12DescriptorHeap *heap : ring->retiredHeaps)
+            release(heap);
+        ring->retiredHeaps.clear();
+        ring->cursor = 0;
+    }
+}
+
+DeviceState::CommandFrame &DeviceState::currentFrame() {
+    return nativeObjectsBorrowed ? borrowedFrame : recordingFrame;
+}
+
+// Separate ExecuteCommandLists calls on one queue run in submission order, and their boundaries flush and invalidate
+// GPU caches, so a recording needs no barrier to observe the writes of work submitted before it.
 bool DeviceState::beginCommands(std::string &error, ID3D12PipelineState *initialState) {
     if (nativeObjectsBorrowed) {
         if (!borrowedCommands) {
@@ -255,49 +301,158 @@ bool DeviceState::beginCommands(std::string &error, ID3D12PipelineState *initial
             borrowedCommands->SetPipelineState(initialState);
         return true;
     }
-    if (!waitForFence(*this, frame.completionValue, error))
+    if (recording) {
+        error = "D3D12 device is already recording a command list";
         return false;
-    return check(frame.allocator->Reset(), "ID3D12CommandAllocator::Reset", error) &&
-           check(frame.commands->Reset(frame.allocator, initialState), "ID3D12GraphicsCommandList::Reset", error);
-}
-
-bool DeviceState::submitCommands(std::string &error) {
-    ID3D12GraphicsCommandList *commands = commandList();
-    if (nativeObjectsBorrowed) {
-        if (!commands) {
-            error = "borrowed D3D12 command list is unavailable";
-            return false;
-        }
-        return true;
     }
-    if (!check(commands->Close(), "ID3D12GraphicsCommandList::Close", error))
+    if (!retireCommandFrames(0, error))
         return false;
-    ID3D12CommandList *lists[] = {commands};
-    queue->ExecuteCommandLists(1, lists);
-    const uint64_t value = ++fenceValue;
-    if (!check(queue->Signal(fence, value), "ID3D12CommandQueue::Signal", error))
+    if (inFlightFrames.size() >= maxFramesInFlight &&
+        !retireCommandFrames(inFlightFrames.front().completionValue, error))
         return false;
-    frame.completionValue = value;
-    if (!waitForFence(*this, value, error))
+    CommandFrame frame;
+    if (!availableFrames.empty()) {
+        frame = std::move(availableFrames.back());
+        availableFrames.pop_back();
+    } else if (!createCommandFrame(frame, error)) {
         return false;
-    recycleCommandStorage();
+    }
+    if (!check(frame.allocator->Reset(), "ID3D12CommandAllocator::Reset", error) ||
+        !check(frame.commands->Reset(frame.allocator, initialState), "ID3D12GraphicsCommandList::Reset", error)) {
+        recycleCommandFrame(std::move(frame));
+        return false;
+    }
+    recordingFrame = std::move(frame);
+    recording = true;
     return true;
 }
 
-ID3D12GraphicsCommandList *DeviceState::commandList() const {
-    return nativeObjectsBorrowed ? borrowedCommands : frame.commands;
+bool DeviceState::submitCommands(uint64_t &value, std::string &error) {
+    value = 0;
+    if (nativeObjectsBorrowed) {
+        if (!borrowedCommands) {
+            error = "borrowed D3D12 command list is unavailable";
+            return false;
+        }
+        CommandFrame next;
+        if (!availableFrames.empty()) {
+            next = std::move(availableFrames.back());
+            availableFrames.pop_back();
+        }
+        borrowedFrame.completionValue = ++submittedValue;
+        value = borrowedFrame.completionValue;
+        inFlightFrames.push_back(std::exchange(borrowedFrame, std::move(next)));
+        return true;
+    }
+    if (!recording) {
+        error = "D3D12 device has no command list recording";
+        return false;
+    }
+    CommandFrame frame = std::exchange(recordingFrame, {});
+    recording = false;
+    if (!check(frame.commands->Close(), "ID3D12GraphicsCommandList::Close", error)) {
+        recycleCommandFrame(std::move(frame));
+        return false;
+    }
+    ID3D12CommandList *lists[] = {frame.commands};
+    queue->ExecuteCommandLists(1, lists);
+    frame.completionValue = ++submittedValue;
+    value = frame.completionValue;
+    inFlightFrames.push_back(std::move(frame));
+    if (!check(queue->Signal(fence, value), "ID3D12CommandQueue::Signal", error)) {
+        deviceLost = true;
+        return false;
+    }
+    return true;
 }
 
-void DeviceState::recycleCommandStorage() {
-    uploadRing.cursor = 0;
-    readbackRing.cursor = 0;
-    for (DescriptorRing *ring :
-         {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing, &dsvDescriptorRing}) {
-        for (ID3D12DescriptorHeap *heap : ring->retiredHeaps)
-            release(heap);
-        ring->retiredHeaps.clear();
-        ring->cursor = 0;
+bool DeviceState::retireCommandFrames(uint64_t through, std::string &error) {
+    if (nativeObjectsBorrowed)
+        return true;
+    if (deviceLost) {
+        error = "D3D12 device was removed";
+        return false;
     }
+    if (through > completedValue && fence->GetCompletedValue() < through) {
+        if (!check(fence->SetEventOnCompletion(through, fenceEvent), "ID3D12Fence::SetEventOnCompletion", error))
+            return false;
+        WaitForSingleObject(fenceEvent, INFINITE);
+    }
+    // A removed device reports every fence value as reached.
+    const uint64_t reached = fence->GetCompletedValue();
+    if (reached == (std::numeric_limits<uint64_t>::max)()) {
+        deviceLost = true;
+        error = "D3D12 device was removed";
+        return false;
+    }
+    completedValue = (std::max)(completedValue, reached);
+    while (!inFlightFrames.empty() && inFlightFrames.front().completionValue <= completedValue) {
+        recycleCommandFrame(std::move(inFlightFrames.front()));
+        inFlightFrames.pop_front();
+    }
+    releaseDeferred(false);
+    return true;
+}
+
+bool DeviceState::waitForValue(uint64_t value, std::string &error) {
+    if (value > submittedValue) {
+        error = "D3D12 fence value was never submitted";
+        return false;
+    }
+    return retireCommandFrames(value, error);
+}
+
+bool DeviceState::pollValue(uint64_t value, bool &completed, std::string &error) {
+    completed = false;
+    if (value > submittedValue) {
+        error = "D3D12 fence value was never submitted";
+        return false;
+    }
+    if (!retireCommandFrames(0, error))
+        return false;
+    completed = value <= completedValue;
+    return true;
+}
+
+void DeviceState::retireBorrowedCommands(uint64_t value) {
+    while (!inFlightFrames.empty() && inFlightFrames.front().completionValue <= value) {
+        recycleCommandFrame(std::move(inFlightFrames.front()));
+        inFlightFrames.pop_front();
+    }
+}
+
+void DeviceState::abandonCommands() {
+    // The host still executes what the abandoned recording put in its command list, so that storage stays in
+    // borrowedFrame and retires with the next borrowed submission.
+    if (nativeObjectsBorrowed)
+        return;
+    if (!recording)
+        return;
+    CommandFrame frame = std::exchange(recordingFrame, {});
+    recording = false;
+    (void)frame.commands->Close();
+    recycleCommandFrame(std::move(frame));
+}
+
+ID3D12GraphicsCommandList *DeviceState::commandList() const {
+    return nativeObjectsBorrowed ? borrowedCommands : recording ? recordingFrame.commands : nullptr;
+}
+
+void DeviceState::releaseAfterSubmittedWork(ID3D12Resource *resource) {
+    if (nativeObjectsBorrowed || submittedValue <= completedValue) {
+        resource->Release();
+        return;
+    }
+    deferredReleases.push_back({submittedValue, resource});
+}
+
+void DeviceState::releaseDeferred(bool all) {
+    const auto retired =
+        std::stable_partition(deferredReleases.begin(), deferredReleases.end(),
+                              [&](const DeferredRelease &entry) { return !all && entry.value > completedValue; });
+    for (auto entry = retired; entry != deferredReleases.end(); ++entry)
+        entry->resource->Release();
+    deferredReleases.erase(retired, deferredReleases.end());
 }
 
 bool DeviceState::createBuffer(Buffer &buffer, size_t size, bool unorderedAccess, D3D12_HEAP_TYPE heapType,
@@ -315,7 +470,7 @@ bool DeviceState::createBuffer(Buffer &buffer, size_t size, bool unorderedAccess
 
 void DeviceState::destroyBuffer(Buffer &buffer) {
     if (buffer.resource && buffer.owned)
-        buffer.resource->Release();
+        releaseAfterSubmittedWork(buffer.resource);
     buffer.resource = nullptr;
     buffer.state = D3D12_RESOURCE_STATE_COMMON;
     buffer.owned = true;
@@ -336,7 +491,7 @@ bool DeviceState::createImage(Image &image, const D3D12_RESOURCE_DESC &descripto
 
 void DeviceState::destroyImage(Image &image) {
     if (image.resource && image.owned)
-        image.resource->Release();
+        releaseAfterSubmittedWork(image.resource);
     image.resource = nullptr;
     image.format = DXGI_FORMAT_UNKNOWN;
     image.state = D3D12_RESOURCE_STATE_COMMON;
@@ -350,60 +505,55 @@ bool DeviceState::acquireStaging(bool upload, size_t size, size_t alignment, ID3
         error = "D3D12 staging allocation request is invalid";
         return false;
     }
-    StagingRing &ring = upload ? uploadRing : readbackRing;
-    const size_t alignedCursor = (ring.cursor + alignment - 1) & ~(alignment - 1);
-    if (!ring.buffer.resource || alignedCursor > ring.capacity || size > ring.capacity - alignedCursor) {
-        if (ring.buffer.resource && size <= ring.capacity) {
-            ring.cursor = 0;
-        } else {
-            if (ring.buffer.resource) {
-                if (!synchronize(error))
-                    return false;
-                if (ring.mapped)
-                    ring.buffer.resource->Unmap(0, nullptr);
-                ring.mapped = nullptr;
-                destroyBuffer(ring.buffer);
-            }
-            size_t capacity = 64 * 1024;
-            while (capacity < size) {
-                if (capacity > (std::numeric_limits<size_t>::max)() / 2) {
-                    error = "D3D12 staging ring capacity overflow";
-                    return false;
-                }
-                capacity *= 2;
-            }
-            if (!createBuffer(ring.buffer, capacity, false, upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK,
-                              upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST, error))
-                return false;
-            const D3D12_RANGE readRange{0, upload ? 0 : capacity};
-            if (!check(ring.buffer.resource->Map(0, &readRange, reinterpret_cast<void **>(&ring.mapped)),
-                       "ID3D12Resource::Map", error)) {
-                destroyBuffer(ring.buffer);
-                return false;
-            }
-            ring.capacity = capacity;
-            ring.cursor = 0;
-        }
+    if (!nativeObjectsBorrowed && !recording) {
+        error = "D3D12 staging requires an active recording";
+        return false;
     }
-    offset = (ring.cursor + alignment - 1) & ~(alignment - 1);
-    resource = ring.buffer.resource;
-    mapped = ring.mapped + offset;
-    ring.cursor = offset + size;
+    StagingChunk *chunk = (upload ? uploadStaging : readbackStaging)
+                              .acquire(upload ? currentFrame().upload : currentFrame().readback, size, alignment,
+                                       offset, [&](size_t capacity, StagingChunk &created) {
+                                           return createStagingChunk(upload, capacity, created, error);
+                                       });
+    if (!chunk)
+        return false;
+    resource = chunk->buffer.resource;
+    mapped = chunk->mapped + offset;
+    return true;
+}
+
+bool DeviceState::createStagingChunk(bool upload, size_t capacity, StagingChunk &chunk, std::string &error) {
+    chunk.capacity = capacity;
+    if (!createBuffer(chunk.buffer, capacity, false, upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK,
+                      upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST, error))
+        return false;
+    const D3D12_RANGE readRange{0, upload ? 0 : capacity};
+    if (!check(chunk.buffer.resource->Map(0, &readRange, reinterpret_cast<void **>(&chunk.mapped)),
+               "ID3D12Resource::Map", error)) {
+        release(chunk.buffer.resource);
+        return false;
+    }
     return true;
 }
 
 bool DeviceState::acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE type, bool shaderVisible, uint32_t count,
                                      ID3D12DescriptorHeap *&heap, D3D12_CPU_DESCRIPTOR_HANDLE &cpu,
                                      D3D12_GPU_DESCRIPTOR_HANDLE &gpu, std::string &error) {
+    if (!nativeObjectsBorrowed && !recording) {
+        error = "D3D12 descriptors require an active recording";
+        return false;
+    }
+    CommandFrame &frame = currentFrame();
     DescriptorRing *ring = nullptr;
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && shaderVisible)
-        ring = &resourceDescriptorRing;
+        ring = &frame.resourceDescriptors;
+    else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        ring = &frame.stagedResourceDescriptors;
     else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && shaderVisible)
-        ring = &samplerDescriptorRing;
+        ring = &frame.samplerDescriptors;
     else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && !shaderVisible)
-        ring = &rtvDescriptorRing;
+        ring = &frame.rtvDescriptors;
     else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && !shaderVisible)
-        ring = &dsvDescriptorRing;
+        ring = &frame.dsvDescriptors;
     if (!ring || count == 0) {
         error = "D3D12 descriptor ring request is unsupported";
         return false;

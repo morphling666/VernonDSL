@@ -1,5 +1,6 @@
 #include "execution_graph/command_graph.h"
 
+#include "VernonFormats.hpp"
 #include "execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
 
@@ -265,7 +266,7 @@ void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) 
 void RenderPass::depth(const DepthStencilAttachmentUse &attachment) {
     ensureMutable();
     depth_ = std::make_unique<DepthStencilAttachmentUse>(attachment);
-    const bool hasStencil = attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    const bool hasStencil = formats::hasStencil(attachment.image.format);
     if (attachment.readOnlyDepth && (!hasStencil || attachment.readOnlyStencil))
         read(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
     else

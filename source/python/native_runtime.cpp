@@ -109,7 +109,7 @@ std::unique_ptr<Runtime> createRhiRuntime(RhiHost &host) {
         backend = VERNON_RUNTIME_OPENGL_ES;
         break;
     }
-    RuntimeContextOwner runtime(vernonRuntimeCreateForRhiDevice(backend, host.state->device));
+    RuntimeContextOwner runtime(vernonRuntimeCreateForRhiDevice(backend, host.state->device, nullptr));
     if (!runtime)
         throw std::runtime_error("cannot create Runtime for Vernon RHI device");
     return std::make_unique<Runtime>(std::move(runtime), host.state);

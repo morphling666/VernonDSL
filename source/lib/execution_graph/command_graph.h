@@ -73,7 +73,7 @@ struct ColorAttachmentUse {
     GraphImage image;
     VernonRhiLoadOperation load{VERNON_RHI_LOAD_PRESERVE};
     VernonRhiStoreOperation store{VERNON_RHI_STORE_PRESERVE};
-    float clear[4]{};
+    VernonClearColor clear{};
 };
 
 struct DepthStencilAttachmentUse {

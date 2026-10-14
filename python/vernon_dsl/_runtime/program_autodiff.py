@@ -75,17 +75,18 @@ def _bind_program_graphics_controls(
         color_operations = dict(render_pass.colors)
         for location, texture in colors:
             attachment = color_operations[location]
+            component = int if texture.format.integer else float
             clear_value = (
-                tuple(float(component) for component in attachment.clear_value)
+                [component(value) for value in attachment.clear_value]
                 if attachment.load is LoadOperation.CLEAR
-                else (0.0, 0.0, 0.0, 0.0)
+                else [component(0)] * 4
             )
             builder.rhi_color_attachment(
                 location,
                 texture._resident_view(context),
                 load_values[attachment.load],
                 store_values[attachment.store],
-                list(clear_value),
+                clear_value,
             )
         depth_texture = render_pass.target._depth_attachment()
         if depth_texture is not None:

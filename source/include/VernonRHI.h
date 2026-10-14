@@ -146,21 +146,19 @@ typedef enum VernonRhiShaderStageBits {
 
 typedef enum VernonRhiFormat {
     VERNON_RHI_FORMAT_UNDEFINED = 0,
-    VERNON_RHI_FORMAT_R8_UNORM = 1,
-    VERNON_RHI_FORMAT_RG8_UNORM = 2,
-    VERNON_RHI_FORMAT_RGBA8_UNORM = 3,
-    VERNON_RHI_FORMAT_RGBA8_SRGB = 4,
-    VERNON_RHI_FORMAT_R16_FLOAT = 5,
-    VERNON_RHI_FORMAT_RGBA16_FLOAT = 6,
-    VERNON_RHI_FORMAT_R32_FLOAT = 7,
-    VERNON_RHI_FORMAT_RGBA32_FLOAT = 8,
-    VERNON_RHI_FORMAT_D32_FLOAT = 9,
-    VERNON_RHI_FORMAT_RGB8_UNORM = 10,
-    VERNON_RHI_FORMAT_RG32_FLOAT = 11,
-    VERNON_RHI_FORMAT_RGB32_FLOAT = 12,
-    VERNON_RHI_FORMAT_R11G11B10_FLOAT = 13,
-    VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT = 14
+#define VERNON_FORMAT(name, NAME, rhi, ...) VERNON_RHI_FORMAT_##NAME = rhi,
+#include "VernonFormats.def"
 } VernonRhiFormat;
+
+typedef enum VernonRhiFormatCapabilityBits {
+    VERNON_RHI_FORMAT_RENDERABLE = 1u << 0,
+    VERNON_RHI_FORMAT_BLENDABLE = 1u << 1,
+    VERNON_RHI_FORMAT_FILTERABLE = 1u << 2,
+    VERNON_RHI_FORMAT_STORAGE = 1u << 3,
+    VERNON_RHI_FORMAT_RESOLVABLE = 1u << 4,
+    VERNON_RHI_FORMAT_MULTISAMPLE = 1u << 5,
+    VERNON_RHI_FORMAT_COPYABLE = 1u << 6
+} VernonRhiFormatCapabilityBits;
 
 /* Layered dimensions (2D_ARRAY, CUBE, CUBE_ARRAY) address layers through array_layer; a cube-array layer is
  * cube * 6 + face. CUBE images hold exactly 6 layers and CUBE_ARRAY images a nonzero multiple of 6. */
@@ -478,7 +476,7 @@ typedef struct VernonRhiColorAttachment {
     VernonRhiResourceState final_state;
     VernonRhiLoadOperation load_operation;
     VernonRhiStoreOperation store_operation;
-    float clear_color[4];
+    VernonClearColor clear_color;
 } VernonRhiColorAttachment;
 
 typedef struct VernonRhiDepthStencilAttachment {
@@ -600,6 +598,7 @@ typedef struct VernonRhiVulkanBorrowedDeviceDescriptor {
     void *physical_device;
     void *device;
     void *queue;
+    /* Must be in the recording state whenever the device records into it; the host submits it. */
     void *command_buffer;
     uint32_t queue_family_index;
     uint32_t queue_capabilities;
@@ -641,6 +640,11 @@ VERNON_RHI_CAPI VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice dev
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
                                                                 const VernonRhiCommandLimits *limits);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice device, VernonRhiCommandLimits *output);
+// Writes the VernonRhiFormatCapabilityBits the device supports for format: the baseline of its VernonFormats.def
+// row narrowed by the device. A device without images reports 0. Unknown formats return
+// VERNON_RHI_STATUS_INVALID_ARGUMENT.
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetFormatCapabilities(VernonRhiDevice device, VernonRhiFormat format,
+                                                                     uint32_t *capabilities);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
                                                                     const VernonRhiCommandEncoderDescriptor *descriptor,
                                                                     VernonRhiCommandEncoder *output);
@@ -671,7 +675,7 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDev
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhiDevice device,
                                                                             VernonRhiCommandEncoder encoder,
                                                                             uint32_t location,
-                                                                            const float clear_color[4]);
+                                                                            const VernonClearColor *clear_color);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(VernonRhiDevice device,
                                                                                    VernonRhiCommandEncoder encoder,
                                                                                    float clear_depth,
@@ -712,6 +716,11 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateImageView(VernonRhiDevice d
                                                                VernonRhiImageView *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetImageSampler(VernonRhiDevice device, VernonRhiImage image,
                                                                const VernonRhiSamplerDescriptor *descriptor);
+/*
+ * Depth and stencil download on every backend; OpenGL ES needs OpenGL ES 3.1 for them. OpenGL and OpenGL ES upload
+ * the depth and stencil of a D32_FLOAT_S8_UINT image only together and return VERNON_RHI_STATUS_UNSUPPORTED for one
+ * aspect alone.
+ */
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice device, VernonRhiImage image,
                                                            const VernonRhiImageUploadDescriptor *uploads,
                                                            size_t upload_count);
@@ -733,6 +742,14 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroySampler(VernonRhiDevice de
 VERNON_RHI_CAPI uint32_t vernonRhiDeviceIsSamplerValid(VernonRhiDevice device, VernonRhiSampler sampler);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetImageNativeHandle(VernonRhiDevice device, VernonRhiImage image,
                                                                     uint64_t *output);
+/*
+ * A borrowed device (vernonRhiCreateBorrowedDirectX12Device, vernonRhiCreateBorrowedVulkanDevice) records into the
+ * host's command list or buffer, and the host executes it. Submitting an encoder and the immediate device operations
+ * that only change device state (uploads, mipmap generation) record in call order and take effect when the host
+ * executes the commands; their staging lives until the host signals the submission's completion. Downloads return
+ * VERNON_RHI_STATUS_UNSUPPORTED, since nothing has executed when they would return; read results back by recording a
+ * copy into a host-visible buffer and reading it after the host's own fence.
+ */
 VERNON_RHI_CAPI VernonRhiDevice
 vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDescriptor *descriptor);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQueue(VernonRhiDevice device, void **output);

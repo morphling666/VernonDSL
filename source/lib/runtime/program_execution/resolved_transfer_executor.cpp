@@ -4,6 +4,7 @@
 #include "execution_graph/execution_graph_internal.h"
 #include "program_tensor_copy.h"
 #include "runtime/runtime_dispatch.h"
+#include "submission_record.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -176,7 +177,8 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
     return VERNON_STATUS_OK;
 }
 
-bool ResolvedTransferExecutor::restoreForRetry(program::GraphDirection graph, std::string &error) {
+bool ResolvedTransferExecutor::restoreForRetry(program::GraphDirection graph, SubmissionRecord &submission,
+                                               std::string &error) {
     const auto &graphs = state_.plan_->resolvedProgram->program.graphs;
     const auto selected = std::find_if(graphs.begin(), graphs.end(), [&](const program::Graph &candidate) {
         return program::graphDirection(candidate.direction) == std::optional<program::GraphDirection>{graph};
@@ -222,7 +224,8 @@ bool ResolvedTransferExecutor::restoreForRetry(program::GraphDirection graph, st
         return true;
     if (!vernon::execution::detail::validateRhiCommandExecutionPlan(plan, error))
         return false;
-    return executeCommandPlanAndWait(context_, plan) == VERNON_STATUS_OK;
+    SubmissionState step;
+    return submission.execute(std::move(plan), step) == VERNON_STATUS_OK;
 }
 
 bool ResolvedTransferExecutor::readbackBoundaryValues(const std::vector<char> &required, std::string &error) const {

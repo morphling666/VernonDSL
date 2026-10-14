@@ -1,6 +1,8 @@
 #ifndef VERNON_PROGRAM_SEMANTIC_TYPES_H
 #define VERNON_PROGRAM_SEMANTIC_TYPES_H
 
+#include "VernonFormats.hpp"
+
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -154,24 +156,7 @@ inline bool validOpaqueContract(std::string_view value) {
 }
 
 inline bool validImageFormat(std::string_view value) {
-    constexpr std::array<std::string_view, 20> formats{
-        "r8_unorm",      "r8_snorm",
-        "r16_float",     "r32_float",
-        "r32_uint",      "r32_sint",
-        "rg8_unorm",     "rg16_float",
-        "rg32_float",    "rgba8_unorm",
-        "rgba8_srgb",    "bgra8_unorm",
-        "bgra8_srgb",    "rgba16_float",
-        "rgba32_float",  "depth16_unorm",
-        "depth24_plus",  "depth24_plus_stencil8",
-        "depth32_float", "depth32_float_stencil8",
-    };
-    if (value == "unknown")
-        return true;
-    for (std::string_view format : formats)
-        if (format == value)
-            return true;
-    return false;
+    return value == "unknown" || vernon::formats::find(value) != nullptr;
 }
 
 class SemanticTypeParser {

@@ -30,6 +30,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties{};
     PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties getPhysicalDeviceFormatProperties{};
+    PFN_vkGetPhysicalDeviceImageFormatProperties getPhysicalDeviceImageFormatProperties{};
     PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2{};
     PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensionProperties{};
     PFN_vkCreateDevice createDevice{};
@@ -50,6 +51,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkDestroyFence destroyFence{};
     PFN_vkWaitForFences waitForFences{};
     PFN_vkResetFences resetFences{};
+    PFN_vkGetFenceStatus getFenceStatus{};
     PFN_vkCreateBuffer createBuffer{};
     PFN_vkDestroyBuffer destroyBuffer{};
     PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements{};

@@ -23,6 +23,9 @@ struct VernonRuntimeContext;
 namespace vernon::runtime {
 struct ProgramInvocationContext;
 } // namespace vernon::runtime
+namespace vernon::runtime::program_execution {
+class SubmissionRecord;
+} // namespace vernon::runtime::program_execution
 namespace vernon::runtime::program {
 class InvocationSnapshot;
 }
@@ -80,6 +83,7 @@ struct ForwardExecutionTarget {
     std::map<VernonProgramNodeId, std::unique_ptr<class PullbackExecution>> *nodePullbacks{};
     bool retainPullback{};
     program_execution::InvocationMutationOutcome &outcome;
+    program_execution::SubmissionRecord &submission;
 };
 
 class CanonicalProgramExecutionWorkspace {

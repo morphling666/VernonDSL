@@ -1456,7 +1456,11 @@ outer shape, and ValueLayout when present. Category is `value`,
 slots never contain publication. `in_place` is valid only for a mutable
 Storage-backed boundary that explicitly exposes a caller-visible side effect.
 It does not promise rollback after submission. Runtime never chooses a mode
-from the concrete host/device resource kind.
+from the concrete host/device resource kind. The compiler emits `in_place`
+for an output whose borrowed Storage is written in the forward graph only by
+`attachment` accesses: render passes write the caller's attachments
+directly, so a failed submission leaves them indeterminate rather than
+unchanged. Every other output is `commit_after_success`.
 
 Each derivative slot has exactly one `derivative_projections` record containing
 `derivative:{slot,path}`, `primal:{slot,path}`, and a canonical `value_path`.
@@ -1854,6 +1858,17 @@ instance bind, invocation, or pullback fails without backend execution.
 A borrowed output is valid only for its declared provider lifetime. A
 transferred owned output is removed from Program ownership at commit.
 
+An invocation completes in `WAIT` or `ASYNCHRONOUS` mode
+([`../runtime/pipelined_submission.md`](../runtime/pipelined_submission.md)).
+`ASYNCHRONOUS` Execute returns after submission; the transactional rules
+above then hold at the submission's completion instead of at Execute. Until
+guarded deferred copies exist, an asynchronous plan writes only `in_place`
+boundaries: resolve records the plan's first `commit_after_success`
+boundary or autodiff tape as its wait requirement, and an asynchronous
+Execute of such a plan, or one retaining a pullback, fails before
+submission with `PROGRAM_SUBMISSION_REQUIRES_WAIT` naming it. Runtime never
+waits instead.
+
 ## 18. Diagnostics
 
 Every rejection emits a strict Diagnostic:
@@ -1921,6 +1936,7 @@ Required stable codes include:
 - `PROGRAM_REPLAY_INVALID`
 - `PROGRAM_DERIVATIVE_ABI`
 - `PROGRAM_TAPE_CONTRACT`
+- `PROGRAM_SUBMISSION_REQUIRES_WAIT`
 - `PROGRAM_RUNTIME_FAILURE`
 
 `PROGRAM_DEPENDENCY_MEMBER` is the parse error reserved for a serialized order,
@@ -2169,14 +2185,13 @@ Array source annotations never introduce alternate Program type spellings;
 ranked Values serialize as `tensor`.
 Aggregate field order is semantic, field names are unique NFC identifiers,
 and nesting is recursive. Tensor/type dimensions MUST equal Value shape
-dimensions after symbol substitution. Resource formats are
-`r8_unorm`, `r8_snorm`, `r16_float`, `r32_float`, `r32_uint`, `r32_sint`,
-`rg8_unorm`, `rg16_float`, `rg32_float`, `rgba8_unorm`, `rgba8_srgb`,
-`bgra8_unorm`, `bgra8_srgb`, `rgba16_float`, `rgba32_float`,
-`depth16_unorm`, `depth24_plus`, `depth24_plus_stencil8`,
-`depth32_float`, `depth32_float_stencil8`, or `unknown`. `unknown` is allowed
-only for sampled image logical types; Storage descriptors always use concrete
-formats.
+dimensions after symbol substitution. Resource formats are the names in
+`source/include/VernonFormats.def` (`r8_unorm`, `rg8_unorm`, `rgb8_unorm`,
+`rgba8_unorm`, `rgba8_srgb`, `r16_float`, `rgba16_float`, `r32_float`,
+`rg32_float`, `rgb32_float`, `rgba32_float`, `r11g11b10_float`, `d32_float`,
+`d32_float_s8_uint`) or `unknown`. `unknown` is allowed only for sampled image
+logical types; Storage descriptors always use concrete formats whose table row
+allows `storage`.
 
 Buffer memory is `host`, `device`, or `shared`. Buffer usage members are
 `uniform`, `storage`, `vertex`, `index`, or `stage_binding`. Image usage

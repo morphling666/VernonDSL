@@ -18,6 +18,8 @@ endif()
 if(Python_EXECUTABLE)
     add_test(NAME VernonGeneratedVersionsCheck COMMAND "${Python_EXECUTABLE}"
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
+    add_test(NAME VernonGeneratedFormatsCheck COMMAND "${Python_EXECUTABLE}"
+                                                      "${VERNON_REPOSITORY_ROOT}/tools/generate_formats.py" --check)
 endif()
 
 set_property(
@@ -154,6 +156,10 @@ if(TARGET VernonRuntime)
                                                                 "${VERNON_REPOSITORY_ROOT}/source/lib")
     target_link_libraries(VernonRhiImageShapeTests PRIVATE GTest::gtest_main)
     vernon_discover_gtests(VernonRhiImageShapeTests)
+    add_executable(VernonRhiStagingPoolTests rhi/staging_pool_test.cpp)
+    target_include_directories(VernonRhiStagingPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib/rhi")
+    target_link_libraries(VernonRhiStagingPoolTests PRIVATE GTest::gtest_main)
+    vernon_discover_gtests(VernonRhiStagingPoolTests)
     add_executable(VernonRhiDeferredActionTests rhi/rhi_deferred_action_test.cpp)
     target_include_directories(VernonRhiDeferredActionTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
                                                                     "${VERNON_REPOSITORY_ROOT}/source/lib")
@@ -211,6 +217,7 @@ if(TARGET VernonRuntime)
         runtime/dirty_range_set_test.cpp
         runtime/execution_command_model_test.cpp
         runtime/execution_graph_test.cpp
+        runtime/execution_workspace_pool_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/program_instance_test.cpp
         runtime/program_manifest_test.cpp
@@ -224,6 +231,7 @@ if(TARGET VernonRuntime)
         runtime/runtime_external_gl_test.cpp
         runtime/shape_layout_test.cpp
         runtime/stage_artifact_contract_test.cpp
+        runtime/submission_queue_test.cpp
         runtime/tensor_bridge_test.cpp
         runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
@@ -315,6 +323,18 @@ if(TARGET VernonRuntime)
         endif()
         include("${language_contract_fixture_specs_file}")
         set(cross_backend_fixture_specs ${VERNON_LANGUAGE_CONTRACT_FIXTURE_SPECS})
+        set(recorded_graphics_asset "${VERNON_TEST_ROOT}/fixtures/recorded_graphics_program_asset.py")
+        list(
+            APPEND
+            cross_backend_fixture_specs
+            "module_graphics|recorded_graphics_opaque_pass|${recorded_graphics_asset}:opaque_pass_asset|graphics"
+            "module_graphics|recorded_graphics_blended_surface|${recorded_graphics_asset}:blended_surface_asset|graphics"
+            "module_graphics|recorded_graphics_packed_tint_surface|${recorded_graphics_asset}:packed_tint_surface_asset|graphics"
+            "module_graphics|recorded_graphics_float_target_surface|${recorded_graphics_asset}:float_target_surface_asset|graphics"
+            "module_graphics|recorded_graphics_sampled_pass|${recorded_graphics_asset}:sampled_pass_asset|graphics"
+            "module_graphics|recorded_graphics_mirrored_vertices_pass|${recorded_graphics_asset}:mirrored_vertices_pass_asset|compute,graphics"
+            "module_graphics|recorded_graphics_scratch_writing_pass|${recorded_graphics_asset}:scratch_writing_pass_asset|compute,graphics"
+        )
         set(VERNON_TEST_FIXTURE_MANIFEST_ROWS)
         set(VERNON_TEST_FIXTURE_PAIRS)
         foreach(enabled_fixture_target IN LISTS enabled_fixture_targets)
@@ -652,12 +672,13 @@ if(TARGET VernonRuntime)
             vernon_discover_gtests(VernonModuleProgramGpuRuntimeTests)
         endif()
         if(module_graphics_fixture_targets)
-            add_executable(VernonModuleGraphicsProgramRuntimeTests
-                           runtime/runtime_module_graphics_program_c_api_test.cpp)
+            add_executable(
+                VernonModuleGraphicsProgramRuntimeTests runtime/runtime_module_graphics_program_c_api_test.cpp
+                                                        runtime/runtime_recorded_graphics_c_api_test.cpp)
             target_link_libraries(
                 VernonModuleGraphicsProgramRuntimeTests
                 PRIVATE GTest::gtest_main
-                        Vernon::Runtime
+                        Vernon::RuntimeTesting
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
             vernon_enable_glfw_context_owner_for_test(VernonModuleGraphicsProgramRuntimeTests)
@@ -668,7 +689,7 @@ if(TARGET VernonRuntime)
             add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
             set_target_properties(VernonModuleGraphicsProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                      "${CMAKE_BINARY_DIR}/source")
-            vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRuntime VernonRHI)
+            vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRHI)
             vernon_discover_gtests(VernonModuleGraphicsProgramRuntimeTests)
         endif()
         if(language_contract_fixture_targets OR language_contract_cpu_fixture_targets)
@@ -933,6 +954,7 @@ if(TARGET VernonRuntime)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp
                                                   rhi/directx12_native_interop_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
+        target_compile_definitions(VernonRuntimeTests PRIVATE NOMINMAX)
         if(TARGET vernon-dsl-native AND Python_FOUND)
             vernon_add_program_asset_test_bundle(
                 directx-pipeline

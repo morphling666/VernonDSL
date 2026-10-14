@@ -38,9 +38,7 @@ bool validateRhiCommandExecutionPlan(const RhiCommandExecutionPlan &plan, std::s
         return false;
     }
     for (size_t index = 0; index < plan.commands.nodes.size(); ++index) {
-        const bool status = plan.commands.nodes[index].kind == CommandNodeKind::Status;
-        if ((!status && (!plan.encoders[index].encode || plan.encoders[index].complete)) ||
-            (status && (plan.encoders[index].encode || !plan.encoders[index].complete))) {
+        if (!plan.encoders[index].encode) {
             error = "RHI command plan has an invalid node encoder";
             return false;
         }
@@ -183,15 +181,6 @@ bool appendRhiCommandExecutionPlan(RhiCommandExecutionPlan &destination, RhiComm
                                    std::make_move_iterator(source.retainedContexts.end()));
     destination = std::move(result);
     return true;
-}
-
-VernonRhiStatus executeRhiCommandPlanAndWait(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                             const RhiCommandExecutionPlan &plan, RhiCommandDagExecutionStats *stats) {
-    std::string error;
-    if (!validateRhiCommandExecutionPlan(plan, error))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return executeRhiCommandDagAndWait(device, requiredCapabilities, plan.commands, plan.encoders, stats,
-                                       &plan.bindings, plan.initialAccesses.empty() ? nullptr : &plan.initialAccesses);
 }
 
 } // namespace vernon::execution::detail

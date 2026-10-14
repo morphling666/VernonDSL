@@ -25,6 +25,10 @@ struct MockProvider {
     VernonRuntimeProviderObject lastEncoder{};
     VernonRuntimeProviderDispatchDescriptor lastDispatch{};
     VernonRuntimeProviderDrawDescriptor lastDraw{};
+    uint32_t renderingBegins{};
+    uint32_t renderingEnds{};
+    size_t lastRenderingColorCount{};
+    size_t lastRenderingSampledImageCount{};
     bool failNextBindingCreation{};
     VernonRuntimeCoreBindings *bindingsToReplaceDuringDispatch{};
     const VernonRuntimeProviderBindingValue *replacementValue{};
@@ -109,6 +113,14 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
         }
         if (resource.identity >= 104)
             description->parent_identity = resource.identity;
+        if (resource.identity == 108) {
+            description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT | VERNON_IMAGE_SAMPLED;
+            description->parent_identity = 104;
+        } else if (resource.identity == 109) {
+            description->image.format = VERNON_TEXTURE_R32_UINT;
+            description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+            description->view.format = VERNON_TEXTURE_R32_UINT;
+        }
         return VERNON_STATUS_OK;
     };
     provider.create_binding_set = [](void *data, const VernonRuntimeProviderBindingSetDescriptor *,
@@ -137,6 +149,18 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     provider.encode_draw = [](void *data, VernonRuntimeProviderObject,
                               const VernonRuntimeProviderDrawDescriptor *draw) {
         static_cast<MockProvider *>(data)->lastDraw = *draw;
+        return VERNON_STATUS_OK;
+    };
+    provider.begin_rendering = [](void *data, VernonRuntimeProviderObject,
+                                  const VernonRuntimeProviderRenderingDescriptor *rendering) {
+        auto &state = *static_cast<MockProvider *>(data);
+        ++state.renderingBegins;
+        state.lastRenderingColorCount = rendering->color_attachment_count;
+        state.lastRenderingSampledImageCount = rendering->sampled_image_count;
+        return VERNON_STATUS_OK;
+    };
+    provider.end_rendering = [](void *data, VernonRuntimeProviderObject) {
+        ++static_cast<MockProvider *>(data)->renderingEnds;
         return VERNON_STATUS_OK;
     };
     provider.destroy_shader = [](void *, VernonRuntimeProviderObject) {};
@@ -527,19 +551,6 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     draw.stencil_reference = 0x100;
     EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
               VERNON_STATUS_INVALID_ARGUMENT);
-    draw.stencil_reference = 0;
-    draw.clear_stencil = 0x100;
-    EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    draw.clear_stencil = 0;
-    VernonRuntimeProviderColorAttachment colorAttachment{};
-    colorAttachment.location = 1;
-    draw.color_attachments = &colorAttachment;
-    draw.color_attachment_count = 1;
-    EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    draw.color_attachments = nullptr;
-    draw.color_attachment_count = 0;
     draw.stencil_reference = 17;
     ASSERT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw), VERNON_STATUS_OK);
     EXPECT_EQ(mock.lastDraw.stencil_reference, 17u);
@@ -557,32 +568,108 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     vernonRuntimeCorePipelineDestroy(pipeline);
 }
 
-TEST(RuntimeForeignProvider, ValidatesAttachmentViewsBeforeEncoding) {
+TEST(RuntimeForeignProvider, ValidatesRenderingAttachmentsBeforeBeginning) {
     MockProvider mock;
     VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
-    VernonRuntimeCorePipelineDescriptor descriptor = graphicsPipelineDescriptor();
-    VernonRuntimeCorePipeline *pipeline = nullptr;
-    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    const VernonRuntimeProviderObject encoder{7};
 
     VernonRuntimeProviderColorAttachment color{};
     color.view = {104, {1}, 0, 0};
-    VernonRuntimeCoreDrawInvocation draw{};
-    draw.struct_size = sizeof(draw);
-    draw.vertex_count = 3;
-    draw.instance_count = 1;
-    draw.color_attachments = &color;
-    draw.color_attachment_count = 1;
-    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_OK);
+    VernonRuntimeProviderRenderingDescriptor rendering{};
+    rendering.struct_size = sizeof(rendering);
+    rendering.color_attachments = &color;
+    rendering.color_attachment_count = 1;
+    rendering.render_area[2] = 16;
+    rendering.render_area[3] = 16;
+    rendering.layers = 1;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreEndRendering(&provider, encoder), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.renderingBegins, 1u);
+    EXPECT_EQ(mock.renderingEnds, 1u);
+    EXPECT_EQ(mock.lastRenderingColorCount, 1u);
 
+    color.location = 1;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    color.location = 0;
     color.view.identity = 100;
-    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
     color.view.identity = 106;
-    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    color.view.identity = 104;
+    rendering.render_area[0] = 1;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    rendering.render_area[0] = 0;
+    rendering.layers = 2;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    rendering.layers = 1;
+
+    VernonRuntimeProviderDepthStencilAttachment depth{};
+    depth.view = {105, {2}, 0, 0};
+    depth.depth_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depth.clear_depth = 1.0f;
+    depth.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    rendering.depth_stencil_attachment = &depth;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    depth.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.renderingBegins, 2u);
+}
+
+// An integer clear carries raw bits, so a float NaN pattern is valid for an integer view and invalid for a float one.
+TEST(RuntimeForeignProvider, ValidatesClearColorsByAttachmentComponentClass) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    const VernonRuntimeProviderObject encoder{7};
+
+    VernonRuntimeProviderColorAttachment color{};
+    color.view = {109, {1}, 0, 0};
+    color.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    color.clear_color.u32[0] = 0xFFFFFFFFu;
+    VernonRuntimeProviderRenderingDescriptor rendering{};
+    rendering.struct_size = sizeof(rendering);
+    rendering.color_attachments = &color;
+    rendering.color_attachment_count = 1;
+    rendering.render_area[2] = 16;
+    rendering.render_area[3] = 16;
+    rendering.layers = 1;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreEndRendering(&provider, encoder), VERNON_STATUS_OK);
 
     color.view.identity = 104;
-    draw.depth_stencil_view = {105, {2}, 0, 0};
-    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_OK);
-    vernonRuntimeCorePipelineDestroy(pipeline);
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    color.clear_color.f32[0] = 1.0f;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.renderingBegins, 2u);
+}
+
+TEST(RuntimeForeignProvider, ValidatesRenderingSampledImagesBeforeBeginning) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    const VernonRuntimeProviderObject encoder{7};
+
+    VernonRuntimeProviderColorAttachment color{};
+    color.view = {104, {1}, 0, 0};
+    VernonRuntimeProviderResourceReference sampled{102, {3}, 0, 0};
+    VernonRuntimeProviderRenderingDescriptor rendering{};
+    rendering.struct_size = sizeof(rendering);
+    rendering.color_attachments = &color;
+    rendering.color_attachment_count = 1;
+    rendering.render_area[2] = 16;
+    rendering.render_area[3] = 16;
+    rendering.layers = 1;
+    rendering.sampled_images = &sampled;
+    rendering.sampled_image_count = 1;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.lastRenderingSampledImageCount, 1u);
+
+    // A view of the attachment's image covering the rendered subresources.
+    sampled.identity = 108;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    sampled.identity = 104;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    rendering.sampled_images = nullptr;
+    EXPECT_EQ(vernonRuntimeCoreBeginRendering(&provider, encoder, &rendering), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(mock.renderingBegins, 1u);
 }
 
 TEST(RuntimeForeignProvider, ReleasesPartiallyPreparedGraphicsVariant) {

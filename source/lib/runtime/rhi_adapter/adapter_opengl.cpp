@@ -1,3 +1,4 @@
+#include "VernonFormats.hpp"
 #include "adapter_common.h"
 #include "rhi/opengl_backend.h"
 #include "rhi/rhi_internal.h"
@@ -20,27 +21,17 @@
 namespace vernon::runtime::rhi_adapter {
 namespace {
 
-struct OpenGLFramebufferSignature {
-    std::array<uint64_t, 18> values{};
-    size_t count{};
-
-    bool operator==(const OpenGLFramebufferSignature &other) const {
-        return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin());
-    }
-};
-
 struct OpenGLAdapterState {
     rhi::opengl::DeviceState *device{};
     uint64_t program{};
     uint64_t vertexArray{};
-    uint64_t framebuffer{};
-    uint64_t framebufferGeneration{};
+    // The device's draw state generation when draws last applied the cached state below.
+    uint64_t drawStateGeneration{};
     std::array<uint32_t, 4> viewport{};
     std::array<uint32_t, 4> scissor{};
-    std::unordered_map<uint64_t, OpenGLFramebufferSignature> framebufferSignatures;
     bool programValid{};
     bool vertexArrayValid{};
-    bool framebufferValid{};
+    bool drawStateValid{};
     bool viewportValid{};
     bool scissorValid{};
 };
@@ -102,7 +93,6 @@ struct NativeGraphicsBundle {
     rhi::opengl::DeviceState *device{};
     rhi::opengl::Uint program{};
     rhi::opengl::Uint vertexArray{};
-    rhi::opengl::Uint framebuffer{};
     PreparedLayout *layout{};
     std::vector<GraphicsBinding> bindings;
     std::vector<GraphicsVertexAttribute> vertexAttributes;
@@ -132,7 +122,6 @@ struct PreparedPipeline {
     VernonRasterizationState rasterization{};
     VernonDepthStencilState depthStencil{};
     std::vector<VernonColorBlendState> colorBlends;
-    uint32_t depthStencilFormat{};
     PreparedLayout *layout{};
     bool compute{};
 
@@ -286,7 +275,6 @@ RhiAdapterResult<void> configureGraphicsStateResult(VernonRuntimeRhiAdapter &ada
         pipeline.colorBlends.assign(descriptor.color_blends, descriptor.color_blends + descriptor.color_blend_count);
     else
         pipeline.colorBlends.clear();
-    pipeline.depthStencilFormat = descriptor.depth_stencil_format;
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -480,24 +468,10 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
 }
 
 std::optional<rhi::opengl::Enum> storageImageFormat(VernonRhiFormat format) {
-    switch (format) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return 0x8229;
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return 0x822D;
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-        return 0x822E;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-        return 0x822B;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-        return 0x8058;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-        return 0x881A;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return 0x8814;
-    default:
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    if (!entry || !entry->allows(VERNON_RHI_FORMAT_STORAGE))
         return std::nullopt;
-    }
+    return entry->glInternalFormat;
 }
 
 RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
@@ -585,14 +559,11 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
         auto stateStatus = configureGraphicsStateResult(adapter, *descriptor, *pipeline);
         if (!stateStatus)
             return stateStatus;
-        if (!compute && !openGLState(adapter).device->createGraphicsObjects(
-                            pipeline->native->vertexArray, pipeline->native->framebuffer, backendDiagnostic)) {
+        auto &state = openGLState(adapter);
+        if (!compute && !state.device->createVertexArray(pipeline->native->vertexArray, backendDiagnostic)) {
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                                             {"opengl_create_graphics_objects", 0, 0}})};
         }
-        if (!compute)
-            openGLState(adapter).framebufferSignatures.emplace(pipeline->native->framebuffer,
-                                                               OpenGLFramebufferSignature{});
         std::vector<rhi::opengl::Int> locations(layout->entries.size(), -1);
         std::vector<uint32_t> activeTextureBindings;
         for (size_t index = 0; index < layout->entries.size(); ++index) {
@@ -980,76 +951,33 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     if (!device.makeCurrent())
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"opengl_make_context_current_for_draw", 0, 0}})};
-    auto renderingClaim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
-    if (!renderingClaim)
-        return RhiAdapterResult<void>{vernon::err(std::move(renderingClaim).error())};
-    const vernon::rhi::CommandRenderingClaim claim = std::move(renderingClaim).value();
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
     if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"opengl_draw_command_encoder_is_invalid", 0, 0}})};
-    const bool firstDraw = claim == vernon::rhi::CommandRenderingClaim::Acquired;
-    auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-    if (!hasRenderingDescriptor)
-        return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
-    const bool standaloneRendering = !std::move(hasRenderingDescriptor).value();
-    auto renderingObject = commandRenderingObject(
-        adapter, commandEncoder, vernon::Option<uint64_t>{vernon::some(pipeline->native->framebuffer)});
-    if (!renderingObject)
-        return RhiAdapterResult<void>{vernon::err(std::move(renderingObject).error())};
-    auto renderingFramebufferOption = std::move(renderingObject).value();
-    if (!renderingFramebufferOption)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::LifecycleFailure, {"opengl_rendering_object_is_unavailable", 0, 0}})};
-    const uint64_t renderingFramebuffer = std::move(renderingFramebufferOption).value();
+    auto opened = openCommandRendering(adapter, commandEncoder);
+    if (!opened)
+        return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_provider_objects", 0, 0}})};
     if (!retainBindingResources(adapter, commandEncoder, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_bindings", 0, 0}})};
-    std::array<VernonRhiLoadOperation, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorLoads{};
-    std::array<std::array<float, 4>, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorClears{};
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-        colorLoads[index] = static_cast<VernonRhiLoadOperation>(descriptor->color_attachments[index].load_operation);
-        std::copy(std::begin(descriptor->color_attachments[index].clear_color),
-                  std::end(descriptor->color_attachments[index].clear_color), colorClears[index].begin());
-        VernonRhiStoreOperation ignoredStore =
-            static_cast<VernonRhiStoreOperation>(descriptor->color_attachments[index].store_operation);
-        auto operations = commandColorOperations(adapter, commandEncoder, index, colorLoads[index], ignoredStore,
-                                                 colorClears[index].data());
-        if (!operations)
-            return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
-    }
-    VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
-    VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
-    VernonRhiLoadOperation stencilLoad = static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
-    VernonRhiStoreOperation stencilStore = static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
-    float clearDepth = descriptor->clear_depth;
-    uint32_t clearStencil = descriptor->clear_stencil;
-    auto depthOperations = commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad,
-                                                  stencilStore, clearDepth, clearStencil);
-    if (!depthOperations)
-        return RhiAdapterResult<void>{vernon::err(std::move(depthOperations).error())};
     auto &driver = device.driver;
-    std::array<rhi::opengl::Enum, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> drawBuffers{};
-    drawBuffers.fill(rhi::opengl::kNone);
-    size_t drawBufferCount = 0;
     device.makeCurrent();
     auto &state = openGLState(adapter);
-    if (state.framebufferGeneration != device.framebufferGeneration) {
-        state.framebufferValid = false;
-        state.framebufferSignatures.clear();
-        state.framebufferGeneration = device.framebufferGeneration;
-    }
-    if (firstDraw || !state.programValid || state.program != pipeline->native->program) {
+    const bool reapply = !state.drawStateValid || state.drawStateGeneration != device.drawStateGeneration;
+    state.drawStateGeneration = device.drawStateGeneration;
+    state.drawStateValid = true;
+    if (reapply || !state.programValid || state.program != pipeline->native->program) {
         driver.useProgram(pipeline->native->program);
         state.program = pipeline->native->program;
         state.programValid = true;
     }
-    if (firstDraw || !state.vertexArrayValid || state.vertexArray != pipeline->native->vertexArray) {
+    if (reapply || !state.vertexArrayValid || state.vertexArray != pipeline->native->vertexArray) {
         driver.bindVertexArray(pipeline->native->vertexArray);
         state.vertexArray = pipeline->native->vertexArray;
         state.vertexArrayValid = true;
@@ -1058,7 +986,8 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         driver.disable(rhi::opengl::kCullFace);
     else {
         driver.enable(rhi::opengl::kCullFace);
-        driver.cullFace(pipeline->rasterization.cull_mode == VERNON_RHI_CULL_FRONT ? 0x0404 : 0x0405);
+        driver.cullFace(pipeline->rasterization.cull_mode == VERNON_RHI_CULL_FRONT ? rhi::opengl::kFront
+                                                                                   : rhi::opengl::kBack);
     }
     driver.frontFace(pipeline->rasterization.front_face == VERNON_RHI_FRONT_FACE_CLOCKWISE ? 0x0900 : 0x0901);
     if (pipeline->rasterization.depth_bias_enabled) {
@@ -1245,73 +1174,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                                           {"opengl_configure_vertex_attribute", error, attribute.layout.location}})};
         }
     }
-    OpenGLFramebufferSignature framebufferSignature{};
-    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorImages{};
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-        const auto &attachment = descriptor->color_attachments[index];
-        if (!retainCommandResource(adapter, commandEncoder, attachment.view))
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"opengl_draw_could_not_retain_its_color_attachment", 0, 0}})};
-        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, attachment.view);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        colorImages[index] = std::move(resolved).value();
-        if (attachment.location >= VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS || colorImages[index] == 0)
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                  {"opengl_draw_contains_an_invalid_color_attachment", 0, 0}})};
-        framebufferSignature.values[framebufferSignature.count++] = attachment.location;
-        framebufferSignature.values[framebufferSignature.count++] = attachment.view.resource.value;
-        const auto target = rhi::opengl::kColorAttachment0 + attachment.location;
-        drawBuffers[attachment.location] = target;
-        drawBufferCount = std::max(drawBufferCount, static_cast<size_t>(attachment.location) + 1);
-    }
-    const bool hasDepth = descriptor->depth_stencil_view.resource.value != 0;
-    if (hasDepth && !retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_depth_attachment", 0, 0}})};
-    uint64_t depthImage = 0;
-    if (hasDepth) {
-        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        depthImage = std::move(resolved).value();
-    }
-    framebufferSignature.values[framebufferSignature.count++] = hasDepth;
-    framebufferSignature.values[framebufferSignature.count++] = descriptor->depth_stencil_view.resource.value;
-    if (firstDraw || !state.framebufferValid || state.framebuffer != renderingFramebuffer) {
-        driver.bindFramebuffer(rhi::opengl::kFramebuffer, static_cast<rhi::opengl::Uint>(renderingFramebuffer));
-        state.framebuffer = static_cast<rhi::opengl::Uint>(renderingFramebuffer);
-        state.framebufferValid = true;
-    }
-    auto cachedFramebuffer = state.framebufferSignatures.find(static_cast<rhi::opengl::Uint>(renderingFramebuffer));
-    if (cachedFramebuffer == state.framebufferSignatures.end() ||
-        !(cachedFramebuffer->second == framebufferSignature)) {
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-            const auto &attachment = descriptor->color_attachments[index];
-            driver.framebufferTexture2D(rhi::opengl::kFramebuffer, rhi::opengl::kColorAttachment0 + attachment.location,
-                                        rhi::opengl::kTexture2D, static_cast<rhi::opengl::Uint>(colorImages[index]), 0);
-        }
-        const rhi::opengl::Enum depthAttachmentPoint = pipeline->depthStencilFormat == rhi::opengl::kDepth32fStencil8
-                                                           ? rhi::opengl::kDepthStencilAttachment
-                                                           : rhi::opengl::kDepthAttachment;
-        driver.framebufferTexture2D(rhi::opengl::kFramebuffer, rhi::opengl::kDepthAttachment, rhi::opengl::kTexture2D,
-                                    0, 0);
-        driver.framebufferTexture2D(rhi::opengl::kFramebuffer, rhi::opengl::kDepthStencilAttachment,
-                                    rhi::opengl::kTexture2D, 0, 0);
-        driver.framebufferTexture2D(rhi::opengl::kFramebuffer, depthAttachmentPoint, rhi::opengl::kTexture2D,
-                                    hasDepth ? static_cast<rhi::opengl::Uint>(depthImage) : 0, 0);
-        driver.drawBuffers(static_cast<rhi::opengl::Size>(std::max<size_t>(1, drawBufferCount)), drawBuffers.data());
-        if (drawBufferCount == 0)
-            driver.readBuffer(rhi::opengl::kNone);
-        if (driver.checkFramebufferStatus(rhi::opengl::kFramebuffer) != rhi::opengl::kFramebufferComplete)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_framebuffer_is_incomplete", 0, 0}})};
-        state.framebufferSignatures.insert_or_assign(static_cast<rhi::opengl::Uint>(renderingFramebuffer),
-                                                     framebufferSignature);
-    }
-    if (firstDraw || !state.viewportValid ||
+    if (reapply || !state.viewportValid ||
         !std::equal(std::begin(descriptor->viewport), std::end(descriptor->viewport), state.viewport.begin())) {
         driver.viewport(static_cast<rhi::opengl::Int>(descriptor->viewport[0]),
                         static_cast<rhi::opengl::Int>(descriptor->viewport[1]),
@@ -1320,55 +1183,15 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         std::copy(std::begin(descriptor->viewport), std::end(descriptor->viewport), state.viewport.begin());
         state.viewportValid = true;
     }
-    if (driver.scissor) {
-        if (firstDraw || !state.scissorValid ||
-            !std::equal(std::begin(descriptor->scissor), std::end(descriptor->scissor), state.scissor.begin())) {
-            driver.enable(rhi::opengl::kScissorTest);
-            driver.scissor(static_cast<rhi::opengl::Int>(descriptor->scissor[0]),
-                           static_cast<rhi::opengl::Int>(descriptor->scissor[1]),
-                           static_cast<rhi::opengl::Size>(descriptor->scissor[2]),
-                           static_cast<rhi::opengl::Size>(descriptor->scissor[3]));
-            std::copy(std::begin(descriptor->scissor), std::end(descriptor->scissor), state.scissor.begin());
-            state.scissorValid = true;
-        }
-    } else if (!std::equal(std::begin(descriptor->viewport), std::end(descriptor->viewport),
-                           std::begin(descriptor->scissor))) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::Unsupported, {"opengl_context_does_not_expose_glscissor", 0, 0}})};
-    }
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-        if (firstDraw && colorLoads[index] == VERNON_RHI_LOAD_CLEAR)
-            driver.clearBufferfv(rhi::opengl::kColor,
-                                 static_cast<rhi::opengl::Int>(descriptor->color_attachments[index].location),
-                                 colorClears[index].data());
-    if (hasDepth && firstDraw) {
-        if (pipeline->depthStencilFormat != rhi::opengl::kDepth32fStencil8 &&
-            (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD || clearStencil))
-            return RhiAdapterResult<void>{vernon::err(
-                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                      {"opengl_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
-        if (depthLoad == VERNON_RHI_LOAD_CLEAR)
-            driver.depthMask(1);
-        if (stencilLoad == VERNON_RHI_LOAD_CLEAR) {
-            driver.stencilMaskSeparate(0x0404, UINT32_MAX);
-            driver.stencilMaskSeparate(0x0405, UINT32_MAX);
-        }
-        if (depthLoad == VERNON_RHI_LOAD_CLEAR && stencilLoad == VERNON_RHI_LOAD_CLEAR)
-            driver.clearBufferfi(rhi::opengl::kDepthStencil, 0, clearDepth,
-                                 static_cast<rhi::opengl::Int>(clearStencil));
-        else {
-            if (depthLoad == VERNON_RHI_LOAD_CLEAR)
-                driver.clearBufferfv(rhi::opengl::kDepth, 0, &clearDepth);
-            if (stencilLoad == VERNON_RHI_LOAD_CLEAR) {
-                const rhi::opengl::Int stencil = static_cast<rhi::opengl::Int>(clearStencil);
-                driver.clearBufferiv(rhi::opengl::kStencil, 0, &stencil);
-            }
-        }
-        driver.depthMask(pipeline->depthStencil.depth_write != 0);
-        if (stencilLoad == VERNON_RHI_LOAD_CLEAR) {
-            driver.stencilMaskSeparate(0x0404, pipeline->depthStencil.stencil_write_mask);
-            driver.stencilMaskSeparate(0x0405, pipeline->depthStencil.stencil_write_mask);
-        }
+    if (reapply || !state.scissorValid ||
+        !std::equal(std::begin(descriptor->scissor), std::end(descriptor->scissor), state.scissor.begin())) {
+        driver.enable(rhi::opengl::kScissorTest);
+        driver.scissor(static_cast<rhi::opengl::Int>(descriptor->scissor[0]),
+                       static_cast<rhi::opengl::Int>(descriptor->scissor[1]),
+                       static_cast<rhi::opengl::Size>(descriptor->scissor[2]),
+                       static_cast<rhi::opengl::Size>(descriptor->scissor[3]));
+        std::copy(std::begin(descriptor->scissor), std::end(descriptor->scissor), state.scissor.begin());
+        state.scissorValid = true;
     }
     rhi::opengl::Enum topology = rhi::opengl::kTriangles;
     if (descriptor->topology == 1)
@@ -1384,7 +1207,14 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             return RhiAdapterResult<void>{vernon::err(
                 vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"opengl_pre_draw_state", error, 0}})};
     }
+    // gl_InstanceID excludes the base instance, so a nonzero first instance would change `instance_index`.
+    if (descriptor->first_instance != 0)
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::Unsupported, {"opengl_draw_first_instance_is_unsupported", 0, 0}})};
     if (descriptor->index_count != 0) {
+        if (descriptor->base_vertex != 0 && !driver.drawElementsInstancedBaseVertex)
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::Unsupported, {"opengl_draw_base_vertex_is_unsupported", 0, 0}})};
         if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_index_buffer", 0, 0}})};
@@ -1393,38 +1223,26 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
         const uint64_t indexBuffer = std::move(resolved).value();
         driver.bindBuffer(rhi::opengl::kElementArrayBuffer, static_cast<rhi::opengl::Uint>(indexBuffer));
-        driver.drawElementsInstanced(
-            topology, static_cast<rhi::opengl::Size>(descriptor->index_count), rhi::opengl::kUnsignedInt,
-            reinterpret_cast<const void *>(static_cast<uintptr_t>(descriptor->index_buffer.offset)),
-            static_cast<rhi::opengl::Size>(descriptor->instance_count));
+        const auto *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(descriptor->index_buffer.offset));
+        if (descriptor->base_vertex != 0)
+            driver.drawElementsInstancedBaseVertex(topology, static_cast<rhi::opengl::Size>(descriptor->index_count),
+                                                   rhi::opengl::kUnsignedInt, indices,
+                                                   static_cast<rhi::opengl::Size>(descriptor->instance_count),
+                                                   static_cast<rhi::opengl::Int>(descriptor->base_vertex));
+        else
+            driver.drawElementsInstanced(topology, static_cast<rhi::opengl::Size>(descriptor->index_count),
+                                         rhi::opengl::kUnsignedInt, indices,
+                                         static_cast<rhi::opengl::Size>(descriptor->instance_count));
     } else if (descriptor->instance_count == 1)
-        driver.drawArrays(topology, static_cast<rhi::opengl::Int>(descriptor->first_vertex),
-                          static_cast<rhi::opengl::Size>(descriptor->vertex_count));
+        driver.drawArrays(topology, 0, static_cast<rhi::opengl::Size>(descriptor->vertex_count));
     else
-        driver.drawArraysInstanced(topology, static_cast<rhi::opengl::Int>(descriptor->first_vertex),
-                                   static_cast<rhi::opengl::Size>(descriptor->vertex_count),
+        driver.drawArraysInstanced(topology, 0, static_cast<rhi::opengl::Size>(descriptor->vertex_count),
                                    static_cast<rhi::opengl::Size>(descriptor->instance_count));
     if (driver.getError) {
         const rhi::opengl::Enum error = driver.getError();
         if (error != 0)
             return RhiAdapterResult<void>{vernon::err(
                 vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"opengl_draw", error, 0}})};
-    }
-    if (standaloneRendering && driver.invalidateFramebuffer) {
-        std::array<rhi::opengl::Enum, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS + 2> discarded{};
-        size_t discardedCount = 0;
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            if (descriptor->color_attachments[index].store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
-                discarded[discardedCount++] =
-                    rhi::opengl::kColorAttachment0 + descriptor->color_attachments[index].location;
-        if (hasDepth && descriptor->depth_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
-            discarded[discardedCount++] = rhi::opengl::kDepthAttachment;
-        if (hasDepth && pipeline->depthStencilFormat == rhi::opengl::kDepth32fStencil8 &&
-            descriptor->stencil_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
-            discarded[discardedCount++] = rhi::opengl::kStencilAttachment;
-        if (discardedCount)
-            driver.invalidateFramebuffer(rhi::opengl::kFramebuffer, static_cast<rhi::opengl::Size>(discardedCount),
-                                         discarded.data());
     }
     if (!recordProviderCommand(adapter, commandEncoder, true))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1455,16 +1273,11 @@ NativeGraphicsBundle::~NativeGraphicsBundle() {
     if (!device)
         return;
     auto &state = openGLState(*adapter);
-    if (framebuffer) {
-        state.framebufferSignatures.erase(framebuffer);
-        if (state.framebufferValid && state.framebuffer == framebuffer)
-            state.framebufferValid = false;
-    }
     if (state.programValid && state.program == program)
         state.programValid = false;
     if (state.vertexArrayValid && state.vertexArray == vertexArray)
         state.vertexArrayValid = false;
-    device->destroyGraphicsObjects(vertexArray, framebuffer);
+    device->destroyVertexArray(vertexArray);
     device->destroyProgram(program);
 }
 void releaseCommandPipeline(void *context, uint64_t) {
@@ -1553,6 +1366,8 @@ void initializeOpenGLProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.create_binding_set = createBindings;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
+    adapter.provider.begin_rendering = beginRenderingCallback;
+    adapter.provider.end_rendering = endRenderingCallback;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;

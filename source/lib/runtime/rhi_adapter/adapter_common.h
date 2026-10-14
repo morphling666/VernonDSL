@@ -5,6 +5,7 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "rhi/rhi_internal.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -84,10 +85,6 @@ inline bool isRhiImageReference(VernonRuntimeProviderResourceReference resource)
     return kind == kRhiImageResource || kind == kRhiImageViewResource;
 }
 
-inline bool isRhiImageViewReference(VernonRuntimeProviderResourceReference resource) {
-    return (resource.identity & kRhiResourceKindMask) == kRhiImageViewResource;
-}
-
 inline bool packedUniformBytes(VernonRuntimeProviderBindingKind kind,
                                VernonRuntimeProviderBindingInterface interfaceKind) {
     return kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
@@ -143,22 +140,13 @@ RhiAdapterResult<uint64_t> nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter
                                                 VernonRuntimeProviderObject encoder) noexcept;
 RhiAdapterResult<bool> commandEncoderRendering(VernonRuntimeRhiAdapter &adapter,
                                                VernonRuntimeProviderObject encoder) noexcept;
-RhiAdapterResult<bool> commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter,
-                                                            VernonRuntimeProviderObject encoder) noexcept;
-RhiAdapterResult<void> commandColorOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                              size_t index, VernonRhiLoadOperation &load,
-                                              VernonRhiStoreOperation &store, float clear[4]) noexcept;
-RhiAdapterResult<void> commandDepthOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                              VernonRhiLoadOperation &depthLoad, VernonRhiStoreOperation &depthStore,
-                                              VernonRhiLoadOperation &stencilLoad,
-                                              VernonRhiStoreOperation &stencilStore, float &clearDepth,
-                                              uint32_t &clearStencil) noexcept;
-RhiAdapterResult<vernon::rhi::CommandRenderingClaim> claimCommandRendering(VernonRuntimeRhiAdapter &adapter,
-                                                                           VernonRuntimeProviderObject encoder,
-                                                                           uint32_t backendKind) noexcept;
-RhiAdapterResult<vernon::Option<uint64_t>> commandRenderingObject(VernonRuntimeRhiAdapter &adapter,
-                                                                  VernonRuntimeProviderObject encoder,
-                                                                  vernon::Option<uint64_t> candidate) noexcept;
+// The provider's rendering callbacks begin and end the RHI rendering scope of the encoder.
+VernonStatus beginRenderingCallback(void *data, VernonRuntimeProviderObject encoder,
+                                    const VernonRuntimeProviderRenderingDescriptor *descriptor);
+VernonStatus endRenderingCallback(void *data, VernonRuntimeProviderObject encoder);
+// Opens the encoder's native rendering scope unless it is open; draws open it before recording.
+RhiAdapterResult<vernon::rhi::OpenedRendering> openCommandRendering(VernonRuntimeRhiAdapter &adapter,
+                                                                    VernonRuntimeProviderObject encoder) noexcept;
 RhiAdapterResult<void> recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                              bool draw) noexcept;
 RhiAdapterResult<void> recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -171,9 +159,6 @@ RhiAdapterResult<void> deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, Ver
 RhiAdapterResult<void> deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                             void *context, uint64_t object,
                                             void (*rollback)(void *, uint64_t)) noexcept;
-RhiAdapterResult<void> setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                                  const uint64_t *colors, const uint64_t *resources, size_t colorCount,
-                                                  uint64_t depth, uint64_t depthResource) noexcept;
 
 } // namespace vernon::runtime::rhi_adapter
 

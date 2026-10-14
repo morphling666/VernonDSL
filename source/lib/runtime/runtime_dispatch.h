@@ -7,6 +7,7 @@
 #include "program_execution/invocation_outcome.h"
 #include "program_execution/materialized_node_frame.h"
 #include "program_execution/program_invocation_state.h"
+#include "program_execution/submission_record.h"
 #include "program_execution_manifest.h"
 #include "resolved_stage_invocation.h"
 #include "runtime_state.h"
@@ -26,7 +27,8 @@ template <typename T> using RuntimeResult = vernon::Result<T, vernon::RuntimeErr
 VernonStatus executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
                                          const program::Graph &graph, program_execution::ProgramInvocationState &frame,
                                          const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
-                                         program_execution::SubmissionState &submission);
+                                         program_execution::SubmissionRecord &submission,
+                                         program_execution::SubmissionState &step);
 
 bool isOpenGLBackend(VernonRuntimeBackend backend);
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic);
@@ -65,6 +67,9 @@ RuntimeResult<VernonRuntimeProviderImageDescription>
 describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
 RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
                                                                           VernonRhiCommandEncoder encoder);
+RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder,
+                                          const VernonRuntimeProviderRenderingDescriptor &descriptor);
+RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
 
 } // namespace vernon::runtime
 

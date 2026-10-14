@@ -136,25 +136,6 @@ struct PreparedBindingSet {
     std::mutex mutex;
 };
 
-class RenderingClaimRollback {
-public:
-    RenderingClaimRollback(VernonRhiDevice device, uint64_t encoderKey, uint32_t backendKind, bool armed) noexcept
-        : device_(device), encoderKey_(encoderKey), backendKind_(backendKind), armed_(armed) {}
-
-    ~RenderingClaimRollback() noexcept {
-        if (armed_)
-            rhi::rollbackCommandRenderingClaim(device_, encoderKey_, backendKind_);
-    }
-
-    void commit() noexcept { armed_ = false; }
-
-private:
-    VernonRhiDevice device_{};
-    uint64_t encoderKey_{};
-    uint32_t backendKind_{};
-    bool armed_{};
-};
-
 bool stringEquals(VernonStringView value, const char *expected) {
     const size_t size = std::strlen(expected);
     return value.data && value.size == size && std::memcmp(value.data, expected, size) == 0;
@@ -1042,22 +1023,6 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-MTLLoadAction loadAction(VernonRhiLoadOperation operation) {
-    switch (operation) {
-    case VERNON_RHI_LOAD_CLEAR:
-        return MTLLoadActionClear;
-    case VERNON_RHI_LOAD_PRESERVE:
-        return MTLLoadActionLoad;
-    case VERNON_RHI_LOAD_DISCARD:
-        return MTLLoadActionDontCare;
-    }
-    return MTLLoadActionDontCare;
-}
-
-MTLStoreAction storeAction(VernonRhiStoreOperation operation) {
-    return operation == VERNON_RHI_STORE_PRESERVE ? MTLStoreActionStore : MTLStoreActionDontCare;
-}
-
 bool primitiveType(uint32_t topology, MTLPrimitiveType &output) {
     switch (topology) {
     case 0:
@@ -1074,15 +1039,6 @@ bool primitiveType(uint32_t topology, MTLPrimitiveType &output) {
     }
 }
 
-bool sameRenderScope(const rhi::metal::RenderingState &left, const rhi::metal::RenderingState &right) {
-    if (left.colorCount != right.colorCount || left.hasDepth != right.hasDepth)
-        return false;
-    for (size_t index = 0; index < left.colors.size(); ++index)
-        if (!(left.colors[index] == right.colors[index]))
-            return false;
-    return !left.hasDepth || left.depth == right.depth;
-}
-
 RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject commandEncoder,
                                         const VernonRuntimeProviderDrawDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1092,177 +1048,39 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics || !pipeline->render ||
         (!bindings && descriptor->bindings.value) || (bindings && bindings->layout != pipeline->layout) ||
         (!bindings && pipeline->layout && !pipeline->layout->entries.empty()) ||
-        !primitiveType(descriptor->topology, primitive) ||
-        descriptor->color_attachment_count != pipeline->colorFormatCount ||
-        (descriptor->depth_stencil_view.resource.value && !pipeline->depthStencil) ||
-        (!descriptor->depth_stencil_view.resource.value && pipeline->depthStencil) || descriptor->instance_count == 0 ||
-        (!descriptor->index_count && descriptor->vertex_count == 0))
+        !primitiveType(descriptor->topology, primitive))
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"metal_adapter_received_an_invalid_or_unsupported_draw", 0, 0}})};
-    auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
-    if (!nativeCommand)
-        return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
-    const uint64_t native = std::move(nativeCommand).value();
-    auto renderingClaimResult = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingDynamic);
-    if (!renderingClaimResult)
-        return RhiAdapterResult<void>{vernon::err(std::move(renderingClaimResult).error())};
-    const vernon::rhi::CommandRenderingClaim renderingClaim = std::move(renderingClaimResult).value();
-    RenderingClaimRollback renderingClaimRollback{adapter.rhiDevice, commandEncoder.value,
-                                                  vernon::rhi::CommandRenderingDynamic,
-                                                  renderingClaim == vernon::rhi::CommandRenderingClaim::Acquired};
-    rhi::metal::RenderingState requested;
-    requested.colorCount = descriptor->color_attachment_count;
-    requested.hasDepth = descriptor->depth_stencil_view.resource.value != 0;
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargets{};
-    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderResources{};
-    std::array<bool, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> seenLocations{};
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-        const auto &source = descriptor->color_attachments[index];
-        if (source.location >= pipeline->colorFormatCount || seenLocations[source.location] ||
-            !retainCommandResource(adapter, commandEncoder, source.view))
+    auto opened = openCommandRendering(adapter, commandEncoder);
+    if (!opened)
+        return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
+    auto *rendering = reinterpret_cast<rhi::metal::RenderingState *>(static_cast<uintptr_t>(opened.value().object));
+    if (!rendering || !rendering->encoder)
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_is_unavailable", 0, 0}})};
+    // Metal requires the pipeline's attachment formats to match the render pass at every location.
+    for (uint32_t location = 0; location < VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS; ++location) {
+        id<MTLTexture> texture = rendering->colorTextures[location];
+        const MTLPixelFormat format =
+            location < pipeline->colorFormatCount ? pipeline->colorFormats[location] : MTLPixelFormatInvalid;
+        if ((texture == nil) != (format == MTLPixelFormatInvalid) ||
+            (texture && (texture.pixelFormat != format || texture.sampleCount != pipeline->sampleCount)))
             return RhiAdapterResult<void>{
                 vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                  {"metal_draw_contains_an_invalid_color_attachment", 0, 0}})};
-        seenLocations[source.location] = true;
-        auto resolution = resolveCommandRhiResource(adapter, commandEncoder, source.view);
-        if (!resolution)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
-        const uint64_t resolved = std::move(resolution).value();
-        id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
-        if (!texture || texture.pixelFormat != pipeline->colorFormats[source.location] ||
-            texture.sampleCount != pipeline->sampleCount)
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                  {"metal_draw_contains_an_incompatible_color_attachment", 0, 0}})};
-        VernonRhiLoadOperation load = static_cast<VernonRhiLoadOperation>(source.load_operation);
-        VernonRhiStoreOperation store = static_cast<VernonRhiStoreOperation>(source.store_operation);
-        float clear[4];
-        std::copy(std::begin(source.clear_color), std::end(source.clear_color), clear);
-        auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-        if (!hasRenderingDescriptor)
-            return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
-        if (std::move(hasRenderingDescriptor).value()) {
-            auto operations = commandColorOperations(adapter, commandEncoder, index, load, store, clear);
-            if (!operations)
-                return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
-        }
-        auto *attachment = pass.colorAttachments[source.location];
-        attachment.texture = texture;
-        attachment.loadAction = loadAction(load);
-        attachment.storeAction = storeAction(store);
-        attachment.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
-        requested.colors[source.location] = {source.view.identity,
-                                             source.view.resource.value,
-                                             source.location,
-                                             static_cast<uint32_t>(texture.pixelFormat),
-                                             static_cast<uint32_t>(load),
-                                             static_cast<uint32_t>(store),
-                                             static_cast<uint32_t>(texture.sampleCount)};
-        requested.colorTextures[source.location] = texture;
-        renderTargets[source.location] = resolved;
-        renderResources[source.location] = resolved;
+                                                  {"metal_draw_contains_an_incompatible_color_attachment", location, 0}})};
     }
-    uint64_t depthTarget = 0;
-    uint64_t depthResource = 0;
-    if (requested.hasDepth) {
-        if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                  {"metal_draw_contains_an_invalid_depth_attachment", 0, 0}})};
-        auto resolution = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
-        if (!resolution)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolution).error())};
-        const uint64_t resolved = std::move(resolution).value();
-        id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
-        if (!texture || texture.pixelFormat != pipeline->depthFormat || texture.sampleCount != pipeline->sampleCount)
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                  {"metal_draw_contains_an_incompatible_depth_attachment", 0, 0}})};
-        VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
-        VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
-        VernonRhiLoadOperation stencilLoad = static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
-        VernonRhiStoreOperation stencilStore =
-            static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
-        float clearDepth = descriptor->clear_depth;
-        uint32_t clearStencil = descriptor->clear_stencil;
-        auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-        if (!hasRenderingDescriptor)
-            return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
-        if (std::move(hasRenderingDescriptor).value()) {
-            auto operations = commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad,
-                                                     stencilStore, clearDepth, clearStencil);
-            if (!operations)
-                return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
-        }
-        pass.depthAttachment.texture = texture;
-        pass.depthAttachment.loadAction = loadAction(depthLoad);
-        pass.depthAttachment.storeAction = storeAction(depthStore);
-        pass.depthAttachment.clearDepth = clearDepth;
-        if (texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
-            pass.stencilAttachment.texture = texture;
-            pass.stencilAttachment.loadAction = loadAction(stencilLoad);
-            pass.stencilAttachment.storeAction = storeAction(stencilStore);
-            pass.stencilAttachment.clearStencil = clearStencil;
-        } else if (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD ||
-                   clearStencil != 0) {
-            return RhiAdapterResult<void>{vernon::err(
-                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                      {"metal_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
-        }
-        requested.depth = {descriptor->depth_stencil_view.identity,
-                           descriptor->depth_stencil_view.resource.value,
-                           0,
-                           static_cast<uint32_t>(texture.pixelFormat),
-                           static_cast<uint32_t>(depthLoad),
-                           static_cast<uint32_t>(depthStore),
-                           static_cast<uint32_t>(texture.sampleCount)};
-        requested.depthStencilTexture = texture;
-        depthTarget = depthResource = resolved;
-    }
+    id<MTLTexture> depthTexture = rendering->depthStencilTexture;
+    if ((depthTexture == nil) != (pipeline->depthStencil == nil) ||
+        (depthTexture &&
+         (depthTexture.pixelFormat != pipeline->depthFormat || depthTexture.sampleCount != pipeline->sampleCount)))
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"metal_draw_contains_an_incompatible_depth_attachment", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"metal_draw_could_not_retain_provider_objects", 0, 0}})};
-    id<MTLRenderCommandEncoder> encoder = nil;
-    if (renderingClaim == vernon::rhi::CommandRenderingClaim::Acquired) {
-        id<MTLCommandBuffer> commandBuffer =
-            (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
-        encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
-        if (!encoder)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_creation_failed", 0, 0}})};
-        auto rendering = std::make_unique<rhi::metal::RenderingState>(requested);
-        rendering->encoder = encoder;
-        const uint64_t renderingValue = reinterpret_cast<uintptr_t>(rendering.get());
-        auto installed = rhi::installCommandRenderingObject(adapter.rhiDevice, commandEncoder.value, renderingValue,
-                                                            renderTargets.data(), renderResources.data(),
-                                                            renderTargets.size(), depthTarget, depthResource);
-        if (!installed) {
-            [encoder endEncoding];
-            return RhiAdapterResult<void>{vernon::err(providerError(std::move(installed).error()))};
-        }
-        renderingClaimRollback.commit();
-        [[maybe_unused]] auto *ownedRendering = rendering.release();
-    } else {
-        auto renderingObject = commandRenderingObject(adapter, commandEncoder, vernon::Option<uint64_t>{});
-        if (!renderingObject)
-            return RhiAdapterResult<void>{vernon::err(std::move(renderingObject).error())};
-        auto renderingValueOption = std::move(renderingObject).value();
-        if (!renderingValueOption)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::LifecycleFailure, {"metal_rendering_object_is_unavailable", 0, 0}})};
-        const uint64_t renderingValue = std::move(renderingValueOption).value();
-        auto *rendering = reinterpret_cast<rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingValue));
-        if (!rendering || !sameRenderScope(*rendering, requested))
-            return RhiAdapterResult<void>{vernon::err(
-                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                      {"metal_draw_attachments_do_not_match_the_active_render_scope", 0, 0}})};
-        encoder = rendering->encoder;
-        if (!encoder)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"metal_render_command_encoder_is_unavailable", 0, 0}})};
-    }
+    id<MTLRenderCommandEncoder> encoder = rendering->encoder;
     [encoder setRenderPipelineState:pipeline->render];
     if (pipeline->depthStencil)
         [encoder setDepthStencilState:pipeline->depthStencil];
@@ -1380,11 +1198,11 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                            indexBuffer:indexBuffer
                      indexBufferOffset:descriptor->index_buffer.offset
                          instanceCount:descriptor->instance_count
-                            baseVertex:descriptor->first_vertex
+                            baseVertex:descriptor->base_vertex
                           baseInstance:descriptor->first_instance];
     } else {
         [encoder drawPrimitives:primitive
-                    vertexStart:descriptor->first_vertex
+                    vertexStart:0
                     vertexCount:descriptor->vertex_count
                   instanceCount:descriptor->instance_count
                    baseInstance:descriptor->first_instance];
@@ -1497,6 +1315,8 @@ void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.create_binding_set = createBindingSet;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
+    adapter.provider.begin_rendering = beginRenderingCallback;
+    adapter.provider.end_rendering = endRenderingCallback;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;

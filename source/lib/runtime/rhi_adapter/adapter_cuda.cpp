@@ -291,7 +291,7 @@ RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter
                 }
                 auto uploaded =
                     cudaResult(cudaDevice(adapter).upload(slot.hostStorage, inlineValue.data, inlineValue.size),
-                               "cuMemcpyHtoD host storage binding");
+                               "cuMemcpyHtoDAsync host storage binding");
                 if (!uploaded)
                     return uploaded;
                 resolvedValues[index] = slot.hostStorage;

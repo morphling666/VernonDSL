@@ -37,15 +37,12 @@ bool Driver::load() {
     VERNON_LOAD_CUDA(primaryContextRetain, "cuDevicePrimaryCtxRetain");
     VERNON_LOAD_CUDA(primaryContextRelease, "cuDevicePrimaryCtxRelease");
     VERNON_LOAD_CUDA(contextSetCurrent, "cuCtxSetCurrent");
-    VERNON_LOAD_CUDA(contextSynchronize, "cuCtxSynchronize");
     VERNON_LOAD_CUDA(errorName, "cuGetErrorName");
     VERNON_LOAD_CUDA(errorString, "cuGetErrorString");
     VERNON_LOAD_CUDA_VERSIONED(memoryAllocate, "cuMemAlloc");
     VERNON_LOAD_CUDA_VERSIONED(memoryFree, "cuMemFree");
     VERNON_LOAD_CUDA(hostAllocate, "cuMemHostAlloc");
     VERNON_LOAD_CUDA(hostFree, "cuMemFreeHost");
-    VERNON_LOAD_CUDA_VERSIONED(copyHostToDevice, "cuMemcpyHtoD");
-    VERNON_LOAD_CUDA_VERSIONED(copyDeviceToHost, "cuMemcpyDtoH");
     VERNON_LOAD_CUDA_VERSIONED(copyHostToDeviceAsync, "cuMemcpyHtoDAsync");
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToHostAsync, "cuMemcpyDtoHAsync");
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToDeviceAsync, "cuMemcpyDtoDAsync");
@@ -58,6 +55,7 @@ bool Driver::load() {
     VERNON_LOAD_CUDA(eventCreate, "cuEventCreate");
     VERNON_LOAD_CUDA_VERSIONED(eventDestroy, "cuEventDestroy");
     VERNON_LOAD_CUDA(eventRecord, "cuEventRecord");
+    VERNON_LOAD_CUDA(eventQuery, "cuEventQuery");
     VERNON_LOAD_CUDA(eventSynchronize, "cuEventSynchronize");
     VERNON_LOAD_CUDA(launchKernel, "cuLaunchKernel");
 

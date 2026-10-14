@@ -4,6 +4,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "VernonFormats.hpp"
 #include "mlir/Bytecode/BytecodeImplementation.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/IR/Builders.h"
@@ -108,23 +109,26 @@ LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, 
         return emitError() << "Texture dimension must be 2d, 3d, cube, 2d_array, or cube_array";
     if (!elementType.isF32() && !elementType.isInteger(32))
         return emitError() << "Texture shader element type must be f32, i32, or u32";
-    if (access == "sampled" || access == "attachment") {
+    if (access == "sampled") {
         if (format != "unknown")
-            return emitError() << access << " Texture format must be unknown";
-        if (access == "attachment" && dimension != "2d")
-            return emitError() << "attachment Texture dimension must be 2d";
+            return emitError() << "sampled Texture format must be unknown";
         return success();
     }
-    if (access != "read" && access != "write" && access != "read_write")
+    const bool attachment = access == "attachment";
+    if (attachment) {
+        if (dimension != "2d")
+            return emitError() << "attachment Texture dimension must be 2d";
+    } else if (access != "read" && access != "write" && access != "read_write") {
         return emitError() << "Texture access must be sampled, attachment, read, write, or read_write";
-    if (dimension == "cube" || dimension == "cube_array")
+    } else if (dimension == "cube" || dimension == "cube_array") {
         return emitError() << "storage Texture dimension must be 2d, 3d, or 2d_array";
-    if (!elementType.isF32())
-        return emitError() << "current storage Texture formats require f32 shader elements";
-    if (!llvm::is_contained(ArrayRef<StringRef>{"r8_unorm", "r16_float", "r32_float", "rg8_unorm", "rgba8_unorm",
-                                                "rgba16_float", "rgba32_float", "d32_float"},
-                            format))
-        return emitError() << "unsupported storage Texture format " << format;
+    }
+    const StringRef kind = attachment ? "attachment" : "storage";
+    const ::vernon::formats::Format *entry = ::vernon::formats::find(std::string_view(format.data(), format.size()));
+    if (!entry || !entry->allows(attachment ? VERNON_RHI_FORMAT_RENDERABLE : VERNON_RHI_FORMAT_STORAGE))
+        return emitError() << "unsupported " << kind << " Texture format " << format;
+    if (entry->integer() ? !elementType.isInteger(32) : !elementType.isF32())
+        return emitError() << kind << " Texture shader element type does not match format " << format;
     return success();
 }
 

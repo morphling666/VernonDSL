@@ -3,6 +3,8 @@
 
 #include "VernonLifecycle.hpp"
 #include "VernonRuntime.h"
+#include "program_execution/submission_queue.h"
+#include "program_execution/submission_record.h"
 #include "program_execution_manifest.h"
 #include "runtime_lifecycle.h"
 
@@ -68,6 +70,7 @@ struct VernonRuntimeContext {
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
     std::mutex referencedRhiBuffersMutex;
     std::map<std::pair<uint64_t, uint64_t>, VernonRhiBuffer> referencedRhiBuffers;
+    vernon::runtime::program_execution::SubmissionQueue submissions;
 };
 
 namespace vernon::runtime {
@@ -93,12 +96,15 @@ private:
 } // namespace vernon::runtime
 
 struct VernonSubmission {
+    VernonSubmission(VernonRuntimeContext &runtime,
+                     std::shared_ptr<vernon::runtime::program_execution::SubmissionRecord> submitted) noexcept
+        : context(&runtime), record(std::move(submitted)) {}
+
     vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
-    VernonRuntimeContext *context{};
-    VernonSubmissionState state{VERNON_SUBMISSION_PENDING};
-    VernonStatus status{VERNON_STATUS_OK};
-    VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRuntimeContext *context;
+    // Shared with the context's submission queue, which only observes it. State queries take a const submission
+    // but retire its finished work.
+    std::shared_ptr<vernon::runtime::program_execution::SubmissionRecord> record;
 };
 
 template <typename State, typename Handle> State &runtimeBackendState(Handle &handle) {
@@ -173,6 +179,7 @@ struct CanonicalProgramAutodiffState {
 };
 
 struct VernonProgramExecutable;
+struct RuntimeGraphicsPipelineState;
 
 struct ProgramGraphNodeAutodiffState {
     std::shared_ptr<VernonProgramExecutable> executable;
@@ -202,6 +209,10 @@ struct VernonProgramExecutable {
     std::unordered_set<uint64_t> graphicsControlKeys;
     std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> programGraphNodeAutodiff;
     CanonicalProgramAutodiffState programAutodiff;
+    // Pipeline 0 of each recorded graphics Node. The states hold no lease on this executable, so every handle,
+    // binding set, or recording that keeps one alive must itself keep this executable alive.
+    std::mutex passPipelineMutex;
+    std::map<VernonProgramNodeId, std::shared_ptr<const RuntimeGraphicsPipelineState>> passPipelines;
 };
 
 inline VernonProgramExecutable::VernonProgramExecutable(

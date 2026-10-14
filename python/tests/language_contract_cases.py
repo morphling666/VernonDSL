@@ -69,6 +69,7 @@ class RuntimeOracleKind(Enum):
     GRAPHICS_TRIANGLE = "graphics_triangle"
     MIXED_COMPUTE_GRAPHICS = "mixed_compute_graphics"
     SIGNED_STRIDE_VJP = "signed_stride_vjp"
+    FRAGMENT_DISCARD = "fragment_discard"
 
 
 class AcceptanceSuite(Enum):
@@ -341,6 +342,12 @@ TYPE_PARSER_INVALID_CASES: Final = (
         "TensorView access",
     ),
     _invalid_type("LANG-RESOURCE-002", "texture-arity", "Texture[f32]", "Texture requires"),
+    _invalid_type(
+        "LANG-RESOURCE-002",
+        "non-storage-format",
+        'Texture["2d", rgba8_srgb, write]',
+        "unsupported storage texture format",
+    ),
     _invalid_type(
         "LANG-RESOURCE-002",
         "unsupported-dimension",
@@ -761,6 +768,25 @@ def store(
         expected='!vernon.texture<"3d", f32, "rgba32_float", "write">',
     ),
     _valid_source(
+        "LANG-TEXTURE-STORAGE",
+        "integer-load-store",
+        "texture_store(r32_uint_texture, coordinate, texture_load(r32_uint_texture, coordinate) + 1)",
+        """
+from vernon_dsl import *
+
+@kernel
+def increment(
+    image: Annotated[Texture["2d", r32_uint, read_write], resource(set=0, binding=0)],
+    coordinate: Vector[i32, 2],
+) -> None:
+    value = texture_load(image, coordinate)
+    texture_store(image, coordinate, value + Vector([u32(1), u32(0), u32(0), u32(0)]))
+""",
+        valid_regions=frozenset({"compute"}),
+        capabilities=frozenset({"compute", "storage_texture"}),
+        expected='!vernon.texture<"2d", i32, "r32_uint", "read_write">',
+    ),
+    _valid_source(
         "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
         "vertex",
         "texture_sample(texture, sampler, coordinates, lod)",
@@ -889,6 +915,178 @@ WORKGROUP_INVALID_CASES: Final = (
         valid_regions=frozenset({"compute"}),
         invalid_regions=frozenset({"vertex", "fragment", "func"}),
         capabilities=frozenset({"compute", "workgroup_memory"}),
+    ),
+)
+
+FRAGMENT_DISCARD_VALID_CASES: Final = (
+    _valid_source(
+        "LANG-DISCARD-001",
+        "non-uniform-fragment",
+        "discard_fragment() in a fragment branch",
+        "from vernon_dsl import *\n"
+        "@fragment\n"
+        "def main(opacity: f32) -> Vector[f32, 4]:\n"
+        "    if opacity < 0.5:\n"
+        "        discard_fragment()\n"
+        "    return Vector([1.0, 0.0, 0.0, 1.0])\n",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics"}),
+        expected=MlirOracle(
+            required=("scf.if", 'vernon.stage = "fragment"'),
+            counts=(('"vernon.discard_fragment"', 1),),
+        ),
+    ),
+    _valid_source(
+        "LANG-DISCARD-001",
+        "return-or-discard",
+        "a branch that discards instead of returning",
+        "from vernon_dsl import *\n"
+        "@fragment\n"
+        "def main(opacity: f32) -> Vector[f32, 4]:\n"
+        "    if opacity < 0.5:\n"
+        "        discard_fragment()\n"
+        "    else:\n"
+        "        return Vector([1.0, 0.0, 0.0, 1.0])\n",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics"}),
+        expected=MlirOracle(required=("func.return",), counts=(('"vernon.discard_fragment"', 1),)),
+    ),
+    _valid_source(
+        "LANG-DISCARD-002",
+        "loop-and-helper",
+        "discard_fragment() in a loop body and in a helper",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def drop(opacity: f32) -> None:\n"
+        "    if opacity < 0.25:\n"
+        "        discard_fragment()\n"
+        "@fragment\n"
+        "def main(opacity: f32) -> Vector[f32, 4]:\n"
+        "    for index in range(3):\n"
+        "        if opacity < f32(index) * 0.25:\n"
+        "            discard_fragment()\n"
+        "    drop(opacity)\n"
+        "    return Vector([1.0, 0.0, 0.0, 1.0])\n",
+        valid_regions=frozenset({"fragment", "func"}),
+        capabilities=frozenset({"graphics"}),
+        expected=MlirOracle(
+            required=("scf.for", "func.call @drop"),
+            counts=(('"vernon.discard_fragment"', 2),),
+        ),
+    ),
+    _valid_source(
+        "LANG-DISCARD-003",
+        "unreachable-statements",
+        "statements after discard_fragment() in the same block",
+        "from vernon_dsl import *\n"
+        "@fragment\n"
+        "def main(opacity: f32) -> Vector[f32, 4]:\n"
+        "    color = Vector([1.0, 0.0, 0.0, 1.0])\n"
+        "    if opacity < 0.5:\n"
+        "        discard_fragment()\n"
+        "        color = Vector([0.0, 0.0, 7.0, 1.0])\n"
+        "    return color\n",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics"}),
+        expected=MlirOracle(required=('"vernon.discard_fragment"',), forbidden=("7.0",)),
+    ),
+)
+
+FRAGMENT_DISCARD_INVALID_CASES: Final = (
+    _invalid_source(
+        "LANG-DISCARD-001",
+        "vertex-entry",
+        "discard_fragment() in a vertex entry",
+        "from vernon_dsl import *\n"
+        "@vertex\n"
+        "def main() -> Vector[f32, 4]:\n"
+        "    discard_fragment()\n"
+        "    return Vector([0.0, 0.0, 0.0, 1.0])\n",
+        r"discard_fragment\(\) is not available in this shader stage",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"compute", "vertex", "func"}),
+        capabilities=frozenset({"graphics"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-001",
+        "compute-entry",
+        "discard_fragment() in a compute entry",
+        "from vernon_dsl import *\n@kernel\ndef main() -> None:\n    discard_fragment()\n",
+        r"discard_fragment\(\) is not available in this shader stage",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"compute", "vertex", "func"}),
+        capabilities=frozenset({"compute"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-001",
+        "arguments",
+        "discard_fragment(value)",
+        "from vernon_dsl import *\n"
+        "@fragment\n"
+        "def main() -> Vector[f32, 4]:\n"
+        "    discard_fragment(1)\n"
+        "    return Vector([0.0, 0.0, 0.0, 1.0])\n",
+        "discard_fragment does not accept arguments",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"compute", "vertex", "func"}),
+        capabilities=frozenset({"graphics"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-001",
+        "value-use",
+        "value = discard_fragment()",
+        "from vernon_dsl import *\n"
+        "@fragment\n"
+        "def main() -> Vector[f32, 4]:\n"
+        "    value = discard_fragment()\n"
+        "    return Vector([0.0, 0.0, 0.0, 1.0])\n",
+        "void function call cannot be assigned",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"compute", "vertex", "func"}),
+        capabilities=frozenset({"graphics"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-001",
+        "shared-function",
+        "discard_fragment() in @func(shared=True)",
+        "from vernon_dsl import *\n@func(shared=True)\ndef drop() -> None:\n    discard_fragment()\n",
+        "shared function 'drop' uses device-only operation 'discard_fragment'",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"host", "func"}),
+        capabilities=frozenset({"graphics"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-002",
+        "helper-from-vertex",
+        "a discarding helper reached from a vertex entry",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def drop() -> None:\n"
+        "    discard_fragment()\n"
+        "@vertex\n"
+        "def main() -> Vector[f32, 4]:\n"
+        "    drop()\n"
+        "    return Vector([0.0, 0.0, 0.0, 1.0])\n",
+        r"discard_fragment\(\) is not available in this shader stage",
+        valid_regions=frozenset({"fragment", "func"}),
+        invalid_regions=frozenset({"compute", "vertex"}),
+        capabilities=frozenset({"graphics"}),
+    ),
+    _invalid_source(
+        "LANG-DISCARD-002",
+        "helper-from-compute",
+        "a discarding helper reached from a compute entry",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def drop() -> None:\n"
+        "    discard_fragment()\n"
+        "@kernel\n"
+        "def main() -> None:\n"
+        "    drop()\n",
+        r"discard_fragment\(\) is not available in this shader stage",
+        valid_regions=frozenset({"fragment", "func"}),
+        invalid_regions=frozenset({"compute", "vertex"}),
+        capabilities=frozenset({"compute"}),
     ),
 )
 
@@ -2625,6 +2823,27 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
         oracle=RuntimeOracle(RuntimeOracleKind.GRAPHICS_TRIANGLE, (255, 64, 0, 255)),
     ),
     LanguageContractAcceptance(
+        id="fragment_discard_checker",
+        contract_ids=frozenset({"LANG-DISCARD-001", "LANG-GENERATED-FRAGMENT-COORD"}),
+        asset_reference="source/tests/fixtures/fragment_discard_asset.py:checker_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.FRAGMENT_DISCARD, (255, 64, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="fragment_discard_loop_and_helper",
+        contract_ids=frozenset({"LANG-DISCARD-002", "LANG-GENERATED-RESOLUTION"}),
+        asset_reference="source/tests/fixtures/fragment_discard_asset.py:loop_and_helper_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.FRAGMENT_DISCARD, (255, 64, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="fragment_discard_unreachable",
+        contract_ids=frozenset({"LANG-DISCARD-003"}),
+        asset_reference="source/tests/fixtures/fragment_discard_asset.py:unreachable_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.FRAGMENT_DISCARD, (255, 64, 0, 255)),
+    ),
+    LanguageContractAcceptance(
         id="sampled_texture",
         contract_ids=frozenset(
             {
@@ -2896,6 +3115,8 @@ _LANGUAGE_CONTRACT_CASES: Final = (
     + TEXTURE_OPERATION_INVALID_CASES
     + ATOMIC_INVALID_CASES
     + WORKGROUP_INVALID_CASES
+    + FRAGMENT_DISCARD_VALID_CASES
+    + FRAGMENT_DISCARD_INVALID_CASES
     + SYNCHRONIZATION_VALID_CASES
     + TENSOR_VIEW_VALID_CASES
     + TENSOR_VIEW_INVALID_CASES
@@ -2940,6 +3161,8 @@ CONTRACT_CASE_GROUPS: Final = {
     "METADATA_INVALID_CASES": METADATA_INVALID_CASES,
     "BUILTIN_INVALID_CASES": BUILTIN_INVALID_CASES,
     "READONLY_ATOMIC_INVALID_CASES": READONLY_ATOMIC_INVALID_CASES,
+    "FRAGMENT_DISCARD_VALID_CASES": FRAGMENT_DISCARD_VALID_CASES,
+    "FRAGMENT_DISCARD_INVALID_CASES": FRAGMENT_DISCARD_INVALID_CASES,
     "RAW_BUILTIN_VALID_CASES": RAW_BUILTIN_VALID_CASES,
     "GENERATED_BUILTIN_VALID_CASES": GENERATED_BUILTIN_VALID_CASES,
     "FRONTEND_IR_SOURCE_CASES": FRONTEND_IR_SOURCE_CASES,

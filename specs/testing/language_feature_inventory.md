@@ -337,6 +337,37 @@ compile failure with the stated stable reason, never a runtime skip.
 - Diagnostic/oracle: argument/stage/scope capability reason; writes become
   visible in the ordering region.
 
+### `LANG-DISCARD-001` — fragment discard
+
+- Valid: `discard_fragment()` in a `@fragment` entry, including non-uniform
+  control flow.
+- Invalid: arguments, use as a value, a vertex or compute entry, or a shared
+  function.
+- Capabilities: compile/runtime `graphics`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: `discard_fragment() is not available in this shader
+  stage`; a fragment that discards every other pixel leaves those pixels'
+  color, depth, and stencil at their cleared values.
+
+### `LANG-DISCARD-002` — fragment discard in loops and helpers
+
+- Valid: `discard_fragment()` inside a loop body and inside a helper reachable
+  only from fragment entries.
+- Invalid: a helper that discards reached from a vertex or compute entry.
+- Capabilities: compile/runtime `graphics`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: the stage diagnostic at the entry's call; the kept and
+  dropped pixels match `LANG-DISCARD-001`.
+
+### `LANG-DISCARD-003` — statements after fragment discard
+
+- Valid: statements after `discard_fragment()` in the same block.
+- Invalid: none beyond `LANG-DISCARD-001`.
+- Capabilities: compile/runtime `graphics`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: the statements are neither typed nor lowered and do not
+  affect any output.
+
 ### `LANG-DISPATCH-001` — ordinary-write dispatch contract
 
 - Valid: launch geometry satisfying compiler-derived unit-grid and

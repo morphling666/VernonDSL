@@ -9,6 +9,35 @@
 
 namespace vernon::runtime {
 
+// The distinct images the draws of a render scope sample, with the subresources each covers at the same index.
+struct GraphicsScopeReads {
+    std::vector<VernonRuntimeProviderResourceReference> images;
+    std::vector<ProviderImageSubresources> subresources;
+};
+
+void addGraphicsScopeReads(GraphicsScopeReads &reads, const PlannedGraphicsInvocation &invocation);
+// Whether a read covers a subresource that `targets` render to; a scope cannot sample its own attachments.
+bool graphicsScopeReadsOverlap(const GraphicsScopeReads &reads, const PlannedRenderTargets &targets);
+
+// The attachments and reads of one render scope. A fused scope takes its load operations from its first node, its
+// store operations from its last node, and the reads of every node. A depth-only attachment has no stencil contents,
+// so its stencil operations discard.
+struct GraphicsRenderScope {
+    std::vector<VernonRuntimeProviderColorAttachment> colors;
+    std::vector<VernonTextureFormat> colorFormats;
+    std::optional<VernonRuntimeProviderDepthStencilAttachment> depth;
+    VernonTextureFormat depthFormat{};
+    std::vector<ProviderImageSubresources> attachmentSubresources;
+    GraphicsScopeReads reads;
+    uint32_t width{};
+    uint32_t height{};
+};
+
+GraphicsRenderScope graphicsRenderScope(const PlannedRenderTargets &targets, GraphicsScopeReads reads);
+
+// Points into `scope`, which must outlive the descriptor.
+VernonRuntimeProviderRenderingDescriptor graphicsRenderingDescriptor(const GraphicsRenderScope &scope);
+
 enum class GraphicsScopeMaterialization {
     Begin,
     Fuse,
@@ -17,33 +46,18 @@ enum class GraphicsScopeMaterialization {
 
 class GraphicsScopeMaterializer {
 public:
-    GraphicsScopeMaterialization materialize(uint32_t candidateRegion, const PlannedGraphicsInvocation &invocation,
-                                             bool interrupted = false);
+    // Materializes a node rendering to `targets` whose draws sample `reads`, which must not overlap `targets`.
+    GraphicsScopeMaterialization materialize(uint32_t candidateRegion, const PlannedRenderTargets &targets,
+                                             const GraphicsScopeReads &reads, bool interrupted = false);
     void reset();
+    // The scope of the last materialized node, extended by every node fused into it.
+    const GraphicsRenderScope &scope() const { return scope_; }
 
 private:
-    struct ColorState {
-        uint32_t location{};
-        VernonRuntimeProviderResourceReference view{};
-        VernonRuntimeProviderStoreOperation store{};
-    };
-
-    struct DepthState {
-        VernonRuntimeProviderResourceReference view{};
-        VernonRuntimeProviderStoreOperation depthStore{};
-        VernonRuntimeProviderStoreOperation stencilStore{};
-    };
-
-    bool canFuse(const PlannedGraphicsInvocation &next) const;
-    void capture(const PlannedGraphicsInvocation &invocation);
+    bool canFuse(const PlannedRenderTargets &next) const;
 
     std::optional<uint32_t> candidateRegion_;
-    std::vector<ColorState> colors_;
-    std::vector<VernonTextureFormat> colorFormats_;
-    uint32_t attachmentWidth_{};
-    uint32_t attachmentHeight_{};
-    VernonTextureFormat depthFormat_{};
-    std::optional<DepthState> depth_;
+    GraphicsRenderScope scope_;
 };
 
 } // namespace vernon::runtime

@@ -4,7 +4,9 @@
 #include "rhi_command_state.h"
 #include "rhi_lifecycle.h"
 
+#include <array>
 #include <string_view>
+#include <utility>
 
 namespace vernon::rhi {
 
@@ -40,12 +42,86 @@ enum CommandRenderingKind : uint32_t {
     CommandRenderingRenderPass = 2,
     CommandRenderingStateless = 3
 };
+struct RenderingColorAttachment {
+    uint64_t view{};
+    VernonRhiFormat format{};
+    uint32_t location{};
+    VernonRhiLoadOperation load{VERNON_RHI_LOAD_PRESERVE};
+    VernonRhiStoreOperation store{VERNON_RHI_STORE_PRESERVE};
+    VernonClearColor clear{};
+};
+
+struct RenderingDepthAttachment {
+    uint64_t view{};
+    VernonRhiFormat format{};
+    bool stencil{};
+    VernonRhiLoadOperation depthLoad{VERNON_RHI_LOAD_PRESERVE};
+    VernonRhiStoreOperation depthStore{VERNON_RHI_STORE_PRESERVE};
+    VernonRhiLoadOperation stencilLoad{VERNON_RHI_LOAD_DISCARD};
+    VernonRhiStoreOperation stencilStore{VERNON_RHI_STORE_DISCARD};
+    float clearDepth{1.0f};
+    uint32_t clearStencil{};
+};
+
+// Attachment views are image view resource keys, as `imageViewResource` returns them. `BeginRendering` validates
+// them against the render area, so backends open the scope without revalidating; `format` is the view's format and
+// `stencil` whether it has a stencil aspect.
+struct RenderingScope {
+    std::array<RenderingColorAttachment, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
+    size_t colorCount{};
+    RenderingDepthAttachment depth{};
+    bool hasDepth{};
+    int32_t x{};
+    int32_t y{};
+    uint32_t width{};
+    uint32_t height{};
+    uint32_t layers{};
+
+    const RenderingColorAttachment *colorAt(uint32_t location) const noexcept {
+        for (size_t index = 0; index < colorCount; ++index)
+            if (colors[index].location == location)
+                return &colors[index];
+        return nullptr;
+    }
+    RenderingColorAttachment *colorAt(uint32_t location) noexcept {
+        return const_cast<RenderingColorAttachment *>(std::as_const(*this).colorAt(location));
+    }
+    // Attachments are indexed colors first, then depth.
+    size_t attachmentCount() const noexcept { return colorCount + (hasDepth ? 1u : 0u); }
+    uint64_t attachmentView(size_t index) const noexcept {
+        return index < colorCount ? colors[index].view : depth.view;
+    }
+};
+
+// An image or image view, as a resource key, that the draws of a rendering scope sample.
+struct RenderingRead {
+    ResourceKind kind{};
+    uint64_t key{};
+};
+
+// A backend's open native scope; `kind` is nonzero. Backends place native color attachments at their locations and
+// store in the location-indexed `colorTargets`/`colorResources` and in `depthTarget`/`depthResource` what their clear
+// and end callbacks address.
+struct OpenedRendering {
+    uint32_t kind{};
+    uint64_t object{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTargets{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorResources{};
+    uint64_t depthTarget{};
+    uint64_t depthResource{};
+};
+
 enum BackendCommandCapabilityBits : uint32_t {
     BackendCommandIndependentRecording = 1u << 0,
+    // Submission, polling and completion may be called from any thread. Without it, every call on the device must come
+    // from the thread that owns the device's native context.
     BackendCommandConcurrentSubmission = 1u << 1,
     BackendCommandTimelineCompletion = 1u << 2,
     BackendCommandGpuTimestamps = 1u << 3,
     BackendCommandExplicitComputeDependencies = 1u << 4,
+    // The device's host executes its submissions, as on a borrowed device. The RHI cannot wait for them, so it rejects
+    // operations whose results the host reads.
+    BackendCommandExternalExecution = 1u << 5,
 };
 
 struct CommandRecording {
@@ -56,6 +132,9 @@ struct CommandRecording {
 struct CommandSubmission {
     bool completed{};
     bool externalCompletion{};
+    // Names the submitted work to pollCommands and completeCommands. It differs from the recording's native handle on
+    // backends that reuse that handle before the work completes.
+    uint64_t retirement{};
 };
 
 struct CommandPoll {
@@ -91,7 +170,7 @@ using ImageResourceCallback = Result<uint64_t, RhiError> (*)(VernonRhiDevice, Ve
 using DescribeImageResourceCallback = Result<ImageResourceDescription, RhiError> (*)(VernonRhiDevice,
                                                                                      uint64_t) noexcept;
 using PollCommandsCallback = Result<CommandPoll, RhiError> (*)(VernonRhiDevice, uint64_t) noexcept;
-using CompleteBorrowedCommandsCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t) noexcept;
+using CompleteCommandsCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t) noexcept;
 using AbandonCommandsCallback = void (*)(VernonRhiDevice, uint64_t) noexcept;
 using RecordBarriersCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *,
                                                           size_t) noexcept;
@@ -100,15 +179,25 @@ using RecordBufferCopyCallback = Result<void, RhiError> (*)(VernonRhiDevice, uin
 using RecordImageCopyCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, uint64_t, VernonRhiImage,
                                                            VernonRhiImage, const VernonRhiImageCopyRegion *,
                                                            size_t) noexcept;
-using EndRenderingCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t,
-                                                        uint32_t, const uint64_t *, size_t, uint64_t,
-                                                        uint64_t) noexcept;
-using ClearColorCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint64_t,
-                                                      int32_t, int32_t, uint32_t, uint32_t, uint32_t, uint64_t,
-                                                      uint32_t, const float[4]) noexcept;
-using ClearDepthStencilCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t,
-                                                             uint64_t, int32_t, int32_t, uint32_t, uint32_t, uint32_t,
-                                                             uint64_t, float, uint32_t, uint32_t) noexcept;
+// Opens the native scope of `scope` on the encoder, applying its load operations, after making `reads` readable by
+// shaders. Attachments and reads are retained and transitioned through the encoder, so a failure leaves rollbacks that
+// restore their state.
+using BeginRenderingCallback = Result<OpenedRendering, RhiError> (*)(VernonRhiDevice, uint64_t encoderKey,
+                                                                     uint64_t native, const RenderingScope &,
+                                                                     const RenderingRead *reads,
+                                                                     size_t readCount) noexcept;
+// Ends the native scope that `BeginRenderingCallback` opened for `scope`, applying its store operations. It runs under
+// the encoder's lock, so it must not call encoder services.
+using EndRenderingCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native, const RenderingScope &,
+                                                        const OpenedRendering &) noexcept;
+// Clear callbacks clear the render area of the open scope's attachment at `location`, or of its depth attachment.
+// They run under the encoder's lock.
+using ClearColorCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native, const RenderingScope &,
+                                                      const OpenedRendering &, uint32_t location,
+                                                      const VernonClearColor &color) noexcept;
+using ClearDepthStencilCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native, const RenderingScope &,
+                                                             const OpenedRendering &, float depth, uint32_t stencil,
+                                                             uint32_t aspects) noexcept;
 using TrackedBufferStateCallback = Result<uint64_t, RhiError> (*)(VernonRhiDevice, VernonRhiBuffer);
 using CreateImageViewCallback = Result<VernonRhiImageView, RhiError> (*)(VernonRhiDevice,
                                                                          const VernonRhiImageViewDescriptor *);
@@ -126,7 +215,6 @@ struct BackendDispatch {
     Result<VernonRhiDevice, RhiError> (*createOwnedDevice)(const VernonRhiOwnedDeviceDescriptor *);
     Result<void, RhiError> (*destroyDevice)(VernonRhiDevice) noexcept;
     Option<VernonStringView> (*lastError)(VernonRhiDevice);
-    Result<void, RhiError> (*synchronize)(VernonRhiDevice);
     Result<void *, RhiError> (*deviceState)(VernonRhiDevice);
     Result<CommandDeviceStateRef, RhiError> (*commandState)(VernonRhiDevice) noexcept;
 
@@ -151,6 +239,8 @@ struct BackendDispatch {
     Option<ImageOperationCallback> destroyImage;
     Option<ImageValidityCallback> isImageValid;
     Option<ImageNativeHandleCallback> getImageNativeHandle;
+    // Device capability bits for a format in the table; the front end intersects them with the table baseline.
+    Option<Result<uint32_t, RhiError> (*)(VernonRhiDevice, VernonRhiFormat)> formatCapabilities;
 
     Option<Result<VernonRhiSampler, RhiError> (*)(VernonRhiDevice, const VernonRhiSamplerDescriptor *)> createSampler;
     Option<Result<void, RhiError> (*)(VernonRhiDevice, VernonRhiSampler)> destroySampler;
@@ -166,11 +256,12 @@ struct BackendDispatch {
     Result<CommandRecording, RhiError> (*beginCommands)(VernonRhiDevice) noexcept;
     Result<CommandSubmission, RhiError> (*submitCommands)(VernonRhiDevice, uint64_t, bool) noexcept;
     Option<PollCommandsCallback> pollCommands;
-    Option<CompleteBorrowedCommandsCallback> completeBorrowedCommands;
+    Option<CompleteCommandsCallback> completeCommands;
     Option<AbandonCommandsCallback> abandonCommands;
     Option<RecordBarriersCallback> recordBarriers;
     Option<RecordBufferCopyCallback> recordBufferCopy;
     Option<RecordImageCopyCallback> recordImageCopy;
+    Option<BeginRenderingCallback> beginRendering;
     Option<EndRenderingCallback> endRendering;
     Option<ClearColorCallback> clearColor;
     Option<ClearDepthStencilCallback> clearDepthStencil;
@@ -186,11 +277,24 @@ struct BackendDispatch {
 VERNON_RHI_CAPI void setDeviceCreationError(std::string_view error) noexcept;
 VERNON_RHI_CAPI VernonStringView deviceCreationError() noexcept;
 const BackendDispatch &openGLBackendDispatch();
-VERNON_RHI_CAPI Result<void, RhiError> deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context,
+// Encoder services for backends and adapters. Resources retained through the encoder `key` stay alive until it
+// completes; cleanups run on completion or abandonment, rollbacks only on abandonment.
+VERNON_RHI_CAPI Result<void, RhiError> retainCommandResource(VernonRhiDevice device, uint64_t key, ResourceKind kind,
+                                                             uint64_t resource_key) noexcept;
+VERNON_RHI_CAPI Result<uint64_t, RhiError> resolveCommandResource(VernonRhiDevice device, uint64_t key,
+                                                                  ResourceKind kind, uint64_t resource_key) noexcept;
+inline Result<uint64_t, RhiError> retainResolvedCommandResource(VernonRhiDevice device, uint64_t key, ResourceKind kind,
+                                                                uint64_t resource_key) noexcept {
+    auto retained = retainCommandResource(device, key, kind, resource_key);
+    if (retained.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(retained).error())};
+    return resolveCommandResource(device, key, kind, resource_key);
+}
+VERNON_RHI_CAPI Result<void, RhiError> deferCommandCleanup(VernonRhiDevice device, uint64_t key, void *context,
+                                                           uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> deferCommandRollback(VernonRhiDevice device, uint64_t key, void *context,
                                                             uint64_t object,
                                                             void (*rollback)(void *, uint64_t)) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> deferCommandCleanup(VernonRhiDevice device, uint64_t encoderKey, void *context,
-                                                           uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept;
 #if defined(VERNON_HAS_CUDA_RHI)
 const BackendDispatch &cudaBackendDispatch();
 #endif

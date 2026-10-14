@@ -4,15 +4,12 @@
 #include "graphics_invocation_planner.h"
 #include "pipeline_metadata.h"
 
-#include <array>
 #include <string>
 #include <vector>
 
 namespace vernon::runtime {
 
 struct PreparedGraphicsDraw {
-    std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> attachments{};
-    VernonRuntimeProviderResourceReference depthAttachment{};
     PlannedGraphicsState graphicsState;
     std::vector<uint32_t> vertexStrides;
     GraphicsVariantKey variantKey;

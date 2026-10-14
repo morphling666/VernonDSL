@@ -23,7 +23,7 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
     description->image.mip_level_count = 1;
     description->image.array_layer_count = 1;
     description->image.sample_count = 1;
-    description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+    description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT | VERNON_IMAGE_SAMPLED;
     description->view.dimension = VERNON_TEXTURE_2D;
     description->view.format = VERNON_TEXTURE_RGBA8_UNORM;
     description->view.subresources = {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR};
@@ -415,44 +415,71 @@ TEST(GraphicsScopeMaterializer, SelectsFusedOrSplitResolvedCandidatePath) {
     second.attachments = {&following};
 
     GraphicsScopeMaterializer materializer;
-    EXPECT_EQ(materializer.materialize(0, first), GraphicsScopeMaterialization::Begin);
-    EXPECT_EQ(materializer.materialize(0, second), GraphicsScopeMaterialization::Fuse);
-    EXPECT_EQ(materializer.materialize(0, second, true), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, first, {}), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, second, {}), GraphicsScopeMaterialization::Fuse);
+    EXPECT_EQ(materializer.materialize(0, second, {}, true), GraphicsScopeMaterialization::Begin);
     VernonColorAttachment clearing = following;
     PlannedGraphicsInvocation clearingInvocation = second;
     clearingInvocation.attachments = {&clearing};
     clearing.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    EXPECT_EQ(materializer.materialize(0, clearingInvocation), GraphicsScopeMaterialization::Split);
+    EXPECT_EQ(materializer.materialize(0, clearingInvocation, {}), GraphicsScopeMaterialization::Split);
     VernonColorAttachment differentView = clearing;
     differentView.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
     differentView.view.identity = 8;
     PlannedGraphicsInvocation differentViewInvocation = second;
     differentViewInvocation.attachments = {&differentView};
-    EXPECT_EQ(materializer.materialize(0, differentViewInvocation), GraphicsScopeMaterialization::Split);
-    EXPECT_EQ(materializer.materialize(1, differentViewInvocation), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, differentViewInvocation, {}), GraphicsScopeMaterialization::Split);
+    EXPECT_EQ(materializer.materialize(1, differentViewInvocation, {}), GraphicsScopeMaterialization::Begin);
 }
 
-TEST(GraphicsScopeMaterializer, SamplingPreviousDepthAttachmentSelectsSplitPath) {
-    VernonDepthAttachment previous{};
-    previous.view = {17, {29}, 0, 0};
+TEST(GraphicsScopeMaterializer, FusedScopeDeclaresTheReadsOfEveryNode) {
+    VernonColorAttachment previous{};
+    previous.view = {7, {11}, 0, 0};
     previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    previous.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    VernonDepthAttachment following = previous;
+    VernonColorAttachment following = previous;
     following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
-    following.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    PlannedGraphicsInvocation first;
+    first.attachments = {&previous};
+    first.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
+    first.attachmentSubresources = {{11, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}}};
+    first.attachmentWidth = 16;
+    first.attachmentHeight = 16;
+    PlannedGraphicsInvocation second = first;
+    second.attachments = {&following};
+    const VernonRuntimeProviderResourceReference albedo{21, {31}, 0, 0};
+    const VernonRuntimeProviderResourceReference normal{22, {32}, 0, 0};
+    first.sampledResources[{0, 0}].imageView = albedo;
+    first.sampledResources[{0, 0}].subresources = {31, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
+    second.sampledResources[{0, 0}] = first.sampledResources[{0, 0}];
+    second.sampledResources[{0, 1}].imageView = normal;
+    second.sampledResources[{0, 1}].subresources = {32, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
 
-    PlannedGraphicsInvocation shadow;
-    shadow.depthAttachment = &previous;
-    shadow.depthFormat = VERNON_TEXTURE_D32_FLOAT;
-    shadow.attachmentWidth = 16;
-    shadow.attachmentHeight = 16;
-    PlannedGraphicsInvocation pbr = shadow;
-    pbr.depthAttachment = &following;
-    pbr.sampledResources[{0, 0}].imageView = previous.view;
-
+    GraphicsScopeReads firstReads;
+    addGraphicsScopeReads(firstReads, first);
+    GraphicsScopeReads secondReads;
+    addGraphicsScopeReads(secondReads, second);
     GraphicsScopeMaterializer materializer;
-    EXPECT_EQ(materializer.materialize(0, shadow), GraphicsScopeMaterialization::Begin);
-    EXPECT_EQ(materializer.materialize(0, pbr), GraphicsScopeMaterialization::Split);
+    EXPECT_EQ(materializer.materialize(0, first, firstReads), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, second, secondReads), GraphicsScopeMaterialization::Fuse);
+    const VernonRuntimeProviderRenderingDescriptor descriptor = graphicsRenderingDescriptor(materializer.scope());
+    ASSERT_EQ(descriptor.sampled_image_count, 2u);
+    EXPECT_EQ(descriptor.sampled_images[0].identity, albedo.identity);
+    EXPECT_EQ(descriptor.sampled_images[1].identity, normal.identity);
+}
+
+TEST(GraphicsScopeMaterializer, DetectsReadsOverlappingTheirAttachments) {
+    PlannedRenderTargets shadow;
+    shadow.attachmentSubresources = {{29, {2, 1, 0, 1, VERNON_IMAGE_ASPECT_DEPTH}}};
+    GraphicsScopeReads otherMip;
+    otherMip.images = {{17, {29}, 0, 0}};
+    otherMip.subresources = {{29, {0, 2, 0, 1, VERNON_IMAGE_ASPECT_DEPTH}}};
+    EXPECT_FALSE(graphicsScopeReadsOverlap(otherMip, shadow));
+    GraphicsScopeReads wholeImage = otherMip;
+    wholeImage.subresources = {{29, {0, 4, 0, 1, VERNON_IMAGE_ASPECT_DEPTH}}};
+    EXPECT_TRUE(graphicsScopeReadsOverlap(wholeImage, shadow));
+    GraphicsScopeReads otherImage = wholeImage;
+    otherImage.subresources[0].parent = 30;
+    EXPECT_FALSE(graphicsScopeReadsOverlap(otherImage, shadow));
 }
 
 TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {

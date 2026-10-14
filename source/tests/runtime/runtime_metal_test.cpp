@@ -48,7 +48,7 @@ TEST(RuntimeMetal, ResolvesBorrowedProgramImageExtentPerInvocation) {
     VernonRhiDevice device = createMetalDevice();
     if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         GTEST_SKIP() << "Metal is unavailable";
-    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
     vernon::runtime::program::Storage storage;
     storage.ownership = vernon::runtime::program::StorageOwnership::Borrowed;
@@ -268,7 +268,7 @@ TEST(RuntimeMetal, CopiesBufferEntirelyOnDevice) {
 TEST(RuntimeMetal, ValidatesMslHostVersionAndComputeLimitsWithSpecificErrors) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
 
     vernon::runtime::RuntimeRequirements requirements;
@@ -622,29 +622,9 @@ TEST(RuntimeMetal, CreatesImageViewsAndRetainsTheirParentImage) {
     vernonRhiDestroyDevice(device);
 }
 
-TEST(RuntimeMetal, RejectsImageDescriptorsThatWouldChangeSemantics) {
+TEST(RuntimeMetal, RejectsBufferDescriptorsThatWouldChangeSemantics) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    VernonRhiImageDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.dimension = VERNON_RHI_IMAGE_2D;
-    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
-    descriptor.width = 2;
-    descriptor.height = 2;
-    descriptor.depth = 2;
-    descriptor.mip_levels = 1;
-    descriptor.array_layers = 1;
-    descriptor.sample_count = 1;
-    descriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
-    VernonRhiImage image{};
-    EXPECT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &image), VERNON_RHI_STATUS_INVALID_ARGUMENT);
-    descriptor.depth = 1;
-    descriptor.mip_levels = 3;
-    EXPECT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &image), VERNON_RHI_STATUS_INVALID_ARGUMENT);
-    descriptor.mip_levels = 1;
-    descriptor.usage |= uint32_t{1} << 31;
-    EXPECT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &image), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 
     VernonRhiBufferDescriptor bufferDescriptor{};
     bufferDescriptor.struct_size = sizeof(bufferDescriptor);
@@ -1479,8 +1459,8 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     EXPECT_EQ(provider->encode_dispatch(provider->user_data, providerCommand, &invalidDispatch),
               VERNON_STATUS_INVALID_ARGUMENT);
     ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, command, &rendering), VERNON_RHI_STATUS_OK);
-    constexpr float deferredClear[]{1, 0, 0, 1};
-    ASSERT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, deferredClear), VERNON_RHI_STATUS_OK);
+    constexpr VernonClearColor deferredClear{{1, 0, 0, 1}};
+    ASSERT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, &deferredClear), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderClearDepthStencilAttachment(
                   device, command, 0.25f, 2, VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL),
               VERNON_RHI_STATUS_OK);
@@ -1521,8 +1501,8 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     attachment.view = secondImageReference;
     EXPECT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_INVALID_ARGUMENT);
     attachment.view = imageReference;
-    constexpr float explicitClear[]{0, 0, 0, 1};
-    EXPECT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, explicitClear), VERNON_RHI_STATUS_OK);
+    constexpr VernonClearColor explicitClear{{0, 0, 0, 1}};
+    EXPECT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, &explicitClear), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderClearDepthStencilAttachment(
                   device, command, 0.5f, 3, VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL),
               VERNON_RHI_STATUS_OK);
@@ -1601,7 +1581,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
         vernonRhiDestroyDevice(device);
         GTEST_SKIP() << "Metal argument-buffer encoding is unavailable on this device";
     }
-    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetContextCapabilities(runtime);
     EXPECT_TRUE(capabilities.supports_compute);
@@ -1692,7 +1672,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     ASSERT_FALSE(bundle.empty());
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
     VernonProgramBundleLoadOptions options{};
@@ -1804,7 +1784,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
         vernonRhiDestroyDevice(device);
         GTEST_SKIP() << "Metal argument-buffer encoding is unavailable on this device";
     }
-    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
     VernonProgramBundleLoadOptions options{};

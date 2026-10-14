@@ -1,3 +1,5 @@
+#include "VernonFormats.hpp"
+#include "image_descriptor_validation.h"
 #include "public_c_boundary.h"
 #include "rhi_internal.h"
 #include "rhi_test_hooks.h"
@@ -93,14 +95,6 @@ vernon::rhi::deviceLastError(VernonRhiDevice device) {
     return Result<Option<VernonStringView>, RhiError>{ok(backend->lastError(device))};
 }
 
-vernon::Result<void, vernon::RhiError> vernon::rhi::synchronizeDevice(VernonRhiDevice device) {
-    const BackendDispatch *backend = dispatch(device);
-    if (!backend)
-        return Result<void, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"synchronize_device", device.generation, device.index}})};
-    return backend->synchronize(device);
-}
-
 bool vernon::rhi::deviceExists(VernonRhiDevice device) { return dispatch(device) != nullptr; }
 
 vernon::Result<vernon::rhi::CommandDeviceStateRef, vernon::RhiError>
@@ -136,38 +130,53 @@ vernon::Result<void *, vernon::RhiError> vernon::rhi::deviceState(VernonRhiDevic
     return backend->deviceState(device);
 }
 
+enum class HostAccess { None, ReadsResults };
+
 template <typename Function>
 vernon::Result<void, vernon::RhiError> dispatchStatusImpl(VernonRhiDevice device, const char *operation,
-                                                          Function &&function) {
+                                                          Function &&function, HostAccess access = HostAccess::None) {
     const auto *backend = dispatch(device);
     if (!backend)
         return vernon::Result<void, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, 0, 0}})};
+    // Rejected before recording: the host would execute the copy after the RHI had already returned its stale result.
+    if (access == HostAccess::ReadsResults &&
+        (vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandExternalExecution))
+        return vernon::Result<void, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::Unsupported, {operation, device.generation, device.index}})};
     return std::forward<Function>(function)(*backend);
 }
 
-#define VERNON_REQUIRED_RESULT_IMPL(name, operation, parameters, arguments)                                            \
+#define VERNON_REQUIRED_RESULT_ACCESS_IMPL(name, operation, access, parameters, arguments)                             \
     static vernon::Result<void, vernon::RhiError> name##Impl parameters {                                              \
-        return dispatchStatusImpl(device, #operation, [&](const vernon::rhi::BackendDispatch &backend) {               \
-            return backend.operation arguments;                                                                        \
-        });                                                                                                            \
+        return dispatchStatusImpl(                                                                                     \
+            device, #operation,                                                                                        \
+            [&](const vernon::rhi::BackendDispatch &backend) { return backend.operation arguments; }, access);         \
     }                                                                                                                  \
     extern "C" VernonRhiStatus name parameters {                                                                       \
         return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
     }
 
-#define VERNON_OPTIONAL_RESULT_IMPL(name, operation, parameters, arguments)                                            \
+#define VERNON_OPTIONAL_RESULT_ACCESS_IMPL(name, operation, access, parameters, arguments)                             \
     static vernon::Result<void, vernon::RhiError> name##Impl parameters {                                              \
-        return dispatchStatusImpl(device, #operation, [&](const vernon::rhi::BackendDispatch &backend) {               \
-            if (!backend.operation)                                                                                    \
-                return vernon::Result<void, vernon::RhiError>{                                                         \
-                    vernon::err(vernon::RhiError{vernon::RhiErrorCode::Unsupported, {#operation, 0, 0}})};             \
-            return backend.operation.value() arguments;                                                                \
-        });                                                                                                            \
+        return dispatchStatusImpl(                                                                                     \
+            device, #operation,                                                                                        \
+            [&](const vernon::rhi::BackendDispatch &backend) {                                                         \
+                if (!backend.operation)                                                                                \
+                    return vernon::Result<void, vernon::RhiError>{                                                     \
+                        vernon::err(vernon::RhiError{vernon::RhiErrorCode::Unsupported, {#operation, 0, 0}})};         \
+                return backend.operation.value() arguments;                                                            \
+            },                                                                                                         \
+            access);                                                                                                   \
     }                                                                                                                  \
     extern "C" VernonRhiStatus name parameters {                                                                       \
         return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
     }
+
+#define VERNON_REQUIRED_RESULT_IMPL(name, operation, parameters, arguments)                                            \
+    VERNON_REQUIRED_RESULT_ACCESS_IMPL(name, operation, HostAccess::None, parameters, arguments)
+#define VERNON_OPTIONAL_RESULT_IMPL(name, operation, parameters, arguments)                                            \
+    VERNON_OPTIONAL_RESULT_ACCESS_IMPL(name, operation, HostAccess::None, parameters, arguments)
 
 static vernon::Result<void, vernon::RhiError>
 vernonRhiDeviceCreateBufferImpl(VernonRhiDevice device, const VernonRhiBufferDescriptor *descriptor,
@@ -199,14 +208,14 @@ VERNON_REQUIRED_RESULT_IMPL(vernonRhiDeviceUploadBufferRanges, uploadBufferRange
                             (VernonRhiDevice device, VernonRhiBuffer buffer, const VernonRhiBufferUploadRange *ranges,
                              size_t rangeCount),
                             (device, buffer, ranges, rangeCount))
-VERNON_REQUIRED_RESULT_IMPL(vernonRhiDeviceDownloadBufferRanges, downloadBufferRanges,
-                            (VernonRhiDevice device, VernonRhiBuffer buffer, const VernonRhiBufferDownloadRange *ranges,
-                             size_t rangeCount),
-                            (device, buffer, ranges, rangeCount))
-VERNON_REQUIRED_RESULT_IMPL(vernonRhiDeviceDownloadBuffer, downloadBuffer,
-                            (VernonRhiDevice device, VernonRhiBuffer buffer, uint64_t offset, void *destination,
-                             uint64_t size),
-                            (device, buffer, offset, destination, size))
+VERNON_REQUIRED_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadBufferRanges, downloadBufferRanges, HostAccess::ReadsResults,
+                                   (VernonRhiDevice device, VernonRhiBuffer buffer,
+                                    const VernonRhiBufferDownloadRange *ranges, size_t rangeCount),
+                                   (device, buffer, ranges, rangeCount))
+VERNON_REQUIRED_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadBuffer, downloadBuffer, HostAccess::ReadsResults,
+                                   (VernonRhiDevice device, VernonRhiBuffer buffer, uint64_t offset, void *destination,
+                                    uint64_t size),
+                                   (device, buffer, offset, destination, size))
 VERNON_REQUIRED_RESULT_IMPL(vernonRhiDeviceDestroyBuffer, destroyBuffer,
                             (VernonRhiDevice device, VernonRhiBuffer buffer), (device, buffer))
 
@@ -220,9 +229,11 @@ extern "C" uint32_t vernonRhiDeviceIsBufferValid(VernonRhiDevice device, VernonR
     });
 }
 
+// `valid` holds the descriptor rules every backend shares; it runs once the backend is known to create the resource.
 template <typename Handle, typename Descriptor, typename Member>
 vernon::Result<void, vernon::RhiError> createOptionalResource(VernonRhiDevice device, const Descriptor *descriptor,
-                                                              Handle *output, const char *operation, Member member) {
+                                                              Handle *output, const char *operation, Member member,
+                                                              bool (*valid)(const Descriptor &) = nullptr) {
     if (!output)
         return vernon::Result<void, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, 0, 0}})};
@@ -231,6 +242,9 @@ vernon::Result<void, vernon::RhiError> createOptionalResource(VernonRhiDevice de
         if (!callback)
             return vernon::Result<void, vernon::RhiError>{
                 vernon::err(vernon::RhiError{vernon::RhiErrorCode::Unsupported, {operation, 0, 0}})};
+        if (valid && (!descriptor || !valid(*descriptor)))
+            return vernon::Result<void, vernon::RhiError>{
+                vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, 0, 0}})};
         auto created = callback.value()(device, descriptor);
         if (created.isErr())
             return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(created).error())};
@@ -243,7 +257,7 @@ extern "C" VernonRhiStatus
 vernonRhiDeviceCreateImage(VernonRhiDevice device, const VernonRhiImageDescriptor *descriptor, VernonRhiImage *output) {
     return vernon::rhi::publicStatusBoundary([&] {
         return createOptionalResource(device, descriptor, output, "createImage",
-                                      &vernon::rhi::BackendDispatch::createImage);
+                                      &vernon::rhi::BackendDispatch::createImage, &vernon::rhi::validImageDescriptor);
     });
 }
 
@@ -290,14 +304,14 @@ VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceUploadImage, uploadImage,
                             (VernonRhiDevice device, VernonRhiImage image,
                              const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount),
                             (device, image, uploads, uploadCount))
-VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceDownloadImage, downloadImage,
-                            (VernonRhiDevice device, VernonRhiImage image,
-                             const VernonRhiImageDownloadDescriptor *descriptor, void *destination, size_t size),
-                            (device, image, descriptor, destination, size))
-VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceDownloadImageBatch, downloadImageBatch,
-                            (VernonRhiDevice device, VernonRhiImage image, const VernonRhiImageDownload *downloads,
-                             size_t downloadCount),
-                            (device, image, downloads, downloadCount))
+VERNON_OPTIONAL_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadImage, downloadImage, HostAccess::ReadsResults,
+                                   (VernonRhiDevice device, VernonRhiImage image,
+                                    const VernonRhiImageDownloadDescriptor *descriptor, void *destination, size_t size),
+                                   (device, image, descriptor, destination, size))
+VERNON_OPTIONAL_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadImageBatch, downloadImageBatch, HostAccess::ReadsResults,
+                                   (VernonRhiDevice device, VernonRhiImage image,
+                                    const VernonRhiImageDownload *downloads, size_t downloadCount),
+                                   (device, image, downloads, downloadCount))
 VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceGenerateImageMipmaps, generateImageMipmaps,
                             (VernonRhiDevice device, VernonRhiImage image), (device, image))
 VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceBindImage, bindImage,
@@ -337,6 +351,31 @@ extern "C" VernonRhiStatus vernonRhiDeviceGetImageNativeHandle(VernonRhiDevice d
                                                                uint64_t *output) {
     return vernon::rhi::publicStatusBoundary(
         [&] { return vernonRhiDeviceGetImageNativeHandleImpl(device, image, output); });
+}
+
+static vernon::Result<void, vernon::RhiError>
+vernonRhiDeviceGetFormatCapabilitiesImpl(VernonRhiDevice device, VernonRhiFormat format, uint32_t *capabilities) {
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    if (!capabilities || !entry)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{
+            vernon::RhiErrorCode::InvalidArgument, {"getFormatCapabilities", device.generation, device.index}})};
+    return dispatchStatusImpl(device, "getFormatCapabilities", [&](const vernon::rhi::BackendDispatch &backend) {
+        uint32_t supported = 0;
+        if (backend.formatCapabilities) {
+            auto queried = backend.formatCapabilities.value()(device, format);
+            if (queried.isErr())
+                return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(queried).error())};
+            supported = queried.value();
+        }
+        *capabilities = entry->baseline & supported;
+        return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceGetFormatCapabilities(VernonRhiDevice device, VernonRhiFormat format,
+                                                                uint32_t *capabilities) {
+    return vernon::rhi::publicStatusBoundary(
+        [&] { return vernonRhiDeviceGetFormatCapabilitiesImpl(device, format, capabilities); });
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceCreateSampler(VernonRhiDevice device,
@@ -602,10 +641,10 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::completeCommandRecording(Ver
     if (!backend)
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"complete_command_recording", native, 0}})};
-    if (!backend->completeBorrowedCommands)
+    if (!backend->completeCommands)
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::Unsupported, {"complete_command_recording", native, 0}})};
-    return backend->completeBorrowedCommands.value()(device, native);
+    return backend->completeCommands.value()(device, native);
 }
 
 void vernon::rhi::abandonCommandRecording(VernonRhiDevice device, uint64_t native) noexcept {
@@ -650,45 +689,51 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::recordImageCopy(VernonRhiDev
     return backend->recordImageCopy.value()(device, encoderKey, native, source, destination, regions, regionCount);
 }
 
-vernon::Result<void, vernon::RhiError>
-vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                                 uint32_t renderingKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
-                                 const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,
-                                 uint64_t renderingObject) noexcept {
+vernon::Result<vernon::rhi::OpenedRendering, vernon::RhiError>
+vernon::rhi::beginCommandRendering(VernonRhiDevice device, uint64_t key, uint64_t native, const RenderingScope &scope,
+                                   const RenderingRead *reads, size_t readCount) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<OpenedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"begin_rendering", native, 0}})};
+    if (!backend->beginRendering)
+        return Result<OpenedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"begin_rendering", native, 0}})};
+    return backend->beginRendering.value()(device, key, native, scope, reads, readCount);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native,
+                                                                        const RenderingScope &scope,
+                                                                        const OpenedRendering &opened) noexcept {
     const BackendDispatch *backend = dispatch(device);
     if (!backend)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"end_rendering", native, 0}})};
     if (!backend->endRendering)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"end_rendering", native, 0}})};
-    return backend->endRendering.value()(device, native, backendKind, renderingKind, colorDiscardMask,
-                                         depthStencilDiscard, colorResources, colorCount, depthResource,
-                                         renderingObject);
+    return backend->endRendering.value()(device, native, scope, opened);
 }
 
-vernon::Result<void, vernon::RhiError>
-vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                               uint32_t renderingKind, uint64_t renderingObject, int32_t x, int32_t y, uint32_t width,
-                               uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
-                               const float color[4]) noexcept {
+vernon::Result<void, vernon::RhiError> vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native,
+                                                                      const RenderingScope &scope,
+                                                                      const OpenedRendering &opened, uint32_t location,
+                                                                      const VernonClearColor &color) noexcept {
     const BackendDispatch *backend = dispatch(device);
     if (!backend)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"clear_color", native, 0}})};
     if (!backend->clearColor)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"clear_color", native, 0}})};
-    return backend->clearColor.value()(device, native, backendKind, renderingKind, renderingObject, x, y, width, height,
-                                       layers, target, location, color);
+    return backend->clearColor.value()(device, native, scope, opened, location, color);
 }
 
-vernon::Result<void, vernon::RhiError>
-vernon::rhi::clearCommandDepthStencil(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                                      uint32_t renderingKind, uint64_t renderingObject, int32_t x, int32_t y,
-                                      uint32_t width, uint32_t height, uint32_t layers, uint64_t target, float depth,
-                                      uint32_t stencil, uint32_t aspects) noexcept {
+vernon::Result<void, vernon::RhiError> vernon::rhi::clearCommandDepthStencil(VernonRhiDevice device, uint64_t native,
+                                                                             const RenderingScope &scope,
+                                                                             const OpenedRendering &opened, float depth,
+                                                                             uint32_t stencil,
+                                                                             uint32_t aspects) noexcept {
     const BackendDispatch *backend = dispatch(device);
     if (!backend)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"clear_depth_stencil", native, 0}})};
     if (!backend->clearDepthStencil)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"clear_depth_stencil", native, 0}})};
-    return backend->clearDepthStencil.value()(device, native, backendKind, renderingKind, renderingObject, x, y, width,
-                                              height, layers, target, depth, stencil, aspects);
+    return backend->clearDepthStencil.value()(device, native, scope, opened, depth, stencil, aspects);
 }

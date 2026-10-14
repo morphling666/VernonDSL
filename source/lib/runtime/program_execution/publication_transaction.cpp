@@ -3,9 +3,11 @@
 #include "device_commands.h"
 #include "failure_injection.h"
 #include "program_tensor_copy.h"
+#include "rhi/image_data_layout.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
+#include "submission_queue.h"
 
 #include <algorithm>
 #include <cstring>
@@ -100,6 +102,7 @@ PublicationResult<void> PublicationTransaction::bindImageCommit(VernonRuntimeCon
     if (injectFailure(FailureBoundary::Allocation) ||
         vernonRhiDeviceCreateImage(context.rhiDevice, &image, &stagingImage) != VERNON_RHI_STATUS_OK)
         return PublicationResult<void>{vernon::err(PublicationError::ImageAllocationFailed)};
+    TransientAllocationMeter::charge(context, vernon::rhi::imageByteSize(image).value_or(0));
     view.image = stagingImage;
     if (vernonRhiDeviceCreateImageView(context.rhiDevice, &view, &stagingView) != VERNON_RHI_STATUS_OK) {
         (void)vernonRhiDeviceDestroyImage(context.rhiDevice, stagingImage);
@@ -439,34 +442,25 @@ void PublicationTransaction::poison() noexcept {
 }
 
 void PublicationTransaction::noteSubmission(SubmissionState state) {
-    if (overallSubmission_ == SubmissionState::Indeterminate)
-        return;
-    if (state == SubmissionState::Indeterminate || state == SubmissionState::Completed)
-        overallSubmission_ = state;
+    overallSubmission_ = mergeSubmissionState(overallSubmission_, state);
 }
 
 void PublicationTransaction::noteInPlaceSubmission(SubmissionState state) {
     noteSubmission(state);
-    if (inPlaceSubmission_ != SubmissionState::Indeterminate &&
-        (state == SubmissionState::Indeterminate || state == SubmissionState::Completed))
-        inPlaceSubmission_ = state;
+    inPlaceSubmission_ = mergeSubmissionState(inPlaceSubmission_, state);
 }
 
 InvocationMutationOutcome PublicationTransaction::mutationOutcome() const {
     InvocationMutationOutcome outcome;
-    outcome.submission = status_ == Status::Poisoned || overallSubmission_ == SubmissionState::Indeterminate
-                             ? SubmissionState::Indeterminate
-                         : status_ == Status::Committed || overallSubmission_ == SubmissionState::Completed
-                             ? SubmissionState::Completed
-                             : SubmissionState::NotSubmitted;
+    outcome.submission =
+        mergeSubmissionState(overallSubmission_, status_ == Status::Poisoned    ? SubmissionState::Indeterminate
+                                                 : status_ == Status::Committed ? SubmissionState::Completed
+                                                                                : SubmissionState::NotSubmitted);
     outcome.boundaries.reserve(boundMutations_.size());
     for (const BoundMutation &entry : boundMutations_) {
         VernonBoundaryMutationState state = VERNON_BOUNDARY_MUTATION_UNCHANGED;
         if (entry.inPlace) {
-            if (inPlaceSubmission_ == SubmissionState::Completed)
-                state = VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED;
-            else if (inPlaceSubmission_ == SubmissionState::Indeterminate)
-                state = VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+            state = inPlaceMutationState(inPlaceSubmission_);
         } else if (status_ == Status::Committed) {
             state = VERNON_BOUNDARY_MUTATION_COMMITTED;
         } else if (status_ == Status::Poisoned) {

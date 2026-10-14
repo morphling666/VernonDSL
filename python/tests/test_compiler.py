@@ -98,12 +98,14 @@ def resources(
 
     @covers_case("LANG-TEXTURE-STORAGE/three-dimensional-store", layers="FI")
     @covers_case("LANG-TEXTURE-STORAGE/array-layer-store", layers="FI")
+    @covers_case("LANG-TEXTURE-STORAGE/integer-load-store", layers="FI")
     @covers_case("LANG-RESOURCE-002/cube-storage", layers="F")
     @covers_case("LANG-RESOURCE-002/cube-array-storage", layers="F")
     def test_storage_texture_uses_unified_texture_annotation(self) -> None:
         cases = (
             case_by_id("LANG-TEXTURE-STORAGE/three-dimensional-store"),
             case_by_id("LANG-TEXTURE-STORAGE/array-layer-store"),
+            case_by_id("LANG-TEXTURE-STORAGE/integer-load-store"),
         )
         for case in cases:
             output = compile_source(case.source, f"{case.name}.py")

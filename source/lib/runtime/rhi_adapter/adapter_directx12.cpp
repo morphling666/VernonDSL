@@ -164,30 +164,10 @@ void restoreBufferState(void *context, uint64_t state) {
     static_cast<rhi::directx12::Buffer *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
 }
 
-void restoreImageState(void *context, uint64_t state) {
-    static_cast<rhi::directx12::Image *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
-}
-
-struct ImageSubresourceRange {
-    uint32_t firstMip{};
-    uint32_t mipCount{};
-    uint32_t firstLayer{};
-    uint32_t layerCount{};
-};
-
-// Raw images expose every mip and layer; image views carry their own dimension and subresource range.
-ImageSubresourceRange imageSubresourceRange(const rhi::directx12::Image &image) {
-    if (image.view.struct_size >= sizeof(VernonRhiImageViewDescriptor))
-        return {image.view.base_mip_level, image.view.mip_level_count, image.view.base_array_layer,
-                image.view.array_layer_count};
-    const D3D12_RESOURCE_DESC native = image.resource->GetDesc();
-    return {0, native.MipLevels, 0, image.dimension == VERNON_RHI_IMAGE_3D ? 1u : native.DepthOrArraySize};
-}
-
 // TEXTURE2D and TEXTURECUBE views cannot start past layer 0, so such selections use the one-element array forms,
 // which shaders declaring the non-array resource type read identically.
 D3D12_SHADER_RESOURCE_VIEW_DESC sampledImageView(const rhi::directx12::Image &image) {
-    const ImageSubresourceRange range = imageSubresourceRange(image);
+    const rhi::directx12::ImageSubresourceRange range = rhi::directx12::imageSubresourceRange(image);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = image.format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT : image.format;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -224,7 +204,7 @@ D3D12_SHADER_RESOURCE_VIEW_DESC sampledImageView(const rhi::directx12::Image &im
 }
 
 D3D12_UNORDERED_ACCESS_VIEW_DESC storageImageView(const rhi::directx12::Image &image) {
-    const ImageSubresourceRange range = imageSubresourceRange(image);
+    const rhi::directx12::ImageSubresourceRange range = rhi::directx12::imageSubresourceRange(image);
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
     view.Format = image.format;
     if (image.dimension == VERNON_RHI_IMAGE_3D) {
@@ -236,34 +216,6 @@ D3D12_UNORDERED_ACCESS_VIEW_DESC storageImageView(const rhi::directx12::Image &i
     } else {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount, 0};
-    }
-    return view;
-}
-
-D3D12_RENDER_TARGET_VIEW_DESC renderTargetView(const rhi::directx12::Image &image) {
-    const ImageSubresourceRange range = imageSubresourceRange(image);
-    D3D12_RENDER_TARGET_VIEW_DESC view{};
-    view.Format = image.format;
-    if (image.dimension == VERNON_RHI_IMAGE_2D && range.firstLayer == 0) {
-        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        view.Texture2D = {range.firstMip, 0};
-    } else {
-        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-        view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount, 0};
-    }
-    return view;
-}
-
-D3D12_DEPTH_STENCIL_VIEW_DESC depthStencilView(const rhi::directx12::Image &image) {
-    const ImageSubresourceRange range = imageSubresourceRange(image);
-    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-    view.Format = image.format;
-    if (image.dimension == VERNON_RHI_IMAGE_2D && range.firstLayer == 0) {
-        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        view.Texture2D = {range.firstMip};
-    } else {
-        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-        view.Texture2DArray = {range.firstMip, range.firstLayer, range.layerCount};
     }
     return view;
 }
@@ -282,11 +234,10 @@ RhiAdapterResult<void> transition(VernonRuntimeRhiAdapter &adapter, VernonRuntim
 RhiAdapterResult<void> transition(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                   ID3D12GraphicsCommandList *commands, rhi::directx12::Image &image,
                                   D3D12_RESOURCE_STATES target) {
-    auto deferred =
-        deferCommandRollback(adapter, encoder, &image, static_cast<uint64_t>(image.state), restoreImageState);
-    if (!deferred)
-        return deferred;
-    rhi::directx12::transition(commands, image.resource, image.state, target);
+    auto transitioned =
+        rhi::directx12::transitionCommandImage(adapter.rhiDevice, encoder.value, commands, image, target);
+    if (transitioned.isErr())
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(transitioned).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -1183,11 +1134,6 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                   {"d3d12_adapter_received_an_invalid_draw_descriptor", invalidDescriptor, 0}})};
     auto &device = *pipeline->device;
-    ID3D12DescriptorHeap *rtvHeap = nullptr;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
-    D3D12_GPU_DESCRIPTOR_HANDLE ignoredGpu{};
-    ID3D12DescriptorHeap *dsvHeap = nullptr;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
     ID3D12DescriptorHeap *resourceHeap = nullptr;
     ID3D12DescriptorHeap *samplerHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE resourceCpu{};
@@ -1199,19 +1145,13 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
     auto *commands =
         reinterpret_cast<ID3D12GraphicsCommandList *>(static_cast<uintptr_t>(std::move(nativeCommand).value()));
-    auto renderingClaim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
-    if (!renderingClaim)
-        return RhiAdapterResult<void>{vernon::err(std::move(renderingClaim).error())};
-    const vernon::rhi::CommandRenderingClaim claim = std::move(renderingClaim).value();
+    auto opened = openCommandRendering(adapter, commandEncoder);
+    if (!opened)
+        return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
     commands->SetPipelineState(pipeline->pipeline);
     commands->OMSetStencilRef(descriptor->stencil_reference);
     adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
     adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
-    const bool firstDraw = claim == vernon::rhi::CommandRenderingClaim::Acquired;
-    auto hasRenderingDescriptor = commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-    if (!hasRenderingDescriptor)
-        return RhiAdapterResult<void>{vernon::err(std::move(hasRenderingDescriptor).error())};
-    const bool standaloneRendering = !std::move(hasRenderingDescriptor).value();
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"d3d12_draw_could_not_retain_provider_objects", 0, 0}})};
@@ -1237,118 +1177,6 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             return RhiAdapterResult<void>{
                 vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                   {"d3d12_acquire_draw_sampler_descriptors", samplerCount, 0}})};
-    }
-    std::array<VernonRhiLoadOperation, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorLoads{};
-    std::array<std::array<float, 4>, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorClears{};
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-        colorLoads[index] = static_cast<VernonRhiLoadOperation>(descriptor->color_attachments[index].load_operation);
-        std::copy(std::begin(descriptor->color_attachments[index].clear_color),
-                  std::end(descriptor->color_attachments[index].clear_color), colorClears[index].begin());
-        VernonRhiStoreOperation ignoredStore =
-            static_cast<VernonRhiStoreOperation>(descriptor->color_attachments[index].store_operation);
-        auto operations = commandColorOperations(adapter, commandEncoder, index, colorLoads[index], ignoredStore,
-                                                 colorClears[index].data());
-        if (!operations)
-            return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
-    }
-    VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
-    VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
-    VernonRhiLoadOperation stencilLoad = static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
-    VernonRhiStoreOperation stencilStore = static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
-    float clearDepth = descriptor->clear_depth;
-    uint32_t clearStencil = descriptor->clear_stencil;
-    auto depthOperations = commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad,
-                                                  stencilStore, clearDepth, clearStencil);
-    if (!depthOperations)
-        return RhiAdapterResult<void>{vernon::err(std::move(depthOperations).error())};
-    if (firstDraw && descriptor->color_attachment_count != 0 &&
-        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
-                                   static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv, ignoredGpu,
-                                   backendDiagnostic))
-        return RhiAdapterResult<void>{vernon::err(
-            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                  {"d3d12_acquire_render_target_descriptors", descriptor->color_attachment_count, 0}})};
-    if (firstDraw && descriptor->depth_stencil_view.resource.value &&
-        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, false, 1, dsvHeap, dsv, ignoredGpu,
-                                   backendDiagnostic))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure,
-            {"d3d12_acquire_depth_stencil_descriptor", descriptor->depth_stencil_view.resource.value, 0}})};
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargets{};
-    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargetResources{};
-    const bool hasDepth = descriptor->depth_stencil_view.resource.value != 0;
-    rhi::directx12::Image *depthImage = nullptr;
-    const UINT rtvIncrement = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    if (firstDraw) {
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-            const auto &attachment = descriptor->color_attachments[index];
-            if (!retainCommandResource(adapter, commandEncoder, attachment.view))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                      {"d3d12_draw_could_not_retain_its_color_attachment", 0, 0}})};
-            if (!isRhiImageReference(attachment.view))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"d3d12_draw_contains_an_invalid_color_attachment", 0, 0}})};
-            auto resolved = resolveCommandRhiResource(adapter, commandEncoder, attachment.view);
-            if (!resolved)
-                return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-            auto *image =
-                reinterpret_cast<rhi::directx12::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-            if (!image || !image->resource)
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"d3d12_draw_contains_an_empty_color_attachment", 0, 0}})};
-            renderTargetResources[attachment.location] = reinterpret_cast<uintptr_t>(image->resource);
-            if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_RENDER_TARGET))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                      {"d3d12_draw_could_not_track_color_attachment_state", 0, 0}})};
-            const D3D12_RENDER_TARGET_VIEW_DESC view = renderTargetView(*image);
-            renderTargets[index] = rtv;
-            device.device->CreateRenderTargetView(image->resource, &view, rtv);
-            rtv.ptr += rtvIncrement;
-        }
-        if (hasDepth) {
-            if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                      {"d3d12_draw_could_not_retain_its_depth_attachment", 0, 0}})};
-            if (!isRhiImageReference(descriptor->depth_stencil_view))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"d3d12_draw_contains_an_invalid_depth_attachment", 0, 0}})};
-            auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
-            if (!resolved)
-                return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-            auto *image =
-                reinterpret_cast<rhi::directx12::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-            depthImage = image;
-            if (!image || !image->resource ||
-                (image->format != DXGI_FORMAT_D32_FLOAT && image->format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"d3d12_draw_contains_an_invalid_depth_attachment", 0, 0}})};
-            if (image->format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
-                (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD || clearStencil))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument,
-                    {"d3d12_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
-            if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_DEPTH_WRITE))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                      {"d3d12_draw_could_not_track_depth_attachment_state", 0, 0}})};
-            const D3D12_DEPTH_STENCIL_VIEW_DESC view = depthStencilView(*image);
-            device.device->CreateDepthStencilView(image->resource, &view, dsv);
-        }
-        std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorTargets{};
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            colorTargets[descriptor->color_attachments[index].location] = renderTargets[index].ptr;
-        if (!setCommandRenderingTargets(adapter, commandEncoder, colorTargets.data(), renderTargetResources.data(),
-                                        colorTargets.size(), hasDepth ? dsv.ptr : 0,
-                                        depthImage ? reinterpret_cast<uintptr_t>(depthImage->resource) : 0))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"d3d12_command_render_target_registration_failed", 0, 0}})};
     }
     std::array<ID3D12DescriptorHeap *, 2> heaps{};
     UINT heapCount = 0;
@@ -1488,7 +1316,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                 }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
                 auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);
-                if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE))
                     return RhiAdapterResult<void>{
                         vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                           {"d3d12_draw_could_not_track_sampled_image_state", 0, 0}})};
@@ -1537,22 +1365,6 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             bindings->samplerGpu = samplerGpu;
         }
     }
-    if (firstDraw) {
-        commands->OMSetRenderTargets(static_cast<UINT>(descriptor->color_attachment_count), renderTargets.data(), FALSE,
-                                     hasDepth ? &dsv : nullptr);
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            if (colorLoads[index] == VERNON_RHI_LOAD_CLEAR)
-                commands->ClearRenderTargetView(renderTargets[index], colorClears[index].data(), 0, nullptr);
-        if (hasDepth && (depthLoad == VERNON_RHI_LOAD_CLEAR || stencilLoad == VERNON_RHI_LOAD_CLEAR)) {
-            UINT flags = 0;
-            if (depthLoad == VERNON_RHI_LOAD_CLEAR)
-                flags |= D3D12_CLEAR_FLAG_DEPTH;
-            if (stencilLoad == VERNON_RHI_LOAD_CLEAR)
-                flags |= D3D12_CLEAR_FLAG_STENCIL;
-            commands->ClearDepthStencilView(dsv, static_cast<D3D12_CLEAR_FLAGS>(flags), clearDepth,
-                                            static_cast<UINT8>(clearStencil), 0, nullptr);
-        }
-    }
     const D3D12_VIEWPORT viewport{static_cast<float>(descriptor->viewport[0]),
                                   static_cast<float>(descriptor->viewport[1]),
                                   static_cast<float>(descriptor->viewport[2]),
@@ -1568,6 +1380,11 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                                             : descriptor->topology == 2 ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
                                                                         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     commands->IASetPrimitiveTopology(topology);
+    // SV_InstanceID and SV_VertexID exclude the draw offsets, so nonzero offsets would change `instance_index` and
+    // `vertex_index`.
+    if (descriptor->first_instance != 0 || descriptor->base_vertex != 0)
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::Unsupported, {"d3d12_draw_base_instance_or_base_vertex_is_unsupported", 0, 0}})};
     if (descriptor->index_count != 0) {
         if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1586,32 +1403,10 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                                                     descriptor->index_buffer.offset,
                                                 static_cast<UINT>(descriptor->index_buffer.size), DXGI_FORMAT_R32_UINT};
         commands->IASetIndexBuffer(&indexView);
-        commands->DrawIndexedInstanced(descriptor->index_count, descriptor->instance_count, 0, descriptor->first_vertex,
+        commands->DrawIndexedInstanced(descriptor->index_count, descriptor->instance_count, 0, descriptor->base_vertex,
                                        descriptor->first_instance);
     } else {
-        commands->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, descriptor->first_vertex,
-                                descriptor->first_instance);
-    }
-    if (standaloneRendering) {
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            if (descriptor->color_attachments[index].store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD) {
-                auto resolved =
-                    resolveCommandRhiResource(adapter, commandEncoder, descriptor->color_attachments[index].view);
-                if (!resolved)
-                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-                auto *image =
-                    reinterpret_cast<rhi::directx12::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-                commands->DiscardResource(image->resource, nullptr);
-            }
-        if (hasDepth && descriptor->depth_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD &&
-            descriptor->stencil_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD) {
-            auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
-            if (!resolved)
-                return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-            auto *image =
-                reinterpret_cast<rhi::directx12::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-            commands->DiscardResource(image->resource, nullptr);
-        }
+        commands->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, 0, descriptor->first_instance);
     }
     if (!recordProviderCommand(adapter, commandEncoder, true))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1724,6 +1519,8 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.create_binding_set = createBindings;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
+    adapter.provider.begin_rendering = beginRenderingCallback;
+    adapter.provider.end_rendering = endRenderingCallback;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;

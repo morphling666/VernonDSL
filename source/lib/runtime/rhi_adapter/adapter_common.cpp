@@ -1,11 +1,15 @@
 #include "adapter_common.h"
 
+#include "VernonFormats.hpp"
 #include "adapter_internal.h"
 #include "adapter_test_hooks.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/provider_image_description.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <new>
 #include <optional>
 #include <utility>
@@ -145,11 +149,11 @@ extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(Verno
     default:
         break;
     }
-    if (adapter) {
-        adapter->rhiDevice = device;
-        adapter->rhiBackend = backend;
-        adapter->rhiDeviceLease.emplace(std::move(deviceLease).value());
-    }
+    if (!adapter)
+        return nullptr;
+    adapter->rhiDevice = device;
+    adapter->rhiBackend = backend;
+    adapter->rhiDeviceLease.emplace(std::move(deviceLease).value());
     return adapter;
 }
 
@@ -191,34 +195,8 @@ namespace vernon::runtime::rhi_adapter {
 namespace {
 
 std::optional<VernonTextureFormat> providerTextureFormat(VernonRhiFormat format) {
-    switch (format) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return VERNON_TEXTURE_R8_UNORM;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-        return VERNON_TEXTURE_RG8_UNORM;
-    case VERNON_RHI_FORMAT_RGB8_UNORM:
-        return VERNON_TEXTURE_RGB8_UNORM;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-        return VERNON_TEXTURE_RGBA8_UNORM;
-    case VERNON_RHI_FORMAT_RGBA8_SRGB:
-        return VERNON_TEXTURE_RGBA8_SRGB;
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return VERNON_TEXTURE_R16_FLOAT;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-        return VERNON_TEXTURE_RGBA16_FLOAT;
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-        return VERNON_TEXTURE_R32_FLOAT;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return VERNON_TEXTURE_RGBA32_FLOAT;
-    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
-        return VERNON_TEXTURE_R11G11B10_FLOAT;
-    case VERNON_RHI_FORMAT_D32_FLOAT:
-        return VERNON_TEXTURE_D32_FLOAT;
-    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
-        return VERNON_TEXTURE_D32_FLOAT_S8_UINT;
-    default:
-        return std::nullopt;
-    }
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    return entry ? std::optional<VernonTextureFormat>(entry->texture) : std::nullopt;
 }
 
 } // namespace
@@ -439,10 +417,7 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
     usage |= (source.usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ? VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT : 0;
     usage |= (source.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ? VERNON_IMAGE_TRANSFER_SOURCE : 0;
     usage |= (source.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ? VERNON_IMAGE_TRANSFER_DESTINATION : 0;
-    const uint32_t aspects = *format == VERNON_TEXTURE_D32_FLOAT ? VERNON_IMAGE_ASPECT_DEPTH
-                             : *format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                                 ? VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL
-                                 : VERNON_IMAGE_ASPECT_COLOR;
+    const uint32_t aspects = vernon::formats::aspects(*format);
     description.image = {dimension,
                          {source.width, source.height, source.depth},
                          *format,
@@ -532,52 +507,124 @@ RhiAdapterResult<bool> commandEncoderRendering(VernonRuntimeRhiAdapter &adapter,
     return RhiAdapterResult<bool>{vernon::ok(std::move(rendering).value())};
 }
 
-RhiAdapterResult<bool> commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter,
-                                                            VernonRuntimeProviderObject encoder) noexcept {
-    auto descriptor = vernon::rhi::commandEncoderHasRenderingDescriptor(adapter.rhiDevice, encoder.value);
-    if (!descriptor)
-        return RhiAdapterResult<bool>{vernon::err(providerError(std::move(descriptor).error()))};
-    return RhiAdapterResult<bool>{vernon::ok(std::move(descriptor).value())};
+RhiAdapterResult<vernon::rhi::OpenedRendering> openCommandRendering(VernonRuntimeRhiAdapter &adapter,
+                                                                    VernonRuntimeProviderObject encoder) noexcept {
+    auto opened = vernon::rhi::openCommandRendering(adapter.rhiDevice, encoder.value);
+    if (!opened)
+        return RhiAdapterResult<vernon::rhi::OpenedRendering>{vernon::err(providerError(std::move(opened).error()))};
+    return RhiAdapterResult<vernon::rhi::OpenedRendering>{vernon::ok(std::move(opened).value())};
 }
 
-RhiAdapterResult<void> commandColorOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                              size_t index, VernonRhiLoadOperation &load,
-                                              VernonRhiStoreOperation &store, float clear[4]) noexcept {
-    auto operations = vernon::rhi::commandColorOperations(adapter.rhiDevice, encoder.value, index, load, store, clear);
-    if (!operations)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(operations).error()))};
+namespace {
+
+RhiAdapterResult<uint64_t> attachmentView(const VernonRuntimeRhiAdapter &adapter,
+                                          VernonRuntimeProviderResourceReference view) noexcept {
+    auto kind = resourceKind(adapter, view);
+    if (!kind)
+        return RhiAdapterResult<uint64_t>{vernon::err(std::move(kind).error())};
+    if (kind.value() != vernon::rhi::ResourceKind::ImageView)
+        return RhiAdapterResult<uint64_t>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"rendering_attachment_is_not_an_image_view", 0, 0}})};
+    return RhiAdapterResult<uint64_t>{vernon::ok(view.resource.value)};
+}
+
+static_assert(VERNON_RUNTIME_PROVIDER_LOAD_CLEAR == static_cast<int>(VERNON_RHI_LOAD_CLEAR) &&
+              VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE == static_cast<int>(VERNON_RHI_LOAD_PRESERVE) &&
+              VERNON_RUNTIME_PROVIDER_LOAD_DISCARD == static_cast<int>(VERNON_RHI_LOAD_DISCARD) &&
+              VERNON_RUNTIME_PROVIDER_STORE_PRESERVE == static_cast<int>(VERNON_RHI_STORE_PRESERVE) &&
+              VERNON_RUNTIME_PROVIDER_STORE_DISCARD == static_cast<int>(VERNON_RHI_STORE_DISCARD));
+
+RhiAdapterResult<void> beginRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                      const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept {
+    const auto invalid = [](const char *operation) {
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {operation, 0, 0}})};
+    };
+    if (descriptor.struct_size < sizeof(descriptor) ||
+        descriptor.color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
+        (descriptor.color_attachment_count && !descriptor.color_attachments) ||
+        (descriptor.sampled_image_count && !descriptor.sampled_images) || descriptor.render_area[0] > INT32_MAX ||
+        descriptor.render_area[1] > INT32_MAX)
+        return invalid("begin_rendering_descriptor");
+    std::vector<vernon::rhi::RenderingRead> reads;
+    try {
+        reads.reserve(descriptor.sampled_image_count);
+    } catch (const std::bad_alloc &) {
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
+                                                                        {"begin_rendering_sampled_images", 0, 0}})};
+    }
+    for (size_t index = 0; index < descriptor.sampled_image_count; ++index) {
+        const VernonRuntimeProviderResourceReference image = descriptor.sampled_images[index];
+        auto kind = resourceKind(adapter, image);
+        if (!kind)
+            return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
+        if (kind.value() != vernon::rhi::ResourceKind::Image && kind.value() != vernon::rhi::ResourceKind::ImageView)
+            return invalid("rendering_sampled_image_is_not_an_image");
+        reads.push_back({kind.value(), image.resource.value});
+    }
+    vernon::rhi::RenderingScope scope;
+    scope.colorCount = descriptor.color_attachment_count;
+    for (size_t index = 0; index < descriptor.color_attachment_count; ++index) {
+        const auto &source = descriptor.color_attachments[index];
+        auto view = attachmentView(adapter, source.view);
+        if (!view)
+            return RhiAdapterResult<void>{vernon::err(std::move(view).error())};
+        auto &target = scope.colors[index];
+        target.view = view.value();
+        target.location = source.location;
+        target.load = static_cast<VernonRhiLoadOperation>(source.load_operation);
+        target.store = static_cast<VernonRhiStoreOperation>(source.store_operation);
+        target.clear = source.clear_color;
+    }
+    if (descriptor.depth_stencil_attachment) {
+        const auto &source = *descriptor.depth_stencil_attachment;
+        auto view = attachmentView(adapter, source.view);
+        if (!view)
+            return RhiAdapterResult<void>{vernon::err(std::move(view).error())};
+        scope.depth.view = view.value();
+        scope.depth.depthLoad = static_cast<VernonRhiLoadOperation>(source.depth_load_operation);
+        scope.depth.depthStore = static_cast<VernonRhiStoreOperation>(source.depth_store_operation);
+        scope.depth.stencilLoad = static_cast<VernonRhiLoadOperation>(source.stencil_load_operation);
+        scope.depth.stencilStore = static_cast<VernonRhiStoreOperation>(source.stencil_store_operation);
+        scope.depth.clearDepth = source.clear_depth;
+        scope.depth.clearStencil = source.clear_stencil;
+        scope.hasDepth = true;
+    }
+    scope.x = static_cast<int32_t>(descriptor.render_area[0]);
+    scope.y = static_cast<int32_t>(descriptor.render_area[1]);
+    scope.width = descriptor.render_area[2];
+    scope.height = descriptor.render_area[3];
+    scope.layers = descriptor.layers;
+    auto begun =
+        vernon::rhi::beginEncoderRendering(adapter.rhiDevice, encoder.value, scope, reads.data(), reads.size());
+    if (!begun)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(begun).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> commandDepthOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                              VernonRhiLoadOperation &depthLoad, VernonRhiStoreOperation &depthStore,
-                                              VernonRhiLoadOperation &stencilLoad,
-                                              VernonRhiStoreOperation &stencilStore, float &clearDepth,
-                                              uint32_t &clearStencil) noexcept {
-    auto operations = vernon::rhi::commandDepthOperations(adapter.rhiDevice, encoder.value, depthLoad, depthStore,
-                                                          stencilLoad, stencilStore, clearDepth, clearStencil);
-    if (!operations)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(operations).error()))};
+RhiAdapterResult<void> endRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) noexcept {
+    auto ended = vernon::rhi::endEncoderRendering(adapter.rhiDevice, encoder.value);
+    if (!ended)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(ended).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<vernon::rhi::CommandRenderingClaim> claimCommandRendering(VernonRuntimeRhiAdapter &adapter,
-                                                                           VernonRuntimeProviderObject encoder,
-                                                                           uint32_t backendKind) noexcept {
-    auto claim = vernon::rhi::claimCommandRendering(adapter.rhiDevice, encoder.value, backendKind);
-    if (!claim)
-        return RhiAdapterResult<vernon::rhi::CommandRenderingClaim>{
-            vernon::err(providerError(std::move(claim).error()))};
-    return RhiAdapterResult<vernon::rhi::CommandRenderingClaim>{vernon::ok(std::move(claim).value())};
+} // namespace
+
+VernonStatus beginRenderingCallback(void *data, VernonRuntimeProviderObject encoder,
+                                    const VernonRuntimeProviderRenderingDescriptor *descriptor) {
+    if (!data || !descriptor)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, beginRendering(adapter, encoder, *descriptor),
+                          "RHI adapter could not begin the rendering scope");
 }
 
-RhiAdapterResult<vernon::Option<uint64_t>> commandRenderingObject(VernonRuntimeRhiAdapter &adapter,
-                                                                  VernonRuntimeProviderObject encoder,
-                                                                  vernon::Option<uint64_t> candidate) noexcept {
-    auto object = vernon::rhi::commandRenderingObject(adapter.rhiDevice, encoder.value, std::move(candidate));
-    if (!object)
-        return RhiAdapterResult<vernon::Option<uint64_t>>{vernon::err(providerError(std::move(object).error()))};
-    return RhiAdapterResult<vernon::Option<uint64_t>>{vernon::ok(std::move(object).value())};
+VernonStatus endRenderingCallback(void *data, VernonRuntimeProviderObject encoder) {
+    if (!data)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, endRendering(adapter, encoder), "RHI adapter could not end the rendering scope");
 }
 
 RhiAdapterResult<void> recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -615,9 +662,7 @@ RhiAdapterResult<void> retainCommandResource(VernonRuntimeRhiAdapter &adapter, V
 bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor) {
     return descriptor && descriptor->struct_size >= sizeof(*descriptor) && descriptor->instance_count != 0 &&
            (descriptor->vertex_count != 0 || descriptor->index_count != 0) &&
-           (descriptor->color_attachment_count != 0 || descriptor->depth_stencil_view.resource.value != 0) &&
-           descriptor->color_attachment_count <= VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS &&
-           (descriptor->color_attachment_count == 0 || descriptor->color_attachments) &&
+           (descriptor->index_count != 0 || descriptor->base_vertex == 0) &&
            ((descriptor->index_count != 0) == (descriptor->index_buffer.resource.value != 0));
 }
 
@@ -637,17 +682,6 @@ RhiAdapterResult<void> deferCommandRollback(VernonRuntimeRhiAdapter &adapter, Ve
         return RhiAdapterResult<void>{vernon::err(providerError(std::move(deferred).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
-
-RhiAdapterResult<void> setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                                  const uint64_t *colors, const uint64_t *resources, size_t colorCount,
-                                                  uint64_t depth, uint64_t depthResource) noexcept {
-    auto targets = vernon::rhi::setCommandRenderingTargets(adapter.rhiDevice, encoder.value, colors, resources,
-                                                           colorCount, depth, depthResource);
-    if (!targets)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(targets).error()))};
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
 } // namespace vernon::runtime::rhi_adapter
 
 extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRuntimeRhiAdapter *adapter,

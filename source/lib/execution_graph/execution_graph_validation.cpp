@@ -1,5 +1,6 @@
 #include "execution_graph/command_graph.h"
 
+#include "VernonFormats.hpp"
 #include "rhi/rhi_internal.h"
 
 #include <algorithm>
@@ -154,8 +155,7 @@ bool CommandGraph::validateDeclarations(std::string &error) const {
         for (const ColorAttachmentUse &color : render->colors_) {
             if (!validateImage(pass->name(), color.image))
                 return false;
-            if (color.image.format == VERNON_RHI_FORMAT_D32_FLOAT ||
-                color.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT || color.location >= 8 ||
+            if (formats::hasDepth(color.image.format) || color.location >= 8 ||
                 !locations.insert(color.location).second || !attachmentResources.insert(color.image.id).second ||
                 !validLoad(color.load) || !validStore(color.store)) {
                 error = "render pass '" + pass->name() + "' contains invalid color attachment resource " +
@@ -178,12 +178,10 @@ bool CommandGraph::validateDeclarations(std::string &error) const {
             const DepthStencilAttachmentUse &depth = *render->depth_;
             if (!validateImage(pass->name(), depth.image))
                 return false;
-            if ((depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT &&
-                 depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) ||
-                !attachmentResources.insert(depth.image.id).second || !validLoad(depth.depthLoad) ||
-                !validStore(depth.depthStore) || !validLoad(depth.stencilLoad) || !validStore(depth.stencilStore) ||
-                depth.clearDepth < 0.0f || depth.clearDepth > 1.0f ||
-                (depth.image.format == VERNON_RHI_FORMAT_D32_FLOAT &&
+            if (!formats::hasDepth(depth.image.format) || !attachmentResources.insert(depth.image.id).second ||
+                !validLoad(depth.depthLoad) || !validStore(depth.depthStore) || !validLoad(depth.stencilLoad) ||
+                !validStore(depth.stencilStore) || depth.clearDepth < 0.0f || depth.clearDepth > 1.0f ||
+                (!formats::hasStencil(depth.image.format) &&
                  (depth.stencilLoad != VERNON_RHI_LOAD_DISCARD || depth.stencilStore != VERNON_RHI_STORE_DISCARD ||
                   depth.clearStencil != 0)) ||
                 (depth.readOnlyDepth &&

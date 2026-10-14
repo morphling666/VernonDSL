@@ -10,6 +10,7 @@ from ..language.ast_utils import decorator_name, dotted_name, rectangular_litera
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, ENTRY_DECORATORS, GRAPHICS_STAGES
 from ..shader_contracts import (
     ATOMIC_OPERATION_NAMES,
+    FRAGMENT_DISCARD_OPERATION,
     GENERATED_INTERFACE_CONTRACTS,
     TypeContract,
     resource_stage_error,
@@ -25,6 +26,7 @@ from .model import (
     BranchMerge,
     ConcreteType,
     EffectScope,
+    FragmentDiscardEffect,
     InterfaceMetadata,
     LValue,
     MemoryOrdering,
@@ -64,6 +66,24 @@ Error = Callable[[ast.AST, str], Exception]
 
 def _scalar(name: str) -> ConcreteType:
     return scalar(name)
+
+
+def _is_fragment_discard(statement: ast.stmt) -> bool:
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and (dotted_name(statement.value.func) or "").split(".")[-1] == FRAGMENT_DISCARD_OPERATION
+    )
+
+
+def _first_statement_with_effect(statements: tuple[TypedStatement, ...], effect: TypedEffect) -> ast.stmt | None:
+    for statement in statements:
+        if effect in statement.effects:
+            return statement.source
+        nested = _first_statement_with_effect(statement.children, effect)
+        if nested is not None:
+            return nested
+    return None
 
 
 def _contract_type(contract: TypeContract) -> ConcreteType:
@@ -210,6 +230,7 @@ class _Inference:
                 roots.append(statement)
         for function in roots:
             self.workgroup_storage_bytes = 0
+            self._validate_direct_fragment_discard(function)
             environment = {
                 argument.arg: self.parse_type(argument.annotation)
                 for argument in function.args.args
@@ -249,6 +270,25 @@ class _Inference:
         self.module._vernon_typed_functions = self._build_typed_functions()
         return ast.fix_missing_locations(self.module)
 
+    def _validate_direct_fragment_discard(self, function: ast.FunctionDef) -> None:
+        """Statements after a discard are not typed, so a non-fragment entry is rejected here before its return
+        validation reports the skipped return instead."""
+        if not function.decorator_list:
+            return
+        function_kind = decorator_name(function.decorator_list[0])
+        if function_kind not in ENTRY_DECORATORS or ENTRY_DECORATOR_STAGES[function_kind] == "fragment":
+            return
+        discard = next(
+            (
+                statement
+                for statement in ast.walk(function)
+                if isinstance(statement, ast.stmt) and _is_fragment_discard(statement)
+            ),
+            None,
+        )
+        if discard is not None:
+            raise self.error(discard, f"{FRAGMENT_DISCARD_OPERATION}() is not available in this shader stage")
+
     def _validate_declared_returns(
         self,
         function: ast.FunctionDef,
@@ -280,7 +320,7 @@ class _Inference:
     @classmethod
     def _block_always_returns(cls, statements: list[ast.stmt]) -> bool:
         for statement in statements:
-            if isinstance(statement, ast.Return):
+            if isinstance(statement, ast.Return) or _is_fragment_discard(statement):
                 return True
             if (
                 isinstance(statement, ast.If)
@@ -387,6 +427,10 @@ class _Inference:
                 formal_indices = {parameter.name: index for index, parameter in enumerate(callee.parameters)}
                 mapped: list[tuple[str, StorageEffect]] = []
                 for effect in callee.effects:
+                    if isinstance(effect, FragmentDiscardEffect):
+                        if effect not in effects:
+                            effects.append(effect)
+                        continue
                     if isinstance(effect, ResourceEffect):
                         formal_index = formal_indices.get(effect.owner)
                         if formal_index is None or formal_index >= len(call.args):
@@ -456,6 +500,15 @@ class _Inference:
                 isinstance(effect, (AtomicEffect, BarrierEffect)) for effect in function.effects
             ):
                 raise self.error(function.source, "workgroup synchronization is supported only in compute kernels")
+            if (
+                function_kind in ENTRY_DECORATORS
+                and ENTRY_DECORATOR_STAGES[function_kind] != "fragment"
+                and FragmentDiscardEffect() in function.effects
+            ):
+                raise self.error(
+                    _first_statement_with_effect(function.body, FragmentDiscardEffect()) or function.source,
+                    f"{FRAGMENT_DISCARD_OPERATION}() is not available in this shader stage",
+                )
             invalid_resource = next(
                 (
                     effect
@@ -562,6 +615,7 @@ class _Inference:
             *self._storage_effects(statement, typed_expressions, parameters),
             *self._resource_effects(typed_expressions, parameters),
             *self._synchronization_effects(typed_expressions),
+            *((FragmentDiscardEffect(),) if _is_fragment_discard(statement) else ()),
         )
         termination = (
             Termination.RETURN
@@ -570,6 +624,8 @@ class _Inference:
             if isinstance(statement, ast.Break)
             else Termination.CONTINUE
             if isinstance(statement, ast.Continue)
+            else Termination.DISCARD
+            if _is_fragment_discard(statement)
             else Termination.FALLTHROUGH
         )
         return_type = None
@@ -917,6 +973,8 @@ class _Inference:
                     environment[statement.target.id] = common
             elif isinstance(statement, ast.Expr):
                 self._expression(statement.value, environment)
+                if _is_fragment_discard(statement):
+                    break
             elif isinstance(statement, ast.Break):
                 if loop_depth == 0:
                     raise self.error(statement, "break is only valid inside a loop")
@@ -1381,7 +1439,7 @@ class _Inference:
                 raise self.error(node.args[2], f"{name} value must be {element.mlir}")
             self._constrain_literal(node.args[2], element)
             return element
-        if name in {"workgroup_barrier", "storage_barrier"}:
+        if name in {"workgroup_barrier", "storage_barrier", FRAGMENT_DISCARD_OPERATION}:
             if node.args or node.keywords:
                 raise self.error(node, f"{name} does not accept arguments")
             return ConcreteType("void", "void")

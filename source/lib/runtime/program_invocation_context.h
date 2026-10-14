@@ -14,11 +14,15 @@ class CanonicalProgramExecutionWorkspace;
 
 namespace vernon::runtime {
 
+struct RecordedGraphicsPasses;
+
 struct ProgramInvocationContext {
     const program::InvocationSnapshot &bindings;
     const std::optional<uint64_t> &checkpointMemoryBudget;
     const std::string &checkpointPolicy;
     ad::CanonicalProgramExecutionWorkspace *executionWorkspace{};
+    // Validated recordings by graphics Node; the executor also writes their telemetry here.
+    RecordedGraphicsPasses *recordedGraphics{};
 };
 
 } // namespace vernon::runtime

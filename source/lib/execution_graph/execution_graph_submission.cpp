@@ -3,7 +3,6 @@
 #include "execution_graph_internal.h"
 
 #include <algorithm>
-#include <chrono>
 #include <memory>
 
 namespace vernon::execution {
@@ -276,18 +275,6 @@ buildRhiCommandBarriers(const detail::CommandDag &dag,
     return VERNON_RHI_STATUS_OK;
 }
 
-static void updateCommandFinalAccesses(std::vector<detail::CommandResourceAccess> &lastAccesses,
-                                       const detail::CommandNode &node) {
-    for (const detail::CommandResourceAccess &access : node.accesses) {
-        lastAccesses.erase(std::remove_if(lastAccesses.begin(), lastAccesses.end(),
-                                          [&](const detail::CommandResourceAccess &previous) {
-                                              return detail::commandAccessesOverlap(previous, access);
-                                          }),
-                           lastAccesses.end());
-        lastAccesses.push_back(access);
-    }
-}
-
 static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
     VernonRhiDevice device, uint32_t requiredCapabilities, const detail::CommandDag &dag,
     const std::vector<detail::RhiCommandNodeEncoder> &encoders, VernonRhiCompletion *outputCompletion,
@@ -298,9 +285,8 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
     std::string error;
     if (!validateCommandDag(dag, error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    for (size_t index = 0; index < encoders.size(); ++index)
-        if (!encoders[index].encode || encoders[index].complete ||
-            dag.nodes[index].kind == detail::CommandNodeKind::Status)
+    for (const detail::RhiCommandNodeEncoder &encoder : encoders)
+        if (!encoder.encode)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::vector<std::vector<VernonRhiBarrier>> nodeBarriers;
     if (resourceBindings) {
@@ -333,7 +319,7 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
         status = vernonRhiCommandEncoderFinish(device, encoder);
     if (status == VERNON_RHI_STATUS_OK)
         status = vernonRhiDeviceSubmit(device, encoder, outputCompletion);
-    else if (encoder.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+    if (status != VERNON_RHI_STATUS_OK && encoder.index != VERNON_RHI_INVALID_HANDLE_INDEX)
         (void)vernonRhiDeviceDestroyCommandEncoder(device, encoder);
     return status;
 }
@@ -346,104 +332,15 @@ VernonRhiStatus detail::submitRhiCommandDag(VernonRhiDevice device, uint32_t req
                                                   resourceBindings, nullptr);
 }
 
-VernonRhiStatus detail::executeRhiCommandDagAndWait(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                                    const CommandDag &dag,
-                                                    const std::vector<RhiCommandNodeEncoder> &encoders,
-                                                    RhiCommandDagExecutionStats *stats,
-                                                    const std::vector<RhiCommandResourceBinding> *resourceBindings,
-                                                    const std::vector<CommandResourceAccess> *initialAccesses) {
-    if (dag.nodes.empty() || encoders.size() != dag.nodes.size())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+VernonRhiStatus detail::submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
+                                             const RhiCommandExecutionPlan &plan,
+                                             VernonRhiCompletion &outputCompletion) {
     std::string error;
-    if (!validateCommandDag(dag, error))
+    if (!validateRhiCommandExecutionPlan(plan, error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (stats)
-        *stats = {};
-    std::vector<CommandResourceAccess> carriedAccesses =
-        initialAccesses ? *initialAccesses : std::vector<CommandResourceAccess>{};
-    uint32_t offset = 0;
-    while (offset < dag.nodes.size()) {
-        const uint32_t begin = offset;
-        while (offset < dag.nodes.size() && dag.nodes[offset].kind != CommandNodeKind::Status) {
-            if (!encoders[offset].encode || encoders[offset].complete)
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-            ++offset;
-        }
-        if (begin != offset) {
-            CommandDag segment;
-            std::vector<RhiCommandNodeEncoder> segmentEncoders;
-            const bool finalState = offset < dag.nodes.size() && !dag.nodes[offset].accesses.empty();
-            segment.nodes.reserve(offset - begin + (finalState ? 1 : 0));
-            segmentEncoders.reserve(offset - begin + (finalState ? 1 : 0));
-            for (uint32_t index = begin; index < offset; ++index) {
-                CommandNode node = dag.nodes[index];
-                std::vector<uint32_t> predecessors;
-                for (uint32_t predecessor : node.predecessors)
-                    if (predecessor >= begin)
-                        predecessors.push_back(predecessor - begin);
-                node.predecessors = std::move(predecessors);
-                segment.nodes.push_back(std::move(node));
-                segmentEncoders.push_back(encoders[index]);
-            }
-            if (finalState) {
-                CommandNode node;
-                node.kind = CommandNodeKind::Transfer;
-                node.queue = CommandQueueClass::Ordered;
-                node.accesses = dag.nodes[offset].accesses;
-                for (uint32_t predecessor : dag.nodes[offset].predecessors)
-                    if (predecessor >= begin && predecessor < offset)
-                        node.predecessors.push_back(predecessor - begin);
-                segment.nodes.push_back(std::move(node));
-                segmentEncoders.push_back(
-                    {[](void *, VernonRhiCommandEncoder) { return VERNON_RHI_STATUS_OK; }, nullptr});
-            }
-            VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-            VernonRhiStatus status =
-                submitRhiCommandDagWithInitialAccesses(device, requiredCapabilities, segment, segmentEncoders,
-                                                       &completion, resourceBindings, &carriedAccesses);
-            if (status != VERNON_RHI_STATUS_OK)
-                return status;
-            if (stats)
-                ++stats->submissions;
-            const auto waitStarted = std::chrono::steady_clock::now();
-            status = vernonRhiCompletionWait(device, completion);
-            if (stats) {
-                ++stats->waits;
-                stats->deviceWaitNanoseconds += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStarted)
-                        .count());
-            }
-            (void)vernonRhiDeviceDestroyCompletion(device, completion);
-            if (status != VERNON_RHI_STATUS_OK)
-                return status;
-            for (uint32_t index = begin; index < offset; ++index)
-                updateCommandFinalAccesses(carriedAccesses, dag.nodes[index]);
-            if (finalState)
-                updateCommandFinalAccesses(carriedAccesses, dag.nodes[offset]);
-        }
-        if (offset < dag.nodes.size()) {
-            const RhiCommandNodeEncoder &status = encoders[offset];
-            if (status.encode || !status.complete)
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-            const VernonRhiStatus completed = status.complete(status.context);
-            if (completed != VERNON_RHI_STATUS_OK)
-                return completed;
-            ++offset;
-        }
-    }
-    return VERNON_RHI_STATUS_OK;
-}
-
-VernonRhiStatus detail::submitRhiCommandList(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                             RhiCommandListEncoder encode, void *context,
-                                             VernonRhiCompletion *outputCompletion) {
-    CommandDag dag;
-    CommandNode node;
-    node.kind = CommandNodeKind::Compute;
-    node.queue = CommandQueueClass::Compute;
-    node.scopeIndices.push_back(0);
-    dag.nodes.push_back(std::move(node));
-    return submitRhiCommandDag(device, requiredCapabilities, dag, {{encode, context}}, outputCompletion);
+    return submitRhiCommandDagWithInitialAccesses(device, requiredCapabilities, plan.commands, plan.encoders,
+                                                  &outputCompletion, &plan.bindings,
+                                                  plan.initialAccesses.empty() ? nullptr : &plan.initialAccesses);
 }
 
 VernonRhiStatus detail::submitRhiComputeCommandRange(
@@ -668,7 +565,7 @@ ExecutionSubmission CompiledCommandGraph::submit(std::shared_ptr<const Execution
                     attachment.final_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
                     attachment.load_operation = begin.load;
                     attachment.store_operation = finish.store;
-                    std::copy(std::begin(begin.clear), std::end(begin.clear), attachment.clear_color);
+                    attachment.clear_color = begin.clear;
                     colors.push_back(attachment);
                 }
                 VernonRhiDepthStencilAttachment depth{};
@@ -709,7 +606,7 @@ ExecutionSubmission CompiledCommandGraph::submit(std::shared_ptr<const Execution
                         for (const auto &color : renderPass->colors())
                             if (color.load == VERNON_RHI_LOAD_CLEAR) {
                                 status = vernonRhiCommandEncoderClearColorAttachment(context.state.device, native,
-                                                                                     color.location, color.clear);
+                                                                                     color.location, &color.clear);
                                 if (status != VERNON_RHI_STATUS_OK)
                                     break;
                             }

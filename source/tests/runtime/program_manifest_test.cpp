@@ -1,3 +1,4 @@
+#include "VernonFormats.hpp"
 #include "backend_runtime_owner.h"
 #include "backend_test_matrix.h"
 #include "runtime/autodiff/retained_pullback_state.h"
@@ -6,6 +7,7 @@
 #include "runtime/program_execution/program_boundary_contract.h"
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/publication_transaction.h"
+#include "runtime/program_execution_backend.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/program_graph_linker.h"
 #include "runtime/runtime_pipeline_backend.h"
@@ -1150,7 +1152,14 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     EXPECT_EQ(diagnostic.path, "/graphs/0/nodes/0/dependencies");
 }
 
-TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
+struct GraphicsAttachmentFixture {
+    nlohmann::json reflection;
+    std::string contractHash;
+    nlohmann::json manifest;
+};
+
+// One draw into a borrowed color attachment of `format`.
+GraphicsAttachmentFixture graphicsAttachmentFixture(const std::string &format = "rgba8_unorm", bool blended = false) {
     nlohmann::json reflection{
         {"required_features", nlohmann::json::array()},
         {"endpoints", nlohmann::json::array()},
@@ -1176,18 +1185,18 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                                              {"descriptor",
                                               {{"tag", "image"},
                                                {"dimension", "2d"},
-                                               {"format", "rgba8_unorm"},
+                                               {"format", format},
                                                {"sample_count", 1},
                                                {"mip_levels", 1},
                                                {"array_layers", 1},
                                                {"aspects", nlohmann::json::array({"color"})},
                                                {"usage", nlohmann::json::array({"color_attachment"})}}}}})},
         {"values", nlohmann::json::array({{{"id", 0},
-                                           {"type", "image<rgba8_unorm>"},
+                                           {"type", "image<" + format + ">"},
                                            {"origin", {{"tag", "argument"}, {"graph", "forward"}, {"slot", 0}}},
                                            {"storage", 0}},
                                           {{"id", 1},
-                                           {"type", "image<rgba8_unorm>"},
+                                           {"type", "image<" + format + ">"},
                                            {"origin", {{"tag", "node_result"}, {"graph", "forward"}, {"node", 0}}},
                                            {"storage", 0}}})},
         {"graphs",
@@ -1235,7 +1244,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                             {"stencil_read_mask", 255},
                             {"stencil_write_mask", 255}}},
                           {"color_blends", nlohmann::json::array({{0,
-                                                                   {{"enabled", false},
+                                                                   {{"enabled", blended},
                                                                     {"source_color", "ONE"},
                                                                     {"destination_color", "ZERO"},
                                                                     {"color_operation", "ADD"},
@@ -1247,7 +1256,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                          {{"control", 0},
                           {"colors", nlohmann::json::array({{{"location", 0},
                                                              {"access", 0},
-                                                             {"formats", nlohmann::json::array({"rgba8_unorm"})},
+                                                             {"formats", nlohmann::json::array({format})},
                                                              {"sample_counts", nlohmann::json::array({1})}}})},
                           {"depth_stencil", nullptr}}},
                         {"draw",
@@ -1255,6 +1264,11 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                           {"default", {{"tag", "direct"}, {"vertex_count", 3}, {"instance_count", 1}}}}},
                         {"dynamic_state", {{"control", 2}}}}}}})}}})}};
     setProgramAbi(manifest, {{"target", 0, "input", "input"}, {"target", 1, "output", "output"}});
+    return {std::move(reflection), contractHash, std::move(manifest)};
+}
+
+TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
+    auto [reflection, contractHash, manifest] = graphicsAttachmentFixture();
     const std::string codeBytes = "test";
     const std::string codeHash = vernon::runtime::sha256Hex(codeBytes.data(), codeBytes.size());
     nlohmann::json target{{"kind", "metal"}, {"options", {{"platform", "macos"}}}};
@@ -1305,6 +1319,44 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
     EXPECT_TRUE(vernon::runtime::program::parse(placeholder, diagnostic).isErr());
     EXPECT_FALSE(diagnostic.code.empty());
     EXPECT_NE(diagnostic.path.find("/descriptor"), std::string::npos);
+}
+
+TEST(ProgramTargetFormats, RejectsTargetsTheDeviceCannotUseAsDeclared) {
+    const auto baseline = [](const vernon::formats::Format &format) { return format.baseline; };
+    const auto validate = [](const std::string &format, bool blended,
+                             const vernon::runtime::program::FormatCapabilityQuery &capabilities,
+                             vernon::runtime::program::Diagnostic &diagnostic) {
+        auto program = vernon::runtime::program::parse(graphicsAttachmentFixture(format, blended).manifest, diagnostic);
+        EXPECT_TRUE(program.isOk()) << diagnostic.message;
+        return program.isOk() &&
+               vernon::runtime::program::validateTargetFormats(program.value(), capabilities, diagnostic);
+    };
+    const std::string colorPath = "/graphs/0/nodes/0/operation/render_pass/colors/0";
+
+    vernon::runtime::program::Diagnostic diagnostic;
+    EXPECT_TRUE(validate("rgba8_unorm", false, baseline, diagnostic)) << diagnostic.message;
+    EXPECT_TRUE(validate("r32_uint", false, baseline, diagnostic)) << diagnostic.message;
+    EXPECT_TRUE(validate("r32_float", true, baseline, diagnostic)) << diagnostic.message;
+
+    EXPECT_FALSE(validate("r32_uint", true, baseline, diagnostic));
+    EXPECT_EQ(diagnostic.code, "PROGRAM_OPERATION_UNSUPPORTED");
+    EXPECT_EQ(diagnostic.path, colorPath);
+    EXPECT_EQ(diagnostic.message, "integer color targets cannot blend");
+
+    const auto withoutFloatBlending = [](const vernon::formats::Format &format) {
+        return format.dataType == VERNON_RHI_IMAGE_DATA_FLOAT32 ? format.baseline & ~VERNON_RHI_FORMAT_BLENDABLE
+                                                                : format.baseline;
+    };
+    EXPECT_FALSE(validate("r32_float", true, withoutFloatBlending, diagnostic));
+    EXPECT_EQ(diagnostic.path, colorPath);
+    EXPECT_EQ(diagnostic.message, "device cannot render and blend any format of this attachment");
+
+    const auto unrenderable = [](const vernon::formats::Format &format) {
+        return format.baseline & ~VERNON_RHI_FORMAT_RENDERABLE;
+    };
+    EXPECT_FALSE(validate("rgba8_unorm", false, unrenderable, diagnostic));
+    EXPECT_EQ(diagnostic.code, "PROGRAM_OPERATION_UNSUPPORTED");
+    EXPECT_EQ(diagnostic.path, "/storages/0/descriptor/format");
 }
 
 } // namespace

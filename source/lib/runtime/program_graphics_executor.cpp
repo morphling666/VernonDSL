@@ -1,38 +1,15 @@
 #include "program_graphics_executor.h"
 
+#include "VernonFormats.hpp"
+
 #include <algorithm>
 
 namespace vernon::runtime {
 namespace {
 
-const char *textureFormatName(VernonTextureFormat format) {
-    switch (format) {
-    case VERNON_TEXTURE_RGBA8_UNORM:
-        return "rgba8_unorm";
-    case VERNON_TEXTURE_RGBA8_SRGB:
-        return "rgba8_srgb";
-    case VERNON_TEXTURE_RGBA16_FLOAT:
-        return "rgba16_float";
-    case VERNON_TEXTURE_RGBA32_FLOAT:
-        return "rgba32_float";
-    case VERNON_TEXTURE_R8_UNORM:
-        return "r8_unorm";
-    case VERNON_TEXTURE_R16_FLOAT:
-        return "r16_float";
-    case VERNON_TEXTURE_R32_FLOAT:
-        return "r32_float";
-    case VERNON_TEXTURE_RG8_UNORM:
-        return "rg8_unorm";
-    case VERNON_TEXTURE_RGB8_UNORM:
-        return "rgb8_unorm";
-    case VERNON_TEXTURE_R11G11B10_FLOAT:
-        return "r11g11b10_float";
-    case VERNON_TEXTURE_D32_FLOAT:
-        return "depth32_float";
-    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return "depth32_float_stencil8";
-    }
-    return "unknown";
+std::string textureFormatName(VernonTextureFormat format) {
+    const vernon::formats::Format *entry = vernon::formats::find(format);
+    return entry ? std::string(entry->name) : "unknown";
 }
 
 std::string formatList(const std::vector<VernonTextureFormat> &formats) {
@@ -114,7 +91,7 @@ bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const pr
 }
 
 bool checkProgramGraphicsAttachmentSignature(const program::GraphicsOperation &graphics,
-                                             const PlannedGraphicsInvocation &plan, std::string &error) {
+                                             const PlannedRenderTargets &plan, std::string &error) {
     if (plan.attachmentFormats.size() != graphics.colorAttachments.size())
         return error = "bound color attachment count does not match the compiled Program", false;
     for (size_t index = 0; index < plan.attachmentFormats.size(); ++index) {
