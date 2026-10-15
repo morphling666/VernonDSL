@@ -5,6 +5,7 @@
 #include "runtime_pipeline_backend.h"
 
 #include <algorithm>
+#include <optional>
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
 #include "backend_directx12.h"
@@ -86,19 +87,8 @@ std::string renderBackendPipelineError(const BackendPipelineFailure &error) {
 }
 
 void destroyBackendPipeline(VernonStageExecutable &pipeline) {
-    if (pipeline.context->backend == VERNON_RUNTIME_CPU) {
+    if (pipeline.context->backend == VERNON_RUNTIME_CPU)
         destroyCpuPipeline(pipeline);
-    } else if (pipeline.context->backend == VERNON_RUNTIME_CUDA) {
-        destroyCudaPipeline(pipeline);
-    } else if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12) {
-        destroyDirectX12Pipeline(pipeline);
-    } else if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
-        destroyVulkanPipeline(pipeline);
-    } else if (pipeline.context->backend == VERNON_RUNTIME_METAL) {
-        destroyMetalPipeline(pipeline);
-    } else {
-        destroyOpenGLPipeline(pipeline);
-    }
     destroyRuntimeBackendState(pipeline);
 }
 
@@ -160,15 +150,15 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     const vernon::rhi::VulkanCacheStats rhiStats = vernon::rhi::getVulkanCacheStats(context->rhiDevice);
     result.defaultImplicitSamplerCreations = rhiStats.defaultImplicitSamplerCreations;
     const VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(*stage);
-    result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
-    result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
-    result.graphicsPipelineCreations = state.rhiGraphicsVariant.handle ? 1 : 0;
+    result.descriptorSetLayoutCreations = state.rhiGraphics.pipeline ? 1 : 0;
+    result.pipelineLayoutCreations = state.rhiGraphics.pipeline ? 1 : 0;
+    result.graphicsPipelineCreations = state.rhiGraphics.variant.handle ? 1 : 0;
     const RhiAdapterPreparationStats adapterStats = getRhiAdapterPreparationStats(*vulkanState(*context).adapter);
     result.bindingSnapshotCreations = adapterStats.bindingSnapshotCreations;
     result.commandBufferAllocations = rhiStats.commandBufferAllocations;
     result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
     result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;
-    result.renderPassCreations = state.rhiGraphicsVariant.handle && !rhiStats.dynamicRendering ? 1 : 0;
+    result.renderPassCreations = state.rhiGraphics.variant.handle && !rhiStats.dynamicRendering ? 1 : 0;
     result.lastStencilReference = adapterStats.lastStencilReference;
     result.lastDrawIndexed = adapterStats.lastDrawIndexed;
     result.dynamicRendering = rhiStats.dynamicRendering;
@@ -183,7 +173,7 @@ size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     const VernonStageExecutable *stage = resolvedGraphicsImplementation(pipeline);
     if (stage && stage->context && stage->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphicsVariant.handle ? 1 : 0;
+        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphics.variant.handle ? 1 : 0;
 #else
     (void)pipeline;
 #endif
@@ -194,7 +184,7 @@ size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecuta
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     const VernonStageExecutable *stage = resolvedGraphicsImplementation(pipeline);
     if (stage && stage->context && stage->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphicsVariant.handle ? 1 : 0;
+        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphics.variant.handle ? 1 : 0;
 #else
     (void)pipeline;
 #endif
@@ -233,9 +223,11 @@ DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonR
     return result;
 }
 
-size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context) {
+namespace {
+
+std::optional<RhiAdapterPreparationStats> rhiAdapterPreparationStats(const VernonRuntimeContext *context) {
     if (!context)
-        return 0;
+        return std::nullopt;
     const VernonRuntimeRhiAdapter *adapter = nullptr;
     if (context->backend == VERNON_RUNTIME_OPENGL || context->backend == VERNON_RUNTIME_OPENGL_ES)
         adapter = runtimeBackendState<OpenGLContextState>(*context).adapter;
@@ -251,28 +243,30 @@ size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *contex
     else if (context->backend == VERNON_RUNTIME_DIRECTX12)
         adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
 #endif
-    return adapter ? getRhiAdapterPreparationStats(*adapter).livePreparedPipelines : 0;
-}
-
-size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context) {
-    if (!context)
-        return 0;
-    const VernonRuntimeRhiAdapter *adapter = nullptr;
-    if (context->backend == VERNON_RUNTIME_OPENGL || context->backend == VERNON_RUNTIME_OPENGL_ES)
-        adapter = runtimeBackendState<OpenGLContextState>(*context).adapter;
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    else if (context->backend == VERNON_RUNTIME_VULKAN)
-        adapter = runtimeBackendState<VulkanContextState>(*context).adapter;
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    else if (context->backend == VERNON_RUNTIME_DIRECTX12)
-        adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
-#endif
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     else if (context->backend == VERNON_RUNTIME_CUDA)
         adapter = runtimeBackendState<CudaContextState>(*context).adapter;
 #endif
-    return adapter ? getRhiAdapterPreparationStats(*adapter).dispatches : 0;
+    if (!adapter)
+        return std::nullopt;
+    return getRhiAdapterPreparationStats(*adapter);
+}
+
+} // namespace
+
+size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context) {
+    const auto stats = rhiAdapterPreparationStats(context);
+    return stats ? stats->livePreparedPipelines : 0;
+}
+
+size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context) {
+    const auto stats = rhiAdapterPreparationStats(context);
+    return stats ? stats->dispatches : 0;
+}
+
+size_t getRhiAdapterBindingCreationCount(const VernonRuntimeContext *context) {
+    const auto stats = rhiAdapterPreparationStats(context);
+    return stats ? stats->bindingCreations : 0;
 }
 #endif
 

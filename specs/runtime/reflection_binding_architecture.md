@@ -651,6 +651,7 @@ Backend and provider mapping:
 
 - `source/lib/runtime/runtime_pipeline_dispatch.cpp`
 - `source/lib/runtime/runtime_pipeline_backend.h`
+- `source/lib/runtime/rhi_provider_pipeline.cpp`
 - `source/lib/runtime/runtime_pipeline_cpu.cpp`
 - `source/lib/runtime/runtime_pipeline_cuda.cpp`
 - `source/lib/runtime/runtime_pipeline_vulkan.cpp`

@@ -3,14 +3,12 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
-#include "prepared_binding_plan.h"
+#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "rhi/vulkan_backend.h"
 #endif
-
-#include <vector>
 
 struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
@@ -36,16 +34,8 @@ inline const VulkanContextState &vulkanState(const VernonRuntimeContext &context
 }
 
 struct VulkanPipelineState {
-    VernonRuntimeCorePipeline *rhiComputePipeline{};
-    VernonRuntimeCoreBindings *rhiComputeBindings{};
-    PreparedComputeBindingPlan rhiComputeBindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
-    uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
-    VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
-    VernonRuntimeCoreBindings *rhiGraphicsBindings{};
-    PreparedGraphicsVariant rhiGraphicsVariant;
-    PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
+    RhiComputePipeline rhiCompute;
+    RhiGraphicsPipeline rhiGraphics;
 };
 #endif
 

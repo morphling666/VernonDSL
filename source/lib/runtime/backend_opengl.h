@@ -3,17 +3,9 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
-#include "compute_launch_planner.h"
-#include "graphics_invocation_planner.h"
-#include "pipeline_metadata.h"
-#include "prepared_binding_plan.h"
 #include "rhi/opengl_backend.h"
+#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
-#include "stage_artifact.h"
-
-#include <string>
-#include <unordered_map>
-#include <vector>
 
 struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
@@ -25,14 +17,8 @@ struct OpenGLContextState {
 };
 
 struct OpenGLPipelineState {
-    VernonRuntimeCorePipeline *rhiPipeline{};
-    VernonRuntimeCoreBindings *rhiBindings{};
-    PreparedGraphicsVariant rhiGraphicsVariant;
-    PreparedComputeBindingPlan rhiComputeBindingPlan;
-    PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> rhiValues;
-    std::vector<std::vector<uint8_t>> rhiComputeBindingStorage;
-    uint32_t workgroup[3]{1, 1, 1};
+    RhiComputePipeline rhiCompute;
+    RhiGraphicsPipeline rhiGraphics;
 };
 
 inline OpenGLContextState &openGLState(VernonRuntimeContext &context) {

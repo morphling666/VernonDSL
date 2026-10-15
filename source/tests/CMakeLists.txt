@@ -1076,6 +1076,24 @@ if(TARGET VernonRuntime)
             opengl_spilled_uniform_bundle
             opengl_spilled_uniform_manifest)
         vernon_add_program_asset_test_bundle(
+            opengl-counter-clockwise-winding
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:counter_clockwise_asset"
+            opengl_counter_clockwise_winding_bundle
+            opengl_counter_clockwise_winding_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-clockwise-winding
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:clockwise_asset"
+            opengl_clockwise_winding_bundle
+            opengl_clockwise_winding_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-fixed-function-state
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:fixed_function_state_asset"
+            opengl_fixed_function_state_bundle
+            opengl_fixed_function_state_manifest)
+        vernon_add_program_asset_test_bundle(
             opengl-indexed-vertex
             opengl
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:indexed_asset"
@@ -1114,6 +1132,9 @@ if(TARGET VernonRuntime)
                     VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE="${opengl_unsigned_uniform_manifest}"
                     VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE="${opengl_explicit_sampler_manifest}"
                     VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE="${opengl_spilled_uniform_manifest}"
+                    VERNON_OPENGL_COUNTER_CLOCKWISE_WINDING_BUNDLE="${opengl_counter_clockwise_winding_manifest}"
+                    VERNON_OPENGL_CLOCKWISE_WINDING_BUNDLE="${opengl_clockwise_winding_manifest}"
+                    VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE="${opengl_fixed_function_state_manifest}"
                     VERNON_OPENGL_INDEXED_VERTEX_BUNDLE="${opengl_indexed_vertex_manifest}"
                     VERNON_OPENGL_I32_VERTEX_BUNDLE="${opengl_i32_vertex_manifest}"
                     VERNON_OPENGL_U32_VERTEX_BUNDLE="${opengl_u32_vertex_manifest}"
@@ -1128,6 +1149,9 @@ if(TARGET VernonRuntime)
             vernon-opengl-unsigned-uniform-test-bundle
             vernon-opengl-explicit-sampler-test-bundle
             vernon-opengl-spilled-uniform-test-bundle
+            vernon-opengl-counter-clockwise-winding-test-bundle
+            vernon-opengl-clockwise-winding-test-bundle
+            vernon-opengl-fixed-function-state-test-bundle
             vernon-opengl-indexed-vertex-test-bundle
             vernon-opengl-i32-vertex-test-bundle
             vernon-opengl-u32-vertex-test-bundle

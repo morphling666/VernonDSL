@@ -348,6 +348,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/cpu_workgroup_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_boundary_view.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/rhi_provider_pipeline.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp

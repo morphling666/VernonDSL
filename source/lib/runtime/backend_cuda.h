@@ -3,11 +3,10 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
-#include "prepared_binding_plan.h"
 #include "rhi/cuda_backend.h"
+#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
 
-#include <vector>
 struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
@@ -23,11 +22,7 @@ struct CudaContextState {
 };
 
 struct CudaPipelineState {
-    VernonRuntimeCorePipeline *pipeline{};
-    VernonRuntimeCoreBindings *bindings{};
-    PreparedComputeBindingPlan bindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> values;
-    uint32_t workgroup[3]{1, 1, 1};
+    RhiComputePipeline rhiCompute;
 };
 
 inline CudaContextState &cudaState(VernonRuntimeContext &context) {

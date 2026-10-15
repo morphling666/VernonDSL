@@ -1,280 +1,64 @@
 #include "runtime_pipeline_backend.h"
 
 #include "VernonFormats.hpp"
-#include "VernonRuntimeRHIAdapter.h"
 #include "backend_opengl.h"
-#include "compute_launch_planner.h"
-#include "pipeline_metadata.h"
-#include "prepared_binding_plan.h"
-#include "prepared_graphics_draw.h"
-#include "tensor_bridge.h"
 
-#include <nlohmann/json.hpp>
-
-#include <algorithm>
-#include <array>
-#include <cstring>
+#include <memory>
 #include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 namespace vernon::runtime {
 
 namespace {
 
-VernonStatus fail(VernonRuntimeContext &context, std::string error,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    invocationDiagnostic(context) = std::move(error);
-    return status;
+// The OpenGL provider validates depth-stencil formats as GL internal formats but reads only the count of color
+// formats, so color formats stay portable.
+std::optional<uint32_t> openGLColorFormat(VernonTextureFormat format) { return static_cast<uint32_t>(format); }
+
+std::optional<uint32_t> openGLDepthFormat(VernonTextureFormat format) {
+    const vernon::formats::Format *found = vernon::formats::find(format);
+    return found ? std::optional<uint32_t>(found->glInternalFormat) : std::nullopt;
 }
+
+constexpr RhiComputeTarget kOpenGLCompute{"OpenGL", "glsl"};
+constexpr RhiGraphicsTarget kOpenGLGraphics{"OpenGL", "glsl", openGLColorFormat, openGLDepthFormat};
 
 } // namespace
 
 BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline) {
     const auto resolve = [&]() {
-        auto *state = new OpenGLPipelineState();
+        VernonRuntimeContext &context = *inputs.context;
+        auto state = std::make_unique<OpenGLPipelineState>();
+        bool prepared = false;
         if (!plan.compute.empty()) {
-            const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-            ReflectedEntry reflection;
-            if (!resolveStageReflection(stage, inputs.context->backend, reflection,
-                                        invocationDiagnostic(*inputs.context))) {
-                delete state;
-                return false;
-            }
-            if (!buildPreparedComputeBindingPlan(plan, reflection, inputs.context->backend,
-                                                 state->rhiComputeBindingPlan, invocationDiagnostic(*inputs.context))) {
-                delete state;
-                return false;
-            }
-            const auto &layouts = state->rhiComputeBindingPlan.layouts;
-            state->rhiValues.resize(layouts.size());
-            state->rhiComputeBindingStorage.resize(layouts.size());
-            for (size_t index = 0; index < layouts.size(); ++index) {
-                state->rhiValues[index].slot = layouts[index].slot;
-                state->rhiValues[index].kind = layouts[index].kind;
-                const bool runtimeManagedBytes =
-                    layouts[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    layouts[index].interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                if (runtimeManagedBytes) {
-                    auto &storage = state->rhiComputeBindingStorage[index];
-                    storage.resize(layouts[index].element_size);
-                    state->rhiValues[index].payload.inline_value.data = storage.data();
-                    state->rhiValues[index].payload.inline_value.size = storage.size();
-                } else {
-                    state->rhiValues[index].flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
-                }
-            }
-            const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                               VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                               {"glsl", 4},
-                                                               stage.source.data(),
-                                                               stage.source.size(),
-                                                               {stage.entry.data(), stage.entry.size()},
-                                                               {},
-                                                               {0, 0, 0, 0}};
-            VernonRuntimeCorePipelineDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-            descriptor.shaders = &shader;
-            descriptor.shader_count = 1;
-            descriptor.bindings = layouts.data();
-            descriptor.binding_count = layouts.size();
-            std::copy_n(stage.workgroup, 3, descriptor.workgroup_size);
-            const VernonStatus status = vernonRuntimeCorePreparePipeline(
-                vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor,
-                &state->rhiPipeline);
-            if (status != VERNON_STATUS_OK) {
-                invocationDiagnostic(*inputs.context) =
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
-                                       "failed to prepare OpenGL provider compute pipeline");
-                delete state;
-                return false;
-            }
-            if (!layouts.empty()) {
-                const VernonStatus bindingStatus = vernonRuntimeCoreCreateBindings(
-                    state->rhiPipeline, state->rhiValues.data(), state->rhiValues.size(), &state->rhiBindings);
-                if (bindingStatus != VERNON_STATUS_OK) {
-                    invocationDiagnostic(*inputs.context) =
-                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
-                                           "failed to prepare OpenGL provider compute bindings");
-                    vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
-                    delete state;
-                    return false;
-                }
-            }
-            std::copy_n(stage.workgroup, 3, state->workgroup);
-            installRuntimeBackendState(pipeline, state);
-            return true;
+            prepared = prepareRhiComputePipeline(context, openGLState(context).adapter, kOpenGLCompute,
+                                                 inputs.artifacts.at(plan.compute), plan, state->rhiCompute);
+        } else if (!plan.vertex.empty() && !plan.fragment.empty()) {
+            prepared = prepareRhiGraphicsPipeline(context, openGLState(context).adapter, kOpenGLGraphics,
+                                                  inputs.artifacts.at(plan.vertex), inputs.artifacts.at(plan.fragment),
+                                                  plan, {context.backend}, state->rhiGraphics);
+        } else {
+            invocationDiagnostic(context) = "OpenGL ProgramAsset is not representable by the RuntimeCore provider";
         }
-        const bool useRhiGraphics = plan.compute.empty() && !plan.vertex.empty() && !plan.fragment.empty();
-        std::string representationError;
-        if (useRhiGraphics && !buildPreparedGraphicsBindingPlan(plan, {inputs.context->backend},
-                                                                state->rhiGraphicsBindingPlan, representationError)) {
-            invocationDiagnostic(*inputs.context) = std::move(representationError);
-            delete state;
+        if (!prepared)
             return false;
-        }
-        if (useRhiGraphics) {
-            const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
-            const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
-            std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                        VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                        {"glsl", 4},
-                                                                        vertex.source.data(),
-                                                                        vertex.source.size(),
-                                                                        {vertex.entry.data(), vertex.entry.size()},
-                                                                        {nullptr, 0},
-                                                                        {0, 0, 0, 0}}};
-            shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
-                               VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                               {"glsl", 4},
-                               fragment.source.data(),
-                               fragment.source.size(),
-                               {fragment.entry.data(), fragment.entry.size()},
-                               {nullptr, 0},
-                               {0, 0, 0, 0}});
-            VernonRuntimeCorePipelineDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-            descriptor.shaders = shaders.data();
-            descriptor.shader_count = shaders.size();
-            descriptor.bindings = state->rhiGraphicsBindingPlan.layouts.data();
-            descriptor.binding_count = state->rhiGraphicsBindingPlan.size();
-            descriptor.vertex_attributes = state->rhiGraphicsBindingPlan.vertexAttributes.data();
-            descriptor.vertex_attribute_count = state->rhiGraphicsBindingPlan.vertexAttributes.size();
-            descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-            descriptor.sample_count = 1;
-            const VernonStatus status = vernonRuntimeCorePreparePipeline(
-                vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor,
-                &state->rhiPipeline);
-            if (status != VERNON_STATUS_OK) {
-                invocationDiagnostic(*inputs.context) =
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
-                                       "failed to prepare OpenGL RHI provider pipeline");
-                delete state;
-                return false;
-            }
-            if (!state->rhiGraphicsBindingPlan.empty()) {
-                state->rhiValues.resize(state->rhiGraphicsBindingPlan.size());
-                for (size_t index = 0; index < state->rhiGraphicsBindingPlan.size(); ++index) {
-                    const auto &layout = state->rhiGraphicsBindingPlan.layouts[index];
-                    auto &value = state->rhiValues[index];
-                    value.slot = layout.slot;
-                    value.kind = layout.kind;
-                    if (layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                        layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
-                        (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-                         layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM)) {
-                        auto &storage = state->rhiGraphicsBindingPlan.sources[index].storage;
-                        value.payload.inline_value.data = storage.data();
-                        value.payload.inline_value.size = storage.size();
-                    } else {
-                        value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
-                    }
-                }
-                const VernonStatus bindingStatus = vernonRuntimeCoreCreateBindings(
-                    state->rhiPipeline, state->rhiValues.data(), state->rhiValues.size(), &state->rhiBindings);
-                if (bindingStatus != VERNON_STATUS_OK) {
-                    invocationDiagnostic(*inputs.context) =
-                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
-                                           "failed to prepare OpenGL RHI bindings");
-                    vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
-                    delete state;
-                    return false;
-                }
-            }
-            installRuntimeBackendState(pipeline, state);
-            return true;
-        }
-        invocationDiagnostic(*inputs.context) =
-            representationError.empty() ? "OpenGL ProgramAsset is not representable by the RuntimeCore provider"
-                                        : std::move(representationError);
-        delete state;
-        return false;
+        installRuntimeBackendState(pipeline, state.release());
+        return true;
     };
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
-}
-
-void destroyOpenGLPipeline(VernonStageExecutable &pipeline) {
-    OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
-    destroyGraphicsVariant(state.rhiGraphicsVariant);
-    vernonRuntimeCoreBindingsDestroy(state.rhiBindings);
-    vernonRuntimeCorePipelineDestroy(state.rhiPipeline);
 }
 
 VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
                                           const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
-    OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
-    if (!state.rhiPipeline)
-        return VERNON_STATUS_OK;
-    if (!fillPreparedGraphicsBindingValues(state.rhiGraphicsBindingPlan, plan, state.rhiValues,
-                                           invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    if (state.rhiBindings) {
-        const VernonStatus bindingStatus =
-            vernonRuntimeCoreUpdateBindings(state.rhiBindings, state.rhiValues.data(), state.rhiValues.size());
-        if (bindingStatus != VERNON_STATUS_OK) {
-            return fail(*pipeline.context,
-                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
-                                           "failed to update OpenGL RHI bindings"),
-                        bindingStatus);
-        }
-    }
-    std::vector<uint32_t> formats;
-    formats.reserve(plan.attachments.size());
-    for (VernonTextureFormat format : plan.attachmentFormats)
-        formats.push_back(static_cast<uint32_t>(format));
-    const vernon::formats::Format *depth = plan.depthAttachment ? vernon::formats::find(plan.depthFormat) : nullptr;
-    const uint32_t depthFormat = depth ? depth->glInternalFormat : 0;
-    PreparedGraphicsDraw prepared;
-    if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
-                             state.rhiValues, prepared, invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    const VernonStatus variantStatus =
-        ensureGraphicsVariant(state.rhiPipeline, prepared.variantKey, state.rhiGraphicsVariant);
-    if (variantStatus != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
-                                       "failed to prepare OpenGL RHI graphics variant"),
-                    variantStatus);
-    }
-    const VernonStatus status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(
-        state.rhiGraphicsVariant.handle, state.rhiBindings, &prepared.invocation);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
-                                       "failed to encode OpenGL RHI draw"),
-                    status);
-    }
-    return VERNON_STATUS_OK;
+    return invokeRhiGraphicsPipeline(*pipeline.context, openGLState(*pipeline.context).adapter, kOpenGLGraphics,
+                                     invocation, plan, runtimeBackendState<OpenGLPipelineState>(pipeline).rhiGraphics);
 }
 
 VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
-    OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
-    if (!state.rhiPipeline)
-        return fail(*pipeline.context, "OpenGL provider compute pipeline is not loaded");
-    std::string error;
-    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
-                                          state.rhiValues, error))
-        return fail(*pipeline.context, "OpenGL " + error);
-    VernonStatus status =
-        state.rhiBindings
-            ? vernonRuntimeCoreUpdateBindings(state.rhiBindings, state.rhiValues.data(), state.rhiValues.size())
-            : vernonRuntimeCoreCreateBindings(state.rhiPipeline, state.rhiValues.data(), state.rhiValues.size(),
-                                              &state.rhiBindings);
-    if (status != VERNON_STATUS_OK)
-        return fail(*pipeline.context, "failed to prepare OpenGL provider bindings", status);
-    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
-    status = vernonRuntimeCoreEncodeDispatch(state.rhiPipeline, state.rhiBindings, launch.commandEncoder, groups,
-                                             nullptr, 0);
-    return status == VERNON_STATUS_OK ? status
-                                      : fail(*pipeline.context, "failed to encode OpenGL provider dispatch", status);
+    return invokeRhiComputePipeline(*pipeline.context, openGLState(*pipeline.context).adapter, kOpenGLCompute,
+                                    pipeline.bindingProjection, launch,
+                                    runtimeBackendState<OpenGLPipelineState>(pipeline).rhiCompute);
 }
 
 } // namespace vernon::runtime

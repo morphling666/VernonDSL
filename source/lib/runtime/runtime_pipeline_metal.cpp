@@ -1,20 +1,13 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_METAL_RUNTIME)
-#include "VernonRuntimeRHIAdapter.h"
 #include "backend_metal.h"
-#include "pipeline_metadata.h"
-#include "prepared_graphics_draw.h"
 #include "rhi/rhi_internal.h"
 
-#include <nlohmann/json.hpp>
-
-#include <algorithm>
-#include <array>
-#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #endif
 
@@ -23,11 +16,13 @@ namespace vernon::runtime {
 #if defined(VERNON_HAS_METAL_RUNTIME)
 namespace {
 
-VernonStatus fail(VernonRuntimeContext &context, std::string error,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    invocationDiagnostic(context) = std::move(error);
-    return status;
+std::optional<uint32_t> metalAttachmentFormat(VernonTextureFormat format) {
+    const uint32_t pixelFormat = rhi::metalTexturePixelFormat(format);
+    return pixelFormat ? std::optional<uint32_t>(pixelFormat) : std::nullopt;
 }
+
+constexpr RhiComputeTarget kMetalCompute{"Metal", "msl"};
+constexpr RhiGraphicsTarget kMetalGraphics{"Metal", "msl", metalAttachmentFormat, metalAttachmentFormat};
 
 struct MetalResourceLocation {
     uint32_t argumentBufferIndex{UINT32_MAX};
@@ -66,6 +61,24 @@ bool resolveMetalResourceLocation(const std::vector<NativeResourceSlot> &slots, 
         error = "Metal reflection has no compiled " + std::string(kind) + " location for " + stage + " binding (" +
                 std::to_string(set) + ", " + std::to_string(binding) + ")";
     return found;
+}
+
+bool resolveMetalComputeNativeBinding(const void *userData, const PreparedBindingSource &source,
+                                      VernonRuntimeProviderBindingLayoutEntry &layout, std::string &error) {
+    const auto &stage = *static_cast<const LoadedStageArtifact *>(userData);
+    const char *resourceKind = source.metadataCarrier                                 ? "uniform_buffer"
+                               : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? "sampled_image"
+                               : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? "storage_image"
+                               : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER       ? "sampler"
+                                                                                      : "storage_buffer";
+    MetalResourceLocation location;
+    if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind, layout.set,
+                                      layout.binding, location, error))
+        return false;
+    layout.set = location.argumentBufferIndex;
+    layout.binding = location.memberId;
+    layout.array_count = location.count;
+    return true;
 }
 
 struct MetalGraphicsNativeBindingContext {
@@ -176,54 +189,13 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
             auto state = std::make_unique<MetalPipelineState>();
             const PreparedGraphicsBindingOptions bindingOptions{VERNON_RUNTIME_METAL, resolveMetalGraphicsNativeBinding,
                                                                 &nativeBindingContext};
-            if (!buildPreparedGraphicsBindingPlan(plan, bindingOptions, state->rhiGraphicsBindingPlan,
-                                                  invocationDiagnostic(*inputs.context)))
+            if (!prepareRhiGraphicsPipeline(*inputs.context, metalState(*inputs.context).adapter, kMetalGraphics,
+                                            vertex, fragment, plan, bindingOptions, state->rhiGraphics))
                 return false;
-            state->rhiGraphicsValues.resize(state->rhiGraphicsBindingPlan.size());
-            const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                    VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                    {"msl", 3},
-                                                                    vertex.source.data(),
-                                                                    vertex.source.size(),
-                                                                    {vertex.entry.data(), vertex.entry.size()},
-                                                                    {},
-                                                                    {0, 0, 0, 0}},
-                                                                   {sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                    VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                                                                    {"msl", 3},
-                                                                    fragment.source.data(),
-                                                                    fragment.source.size(),
-                                                                    {fragment.entry.data(), fragment.entry.size()},
-                                                                    {},
-                                                                    {0, 0, 0, 0}}};
-            VernonRuntimeCorePipelineDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-            descriptor.shaders = shaders;
-            descriptor.shader_count = 2;
-            descriptor.bindings = state->rhiGraphicsBindingPlan.layouts.data();
-            descriptor.binding_count = state->rhiGraphicsBindingPlan.size();
-            descriptor.vertex_attributes = state->rhiGraphicsBindingPlan.vertexAttributes.data();
-            descriptor.vertex_attribute_count = state->rhiGraphicsBindingPlan.vertexAttributes.size();
-            descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-            descriptor.sample_count = 1;
-            const VernonStatus status = vernonRuntimeCorePreparePipeline(
-                vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter), &descriptor,
-                &state->rhiGraphicsPipeline);
-            if (status != VERNON_STATUS_OK) {
-                invocationDiagnostic(*inputs.context) =
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter),
-                                       "failed to prepare Metal provider graphics pipeline");
-                return false;
-            }
             installRuntimeBackendState(pipeline, state.release());
             return true;
         }
         const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-        ReflectedEntry reflection;
-        if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*inputs.context)))
-            return false;
         MetalArgumentBufferUsage argumentBufferUsage;
         if (!collectMetalArgumentBufferUsage(stage.nativeSlots, stage.entry, "compute", argumentBufferUsage,
                                              invocationDiagnostic(*inputs.context)) ||
@@ -231,55 +203,11 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
                                               metalState(*inputs.context).argumentBufferEncodingSupported,
                                               invocationDiagnostic(*inputs.context)))
             return false;
-
         auto state = std::make_unique<MetalPipelineState>();
-        if (!buildPreparedComputeBindingPlan(plan, reflection, VERNON_RUNTIME_METAL, state->rhiComputeBindingPlan,
-                                             invocationDiagnostic(*inputs.context)))
+        const RhiComputeNativeBindingResolver resolver{resolveMetalComputeNativeBinding, &stage};
+        if (!prepareRhiComputePipeline(*inputs.context, metalState(*inputs.context).adapter, kMetalCompute, stage, plan,
+                                       state->rhiCompute, resolver))
             return false;
-        for (size_t index = 0; index < state->rhiComputeBindingPlan.size(); ++index) {
-            auto &layout = state->rhiComputeBindingPlan.layouts[index];
-            const PreparedBindingSource &source = state->rhiComputeBindingPlan.sources[index];
-            const char *resourceKind = source.metadataCarrier                                 ? "uniform_buffer"
-                                       : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? "sampled_image"
-                                       : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? "storage_image"
-                                       : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER       ? "sampler"
-                                                                                              : "storage_buffer";
-            MetalResourceLocation location;
-            if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind, layout.set,
-                                              layout.binding, location, invocationDiagnostic(*inputs.context)))
-                return false;
-            layout.set = location.argumentBufferIndex;
-            layout.binding = location.memberId;
-            layout.array_count = location.count;
-        }
-        state->rhiComputeValues.resize(state->rhiComputeBindingPlan.size());
-        std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
-        const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                           VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                           {"msl", 3},
-                                                           stage.source.data(),
-                                                           stage.source.size(),
-                                                           {stage.entry.data(), stage.entry.size()},
-                                                           {},
-                                                           {0, 0, 0, 0}};
-        VernonRuntimeCorePipelineDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-        descriptor.shaders = &shader;
-        descriptor.shader_count = 1;
-        descriptor.bindings = state->rhiComputeBindingPlan.layouts.data();
-        descriptor.binding_count = state->rhiComputeBindingPlan.size();
-        std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
-        const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
-                                             &descriptor, &state->rhiComputePipeline);
-        if (status != VERNON_STATUS_OK) {
-            invocationDiagnostic(*inputs.context) =
-                providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter),
-                                   "failed to prepare Metal provider compute pipeline");
-            return false;
-        }
         installRuntimeBackendState(pipeline, state.release());
         return true;
 #else
@@ -292,76 +220,12 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-void destroyMetalPipeline(VernonStageExecutable &pipeline) {
-#if defined(VERNON_HAS_METAL_RUNTIME)
-    MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
-    vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
-    vernonRuntimeCorePipelineDestroy(state.rhiComputePipeline);
-    vernonRuntimeCoreBindingsDestroy(state.rhiGraphicsBindings);
-    destroyGraphicsVariant(state.rhiGraphicsVariant);
-    vernonRuntimeCorePipelineDestroy(state.rhiGraphicsPipeline);
-#else
-    (void)pipeline;
-#endif
-}
-
 VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
                                          const VernonStageInvocationDescriptor &invocation,
                                          const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
-    if (!state.rhiGraphicsPipeline)
-        return VERNON_STATUS_OK;
-    VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;
-    if (!fillPreparedGraphicsBindingValues(state.rhiGraphicsBindingPlan, plan, state.rhiGraphicsValues,
-                                           invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    VernonStatus status =
-        state.rhiGraphicsBindings
-            ? vernonRuntimeCoreUpdateBindings(state.rhiGraphicsBindings, state.rhiGraphicsValues.data(),
-                                              state.rhiGraphicsValues.size())
-            : vernonRuntimeCoreCreateBindings(state.rhiGraphicsPipeline, state.rhiGraphicsValues.data(),
-                                              state.rhiGraphicsValues.size(), &state.rhiGraphicsBindings);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
-                                       "failed to update Metal RHI graphics bindings"),
-                    status);
-    }
-    std::vector<uint32_t> formats;
-    formats.reserve(plan.attachments.size());
-    for (size_t index = 0; index < plan.attachments.size(); ++index) {
-        const uint32_t format = rhi::metalTexturePixelFormat(plan.attachmentFormats[index]);
-        if (!format)
-            return fail(*pipeline.context, "Metal RHI color attachment is stale");
-        formats.push_back(format);
-    }
-    uint32_t depthFormat = 0;
-    if (plan.depthAttachment) {
-        depthFormat = rhi::metalTexturePixelFormat(plan.depthFormat);
-        if (!depthFormat)
-            return fail(*pipeline.context, "Metal RHI depth attachment is stale");
-    }
-    PreparedGraphicsDraw prepared;
-    if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
-                             state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
-                                       "failed to prepare Metal RHI graphics variant"),
-                    status);
-    }
-    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
-                                                                  state.rhiGraphicsBindings, &prepared.invocation);
-    if (status != VERNON_STATUS_OK) {
-        return fail(
-            *pipeline.context,
-            providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter), "failed to encode Metal RHI draw"),
-            status);
-    }
-    return VERNON_STATUS_OK;
+    return invokeRhiGraphicsPipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalGraphics,
+                                     invocation, plan, runtimeBackendState<MetalPipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
     (void)invocation;
@@ -372,34 +236,9 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
 
 VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
-    VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;
-    std::string error;
-    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
-                                          state.rhiComputeValues, error))
-        return fail(*pipeline.context, "Metal " + error);
-    VernonStatus status =
-        state.rhiComputeBindings
-            ? vernonRuntimeCoreUpdateBindings(state.rhiComputeBindings, state.rhiComputeValues.data(),
-                                              state.rhiComputeValues.size())
-            : vernonRuntimeCoreCreateBindings(state.rhiComputePipeline, state.rhiComputeValues.data(),
-                                              state.rhiComputeValues.size(), &state.rhiComputeBindings);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
-                                       "failed to prepare Metal invocation bindings"),
-                    status);
-    }
-    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
-    status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
-                                             groups, nullptr, 0);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
-                                       "failed to encode Metal provider dispatch"),
-                    status);
-    }
-    return VERNON_STATUS_OK;
+    return invokeRhiComputePipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalCompute,
+                                    pipeline.bindingProjection, launch,
+                                    runtimeBackendState<MetalPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
     (void)launch;

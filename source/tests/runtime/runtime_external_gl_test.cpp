@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -40,10 +41,13 @@ constexpr GlEnum kUnsignedInt = 0x1405;
 constexpr GlEnum kFloat = 0x1406;
 constexpr GlEnum kBack = 0x0405;
 constexpr GlEnum kClockwise = 0x0900;
-constexpr GlEnum kLess = 0x0201;
+constexpr GlEnum kCounterClockwise = 0x0901;
+constexpr GlEnum kLessEqual = 0x0203;
+constexpr GlEnum kOne = 1;
 constexpr GlEnum kSourceAlpha = 0x0302;
 constexpr GlEnum kOneMinusSourceAlpha = 0x0303;
 constexpr GlEnum kAdd = 0x8006;
+constexpr GlEnum kSubtract = 0x800A;
 constexpr GlEnum kColorAttachment0 = 0x8CE0;
 constexpr GlEnum kStencilAttachment = 0x8D20;
 constexpr GlEnum kAlreadySignaled = 0x911A;
@@ -785,8 +789,10 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
     VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
     ASSERT_TRUE(gl);
     {
+        const size_t bindingCreations = vernon::runtime::getRhiAdapterBindingCreationCount(gl);
         vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
         ASSERT_TRUE(program) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations);
         auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT, 1,
                                                 1, 1, VERNON_RHI_IMAGE_STORAGE);
         const auto imageView =
@@ -805,6 +811,12 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
         EXPECT_EQ(dispatchCount, 1u);
         EXPECT_EQ(storageBindingCount, 1u);
         EXPECT_EQ(memoryBarrierCount, 3u);
+        EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations + 1);
+        ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
+                  VERNON_STATUS_OK)
+            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        EXPECT_EQ(dispatchCount, 2u);
+        EXPECT_EQ(storageBindingCount, 2u);
         EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
         EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
     }
@@ -1084,6 +1096,91 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     }
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+#endif
+
+#if defined(VERNON_OPENGL_COUNTER_CLOCKWISE_WINDING_BUNDLE) && defined(VERNON_OPENGL_CLOCKWISE_WINDING_BUNDLE)
+// GL vertex stages negate y, which mirrors window-space winding, so each declared front face selects the opposite one.
+TEST(RuntimeExternalGl, MirrorsDeclaredFrontFaceForTheFlippedVertexY) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    const auto targetView =
+        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const VernonColorAttachment attachment{0, targetView.reference};
+    const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    const std::array<std::pair<const char *, GlEnum>, 2> windings{{
+        {VERNON_OPENGL_COUNTER_CLOCKWISE_WINDING_BUNDLE, kClockwise},
+        {VERNON_OPENGL_CLOCKWISE_WINDING_BUNDLE, kCounterClockwise},
+    }};
+    for (const auto &[manifest, expectedWinding] : windings) {
+        cullMode = 0;
+        frontWinding = 0;
+        vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
+        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
+            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        EXPECT_EQ(cullMode, kBack) << manifest;
+        EXPECT_EQ(frontWinding, expectedWinding) << manifest;
+    }
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+#endif
+
+#if defined(VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE)
+TEST(RuntimeExternalGl, AppliesDeclaredDepthStencilAndBlendState) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    RhiImage color = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    RhiImage depthStencil =
+        vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1,
+                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    ASSERT_NE(color.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_NE(depthStencil.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    const auto colorView =
+        vernon::tests::createImageView(rhiRuntime(gl), color, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto depthStencilView = vernon::tests::createImageView(
+        rhiRuntime(gl), depthStencil, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 1, 1,
+        VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
+    const VernonColorAttachment attachment{0, colorView.reference};
+    VernonDepthAttachment depthAttachment{};
+    depthAttachment.view = depthStencilView.reference;
+    depthAttachment.clear_depth = 1.0F;
+    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    graphics.renderPass.depth_attachment = &depthAttachment;
+    graphics.dynamic.stencil_reference = 23;
+    stencilFuncCount = 0;
+    stencilReference = 0;
+    stencilReadMask = 0;
+    depthWrite = 0;
+    depthComparison = 0;
+    depthBias = {};
+    blendFactors = {};
+    blendOperations = {};
+    colorWriteMask = {};
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE);
+        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
+            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    }
+    EXPECT_EQ(stencilFuncCount, 2U);
+    EXPECT_EQ(stencilReference, 23);
+    EXPECT_EQ(stencilReadMask, 0x5AU);
+    EXPECT_EQ(depthWrite, 1);
+    EXPECT_EQ(depthComparison, kLessEqual);
+    EXPECT_EQ(depthBias, (std::array<float, 2>{3.0F, 2.0F}));
+    EXPECT_EQ(blendFactors, (std::array<GlEnum, 4>{kSourceAlpha, kOneMinusSourceAlpha, kOne, kOneMinusSourceAlpha}));
+    EXPECT_EQ(blendOperations, (std::array<GlEnum, 2>{kSubtract, kAdd}));
+    EXPECT_EQ(colorWriteMask, (std::array<GlBoolean, 4>{1, 1, 0, 0}));
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, depthStencilView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, colorView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, depthStencil.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, color.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif

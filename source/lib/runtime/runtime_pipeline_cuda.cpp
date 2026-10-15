@@ -3,12 +3,12 @@
 #include "compute_launch_planner.h"
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-#include "VernonRuntimeRHIAdapter.h"
 #include "backend_cuda.h"
 
-#include <algorithm>
 #include <memory>
-#include <utility>
+#include <string>
+#include <variant>
+#include <vector>
 #endif
 
 namespace vernon::runtime {
@@ -16,11 +16,69 @@ namespace vernon::runtime {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 namespace {
 
-VernonStatus fail(VernonRuntimeContext &context, std::string error,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    invocationDiagnostic(context) = std::move(error);
-    return status;
+// CUDA passes packed host values as host-storage buffers, so storage bindings accept either an RHI Tensor or bytes.
+bool fillCudaComputeValues(const PreparedComputeBindingPlan &plan, const StageBindingPlan &,
+                           const PlannedComputeLaunch &launch, std::vector<VernonRuntimeProviderBindingValue> &values,
+                           std::string &error) {
+    values.resize(plan.size());
+    for (size_t index = 0; index < plan.size(); ++index) {
+        const auto &layout = plan.layouts[index];
+        const PreparedBindingSource &preparedSource = plan.sources[index];
+        auto &value = values[index];
+        value = {};
+        value.slot = layout.slot;
+        value.kind = layout.kind;
+        if (preparedSource.metadataCarrier) {
+            if (bindComputeMetadataCarrier(layout, preparedSource, launch, value))
+                continue;
+            error = "metadata carrier payload does not match its compiled ABI";
+            return false;
+        }
+        if (preparedSource.argumentIndex >= launch.arguments.size()) {
+            error = "prepared argument index is invalid";
+            return false;
+        }
+        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
+        const std::string argumentName = "#" + std::to_string(layout.argument_index);
+        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            const auto *packed = std::get_if<ComputeScalarArgument>(&argument);
+            if (tensor && tensor->resource.resource.value) {
+                value.payload.buffer.resource = tensor->resource;
+                if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
+                    preparedSource.resourceOffset >
+                        value.payload.buffer.resource.size - value.payload.buffer.resource.offset) {
+                    error = "aggregate storage leaf exceeds its Tensor resource";
+                    return false;
+                }
+                value.payload.buffer.resource.offset += preparedSource.resourceOffset;
+            } else if (packed && packed->data && packed->size) {
+                value.flags = VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE;
+                value.payload.inline_value.data = packed->data;
+                value.payload.inline_value.size = packed->size;
+            } else {
+                error = "prepared storage binding for argument " + argumentName +
+                        " requires an RHI Tensor or packed host value";
+                return false;
+            }
+            continue;
+        }
+        const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+        if (!scalar) {
+            error = "prepared inline binding for argument " + argumentName + " received a resource value";
+            return false;
+        }
+        if (!scalar->data || !scalar->size) {
+            error = "prepared inline binding for argument " + argumentName + " has no packed host data";
+            return false;
+        }
+        value.payload.inline_value.data = scalar->data;
+        value.payload.inline_value.size = scalar->size;
+    }
+    return true;
 }
+
+constexpr RhiComputeTarget kCudaCompute{"CUDA", "ptx", fillCudaComputeValues};
 
 } // namespace
 #endif
@@ -30,40 +88,9 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
     const auto resolve = [&]() {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
         auto state = std::make_unique<CudaPipelineState>();
-        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-        ReflectedEntry reflection;
-        if (!resolveStageReflection(stage, VERNON_RUNTIME_CUDA, reflection, invocationDiagnostic(*inputs.context)))
+        if (!prepareRhiComputePipeline(*inputs.context, cudaState(*inputs.context).adapter, kCudaCompute,
+                                       inputs.artifacts.at(plan.compute), plan, state->rhiCompute))
             return false;
-        if (!buildPreparedComputeBindingPlan(plan, reflection, VERNON_RUNTIME_CUDA, state->bindingPlan,
-                                             invocationDiagnostic(*inputs.context)))
-            return false;
-        state->values.resize(state->bindingPlan.size());
-        std::copy_n(stage.workgroup, 3, state->workgroup);
-        const VernonRuntimeProviderShaderDescriptor shaderDescriptor{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                     VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                                     {"ptx", 3},
-                                                                     stage.source.data(),
-                                                                     stage.source.size(),
-                                                                     {stage.entry.data(), stage.entry.size()},
-                                                                     {nullptr, 0},
-                                                                     {0, 0, 0, 0}};
-        VernonRuntimeCorePipelineDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-        descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-        descriptor.shaders = &shaderDescriptor;
-        descriptor.shader_count = 1;
-        descriptor.bindings = state->bindingPlan.layouts.data();
-        descriptor.binding_count = state->bindingPlan.layouts.size();
-        std::copy_n(state->workgroup, 3, descriptor.workgroup_size);
-        const VernonStatus status = vernonRuntimeCorePreparePipeline(
-            vernonRuntimeRhiAdapterGetProvider(cudaState(*inputs.context).adapter), &descriptor, &state->pipeline);
-        if (status != VERNON_STATUS_OK) {
-            invocationDiagnostic(*inputs.context) =
-                providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*inputs.context).adapter),
-                                   "failed to prepare CUDA provider pipeline");
-            return false;
-        }
         installRuntimeBackendState(pipeline, state.release());
         return true;
 #else
@@ -76,85 +103,11 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-void destroyCudaPipeline(VernonStageExecutable &pipeline) {
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-    CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
-    vernonRuntimeCoreBindingsDestroy(state.bindings);
-    vernonRuntimeCorePipelineDestroy(state.pipeline);
-#else
-    (void)pipeline;
-#endif
-}
-
 VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-    CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
-    for (size_t index = 0; index < state.bindingPlan.size(); ++index) {
-        const auto &layout = state.bindingPlan.layouts[index];
-        const PreparedBindingSource &preparedSource = state.bindingPlan.sources[index];
-        auto &value = state.values[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (preparedSource.metadataCarrier) {
-            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
-                return fail(*pipeline.context, "CUDA metadata carrier payload does not match its compiled ABI");
-            continue;
-        }
-        if (preparedSource.argumentIndex >= launch.arguments.size())
-            return fail(*pipeline.context, "CUDA prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
-        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            const auto *packed = std::get_if<ComputeScalarArgument>(&argument);
-            if (tensor && tensor->resource.resource.value) {
-                value.payload.buffer.resource = tensor->resource;
-                if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
-                    preparedSource.resourceOffset >
-                        value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
-                    return fail(*pipeline.context, "CUDA aggregate storage leaf exceeds its Tensor resource");
-                value.payload.buffer.resource.offset += preparedSource.resourceOffset;
-            } else if (packed && packed->data && packed->size) {
-                value.flags = VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE;
-                value.payload.inline_value.data = packed->data;
-                value.payload.inline_value.size = packed->size;
-            } else {
-                return fail(*pipeline.context, "CUDA prepared storage binding for argument #" +
-                                                   std::to_string(layout.argument_index) +
-                                                   " requires an RHI Tensor or packed host value");
-            }
-        } else {
-            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar)
-                return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
-                                                   std::to_string(layout.argument_index) +
-                                                   " received a resource value");
-            if (!scalar->data || !scalar->size)
-                return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
-                                                   std::to_string(layout.argument_index) + " has no packed host data");
-            value.payload.inline_value.data = scalar->data;
-            value.payload.inline_value.size = scalar->size;
-        }
-    }
-    VernonStatus status =
-        state.bindings ? vernonRuntimeCoreUpdateBindings(state.bindings, state.values.data(), state.values.size())
-                       : vernonRuntimeCoreCreateBindings(state.pipeline, state.values.data(), state.values.size(),
-                                                         &state.bindings);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter),
-                                       "failed to prepare CUDA invocation bindings"),
-                    status);
-    }
-    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
-    status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups, nullptr, 0);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter),
-                                       "failed to encode CUDA provider dispatch"),
-                    status);
-    }
-    return VERNON_STATUS_OK;
+    return invokeRhiComputePipeline(*pipeline.context, cudaState(*pipeline.context).adapter, kCudaCompute,
+                                    pipeline.bindingProjection, launch,
+                                    runtimeBackendState<CudaPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
     (void)launch;

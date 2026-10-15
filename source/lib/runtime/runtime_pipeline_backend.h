@@ -24,10 +24,8 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
 
 BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                           VernonStageExecutable &pipeline);
-void destroyCudaPipeline(VernonStageExecutable &pipeline);
 VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyVulkanPipeline(VernonStageExecutable &pipeline);
 BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
 VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
@@ -35,7 +33,6 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
                                           const PlannedGraphicsInvocation &plan);
 VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyDirectX12Pipeline(VernonStageExecutable &pipeline);
 BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                                VernonStageExecutable &pipeline);
 VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
@@ -43,7 +40,6 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
                                              const PlannedGraphicsInvocation &plan);
 VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyMetalPipeline(VernonStageExecutable &pipeline);
 BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                            VernonStageExecutable &pipeline);
 VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
@@ -51,7 +47,6 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
                                          const PlannedGraphicsInvocation &plan);
 VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 
-void destroyOpenGLPipeline(VernonStageExecutable &pipeline);
 BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
 VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,

@@ -128,6 +128,15 @@ struct PreparedPipeline {
             owner->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
     }
 };
+// Shader-visible descriptor tables written for one command encoder; a binding set reused within that encoder keeps
+// them instead of acquiring and writing new ones.
+struct DescriptorTables {
+    uint64_t encoder{};
+    ID3D12DescriptorHeap *resourceHeap{};
+    ID3D12DescriptorHeap *samplerHeap{};
+    D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
+};
 struct PreparedBindingSet {
     std::atomic<uint32_t> references{1};
     struct Slot {
@@ -147,16 +156,9 @@ struct PreparedBindingSet {
     std::unordered_map<uint32_t, size_t> slotIndices;
     uint32_t resourceDescriptorCount{};
     uint32_t samplerDescriptorCount{};
-    uint64_t descriptorEncoder{};
-    ID3D12DescriptorHeap *resourceHeap{};
-    ID3D12DescriptorHeap *samplerHeap{};
-    D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
-    uint64_t computeDescriptorEncoder{};
-    ID3D12DescriptorHeap *computeResourceHeap{};
-    ID3D12DescriptorHeap *computeSamplerHeap{};
-    D3D12_GPU_DESCRIPTOR_HANDLE computeResourceGpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE computeSamplerGpu{};
+    // Draws and dispatches cache separately because one binding set may be bound by both within one encoder.
+    DescriptorTables drawDescriptors;
+    DescriptorTables dispatchDescriptors;
     std::mutex mutex;
 };
 
@@ -217,6 +219,67 @@ RhiAdapterResult<void> appendDescriptorTables(const std::vector<VernonRuntimePro
     pipeline.hasResourceTable = !resourceRanges.empty();
     pipeline.hasSamplerTable = !samplerRanges.empty();
     return RhiAdapterResult<void>{vernon::ok()};
+}
+
+struct AcquiredDescriptorTables {
+    DescriptorTables tables;
+    // Write cursors into freshly acquired tables; unused when the cached tables are reused.
+    D3D12_CPU_DESCRIPTOR_HANDLE resourceCpu{};
+    D3D12_CPU_DESCRIPTOR_HANDLE samplerCpu{};
+    bool reused{};
+};
+
+RhiAdapterResult<AcquiredDescriptorTables> acquireDescriptorTables(rhi::directx12::DeviceState &device,
+                                                                   const PreparedBindingSet *bindings,
+                                                                   const DescriptorTables *cached, uint64_t encoder,
+                                                                   std::string &diagnostic) {
+    AcquiredDescriptorTables acquired;
+    if (cached && cached->encoder == encoder) {
+        acquired.tables = *cached;
+        acquired.reused = true;
+        return RhiAdapterResult<AcquiredDescriptorTables>{vernon::ok(acquired)};
+    }
+    acquired.tables.encoder = encoder;
+    const uint32_t resourceCount = bindings ? bindings->resourceDescriptorCount : 0;
+    const uint32_t samplerCount = bindings ? bindings->samplerDescriptorCount : 0;
+    if (resourceCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, resourceCount,
+                                                    acquired.tables.resourceHeap, acquired.resourceCpu,
+                                                    acquired.tables.resourceGpu, diagnostic))
+        return RhiAdapterResult<AcquiredDescriptorTables>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"d3d12_acquire_resource_descriptors", resourceCount, 0}})};
+    if (samplerCount &&
+        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, true, samplerCount, acquired.tables.samplerHeap,
+                                   acquired.samplerCpu, acquired.tables.samplerGpu, diagnostic))
+        return RhiAdapterResult<AcquiredDescriptorTables>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"d3d12_acquire_sampler_descriptors", samplerCount, 0}})};
+    return RhiAdapterResult<AcquiredDescriptorTables>{vernon::ok(acquired)};
+}
+
+// Root parameter order matches appendDescriptorTables: the resource table, then the sampler table.
+void bindDescriptorTables(ID3D12GraphicsCommandList *commands, const PreparedPipeline &pipeline,
+                          const DescriptorTables &tables) {
+    std::array<ID3D12DescriptorHeap *, 2> heaps{};
+    UINT heapCount = 0;
+    for (ID3D12DescriptorHeap *heap : {tables.resourceHeap, tables.samplerHeap})
+        if (heap)
+            heaps[heapCount++] = heap;
+    if (heapCount)
+        commands->SetDescriptorHeaps(heapCount, heaps.data());
+    if (pipeline.graphics)
+        commands->SetGraphicsRootSignature(pipeline.rootSignature);
+    else
+        commands->SetComputeRootSignature(pipeline.rootSignature);
+    UINT rootIndex = 0;
+    const auto bindTable = [&](D3D12_GPU_DESCRIPTOR_HANDLE table) {
+        if (pipeline.graphics)
+            commands->SetGraphicsRootDescriptorTable(rootIndex++, table);
+        else
+            commands->SetComputeRootDescriptorTable(rootIndex++, table);
+    };
+    if (pipeline.hasResourceTable)
+        bindTable(tables.resourceGpu);
+    if (pipeline.hasSamplerTable)
+        bindTable(tables.samplerGpu);
 }
 
 const D3D12_SAMPLER_DESC &samplerDescriptor(const PreparedBindingSet::Slot &slot) {
@@ -382,6 +445,55 @@ std::optional<RhiAdapterResult<void>> writeResourceDescriptor(DescriptorWriter &
     default:
         return std::nullopt;
     }
+}
+
+/* Packed uniform bytes live in a slot-owned default-heap buffer, so a fresh descriptor table stages and copies them
+ * before writing a constant-buffer view (uniform buffers) or a raw UAV (every other packed kind). */
+RhiAdapterResult<void> writeInlineBufferDescriptor(DescriptorWriter &writer, PreparedBindingSet::Slot &slot,
+                                                   std::string &backendDiagnostic) {
+    if (writer.reuse)
+        return RhiAdapterResult<void>{vernon::ok()};
+    const size_t size = slot.inlineStorage.size();
+    ID3D12Resource *upload = nullptr;
+    size_t uploadOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!writer.device.acquireStaging(true, size, 256, upload, uploadOffset, mapped, backendDiagnostic))
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                              {"d3d12_acquire_inline_binding_staging", size, slot.layout.slot}})};
+    std::memcpy(mapped, slot.inlineStorage.data(), size);
+    const bool constantBuffer = slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+    const auto transitionInline = [&](D3D12_RESOURCE_STATES target) -> RhiAdapterResult<void> {
+        if (!transition(writer.adapter, writer.commandEncoder, writer.commands, slot.inlineResource, target))
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure,
+                {"d3d12_could_not_track_inline_binding_state", static_cast<uint64_t>(target), slot.layout.slot}})};
+        return RhiAdapterResult<void>{vernon::ok()};
+    };
+    if (auto copyDestination = transitionInline(D3D12_RESOURCE_STATE_COPY_DEST); !copyDestination)
+        return copyDestination;
+    writer.commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset, size);
+    if (auto bound = transitionInline(constantBuffer ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+                                                     : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        !bound)
+        return bound;
+    if (constantBuffer) {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
+        view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
+        view.SizeInBytes = (static_cast<UINT>(size) + 255u) & ~255u;
+        writer.device.device->CreateConstantBufferView(&view, writer.resourceCpu);
+    } else {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.NumElements = static_cast<UINT>(std::max<size_t>(1, (size + 3) / 4));
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        writer.device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view,
+                                                        writer.resourceCpu);
+    }
+    writer.resourceCpu.ptr +=
+        writer.device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -1101,12 +1213,6 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"d3d12_adapter_received_an_invalid_dispatch_descriptor", 0, 0}})};
     auto &device = *pipeline->device;
-    ID3D12DescriptorHeap *resourceHeap = nullptr;
-    ID3D12DescriptorHeap *samplerHeap = nullptr;
-    D3D12_CPU_DESCRIPTOR_HANDLE resourceCpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
-    D3D12_CPU_DESCRIPTOR_HANDLE samplerCpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
@@ -1125,74 +1231,21 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
     std::unique_lock<std::mutex> bindingGuard;
     if (bindings)
         bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
-    const uint32_t resourceCount = bindings ? bindings->resourceDescriptorCount : 0;
-    const uint32_t samplerCount = bindings ? bindings->samplerDescriptorCount : 0;
-    const bool reuseDescriptors = bindings && bindings->computeDescriptorEncoder == commandEncoder.value;
-    if (reuseDescriptors) {
-        resourceHeap = bindings->computeResourceHeap;
-        samplerHeap = bindings->computeSamplerHeap;
-        resourceGpu = bindings->computeResourceGpu;
-        samplerGpu = bindings->computeSamplerGpu;
-    } else {
-        if (resourceCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, resourceCount,
-                                                        resourceHeap, resourceCpu, resourceGpu, backendDiagnostic))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"d3d12_acquire_dispatch_descriptors", resourceCount, 0}})};
-        if (samplerCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, true, samplerCount,
-                                                       samplerHeap, samplerCpu, samplerGpu, backendDiagnostic))
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_acquire_dispatch_sampler_descriptors", samplerCount, 0}})};
-    }
-    const UINT increment = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto acquiredTables = acquireDescriptorTables(device, bindings, bindings ? &bindings->dispatchDescriptors : nullptr,
+                                                  commandEncoder.value, backendDiagnostic);
+    if (!acquiredTables)
+        return RhiAdapterResult<void>{vernon::err(std::move(acquiredTables).error())};
+    const AcquiredDescriptorTables acquired = std::move(acquiredTables).value();
     if (bindings) {
         if (!retainBindingResources(adapter, commandEncoder, bindings))
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::BackendFailure, {"d3d12_dispatch_could_not_retain_its_resources", 0, 0}})};
-        DescriptorWriter writer{adapter, commandEncoder, commands, device, reuseDescriptors, resourceCpu, samplerCpu};
+        DescriptorWriter writer{adapter,         commandEncoder,       commands,           device,
+                                acquired.reused, acquired.resourceCpu, acquired.samplerCpu};
         for (auto &slot : bindings->slots) {
             if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
-                if (!reuseDescriptors) {
-                    ID3D12Resource *upload = nullptr;
-                    size_t uploadOffset = 0;
-                    uint8_t *mapped = nullptr;
-                    if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
-                                               backendDiagnostic))
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                            vernon::ProviderErrorCode::BackendFailure,
-                            {"d3d12_acquire_dispatch_staging", slot.inlineStorage.size(), slot.layout.slot}})};
-                    std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_COPY_DEST))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_dispatch_could_not_track_inline_resource_state", 0, 0}})};
-                    commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
-                                               slot.inlineStorage.size());
-                    const bool constantBuffer = slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
-                    const D3D12_RESOURCE_STATES targetState = constantBuffer
-                                                                  ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
-                                                                  : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource, targetState))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_dispatch_could_not_track_inline_resource_state", 0, 0}})};
-                    if (constantBuffer) {
-                        D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
-                        view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
-                        view.SizeInBytes = (static_cast<UINT>(slot.inlineStorage.size()) + 255u) & ~255u;
-                        device.device->CreateConstantBufferView(&view, writer.resourceCpu);
-                    } else {
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                        view.Format = DXGI_FORMAT_R32_TYPELESS;
-                        view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-                        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                        device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view,
-                                                                 writer.resourceCpu);
-                    }
-                    writer.resourceCpu.ptr += increment;
-                }
+                if (auto written = writeInlineBufferDescriptor(writer, slot, backendDiagnostic); !written)
+                    return written;
             } else if (std::optional<RhiAdapterResult<void>> written = writeResourceDescriptor(writer, slot)) {
                 if (!*written)
                     return std::move(*written);
@@ -1203,28 +1256,9 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                                                        slot.layout.slot, static_cast<uint32_t>(slot.layout.kind)}})};
             }
         }
-        if (!reuseDescriptors) {
-            bindings->computeDescriptorEncoder = commandEncoder.value;
-            bindings->computeResourceHeap = resourceHeap;
-            bindings->computeSamplerHeap = samplerHeap;
-            bindings->computeResourceGpu = resourceGpu;
-            bindings->computeSamplerGpu = samplerGpu;
-        }
+        bindings->dispatchDescriptors = acquired.tables;
     }
-    std::array<ID3D12DescriptorHeap *, 2> heaps{};
-    UINT heapCount = 0;
-    if (resourceHeap)
-        heaps[heapCount++] = resourceHeap;
-    if (samplerHeap)
-        heaps[heapCount++] = samplerHeap;
-    if (heapCount)
-        commands->SetDescriptorHeaps(heapCount, heaps.data());
-    commands->SetComputeRootSignature(pipeline->rootSignature);
-    UINT rootIndex = 0;
-    if (pipeline->hasResourceTable)
-        commands->SetComputeRootDescriptorTable(rootIndex++, resourceGpu);
-    if (pipeline->hasSamplerTable)
-        commands->SetComputeRootDescriptorTable(rootIndex, samplerGpu);
+    bindDescriptorTables(commands, *pipeline, acquired.tables);
     commands->Dispatch(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
     if (!recordProviderCommand(adapter, commandEncoder, false))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1248,12 +1282,6 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                   {"d3d12_adapter_received_an_invalid_draw_descriptor", invalidDescriptor, 0}})};
     auto &device = *pipeline->device;
-    ID3D12DescriptorHeap *resourceHeap = nullptr;
-    ID3D12DescriptorHeap *samplerHeap = nullptr;
-    D3D12_CPU_DESCRIPTOR_HANDLE resourceCpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
-    D3D12_CPU_DESCRIPTOR_HANDLE samplerCpu{};
-    D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
         return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
@@ -1272,40 +1300,12 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
     std::unique_lock<std::mutex> bindingGuard;
     if (bindings)
         bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
-    const uint32_t resourceCount = bindings ? bindings->resourceDescriptorCount : 0;
-    const uint32_t samplerCount = bindings ? bindings->samplerDescriptorCount : 0;
-    const bool reuseDescriptors = bindings && bindings->descriptorEncoder == commandEncoder.value;
-    if (reuseDescriptors) {
-        resourceHeap = bindings->resourceHeap;
-        samplerHeap = bindings->samplerHeap;
-        resourceGpu = bindings->resourceGpu;
-        samplerGpu = bindings->samplerGpu;
-    } else {
-        if (resourceCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, resourceCount,
-                                                        resourceHeap, resourceCpu, resourceGpu, backendDiagnostic))
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_acquire_draw_resource_descriptors", resourceCount, 0}})};
-        if (samplerCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, true, samplerCount,
-                                                       samplerHeap, samplerCpu, samplerGpu, backendDiagnostic))
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_acquire_draw_sampler_descriptors", samplerCount, 0}})};
-    }
-    std::array<ID3D12DescriptorHeap *, 2> heaps{};
-    UINT heapCount = 0;
-    if (resourceHeap)
-        heaps[heapCount++] = resourceHeap;
-    if (samplerHeap)
-        heaps[heapCount++] = samplerHeap;
-    if (heapCount)
-        commands->SetDescriptorHeaps(heapCount, heaps.data());
-    commands->SetGraphicsRootSignature(pipeline->rootSignature);
-    UINT rootIndex = 0;
-    if (pipeline->hasResourceTable)
-        commands->SetGraphicsRootDescriptorTable(rootIndex++, resourceGpu);
-    if (pipeline->hasSamplerTable)
-        commands->SetGraphicsRootDescriptorTable(rootIndex, samplerGpu);
+    auto acquiredTables = acquireDescriptorTables(device, bindings, bindings ? &bindings->drawDescriptors : nullptr,
+                                                  commandEncoder.value, backendDiagnostic);
+    if (!acquiredTables)
+        return RhiAdapterResult<void>{vernon::err(std::move(acquiredTables).error())};
+    const AcquiredDescriptorTables acquired = std::move(acquiredTables).value();
+    bindDescriptorTables(commands, *pipeline, acquired.tables);
     if (bindings) {
         if (!retainBindingResources(adapter, commandEncoder, bindings))
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
@@ -1326,74 +1326,14 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
             }
             commands->SetGraphicsRoot32BitConstants(block.rootParameter, block.valueCount, rootValues.data(), 0);
         }
-        const UINT resourceIncrement =
-            device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        DescriptorWriter writer{adapter, commandEncoder, commands, device, reuseDescriptors, resourceCpu, samplerCpu};
+        DescriptorWriter writer{adapter,         commandEncoder,       commands,           device,
+                                acquired.reused, acquired.resourceCpu, acquired.samplerCpu};
         for (auto &slot : bindings->slots) {
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-                if (!reuseDescriptors) {
-                    ID3D12Resource *upload = nullptr;
-                    size_t uploadOffset = 0;
-                    uint8_t *mapped = nullptr;
-                    if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
-                                               backendDiagnostic))
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                            vernon::ProviderErrorCode::BackendFailure,
-                            {"d3d12_acquire_draw_uniform_staging", slot.inlineStorage.size(), slot.layout.slot}})};
-                    std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_COPY_DEST))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_draw_could_not_track_inline_resource_state", 0, 0}})};
-                    commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
-                                               slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_draw_could_not_track_inline_resource_state", 0, 0}})};
-                    D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
-                    view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
-                    view.SizeInBytes = (static_cast<UINT>(slot.inlineStorage.size()) + 255u) & ~255u;
-                    device.device->CreateConstantBufferView(&view, writer.resourceCpu);
-                    writer.resourceCpu.ptr += resourceIncrement;
-                }
-            } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-                       slot.layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
-                if (!reuseDescriptors) {
-                    ID3D12Resource *upload = nullptr;
-                    size_t uploadOffset = 0;
-                    uint8_t *mapped = nullptr;
-                    if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
-                                               backendDiagnostic))
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                            vernon::ProviderErrorCode::BackendFailure,
-                            {"d3d12_acquire_draw_storage_staging", slot.inlineStorage.size(), slot.layout.slot}})};
-                    std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_COPY_DEST))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_draw_could_not_track_inline_resource_state", 0, 0}})};
-                    commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
-                                               slot.inlineStorage.size());
-                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
-                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-                        return RhiAdapterResult<void>{vernon::err(
-                            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"d3d12_draw_could_not_track_inline_resource_state", 0, 0}})};
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    view.Format = DXGI_FORMAT_R32_TYPELESS;
-                    view.Buffer.FirstElement = 0;
-                    view.Buffer.NumElements =
-                        static_cast<UINT>(std::max<uint64_t>(1, (slot.inlineStorage.size() + 3) / 4));
-                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                    device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view,
-                                                             writer.resourceCpu);
-                    writer.resourceCpu.ptr += resourceIncrement;
-                }
+            // Graphics inline values travel as root constants above and own no descriptor.
+            if (slot.layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+                packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
+                if (auto written = writeInlineBufferDescriptor(writer, slot, backendDiagnostic); !written)
+                    return written;
             } else if (std::optional<RhiAdapterResult<void>> written = writeResourceDescriptor(writer, slot)) {
                 if (!*written)
                     return std::move(*written);
@@ -1413,13 +1353,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
                 commands->IASetVertexBuffers(slot.layout.binding, 1, &view);
             }
         }
-        if (!reuseDescriptors) {
-            bindings->descriptorEncoder = commandEncoder.value;
-            bindings->resourceHeap = resourceHeap;
-            bindings->samplerHeap = samplerHeap;
-            bindings->resourceGpu = resourceGpu;
-            bindings->samplerGpu = samplerGpu;
-        }
+        bindings->drawDescriptors = acquired.tables;
     }
     const D3D12_VIEWPORT viewport{static_cast<float>(descriptor->viewport[0]),
                                   static_cast<float>(descriptor->viewport[1]),

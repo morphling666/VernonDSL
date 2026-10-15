@@ -483,6 +483,23 @@ timeline support. Absence maps to `Unsupported`; failure after invoking a
 present callback is a typed `Result` error. Dispatch registration names each
 field explicitly and does not use positional null sentinels.
 
+Compute and graphics resolve and invoke are shared by every RuntimeCore
+provider backend (Vulkan, DirectX 12, Metal, OpenGL/ES, CUDA) in
+`rhi_provider_pipeline`. A backend supplies only a target: its diagnostic name
+and artifact kind, plus the attachment-format mapping for graphics and the
+value fill for compute. Whether the provider receives the artifact's binary or
+source follows from which one the Stage loader filled. Metal also supplies
+native binding resolvers that remap layouts to argument-buffer locations, and
+CUDA supplies its own value fill, since packed host values become host-storage
+buffers there. The binding set is created at the first invocation and updated
+in place afterwards; resolve never creates placeholder bindings, because every
+invocation rewrites all values. The shared pipeline objects own their provider
+handles and release them on destruction, so a resolve that fails halfway leaks
+nothing and backends need no teardown hook. Sharing keeps the backends from
+drifting: they report identical diagnostics, each including the provider's
+last error. CPU stays separate: it packs a call frame and dispatches through
+the CPU provider with push constants.
+
 ### CUDA
 
 CUDA is compute-only. It loads PTX through the Driver API and validates

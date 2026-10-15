@@ -1,18 +1,10 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "VernonRuntimeRHIAdapter.h"
 #include "backend_vulkan.h"
-#include "compute_launch_planner.h"
-#include "pipeline_metadata.h"
-#include "prepared_graphics_draw.h"
-#include "tensor_bridge.h"
 
-#include <algorithm>
-#include <array>
-#include <cstring>
-#include <utility>
-#include <vector>
+#include <memory>
+#include <optional>
 #endif
 
 namespace vernon::runtime {
@@ -20,22 +12,19 @@ namespace vernon::runtime {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 namespace {
 
-VernonStatus fail(VernonRuntimeContext &context, std::string error,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    invocationDiagnostic(context) = std::move(error);
-    return status;
-}
-
-VkFormat vulkanTextureFormat(VernonTextureFormat format) {
+std::optional<uint32_t> vulkanAttachmentFormat(VernonTextureFormat format) {
     switch (format) {
 #define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
                       vulkan, ...)                                                                                     \
     case VERNON_TEXTURE_##NAME:                                                                                        \
-        return vulkan;
+        return vulkan == VK_FORMAT_UNDEFINED ? std::nullopt : std::optional<uint32_t>(vulkan);
 #include "VernonFormats.def"
     }
-    return VK_FORMAT_UNDEFINED;
+    return std::nullopt;
 }
+
+constexpr RhiComputeTarget kVulkanCompute{"Vulkan", "spirv"};
+constexpr RhiGraphicsTarget kVulkanGraphics{"Vulkan", "spirv", vulkanAttachmentFormat, vulkanAttachmentFormat};
 
 } // namespace
 #endif
@@ -44,99 +33,18 @@ BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, con
                                             VernonStageExecutable &pipeline) {
     const auto resolve = [&]() {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-        auto *state = new VulkanPipelineState();
-        if (!plan.compute.empty()) {
-            const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
-            ReflectedEntry reflection;
-            if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection,
-                                        invocationDiagnostic(*inputs.context))) {
-                delete state;
-                return false;
-            }
-            if (!buildPreparedComputeBindingPlan(plan, reflection, VERNON_RUNTIME_VULKAN, state->rhiComputeBindingPlan,
-                                                 invocationDiagnostic(*inputs.context))) {
-                delete state;
-                return false;
-            }
-            state->rhiComputeValues.resize(state->rhiComputeBindingPlan.size());
-            std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
-            const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                               VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
-                                                               {"spirv", 5},
-                                                               stage.binary.data(),
-                                                               stage.binary.size(),
-                                                               {stage.entry.data(), stage.entry.size()},
-                                                               {},
-                                                               {0, 0, 0, 0}};
-            VernonRuntimeCorePipelineDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.kind = VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
-            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
-            descriptor.shaders = &shader;
-            descriptor.shader_count = 1;
-            descriptor.bindings = state->rhiComputeBindingPlan.layouts.data();
-            descriptor.binding_count = state->rhiComputeBindingPlan.layouts.size();
-            std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
-            const VernonStatus status = vernonRuntimeCorePreparePipeline(
-                vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter), &descriptor,
-                &state->rhiComputePipeline);
-            if (status != VERNON_STATUS_OK) {
-                invocationDiagnostic(*inputs.context) =
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter),
-                                       "failed to prepare Vulkan provider compute pipeline");
-                delete state;
-                return false;
-            }
-        }
-        if (!plan.vertex.empty()) {
-            const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
-            const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
-            if (!buildPreparedGraphicsBindingPlan(plan, {VERNON_RUNTIME_VULKAN}, state->rhiGraphicsBindingPlan,
-                                                  invocationDiagnostic(*inputs.context))) {
-                delete state;
-                return false;
-            }
-            state->rhiGraphicsValues.resize(state->rhiGraphicsBindingPlan.size());
-            std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                        VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                        {"spirv", 5},
-                                                                        vertex.binary.data(),
-                                                                        vertex.binary.size(),
-                                                                        {vertex.entry.data(), vertex.entry.size()},
-                                                                        {},
-                                                                        {0, 0, 0, 0}}};
-            shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
-                               VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                               {"spirv", 5},
-                               fragment.binary.data(),
-                               fragment.binary.size(),
-                               {fragment.entry.data(), fragment.entry.size()},
-                               {},
-                               {0, 0, 0, 0}});
-            VernonRuntimeCorePipelineDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-            descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-            descriptor.shaders = shaders.data();
-            descriptor.shader_count = shaders.size();
-            descriptor.bindings = state->rhiGraphicsBindingPlan.layouts.data();
-            descriptor.binding_count = state->rhiGraphicsBindingPlan.size();
-            descriptor.vertex_attributes = state->rhiGraphicsBindingPlan.vertexAttributes.data();
-            descriptor.vertex_attribute_count = state->rhiGraphicsBindingPlan.vertexAttributes.size();
-            descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-            descriptor.sample_count = 1;
-            const VernonStatus status = vernonRuntimeCorePreparePipeline(
-                vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter), &descriptor,
-                &state->rhiGraphicsPipeline);
-            if (status != VERNON_STATUS_OK) {
-                invocationDiagnostic(*inputs.context) =
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter),
-                                       "failed to prepare Vulkan provider graphics pipeline");
-                delete state;
-                return false;
-            }
-        }
-        installRuntimeBackendState(pipeline, state);
+        VernonRuntimeContext &context = *inputs.context;
+        auto state = std::make_unique<VulkanPipelineState>();
+        if (!plan.compute.empty() &&
+            !prepareRhiComputePipeline(context, vulkanState(context).adapter, kVulkanCompute,
+                                       inputs.artifacts.at(plan.compute), plan, state->rhiCompute))
+            return false;
+        if (!plan.vertex.empty() &&
+            !prepareRhiGraphicsPipeline(context, vulkanState(context).adapter, kVulkanGraphics,
+                                        inputs.artifacts.at(plan.vertex), inputs.artifacts.at(plan.fragment), plan,
+                                        {VERNON_RUNTIME_VULKAN}, state->rhiGraphics))
+            return false;
+        installRuntimeBackendState(pipeline, state.release());
         return true;
 #else
         return false;
@@ -145,71 +53,12 @@ BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, con
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-void destroyVulkanPipeline(VernonStageExecutable &pipeline) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
-    vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
-    vernonRuntimeCorePipelineDestroy(state.rhiComputePipeline);
-    vernonRuntimeCoreBindingsDestroy(state.rhiGraphicsBindings);
-    destroyGraphicsVariant(state.rhiGraphicsVariant);
-    vernonRuntimeCorePipelineDestroy(state.rhiGraphicsPipeline);
-#else
-    (void)pipeline;
-#endif
-}
-
 VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
                                           const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
-    if (!state.rhiGraphicsPipeline)
-        return VERNON_STATUS_OK;
-    const auto &adapter = *vulkanState(*pipeline.context).adapter;
-    if (!fillPreparedGraphicsBindingValues(state.rhiGraphicsBindingPlan, plan, state.rhiGraphicsValues,
-                                           invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    VernonStatus status =
-        state.rhiGraphicsBindings
-            ? vernonRuntimeCoreUpdateBindings(state.rhiGraphicsBindings, state.rhiGraphicsValues.data(),
-                                              state.rhiGraphicsValues.size())
-            : vernonRuntimeCoreCreateBindings(state.rhiGraphicsPipeline, state.rhiGraphicsValues.data(),
-                                              state.rhiGraphicsValues.size(), &state.rhiGraphicsBindings);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter),
-                                       "failed to update Vulkan RHI graphics bindings"),
-                    status);
-    }
-    std::vector<uint32_t> formats;
-    for (size_t index = 0; index < plan.attachments.size(); ++index) {
-        const VkFormat format = vulkanTextureFormat(plan.attachmentFormats[index]);
-        if (format == VK_FORMAT_UNDEFINED)
-            return fail(*pipeline.context, "Vulkan RHI color attachment format is unsupported");
-        formats.push_back(static_cast<uint32_t>(format));
-    }
-    const uint32_t depthFormat =
-        !plan.depthAttachment ? 0 : static_cast<uint32_t>(vulkanTextureFormat(plan.depthFormat));
-    PreparedGraphicsDraw prepared;
-    if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsBindingPlan.layouts,
-                             state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter),
-                                       "failed to prepare Vulkan RHI graphics variant"),
-                    status);
-    }
-    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
-                                                                  state.rhiGraphicsBindings, &prepared.invocation);
-    if (status != VERNON_STATUS_OK) {
-        return fail(*pipeline.context,
-                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter),
-                                       "failed to encode Vulkan RHI draw"),
-                    status);
-    }
-    return VERNON_STATUS_OK;
+    return invokeRhiGraphicsPipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanGraphics,
+                                     invocation, plan, runtimeBackendState<VulkanPipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
     (void)invocation;
@@ -220,24 +69,9 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
 
 VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
-    std::string error;
-    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
-                                          state.rhiComputeValues, error))
-        return fail(*pipeline.context, "Vulkan " + error);
-    VernonStatus status =
-        state.rhiComputeBindings
-            ? vernonRuntimeCoreUpdateBindings(state.rhiComputeBindings, state.rhiComputeValues.data(),
-                                              state.rhiComputeValues.size())
-            : vernonRuntimeCoreCreateBindings(state.rhiComputePipeline, state.rhiComputeValues.data(),
-                                              state.rhiComputeValues.size(), &state.rhiComputeBindings);
-    if (status != VERNON_STATUS_OK)
-        return fail(*pipeline.context, "failed to prepare Vulkan invocation bindings", status);
-    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
-    status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
-                                             groups, nullptr, 0);
-    return status == VERNON_STATUS_OK ? status
-                                      : fail(*pipeline.context, "failed to encode Vulkan provider dispatch", status);
+    return invokeRhiComputePipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanCompute,
+                                    pipeline.bindingProjection, launch,
+                                    runtimeBackendState<VulkanPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
     (void)launch;

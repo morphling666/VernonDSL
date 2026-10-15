@@ -3,13 +3,11 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
-#include "graphics_invocation_planner.h"
 #include "metal_runtime_capabilities.h"
-#include "prepared_binding_plan.h"
+#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
 
 #include <cstdint>
-#include <vector>
 
 struct VernonRuntimeRhiAdapter;
 
@@ -33,16 +31,8 @@ inline const MetalContextState &metalState(const VernonRuntimeContext &context) 
 }
 
 struct MetalPipelineState {
-    VernonRuntimeCorePipeline *rhiComputePipeline{};
-    VernonRuntimeCoreBindings *rhiComputeBindings{};
-    PreparedComputeBindingPlan rhiComputeBindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
-    uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
-    VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
-    VernonRuntimeCoreBindings *rhiGraphicsBindings{};
-    PreparedGraphicsVariant rhiGraphicsVariant;
-    PreparedGraphicsBindingPlan rhiGraphicsBindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
+    RhiComputePipeline rhiCompute;
+    RhiGraphicsPipeline rhiGraphics;
 };
 
 } // namespace vernon::runtime

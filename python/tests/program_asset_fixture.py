@@ -172,6 +172,59 @@ u32_vertex_asset = vertex_format_asset("u32", u32_vertex)
 f32_vertex_asset = vertex_format_asset("f32", indexed_vertex)
 
 
+def winding_asset(name: str, front_face: vd.FrontFace):
+    return vd.program_asset(
+        id=f"pipelines/{name}_winding",
+        program=vd.pipeline(
+            resource_only_vertex,
+            solid_fragment,
+            state=vd.graphics_state(
+                rasterization=vd.RasterizationState(cull_mode=vd.CullMode.BACK, front_face=front_face),
+            ),
+            targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+        ),
+        variants=({},),
+    )
+
+
+counter_clockwise_asset = winding_asset("counter_clockwise", vd.FrontFace.COUNTER_CLOCKWISE)
+clockwise_asset = winding_asset("clockwise", vd.FrontFace.CLOCKWISE)
+
+
+fixed_function_state_asset = vd.program_asset(
+    id="pipelines/fixed_function_state",
+    program=vd.pipeline(
+        resource_only_vertex,
+        solid_fragment,
+        state=vd.graphics_state(
+            rasterization=vd.RasterizationState(depth_bias_constant=2.0, depth_bias_slope=3.0),
+            depth_stencil=vd.DepthStencilState(
+                depth_test=True,
+                depth_write=True,
+                depth_compare=vd.CompareOperation.LESS_EQUAL,
+                stencil_test=True,
+                stencil_read_mask=0x5A,
+                stencil_write_mask=0xA5,
+            ),
+            color_blends={
+                0: vd.ColorBlendState(
+                    enabled=True,
+                    source_color=vd.BlendFactor.SOURCE_ALPHA,
+                    destination_color=vd.BlendFactor.ONE_MINUS_SOURCE_ALPHA,
+                    color_operation=vd.BlendOperation.SUBTRACT,
+                    source_alpha=vd.BlendFactor.ONE,
+                    destination_alpha=vd.BlendFactor.ONE_MINUS_SOURCE_ALPHA,
+                    alpha_operation=vd.BlendOperation.ADD,
+                    write_mask=vd.ColorWrite.RED | vd.ColorWrite.GREEN,
+                )
+            },
+        ),
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}, depth=vd.d32_float_s8_uint),
+    ),
+    variants=({},),
+)
+
+
 explicit_sampler_asset = vd.program_asset(
     id="pipelines/explicit_sampler",
     program=vd.pipeline(

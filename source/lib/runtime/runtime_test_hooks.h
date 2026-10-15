@@ -46,6 +46,7 @@ uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
 DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context);
 size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context);
 size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
+size_t getRhiAdapterBindingCreationCount(const VernonRuntimeContext *context);
 bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures, uint64_t samplers,
                                                  bool writableTexture, uint32_t deviceTier);
 uint64_t diagnosticClockForTesting() noexcept;
