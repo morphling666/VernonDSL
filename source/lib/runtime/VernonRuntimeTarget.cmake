@@ -371,12 +371,20 @@ function(vernon_add_runtime)
                 VernonRHI
                 $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
 
-    add_library(
-        VernonRuntime
-        ${VERNON_RUNTIME_LIBRARY_TYPE}
+    # The translation units that define the public C API; each target compiles them with its own export visibility.
+    set(_vernon_runtime_api_sources
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_python_bridge.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/boundary.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/graphics_recording.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_executable.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_invocation.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_loading.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_state.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/stage_execution.cpp)
+
+    add_library(VernonRuntime ${VERNON_RUNTIME_LIBRARY_TYPE} ${_vernon_runtime_api_sources}
+                              ${_VERNON_RUNTIME_IMPL_DIR}/runtime_python_bridge.cpp)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
     target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
                                          $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
@@ -443,8 +451,7 @@ function(vernon_add_runtime)
     endforeach()
     if(BUILD_TESTING)
         target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_RUNTIME_TESTING=1)
-        add_library(VernonRuntimeTestHost STATIC ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
-                                                 ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp)
+        add_library(VernonRuntimeTestHost STATIC ${_vernon_runtime_api_sources})
         target_sources(
             VernonRuntimeTestHost PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
                                           $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)

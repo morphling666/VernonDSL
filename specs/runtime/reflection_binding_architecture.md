@@ -672,10 +672,13 @@ Windows visibility according to the final library type:
   export visibility. Compiler tests compile that façade with static visibility
   and reuse the engine objects.
 - `VernonRuntimeImplementation` contains reusable implementation sources and
-  always uses static visibility. `VernonRuntime` compiles
-  `VernonRuntime.cpp` and `autodiff/runtime_autodiff.cpp` with export
-  visibility; `VernonRuntimeTestHost` compiles the same two public translation
-  units with static visibility.
+  always uses static visibility. `VernonRuntime` compiles the translation
+  units that define the C API (`VernonRuntime.cpp`, `capi/*.cpp` and
+  `autodiff/runtime_autodiff.cpp`) with export visibility;
+  `VernonRuntimeTestHost` compiles the same public translation units with
+  static visibility. `capi/boundary.h` holds the exception and diagnostic
+  boundary every C API entry runs through, and `capi/program_state.h` the
+  internal state of the opaque Program handles.
 - `VernonRuntimeUtilities` remains a separate static target because both the
   Runtime and Python native module consume it. Static Runtime packages export
   this target with the other transitive static dependencies.
