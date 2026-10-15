@@ -9,12 +9,13 @@ from typing import Annotated, get_args, get_origin
 import numpy as np
 import vernon_dsl as vd
 from backend_test_matrix import BackendRequirements, backend_row, probe_backend, require_available
+from native_support import native_available
 from static_specialization_shader import MODE, TINTED, mode_fragment, mode_kernel, mode_vertex
 from vernon_dsl.bundle import canonical_json
 from vernon_dsl.compiler import compile_file
 from vernon_dsl.diagnostics import CompileError
 from vernon_dsl.frontend.runtime_types import resolved_annotations
-from vernon_dsl.program_assets import ProgramCompileError, cook_program_asset
+from vernon_dsl.program_assets import cook_program_asset
 from vernon_dsl.types import SpecializationAssignment
 
 _CONFIG = 'from vernon_dsl import *\nMODE = specialization("MODE", u32)\n'
@@ -46,16 +47,6 @@ def main(
 
 def _mode(value: int) -> SpecializationAssignment:
     return SpecializationAssignment("MODE", "u32", value)
-
-
-def _native_available() -> bool:
-    try:
-        from vernon_dsl._program_assets.compile_orchestration import _native_module
-
-        _native_module()
-        return True
-    except ProgramCompileError:
-        return False
 
 
 class StaticSpecializationCompilerTests(unittest.TestCase):
@@ -237,7 +228,7 @@ class VulkanStaticSpecializationTests(unittest.TestCase):
 
 class StaticSpecializationAssetTests(unittest.TestCase):
     def test_graphics_asset_cooks_integer_variants(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "modes.py"

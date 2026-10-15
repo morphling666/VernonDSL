@@ -130,6 +130,12 @@ void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &m
             continue;
         }
         if (name(parameter) == "output") {
+            VernonProgramImageConstraintView constraint{};
+            constraint.struct_size = sizeof(constraint);
+            ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint),
+                      VERNON_STATUS_OK);
+            EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_COLOR_ATTACHMENT);
+            EXPECT_EQ(constraint.sample_result_class, VERNON_IMAGE_SAMPLE_NONE);
             VernonProgramArgument output{};
             output.slot = parameter.slot;
             output.kind = VERNON_PROGRAM_IMAGE;

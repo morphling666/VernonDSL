@@ -626,6 +626,7 @@ The descriptor is exactly one of:
   "extent": [64, 32, 1],
   "format": "rgba16_float",
   "sample_count": 1,
+  "sample_result_class": "float",
   "mip_levels": 1,
   "array_layers": 1,
   "aspects": ["color"],
@@ -661,11 +662,18 @@ the current invocation. Zero, negative, null, empty-array, and other
 placeholder image extents are invalid. Canonical owned static shapes are
 `2d = [W,H,1]` and `3d = [W,H,D]`.
 Format, sample count, mip levels, aspects, and usage are exact
-creation or provider requirements. `array_layers` is exact for owned Storage;
-for borrowed Storage it is the minimum layer count of the bound view (6 for
-`cube` and `cube_array`, otherwise 1). A borrowed binding is checked against
-the bound view's dimension, so a `2d` view of one array layer satisfies `2d`. Opaque contract identity is exact; opaque
-storage has no byte range, image subresource, or ValueLayout.
+creation or provider requirements, except that borrowed sampled-only Storage
+may leave its format `unknown` (Appendix B). `array_layers` is exact for
+owned Storage; for borrowed Storage it is the minimum layer count of the
+bound view (6 for `cube` and `cube_array`, otherwise 1). A borrowed binding
+is checked against the bound view's dimension, so a `2d` view of one array
+layer satisfies `2d`.
+An image Storage whose usage contains `sampled` MUST contain
+`sample_result_class`, which is `float`, `sint`, or `uint`, and every other
+image Storage MUST omit it. It is the class every sampled use reads: `float`
+covers `float` and `unorm` formats. A concrete format MUST provide that class,
+and a borrowed binding's view format MUST provide it. Opaque contract identity
+is exact; opaque storage has no byte range, image subresource, or ValueLayout.
 
 For owned Storage, the descriptor is exact runtime creation authority. The
 runtime creates it at the start of its declared lifetime and MUST NOT replace
@@ -1636,7 +1644,7 @@ result resource transfers only after successful commit.
   "stages": {"fullscreen": {"operation": "graphics", "contract_hash": "0000000000000000000000000000000000000000000000000000000000000000"}},
   "parameters": [],
   "storages": [
-    {"id": 0, "name": "color", "initial_value": 2, "ownership": "owned", "lifetime": "invocation", "mutability": "mutable", "descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}}
+    {"id": 0, "name": "color", "initial_value": 2, "ownership": "owned", "lifetime": "invocation", "mutability": "mutable", "descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "sample_result_class": "float", "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}}
   ],
   "values": [
     {"id": 0, "name": "width", "type": "u32", "shape": [], "origin": {"tag": "argument", "graph": "forward", "slot": 0}, "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
@@ -1671,7 +1679,7 @@ result resource transfers only after successful commit.
     "boundary_slots": [
       {"id": 0, "path": "width", "value": 0, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:0", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
       {"id": 1, "path": "height", "value": 1, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:1", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
-      {"id": 2, "path": "color", "value": 4, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba16_float>", "outer_shape": [], "alias_owner": "storage:0", "storage_id": 0, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}, "publication": "commit_after_success"}
+      {"id": 2, "path": "color", "value": 4, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba16_float>", "outer_shape": [], "alias_owner": "storage:0", "storage_id": 0, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "sample_result_class": "float", "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}, "publication": "commit_after_success"}
     ],
     "derivative_projections": [],
     "tape_plans": []
@@ -2189,9 +2197,9 @@ dimensions after symbol substitution. Resource formats are the names in
 `source/include/VernonFormats.def` (`r8_unorm`, `rg8_unorm`, `rgb8_unorm`,
 `rgba8_unorm`, `rgba8_srgb`, `r16_float`, `rgba16_float`, `r32_float`,
 `rg32_float`, `rgb32_float`, `rgba32_float`, `r11g11b10_float`, `d32_float`,
-`d32_float_s8_uint`) or `unknown`. `unknown` is allowed only for sampled image
-logical types; Storage descriptors always use concrete formats whose table row
-allows `storage`.
+`d32_float_s8_uint`, `r32_uint`, `rg32_uint`) or `unknown`. `unknown` is
+allowed only for sampled image logical types and the borrowed Storage they
+bind, whose `sample_result_class` then constrains the bound view's format.
 
 Buffer memory is `host`, `device`, or `shared`. Buffer usage members are
 `uniform`, `storage`, `vertex`, `index`, or `stage_binding`. Image usage
@@ -2217,8 +2225,9 @@ Hashes must be real lowercase digests; zeros above are structural
 placeholders. Buffer `view_rank` is uint32, and image fields use Storage
 descriptor vocabulary. Endpoint constraints may be less specific only by
 using image format `"any"` or sample count `0`; Storage remains the concrete
-resource authority. An image layout for role `sampled` additionally permits
-optional
+resource authority. An image layout for role `sampled` additionally requires
+the `sample_result_class` of its Storage, which every other role omits, and
+permits optional
 `sampler_endpoint:{"module":"fragment","interface":"argument","index":0}`;
 it is forbidden
 for every other role.

@@ -481,9 +481,8 @@ class ProgramTemplate:
                             continue
                         if stage.kind == "fragment" and "varying" in interface_kinds:
                             continue
-                        access = str(typed.type.arguments[3]) if typed.type.kind == "texture" else typed.access.value
                         previous = parameters.get(typed.name)
-                        parameter = KernelParameter(typed.name, access, False, False)
+                        parameter = KernelParameter(typed.name, typed.access.value, False, False)
                         if previous is not None and previous.access != parameter.access:
                             raise TypeError(f"graphics stages disagree on access for parameter {typed.name!r}")
                         parameters[typed.name] = parameter
@@ -523,13 +522,10 @@ class ProgramTemplate:
                 if parameter.name not in parameter_names:
                     continue
                 is_storage = parameter.type.kind == "tensor_view"
-                access = (
-                    str(parameter.type.arguments[3]) if parameter.type.kind == "texture" else parameter.access.value
-                )
                 parameters.append(
                     KernelParameter(
                         parameter.name,
-                        access,
+                        parameter.access.value,
                         is_storage and parameter.name in entry.storage_activity.readable_roots,
                         bool(entry.storage_activity.dependencies_for(parameter.name)),
                     )

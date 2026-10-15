@@ -86,11 +86,9 @@ BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, 
                 vernonRuntimeRhiAdapterGetProvider(directX12State(*inputs.context).adapter), &descriptor,
                 &pipelineState->rhiComputePipeline);
             if (status != VERNON_STATUS_OK) {
-                const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter);
-                invocationDiagnostic(*inputs.context) = providerError.data
-                                                            ? std::string(providerError.data, providerError.size)
-                                                            : "failed to prepare D3D12 provider compute pipeline";
+                invocationDiagnostic(*inputs.context) =
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter),
+                                       "failed to prepare D3D12 provider compute pipeline");
                 delete pipelineState;
                 return false;
             }
@@ -136,11 +134,9 @@ BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, 
                 vernonRuntimeRhiAdapterGetProvider(directX12State(*inputs.context).adapter), &descriptor,
                 &pipelineState->rhiGraphicsPipeline);
             if (status != VERNON_STATUS_OK) {
-                const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter);
-                invocationDiagnostic(*inputs.context) = providerError.data
-                                                            ? std::string(providerError.data, providerError.size)
-                                                            : "failed to prepare D3D12 provider graphics pipeline";
+                invocationDiagnostic(*inputs.context) =
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter),
+                                       "failed to prepare D3D12 provider graphics pipeline");
                 delete pipelineState;
                 return false;
             }
@@ -185,11 +181,9 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
             : vernonRuntimeCoreCreateBindings(state.rhiGraphicsPipeline, state.rhiGraphicsValues.data(),
                                               state.rhiGraphicsValues.size(), &state.rhiGraphicsBindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to update D3D12 RHI graphics bindings",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter),
+                                       "failed to update D3D12 RHI graphics bindings"),
                     status);
     }
     std::vector<uint32_t> formats;
@@ -208,21 +202,17 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
         return VERNON_STATUS_INVALID_ARGUMENT;
     status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare D3D12 RHI graphics variant",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter),
+                                       "failed to prepare D3D12 RHI graphics variant"),
                     status);
     }
     status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
                                                                   state.rhiGraphicsBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode D3D12 RHI draw",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter),
+                                       "failed to encode D3D12 RHI draw"),
                     status);
     }
     return VERNON_STATUS_OK;
@@ -237,54 +227,10 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
 VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
-    VernonRuntimeRhiAdapter &adapter = *directX12State(*pipeline.context).adapter;
-    for (size_t index = 0; index < state.rhiComputeBindingPlan.size(); ++index) {
-        const VernonRuntimeProviderBindingLayoutEntry &layout = state.rhiComputeBindingPlan.layouts[index];
-        const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
-        VernonRuntimeProviderBindingValue &value = state.rhiComputeValues[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (preparedSource.metadataCarrier) {
-            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
-                return fail(*pipeline.context, "D3D12 metadata carrier payload does not match its compiled ABI");
-            continue;
-        }
-        if (preparedSource.argumentIndex >= launch.arguments.size())
-            return fail(*pipeline.context, "D3D12 prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
-        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
-                if (!bindComputeValueStorage(layout, argument, value))
-                    return fail(*pipeline.context, "D3D12 prepared Value storage binding has invalid bytes");
-                continue;
-            }
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->resource.resource.value)
-                return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");
-            value.payload.buffer.resource = tensor->resource;
-            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
-                preparedSource.resourceOffset >
-                    value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
-                return fail(*pipeline.context, "D3D12 aggregate storage leaf exceeds its Tensor resource");
-            value.payload.buffer.resource.offset += preparedSource.resourceOffset;
-        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto *image = std::get_if<ComputeImageArgument>(&argument);
-            if (!image || !image->view.resource.value)
-                return fail(*pipeline.context, "D3D12 prepared image binding requires an RHI Texture");
-            value.payload.image.view = image->view;
-        } else {
-            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar || !scalar->data || !scalar->size)
-                return fail(*pipeline.context, "D3D12 prepared inline binding requires host data at argument " +
-                                                   std::to_string(layout.argument_index) + " (kind " +
-                                                   std::to_string(argument.index()) + ", size " +
-                                                   std::to_string(scalar ? scalar->size : 0) + ")");
-            value.payload.inline_value.data = scalar->data;
-            value.payload.inline_value.size = scalar->size;
-        }
-    }
+    std::string error;
+    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
+                                          state.rhiComputeValues, error))
+        return fail(*pipeline.context, "D3D12 " + error);
     VernonStatus status =
         state.rhiComputeBindings
             ? vernonRuntimeCoreUpdateBindings(state.rhiComputeBindings, state.rhiComputeValues.data(),
@@ -292,22 +238,18 @@ VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, con
             : vernonRuntimeCoreCreateBindings(state.rhiComputePipeline, state.rhiComputeValues.data(),
                                               state.rhiComputeValues.size(), &state.rhiComputeBindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare D3D12 invocation bindings",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter),
+                                       "failed to prepare D3D12 invocation bindings"),
                     status);
     }
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
                                              groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode D3D12 provider dispatch",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter),
+                                       "failed to encode D3D12 provider dispatch"),
                     status);
     }
     return VERNON_STATUS_OK;

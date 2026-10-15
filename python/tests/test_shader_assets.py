@@ -22,6 +22,7 @@ from backend_test_matrix import (
     probe_compiler,
     require_available,
 )
+from native_support import native_available
 from vernon_dsl._program_assets.artifact_io import artifact_extension
 from vernon_dsl._program_assets.capture import CapturedProgram, capture_program
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
@@ -74,16 +75,6 @@ def _fake_native(compile_program_result: object) -> Any:
             return getattr(native, name)
 
     return Native()
-
-
-def _native_available() -> bool:
-    try:
-        from vernon_dsl._program_assets.compile_orchestration import _native_module
-
-        _native_module()
-        return True
-    except ProgramCompileError:
-        return False
 
 
 def _deployed_modules(document: Any) -> list[dict[str, Any]]:
@@ -646,7 +637,7 @@ module_vjp_asset = vd.program_asset(
     def test_all_five_authored_forms_produce_only_captured_program(self) -> None:
         from vernon_dsl._program_assets.source import load_program_asset_declaration
 
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "capture_forms.py"
@@ -771,7 +762,7 @@ class GraphicsTargetFormatTests(unittest.TestCase):
         self.assertEqual(vd.program_asset(id="compute", program=compute).id, "compute")
 
     def test_bare_kernel_cooks_symbolic_dispatch_controls(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         source = Path(__file__).with_name("program_asset_fixture.py")
         with tempfile.TemporaryDirectory() as directory:
@@ -849,7 +840,7 @@ class BarePipelineAssetCookTests(unittest.TestCase):
         format: str = "rgba16_float",
         extra: str = "",
     ) -> dict[str, Any]:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         source = Path(directory) / f"{name}.py"
         source.write_text(_BARE_PIPELINE_ASSET.format(format=format, extra=extra), encoding="utf-8")
@@ -916,7 +907,7 @@ class BarePipelineAssetCookTests(unittest.TestCase):
     def test_every_variant_of_a_canonical_asset_is_deployed(self) -> None:
         """Canonical deployment used to refuse more than one variant, and its caller split the plan to get around it."""
 
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "multi.py"
@@ -967,7 +958,7 @@ asset = vd.program_asset(
             )
 
     def test_typed_specialization_cooks_distinct_program_variants(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "typed_variant.py"
@@ -1022,7 +1013,7 @@ asset = vd.program_asset(
     def test_a_graphics_vjp_asset_is_refused_as_an_unsupported_capability(self) -> None:
         """One diagnostic, not the contradictory demand for a rule set that no graphics VJP could ever use."""
 
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "graphics_vjp.py"
@@ -1142,7 +1133,7 @@ class ShaderAssetCookTests(unittest.TestCase):
         self.assertEqual(encoded["reflection"], reflection)
 
     def test_module_single_compute_cooks_canonical_program(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1423,7 +1414,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                         )
 
     def test_recooking_prunes_outputs_of_the_previous_cook(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1509,7 +1500,7 @@ asset = vd.program_asset(
                 )
 
     def test_gpu_no_tape_vjp_cooks_canonical_program(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_no_tape_asset.py"
         with tempfile.TemporaryDirectory() as directory:
@@ -1532,7 +1523,7 @@ asset = vd.program_asset(
             self.assertEqual(set(program["stages"]), set(variant["artifact_system"]["artifacts"]))
 
     def test_gpu_captured_tape_vjp_cooks_canonical_programs(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
 
         source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_tape_asset.py"
@@ -1573,7 +1564,7 @@ asset = vd.program_asset(
 
     def test_four_graphics_variants_deploy_canonical_programs(self) -> None:
         root = Path(__file__).parents[2]
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             manifest = cook_program_asset(
@@ -1613,7 +1604,7 @@ asset = vd.program_asset(
 
     def test_python_descriptors_cook_all_runtime_backends(self) -> None:
         root = Path(__file__).parents[2]
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         from vernon_dsl._program_assets.compile_orchestration import _native_module
 
@@ -1675,7 +1666,7 @@ asset = vd.program_asset(
 
     def test_cook_only_source_targets_support_graphics_and_compute(self) -> None:
         root = Path(__file__).parents[2]
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
 
         assets = (
@@ -1746,7 +1737,7 @@ asset = vd.program_asset(
 
     def test_vulkan_program_bundle_embeds_verified_spirv(self) -> None:
         root = Path(__file__).parents[2]
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
             manifest = cook_program_asset(

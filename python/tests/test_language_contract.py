@@ -569,7 +569,7 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertEqual(value_statement.effect, Effect.PURE)
         self.assertEqual(
             resource_statement.effects,
-            (ResourceEffect("texture_sample", "image", frozenset({"fragment"})),),
+            (ResourceEffect("texture_sample", "image", frozenset({"fragment"}), False, "explicit"),),
         )
         self.assertEqual(resource_statement.effect, Effect.READ)
         self.assertEqual(
@@ -580,6 +580,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "owner": "image",
                 "stages": ["fragment"],
                 "has_lod": False,
+                "sampler_mode": "explicit",
             },
         )
 
@@ -602,7 +603,7 @@ class LanguageVersionTests(unittest.TestCase):
 
         helper = next(function for function in result.typed_functions if function.qualified_name == "sample")
         entry = next(function for function in result.typed_functions if function.symbol == "main")
-        effect = ResourceEffect("texture_sample", "image", frozenset({"fragment"}))
+        effect = ResourceEffect("texture_sample", "image", frozenset({"fragment"}), False, "explicit")
         self.assertEqual(helper.effects, (effect,))
         self.assertEqual(entry.effects, (effect,))
         self.assertIn('name = "texture_sample"', result.mlir)
@@ -1532,7 +1533,7 @@ class NumericInferenceTests(unittest.TestCase):
             "from vernon_dsl import *\n"
             "@kernel\n"
             "def main(\n"
-            "    output: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=0)],\n"
+            "    output: TensorView[f32, (dyn,), read_write],\n"
             "    index: u32,\n"
             "    value: f16,\n"
             ") -> None:\n"
@@ -1556,7 +1557,7 @@ class NumericInferenceTests(unittest.TestCase):
                 "    output[0] = value\n"
                 "@kernel\n"
                 "def main(\n"
-                "    output: Annotated[TensorView[f32, (dyn,), read], resource(set=0, binding=0)],\n"
+                "    output: TensorView[f32, (dyn,), read],\n"
                 "    value: f32,\n"
                 ") -> None:\n"
                 "    store(output, value)\n",

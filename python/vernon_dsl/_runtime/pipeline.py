@@ -34,6 +34,7 @@ from ..render import (
 from ..types import (
     Specialization,
     SpecializationAssignment,
+    _Scalar,
     dyn,
     specialization_key,
     specialization_key_data,
@@ -248,7 +249,7 @@ class Pipeline:
                 elif getattr(base, "name", None) in {"Vector", "Matrix"}:
                     dtype, *cell_shape = base.arguments
                     cell_shape = tuple(cell_shape)
-                elif is_struct_class(base):
+                elif is_struct_class(base) or isinstance(base, _Scalar):
                     dtype, cell_shape = base, ()
                 else:
                     raise TypeError(f"vertex storage argument {name!r} has no canonical cell type")

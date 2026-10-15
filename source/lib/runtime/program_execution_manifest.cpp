@@ -65,6 +65,20 @@ bool digestValue(const nlohmann::json &value) {
     return value.is_string() && isSha256Hex(value.get_ref<const std::string &>());
 }
 
+bool sampleResultClassValue(const nlohmann::json &object, bool sampled, VernonImageSampleResultClass &result) {
+    result = VERNON_IMAGE_SAMPLE_NONE;
+    if (!object.contains("sample_result_class"))
+        return !sampled;
+    const nlohmann::json &value = object["sample_result_class"];
+    const std::optional<VernonImageSampleResultClass> parsed =
+        value.is_string() ? vernon::formats::parseSampleResultClass(value.get_ref<const std::string &>())
+                          : std::nullopt;
+    if (!sampled || !parsed)
+        return false;
+    result = *parsed;
+    return true;
+}
+
 bool uint64Value(const nlohmann::json &value, uint64_t &result) {
     if (!value.is_number_integer() && !value.is_number_unsigned())
         return false;
@@ -706,11 +720,11 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
                                              ? exactObject(descriptor,
                                                            {"tag", "dimension", "format", "sample_count", "mip_levels",
                                                             "array_layers", "aspects", "usage"},
-                                                           {}, diagnostic, path + "/descriptor")
+                                                           {"sample_result_class"}, diagnostic, path + "/descriptor")
                                              : exactObject(descriptor,
                                                            {"tag", "dimension", "extent", "format", "sample_count",
                                                             "mip_levels", "array_layers", "aspects", "usage"},
-                                                           {}, diagnostic, path + "/descriptor");
+                                                           {"sample_result_class"}, diagnostic, path + "/descriptor");
             if (!exactDescriptor || !descriptor["dimension"].is_string() ||
                 (!borrowedImage && (!descriptor["extent"].is_array() || descriptor["extent"].size() != 3)) ||
                 !descriptor["format"].is_string() ||
@@ -758,6 +772,13 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
                     return fail(diagnostic, "PROGRAM_NON_CANONICAL_ORDER", "parse", path + "/descriptor/" + key,
                                 "entries must be sorted and unique");
             }
+            const bool sampled = std::binary_search(storage.image.usage.begin(), storage.image.usage.end(), "sampled");
+            if (!sampleResultClassValue(descriptor, sampled, storage.image.sampleResultClass) ||
+                (sampled && vernon::formats::find(storage.image.format) &&
+                 !vernon::formats::providesSampleResultClass(storage.image.format, storage.image.sampleResultClass)))
+                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor/sample_result_class",
+                            "a sampled image Storage, and only a sampled one, names the sample result class of its "
+                            "format");
         } else if (descriptorTag == "opaque") {
             storage.descriptorKind = StorageDescriptorKind::Opaque;
             if (!exactObject(descriptor, {"tag", "contract", "contract_hash", "usage"}, {}, diagnostic,
@@ -1943,8 +1964,8 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                 uint64_t minimumAlignment{};
                 if (image) {
                     uint32_t sampleCount = 0;
-                    if (!exactObject(layout, {"tag", "dimension", "format", "sample_count", "aspects"}, {}, diagnostic,
-                                     endpointPath + "/layout") ||
+                    if (!exactObject(layout, {"tag", "dimension", "format", "sample_count", "aspects"},
+                                     {"sample_result_class"}, diagnostic, endpointPath + "/layout") ||
                         !layout["dimension"].is_string() || !layout["format"].is_string() ||
                         !uint32Value(layout["sample_count"], sampleCount) || !layout["aspects"].is_array() ||
                         layout["aspects"].empty())
@@ -1956,6 +1977,10 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                                         endpointPath + "/layout/aspects", "image aspects must be strings");
                     endpoint.imageDimension = layout["dimension"].get<std::string>();
                     endpoint.imageFormat = layout["format"].get<std::string>();
+                    if (!sampleResultClassValue(layout, endpoint.role == "sampled", endpoint.imageSampleResultClass))
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                    endpointPath + "/layout/sample_result_class",
+                                    "a sampled image endpoint, and only a sampled one, names its sample result class");
                 } else if (sampler) {
                     if (!exactObject(layout, {"tag"}, {}, diagnostic, endpointPath + "/layout"))
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/layout",

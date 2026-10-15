@@ -74,6 +74,7 @@ struct ReflectedEndpoint {
     bool viewDescriptor{};
     std::string imageDimension;
     std::string imageFormat;
+    VernonImageSampleResultClass imageSampleResultClass{VERNON_IMAGE_SAMPLE_NONE};
     std::vector<EndpointAbiBinding> abiBindings;
     std::string writeFootprintKind;
     std::vector<uint32_t> writeFootprintIndices;
@@ -199,6 +200,8 @@ struct ImageDescriptor {
     std::vector<uint64_t> extent;
     std::vector<ControlComponent> extentControls;
     std::string format;
+    // NONE exactly when usage lacks "sampled"; otherwise the class every sampled view of this Storage reads.
+    VernonImageSampleResultClass sampleResultClass{VERNON_IMAGE_SAMPLE_NONE};
     uint32_t sampleCount{};
     uint32_t mipLevels{};
     uint32_t arrayLayers{};

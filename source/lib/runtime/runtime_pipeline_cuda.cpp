@@ -59,9 +59,9 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
             vernonRuntimeRhiAdapterGetProvider(cudaState(*inputs.context).adapter), &descriptor, &state->pipeline);
         if (status != VERNON_STATUS_OK) {
-            const VernonStringView error = vernonRuntimeRhiAdapterGetLastError(cudaState(*inputs.context).adapter);
             invocationDiagnostic(*inputs.context) =
-                error.data ? std::string(error.data, error.size) : "failed to prepare CUDA provider pipeline";
+                providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*inputs.context).adapter),
+                                   "failed to prepare CUDA provider pipeline");
             return false;
         }
         installRuntimeBackendState(pipeline, state.release());
@@ -141,21 +141,17 @@ VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const Pl
                        : vernonRuntimeCoreCreateBindings(state.pipeline, state.values.data(), state.values.size(),
                                                          &state.bindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare CUDA invocation bindings",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter),
+                                       "failed to prepare CUDA invocation bindings"),
                     status);
     }
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode CUDA provider dispatch",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(cudaState(*pipeline.context).adapter),
+                                       "failed to encode CUDA provider dispatch"),
                     status);
     }
     return VERNON_STATUS_OK;

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace vernon::formats {
@@ -31,6 +32,12 @@ struct Format {
                : dataFormat == VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL
                    ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
                    : VERNON_RHI_IMAGE_ASPECT_COLOR;
+    }
+    constexpr uint32_t components() const {
+        return dataFormat == VERNON_RHI_IMAGE_DATA_RG                                                 ? 2
+               : dataFormat == VERNON_RHI_IMAGE_DATA_RGB || dataFormat == VERNON_RHI_IMAGE_DATA_BGR   ? 3
+               : dataFormat == VERNON_RHI_IMAGE_DATA_RGBA || dataFormat == VERNON_RHI_IMAGE_DATA_BGRA ? 4
+                                                                                                      : 1;
     }
     constexpr bool allows(uint32_t capabilities) const { return (baseline & capabilities) == capabilities; }
     constexpr bool integer() const {
@@ -127,6 +134,40 @@ template <typename Key> constexpr bool hasStencil(Key format) {
 template <typename Key> constexpr bool isInteger(Key format) {
     const Format *entry = find(format);
     return entry && entry->integer();
+}
+
+// Shaders read unorm and float views alike as floats; integer views keep their signedness.
+constexpr VernonImageSampleResultClass sampleResultClass(const Format &entry) {
+    return entry.componentClass == ComponentClass::Uint   ? VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER
+           : entry.componentClass == ComponentClass::Sint ? VERNON_IMAGE_SAMPLE_SIGNED_INTEGER
+                                                          : VERNON_IMAGE_SAMPLE_FLOAT;
+}
+
+template <typename Key> constexpr bool providesSampleResultClass(Key format, VernonImageSampleResultClass resultClass) {
+    const Format *entry = find(format);
+    return entry && sampleResultClass(*entry) == resultClass;
+}
+
+constexpr std::string_view sampleResultClassName(VernonImageSampleResultClass resultClass) {
+    switch (resultClass) {
+    case VERNON_IMAGE_SAMPLE_FLOAT:
+        return "float";
+    case VERNON_IMAGE_SAMPLE_SIGNED_INTEGER:
+        return "sint";
+    case VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER:
+        return "uint";
+    case VERNON_IMAGE_SAMPLE_NONE:
+        break;
+    }
+    return "none";
+}
+
+constexpr std::optional<VernonImageSampleResultClass> parseSampleResultClass(std::string_view name) {
+    for (VernonImageSampleResultClass resultClass :
+         {VERNON_IMAGE_SAMPLE_FLOAT, VERNON_IMAGE_SAMPLE_SIGNED_INTEGER, VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER})
+        if (sampleResultClassName(resultClass) == name)
+            return resultClass;
+    return std::nullopt;
 }
 
 // A view may reinterpret an image only between the unorm and sRGB encodings of the same texels.

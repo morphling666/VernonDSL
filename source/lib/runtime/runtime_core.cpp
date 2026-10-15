@@ -197,25 +197,6 @@ bool layoutIsCanonical(const VernonRuntimeProviderBindingLayoutEntry *bindings, 
     return true;
 }
 
-bool imageSampleResultClass(VernonTextureFormat format, VernonImageSampleResultClass &result) {
-    const vernon::formats::Format *entry = vernon::formats::find(format);
-    if (!entry)
-        return false;
-    switch (entry->componentClass) {
-    case vernon::formats::ComponentClass::Float:
-    case vernon::formats::ComponentClass::Unorm:
-        result = VERNON_IMAGE_SAMPLE_FLOAT;
-        return true;
-    case vernon::formats::ComponentClass::Uint:
-        result = VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER;
-        return true;
-    case vernon::formats::ComponentClass::Sint:
-        result = VERNON_IMAGE_SAMPLE_SIGNED_INTEGER;
-        return true;
-    }
-    return false;
-}
-
 bool shaderStagesAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor) {
     if (!descriptor.shaders || descriptor.shader_count == 0 ||
         descriptor.shader_count > VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES)
@@ -319,13 +300,11 @@ VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
             return status;
         const uint32_t requiredUsage =
             found->kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? VERNON_IMAGE_STORAGE : VERNON_IMAGE_SAMPLED;
-        VernonImageSampleResultClass sampleResultClass{};
         if (!vernon::runtime::providerImageDescriptionIsCanonical(description) ||
             description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
             description.view.dimension != found->image_dimension || !(description.image.usage & requiredUsage) ||
             (found->kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
-             (!imageSampleResultClass(description.view.format, sampleResultClass) ||
-              sampleResultClass != found->sample_result_class)) ||
+             !vernon::formats::providesSampleResultClass(description.view.format, found->sample_result_class)) ||
             (found->kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
              description.view.format != found->storage_image_format))
             return VERNON_STATUS_INVALID_ARGUMENT;

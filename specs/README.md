@@ -89,9 +89,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
   per invocation.
 - [`program/fragment_discard.md`](program/fragment_discard.md) proposes the
   `vd.discard_fragment()` statement for masked raster.
-- [`program/integer_targets.md`](program/integer_targets.md) proposes a
-  single format table, `r32_uint`/`rg32_uint` color targets, interpolation
-  qualifiers, `2d_ms` reads, and typed clear values.
+- [`program/integer_targets.md`](program/integer_targets.md) records the
+  design of the single format table, `r32_uint`/`rg32_uint` color targets,
+  interpolation qualifiers, sampled texel fetch, and typed clear values.
 - [`runtime/pipelined_submission.md`](runtime/pipelined_submission.md)
   specifies asynchronous submission for graphics, compute and autodiff:
   every Execute returns after submission and completion effects belong to

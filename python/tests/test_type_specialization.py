@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import vernon_dsl as vd
 from backend_test_matrix import BackendRequirements, backend_row, probe_backend, require_available
+from native_support import native_available
 from type_specialization_materials import Flat, Glossy, Lookup, Matte, Scaled, SurfaceParams
 from type_specialization_template import ELEMENT, MATERIAL, SURFACE, convert, shade, surface_fragment, surface_vertex
 from vernon_dsl import CompileError, Compiler
@@ -44,16 +45,6 @@ def main(material: MATERIAL, extra: When[MATERIAL == glossy.Glossy, f32]) -> f32
 
 def _type(name: str, identity: str) -> SpecializationAssignment:
     return SpecializationAssignment(name, "type", identity)
-
-
-def _native_available() -> bool:
-    try:
-        from vernon_dsl._program_assets.compile_orchestration import _native_module
-
-        _native_module()
-        return True
-    except ProgramCompileError:
-        return False
 
 
 def _import_file(path: Path):
@@ -251,7 +242,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
                 lint_python_program_asset(source, "asset")
 
     def test_graphics_asset_cooks_one_variant_per_type(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         surfaces = "source.tests.fixtures.language_contract_graphics_asset"
         with tempfile.TemporaryDirectory() as directory:
@@ -280,7 +271,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
         self.assertEqual(len(deployed), 2)
 
     def test_kernel_cooks_type_specialization_without_postponed_annotations(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         source = (
             "from typing import Annotated\n"
@@ -312,7 +303,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
         self.assertIn("operator.gain", [slot["path"] for slot in variant["program"]["abi"]["boundary_slots"]])
 
     def test_type_value_from_another_project_specializes_a_library_template(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         library_ops = (
             "from typing import Annotated\n"
@@ -401,7 +392,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
             self.assertEqual(json.loads(documents[0])["content_hash"], json.loads(documents[1])["content_hash"])
 
     def test_declaration_object_cooks_caller_selected_variants(self) -> None:
-        if not _native_available():
+        if not native_available():
             self.skipTest("native Vernon extension is not built")
         path = _FIXTURES / "language_contract_graphics_asset.py"
         specification = importlib.util.spec_from_file_location("_language_contract_graphics_asset", path)

@@ -173,8 +173,9 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
             if (!prepareCanonicalComputeInterface(compiledEntry, rawValues, boundValues, nextSlot, error))
                 return false;
             ProgramComputeEndpointPlan computePlan;
-            if (!buildCanonicalComputeEndpoints(compiledEntry, rawValues, boundValues, resources, nextSlot, computePlan,
-                                                error))
+            if (!buildCanonicalComputeEndpoints(compiledEntry, rawValues, storages, boundValues, resources, nextSlot,
+                                                computePlan, error) ||
+                !applyProgramStorageUsageRequirements(storages, computePlan.storageUsageRequirements, error))
                 return false;
             llvm::json::Object stageContract;
             if (!buildCanonicalComputeStageContract(compiledEntry, compiledReflection, computePlan.endpoints.take(),

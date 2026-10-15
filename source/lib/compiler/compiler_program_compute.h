@@ -4,6 +4,7 @@
 #include "VernonProgramPlanTypes.h"
 #include "compiler_program_plan_records.h"
 #include "compiler_program_stage.h"
+#include "compiler_program_storage.h"
 
 #include "llvm/Support/JSON.h"
 
@@ -14,14 +15,13 @@
 
 namespace vernon::compiler {
 
-struct ProgramLogicalResource;
-
 struct ProgramComputeEndpointPlan {
     ProgramEndpointRecords endpoints;
     ProgramEndpointBindingRecords endpointBindings;
     ProgramImplementationEndpointRecords implementationEndpoints;
     ProgramAccessRecords accesses;
     ProgramModuleMetadataCarriers metadataCarriers;
+    ProgramStorageUsageRequirements storageUsageRequirements;
 };
 
 bool isProgramTapeCarrierRole(llvm::StringRef role);
@@ -35,7 +35,7 @@ bool prepareCanonicalComputeInterface(const llvm::json::Object &compiledEntry, c
                                       std::string &error);
 
 bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, const llvm::json::Array &rawValues,
-                                    const ProgramNodeBindingIndex &boundValues,
+                                    const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                     std::map<int64_t, ProgramLogicalResource> &resources, int64_t nextPortableSlot,
                                     ProgramComputeEndpointPlan &plan, std::string &error);
 

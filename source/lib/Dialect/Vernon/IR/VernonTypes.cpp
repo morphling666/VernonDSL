@@ -99,7 +99,7 @@ int64_t TextureType::sampleCoordinateWidth() const {
     return (getDimension() == "2d" ? 2 : getDimension() == "cube_array" ? 4 : 3);
 }
 
-int64_t TextureType::storageCoordinateWidth() const { return getDimension() == "2d" ? 2 : 3; }
+int64_t TextureType::texelCoordinateWidth() const { return getDimension() == "2d" ? 2 : 3; }
 
 int64_t TextureType::sizeWidth() const { return getDimension() == "3d" || isArrayed() ? 3 : 2; }
 

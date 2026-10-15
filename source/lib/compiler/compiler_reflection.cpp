@@ -3,6 +3,7 @@
 #include "compiler_program_reflection.h"
 #include "compiler_program_semantic_type.h"
 
+#include "VernonFormats.hpp"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -31,7 +32,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <tuple>
 #include <utility>
 
 namespace vernon::compiler {
@@ -277,20 +277,12 @@ ResourceKind resourceKind(mlir::Type type) {
     return ResourceKind::None;
 }
 
-struct SampledTextureBinding {
-    int64_t descriptorSet;
-    int64_t binding;
-
-    bool operator<(const SampledTextureBinding &other) const {
-        return std::tie(descriptorSet, binding) < std::tie(other.descriptorSet, other.binding);
-    }
-};
-
 using ResourceOrigins = std::set<unsigned>;
 using ResourceProvenance = llvm::DenseMap<mlir::Value, ResourceOrigins>;
+// Sampler entry argument index to the texture entry argument indices it samples.
+using SamplerTextures = std::map<unsigned, std::set<unsigned>>;
 
-mlir::FailureOr<std::map<unsigned, std::set<SampledTextureBinding>>>
-analyzeSampledTextureBindings(mlir::func::FuncOp function) {
+mlir::FailureOr<SamplerTextures> analyzeSampledTextures(mlir::func::FuncOp function) {
     struct ForwardingEdge {
         mlir::Value source;
         mlir::Value destination;
@@ -370,8 +362,8 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
         }
     }
 
-    std::map<unsigned, std::set<SampledTextureBinding>> samplerBindings;
-    std::map<SampledTextureBinding, std::set<unsigned>> bindingSamplers;
+    SamplerTextures samplerTextures;
+    std::map<unsigned, std::set<unsigned>> textureSamplers;
     bool invalid = false;
     function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
         if (intrinsic.getName() != "texture_sample")
@@ -397,16 +389,6 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
                 invalid = true;
                 continue;
             }
-            auto attrs = function.getArgAttrDict(textureOrigin);
-            auto descriptorSet = attrs.getAs<mlir::IntegerAttr>("vernon.set");
-            auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding");
-            if (!descriptorSet || !binding) {
-                intrinsic.emitError() << "texture_sample texture entry argument #" << textureOrigin
-                                      << " has no descriptor set/binding";
-                invalid = true;
-                continue;
-            }
-            SampledTextureBinding sampledBinding{descriptorSet.getInt(), binding.getInt()};
             for (unsigned samplerOrigin : samplerOrigins) {
                 if (samplerOrigin >= function.getNumArguments() ||
                     resourceKind(function.getArgumentTypes()[samplerOrigin]) != ResourceKind::Sampler) {
@@ -416,27 +398,114 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
                     invalid = true;
                     continue;
                 }
-                samplerBindings[samplerOrigin].insert(sampledBinding);
-                bindingSamplers[sampledBinding].insert(samplerOrigin);
+                samplerTextures[samplerOrigin].insert(textureOrigin);
+                textureSamplers[textureOrigin].insert(samplerOrigin);
             }
         }
     });
+
+    // An implicit sampler pairs with the texture its metadata names even when nothing samples that texture: a fetched
+    // or measured texture is still a combined image-sampler binding.
+    for (unsigned samplerIndex = 0; samplerIndex < function.getNumArguments(); ++samplerIndex) {
+        mlir::DictionaryAttr samplerAttrs = function.getArgAttrDict(samplerIndex);
+        auto implicitTexture = samplerAttrs ? samplerAttrs.getAs<mlir::StringAttr>("vernon.implicit_texture") : nullptr;
+        if (!implicitTexture)
+            continue;
+        std::optional<unsigned> texture;
+        for (unsigned textureIndex = 0; textureIndex < function.getNumArguments(); ++textureIndex) {
+            mlir::DictionaryAttr textureAttrs = function.getArgAttrDict(textureIndex);
+            auto sourceName = textureAttrs ? textureAttrs.getAs<mlir::StringAttr>("vernon.source_name") : nullptr;
+            if (sourceName && sourceName == implicitTexture &&
+                resourceKind(function.getArgumentTypes()[textureIndex]) == ResourceKind::Texture)
+                texture = textureIndex;
+        }
+        if (!texture) {
+            function.emitError() << "implicit sampler argument #" << samplerIndex << " names texture '"
+                                 << implicitTexture.getValue() << "', which is not a texture entry argument";
+            invalid = true;
+            continue;
+        }
+        samplerTextures[samplerIndex].insert(*texture);
+        textureSamplers[*texture].insert(samplerIndex);
+    }
     if (invalid)
         return mlir::failure();
 
-    for (const auto &[binding, samplers] : bindingSamplers) {
+    for (const auto &[texture, samplers] : textureSamplers) {
         if (samplers.size() <= 1)
             continue;
         std::string samplerList;
         llvm::raw_string_ostream stream(samplerList);
         llvm::interleaveComma(samplers, stream, [&](unsigned sampler) { stream << '#' << sampler; });
-        function.emitError() << "sampled texture at set " << binding.descriptorSet << ", binding " << binding.binding
+        function.emitError() << "sampled texture entry argument #" << texture
                              << " may use multiple sampler entry arguments (" << samplerList
                              << "); the current combined-image SPIR-V model requires one sampler "
                                 "origin per sampled texture binding";
         return mlir::failure();
     }
-    return samplerBindings;
+    return samplerTextures;
+}
+
+// A sampler pairs with the descriptor its texture's own row reflects, so the pair follows each stage's binding
+// numbering, which is flattened in compute.
+bool reflectSampledImageBindings(llvm::json::Array &arguments, const SamplerTextures &samplerTextures,
+                                 mlir::func::FuncOp function) {
+    std::map<int64_t, llvm::json::Object *> rows;
+    for (llvm::json::Value &value : arguments)
+        if (llvm::json::Object *row = value.getAsObject())
+            if (std::optional<int64_t> index = row->getInteger("index"))
+                rows[*index] = row;
+    for (const auto &[sampler, textures] : samplerTextures) {
+        auto samplerRow = rows.find(sampler);
+        if (samplerRow == rows.end()) {
+            function.emitError() << "sampler entry argument #" << sampler << " has no reflected row";
+            return false;
+        }
+        llvm::json::Array bindings;
+        for (unsigned texture : textures) {
+            auto textureRow = rows.find(texture);
+            const std::optional<int64_t> descriptorSet =
+                textureRow == rows.end() ? std::nullopt : textureRow->second->getInteger("vernon.set");
+            const std::optional<int64_t> binding =
+                textureRow == rows.end() ? std::nullopt : textureRow->second->getInteger("vernon.binding");
+            if (!descriptorSet || !binding) {
+                function.emitError() << "sampled texture entry argument #" << texture
+                                     << " has no reflected descriptor set/binding";
+                return false;
+            }
+            bindings.emplace_back(llvm::json::Object{{"set", *descriptorSet}, {"binding", *binding}});
+        }
+        (*samplerRow->second)["sampled_image_bindings"] = std::move(bindings);
+    }
+    return true;
+}
+
+/* Linkage records read interpolation from reflection, so every located varying reflects its resolved mode, including
+ * the integer default that has no attribute. */
+bool reflectVaryingInterpolation(llvm::json::Object &row, mlir::DictionaryAttr attrs, mlir::Type type,
+                                 mlir::ModuleOp module) {
+    if (!attrs || !attrs.get(mlir::vernon::kLocationAttrName))
+        return true;
+    mlir::FailureOr<mlir::vernon::Interpolation> interpolation =
+        mlir::vernon::resolveInterpolation(attrs, type, module);
+    if (mlir::failed(interpolation))
+        return false;
+    row[mlir::vernon::kInterpolationAttrName.str()] = mlir::vernon::stringifyInterpolation(*interpolation).str();
+    return true;
+}
+
+/* A sampled texture's integer element type is signless, so only its declared dtype distinguishes the sint and uint
+ * classes that a bound view's format must match. */
+std::optional<VernonImageSampleResultClass> sampleResultClass(mlir::vernon::TextureType texture,
+                                                              llvm::ArrayRef<llvm::StringRef> dtypes) {
+    if (dtypes.size() > 1)
+        return std::nullopt;
+    const llvm::StringRef dtype = dtypes.empty() ? llvm::StringRef() : dtypes.front();
+    if (texture.getElementType().isF32() && (dtype.empty() || dtype == "f32"))
+        return VERNON_IMAGE_SAMPLE_FLOAT;
+    if (texture.getElementType().isInteger(32) && (dtype == "i32" || dtype == "u32"))
+        return dtype == "i32" ? VERNON_IMAGE_SAMPLE_SIGNED_INTEGER : VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER;
+    return std::nullopt;
 }
 
 } // namespace
@@ -684,9 +753,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         if (stage.getValue() == "compute")
             requiredFeatures.insert("compute");
 
-        mlir::FailureOr<std::map<unsigned, std::set<SampledTextureBinding>>> sampledBindings =
-            analyzeSampledTextureBindings(function);
-        if (mlir::failed(sampledBindings)) {
+        mlir::FailureOr<SamplerTextures> samplerTextures = analyzeSampledTextures(function);
+        if (mlir::failed(samplerTextures)) {
             invalid = true;
             return;
         }
@@ -1120,6 +1188,12 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         requiredFeatures.insert("instancing");
                 }
             }
+            if (stage.getValue() == "fragment" &&
+                !reflectVaryingInterpolation(argument, argumentAttrs, argumentType, module)) {
+                function.emitError() << "argument #" << index << " has no varying interpolation";
+                invalid = true;
+                return;
+            }
             if (logicalValue) {
                 if (logicalValue->sourcePathExplicit)
                     argument["vernon.source_name"] = logicalValue->sourcePath;
@@ -1289,8 +1363,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["resource_kind"] = "image";
                 argument["dimension"] = texture.getDimension().str();
                 if (texture.getAccess() == "sampled") {
+                    const std::optional<VernonImageSampleResultClass> resultClass =
+                        sampleResultClass(texture, valueLogicalDtypes);
+                    if (!resultClass) {
+                        function.emitError() << "sampled Texture argument #" << index
+                                             << " needs a vernon.dtype of f32, i32, or u32 matching its element type";
+                        invalid = true;
+                        return;
+                    }
                     argument["binding_role"] = "sampled";
-                    argument["sample_result_class"] = "float";
+                    argument["sample_result_class"] = std::string(vernon::formats::sampleResultClassName(*resultClass));
                     argument["access"] = "read";
                 } else {
                     argument["binding_role"] = "storage";
@@ -1300,17 +1382,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             } else if (mlir::isa<mlir::vernon::SamplerType>(argumentType)) {
                 argument["kind"] = "sampler";
                 argument["access"] = "read";
-                auto pairs = sampledBindings->find(index);
-                if (pairs != sampledBindings->end()) {
-                    llvm::json::Array bindings;
-                    for (const SampledTextureBinding &pair : pairs->second) {
-                        llvm::json::Object reflectedBinding;
-                        reflectedBinding["set"] = pair.descriptorSet;
-                        reflectedBinding["binding"] = pair.binding;
-                        bindings.emplace_back(std::move(reflectedBinding));
-                    }
-                    argument["sampled_image_bindings"] = std::move(bindings);
-                }
             }
             const llvm::SmallVector<uint32_t> *graphicsStorageBindings =
                 stage.getValue() == "compute" ? nullptr : graphicsBindings->find(function.getSymName(), index);
@@ -1414,6 +1485,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (mlir::isa<mlir::vernon::SamplerType>(argumentType))
                 requiredFeatures.insert("samplers");
             arguments.emplace_back(std::move(argument));
+        }
+        if (!reflectSampledImageBindings(arguments, *samplerTextures, function)) {
+            invalid = true;
+            return;
         }
 
         llvm::json::Array results;
@@ -1582,6 +1657,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (resultAttrs) {
                 for (mlir::NamedAttribute attr : resultAttrs)
                     output[attr.getName().strref().str()] = attributeToJson(attr.getValue());
+            }
+            if (stage.getValue() == "vertex" && !reflectVaryingInterpolation(output, resultAttrs, resultType, module)) {
+                function.emitError() << "result #" << index << " has no varying interpolation";
+                invalid = true;
+                return;
             }
             mlir::FailureOr<llvm::json::Object> valueLayout =
                 reflectValueLayout(resultType, logicalDtypes, canonicalType);

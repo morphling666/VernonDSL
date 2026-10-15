@@ -1321,6 +1321,38 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
     EXPECT_NE(diagnostic.path.find("/descriptor"), std::string::npos);
 }
 
+TEST(ProgramExecutionManifest, SampledImageStorageNamesTheResultClassOfItsFormat) {
+    const auto parseDescriptor = [](const std::string &format, const nlohmann::json &usage,
+                                    const nlohmann::json &resultClass,
+                                    vernon::runtime::program::Diagnostic &diagnostic) {
+        nlohmann::json manifest = graphicsAttachmentFixture(format).manifest;
+        nlohmann::json &descriptor = manifest["storages"][0]["descriptor"];
+        descriptor["usage"] = usage;
+        if (!resultClass.is_null())
+            descriptor["sample_result_class"] = resultClass;
+        for (nlohmann::json &slot : manifest["abi"]["boundary_slots"])
+            slot["storage_descriptor"] = descriptor;
+        return vernon::runtime::program::parse(manifest, diagnostic).isOk();
+    };
+    const nlohmann::json sampled = nlohmann::json::array({"color_attachment", "sampled"});
+    const std::string path = "/storages/0/descriptor/sample_result_class";
+
+    vernon::runtime::program::Diagnostic diagnostic;
+    EXPECT_TRUE(parseDescriptor("rgba8_unorm", sampled, "float", diagnostic)) << diagnostic.message;
+    EXPECT_TRUE(parseDescriptor("r32_uint", sampled, "uint", diagnostic)) << diagnostic.message;
+
+    for (const auto &[format, usage, resultClass] :
+         {std::tuple{"rgba8_unorm", sampled, nlohmann::json()},
+          std::tuple{"r32_uint", sampled, nlohmann::json("float")},
+          std::tuple{"rgba8_unorm", sampled, nlohmann::json("half")},
+          std::tuple{"rgba8_unorm", nlohmann::json::array({"color_attachment"}), nlohmann::json("float")}}) {
+        diagnostic = {};
+        EXPECT_FALSE(parseDescriptor(format, usage, resultClass, diagnostic)) << format << " " << resultClass;
+        EXPECT_EQ(diagnostic.code, "PROGRAM_STORAGE_DESCRIPTOR");
+        EXPECT_EQ(diagnostic.path, path);
+    }
+}
+
 TEST(ProgramTargetFormats, RejectsTargetsTheDeviceCannotUseAsDeclared) {
     const auto baseline = [](const vernon::formats::Format &format) { return format.baseline; };
     const auto validate = [](const std::string &format, bool blended,

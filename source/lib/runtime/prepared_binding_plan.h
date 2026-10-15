@@ -120,6 +120,13 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                                      VernonRuntimeBackend backend, PreparedComputeBindingPlan &output,
                                      std::string &error);
 bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, std::string &error);
+bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
+                                const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
+                                VernonRuntimeProviderBindingValue &value);
+// `projection` only enriches diagnostics; `values` is resized to one provider value per prepared layout.
+bool fillPreparedComputeBindingValues(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
+                                      const PlannedComputeLaunch &launch,
+                                      std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error);
 
 bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
                                      OpenGLNativeUniformShape &result);

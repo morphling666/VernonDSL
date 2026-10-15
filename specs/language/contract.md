@@ -305,7 +305,8 @@ storage texture is `Texture[dimension, format, access]`, where `dimension` is
 `2d`, `3d`, or `2d_array`,
 `access` is `read`, `write`, or `read_write`, and format is one of
 `r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
-`rgba16_float`, or `rgba32_float`.
+`rgba16_float`, `rgba32_float`, `r32_uint`, or `rg32_uint`: the formats whose
+row in `source/include/VernonFormats.def` allows `storage`.
 
 Texture queries and sampling use resource-specific operations; they are not
 ordinary TensorView loads or stores. Sampler state is separate from sampled
@@ -324,23 +325,32 @@ The supported texture operation regions are:
 - `texture_size(texture[, lod])` is valid in vertex and fragment stages and
   requires an integer scalar LOD when present;
 - `texture_load` and `texture_store` operate on storage Textures with integer
-  coordinates and enforce the declared read/write access.
+  coordinates and enforce the declared read/write access;
+- `texture_load(texture, coordinates)` also fetches one texel of the base
+  level of a sampled `2d`, `3d`, or `2d_array` Texture, with integer
+  coordinates, in vertex and fragment stages. A `cube` or `cube_array`
+  Texture has no texel space and is rejected.
+
+An `i32` or `u32` sampled Texture is read with `texture_load` only, because
+integer formats are not filterable; `texture_sample` on it fails with
+`integer textures are read with texture_load, not texture_sample`.
 
 Sampling coordinates are floating Tensor Values with rank determined by the
 Texture dimension, and sampling LOD is a floating Scalar. Arrayed dimensions
 follow SPIR-V: the layer is the last coordinate component and `texture_size`
 appends the layer count. A `cube_array` layer selects a whole cube.
 
-| Dimension | Sample coordinates | Storage coordinates | `texture_size` |
+| Dimension | Sample coordinates | Texel coordinates | `texture_size` |
 |---|---|---|---|
 | `2d` | `(u, v)` | `(x, y)` | `(w, h)` |
 | `3d` | `(u, v, w)` | `(x, y, z)` | `(w, h, d)` |
 | `cube` | `(x, y, z)` direction | — | `(w, h)` |
 | `2d_array` | `(u, v, layer)` | `(x, y, layer)` | `(w, h, layers)` |
 | `cube_array` | `(x, y, z, cube)` | — | `(w, h, cubes)` |
- One Texture entry
-parameter cannot mix implicit and explicit sampler forms in the same stage.
-Implicit sampling creates a deterministic sampler interface binding.
+
+One Texture entry parameter cannot mix implicit and explicit sampler forms in
+the same stage, whether it is sampled directly or through helpers. Implicit
+sampling creates a deterministic sampler interface binding.
 
 ## 5. Ownership, borrowing, and effects
 
@@ -451,6 +461,28 @@ Graphics transport does not change semantic category. A
 a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
 Value even if a backend uses a buffer physically. Direct shader addressing,
 stores, and atomics require `TensorView[..., resource()]`.
+
+Kernel Resources bind in argument order: set 0, at the flattened binding of
+their argument. `resource(set, binding)` therefore applies only to graphics
+stages, and on a kernel parameter fails with
+`kernel Resources bind in argument order; resource(set, binding) applies only to graphics stages`.
+
+A fragment output's element type follows its color target's component class:
+`f32` for `float` and `unorm` formats, `u32` for `uint`, and `i32` for `sint`,
+with the format's component count (`u32` for `r32_uint`,
+`Vector[u32, 2]` for `rg32_uint`). A mismatch fails with a diagnostic
+containing `fragment output type does not match color target format`. Integer
+color targets cannot blend (`integer color targets cannot blend`), and a
+render pass clears them with integers in the format's range.
+
+`varying(interpolation)` qualifies a vertex output field and the matching
+fragment input. `Interpolation.PERSPECTIVE` is the default for floating
+varyings, `LINEAR` interpolates in screen space, and `FLAT` takes the
+provoking vertex's value; which vertex provokes is backend-defined. Integer
+varyings are `FLAT` by default, and any other mode on one fails with a
+diagnostic containing `integer varyings must be flat`. Both stages must
+declare the same mode, or pipeline planning fails with a diagnostic containing
+`varying interpolation differs between stages`.
 
 A persistent `ProgramAsset` wraps exactly one executable Program. Its
 `program=` is a compute Kernel, a `vd.pipeline(...)` graphics pipeline, an

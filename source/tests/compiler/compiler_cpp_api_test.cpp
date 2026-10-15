@@ -259,6 +259,46 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompilerDestroy(context);
 }
 
+TEST(CompilerReflection, SampledTexturesReflectTheResultClassOfTheirDtype) {
+    const auto fetchModule = [](std::string_view dtypeAttribute) {
+        return std::string(R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @classes(
+      %colors: !vernon.texture<"2d", f32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64
+      },
+      %identifiers: !vernon.texture<"2d", i32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 1 : i64)mlir") +
+               std::string(dtypeAttribute) + R"mlir(
+      },
+      %offsets: !vernon.texture<"2d", i32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 2 : i64, vernon.dtype = "i32"
+      },
+      %texel: tensor<2xi32> {
+        vernon.interface = "input", vernon.location = 0 : i64, vernon.dtype = "i32"
+      }) -> (tensor<4xi32> {
+        vernon.interface = "output", vernon.location = 0 : i64, vernon.dtype = "u32"
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %identifier = "vernon.intrinsic"(%identifiers, %texel) {name = "texture_load"} :
+        (!vernon.texture<"2d", i32, "unknown", "sampled">, tensor<2xi32>) -> tensor<4xi32>
+    return %identifier : tensor<4xi32>
+  }
+})mlir";
+    };
+
+    VernonCompilerContext *context = vernonCompilerCreate();
+    ASSERT_TRUE(context);
+    const nlohmann::json reflection = validateReflection(context, fetchModule(R"(, vernon.dtype = "u32")"));
+    const nlohmann::json &classes = entry(reflection, "classes");
+    EXPECT_EQ(argument(classes, 0).at("sample_result_class"), "float");
+    EXPECT_EQ(argument(classes, 1).at("sample_result_class"), "uint");
+    EXPECT_EQ(argument(classes, 2).at("sample_result_class"), "sint");
+
+    expectDiagnostic(context, fetchModule(""),
+                     "sampled Texture argument #1 needs a vernon.dtype of f32, i32, or u32 matching its element type");
+    vernonCompilerDestroy(context);
+}
+
 TEST(CompilerReflection, TracksTextureSamplerAndSwizzleSemantics) {
     constexpr std::string_view module = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
@@ -489,6 +529,44 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(helperReflection.at("entries").size() == 1);
     ASSERT_TRUE(argument(helperEntry, 1).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 4}}}));
+
+    constexpr std::string_view computeModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  "vernon.struct"() {
+    sym_name = "Pair",
+    fields = ["first:f32", "second:i32"],
+    abi_leaf_dtypes = ["f32", "i32"]
+  } : () -> ()
+  func.func @compute_sample(
+      %pairs: !vernon.tensor_view<!vernon.struct<"Pair">, [2], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.abi_leaf_dtypes = ["f32", "i32"],
+        vernon.element_abi_leaf_dtypes = ["f32", "i32"],
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 1 : i64
+      },
+      %sampler: !vernon.sampler {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 2 : i64
+      }) attributes {
+        vernon.entry, vernon.stage = "compute", vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %uv = arith.constant dense<0.5> : tensor<2xf32>
+    %lod = arith.constant 0.0 : f32
+    %sample = "vernon.intrinsic"(%texture, %sampler, %uv, %lod)
+        {name = "texture_sample"} :
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)
+        -> tensor<4xf32>
+    return
+  }
+})mlir";
+    nlohmann::json computeReflection = validateReflection(context, computeModule);
+    const nlohmann::json &computeEntry = entry(computeReflection, "compute_sample");
+    ASSERT_TRUE(argument(computeEntry, 1).at("vernon.binding") == 2);
+    ASSERT_TRUE(argument(computeEntry, 2).at("sampled_image_bindings") ==
+                nlohmann::json::array({{{"set", 0}, {"binding", 2}}}));
 
     constexpr std::string_view ambiguousSamplerModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {

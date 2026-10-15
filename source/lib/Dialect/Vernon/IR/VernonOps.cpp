@@ -139,15 +139,19 @@ LogicalResult IntrinsicOp::verify() {
     };
 
     if (getName() == "texture_load" || getName() == "texture_store") {
-        auto texture = dyn_cast<TextureType>(getOperand(0).getType());
-        if (!texture || texture.getAccess() == "sampled")
-            return emitOpError() << getName() << " operand #0 must be a Vernon storage Texture";
         const bool load = getName() == "texture_load";
+        auto texture = dyn_cast<TextureType>(getOperand(0).getType());
+        if (!texture)
+            return emitOpError() << getName() << " operand #0 must be a Vernon Texture";
+        if (!load && texture.getAccess() == "sampled")
+            return emitOpError("texture_store operand #0 must be a Vernon storage Texture");
+        if (texture.isCube())
+            return emitOpError() << getName() << " cannot address texels of a " << texture.getDimension() << " texture";
         if ((load && texture.getAccess() == "write") || (!load && texture.getAccess() == "read"))
             return emitOpError() << getName() << " is incompatible with " << texture.getAccess() << " access";
         if (getNumOperands() != (load ? 2u : 3u) || getNumResults() != (load ? 1u : 0u))
             return emitOpError() << getName() << " has an invalid operand or result count";
-        const int64_t rank = texture.storageCoordinateWidth();
+        const int64_t rank = texture.texelCoordinateWidth();
         auto coordinates = shapedWidthAndElement(getOperand(1).getType());
         if (!coordinates || coordinates->first != rank || !coordinates->second.isSignlessInteger(32))
             return emitOpError() << getName() << " coordinates must be a " << rank << "-component i32 vector";

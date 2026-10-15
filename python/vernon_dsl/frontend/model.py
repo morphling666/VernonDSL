@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -230,8 +230,10 @@ class StorageEffect:
 class ResourceEffect:
     operation: str
     owner: str
-    stages: frozenset[str] = frozenset()
-    has_lod: bool = False
+    stages: frozenset[str]
+    has_lod: bool
+    # "implicit" or "explicit" for texture_sample; None for operations that read no sampler.
+    sampler_mode: str | None
 
 
 class MemoryOrdering(Enum):
@@ -270,6 +272,17 @@ class FragmentDiscardEffect:
 
 
 TypedEffect = StorageEffect | ResourceEffect | AtomicEffect | BarrierEffect | FragmentDiscardEffect
+
+
+def resource_sampler_modes(effects: Iterable[TypedEffect]) -> tuple[dict[str, str], ResourceEffect | None]:
+    """The sampler mode of each sampled texture, and the first effect whose mode contradicts an earlier one."""
+    modes: dict[str, str] = {}
+    for effect in effects:
+        if not isinstance(effect, ResourceEffect) or effect.sampler_mode is None:
+            continue
+        if modes.setdefault(effect.owner, effect.sampler_mode) != effect.sampler_mode:
+            return modes, effect
+    return modes, None
 
 
 class Termination(Enum):

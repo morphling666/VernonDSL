@@ -17,30 +17,6 @@ inline BackendPipelineResult backendPipelineResolutionFailure(BackendStageBuildI
         vernon::err(BackendPipelineFailure{BackendPipelineError::BackendResolutionFailed, std::move(diagnostic)})};
 }
 
-inline bool bindComputeValueStorage(const VernonRuntimeProviderBindingLayoutEntry &layout,
-                                    const ComputeLaunchArgument &argument, VernonRuntimeProviderBindingValue &value) {
-    if (layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-        layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM)
-        return false;
-    const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-    if (!scalar || !scalar->data || scalar->size != layout.element_size)
-        return false;
-    value.payload.inline_value.data = scalar->data;
-    value.payload.inline_value.size = scalar->size;
-    return true;
-}
-
-inline bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
-                                       const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
-                                       VernonRuntimeProviderBindingValue &value) {
-    if (!source.metadataCarrier || launch.metadataPayload.empty() ||
-        launch.metadataPayload.size() != layout.element_size || launch.metadataAlignment != layout.element_alignment)
-        return false;
-    value.payload.inline_value.data = launch.metadataPayload.data();
-    value.payload.inline_value.size = launch.metadataPayload.size();
-    return true;
-}
-
 BackendPipelineResult resolveCpuPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                          VernonStageExecutable &pipeline);
 void destroyCpuPipeline(VernonStageExecutable &pipeline);

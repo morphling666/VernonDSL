@@ -471,12 +471,15 @@ compile failure with the stated stable reason, never a runtime skip.
 ### `LANG-INTERFACE-001` — graphics interface metadata
 
 - Valid: `attribute()` with inferred/explicit non-negative location and
-  non-negative divisor, `uniform()` with optional set/binding, `varying()`,
-  `resource(set, binding)`, and `builtin(name)` in their legal stage/direction
-  regions.
+  non-negative divisor, `uniform()` with optional set/binding,
+  `varying(interpolation)` with `PERSPECTIVE`, `LINEAR`, `FLAT`, or the
+  type's default, graphics `resource(set, binding)`, and `builtin(name)` in
+  their legal stage/direction regions.
 - Invalid: unknown or duplicate/conflicting metadata, wrong literal arity/type,
-  negative location/divisor, binding collision, or metadata on an incompatible
-  semantic category/stage.
+  negative location/divisor, binding collision, metadata on an incompatible
+  semantic category/stage (including `resource(set, binding)` on a kernel
+  parameter), a non-flat integer varying, or interpolation that differs
+  between stages.
 - Capabilities: compile/runtime `graphics` and Resource capability where used.
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: metadata/location/binding/stage reason; deterministic
@@ -537,7 +540,8 @@ For every generated-interface ID:
 
 - Valid: `texture_sample(texture, sampler, coordinates)` only in fragment.
 - Invalid: vertex/compute use, wrong Resource kinds, or mixing implicit and
-  explicit sampler modes for one entry Texture parameter.
+  explicit sampler modes for one entry Texture parameter, directly or through
+  helpers.
 - Capabilities: compile/runtime `graphics`, `texture_sampler`.
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: fragment-only/sampler-mode reason; sampler state affects
@@ -573,11 +577,39 @@ For every generated-interface ID:
 
 - Valid: integer coordinates of the texture rank; load on read/read_write and
   store of a four-component texel on write/read_write.
-- Invalid: sampled Texture, wrong coordinate/value type, or access violation.
+- Invalid: store to a sampled Texture, wrong coordinate/value type, or access
+  violation.
 - Capabilities: compile/runtime stage capability plus `storage_texture`.
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: storage/access/coordinate/value reason; exact loaded or
   stored texel.
+
+### `LANG-TEXTURE-FETCH` — sampled texture texel fetch
+
+- Valid: `texture_load(texture, coordinates)` on a sampled 2D, 3D, or 2D-array
+  Texture of any element type in graphics stages, with integer coordinates of
+  the texel rank, reading the base level without a sampler.
+- Invalid: cube textures, non-integer coordinates, or compute use;
+  `texture_sample` on an integer Texture; binding a view whose format provides
+  a different sample result class.
+- Capabilities: compile/runtime `graphics`, `texture_sampler`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: dimension/coordinate/stage/sampling reason, and the
+  binding's sample result class reason; every fetched `u32` texel, including
+  values above 2^24, reaches an `r32_uint` target exactly.
+
+### `LANG-COLOR-TARGET` — color target value types
+
+- Valid: a fragment output of the target's component class and count (`f32`
+  for float and unorm, `u32` for uint, `i32` for sint), and a render pass that
+  clears an integer target with integers in the format's range.
+- Invalid: an output type that does not match its target, blending on an
+  integer-only attachment, or a non-integer or out-of-range clear of an
+  integer target.
+- Capabilities: compile/runtime `graphics`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: output type, blend and clear reasons; every `u32` the
+  fragment writes reaches an `r32_uint` target exactly.
 
 ## 6. Statements, expressions, and math
 

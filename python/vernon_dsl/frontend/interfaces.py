@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Protocol
 
 from ..language.ast_utils import dotted_name
-from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS, resource_stage_error, texture_sampling_contract
-from .model import ConcreteType
+from ..language.stage_registry import GRAPHICS_STAGES
+from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS
+from .model import ConcreteType, ResourceEffect, TypedEffect, resource_sampler_modes
 from .type_parser import AnnotatedType
 
 
@@ -28,19 +30,38 @@ class GeneratedInterfacePlan:
     texture_sampler_modes: Mapping[str, str]
 
 
+def _unpaired_textures(
+    argument_types: Mapping[str, ConcreteType], effects: tuple[TypedEffect, ...], sampler_modes: Mapping[str, str]
+) -> set[str]:
+    """Sampled textures that the entry reaches, directly or through helpers, and that no explicit sampler pairs
+    with. Those bind as combined image-samplers, so each still needs an implicit sampler even when it is only
+    fetched or measured."""
+    reached: set[str] = set()
+    for effect in effects:
+        if not isinstance(effect, ResourceEffect):
+            continue
+        texture = argument_types.get(effect.owner)
+        if texture is not None and texture.kind == "texture" and texture.arguments[3] == "sampled":
+            reached.add(effect.owner)
+    return {name for name in reached if sampler_modes.get(name) != "explicit"}
+
+
 def plan_generated_interface(
     context: InterfaceContext,
     node: ast.FunctionDef,
     argument_annotations: list[AnnotatedType],
     stage: str | None,
+    effects: tuple[TypedEffect, ...],
 ) -> GeneratedInterfacePlan:
     argument_types = {
         argument.arg: annotation.type for argument, annotation in zip(node.args.args, argument_annotations, strict=True)
     }
-    implicit_textures: set[str] = set()
-    generated_apis: set[str] = set()
-    sampler_modes: dict[str, str] = {}
+    sampler_modes, _ = resource_sampler_modes(effects)
+    implicit_textures = (
+        _unpaired_textures(argument_types, effects, sampler_modes) if stage in GRAPHICS_STAGES else set()
+    )
 
+    generated_apis: set[str] = set()
     for value in ast.walk(node):
         if not isinstance(value, ast.Call):
             continue
@@ -50,33 +71,6 @@ def plan_generated_interface(
             if stage != contract.stage:
                 raise context.error(value, f"{name}() is available only in {contract.stage} shaders")
             generated_apis.add(name)
-        if name != "texture_sample" or not value.args:
-            continue
-        texture_name = value.args[0].id if isinstance(value.args[0], ast.Name) else None
-        if texture_name is None or argument_types.get(texture_name, ConcreteType("void", "void")).kind != "texture":
-            continue
-        argument_kinds = ["texture"]
-        for argument in value.args[1:]:
-            argument_type = argument_types.get(argument.id) if isinstance(argument, ast.Name) else None
-            argument_kinds.append(argument_type.kind if argument_type is not None else "value")
-        sampling = texture_sampling_contract(argument_kinds)
-        if sampling is None:
-            continue
-        if stage is not None and stage not in sampling.stages:
-            raise context.error(
-                value,
-                resource_stage_error("texture_sample", sampling.stages, has_lod=sampling.has_lod),
-            )
-        previous_mode = sampler_modes.get(texture_name)
-        if previous_mode is not None and previous_mode != sampling.sampler_mode:
-            raise context.error(
-                value,
-                "one texture entry parameter cannot be sampled through both "
-                "implicit and explicit sampler forms in the same stage",
-            )
-        sampler_modes[texture_name] = sampling.sampler_mode
-        if not sampling.explicit_sampler:
-            implicit_textures.add(texture_name)
 
     return GeneratedInterfacePlan(
         tuple(ImplicitSamplerPlan(texture_name) for texture_name in sorted(implicit_textures)),

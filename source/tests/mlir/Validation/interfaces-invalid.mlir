@@ -6,6 +6,7 @@
 // CHECK-DAG: compute entry requires 'vernon.workgroup_size'
 // CHECK-DAG: contains compiler-owned TensorView metadata ABI state
 // CHECK-DAG: but the vertex output has type
+// CHECK-DAG: argument #0 compute resource binds in argument order and must use descriptor set 0, binding 0
 
 module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 2 : i64} {
   func.func @bad_vertex(
@@ -40,6 +41,16 @@ module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_ve
       }) attributes {
     vernon.entry, vernon.stage = "compute"
   } {
+    return
+  }
+
+  func.func @bad_compute_binding(
+      %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
+        vernon.interface = "resource", vernon.set = 1 : i64, vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry, vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
     return
   }
 }

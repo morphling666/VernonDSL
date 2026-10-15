@@ -178,10 +178,8 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
     }
 
     for (const Parameter &parameter : stagePlan.parameters) {
-        if (isOpenGLBackend(backend) && parameter.kind == "image" && parameter.bindingRole == "sampled") {
-            error = "OpenGL compute pipelines do not support sampled textures in the current language contract";
-            return false;
-        }
+        if (parameter.kind == "sampler")
+            continue;
         for (const ParameterUse &use : parameter.uses) {
             if (use.stage != "compute" && use.stage != stagePlan.compute)
                 continue;
@@ -251,6 +249,45 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         }
     }
 
+    // A sampler has no descriptor of its own: it binds at the native descriptor of each image it samples, where the
+    // provider merges both into one combined image-sampler, so image layouts must exist first.
+    for (const Parameter &parameter : stagePlan.parameters) {
+        if (parameter.kind != "sampler")
+            continue;
+        bool firstLayout = true;
+        for (const ParameterUse &use : parameter.uses) {
+            if (use.stage != "compute" && use.stage != stagePlan.compute)
+                continue;
+            for (const SampledImageBinding &sampled : use.sampledImageBindings) {
+                const auto image = std::find_if(output.layouts.begin(), output.layouts.end(), [&](const auto &layout) {
+                    if (layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                        layout.argument_index >= reflection.arguments.size())
+                        return false;
+                    const ReflectedArgument &argument = reflection.arguments[layout.argument_index];
+                    return argument.descriptorSet == sampled.descriptorSet && argument.binding == sampled.binding;
+                });
+                if (image == output.layouts.end()) {
+                    error = "prepared compute sampler pairs with no prepared sampled image";
+                    return false;
+                }
+                VernonRuntimeProviderBindingLayoutEntry layout{};
+                layout.slot = firstLayout ? parameter.slot : ++internalSlot;
+                layout.set = image->set;
+                layout.binding = image->binding;
+                layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                layout.access = 1;
+                layout.array_count = 1;
+                layout.argument_index = use.index;
+                layout.element_size = 1;
+                if (!appendBinding(output, layout, use.index, 0, error))
+                    return false;
+                firstLayout = false;
+            }
+        }
+    }
+
     if (const MetadataCarrier *computeCarrier = stageMetadataCarrier(stagePlan, "compute")) {
         const MetadataCarrier &carrier = *computeCarrier;
         if (carrier.size > UINT32_MAX || carrier.alignment > UINT32_MAX || output.layouts.size() > UINT32_MAX) {
@@ -300,6 +337,91 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
         output.sources.push_back(sources[index]);
     }
     return validatePreparedComputeBindingPlan(output, error);
+}
+
+bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
+                                const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
+                                VernonRuntimeProviderBindingValue &value) {
+    if (!source.metadataCarrier || launch.metadataPayload.empty() ||
+        launch.metadataPayload.size() != layout.element_size || launch.metadataAlignment != layout.element_alignment)
+        return false;
+    value.payload.inline_value.data = launch.metadataPayload.data();
+    value.payload.inline_value.size = launch.metadataPayload.size();
+    return true;
+}
+
+bool fillPreparedComputeBindingValues(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
+                                      const PlannedComputeLaunch &launch,
+                                      std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error) {
+    values.resize(prepared.size());
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        const VernonRuntimeProviderBindingLayoutEntry &layout = prepared.layouts[index];
+        const PreparedBindingSource &source = prepared.sources[index];
+        VernonRuntimeProviderBindingValue &value = values[index];
+        value = {};
+        value.slot = layout.slot;
+        value.kind = layout.kind;
+        if (source.metadataCarrier) {
+            if (!bindComputeMetadataCarrier(layout, source, launch, value)) {
+                error = "metadata carrier payload does not match its compiled ABI";
+                return false;
+            }
+            continue;
+        }
+        if (source.argumentIndex >= launch.arguments.size()) {
+            error = "prepared argument index is invalid";
+            return false;
+        }
+        const ComputeLaunchArgument &argument = launch.arguments[source.argumentIndex];
+        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+            layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (!tensor || !tensor->resource.resource.value) {
+                error = "prepared storage binding requires an RHI Tensor";
+                return false;
+            }
+            value.payload.buffer.resource = tensor->resource;
+            VernonRuntimeProviderResourceReference &resource = value.payload.buffer.resource;
+            if (resource.offset > resource.size || source.resourceOffset > resource.size - resource.offset) {
+                error = "aggregate storage leaf exceeds its Tensor resource";
+                return false;
+            }
+            resource.offset += source.resourceOffset;
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            const auto *image = std::get_if<ComputeImageArgument>(&argument);
+            if (!image || !image->view.resource.value) {
+                error = "prepared image binding requires an RHI Texture";
+                return false;
+            }
+            value.payload.image.view = image->view;
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
+            const auto *sampler = std::get_if<ComputeSamplerArgument>(&argument);
+            if (!sampler || !sampler->resource.resource.value) {
+                error = "prepared sampler binding requires an RHI Sampler";
+                return false;
+            }
+            value.payload.sampler.resource = sampler->resource;
+        } else {
+            // A Value-storage buffer carries its packed bytes inline, exactly like an inline value.
+            const bool valueStorage = layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+            if (!scalar || !scalar->data || !scalar->size || (valueStorage && scalar->size != layout.element_size)) {
+                error = "prepared inline binding requires host data at argument " +
+                        std::to_string(layout.argument_index) + " (kind " + std::to_string(argument.index()) +
+                        ", size " + std::to_string(scalar ? scalar->size : 0) + ")";
+                for (const Parameter &parameter : projection.parameters)
+                    for (const ParameterUse &use : parameter.uses)
+                        if (use.index == layout.argument_index)
+                            error += " for parameter '" + parameter.name + "' (interface " + use.interfaceKind +
+                                     ", transport " + use.transport + ")";
+                return false;
+            }
+            value.payload.inline_value.data = scalar->data;
+            value.payload.inline_value.size = scalar->size;
+        }
+    }
+    return true;
 }
 
 bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, std::string &error) {
@@ -450,7 +572,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         source.descriptorBinding = use.binding;
 
         if (parameter.kind == "sampler") {
-            if (use.sampledImageBindings.empty() || (directX12 && use.sampledImageBindings.size() != 1)) {
+            if (use.sampledImageBindings.empty()) {
                 error = "graphics sampler has no reflected image binding";
                 return false;
             }

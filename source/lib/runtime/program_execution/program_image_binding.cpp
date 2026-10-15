@@ -85,6 +85,12 @@ bool resolveBorrowedProgramImage(VernonRuntimeContext &context, const program::S
     if ((!genericSampledConstraint && (!expectedFormat || resolved.image.format != *expectedFormat)) ||
         (genericSampledConstraint && resolved.image.format == VERNON_RHI_FORMAT_UNDEFINED))
         return error = "Program borrowed image format does not match its Storage descriptor", false;
+    if (storage.image.sampleResultClass != VERNON_IMAGE_SAMPLE_NONE &&
+        !vernon::formats::providesSampleResultClass(resolved.view.format, storage.image.sampleResultClass))
+        return error = "Program borrowed image view format does not provide the " +
+                       std::string(vernon::formats::sampleResultClassName(storage.image.sampleResultClass)) +
+                       " sample result class of its sampled Texture",
+               false;
     if ((!genericSampledConstraint && (resolved.view.aspects & expectedAspects) != expectedAspects) ||
         (genericSampledConstraint && !resolved.view.aspects))
         return error = "Program borrowed image aspects do not match its Storage descriptor", false;

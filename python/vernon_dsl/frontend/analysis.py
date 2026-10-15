@@ -36,6 +36,7 @@ def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
             "owner": effect.owner,
             "stages": sorted(effect.stages),
             "has_lod": effect.has_lod,
+            "sampler_mode": effect.sampler_mode,
         }
     if isinstance(effect, StorageEffect):
         return {

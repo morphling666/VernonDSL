@@ -54,6 +54,7 @@ from .intrinsics import (
 )
 from .types import (
     Feature,
+    Interpolation,
     Matrix,
     Sampler,
     Specialization,
@@ -277,6 +278,7 @@ __all__ = [
     "GraphicsPipelineState",
     "GraphicsTargetFormats",
     "IndexBufferView",
+    "Interpolation",
     "Kernel",
     "LoadOperation",
     "Matrix",

@@ -27,6 +27,7 @@ struct LocationEndpoint {
     unsigned index;
     Type type;
     int64_t location;
+    std::optional<Interpolation> interpolation;
 };
 
 class WorkgroupUniformityAnalysis {
@@ -577,6 +578,14 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                     function.emitError() << "argument #" << index << " graphics TensorView must have read access";
                     invalid = true;
                 }
+                if (kind == InterfaceKind::Resource && *stage == ShaderStage::Compute && descriptorSet && binding &&
+                    (*descriptorSet != 0 || *binding != static_cast<int64_t>(index))) {
+                    function.emitError() << "argument #" << index
+                                         << " compute resource binds in argument order and must use descriptor set 0, "
+                                            "binding "
+                                         << index;
+                    invalid = true;
+                }
                 const bool graphicsPlannedResource =
                     kind == InterfaceKind::Resource && !isResult && *stage != ShaderStage::Compute &&
                     isa<TextureType, SamplerType>(type) && !attrs.descriptorSet && !attrs.binding;
@@ -626,6 +635,35 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                     }
                 }
 
+                const bool varying =
+                    isIo && location && (isResult ? *stage == ShaderStage::Vertex : *stage == ShaderStage::Fragment);
+                std::optional<Interpolation> interpolation;
+                if (varying) {
+                    FailureOr<Interpolation> typeDefault = resolveInterpolation({}, type, getOperation());
+                    FailureOr<Interpolation> resolved = resolveInterpolation(dictionary, type, getOperation());
+                    if (failed(typeDefault)) {
+                        function.emitError()
+                            << (isResult ? "result #" : "argument #") << index << " varying has no numeric layout";
+                        invalid = true;
+                    } else if (failed(resolved)) {
+                        function.emitError()
+                            << (isResult ? "result #" : "argument #") << index << " '" << kInterpolationAttrName
+                            << "' must be \"smooth\", \"noperspective\", or \"flat\"";
+                        invalid = true;
+                    } else if (*typeDefault == Interpolation::Flat && *resolved != Interpolation::Flat) {
+                        function.emitError()
+                            << (isResult ? "result #" : "argument #") << index << " integer varyings must be flat";
+                        invalid = true;
+                    } else {
+                        interpolation = *resolved;
+                    }
+                } else if (dictionary && dictionary.get(kInterpolationAttrName)) {
+                    function.emitError() << (isResult ? "result #" : "argument #") << index << " '"
+                                         << kInterpolationAttrName
+                                         << "' is only valid on located vertex outputs and fragment inputs";
+                    invalid = true;
+                }
+
                 if (!isIo || (!location && !builtin))
                     return;
 
@@ -661,7 +699,7 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 if (!location)
                     return;
                 auto &endpoints = kind == InterfaceKind::Input ? stageInputs[*stage] : stageOutputs[*stage];
-                endpoints.push_back({function, index, type, *location});
+                endpoints.push_back({function, index, type, *location, interpolation});
             };
 
             for (unsigned index = 0; index < function.getNumArguments(); ++index)
@@ -752,6 +790,11 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                         << stringifyShaderStage(consumer) << " input #" << input.index << " at location "
                         << input.location << " has type " << input.type << ", but the "
                         << stringifyShaderStage(producer) << " output has type " << matchingLocation->type;
+                    invalid = true;
+                } else if (matchingLocation->interpolation != input.interpolation) {
+                    input.function.emitError()
+                        << stringifyShaderStage(consumer) << " input #" << input.index << " at location "
+                        << input.location << ": varying interpolation differs between stages";
                     invalid = true;
                 }
             }

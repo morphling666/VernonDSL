@@ -197,6 +197,13 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const VernonStageIn
                 plan.assignedArguments[use.index] = 1;
                 continue;
             }
+            if (supplied.kind == VERNON_PROGRAM_SAMPLER) {
+                if (parameter.kind != "sampler" || !supplied.resource.resource.value)
+                    return fail(error, "compute sampler argument is invalid");
+                argument = ComputeSamplerArgument{supplied.resource};
+                plan.assignedArguments[use.index] = 1;
+                continue;
+            }
             if (supplied.kind != VERNON_PROGRAM_TENSOR)
                 return fail(error, "compute argument kind is unsupported");
             if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
@@ -430,8 +437,8 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         const VernonProgramArgument *argument = findArgument(invocation, parameter.slot);
         if (!argument)
             return fail(error, "pipeline argument kind does not match layout");
-        if (parameter.kind == "image") {
-            if (argument->kind != VERNON_PROGRAM_IMAGE)
+        if (parameter.kind == "image" || parameter.kind == "sampler") {
+            if (argument->kind != (parameter.kind == "image" ? VERNON_PROGRAM_IMAGE : VERNON_PROGRAM_SAMPLER))
                 return fail(error, "pipeline argument kind does not match layout");
             continue;
         }

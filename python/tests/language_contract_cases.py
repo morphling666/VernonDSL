@@ -55,6 +55,8 @@ class RuntimeOracleKind(Enum):
     SPECIALIZATION_PIXELS = "specialization_pixels"
     TYPE_SPECIALIZATION_PIXELS = "type_specialization_pixels"
     STORAGE_TEXEL = "storage_texel"
+    COMPUTE_SAMPLED_TEXELS = "compute_sampled_texels"
+    TEXEL_FETCH = "texel_fetch"
     STRUCTURED_VIEW = "structured_view"
     SYNCHRONIZATION = "synchronization"
     MODULE_VJP = "module_vjp"
@@ -82,7 +84,9 @@ class AcceptanceSuite(Enum):
 
 @dataclass(frozen=True)
 class RuntimeOracle:
-    """For SPECIALIZATION_PIXELS, `specialization` names a u32 specialization and `expected` holds one
+    """`parameter` names the Program parameter the oracle binds: the buffer it reads back for buffer oracles, and
+    the Texture whose texels it uploads for TEXEL_FETCH.
+    For SPECIALIZATION_PIXELS, `specialization` names a u32 specialization and `expected` holds one
     (value, red channel) pair per cooked variant; the runtime resolves and renders each variant.
     For TYPE_SPECIALIZATION_PIXELS, `specialization` names a type specialization, `type_values` holds
     the type identity of each cooked variant, and `expected` holds the matching red channels."""
@@ -406,6 +410,17 @@ METADATA_VALID_CASES: Final = tuple(
         ),
         ("varying", "Annotated[f32, varying()]", ("varying", ())),
         (
+            "linear-varying",
+            "Annotated[f32, varying(Interpolation.LINEAR)]",
+            ("varying", ("noperspective",)),
+        ),
+        (
+            "flat-varying-keyword",
+            "Annotated[f32, vd.varying(interpolation=vd.Interpolation.FLAT)]",
+            ("varying", ("flat",)),
+        ),
+        ("default-varying-none", "Annotated[f32, varying(None)]", ("varying", ())),
+        (
             "bound-resource",
             "Annotated[f32, resource(set=1, binding=2)]",
             ("resource", (1, 2)),
@@ -428,7 +443,14 @@ METADATA_INVALID_CASES: Final = tuple(
             "Annotated[f32, instance(location=0)]",
             "unknown annotation metadata",
         ),
-        ("varying-arity", "Annotated[f32, varying(1)]", "wrong number"),
+        (
+            "varying-arity",
+            "Annotated[f32, varying(Interpolation.FLAT, Interpolation.FLAT)]",
+            "wrong number",
+        ),
+        ("varying-literal-interpolation", "Annotated[f32, varying(1)]", "vd.Interpolation"),
+        ("varying-unknown-interpolation", "Annotated[f32, varying(Interpolation.CENTROID)]", "vd.Interpolation"),
+        ("varying-sampling", "Annotated[f32, varying(sampling=1)]", "accepts only interpolation"),
         (
             "negative-divisor",
             "Annotated[f32, attribute(divisor=-1)]",
@@ -691,6 +713,108 @@ def main(
         "both implicit and explicit sampler forms",
         capabilities=frozenset({"graphics", "texture_sampler"}),
     ),
+    _invalid_source(
+        "LANG-TEXTURE-SAMPLE-EXPLICIT",
+        "mixed-sampler-mode-through-helper",
+        "explicit texture_sample in a helper mixed with implicit sampling in the entry",
+        """
+from vernon_dsl import *
+@func
+def filtered(image: Texture["2d", f32], sampler: Sampler, uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample(image, sampler, uv)
+@fragment
+def main(
+    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    sampler: Annotated[Sampler, resource(set=0, binding=1)],
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
+    implicit_value = texture_sample(image, uv)
+    return implicit_value + filtered(image, sampler, uv)
+""",
+        "texture parameter 'image' cannot be sampled through both implicit and explicit sampler forms",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-FETCH",
+        "cube-fetch",
+        "texture_load(cube_texture, coordinates)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["cube", f32], texel: Vector[i32, 3]) -> Vector[f32, 4]:
+    return texture_load(image, texel)
+""",
+        "texture_load cannot address texels of a cube texture",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-FETCH",
+        "floating-coordinates",
+        "texture_load(texture, floating_coordinates)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", u32], uv: Vector[f32, 2]) -> u32:
+    return texture_load(image, uv)[0]
+""",
+        "coordinates for a 2d texture must be a 2-component integer vector",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-FETCH",
+        "compute-fetch",
+        "texture_load(sampled_texture, coordinates) in compute",
+        """
+from vernon_dsl import *
+@kernel(workgroup_size=(1, 1, 1))
+def main(image: Texture["2d", u32], output: TensorView[u32, (1,), write]) -> None:
+    output[0] = texture_load(image, Vector([0, 0]))[0]
+""",
+        "texture_load from a sampled texture is supported only in graphics stages",
+        valid_regions=frozenset({"vertex", "fragment"}),
+        invalid_regions=frozenset({"compute"}),
+        capabilities=frozenset({"compute", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-FETCH",
+        "integer-sample",
+        "texture_sample(integer_texture, coordinates)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", u32], uv: Vector[f32, 2]) -> Vector[u32, 4]:
+    return texture_sample(image, uv)
+""",
+        "integer textures are read with texture_load, not texture_sample",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-STORAGE",
+        "sampled-store",
+        "texture_store(sampled_texture, coordinates, value)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], texel: Vector[i32, 2]) -> Vector[f32, 4]:
+    texture_store(image, texel, Vector([1.0, 1.0, 1.0, 1.0]))
+    return Vector([1.0, 1.0, 1.0, 1.0])
+""",
+        "texture_store requires a storage Texture",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-INTERFACE-001",
+        "kernel-resource-binding",
+        "kernel Resource with resource(set, binding)",
+        """
+from vernon_dsl import *
+@kernel
+def main(image: Annotated[Texture["2d", rgba32_float, write], resource(set=1, binding=0)]) -> None:
+    texture_store(image, Vector([0, 0]), Vector([1.0, 1.0, 1.0, 1.0]))
+""",
+        "kernel Resources bind in argument order",
+        capabilities=frozenset({"compute", "storage_texture"}),
+    ),
 )
 
 TEXTURE_OPERATION_VALID_CASES: Final = tuple(
@@ -724,7 +848,7 @@ from vernon_dsl import *
 
 @kernel
 def store(
-    image: Annotated[Texture["2d_array", rgba32_float, write], resource(set=0, binding=0)],
+    image: Texture["2d_array", rgba32_float, write],
     coordinate: Vector[i32, 3],
     value: Vector[f32, 4],
 ) -> None:
@@ -757,7 +881,7 @@ from vernon_dsl import *
 
 @kernel
 def store(
-    image: Annotated[Texture["3d", rgba32_float, write], resource(set=0, binding=0)],
+    image: Texture["3d", rgba32_float, write],
     coordinate: Vector[i32, 3],
     value: Vector[f32, 4],
 ) -> None:
@@ -776,7 +900,7 @@ from vernon_dsl import *
 
 @kernel
 def increment(
-    image: Annotated[Texture["2d", r32_uint, read_write], resource(set=0, binding=0)],
+    image: Texture["2d", r32_uint, read_write],
     coordinate: Vector[i32, 2],
 ) -> None:
     value = texture_load(image, coordinate)
@@ -785,6 +909,41 @@ def increment(
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_texture"}),
         expected='!vernon.texture<"2d", i32, "r32_uint", "read_write">',
+    ),
+    _valid_source(
+        "LANG-TEXTURE-FETCH",
+        "integer-fetch",
+        "texture_load(sampled_texture, coordinates)",
+        """
+from vernon_dsl import *
+
+@fragment
+def main(
+    identifiers: Annotated[Texture["2d", u32], resource(set=0, binding=0)],
+    layers: Annotated[Texture["2d_array", f32], resource(set=0, binding=1)],
+    pixel: Annotated[Vector[f32, 4], builtin("frag_coord")],
+) -> u32:
+    texel = Vector([i32(pixel.x), i32(pixel.y)])
+    shade = texture_load(layers, Vector([texel.x, texel.y, 1]))
+    return texture_load(identifiers, texel)[0] + u32(shade.x)
+""",
+        valid_regions=frozenset({"vertex", "fragment"}),
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+        expected='(!vernon.texture<"2d", i32, "unknown", "sampled">, tensor<2xi32>) -> tensor<4xi32>',
+    ),
+    _valid_source(
+        "LANG-COLOR-TARGET",
+        "unsigned-output",
+        "fragment result of an unsigned integer target",
+        """
+from vernon_dsl import *
+@fragment
+def main(pixel: Annotated[Vector[f32, 4], builtin("frag_coord")]) -> u32:
+    return u32(pixel.x)
+""",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics"}),
+        expected='(i32 {vernon.interface = "output", vernon.location = 0 : i64, vernon.abi_leaf_dtypes = ["u32"]})',
     ),
     _valid_source(
         "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
@@ -2915,6 +3074,41 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
         asset_reference="source/tests/fixtures/language_contract_texture_asset.py:storage_asset",
         requirements=AcceptanceRequirements(compute=True, storage_texture=True),
         oracle=RuntimeOracle(RuntimeOracleKind.STORAGE_TEXEL, (1.0, 1.0, 1.0, 1.0)),
+    ),
+    LanguageContractAcceptance(
+        id="compute_sampled_texture",
+        contract_ids=frozenset({"LANG-RESOURCE-002", "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD"}),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:compute_sample_asset",
+        requirements=AcceptanceRequirements(compute=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.COMPUTE_SAMPLED_TEXELS, (0.1, 0.3, 0.7, 1.0)),
+    ),
+    LanguageContractAcceptance(
+        id="texel_fetch",
+        contract_ids=frozenset({"LANG-TEXTURE-FETCH", "LANG-COLOR-TARGET"}),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:fetch_asset",
+        requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(
+            RuntimeOracleKind.TEXEL_FETCH,
+            (
+                0xFFFFFFFF,
+                (1 << 24) + 1,
+                (1 << 31) + 3,
+                7,
+                0,
+                (1 << 24) + 5,
+                0x89ABCDEF,
+                11,
+                0x7FFFFFFF,
+                (1 << 25) + 1,
+                13,
+                0xFEDCBA98,
+                17,
+                (1 << 24) + 19,
+                0x80000000,
+                23,
+            ),
+            parameter="identifiers",
+        ),
     ),
     LanguageContractAcceptance(
         id="synchronization",

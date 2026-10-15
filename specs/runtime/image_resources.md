@@ -145,7 +145,19 @@ access
 
 Only storage bindings require an exact shader-visible image format. Sampled
 bindings require a compatible component class and obtain the concrete physical
-format from the bound view descriptor.
+format from the bound view descriptor. The sample result class is `float`
+for an `f32` sample type, `sint` for `i32` and `uint` for `u32`; `float` and
+`unorm` formats provide `float`. Because the MLIR texture element type is
+signless, the frontend carries the sample type as the argument's
+`vernon.dtype`, and binding rejects a view whose format provides another
+class. The Program image constraint query reports that class, and
+`VERNON_IMAGE_SAMPLE_NONE` for an image that is never sampled.
+
+The query's binding role comes from the image Storage usage, not from the
+parameter's access: an attachment usage wins, then `storage`, then `sampled`,
+then transfer. A storage texture that a shader only reads is therefore still
+a storage binding, and needs storage usage and its exact format. The query
+reports the storage format whenever the usage includes `storage`.
 
 ## 4. Difference from TensorView
 
@@ -250,6 +262,29 @@ logical storage constraint -> RHI format compatibility check
 RHI format                 -> Vulkan/D3D12/Metal/OpenGL native format
 RHI view dimension         -> backend native view target
 ```
+
+Format facts have one source, the X-macro table
+`source/include/VernonFormats.def`. Each row gives the public name, RHI and
+texture enum values, component class, pixel size, host data format and type,
+the native GL, Vulkan, D3D12, Metal and SPIR-V formats, and the baseline
+capabilities its class allows (renderable, blendable, filterable, storage,
+resolvable, multisample, copyable). Every C++ and Python consumer reads it
+(the reasons are in the [runtime design](design.md) section 12). Integer
+formats (`r32_uint`, `rg32_uint`) are never blendable, filterable or
+resolvable.
+
+A device narrows the baseline: `vernonRhiDeviceGetFormatCapabilities` reports
+the capabilities it actually supports, and Program load rejects, with
+`PROGRAM_OPERATION_UNSUPPORTED`, a target format the device cannot render,
+store or multisample, and blending on an integer-only attachment.
+
+Host image data follows the row's host data format and type, tightly packed
+row by row, with no conversion. Integer formats transfer one host `uint32`
+per component, so uploads and readbacks are exact.
+
+Color clears take a `VernonClearColor` (`VernonGraphicsState.h`), read
+according to the attachment's component class, so integer clears are exact
+on every backend.
 
 OpenGL 4.3 or `ARB_texture_view` is required for true shader-visible aliased
 views. A canonical identity view whose format, dimension, aspects, and complete

@@ -117,6 +117,46 @@ def storage_texture_round_trip(
     vd.texture_store(image, coordinate, value + vd.Vector([1.0, 2.0, 3.0, 4.0]))
 
 
+@vd.kernel(workgroup_size=(4, 1, 1))
+def read_only_storage_texture(
+    image: vd.Texture["2d", vd.rgba32_float, vd.read],  # noqa: F722
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    texel = vd.texture_load(image, vd.Vector([vd.i32(gid[0]), vd.i32(0)]))
+    output[gid[0]] = texel[0] + texel[3]
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def compute_texture_sample(
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    image: vd.Texture["2d", vd.f32],  # noqa: F722
+    image_sampler: vd.Sampler,
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    u = (vd.f32(gid[0]) + 0.5) / 4.0 + (0.5 if gid[0] == 3 else 0.0)
+    output[gid[0]] = vd.texture_sample(image, image_sampler, vd.Vector([u, 0.5]), 0.0)[0]
+
+
+@vd.struct(shared=True)
+class SampleCoordinate:
+    u: vd.f32
+    scale: vd.f32
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def compute_texture_sample_after_records(
+    coordinates: vd.TensorView[SampleCoordinate, (vd.dyn,), vd.read],
+    image: vd.Texture["2d", vd.f32],  # noqa: F722
+    image_sampler: vd.Sampler,
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    coordinate = coordinates[gid[0]]
+    texel = vd.texture_sample(image, image_sampler, vd.Vector([coordinate.u, 0.5]), 0.0)
+    output[gid[0]] = texel[0] * coordinate.scale
+
+
 @vd.kernel(workgroup_size=(2, 1, 1))
 def matrix_vector(
     output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
@@ -682,6 +722,44 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             expected[0:1, 1:3, 1:3],
         )
         np.testing.assert_array_equal(image.download(), expected)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    def test_read_only_storage_texture_binds_as_storage(self, backend: BackendRow) -> None:
+        texels = np.zeros((1, 4, 4), dtype=np.float32)
+        texels[0, :, 0] = [1.0, 2.0, 3.0, 4.0]
+        texels[0, :, 3] = [10.0, 20.0, 30.0, 40.0]
+        image = vd.Texture.from_numpy(
+            texels, dimension="2d", format=vd.rgba32_float, usage=("storage", "transfer_destination")
+        )
+        output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        read_only_storage_texture(image, output, grid=(1, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), [11.0, 22.0, 33.0, 44.0])
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, texture_sampler_operations=True))
+    def test_compute_samples_texture_through_bound_sampler(self, backend: BackendRow) -> None:
+        texels = np.zeros((1, 4, 4), dtype=np.uint8)
+        texels[0, :, 0] = [0, 51, 102, 255]
+        image = vd.Texture.from_numpy(texels, format=vd.rgba8_unorm)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        compute_texture_sample(output, image, vd.sampler(address="clamp_to_edge"), grid=(1, 1, 1))
+        # The last invocation samples past the right edge, which only clamp_to_edge maps to the edge texel.
+        np.testing.assert_allclose(output.to_numpy(), [0.0, 0.2, 0.4, 1.0], atol=1e-6)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, texture_sampler_operations=True))
+    def test_compute_sampler_pairs_after_multi_leaf_storage(self, backend: BackendRow) -> None:
+        """A struct view takes one binding per field, so the image's binding differs from its parameter index."""
+        texels = np.zeros((1, 4, 4), dtype=np.uint8)
+        texels[0, :, 0] = [0, 51, 102, 255]
+        image = vd.Texture.from_numpy(texels, format=vd.rgba8_unorm)
+        records = vd.storage.from_values(
+            tuple(SampleCoordinate(vd.f32((index + 0.5) / 4.0), vd.f32(index + 1.0)) for index in range(4)),
+            dtype=SampleCoordinate,
+        )
+        output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        compute_texture_sample_after_records(
+            records.view(access="read"), image, vd.sampler(address="clamp_to_edge"), output, grid=(1, 1, 1)
+        )
+        np.testing.assert_allclose(output.to_numpy(), [0.0, 0.4, 1.2, 4.0], atol=1e-6)
 
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
     def test_three_dimensional_texture_mipmap_backend_parity(self, backend: BackendRow) -> None:

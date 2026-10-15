@@ -117,6 +117,44 @@ def resources(
         assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-storage"))
         assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-array-storage"))
 
+    @covers_case("LANG-TEXTURE-FETCH/integer-fetch", layers="FI")
+    @covers_case("LANG-TEXTURE-FETCH/cube-fetch", layers="F")
+    @covers_case("LANG-TEXTURE-FETCH/floating-coordinates", layers="F")
+    @covers_case("LANG-TEXTURE-FETCH/compute-fetch", layers="F")
+    @covers_case("LANG-TEXTURE-FETCH/integer-sample", layers="F")
+    @covers_case("LANG-TEXTURE-STORAGE/sampled-store", layers="F")
+    def test_sampled_texture_fetch_uses_texel_coordinates(self) -> None:
+        case = case_by_id("LANG-TEXTURE-FETCH/integer-fetch")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        assert isinstance(case.expected, str)
+        self.assertIn(case.expected, output)
+        self.assertIn(
+            '(!vernon.texture<"2d_array", f32, "unknown", "sampled">, tensor<3xi32>) -> tensor<4xf32>',
+            output,
+        )
+        self.assertRegex(output, r'source_name = "identifiers"[^}]*vernon\.dtype = "u32"')
+        self.assertIn('vernon.implicit_texture = "identifiers"', output)
+        self.assertIn('vernon.implicit_texture = "layers"', output)
+
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-FETCH/cube-fetch"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-FETCH/floating-coordinates"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-FETCH/compute-fetch"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-FETCH/integer-sample"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-STORAGE/sampled-store"))
+
+    @covers_case("LANG-COLOR-TARGET/unsigned-output", layers="FI")
+    def test_fragment_result_keeps_its_unsigned_type(self) -> None:
+        case = case_by_id("LANG-COLOR-TARGET/unsigned-output")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        assert isinstance(case.expected, str)
+        self.assertIn(case.expected, output)
+
+    @covers_case("LANG-INTERFACE-001/kernel-resource-binding", layers="F")
+    def test_kernel_resources_reject_explicit_bindings(self) -> None:
+        assert_frontend_rejects(self, case_by_id("LANG-INTERFACE-001/kernel-resource-binding"))
+
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """
 from vernon_dsl import *
@@ -213,6 +251,29 @@ def main(
         self.assertNotIn("vernon.set", sampler)
         self.assertNotIn("vernon.binding", sampler)
 
+    def test_every_unpaired_sampled_texture_gets_an_implicit_sampler(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def shade(image: Texture["2d", f32], sampler: Sampler, uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample(image, sampler, uv)
+
+@fragment
+def main(
+    measured: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    explicit: Annotated[Texture["2d", f32], resource(set=0, binding=1)],
+    linear: Annotated[Sampler, resource(set=0, binding=2)],
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
+    extent = texture_size(measured)
+    return shade(explicit, linear, uv) * f32(extent.x)
+"""
+        output = compile_source(source, "unpaired_sampled_textures.py")
+        # A combined image-sampler binding needs a sampler even when nothing samples through it.
+        self.assertIn('vernon.implicit_texture = "measured"', output)
+        self.assertNotIn('vernon.implicit_texture = "explicit"', output)
+
     def test_swizzle_aliases_are_canonicalized(self) -> None:
         source = """
 from vernon_dsl import *
@@ -260,8 +321,10 @@ class StageTests(unittest.TestCase):
             assert_frontend_rejects(self, case)
 
     @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode-through-helper", layers="F")
     def test_texture_cannot_mix_implicit_and_explicit_samplers(self) -> None:
         assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode-through-helper"))
 
     @covers_case_group("GENERATED_BUILTIN_VALID_CASES", layers="FI")
     def test_parameterless_graphics_builtins(self) -> None:
@@ -368,7 +431,7 @@ def shade(color: Annotated[Vector[f32, 4], varying()]) -> f32:
 
 @kernel(workgroup_size=(8, 4, 1))
 def update(
-    values: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=3)],
+    values: TensorView[f32, (dyn,), read_write],
     invocation: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
 ) -> None:
     current = values[invocation[0]]

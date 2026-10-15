@@ -44,9 +44,10 @@ from .model import (
     TypedParameter,
     TypedStatement,
     is_abi_stable_value,
+    resource_sampler_modes,
 )
 from .tensor_shapes import matmul_shape
-from .texture_dimensions import SAMPLE_COORDINATE_RANK, SIZE_RANK, STORAGE_COORDINATE_RANK
+from .texture_dimensions import SAMPLE_COORDINATE_RANK, SIZE_RANK, TEXEL_COORDINATE_RANK
 from .type_solver import (
     InferenceType,
     can_convert,
@@ -362,8 +363,9 @@ class _Inference:
                 argument_type = self.parse_type(argument.annotation)
                 access = AccessMode.READ
                 if argument_type.kind == "tensor_view":
-                    access_name = argument_type.arguments[2]
-                    access = AccessMode(str(access_name))
+                    access = AccessMode(str(argument_type.arguments[2]))
+                elif argument_type.kind == "texture" and argument_type.arguments[3] != "sampled":
+                    access = AccessMode(str(argument_type.arguments[3]))
                 parameters.append(
                     TypedParameter(
                         argument.arg,
@@ -528,6 +530,13 @@ class _Inference:
                         invalid_resource.stages,
                         has_lod=invalid_resource.has_lod,
                     ),
+                )
+            _, mixed_sampler = resource_sampler_modes(function.effects)
+            if mixed_sampler is not None:
+                raise self.error(
+                    _first_statement_with_effect(function.body, mixed_sampler) or function.source,
+                    f"texture parameter '{mixed_sampler.owner}' cannot be sampled through both "
+                    "implicit and explicit sampler forms in the same stage",
                 )
             if function_kind not in ENTRY_DECORATORS | {"func"} and function.effects:
                 raise self.error(
@@ -734,7 +743,7 @@ class _Inference:
     ) -> tuple[ResourceEffect, ...]:
         effects: list[ResourceEffect] = []
         for expression in expressions:
-            if expression.operation not in {"texture_sample", "texture_size"}:
+            if expression.operation not in {"texture_sample", "texture_size", "texture_load"}:
                 continue
             call = expression.source
             if not isinstance(call, ast.Call) or not call.args or not isinstance(call.args[0], ast.Name):
@@ -742,7 +751,13 @@ class _Inference:
             texture_parameter = parameters.get(call.args[0].id)
             if texture_parameter is None or texture_parameter.type.kind != "texture":
                 continue
-            if expression.operation == "texture_size":
+            sampler_mode: str | None = None
+            if expression.operation == "texture_load":
+                if texture_parameter.type.arguments[3] != "sampled":
+                    continue
+                stages = GRAPHICS_STAGES
+                has_lod = False
+            elif expression.operation == "texture_size":
                 stages = GRAPHICS_STAGES
                 has_lod = len(call.args) == 2
             else:
@@ -755,7 +770,8 @@ class _Inference:
                     continue
                 stages = sampling.stages
                 has_lod = sampling.has_lod
-            effect = ResourceEffect(expression.operation, texture_parameter.name, stages, has_lod)
+                sampler_mode = sampling.sampler_mode
+            effect = ResourceEffect(expression.operation, texture_parameter.name, stages, has_lod, sampler_mode)
             if effect not in effects:
                 effects.append(effect)
         return tuple(effects)
@@ -1530,12 +1546,16 @@ class _Inference:
         if name in {"texture_load", "texture_store"}:
             expected_arguments = 2 if name == "texture_load" else 3
             if len(arguments) != expected_arguments or not isinstance(arguments[0], ConcreteType):
-                raise self.error(node, f"{name} requires a storage texture and coordinates")
+                raise self.error(node, f"{name} requires a texture and coordinates")
             texture = arguments[0]
-            if texture.kind != "texture" or texture.arguments[3] == "sampled":
-                raise self.error(node.args[0], f"{name} requires a storage Texture")
+            if texture.kind != "texture":
+                raise self.error(node.args[0], f"{name} requires a Texture")
             dimension, element, _, access = texture.arguments
-            rank = STORAGE_COORDINATE_RANK[str(dimension)]
+            if name == "texture_store" and access == "sampled":
+                raise self.error(node.args[0], "texture_store requires a storage Texture")
+            rank = TEXEL_COORDINATE_RANK.get(str(dimension))
+            if rank is None:
+                raise self.error(node.args[0], f"texture_load cannot address texels of a {dimension} texture")
             coordinates = arguments[1]
             coordinate_element = (
                 coordinates.arguments[0]
@@ -1551,7 +1571,7 @@ class _Inference:
             ):
                 raise self.error(
                     node.args[1],
-                    f"{name} coordinates for a {dimension} storage texture must be a {rank}-component integer vector",
+                    f"{name} coordinates for a {dimension} texture must be a {rank}-component integer vector",
                 )
             assert isinstance(element, ConcreteType)
             texel = ConcreteType("tensor", "Tensor", (element, 4))
@@ -1579,6 +1599,8 @@ class _Inference:
                 raise self.error(node, "texture_sample requires coordinates")
             element = texture.arguments[1]
             assert isinstance(element, ConcreteType)
+            if element.is_integer:
+                raise self.error(node.args[0], "integer textures are read with texture_load, not texture_sample")
             dimension = texture.arguments[0]
             rank = SAMPLE_COORDINATE_RANK.get(str(dimension))
             coordinates = arguments[coordinate_index]

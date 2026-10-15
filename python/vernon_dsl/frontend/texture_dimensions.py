@@ -9,7 +9,7 @@ from __future__ import annotations
 TEXTURE_DIMENSIONS = ("2d", "3d", "cube", "2d_array", "cube_array")
 STORAGE_TEXTURE_DIMENSIONS = ("2d", "3d", "2d_array")
 SAMPLE_COORDINATE_RANK = {"2d": 2, "3d": 3, "cube": 3, "2d_array": 3, "cube_array": 4}
-STORAGE_COORDINATE_RANK = {"2d": 2, "3d": 3, "2d_array": 3}
+TEXEL_COORDINATE_RANK = {"2d": 2, "3d": 3, "2d_array": 3}
 SIZE_RANK = {"2d": 2, "3d": 3, "cube": 2, "2d_array": 3, "cube_array": 3}
 
 

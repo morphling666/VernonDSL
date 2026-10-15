@@ -4,6 +4,7 @@
 #include "compiler_program_graph.h"
 #include "compiler_program_types.h"
 
+#include "VernonTextureTypes.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 
@@ -63,7 +64,13 @@ struct ProgramStoragePlan {
     ProgramStorageAliasPlan aliases;
 };
 
-using ProgramStorageUsageRequirements = std::map<int64_t, std::set<std::string>>;
+struct ProgramStorageRequirement {
+    std::set<std::string> usage;
+    // Every sampled use of one Storage must read the same class, which the bound image's format must then provide.
+    std::optional<VernonImageSampleResultClass> sampleResultClass;
+};
+
+using ProgramStorageUsageRequirements = std::map<int64_t, ProgramStorageRequirement>;
 
 bool isProgramTextureType(llvm::StringRef type);
 bool isProgramSamplerType(llvm::StringRef type);
@@ -85,6 +92,12 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
 
 bool applyProgramStorageUsageRequirements(llvm::json::Array &storages,
                                           const ProgramStorageUsageRequirements &requirements, std::string &error);
+
+// Builds the layout of a reflected image endpoint and records the usage its binding role demands of the Storage: a
+// storage image needs "storage" and its exact format, a sampled image needs "sampled" and one sample result class.
+bool planProgramImageEndpoint(const llvm::json::Object &row, const ProgramLogicalResource &resource,
+                              const llvm::json::Array &storages, ProgramStorageUsageRequirements &requirements,
+                              llvm::json::Object &layout, std::string &error);
 
 int64_t programStorageRoot(const std::map<int64_t, int64_t> &parents, int64_t value);
 

@@ -45,6 +45,10 @@ public:
         if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type))
             return readStruct(structure);
         if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(type)) {
+            // A sampled texture's dtype names its sample result class; the image type itself records only the format.
+            if (texture.getAccess() == "sampled" && dtypeIndex_ < logicalDtypes_.size() &&
+                mlir::failed(readScalar(texture.getElementType())))
+                return mlir::failure();
             SemanticType result;
             result.kind = SemanticTypeKind::Image;
             result.parameter = texture.getFormat().str();

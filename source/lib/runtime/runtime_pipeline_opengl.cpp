@@ -88,11 +88,9 @@ BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, con
                 vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor,
                 &state->rhiPipeline);
             if (status != VERNON_STATUS_OK) {
-                const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
-                invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
-                                                            ? std::string(providerError.data, providerError.size)
-                                                            : "failed to prepare OpenGL provider compute pipeline";
+                invocationDiagnostic(*inputs.context) =
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
+                                       "failed to prepare OpenGL provider compute pipeline");
                 delete state;
                 return false;
             }
@@ -100,11 +98,9 @@ BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, con
                 const VernonStatus bindingStatus = vernonRuntimeCoreCreateBindings(
                     state->rhiPipeline, state->rhiValues.data(), state->rhiValues.size(), &state->rhiBindings);
                 if (bindingStatus != VERNON_STATUS_OK) {
-                    const VernonStringView providerError =
-                        vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
-                    invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
-                                                                ? std::string(providerError.data, providerError.size)
-                                                                : "failed to prepare OpenGL provider compute bindings";
+                    invocationDiagnostic(*inputs.context) =
+                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
+                                           "failed to prepare OpenGL provider compute bindings");
                     vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
                     delete state;
                     return false;
@@ -157,11 +153,9 @@ BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, con
                 vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor,
                 &state->rhiPipeline);
             if (status != VERNON_STATUS_OK) {
-                const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
-                invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
-                                                            ? std::string(providerError.data, providerError.size)
-                                                            : "failed to prepare OpenGL RHI provider pipeline";
+                invocationDiagnostic(*inputs.context) =
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
+                                       "failed to prepare OpenGL RHI provider pipeline");
                 delete state;
                 return false;
             }
@@ -186,11 +180,9 @@ BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, con
                 const VernonStatus bindingStatus = vernonRuntimeCoreCreateBindings(
                     state->rhiPipeline, state->rhiValues.data(), state->rhiValues.size(), &state->rhiBindings);
                 if (bindingStatus != VERNON_STATUS_OK) {
-                    const VernonStringView providerError =
-                        vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
-                    invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
-                                                                ? std::string(providerError.data, providerError.size)
-                                                                : "failed to prepare OpenGL RHI bindings";
+                    invocationDiagnostic(*inputs.context) =
+                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter),
+                                           "failed to prepare OpenGL RHI bindings");
                     vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
                     delete state;
                     return false;
@@ -228,11 +220,9 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
         const VernonStatus bindingStatus =
             vernonRuntimeCoreUpdateBindings(state.rhiBindings, state.rhiValues.data(), state.rhiValues.size());
         if (bindingStatus != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
             return fail(*pipeline.context,
-                        providerError.data ? std::string(providerError.data, providerError.size)
-                                           : "failed to update OpenGL RHI bindings",
+                        providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
+                                           "failed to update OpenGL RHI bindings"),
                         bindingStatus);
         }
     }
@@ -249,21 +239,17 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
     const VernonStatus variantStatus =
         ensureGraphicsVariant(state.rhiPipeline, prepared.variantKey, state.rhiGraphicsVariant);
     if (variantStatus != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare OpenGL RHI graphics variant",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
+                                       "failed to prepare OpenGL RHI graphics variant"),
                     variantStatus);
     }
     const VernonStatus status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(
         state.rhiGraphicsVariant.handle, state.rhiBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError =
-            vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode OpenGL RHI draw",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter),
+                                       "failed to encode OpenGL RHI draw"),
                     status);
     }
     return VERNON_STATUS_OK;
@@ -273,51 +259,10 @@ VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const 
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
         return fail(*pipeline.context, "OpenGL provider compute pipeline is not loaded");
-    const PreparedComputeBindingPlan &bindingPlan = state.rhiComputeBindingPlan;
-    for (size_t index = 0; index < bindingPlan.size(); ++index) {
-        const auto &layout = bindingPlan.layouts[index];
-        const PreparedBindingSource &preparedSource = bindingPlan.sources[index];
-        auto &value = state.rhiValues[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (preparedSource.metadataCarrier) {
-            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
-                return fail(*pipeline.context, "OpenGL metadata carrier payload does not match its compiled ABI");
-            continue;
-        }
-        if (preparedSource.argumentIndex >= launch.arguments.size())
-            return fail(*pipeline.context, "OpenGL prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
-        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
-                if (!bindComputeValueStorage(layout, argument, value))
-                    return fail(*pipeline.context, "OpenGL prepared Value storage binding has invalid bytes");
-                continue;
-            }
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->resource.resource.value)
-                return fail(*pipeline.context, "OpenGL prepared storage binding requires an RHI Tensor");
-            value.payload.buffer.resource = tensor->resource;
-            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
-                preparedSource.resourceOffset >
-                    value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
-                return fail(*pipeline.context, "OpenGL aggregate storage leaf exceeds its Tensor resource");
-            value.payload.buffer.resource.offset += preparedSource.resourceOffset;
-        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto *image = std::get_if<ComputeImageArgument>(&argument);
-            if (!image || !image->view.resource.value)
-                return fail(*pipeline.context, "OpenGL prepared image binding requires an RHI Texture");
-            value.payload.image.view = image->view;
-        } else {
-            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar || !scalar->data || !scalar->size)
-                return fail(*pipeline.context, "OpenGL prepared inline binding requires host data");
-            value.payload.inline_value.data = scalar->data;
-            value.payload.inline_value.size = scalar->size;
-        }
-    }
+    std::string error;
+    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
+                                          state.rhiValues, error))
+        return fail(*pipeline.context, "OpenGL " + error);
     VernonStatus status =
         state.rhiBindings
             ? vernonRuntimeCoreUpdateBindings(state.rhiBindings, state.rhiValues.data(), state.rhiValues.size())

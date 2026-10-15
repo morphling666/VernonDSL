@@ -78,7 +78,8 @@ def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
     bool isArrayed() const;
     bool isCube() const;
     int64_t sampleCoordinateWidth() const;
-    int64_t storageCoordinateWidth() const;
+    // Integer texel coordinates address 2d, 3d, and 2d_array textures only; cube textures have no texel space.
+    int64_t texelCoordinateWidth() const;
     int64_t sizeWidth() const;
   }];
 }

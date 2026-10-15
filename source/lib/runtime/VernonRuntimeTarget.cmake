@@ -270,8 +270,12 @@ function(vernon_add_runtime)
     target_compile_definitions(VernonRuntimeInternals PRIVATE VERNON_RUNTIME_STATIC)
     target_include_directories(VernonRuntimeInternals PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
                                                               $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonRuntimeInternals PRIVATE VernonRuntimeCore VernonRuntimeUtilities
-                                                         $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+    target_link_libraries(
+        VernonRuntimeInternals
+        PRIVATE VernonRuntimeCore
+                VernonRuntimeUtilities
+                Vernon::RHI
+                $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
     if(MSVC)
         target_compile_options(VernonRuntimeInternals PRIVATE /EHsc)
     endif()

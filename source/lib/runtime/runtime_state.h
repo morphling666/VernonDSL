@@ -80,6 +80,11 @@ const std::string *currentInvocationDiagnostic(const VernonRuntimeContext &conte
 VernonStringView currentInvocationDiagnosticView(const VernonRuntimeContext &context) noexcept;
 void clearInvocationDiagnostic(const VernonRuntimeContext &context) noexcept;
 
+// Providers may report failure with an empty last error; the fallback names the failed operation instead.
+inline std::string providerDiagnostic(VernonStringView error, std::string_view fallback) {
+    return error.data && error.size ? std::string(error.data, error.size) : std::string(fallback);
+}
+
 class RuntimeDiagnosticScope {
 public:
     explicit RuntimeDiagnosticScope(const VernonRuntimeContext *context) noexcept;

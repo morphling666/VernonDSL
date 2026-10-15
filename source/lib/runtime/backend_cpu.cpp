@@ -398,9 +398,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     const VernonStatus status = vernonRuntimeCorePreparePipeline(cpuProvider(context), &descriptor, &state.pipeline);
     if (status == VERNON_STATUS_OK)
         return true;
-    const VernonStringView providerError = cpuProviderLastError(context);
-    invocationDiagnostic(context) = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare CPU provider pipeline";
+    invocationDiagnostic(context) =
+        providerDiagnostic(cpuProviderLastError(context), "failed to prepare CPU provider pipeline");
     return false;
 }
 

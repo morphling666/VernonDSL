@@ -11,7 +11,6 @@ enum class Id {
     GraphicsForward,
     ComputeTextureBinding,
     GraphicsTextureSampling,
-    ComputeSamplerBinding,
     ComputeVjp,
     GraphicsVjp,
     OpaqueResourceVjp,
@@ -28,13 +27,11 @@ struct Entry {
     std::string_view diagnostic;
 };
 
-inline constexpr std::array<Entry, 11> matrix{{
+inline constexpr std::array<Entry, 10> matrix{{
     {Id::ComputeForward, "compute_forward", true, {}, {}},
     {Id::GraphicsForward, "graphics_forward", true, {}, {}},
     {Id::ComputeTextureBinding, "compute_texture_binding", true, {}, {}},
     {Id::GraphicsTextureSampling, "graphics_texture_sampling", true, {}, {}},
-    {Id::ComputeSamplerBinding, "compute_sampler_binding", false, "PROGRAM_COMPUTE_SAMPLER_UNSUPPORTED",
-     "compute Program sampler bindings are unsupported"},
     {Id::ComputeVjp, "compute_vjp", true, {}, {}},
     {Id::GraphicsVjp, "graphics_vjp", false, "PROGRAM_GRAPHICS_VJP_UNSUPPORTED", "graphics Program VJP is unsupported"},
     {Id::OpaqueResourceVjp, "opaque_resource_vjp", false, "PROGRAM_OPAQUE_RESOURCE_VJP_UNSUPPORTED",

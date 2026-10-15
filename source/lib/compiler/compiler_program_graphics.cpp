@@ -3,6 +3,9 @@
 #include "compiler_json.h"
 #include "compiler_program_stage.h"
 
+#include "VernonFormats.hpp"
+#include "VernonProgramSemanticTypes.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 
@@ -41,10 +44,64 @@ bool appendProgramGraphicsLinkage(llvm::json::Array &rows, const llvm::json::Obj
     else
         return false;
     linkage["type"] = row.getString("type").value_or("").str();
-    if (linkage.get("location"))
-        linkage["interpolation"] = row.getString("vernon.interpolation").value_or("smooth").str();
+    if (linkage.get("location")) {
+        const std::optional<llvm::StringRef> interpolation = row.getString("vernon.interpolation");
+        if (!interpolation)
+            return false;
+        linkage["interpolation"] = interpolation->str();
+    }
     rows.emplace_back(std::move(linkage));
     return true;
+}
+
+/* Stages compile separately, so only the pipeline plan sees both sides of a varying. */
+bool validateProgramGraphicsLinkage(const llvm::json::Array &vertexOutputs, const llvm::json::Array &fragmentInputs,
+                                    std::string &error) {
+    for (const llvm::json::Value &inputValue : fragmentInputs) {
+        const llvm::json::Object *input = inputValue.getAsObject();
+        const std::optional<int64_t> location = input ? input->getInteger("location") : std::nullopt;
+        if (!location)
+            continue;
+        const auto output = llvm::find_if(vertexOutputs, [&](const llvm::json::Value &outputValue) {
+            const llvm::json::Object *candidate = outputValue.getAsObject();
+            return candidate && candidate->getInteger("location") == location;
+        });
+        const std::string varying = "fragment input at location " + std::to_string(*location);
+        if (output == vertexOutputs.end()) {
+            error = varying + " has no vertex output";
+            return false;
+        }
+        const llvm::json::Object &producer = *output->getAsObject();
+        const llvm::StringRef inputType = input->getString("type").value_or("");
+        const llvm::StringRef outputType = producer.getString("type").value_or("");
+        if (inputType != outputType) {
+            error = varying + " has type " + inputType.str() + ", but the vertex output has type " + outputType.str();
+            return false;
+        }
+        if (input->getString("interpolation") != producer.getString("interpolation")) {
+            error = varying + ": varying interpolation differs between stages";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string programFragmentOutputType(const vernon::formats::Format &format) {
+    using vernon::formats::ComponentClass;
+    using vernon::program::ScalarSemanticId;
+    using vernon::program::SemanticType;
+    using vernon::program::SemanticTypeKind;
+    SemanticType scalar;
+    scalar.scalar = format.componentClass == ComponentClass::Uint   ? ScalarSemanticId::U32
+                    : format.componentClass == ComponentClass::Sint ? ScalarSemanticId::I32
+                                                                    : ScalarSemanticId::F32;
+    if (format.components() == 1)
+        return vernon::program::serializeSemanticType(scalar);
+    SemanticType vector;
+    vector.kind = SemanticTypeKind::Tensor;
+    vector.dimensions = {static_cast<int64_t>(format.components())};
+    vector.elements = {scalar};
+    return vernon::program::serializeSemanticType(vector);
 }
 
 std::string programGraphicsVertexFormat(llvm::StringRef dtype, int64_t components) {
@@ -144,7 +201,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                 if (moduleLinkage) {
                     if (!appendProgramGraphicsLinkage(
                             (role == "vertex" ? plan.vertexOutputs.json() : plan.fragmentInputs.json()), *row)) {
-                        error = "compiled graphics linkage has no location or builtin";
+                        error = "compiled graphics linkage needs a location with interpolation, or a builtin";
                         return false;
                     }
                     continue;
@@ -272,25 +329,13 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                     }
                     llvm::json::Object resourceLayout;
                     if (kind == "image") {
-                        const ProgramLogicalResource &resource = resources.at(valueId);
-                        const llvm::json::Object *storage =
-                            resource.storage >= 0 && static_cast<size_t>(resource.storage) < storages.size()
-                                ? storages[static_cast<size_t>(resource.storage)].getAsObject()
-                                : nullptr;
-                        const llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
-                        const llvm::json::Array *aspects = descriptor ? descriptor->getArray("aspects") : nullptr;
-                        if (!descriptor || descriptor->getString("tag") != "image" || !descriptor->getArray("usage") ||
-                            !aspects) {
-                            error = "compiled graphics image endpoint has no canonical image Storage";
+                        if (row->getString("binding_role") != "sampled") {
+                            error = "graphics stages bind only sampled Textures";
                             return false;
                         }
-                        plan.storageUsageRequirements[resource.storage].insert("sampled");
-                        resourceLayout =
-                            llvm::json::Object{{"tag", "image"},
-                                               {"dimension", descriptor->getString("dimension").value_or("").str()},
-                                               {"format", descriptor->getString("format").value_or("any").str()},
-                                               {"sample_count", descriptor->getInteger("sample_count").value_or(0)},
-                                               {"aspects", copyJsonArray(*aspects)}};
+                        if (!planProgramImageEndpoint(*row, resources.at(valueId), storages,
+                                                      plan.storageUsageRequirements, resourceLayout, error))
+                            return false;
                     } else if (kind == "sampler")
                         resourceLayout = llvm::json::Object{{"tag", "sampler"}};
                     else if (vertexAttribute) {
@@ -304,7 +349,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                             error = "compiled vertex attribute has no canonical buffer Storage";
                             return false;
                         }
-                        plan.storageUsageRequirements[resource.storage].insert("vertex");
+                        plan.storageUsageRequirements[resource.storage].usage.insert("vertex");
                         llvm::json::Array cellShape = programGraphicsAttributeCellShape(*row);
                         const int64_t viewRank = static_cast<int64_t>(cellShape.size());
                         resourceLayout = llvm::json::Object{
@@ -442,6 +487,8 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
             return false;
         plan.metadataCarriers.emplace(role.str(), std::move(carrier));
     }
+    if (!validateProgramGraphicsLinkage(plan.vertexOutputs.json(), plan.fragmentInputs.json(), error))
+        return false;
     if (coveredBindings.size() != boundValues.size()) {
         error = "compiled graphics ABI does not exactly cover logical bindings";
         return false;
@@ -525,6 +572,17 @@ bool buildCanonicalGraphicsOperation(const llvm::json::Object &node, const llvm:
             return false;
         }
         const AttachmentImage &color = colorImages[static_cast<size_t>(location)];
+        const vernon::formats::Format *format = vernon::formats::find(std::string_view(color.format));
+        const llvm::StringRef written = output->getString("type").value_or("");
+        if (!format) {
+            error = "color attachment " + std::to_string(location) + " has unknown format " + color.format;
+            return false;
+        }
+        if (const std::string expected = programFragmentOutputType(*format); written != expected) {
+            error = "fragment output type does not match color target format: location " + std::to_string(location) +
+                    " writes " + written.str() + " to " + color.format + ", which takes " + expected;
+            return false;
+        }
         attachmentConstraints.emplace_back(llvm::json::Object{
             {"location", location},
             {"formats", llvm::json::Array{color.format}},

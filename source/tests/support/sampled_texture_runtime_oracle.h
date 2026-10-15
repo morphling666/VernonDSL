@@ -47,9 +47,15 @@ inline void runSampledTextureRuntimeOracle(OwnedRhiRuntime &owned, VernonProgram
         VernonProgramArgument argument{};
         argument.slot = parameter.slot;
         argument.kind = parameter.kind;
-        if (parameter.kind == VERNON_PROGRAM_IMAGE)
+        if (parameter.kind == VERNON_PROGRAM_IMAGE) {
+            VernonProgramImageConstraintView constraint{};
+            constraint.struct_size = sizeof(constraint);
+            ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint),
+                      VERNON_STATUS_OK);
+            EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_SAMPLED);
+            EXPECT_EQ(constraint.sample_result_class, VERNON_IMAGE_SAMPLE_FLOAT);
             argument.image = {sampledView.reference};
-        else {
+        } else {
             ASSERT_EQ(parameter.kind, VERNON_PROGRAM_SAMPLER);
             argument.resource = sampler.reference;
         }

@@ -472,6 +472,10 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                                       : entry.execution_model == spv::ExecutionModelGLCompute ? 430
                                                                                               : 330;
                     options.enable_420pack_extension = options.es;
+                    // Image row 0 is the top (normalized device y = +1) on every target, but GL rasterizes y = +1
+                    // to the last row. Negating y in the vertex stage also reverses winding, which the OpenGL
+                    // adapter compensates by inverting the front face.
+                    options.vertex.flip_vert_y = entry.execution_model == spv::ExecutionModelVertex;
                     compiler.set_common_options(options);
                     source = compiler.compile();
                     extension = options.es ? "gles" : "glsl";

@@ -7,6 +7,7 @@ from typing import Protocol
 from .._formats import TEXTURE_FORMATS_BY_NAME
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
+from ..types import Interpolation
 from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
 from .texture_dimensions import STORAGE_TEXTURE_DIMENSIONS, TEXTURE_DIMENSIONS, dimension_list
 
@@ -189,11 +190,12 @@ class TypeParser:
         if not isinstance(node, ast.Call):
             raise self.context.error(node, "DSL annotation metadata must be a call")
         kind = (dotted_name(node.func) or "").split(".")[-1]
+        if kind == "varying":
+            return self._varying(node)
         arities: dict[str, int | tuple[int, ...]] = {
             "attribute": (0, 1, 2),
             "builtin": 1,
             "uniform": (0, 2),
-            "varying": 0,
             "resource": 2,
         }
         if kind not in arities:
@@ -239,3 +241,21 @@ class TypeParser:
             if not isinstance(divisor, int) or divisor < 0:
                 raise self.context.error(node, "attribute divisor must be non-negative")
         return InterfaceMetadata(kind, tuple(parsed))
+
+    def _varying(self, node: ast.Call) -> InterfaceMetadata:
+        values = list(node.args)
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                raise self.context.error(keyword, "metadata does not support **kwargs")
+            if keyword.arg != "interpolation":
+                raise self.context.error(keyword, "varying metadata accepts only interpolation")
+            values.append(keyword.value)
+        if len(values) > 1:
+            raise self.context.error(node, "varying metadata has the wrong number of arguments")
+        if not values or (isinstance(values[0], ast.Constant) and values[0].value is None):
+            return InterfaceMetadata("varying", ())
+        owner, _, member = (dotted_name(values[0]) or "").rpartition(".")
+        if owner.split(".")[-1] != "Interpolation" or member not in Interpolation.__members__:
+            members = ", ".join(f"vd.Interpolation.{name}" for name in Interpolation.__members__)
+            raise self.context.error(values[0], f"varying interpolation must be one of {members}")
+        return InterfaceMetadata("varying", (Interpolation[member].value,))

@@ -288,6 +288,89 @@ def flat_coordinate_fragment(
 
 
 @vd.fragment
+def shared_sampler_fragment(
+    uv: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+    base: vd.Texture["2d", vd.f32],  # noqa: F722, F821
+    detail: vd.Texture["2d", vd.f32],  # noqa: F722, F821
+    sampler: vd.Sampler,
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(base, sampler, uv) + vd.texture_sample(detail, sampler, uv)
+
+
+@vd.fragment
+def identifier_fetch_fragment(
+    identifiers: Annotated[vd.Texture["2d", vd.u32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+) -> vd.u32:
+    pixel = vd.fragment_coord()
+    identifier = vd.texture_load(identifiers, vd.Vector([vd.i32(pixel.x), vd.i32(pixel.y)]))[0]
+    return identifier // vd.u32(7) + identifier % vd.u32(7) * vd.u32(0x20000000)
+
+
+@vd.struct
+class IdentifierVaryings:
+    position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
+    base: vd.u32
+
+
+@vd.vertex
+def identifier_vertex(
+    position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    base: Annotated[vd.u32, vd.attribute()],
+) -> IdentifierVaryings:
+    return IdentifierVaryings(vd.Vector([position, 0.0, 1.0]), base)
+
+
+@vd.struct
+class IdentifierTargets:
+    color: vd.Vector[vd.f32, 4]
+    identifier: vd.u32
+
+
+@vd.fragment
+def identifier_mrt_fragment(
+    base: Annotated[vd.u32, vd.varying()],
+) -> IdentifierTargets:
+    pixel = vd.fragment_coord()
+    identifier = base + vd.u32(pixel.x) * vd.u32(0x40000000) + vd.u32(pixel.y)
+    return IdentifierTargets(vd.Vector([1.0, 0.25, 0.0, 1.0]), identifier)
+
+
+@vd.fragment
+def identifier_pair_fragment(
+    base: Annotated[vd.u32, vd.varying()],
+) -> vd.Vector[vd.u32, 2]:
+    pixel = vd.fragment_coord()
+    column = vd.u32(pixel.x)
+    row = vd.u32(pixel.y)
+    return vd.Vector([base + column * vd.u32(0x40000000) + row, vd.u32(0xFFFFFFFF) - column * vd.u32(0x01010101) - row])
+
+
+@vd.struct
+class InterpolatedVaryings:
+    position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
+    perspective: vd.f32
+    linear: Annotated[vd.f32, vd.varying(vd.Interpolation.LINEAR)]
+    flat: Annotated[vd.f32, vd.varying(vd.Interpolation.FLAT)]
+
+
+@vd.vertex
+def interpolation_vertex(
+    position: Annotated[vd.Vector[vd.f32, 4], vd.attribute()],
+    value: Annotated[vd.f32, vd.attribute()],
+) -> InterpolatedVaryings:
+    return InterpolatedVaryings(position, value, value, value)
+
+
+@vd.fragment
+def interpolation_fragment(
+    perspective: Annotated[vd.f32, vd.varying()],
+    linear: Annotated[vd.f32, vd.varying(vd.Interpolation.LINEAR)],
+    flat: Annotated[vd.f32, vd.varying(vd.Interpolation.FLAT)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([perspective, linear, flat, 1.0])
+
+
+@vd.fragment
 def optional_texture_fragment(
     base_image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
     base_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],

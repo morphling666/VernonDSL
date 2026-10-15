@@ -523,6 +523,16 @@ other pool (freed sets return space to their own pool), and only then creates
 a pool twice the size of the last, up to sixteen times the first. Pools are
 created on first use, so borrowed devices allocate sets the same way.
 
+Native Vulkan rasterizes normalized device y = -1 to image row 0, the
+opposite of the shared convention (`graphics_execution.md` section 6). The
+adapter therefore sets a negative-height viewport (origin y + height, height
+-height), core since Vulkan 1.1, which the backend requires. Front face and
+scissor pass through unchanged, because the flipped viewport keeps winding and
+framebuffer rows in the shared convention. Negating `gl_Position.y` in the
+shader, as on GL, was rejected: GL gets the negation from SPIRV-Cross, but
+Vulkan consumes SPIR-V directly and would need a SPIR-V rewrite of every
+vertex stage, while the viewport is dynamic state the adapter already sets.
+
 ### DirectX 12
 
 DirectX 12 loads pre-cooked DXIL and never invokes DXC at deployment. The
@@ -560,6 +570,15 @@ so space 0 holds only the root constants. Otherwise the uniform block planned
 at set 0 binding 0 would also take b0 space0. A constant-buffer block takes its
 layout from the std140 SPIR-V interface decorations, as on every other backend.
 
+Compute and graphics root signatures share one descriptor-table builder: a
+CBV/SRV/UAV table and a sampler table, each in layout entry order. They
+differ only in inline values, which are raw UAV buffers in compute and root
+constants in graphics. Dispatches and draws write storage buffers, images
+and samplers through one descriptor writer, so both report the same errors.
+A dispatch or draw that reuses the descriptors an earlier one of its binding
+set wrote in the same encoder still transitions every resource, because a
+command in between may have left a resource in another state.
+
 ### Metal
 
 Metal consumes cooked MSL on supported Apple platforms. Runtime validates MSL,
@@ -587,6 +606,22 @@ from the binding rather than the source name because source names are
 sanitized, uniqued per stage, or generated (TensorView metadata carriers). The
 `GL_ARB_shading_language_420pack` alternative was rejected because macOS
 OpenGL 4.1 does not expose it.
+
+GL rasterizes normalized device y = +1 to the last image row, as native
+Vulkan does (`graphics_execution.md` section 6). Every GL vertex stage therefore
+negates `gl_Position.y` (SPIRV-Cross `flip_vert_y`), and the adapter inverts
+`glFrontFace`, because the negation mirrors window-space winding. Window
+coordinates then count rows from row 0, so `gl_FragCoord`, `glViewport` and
+`glScissor` need no change. wgpu and Dawn emulate the same convention on GL.
+`glClipControl(GL_UPPER_LEFT)` was rejected because it requires OpenGL 4.5,
+which macOS OpenGL 4.1 and OpenGL ES 3.1 lack.
+
+The GL draw state that Runtime sets on a host context, including the inverted
+front face, persists after Runtime returns. The host re-establishes any state
+its own draws depend on, as with Skia and Qt RHI external commands. Runtime
+in turn reapplies its own state whenever the host may have changed it.
+Restoring host state after each draw was rejected because it would need a
+query of every state Runtime touches.
 
 The context owner outlives RHI and Runtime children. All GL allocation,
 transfer, deletion, and invocation operations first make the associated
@@ -646,6 +681,19 @@ aspect, mip, and layer ranges.
 Compiler-generated resolution and implicit Sampler endpoints are system
 endpoints. They are resolved from validated graphics state and do not become
 public Program parameters.
+
+Every sampled Texture binds as a combined image-sampler, so a Sampler has no
+descriptor of its own, in compute and graphics alike. The prepared binding
+plan gives a Sampler one layout entry at the native descriptor of each
+Texture it samples (the reflected relation is in the
+[compiler design](../compiler/design.md)), and the adapter merges each pair
+at that descriptor. Vulkan writes one combined descriptor. D3D12 places the
+sampler in a sampler table at the Texture's register. OpenGL binds the
+sampler object to the Texture's unit. Metal resolves the sampler member that
+reflection records beside the Texture. OpenGL compute GLSL (4.30, and ES
+3.10 as for every OpenGL ES stage) declares each unit through
+`layout(binding)`, so compute assigns no unit uniform, unlike desktop
+graphics GLSL 3.30.
 
 Render scopes:
 

@@ -46,7 +46,13 @@ from pipeline_shader import (
     heightmap_fragment,
     heightmap_vertex,
     i32_attribute_vertex,
+    identifier_fetch_fragment,
+    identifier_mrt_fragment,
+    identifier_pair_fragment,
+    identifier_vertex,
     instanced_tensor_transform_vertex,
+    interpolation_fragment,
+    interpolation_vertex,
     mat2_vertex,
     matrix_elementwise_fragment,
     matrix_vertex,
@@ -58,6 +64,7 @@ from pipeline_shader import (
     optional_texture_fragment,
     oversized_tensor_attribute_vertex,
     rank_three_tensor_attribute_vertex,
+    shared_sampler_fragment,
     solid_fragment,
     spilled_matrix_vertex,
     static_tensor_fragment,
@@ -761,6 +768,157 @@ def assert_vertex_heightmap_sampling(test: unittest.TestCase) -> None:
     np.testing.assert_allclose(target.to_numpy()[8, 8], texel, atol=1)
 
 
+def assert_one_sampler_samples_two_textures(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    base = vd.Texture.from_numpy(np.full((2, 2, 4), (100, 20, 0, 255), dtype=np.uint8))
+    detail = vd.Texture.from_numpy(np.full((2, 2, 4), (20, 100, 60, 0), dtype=np.uint8))
+    target = vd.Texture.zeros(shape=(8, 8))
+    vd.pipeline(triangle_vertex, shared_sampler_fragment)(
+        position=positions,
+        uv=np.array((0.5, 0.5), dtype=np.float32),
+        base=base,
+        detail=detail,
+        sampler=vd.sampler(address="clamp_to_edge"),
+        render_pass=render_target(target),
+    )
+    np.testing.assert_allclose(target.to_numpy()[4, 4], (120, 120, 60, 255), atol=1)
+
+
+def assert_sampled_identifiers_are_fetched_exactly(test: unittest.TestCase) -> None:
+    covering = vd.storage.from_numpy(np.array(((-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)), dtype=np.float32))
+    texels = np.array(
+        (0xFFFFFFFF, 2**24 + 1, 0x89ABCDEF, 0x80000000, 0, 1, 2**24, 2**31 - 1)
+        + tuple(0x01000000 + 0x00F0F0F1 * index for index in range(8)),
+        dtype=np.uint32,
+    ).reshape(4, 4)
+    target = vd.Texture.zeros(shape=(4, 4), format=vd.r32_uint)
+    render_pass = vd.render_pass(vd.RenderTarget.from_attachments(colors={0: target}), color=vd.clear((0, 0, 0, 0)))
+    render = vd.pipeline(triangle_vertex, identifier_fetch_fragment)
+
+    render(
+        position=covering,
+        identifiers=vd.Texture.from_numpy(texels, format=vd.r32_uint),
+        render_pass=render_pass,
+    )
+    np.testing.assert_array_equal(target.to_numpy().reshape(4, 4), texels // 7 + texels % 7 * np.uint32(0x20000000))
+
+    with test.assertRaisesRegex(ValueError, "does not provide the uint sample result class of its sampled Texture"):
+        render(position=covering, identifiers=vd.Texture.zeros(shape=(4, 4)), render_pass=render_pass)
+
+
+IDENTIFIER_BASE = (1 << 24) + 1
+ALL_BITS = 0xFFFFFFFF
+
+
+def _identifier_draw_inputs(covered: bool) -> tuple[vd.TensorStorage, vd.TensorStorage]:
+    corners = ((-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)) if covered else ((2.0, 2.0), (3.0, 2.0), (2.0, 3.0))
+    positions = vd.storage.from_numpy(np.array(corners, dtype=np.float32))
+    return positions, vd.storage.from_numpy(np.full(3, IDENTIFIER_BASE, dtype=np.uint32))
+
+
+def _expected_identifiers(shape: tuple[int, int]) -> np.ndarray:
+    rows, columns = np.indices(shape, dtype=np.uint64)
+    return (IDENTIFIER_BASE + columns * 0x40000000 + rows).astype(np.uint32)
+
+
+def assert_mrt_writes_exact_identifiers(test: unittest.TestCase) -> None:
+    color = vd.Texture.zeros(shape=(4, 4))
+    identifiers = vd.Texture.zeros(shape=(4, 4), format=vd.r32_uint)
+    target = vd.RenderTarget.from_attachments(colors={0: color, 1: identifiers})
+    render = vd.pipeline(identifier_vertex, identifier_mrt_fragment)
+
+    position, base = _identifier_draw_inputs(covered=True)
+    render(
+        position=position,
+        base=base,
+        render_pass=vd.render_pass(target, colors={0: vd.clear((0.0, 0.0, 0.0, 0.0)), 1: vd.clear((0, 0, 0, 0))}),
+    )
+    np.testing.assert_array_equal(identifiers.to_numpy().reshape(4, 4), _expected_identifiers((4, 4)))
+    np.testing.assert_array_equal(color.to_numpy(), np.broadcast_to(np.array((255, 64, 0, 255), np.uint8), (4, 4, 4)))
+
+    position, base = _identifier_draw_inputs(covered=False)
+    render(
+        position=position,
+        base=base,
+        render_pass=vd.render_pass(
+            target, colors={0: vd.clear((0.0, 0.0, 0.0, 0.0)), 1: vd.clear((ALL_BITS, 0, 0, 0))}
+        ),
+    )
+    np.testing.assert_array_equal(identifiers.to_numpy().reshape(4, 4), np.full((4, 4), ALL_BITS, np.uint32))
+
+
+def assert_identifier_pairs_round_trip(test: unittest.TestCase) -> None:
+    pairs = vd.Texture.zeros(shape=(4, 4), format=vd.rg32_uint)
+    target = vd.RenderTarget.from_attachments(colors={0: pairs})
+    render = vd.pipeline(identifier_vertex, identifier_pair_fragment)
+
+    position, base = _identifier_draw_inputs(covered=True)
+    render(position=position, base=base, render_pass=vd.render_pass(target, color=vd.clear((0, 0, 0, 0))))
+    rows, columns = np.indices((4, 4), dtype=np.uint64)
+    expected = np.stack(
+        (_expected_identifiers((4, 4)), (ALL_BITS - columns * 0x01010101 - rows).astype(np.uint32)), axis=-1
+    )
+    np.testing.assert_array_equal(pairs.to_numpy().reshape(4, 4, 2), expected)
+
+    position, base = _identifier_draw_inputs(covered=False)
+    render(
+        position=position,
+        base=base,
+        render_pass=vd.render_pass(target, color=vd.clear((ALL_BITS, 0x89ABCDEF, 0, 0))),
+    )
+    np.testing.assert_array_equal(
+        pairs.to_numpy().reshape(4, 4, 2),
+        np.broadcast_to(np.array((ALL_BITS, 0x89ABCDEF), np.uint32), (4, 4, 2)),
+    )
+
+
+def assert_varyings_follow_their_interpolation(test: unittest.TestCase) -> None:
+    size = 16
+    corners = np.array(((-0.9, -0.9), (0.9, -0.9), (-0.9, 0.9)), dtype=np.float64)
+    depth = np.array((1.0, 4.0, 2.0))
+    # The provoking vertex is the first one on Vulkan, D3D12 and Metal but the last one on OpenGL.
+    values = np.array((0.75, 0.25, 0.75))
+    clip = np.concatenate((corners * depth[:, None], np.zeros((3, 1)), depth[:, None]), axis=1)
+    target = vd.Texture.zeros(shape=(size, size), format=vd.rgba32_float)
+
+    vd.pipeline(interpolation_vertex, interpolation_fragment)(
+        position=vd.storage.from_numpy(clip.astype(np.float32)),
+        value=vd.storage.from_numpy(values.astype(np.float32)),
+        render_pass=render_target(target),
+    )
+
+    # Row 0 of a readback is the top of the target, at normalized device y = +1.
+    rows, columns = np.indices((size, size))
+    centers = np.stack((2.0 * (columns + 0.5) / size - 1.0, 1.0 - 2.0 * (rows + 0.5) / size), axis=-1)
+    edges = corners[1:] - corners[0]
+    screen = np.linalg.solve(edges.T, (centers - corners[0]).reshape(-1, 2).T).T.reshape(size, size, 2)
+    weights = np.concatenate((1.0 - screen.sum(axis=-1, keepdims=True), screen), axis=-1)
+    interior = (weights > 0.05).all(axis=-1)
+    linear = weights @ values
+    perspective = (weights / depth) @ values / (weights / depth).sum(axis=-1)
+
+    pixels = target.to_numpy()[interior]
+    test.assertGreater(int(interior.sum()), 20)
+    test.assertGreater(float(np.abs(perspective - linear)[interior].max()), 0.05)
+    np.testing.assert_allclose(pixels[:, 0], perspective[interior], atol=1e-4)
+    np.testing.assert_allclose(pixels[:, 1], linear[interior], atol=1e-4)
+    np.testing.assert_array_equal(pixels[:, 2], np.full(pixels.shape[0], 0.75, np.float32))
+
+
+def assert_front_face_follows_normalized_device_winding(test: unittest.TestCase) -> None:
+    counter_clockwise = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), np.float32))
+    for front_face, drawn in ((vd.FrontFace.COUNTER_CLOCKWISE, True), (vd.FrontFace.CLOCKWISE, False)):
+        target = vd.Texture.zeros(shape=(8, 8))
+        state = vd.graphics_state(
+            rasterization=vd.RasterizationState(cull_mode=vd.CullMode.BACK, front_face=front_face)
+        )
+        vd.pipeline(triangle_vertex, solid_fragment, state=state)(
+            position=counter_clockwise, render_pass=render_target(target)
+        )
+        with test.subTest(front_face=front_face):
+            test.assertEqual(int(target.to_numpy()[4, 4, 3]), 255 if drawn else 0)
+
+
 def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
     positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
     base_image = vd.Texture.from_numpy(np.full((2, 2, 4), (0, 255, 0, 255), dtype=np.uint8))
@@ -1234,6 +1392,24 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
 
+    def test_one_sampler_samples_two_textures(self) -> None:
+        assert_one_sampler_samples_two_textures(self)
+
+    def test_sampled_identifiers_are_fetched_exactly(self) -> None:
+        assert_sampled_identifiers_are_fetched_exactly(self)
+
+    def test_mrt_writes_exact_identifiers(self) -> None:
+        assert_mrt_writes_exact_identifiers(self)
+
+    def test_identifier_pairs_round_trip(self) -> None:
+        assert_identifier_pairs_round_trip(self)
+
+    def test_varyings_follow_their_interpolation(self) -> None:
+        assert_varyings_follow_their_interpolation(self)
+
+    def test_front_face_follows_normalized_device_winding(self) -> None:
+        assert_front_face_follows_normalized_device_winding(self)
+
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
 
@@ -1298,7 +1474,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(target.to_numpy()[8, 8, 0]), 240)
 
     @staticmethod
-    def _advanced_inputs() -> tuple[vd.Tensor, vd.Tensor, vd.Tensor]:
+    def _advanced_inputs() -> tuple[vd.TensorStorage, vd.TensorStorage, vd.TensorStorage]:
         positions = vd.storage.from_numpy(
             np.array(
                 ((-0.25, -0.25), (0.25, -0.25), (0.25, 0.25), (-0.25, 0.25)),
@@ -1434,6 +1610,24 @@ class OpenGLESPipelineTests(unittest.TestCase):
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
 
+    def test_one_sampler_samples_two_textures(self) -> None:
+        assert_one_sampler_samples_two_textures(self)
+
+    def test_sampled_identifiers_are_fetched_exactly(self) -> None:
+        assert_sampled_identifiers_are_fetched_exactly(self)
+
+    def test_mrt_writes_exact_identifiers(self) -> None:
+        assert_mrt_writes_exact_identifiers(self)
+
+    def test_identifier_pairs_round_trip(self) -> None:
+        assert_identifier_pairs_round_trip(self)
+
+    def test_varyings_follow_their_interpolation(self) -> None:
+        assert_varyings_follow_their_interpolation(self)
+
+    def test_front_face_follows_normalized_device_winding(self) -> None:
+        assert_front_face_follows_normalized_device_winding(self)
+
 
 class VulkanPipelineTests(unittest.TestCase):
     def test_aggregate_attribute_renders(self) -> None:
@@ -1518,6 +1712,24 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
+
+    def test_one_sampler_samples_two_textures(self) -> None:
+        assert_one_sampler_samples_two_textures(self)
+
+    def test_sampled_identifiers_are_fetched_exactly(self) -> None:
+        assert_sampled_identifiers_are_fetched_exactly(self)
+
+    def test_mrt_writes_exact_identifiers(self) -> None:
+        assert_mrt_writes_exact_identifiers(self)
+
+    def test_identifier_pairs_round_trip(self) -> None:
+        assert_identifier_pairs_round_trip(self)
+
+    def test_varyings_follow_their_interpolation(self) -> None:
+        assert_varyings_follow_their_interpolation(self)
+
+    def test_front_face_follows_normalized_device_winding(self) -> None:
+        assert_front_face_follows_normalized_device_winding(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
@@ -1669,6 +1881,24 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
         assert_vertex_heightmap_sampling(self)
+
+    def test_one_sampler_samples_two_textures(self) -> None:
+        assert_one_sampler_samples_two_textures(self)
+
+    def test_sampled_identifiers_are_fetched_exactly(self) -> None:
+        assert_sampled_identifiers_are_fetched_exactly(self)
+
+    def test_mrt_writes_exact_identifiers(self) -> None:
+        assert_mrt_writes_exact_identifiers(self)
+
+    def test_identifier_pairs_round_trip(self) -> None:
+        assert_identifier_pairs_round_trip(self)
+
+    def test_varyings_follow_their_interpolation(self) -> None:
+        assert_varyings_follow_their_interpolation(self)
+
+    def test_front_face_follows_normalized_device_winding(self) -> None:
+        assert_front_face_follows_normalized_device_winding(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)

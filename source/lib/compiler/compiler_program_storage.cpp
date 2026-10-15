@@ -1,5 +1,6 @@
 #include "compiler_program_storage.h"
 
+#include "VernonFormats.hpp"
 #include "VernonProgramSemanticTypes.h"
 #include "compiler_json.h"
 
@@ -406,24 +407,11 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             }
             const bool colorAttachment = colorAttachmentRoots.count(root);
             const bool depthAttachment = depthAttachmentRoots.count(root);
-            bool computeImage = false;
-            for (const auto &[stageName, resources] : index.resourcesByStage) {
-                const auto compiled = index.compiledByRequest.find(stageName);
-                if (compiled == index.compiledByRequest.end() ||
-                    compiled->second->operation != ProgramStageOperation::Compute)
-                    continue;
-                computeImage |= llvm::any_of(resources, [&](const auto &entry) {
-                    const auto owner = plan.aliases.ownerByValue.find(entry.second.before);
-                    return owner != plan.aliases.ownerByValue.end() && owner->second.value == root;
-                });
-            }
             llvm::json::Array usage;
             if (colorAttachment)
                 usage.emplace_back("color_attachment");
             else if (depthAttachment)
                 usage.emplace_back("depth_stencil_attachment");
-            else if (computeImage)
-                usage.emplace_back("storage");
             descriptor = llvm::json::Object{{"tag", "image"},
                                             {"dimension", dimension->str()},
                                             {"format", semantic->parameter},
@@ -637,7 +625,20 @@ bool applyProgramStorageUsageRequirements(llvm::json::Array &storages,
             error = "Program storage usage requirement has no canonical descriptor";
             return false;
         }
-        std::set<std::string> merged = required;
+        if (required.sampleResultClass) {
+            const std::string name(vernon::formats::sampleResultClassName(*required.sampleResultClass));
+            const std::string_view format(descriptor->getString("format").value_or(""));
+            const std::optional<llvm::StringRef> recorded = descriptor->getString("sample_result_class");
+            if ((vernon::formats::find(format) &&
+                 !vernon::formats::providesSampleResultClass(format, *required.sampleResultClass)) ||
+                (recorded && *recorded != name)) {
+                error = "Program Storage '" + storage->getString("name").value_or("").str() + "' is sampled as " +
+                        name + " but its format or another sampled use provides a different class";
+                return false;
+            }
+            (*descriptor)["sample_result_class"] = name;
+        }
+        std::set<std::string> merged = required.usage;
         for (const llvm::json::Value &value : *usage) {
             const std::optional<llvm::StringRef> name = value.getAsString();
             if (!name || name->empty()) {
@@ -651,6 +652,58 @@ bool applyProgramStorageUsageRequirements(llvm::json::Array &storages,
             canonical.emplace_back(name);
         *usage = std::move(canonical);
     }
+    return true;
+}
+
+bool planProgramImageEndpoint(const llvm::json::Object &row, const ProgramLogicalResource &resource,
+                              const llvm::json::Array &storages, ProgramStorageUsageRequirements &requirements,
+                              llvm::json::Object &layout, std::string &error) {
+    const llvm::json::Object *storage = resource.storage >= 0 && static_cast<size_t>(resource.storage) < storages.size()
+                                            ? storages[static_cast<size_t>(resource.storage)].getAsObject()
+                                            : nullptr;
+    const llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
+    const llvm::json::Array *aspects = descriptor ? descriptor->getArray("aspects") : nullptr;
+    if (!descriptor || descriptor->getString("tag") != "image" || !descriptor->getArray("usage") || !aspects) {
+        error = "compiled image endpoint has no canonical image Storage";
+        return false;
+    }
+    ProgramStorageRequirement &requirement = requirements[resource.storage];
+    layout = llvm::json::Object{{"tag", "image"},
+                                {"dimension", descriptor->getString("dimension").value_or("").str()},
+                                {"sample_count", descriptor->getInteger("sample_count").value_or(0)},
+                                {"aspects", copyJsonArray(*aspects)}};
+    const std::optional<llvm::StringRef> role = row.getString("binding_role");
+    if (role == "storage") {
+        const std::string_view format(row.getString("exact_storage_format").value_or(""));
+        const vernon::formats::Format *entry = vernon::formats::find(format);
+        if (!entry || !entry->allows(VERNON_RHI_FORMAT_STORAGE)) {
+            error = "compiled storage image endpoint has no storage-capable exact format";
+            return false;
+        }
+        requirement.usage.insert("storage");
+        layout["format"] = std::string(format);
+        return true;
+    }
+    if (role != "sampled") {
+        error = "compiled image endpoint has an unknown binding role";
+        return false;
+    }
+    const std::optional<VernonImageSampleResultClass> resultClass =
+        vernon::formats::parseSampleResultClass(std::string_view(row.getString("sample_result_class").value_or("")));
+    if (!resultClass) {
+        error = "compiled sampled image endpoint has no sample result class";
+        return false;
+    }
+    if (requirement.sampleResultClass && *requirement.sampleResultClass != *resultClass) {
+        error = "Program Storage is sampled with both " +
+                std::string(vernon::formats::sampleResultClassName(*requirement.sampleResultClass)) + " and " +
+                std::string(vernon::formats::sampleResultClassName(*resultClass)) + " result classes";
+        return false;
+    }
+    requirement.usage.insert("sampled");
+    requirement.sampleResultClass = resultClass;
+    layout["format"] = descriptor->getString("format").value_or("any").str();
+    layout["sample_result_class"] = std::string(vernon::formats::sampleResultClassName(*resultClass));
     return true;
 }
 

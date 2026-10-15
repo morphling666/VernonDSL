@@ -139,12 +139,15 @@ def probe_compiler(row: BackendRow, requirements: BackendRequirements) -> ProbeR
     ):
         if required and not capabilities[key]:
             return _unsupported(row, key)
-    if requirements.texture_sampler_operations:
-        capability = "graphics_texture_sampling" if requirements.graphics else "compute_sampler_binding"
-        program_capability = dict(_native._program_capability(capability))
-        if not program_capability["supported"]:
-            return _unsupported(row, capability)
-    if requirements.storage_texture and not capabilities["compute_texture_binding"]:
+    if (
+        requirements.texture_sampler_operations
+        and requirements.graphics
+        and not dict(_native._program_capability("graphics_texture_sampling"))["supported"]
+    ):
+        return _unsupported(row, "graphics_texture_sampling")
+    # Any Texture bound to a compute stage, sampled or storage, needs compute_texture_binding.
+    compute_texture = requirements.storage_texture or (requirements.texture_sampler_operations and requirements.compute)
+    if compute_texture and not capabilities["compute_texture_binding"]:
         return _unsupported(row, "compute_texture_binding")
     if requirements.non_r32_read_write_storage_images and not capabilities["non_r32_read_write_storage_images"]:
         return _unsupported(row, "non_r32_read_write_storage_images")

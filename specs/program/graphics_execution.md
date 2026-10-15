@@ -123,6 +123,18 @@ ImageView is a descriptor-bearing alias of image Storage. Program Value
 origins retain parent version and exact subresource range; the physical
 allocation format belongs to the Storage descriptor.
 
+Every backend uses one coordinate convention, the one Direct3D 12, Metal and
+WebGPU define. Vulkan reaches it with a negative-height viewport and OpenGL
+with a vertex y flip ([runtime design](../runtime/design.md) section 10):
+
+- Normalized device y = +1 is image row 0, the first row a host upload
+  writes and a readback returns.
+- Framebuffer coordinates, `fragment_coord()`, viewport, scissor and render
+  area have their origin at the top-left corner of row 0, and y grows with
+  the row index.
+- Winding is evaluated in normalized device coordinates with y up, so
+  `counter_clockwise` names the same triangles on every backend.
+
 ## 7. Render-scope planning
 
 The private Command DAG may fuse adjacent graphics Nodes into one native

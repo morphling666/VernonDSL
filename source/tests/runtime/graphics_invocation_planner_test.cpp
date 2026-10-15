@@ -134,7 +134,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     texture.kind = "image";
     texture.dimension = "2d";
     texture.bindingRole = "sampled";
-    texture.sampleResultClass = "float";
+    texture.sampleResultClass = VERNON_IMAGE_SAMPLE_FLOAT;
     texture.uses.push_back({"fragment", "uniform", "albedo", "", {}, 0, UINT32_MAX, 0, 0, 5, {}});
     variant.parameters = {vertices, texture};
     Parameter implicitSampler;

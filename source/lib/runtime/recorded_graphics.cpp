@@ -66,6 +66,7 @@ bool sameEndpointReflection(const Parameter &left, const program::TargetBinding 
            leftTarget.reflectedKind == rightTarget.reflectedKind && leftTarget.role == rightTarget.role &&
            leftTarget.access == rightTarget.access && leftTarget.dimension == rightTarget.dimension &&
            leftTarget.imageFormat == rightTarget.imageFormat &&
+           leftTarget.imageSampleResultClass == rightTarget.imageSampleResultClass &&
            sameProjection(leftTarget.endpointProjection, rightTarget.endpointProjection);
 }
 

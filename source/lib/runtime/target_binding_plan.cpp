@@ -322,12 +322,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
 
     for (const ReflectedEndpoint &endpoint : stage.stage.endpoints) {
-        if (compute && endpoint.role == "sampler") {
-            const program_capabilities::Entry &capability =
-                program_capabilities::get(program_capabilities::Id::ComputeSamplerBinding);
-            return reject(diagnostic, std::string(capability.diagnosticCode), "/endpoints",
-                          std::string(capability.diagnostic));
-        }
         TargetBinding target;
         target.endpoint = {endpoint.module, endpoint.interfaceKind, endpoint.index, UINT32_MAX, endpoint.access};
         target.endpointType = vernon::program::parseSemanticType(endpoint.type);
@@ -338,6 +332,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         target.access = endpoint.access;
         target.dimension = endpoint.imageDimension;
         target.imageFormat = endpoint.imageFormat;
+        target.imageSampleResultClass = endpoint.imageSampleResultClass;
         target.viewShape = endpoint.viewShape;
         target.writeFootprintKind = endpoint.writeFootprintKind;
         target.writeFootprintIndices = endpoint.writeFootprintIndices;
@@ -347,12 +342,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
              * it never becomes a Program parameter, but the backend needs the images it pairs with. */
             if (endpoint.builtin != "sampler")
                 continue;
-            if (compute) {
-                const program_capabilities::Entry &capability =
-                    program_capabilities::get(program_capabilities::Id::ComputeSamplerBinding);
-                return reject(diagnostic, std::string(capability.diagnosticCode), "/endpoints",
-                              std::string(capability.diagnostic));
-            }
             const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
             if (!compiled || compiled->sampledImageBindings.empty())
                 return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
@@ -1055,6 +1044,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
             binding.viewTransform && !binding.viewTransform->axes.empty() &&
             binding.viewTransform->axes.front().source == ViewAxisSource::InvocationLinearCarrier;
         parameter.exactStorageFormat = binding.imageFormat;
+        parameter.sampleResultClass = binding.imageSampleResultClass;
         parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
         ParameterUse use;
         use.stage = "compute";
@@ -1091,6 +1081,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                                               : std::optional<InterfacePlan>{};
         use.descriptorSet = 0;
         use.binding = binding.endpoint.portableSlot;
+        use.sampledImageBindings = binding.sampledImageBindings;
         if (vernon::runtime::Parameter *shared = sharedParameter(plan, stagePlan, binding)) {
             if (shared->access != "read" || parameter.access != "read")
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/endpoints",
@@ -1287,8 +1278,7 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             parameter.dimension = binding.dimension;
             parameter.bindingRole = binding.role;
             parameter.exactStorageFormat = binding.imageFormat;
-            if (binding.kind == "image" && binding.role == "sampled")
-                parameter.sampleResultClass = "float";
+            parameter.sampleResultClass = binding.imageSampleResultClass;
             parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
             stagePlan.parameters.push_back(std::move(parameter));
             shared = &stagePlan.parameters.back();

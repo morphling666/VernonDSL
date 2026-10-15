@@ -22,6 +22,8 @@ _RUNTIME_ORACLES_BY_SUITE = {
             RuntimeOracleKind.SPECIALIZATION_PIXELS,
             RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS,
             RuntimeOracleKind.STORAGE_TEXEL,
+            RuntimeOracleKind.COMPUTE_SAMPLED_TEXELS,
+            RuntimeOracleKind.TEXEL_FETCH,
             RuntimeOracleKind.STRUCTURED_VIEW,
             RuntimeOracleKind.GRAPHICS_TRIANGLE,
             RuntimeOracleKind.FAN_OUT_VJP,

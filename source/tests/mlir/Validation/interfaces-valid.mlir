@@ -14,15 +14,32 @@ module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_ve
       },
       tensor<3xf32> {
         vernon.interface = "output", vernon.location = 0 : i64
+      },
+      i32 {
+        vernon.interface = "output", vernon.location = 1 : i64
+      },
+      f32 {
+        vernon.interface = "output", vernon.location = 2 : i64,
+        vernon.interpolation = "noperspective"
       }) attributes {
         vernon.entry, vernon.stage = "vertex"
       } {
-    return %position, %color : tensor<4xf32>, tensor<3xf32>
+    %identifier = arith.constant 7 : i32
+    %depth = arith.constant 0.5 : f32
+    return %position, %color, %identifier, %depth : tensor<4xf32>, tensor<3xf32>, i32, f32
   }
 
   func.func @fragment_main(
       %color: tensor<3xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
+      },
+      %identifier: i32 {
+        vernon.interface = "input", vernon.location = 1 : i64,
+        vernon.interpolation = "flat"
+      },
+      %depth: f32 {
+        vernon.interface = "input", vernon.location = 2 : i64,
+        vernon.interpolation = "noperspective"
       },
       %material: tensor<4xf32> {
         vernon.interface = "uniform",
@@ -39,7 +56,7 @@ module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_ve
   func.func @compute_main(
       %buffer: tensor<16xf32> {
         vernon.interface = "resource",
-        vernon.set = 0 : i64, vernon.binding = 1 : i64
+        vernon.set = 0 : i64, vernon.binding = 0 : i64
       }) attributes {
         vernon.entry, vernon.stage = "compute",
         vernon.workgroup_size = array<i32: 8, 4, 1>

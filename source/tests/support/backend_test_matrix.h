@@ -108,14 +108,12 @@ inline BackendProbeResult probeCompilerBackend(const VernonCompilerContext *comp
         return unsupported(backend.name, "f32_atomic_add");
     if (requirements.f64AtomicAdd && !capabilities.supports_f64_device_atomic_add)
         return unsupported(backend.name, "f64_atomic_add");
-    if (requirements.textureSamplerOperations) {
-        using namespace vernon::program_capabilities;
-        if (requirements.compute && !get(Id::ComputeSamplerBinding).supported)
-            return unsupported(backend.name, "compute_sampler_binding");
-        if (requirements.graphics && !get(Id::GraphicsTextureSampling).supported)
-            return unsupported(backend.name, "graphics_texture_sampling");
-    }
-    if (requirements.storageTexture && !capabilities.supports_compute_texture_binding)
+    if (requirements.textureSamplerOperations && requirements.graphics &&
+        !vernon::program_capabilities::get(vernon::program_capabilities::Id::GraphicsTextureSampling).supported)
+        return unsupported(backend.name, "graphics_texture_sampling");
+    // Any Texture bound to a compute stage, sampled or storage, needs compute_texture_binding.
+    if ((requirements.storageTexture || (requirements.textureSamplerOperations && requirements.compute)) &&
+        !capabilities.supports_compute_texture_binding)
         return unsupported(backend.name, "compute_texture_binding");
     if (requirements.nonR32ReadWriteStorageImages && !capabilities.supports_non_r32_read_write_storage_images)
         return unsupported(backend.name, "non_r32_read_write_storage_images");

@@ -21,8 +21,6 @@ TEST(ProgramCapabilities, CurrentReleaseUsesStableUnsupportedDecisions) {
     using namespace vernon::program_capabilities;
     EXPECT_TRUE(get(Id::ComputeVjp).supported);
     EXPECT_TRUE(get(Id::GraphicsTextureSampling).supported);
-    EXPECT_FALSE(get(Id::ComputeSamplerBinding).supported);
-    EXPECT_EQ(get(Id::ComputeSamplerBinding).diagnosticCode, "PROGRAM_COMPUTE_SAMPLER_UNSUPPORTED");
     EXPECT_FALSE(get(Id::GraphicsVjp).supported);
     EXPECT_FALSE(get(Id::OpaqueResourceVjp).supported);
     EXPECT_TRUE(get(Id::CpuF16).supported);

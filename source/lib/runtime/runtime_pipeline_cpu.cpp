@@ -425,19 +425,17 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
                        : vernonRuntimeCoreCreateBindings(state.pipeline, state.values.data(), state.values.size(),
                                                          &state.bindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = cpuProviderLastError(*pipeline.context);
-        return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare CPU provider bindings",
-                    status);
+        return fail(
+            *pipeline.context,
+            providerDiagnostic(cpuProviderLastError(*pipeline.context), "failed to prepare CPU provider bindings"),
+            status);
     }
     status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = cpuProviderLastError(*pipeline.context);
-        return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode CPU provider dispatch",
-                    status);
+        return fail(
+            *pipeline.context,
+            providerDiagnostic(cpuProviderLastError(*pipeline.context), "failed to encode CPU provider dispatch"),
+            status);
     }
     return VERNON_STATUS_OK;
 }

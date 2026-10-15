@@ -124,27 +124,9 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
 
 FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
     if (auto texture = dyn_cast<TextureType>(type)) {
-        std::optional<spirv::Dim> dimension = llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
-                                                  .Cases("2d", "2d_array", spirv::Dim::Dim2D)
-                                                  .Case("3d", spirv::Dim::Dim3D)
-                                                  .Cases("cube", "cube_array", spirv::Dim::Cube)
-                                                  .Default(std::nullopt);
-        if (!dimension)
-            return failure();
-        const spirv::ImageArrayedInfo arrayed =
-            texture.isArrayed() ? spirv::ImageArrayedInfo::Arrayed : spirv::ImageArrayedInfo::NonArrayed;
-        if (texture.getAccess() != "sampled") {
-            std::optional<spirv::ImageFormat> format = spirvStorageImageFormat(texture.getFormat());
-            if (!format || texture.isCube())
-                return failure();
-            return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth, arrayed,
-                                         spirv::ImageSamplingInfo::SingleSampled, spirv::ImageSamplerUseInfo::NoSampler,
-                                         *format);
-        }
-        auto image = spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
-                                           arrayed, spirv::ImageSamplingInfo::SingleSampled,
-                                           spirv::ImageSamplerUseInfo::NeedSampler, spirv::ImageFormat::Unknown);
-        return spirv::SampledImageType::get(image);
+        if (std::optional<Type> descriptor = spirvTextureDescriptorType(texture))
+            return *descriptor;
+        return failure();
     }
     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
         return convertTensorType(tensor, module);
@@ -216,7 +198,11 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
 }
 
 Type applyInterfaceIntegerSignedness(Type type, DictionaryAttr attributes) {
+    if (!attributes)
+        return type;
     auto dtype = attributes.getAs<StringAttr>("vernon.dtype");
+    if (auto leaves = attributes.getAs<ArrayAttr>("vernon.abi_leaf_dtypes"); !dtype && leaves && leaves.size() == 1)
+        dtype = dyn_cast<StringAttr>(leaves[0]);
     if (!dtype || (dtype.getValue() != "i32" && dtype.getValue() != "u32"))
         return type;
     const auto signedness = dtype.getValue() == "i32" ? IntegerType::SignednessSemantics::Signed
@@ -450,6 +436,18 @@ spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location loc
     if (builtIn == spirv::BuiltIn::Position && storageClass == spirv::StorageClass::Output)
         variable->setAttr("invariant", builder.getUnitAttr());
     return variable;
+}
+
+LogicalResult decorateVaryingInterpolation(spirv::GlobalVariableOp variable, DictionaryAttr attributes, Type type,
+                                           ModuleOp module) {
+    FailureOr<Interpolation> interpolation = resolveInterpolation(attributes, type, module);
+    if (failed(interpolation))
+        return failure();
+    if (*interpolation == Interpolation::Flat)
+        variable->setAttr("flat", UnitAttr::get(variable.getContext()));
+    else if (*interpolation == Interpolation::NoPerspective)
+        variable->setAttr("no_perspective", UnitAttr::get(variable.getContext()));
+    return success();
 }
 
 void flattenComposite(Location location, Value value, OpBuilder &builder, SmallVectorImpl<Value> &leaves) {
@@ -949,20 +947,10 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             Value sampledImage = mapped(intrinsic.getOperand(0));
             Value coordinates = mapped(intrinsic.getOperand(2));
             FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
-            if (!sampledImage || !coordinates || failed(resultType))
+            Value lod = intrinsic.getNumOperands() == 4 ? mapped(intrinsic.getOperand(3)) : Value();
+            if (!sampledImage || !coordinates || failed(resultType) || (intrinsic.getNumOperands() == 4 && !lod))
                 return failure();
-            if (intrinsic.getNumOperands() == 4) {
-                Value lod = mapped(intrinsic.getOperand(3));
-                if (!lod)
-                    return failure();
-                auto imageOperands = spirv::ImageOperandsAttr::get(builder.getContext(), spirv::ImageOperands::Lod);
-                return spirv::ImageSampleExplicitLodOp::create(builder, location, *resultType, sampledImage,
-                                                               coordinates, imageOperands, ValueRange{lod})
-                    .getResult();
-            }
-            return spirv::ImageSampleImplicitLodOp::create(builder, location, *resultType, sampledImage, coordinates,
-                                                           spirv::ImageOperandsAttr(), ValueRange{})
-                .getResult();
+            return buildSpirvTextureSample(builder, location, *resultType, sampledImage, coordinates, lod);
         }
         if (intrinsic.getName() == "texture_load") {
             Value image = mapped(intrinsic.getOperand(0));
@@ -970,9 +958,7 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
             if (!image || !coordinates || failed(resultType))
                 return failure();
-            return spirv::ImageReadOp::create(builder, location, *resultType, image, coordinates,
-                                              spirv::ImageOperandsAttr(), ValueRange{})
-                .getResult();
+            return buildSpirvTextureLoad(builder, location, *resultType, image, coordinates);
         }
         if (intrinsic.getName() == "texture_size") {
             Value sampledImage = mapped(intrinsic.getOperand(0));
@@ -1190,26 +1176,21 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         return failure();
     }
 
-    if (auto cast = dyn_cast<arith::SIToFPOp>(operation)) {
-        Value input = mapped(cast.getIn());
-        FailureOr<Type> resultType = convertValueType(cast.getType());
+    if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(operation)) {
+        Value input = mapped(operation.getOperand(0));
+        FailureOr<Type> resultType = convertValueType(operation.getResult(0).getType());
         if (!input || failed(resultType))
             return failure();
         return lowerCompositeElementwise(
             location, *resultType, ArrayRef<Value>{input}, builder,
             [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
-                return spirv::ConvertSToFOp::create(builder, location, type, values[0]).getResult();
-            });
-    }
-    if (auto cast = dyn_cast<arith::UIToFPOp>(operation)) {
-        Value input = mapped(cast.getIn());
-        FailureOr<Type> resultType = convertValueType(cast.getType());
-        if (!input || failed(resultType))
-            return failure();
-        return lowerCompositeElementwise(
-            location, *resultType, ArrayRef<Value>{input}, builder,
-            [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
-                return spirv::ConvertUToFOp::create(builder, location, type, values[0]).getResult();
+                if (isa<arith::SIToFPOp>(operation))
+                    return spirv::ConvertSToFOp::create(builder, location, type, values[0]).getResult();
+                if (isa<arith::UIToFPOp>(operation))
+                    return spirv::ConvertUToFOp::create(builder, location, type, values[0]).getResult();
+                if (isa<arith::FPToSIOp>(operation))
+                    return spirv::ConvertFToSOp::create(builder, location, type, values[0]).getResult();
+                return spirv::ConvertFToUOp::create(builder, location, type, values[0]).getResult();
             });
     }
 
@@ -1258,6 +1239,16 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return lowerBinary([&](Value a, Value b) { return spirv::FMulOp::create(builder, location, a, b); });
         if (name == arith::DivFOp::getOperationName())
             return lowerBinary([&](Value a, Value b) { return spirv::FDivOp::create(builder, location, a, b); });
+        if (name == arith::RemFOp::getOperationName())
+            return lowerBinary([&](Value a, Value b) { return spirv::FRemOp::create(builder, location, a, b); });
+        if (name == arith::DivSIOp::getOperationName())
+            return lowerBinary([&](Value a, Value b) { return spirv::SDivOp::create(builder, location, a, b); });
+        if (name == arith::DivUIOp::getOperationName())
+            return lowerBinary([&](Value a, Value b) { return spirv::UDivOp::create(builder, location, a, b); });
+        if (name == arith::RemSIOp::getOperationName())
+            return lowerBinary([&](Value a, Value b) { return spirv::SRemOp::create(builder, location, a, b); });
+        if (name == arith::RemUIOp::getOperationName())
+            return lowerBinary([&](Value a, Value b) { return spirv::UModOp::create(builder, location, a, b); });
         if (name == arith::AddIOp::getOperationName())
             return lowerBinary([&](Value a, Value b) { return spirv::IAddOp::create(builder, location, a, b); });
         if (name == arith::SubIOp::getOperationName())
@@ -1825,6 +1816,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             globals.push_back(createInterfaceVariable(
                 moduleBuilder, source.getLoc(), name, interfaceType, storageClass, argumentAttrs,
                 succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr, scalars ? &*scalars : nullptr));
+            if (stage.getValue() == "fragment" && kind.getValue() == "input" && location &&
+                failed(decorateVaryingInterpolation(globals.back(), argumentAttrs, type, sourceModule)))
+                return source.emitError() << "fragment input #" << index << " has no varying interpolation";
             if (scalars)
                 memberRange = BlockMemberRange{0, static_cast<uint32_t>(scalars->types.size())};
         }
@@ -1843,8 +1837,13 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         std::string preferred = sanitizeInterfaceName(sourceName ? sourceName.getValue() : StringRef(), fallback,
                                                       stage.getValue() == "vertex");
         std::string name = uniqueInterfaceName(preferred, stage.getValue(), usedInterfaceNames);
-        auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name, *converted,
-                                              spirv::StorageClass::Output, source.getResultAttrDict(index));
+        DictionaryAttr resultAttrs = source.getResultAttrDict(index);
+        auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name,
+                                              applyInterfaceIntegerSignedness(*converted, resultAttrs),
+                                              spirv::StorageClass::Output, resultAttrs);
+        if (stage.getValue() == "vertex" && parseInterfaceAttrs(resultAttrs).location &&
+            failed(decorateVaryingInterpolation(global, resultAttrs, type, sourceModule)))
+            return source.emitError() << "vertex output #" << index << " has no varying interpolation";
         outputs.push_back(global);
         interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
     }
@@ -1962,7 +1961,11 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         if (auto returnOp = dyn_cast<func::ReturnOp>(operation)) {
             for (auto [value, global] : llvm::zip_equal(returnOp.getOperands(), outputs)) {
                 Value pointer = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
-                spirv::StoreOp::create(bodyBuilder, source.getLoc(), pointer, mapping.lookup(value));
+                Value stored = mapping.lookup(value);
+                Type outputType = cast<spirv::PointerType>(global.getType()).getPointeeType();
+                if (stored.getType() != outputType)
+                    stored = spirv::BitcastOp::create(bodyBuilder, source.getLoc(), outputType, stored);
+                spirv::StoreOp::create(bodyBuilder, source.getLoc(), pointer, stored);
             }
             spirv::ReturnOp::create(bodyBuilder, source.getLoc());
             continue;

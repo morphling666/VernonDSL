@@ -180,7 +180,7 @@ struct Parameter {
     std::string addressSpace;
     std::string dimension;
     std::string bindingRole;
-    std::string sampleResultClass;
+    VernonImageSampleResultClass sampleResultClass{VERNON_IMAGE_SAMPLE_NONE};
     std::string exactStorageFormat;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::string autodiffSource;

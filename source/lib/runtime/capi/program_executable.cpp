@@ -53,12 +53,14 @@ VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source
         return std::find(source.storage->image.usage.begin(), source.storage->image.usage.end(), usage) !=
                source.storage->image.usage.end();
     };
+    // A read-only storage texture is still a storage binding, so the role comes from the Storage usage, not access.
     destination.binding_role = hasUsage("color_attachment")           ? VERNON_IMAGE_BINDING_COLOR_ATTACHMENT
                                : hasUsage("depth_stencil_attachment") ? VERNON_IMAGE_BINDING_DEPTH_STENCIL_ATTACHMENT
-                               : source.access == program::BoundaryAccess::Read ? VERNON_IMAGE_BINDING_SAMPLED
-                                                                                : VERNON_IMAGE_BINDING_STORAGE;
-    destination.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
-    if (destination.binding_role == VERNON_IMAGE_BINDING_STORAGE) {
+                               : hasUsage("storage")                  ? VERNON_IMAGE_BINDING_STORAGE
+                               : hasUsage("sampled")                  ? VERNON_IMAGE_BINDING_SAMPLED
+                                                                      : VERNON_IMAGE_BINDING_TRANSFER;
+    destination.sample_result_class = source.storage->image.sampleResultClass;
+    if (hasUsage("storage")) {
         const auto format = artifactStorageFormat(source.storage->image.format);
         if (!format)
             return VERNON_STATUS_PARSE_ERROR;

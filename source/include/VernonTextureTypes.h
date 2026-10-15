@@ -43,7 +43,9 @@ typedef enum VernonImageBindingRole {
 typedef enum VernonImageSampleResultClass {
     VERNON_IMAGE_SAMPLE_FLOAT = 0,
     VERNON_IMAGE_SAMPLE_SIGNED_INTEGER = 1,
-    VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER = 2
+    VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER = 2,
+    /* The image is not sampled, so no sample result class constrains its view format. */
+    VERNON_IMAGE_SAMPLE_NONE = 3
 } VernonImageSampleResultClass;
 
 typedef struct VernonImageExtent {

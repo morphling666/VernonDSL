@@ -4,6 +4,7 @@ import builtins
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn, Self, TypeAlias
 
@@ -455,8 +456,25 @@ def uniform(set: int | None = None, binding: int | None = None) -> Annotation:
     return _annotation("uniform", *((set, binding) if set is not None else ()))
 
 
-def varying() -> Annotation:
-    return _annotation("varying")
+class Interpolation(Enum):
+    """How a varying is interpolated across a primitive; values are the manifest spellings."""
+
+    PERSPECTIVE = "smooth"
+    LINEAR = "noperspective"
+    FLAT = "flat"
+
+
+def varying(interpolation: Interpolation | None = None) -> Annotation:
+    """Mark a fragment input or vertex output field as a varying.
+
+    Without `interpolation`, integer varyings are flat and all others perspective-correct.
+    """
+
+    if interpolation is None:
+        return _annotation("varying")
+    if not isinstance(interpolation, Interpolation):
+        raise TypeError("varying interpolation must be a vd.Interpolation")
+    return _annotation("varying", interpolation.value)
 
 
 def resource(set: int, binding: int) -> Annotation:

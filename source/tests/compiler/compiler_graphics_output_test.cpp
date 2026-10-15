@@ -367,32 +367,20 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
 TEST(CompilerGraphicsOutput, LowersEachMetalDescriptorSetToOneArgumentBuffer) {
     static constexpr char multiSetModule[] = R"(
 module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
-  func.func @multi_set_compute(
-      %left: !vernon.tensor_view<f32, [1], "read_write", "device"> {
-        vernon.interface = "resource",
-
-        vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+  func.func @multi_set_fragment(
+      %left: tensor<4xf32> {
+        vernon.interface = "uniform", vernon.set = 0 : i64, vernon.binding = 0 : i64
       },
-      %right: !vernon.tensor_view<f32, [1], "read", "device"> {
-        vernon.interface = "resource",
-
-        vernon.set = 1 : i64,
-        vernon.binding = 0 : i64
+      %right: tensor<4xf32> {
+        vernon.interface = "uniform", vernon.set = 1 : i64, vernon.binding = 0 : i64
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.location = 0 : i64
       }) attributes {
         vernon.entry,
-        vernon.stage = "compute",
-        vernon.workgroup_size = array<i32: 1, 1, 1>
+        vernon.stage = "fragment"
       } {
-    %zero = arith.constant 0 : index
-    %left_value = "vernon.load"(%left, %zero) :
-      (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
-    %right_value = "vernon.load"(%right, %zero) :
-      (!vernon.tensor_view<f32, [1], "read", "device">, index) -> f32
-    %sum = arith.addf %left_value, %right_value : f32
-    "vernon.store"(%sum, %left, %zero) :
-      (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
-    return
+    %sum = arith.addf %left, %right : tensor<4xf32>
+    return %sum : tensor<4xf32>
   }
 }
 )";
@@ -417,9 +405,9 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
     for (uint32_t set = 0; set < 2; ++set) {
         EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
-            return slot.value("entry_point", "") == "multi_set_compute" && slot.value("kind", "") == "storage_buffer" &&
-                   slot.value("set", UINT32_MAX) == set && slot.value("argument_buffer_index", UINT32_MAX) == set &&
-                   slot.value("member_id", UINT32_MAX) == 0;
+            return slot.value("entry_point", "") == "multi_set_fragment" &&
+                   slot.value("kind", "") == "uniform_buffer" && slot.value("set", UINT32_MAX) == set &&
+                   slot.value("argument_buffer_index", UINT32_MAX) == set && slot.value("member_id", UINT32_MAX) == 0;
         })) << slots.dump();
     }
     vernonCompileResultDestroy(result);
@@ -1049,7 +1037,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 1 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",

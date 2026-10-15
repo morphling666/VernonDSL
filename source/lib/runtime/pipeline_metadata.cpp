@@ -680,9 +680,9 @@ bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProvid
         return false;
     layout.image_dimension = *dimension;
     if (parameter.bindingRole == "sampled") {
-        if (parameter.sampleResultClass != "float")
+        if (parameter.sampleResultClass == VERNON_IMAGE_SAMPLE_NONE)
             return false;
-        layout.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
+        layout.sample_result_class = parameter.sampleResultClass;
         return true;
     }
     if (parameter.bindingRole != "storage")

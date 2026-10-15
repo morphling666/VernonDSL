@@ -23,7 +23,6 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/BitVector.h"
-#include "llvm/ADT/StringSwitch.h"
 
 #include <optional>
 
@@ -196,54 +195,109 @@ struct AtomicRMWToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> 
     }
 };
 
-FailureOr<Type> convertStorageTextureType(TextureType texture) {
-    if (texture.getAccess() == "sampled" || texture.isCube())
-        return failure();
-    std::optional<spirv::Dim> dimension = llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
-                                              .Cases("2d", "2d_array", spirv::Dim::Dim2D)
-                                              .Case("3d", spirv::Dim::Dim3D)
-                                              .Default(std::nullopt);
-    std::optional<spirv::ImageFormat> format = spirvStorageImageFormat(texture.getFormat());
-    if (!dimension || !format)
-        return failure();
-    Type image = spirv::ImageType::get(
-        texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
-        texture.isArrayed() ? spirv::ImageArrayedInfo::Arrayed : spirv::ImageArrayedInfo::NonArrayed,
-        spirv::ImageSamplingInfo::SingleSampled, spirv::ImageSamplerUseInfo::NoSampler, *format);
-    return spirv::PointerType::get(image, spirv::StorageClass::UniformConstant);
-}
-
-struct StorageTextureIntrinsicToSPIRVPattern final : OpConversionPattern<IntrinsicOp> {
+struct TextureIntrinsicToSPIRVPattern final : OpConversionPattern<IntrinsicOp> {
     using OpConversionPattern::OpConversionPattern;
 
     LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         if (adaptor.getOperands().empty())
             return failure();
-        Value image = adaptor.getOperands()[0];
-        auto pointer = dyn_cast<spirv::PointerType>(image.getType());
-        if (!pointer || !isa<spirv::ImageType>(pointer.getPointeeType()))
+        Value descriptor = adaptor.getOperands()[0];
+        auto pointer = dyn_cast<spirv::PointerType>(descriptor.getType());
+        if (!pointer || !isa<spirv::ImageType, spirv::SampledImageType>(pointer.getPointeeType()))
             return failure();
-        image = spirv::LoadOp::create(rewriter, op.getLoc(), image);
-        if (op.getName() == "texture_load") {
-            Type resultType = getTypeConverter()->convertType(op.getResult().getType());
-            if (!resultType || adaptor.getOperands().size() != 2)
-                return failure();
-            rewriter.replaceOpWithNewOp<spirv::ImageReadOp>(op, resultType, image, adaptor.getOperands()[1],
-                                                            spirv::ImageOperandsAttr(), ValueRange{});
-            return success();
-        }
-        if (op.getName() == "texture_store") {
-            if (adaptor.getOperands().size() != 3)
-                return failure();
+        const bool sampled = isa<spirv::SampledImageType>(pointer.getPointeeType());
+        const StringRef name = op.getName();
+        const size_t operandCount = adaptor.getOperands().size();
+        const bool matches =
+            sampled ? name == "texture_sample" && operandCount == 4
+                    : (name == "texture_load" && operandCount == 2) || (name == "texture_store" && operandCount == 3);
+        if (!matches)
+            return failure();
+        Type resultType = op.getNumResults() == 1 ? getTypeConverter()->convertType(op.getResult().getType()) : Type();
+        if (op.getNumResults() == 1 && !resultType)
+            return failure();
+
+        Value image = spirv::LoadOp::create(rewriter, op.getLoc(), descriptor);
+        if (sampled) {
+            rewriter.replaceOp(op, buildSpirvTextureSample(rewriter, op.getLoc(), resultType, image,
+                                                           adaptor.getOperands()[2], adaptor.getOperands()[3]));
+        } else if (name == "texture_load") {
+            rewriter.replaceOp(
+                op, buildSpirvTextureLoad(rewriter, op.getLoc(), resultType, image, adaptor.getOperands()[1]));
+        } else {
             spirv::ImageWriteOp::create(rewriter, op.getLoc(), image, adaptor.getOperands()[1],
                                         adaptor.getOperands()[2], spirv::ImageOperandsAttr(), ValueRange{});
             rewriter.eraseOp(op);
-            return success();
         }
-        return failure();
+        return success();
     }
 };
+
+// A sampler binds through the combined image-sampler of the texture it samples, so it has no SPIR-V value. It stays a
+// kernel argument until conversion because texture_sample needs it as an operand and the function conversion is
+// one-to-one; this pass-private mark survives the conversion, which replaces the sampler type with a placeholder.
+constexpr llvm::StringLiteral kCombinedSamplerAttrName = "vernon.combined_sampler";
+
+/* Marks every sampler argument after checking that the combined image-sampler model can lower its uses: the sampler
+ * placeholder has no SPIR-V value, so it may reach only the sampler operand of texture_sample, and compute has no
+ * implicit derivatives, so a sampled texture is only ever sampled at an explicit lod. */
+LogicalResult prepareComputeSampling(gpu::GPUModuleOp module) {
+    WalkResult result = module.walk([](Operation *op) -> WalkResult {
+        if (auto function = dyn_cast<gpu::GPUFuncOp>(op)) {
+            for (BlockArgument argument : function.getArguments()) {
+                if (!isa<SamplerType>(argument.getType()))
+                    continue;
+                for (OpOperand &use : argument.getUses()) {
+                    auto intrinsic = dyn_cast<IntrinsicOp>(use.getOwner());
+                    if (!intrinsic || intrinsic.getName() != "texture_sample" || use.getOperandNumber() != 1) {
+                        use.getOwner()->emitError() << "compute sampler argument #" << argument.getArgNumber()
+                                                    << " may be used only as the sampler of texture_sample";
+                        return WalkResult::interrupt();
+                    }
+                }
+                function.setArgAttr(argument.getArgNumber(), kCombinedSamplerAttrName,
+                                    UnitAttr::get(function.getContext()));
+            }
+            return WalkResult::advance();
+        }
+        auto intrinsic = dyn_cast<IntrinsicOp>(op);
+        auto texture = intrinsic && intrinsic.getNumOperands() != 0
+                           ? dyn_cast<TextureType>(intrinsic.getOperand(0).getType())
+                           : TextureType();
+        if (!texture || texture.getAccess() != "sampled")
+            return WalkResult::advance();
+        if (intrinsic.getName() != "texture_sample") {
+            intrinsic.emitOpError() << intrinsic.getName()
+                                    << " from a sampled texture is supported only in graphics stages";
+            return WalkResult::interrupt();
+        }
+        if (intrinsic.getNumOperands() != 4) {
+            intrinsic.emitOpError("texture_sample without lod is supported only in graphics stages");
+            return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+    });
+    return failure(result.wasInterrupted());
+}
+
+LogicalResult eraseCombinedSamplerArguments(ModuleOp module) {
+    SmallVector<spirv::FuncOp> functions;
+    module.walk([&](spirv::FuncOp function) { functions.push_back(function); });
+    for (spirv::FuncOp function : functions) {
+        llvm::BitVector erase(function.getNumArguments());
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            if (!function.getArgAttr(index, kCombinedSamplerAttrName))
+                continue;
+            if (!function.getArgument(index).use_empty())
+                return function.emitError() << "combined sampler argument #" << index << " is still used";
+            erase.set(index);
+        }
+        if (erase.any() && failed(function.eraseArguments(erase)))
+            return function.emitError("cannot remove combined sampler arguments");
+    }
+    return success();
+}
 
 // Aggregate metadata is one explicit Uniform block. The generic SPIR-V ABI
 // lowering can assign storage classes only to scalar function arguments, so
@@ -365,6 +419,10 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
         for (gpu::GPUModuleOp gpuModule : gpuModules) {
             OpBuilder builder(gpuModule);
             auto clone = cast<gpu::GPUModuleOp>(builder.clone(*gpuModule.getOperation()));
+            if (failed(prepareComputeSampling(clone))) {
+                signalPassFailure();
+                return;
+            }
             bool usesIntegerCasStorage = false;
             clone.walk([&](memref::AtomicRMWOp atomic) {
                 auto implementation = atomic->getAttrOfType<StringAttr>(kAtomicImplementationAttrName);
@@ -385,9 +443,13 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
                 });
             }
             typeConverter.addConversion([](TextureType texture) -> std::optional<Type> {
-                FailureOr<Type> converted = convertStorageTextureType(texture);
-                return succeeded(converted) ? std::optional<Type>(*converted) : std::nullopt;
+                std::optional<Type> descriptor = spirvTextureDescriptorType(texture);
+                if (!descriptor)
+                    return std::nullopt;
+                return spirv::PointerType::get(*descriptor, spirv::StorageClass::UniformConstant);
             });
+            typeConverter.addConversion(
+                [](SamplerType sampler) -> Type { return IntegerType::get(sampler.getContext(), 32); });
 
             RewritePatternSet patterns(&getContext());
             populateGPUToSPIRVPatterns(typeConverter, patterns);
@@ -401,7 +463,7 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
             populateVectorToSPIRVPatterns(typeConverter, patterns);
             patterns.add<Atan2ToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
             patterns.add<AtomicRMWToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
-            patterns.add<StorageTextureIntrinsicToSPIRVPattern>(typeConverter, &getContext());
+            patterns.add<TextureIntrinsicToSPIRVPattern>(typeConverter, &getContext());
             if (usesIntegerCasStorage) {
                 patterns.add<CasBackedLoadToSPIRVPattern, CasBackedStoreToSPIRVPattern>(typeConverter, &getContext(),
                                                                                         PatternBenefit(2));
@@ -412,7 +474,8 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
                 return;
             }
         }
-        if (failed(materializeMetadataInterfaceVariables(getOperation())) ||
+        if (failed(eraseCombinedSamplerArguments(getOperation())) ||
+            failed(materializeMetadataInterfaceVariables(getOperation())) ||
             failed(materializeStorageImageInterfaceVariables(getOperation())))
             signalPassFailure();
     }

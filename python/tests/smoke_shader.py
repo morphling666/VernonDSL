@@ -25,7 +25,7 @@ def fragment_main(
 
 @kernel(workgroup_size=(8, 4, 1))
 def compute_main(
-    values: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=0)],
+    values: TensorView[f32, (dyn,), read_write],
     invocation: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
 ) -> None:
     linear_invocation = invocation[0] + invocation[1] * 8

@@ -87,7 +87,9 @@ class _FunctionEmitter:
         self.environment: dict[str, Value] = {}
         self.generated_values: dict[str, Value] = {}
         self.implicit_samplers: dict[str, Value] = {}
-        self.interface_plan = plan_generated_interface(context, self.node, argument_annotations, stage)
+        self.interface_plan = plan_generated_interface(
+            context, self.node, argument_annotations, stage, typed_function.effects
+        )
         self.returned = False
         self.loop_controls: list[str] = []
         self.next_hidden = 0
@@ -248,6 +250,11 @@ class _FunctionEmitter:
                 access=access,
             )
             self.environment[argument.arg] = value
+            if self.stage == "compute" and any(item.kind == "resource" for item in annotation.metadata):
+                raise self.context.error(
+                    argument,
+                    "kernel Resources bind in argument order; resource(set, binding) applies only to graphics stages",
+                )
             attributes = self._metadata_attributes(annotation.metadata, stage=self.stage, is_result=False)
             if index in argument_locations and not any(
                 attribute.startswith("vernon.location") for attribute in attributes
@@ -257,23 +264,14 @@ class _FunctionEmitter:
             group = binding_group_occurrence(argument)
             if group is not None and self.stage in GRAPHICS_STAGES:
                 attributes.append(f'vernon.binding_group = "{group}"')
-            if annotation.type.kind == "scalar":
-                attributes.append(f'vernon.dtype = "{annotation.type.name}"')
-            elif annotation.type.kind == "tensor":
+            attributes.extend(self._dtype_attributes(annotation.type))
+            if annotation.type.kind == "tensor_view":
                 element_type = annotation.type.arguments[0]
                 assert isinstance(element_type, DslType)
-                if element_type.kind == "scalar":
-                    attributes.append(f'vernon.dtype = "{element_type.name}"')
-            elif annotation.type.kind == "tensor_view":
-                element_type = annotation.type.arguments[0]
-                assert isinstance(element_type, DslType)
-                if element_type.kind == "scalar":
-                    attributes.append(f'vernon.dtype = "{element_type.name}"')
                 attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
             if value_type.kind in {"tensor_view", "texture", "sampler"} and self.stage is not None:
-                has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute
                     for attribute in attributes
@@ -282,7 +280,8 @@ class _FunctionEmitter:
                 attributes.append('vernon.interface = "resource"')
                 # Graphics stages compile separately but link into one pipeline; only the compiler's binding
                 # planner sees the pipeline-wide binding base, so it owns every unannotated graphics binding.
-                if not has_explicit_binding and self.stage not in {"vertex", "fragment"}:
+                # Kernels have no such planner and bind in argument order.
+                if self.stage == "compute":
                     attributes.extend(("vernon.set = 0 : i64", f"vernon.binding = {index} : i64"))
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
@@ -376,6 +375,17 @@ class _FunctionEmitter:
             attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
         return attributes
 
+    @staticmethod
+    def _dtype_attributes(value_type: DslType) -> list[str]:
+        if value_type.kind in {"tensor", "tensor_view"}:
+            element = value_type.arguments[0]
+        elif value_type.kind == "texture" and value_type.arguments[3] == "sampled":
+            element = value_type.arguments[1]
+        else:
+            element = value_type
+        assert isinstance(element, DslType)
+        return [f'vernon.dtype = "{element.name}"'] if element.kind == "scalar" else []
+
     def _abi_leaf_dtypes_attribute(self, value_type: DslType, attribute: str) -> str:
         def fields(name: str) -> tuple[tuple[str, DslType], ...]:
             return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
@@ -414,14 +424,10 @@ class _FunctionEmitter:
             ]
             if contract.builtin is not None:
                 attributes.append(f'vernon.builtin = "{contract.builtin}"')
+            attributes.extend(self._dtype_attributes(value_type))
             if value_type.kind == "scalar":
-                attributes.append(f'vernon.dtype = "{value_type.name}"')
                 attributes.append(self._abi_leaf_dtypes_attribute(value_type, "vernon.abi_leaf_dtypes"))
             elif value_type.kind == "tensor":
-                element_type = value_type.arguments[0]
-                assert isinstance(element_type, DslType)
-                if element_type.kind == "scalar":
-                    attributes.append(f'vernon.dtype = "{element_type.name}"')
                 attributes.extend(self._abi_attributes(value_type))
             arguments.append(f"{value.name}: {value.type.mlir} {{{', '.join(attributes)}}}")
 
@@ -486,6 +492,8 @@ class _FunctionEmitter:
                     )
             elif item.kind == "varying":
                 attributes.append("vernon.varying = true")
+                if item.arguments:
+                    attributes.append(f'vernon.interpolation = "{item.arguments[0]}"')
             else:
                 attributes.append(f'vernon.{item.kind} = "{item.arguments[0]}"')
         return attributes

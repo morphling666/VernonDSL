@@ -177,6 +177,11 @@ void bindIndexedBuffer(rhi::opengl::Driver &driver, rhi::opengl::Enum target, ui
                                static_cast<rhi::opengl::SizePtr>(slot.resourceRange));
 }
 
+void bindSampledTexture(rhi::opengl::Driver &driver, uint32_t unit, const PreparedBindingSet::Slot &slot) {
+    driver.activeTexture(rhi::opengl::kTexture0 + unit);
+    driver.bindTexture(rhi::opengl::textureTarget(slot.resourceTarget), static_cast<rhi::opengl::Uint>(slot.resource));
+}
+
 void releaseCommandBindings(void *context, uint64_t);
 void releaseCommandPipeline(void *context, uint64_t);
 
@@ -354,7 +359,9 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                                        source.binding != UINT32_MAX && source.element_size != 0;
             const bool sampledImage = source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
-                                      source.binding != UINT32_MAX && source.name.data && source.name.size != 0;
+                                      source.binding != UINT32_MAX &&
+                                      (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE ||
+                                       (source.name.data && source.name.size != 0));
             const bool storageImage = source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
                                       source.binding != UINT32_MAX && source.access != 0;
@@ -894,6 +901,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
             (binding.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
              binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
              binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
+             binding.kind != VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE && binding.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
              binding.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE))
             return RhiAdapterResult<void>{
                 vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
@@ -909,6 +917,11 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                                                                    : rhi::opengl::kReadWrite;
             device.driver.bindImageTexture(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource), 0,
                                            slot.resourceTarget != VERNON_RHI_IMAGE_2D, 0, access, *format);
+        } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            // Compute GLSL declares each sampler's texture unit as its binding, so no unit uniform is assigned.
+            bindSampledTexture(device.driver, binding.binding, slot);
+        } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
+            device.driver.bindSampler(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource));
         } else {
             const rhi::opengl::Enum target = binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
                                                  ? rhi::opengl::kUniformBuffer
@@ -989,7 +1002,10 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         driver.cullFace(pipeline->rasterization.cull_mode == VERNON_RHI_CULL_FRONT ? rhi::opengl::kFront
                                                                                    : rhi::opengl::kBack);
     }
-    driver.frontFace(pipeline->rasterization.front_face == VERNON_RHI_FRONT_FACE_CLOCKWISE ? 0x0900 : 0x0901);
+    // GL vertex stages negate y so that image row 0 is the top, which mirrors every primitive's window-space winding.
+    driver.frontFace(pipeline->rasterization.front_face == VERNON_RHI_FRONT_FACE_CLOCKWISE
+                         ? rhi::opengl::kCounterClockwise
+                         : rhi::opengl::kClockwise);
     if (pipeline->rasterization.depth_bias_enabled) {
         driver.enable(0x8037);
         driver.polygonOffset(pipeline->rasterization.depth_bias_slope, pipeline->rasterization.depth_bias_constant);
@@ -1066,9 +1082,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             bindIndexedBuffer(driver, rhi::opengl::kShaderStorageBuffer, binding.binding, slot);
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto target = rhi::opengl::textureTarget(slot.resourceTarget);
-            driver.activeTexture(rhi::opengl::kTexture0 + binding.binding);
-            driver.bindTexture(target, static_cast<rhi::opengl::Uint>(slot.resource));
+            bindSampledTexture(driver, binding.binding, slot);
             driver.uniform1i(binding.location, static_cast<rhi::opengl::Int>(binding.binding));
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
             driver.bindSampler(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource));

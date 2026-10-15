@@ -1,6 +1,5 @@
 #include "compiler_program_compute.h"
 
-#include "VernonProgramCapabilities.h"
 #include "compiler_json.h"
 #include "compiler_program_stage.h"
 #include "compiler_program_storage.h"
@@ -94,7 +93,7 @@ bool prepareCanonicalComputeInterface(const llvm::json::Object &compiledEntry, c
 }
 
 bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, const llvm::json::Array &rawValues,
-                                    const ProgramNodeBindingIndex &boundValues,
+                                    const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                     std::map<int64_t, ProgramLogicalResource> &resources, int64_t nextPortableSlot,
                                     ProgramComputeEndpointPlan &plan, std::string &error) {
     std::map<int64_t, int64_t> metadataRanks;
@@ -182,12 +181,6 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         auto resourceIt = resources.find(valueId);
         const bool resource = resourceIt != resources.end();
         const llvm::StringRef endpointKind = row.getString("kind").value_or("");
-        if (endpointKind == "sampler") {
-            const program_capabilities::Entry &capability =
-                program_capabilities::get(program_capabilities::Id::ComputeSamplerBinding);
-            error = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
-            return false;
-        }
         const bool opaqueResourceEndpoint = endpointKind == "image" || endpointKind == "sampler";
         const std::optional<llvm::StringRef> autodiffRole = row.getString("vernon.autodiff_role");
         const bool tapeCarrier = logicalValue && isProgramAdTapeType(logicalValue->getString("type").value_or("")) &&
@@ -405,7 +398,7 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         if (opaqueResourceEndpoint)
             if (std::optional<int64_t> slot = row.getInteger("vernon.binding"))
                 abi.emplace_back(
-                    llvm::json::Object{{"semantic", "resource"},
+                    llvm::json::Object{{"semantic", endpointKind == "sampler" ? "sampler" : "resource"},
                                        {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}}});
         if (const llvm::json::Array *leaves = row.getArray("storage_leaves"))
             for (size_t leafIndex = 0; leafIndex < leaves->size(); ++leafIndex)
@@ -421,13 +414,11 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
             return false;
         }
         llvm::json::Object resourceLayout;
-        if (endpointKind == "image")
-            resourceLayout = llvm::json::Object{{"tag", "image"},
-                                                {"dimension", row.getString("dimension").value_or("").str()},
-                                                {"format", row.getString("exact_storage_format").value_or("").str()},
-                                                {"sample_count", int64_t{1}},
-                                                {"aspects", llvm::json::Array{"color"}}};
-        else if (endpointKind == "sampler")
+        if (endpointKind == "image") {
+            if (!planProgramImageEndpoint(row, resourceIt->second, storages, plan.storageUsageRequirements,
+                                          resourceLayout, error))
+                return false;
+        } else if (endpointKind == "sampler")
             resourceLayout = llvm::json::Object{{"tag", "sampler"}};
         else {
             resourceLayout =

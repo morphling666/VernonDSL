@@ -212,11 +212,9 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
                 vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter), &descriptor,
                 &state->rhiGraphicsPipeline);
             if (status != VERNON_STATUS_OK) {
-                const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
-                invocationDiagnostic(*inputs.context) = providerError.data
-                                                            ? std::string(providerError.data, providerError.size)
-                                                            : "failed to prepare Metal provider graphics pipeline";
+                invocationDiagnostic(*inputs.context) =
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter),
+                                       "failed to prepare Metal provider graphics pipeline");
                 return false;
             }
             installRuntimeBackendState(pipeline, state.release());
@@ -244,6 +242,7 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
             const char *resourceKind = source.metadataCarrier                                 ? "uniform_buffer"
                                        : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? "sampled_image"
                                        : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? "storage_image"
+                                       : layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER       ? "sampler"
                                                                                               : "storage_buffer";
             MetalResourceLocation location;
             if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind, layout.set,
@@ -276,11 +275,9 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
             vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
                                              &descriptor, &state->rhiComputePipeline);
         if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
-            invocationDiagnostic(*inputs.context) = providerError.data
-                                                        ? std::string(providerError.data, providerError.size)
-                                                        : "failed to prepare Metal provider compute pipeline";
+            invocationDiagnostic(*inputs.context) =
+                providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter),
+                                   "failed to prepare Metal provider compute pipeline");
             return false;
         }
         installRuntimeBackendState(pipeline, state.release());
@@ -326,10 +323,9 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
             : vernonRuntimeCoreCreateBindings(state.rhiGraphicsPipeline, state.rhiGraphicsValues.data(),
                                               state.rhiGraphicsValues.size(), &state.rhiGraphicsBindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data && providerError.size ? std::string(providerError.data, providerError.size)
-                                                             : "failed to update Metal RHI graphics bindings",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
+                                       "failed to update Metal RHI graphics bindings"),
                     status);
     }
     std::vector<uint32_t> formats;
@@ -352,20 +348,18 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
         return VERNON_STATUS_INVALID_ARGUMENT;
     status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare Metal RHI graphics variant",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
+                                       "failed to prepare Metal RHI graphics variant"),
                     status);
     }
     status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
                                                                   state.rhiGraphicsBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
-        return fail(*pipeline.context,
-                    providerError.data && providerError.size ? std::string(providerError.data, providerError.size)
-                                                             : "failed to encode Metal RHI draw",
-                    status);
+        return fail(
+            *pipeline.context,
+            providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter), "failed to encode Metal RHI draw"),
+            status);
     }
     return VERNON_STATUS_OK;
 #else
@@ -380,50 +374,10 @@ VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const P
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;
-    for (size_t index = 0; index < state.rhiComputeBindingPlan.size(); ++index) {
-        const auto &layout = state.rhiComputeBindingPlan.layouts[index];
-        const PreparedBindingSource &preparedSource = state.rhiComputeBindingPlan.sources[index];
-        auto &value = state.rhiComputeValues[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (preparedSource.metadataCarrier) {
-            if (!bindComputeMetadataCarrier(layout, preparedSource, launch, value))
-                return fail(*pipeline.context, "Metal metadata carrier payload does not match its compiled ABI");
-            continue;
-        }
-        if (preparedSource.argumentIndex >= launch.arguments.size())
-            return fail(*pipeline.context, "Metal prepared argument index is invalid");
-        const ComputeLaunchArgument &argument = launch.arguments[preparedSource.argumentIndex];
-        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
-                if (!bindComputeValueStorage(layout, argument, value))
-                    return fail(*pipeline.context, "Metal prepared Value storage binding has invalid bytes");
-                continue;
-            }
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->resource.resource.value)
-                return fail(*pipeline.context, "Metal prepared storage binding requires an RHI Tensor");
-            value.payload.buffer.resource = tensor->resource;
-            if (value.payload.buffer.resource.offset > value.payload.buffer.resource.size ||
-                preparedSource.resourceOffset >
-                    value.payload.buffer.resource.size - value.payload.buffer.resource.offset)
-                return fail(*pipeline.context, "Metal aggregate storage leaf exceeds its Tensor resource");
-            value.payload.buffer.resource.offset += preparedSource.resourceOffset;
-        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto *image = std::get_if<ComputeImageArgument>(&argument);
-            if (!image || !image->view.resource.value)
-                return fail(*pipeline.context, "Metal prepared image binding requires an RHI Texture");
-            value.payload.image.view = image->view;
-        } else {
-            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar || !scalar->data || !scalar->size)
-                return fail(*pipeline.context, "Metal prepared inline binding requires packed host data");
-            value.payload.inline_value.data = scalar->data;
-            value.payload.inline_value.size = scalar->size;
-        }
-    }
+    std::string error;
+    if (!fillPreparedComputeBindingValues(state.rhiComputeBindingPlan, pipeline.bindingProjection, launch,
+                                          state.rhiComputeValues, error))
+        return fail(*pipeline.context, "Metal " + error);
     VernonStatus status =
         state.rhiComputeBindings
             ? vernonRuntimeCoreUpdateBindings(state.rhiComputeBindings, state.rhiComputeValues.data(),
@@ -431,20 +385,18 @@ VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const P
             : vernonRuntimeCoreCreateBindings(state.rhiComputePipeline, state.rhiComputeValues.data(),
                                               state.rhiComputeValues.size(), &state.rhiComputeBindings);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare Metal invocation bindings",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
+                                       "failed to prepare Metal invocation bindings"),
                     status);
     }
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
                                              groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode Metal provider dispatch",
+                    providerDiagnostic(vernonRuntimeRhiAdapterGetLastError(&adapter),
+                                       "failed to encode Metal provider dispatch"),
                     status);
     }
     return VERNON_STATUS_OK;

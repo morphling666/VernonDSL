@@ -5,6 +5,7 @@
 
 #include "VernonVersions.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -26,8 +27,10 @@ namespace mlir::vernon {
 ///   vernon.set = <non-negative integer>
 ///   vernon.binding = <non-negative integer>
 ///   vernon.instance_divisor = <positive integer>
+///   vernon.interpolation = "smooth" | "noperspective" | "flat"
 ///
 /// Input/output interfaces have exactly one of location or builtin.
+/// Interpolation applies only to located vertex outputs and fragment inputs.
 /// Resource interfaces have both set and binding. Uniform interfaces may omit
 /// both for native OpenGL uniforms, or provide both when backed by a descriptor.
 /// Ordinary values use standard tensor/vector/linalg types and operations; this
@@ -42,17 +45,25 @@ inline constexpr llvm::StringLiteral kBuiltinAttrName = "vernon.builtin";
 inline constexpr llvm::StringLiteral kDescriptorSetAttrName = "vernon.set";
 inline constexpr llvm::StringLiteral kBindingAttrName = "vernon.binding";
 inline constexpr llvm::StringLiteral kInstanceDivisorAttrName = "vernon.instance_divisor";
+inline constexpr llvm::StringLiteral kInterpolationAttrName = "vernon.interpolation";
 inline constexpr llvm::StringLiteral kTensorMetadataCarrierAttrName = "vernon.tensor_metadata_carrier";
 inline constexpr llvm::StringLiteral kTensorMetadataProfileAttrName = "vernon.tensor_metadata_profile";
 inline constexpr llvm::StringLiteral kTensorMetadataFieldCountAttrName = "vernon.tensor_metadata_field_count";
 
 enum class ShaderStage { Vertex, Fragment, Compute };
 enum class InterfaceKind { Input, Output, Uniform, Resource };
+enum class Interpolation { Smooth, NoPerspective, Flat };
 
 StringRef stringifyShaderStage(ShaderStage stage);
 StringRef stringifyInterfaceKind(InterfaceKind kind);
+StringRef stringifyInterpolation(Interpolation interpolation);
 FailureOr<ShaderStage> parseShaderStage(Attribute attr);
 FailureOr<InterfaceKind> parseInterfaceKind(Attribute attr);
+FailureOr<Interpolation> parseInterpolation(Attribute attr);
+
+/// The interpolation of a varying: its explicit `vernon.interpolation`, else Flat when any scalar leaf is an integer
+/// and Smooth otherwise. Fails on an unknown spelling or a type without numeric leaves.
+FailureOr<Interpolation> resolveInterpolation(DictionaryAttr attrs, Type type, ModuleOp module);
 
 /// Parsed views keep the original attributes so validation can distinguish a
 /// missing attribute from an attribute with the wrong storage type.

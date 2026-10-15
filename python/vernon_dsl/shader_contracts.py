@@ -143,4 +143,6 @@ def resource_stage_error(operation: str, stages: frozenset[str], *, has_lod: boo
     requirement = "fragment shaders" if stages == _FRAGMENT_ONLY else "graphics stages"
     if operation == "texture_sample":
         return f"texture_sample {'with' if has_lod else 'without'} lod is supported only in {requirement}"
+    if operation == "texture_load":
+        return f"texture_load from a sampled texture is supported only in {requirement}"
     return f"{operation} is supported only in {requirement}"

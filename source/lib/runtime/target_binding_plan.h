@@ -116,6 +116,7 @@ struct TargetBinding {
     std::string access;
     std::string dimension;
     std::string imageFormat;
+    VernonImageSampleResultClass imageSampleResultClass{VERNON_IMAGE_SAMPLE_NONE};
     std::string builtin;
     std::optional<ViewTransform> viewTransform;
     std::optional<CanonicalValueType> valueType;

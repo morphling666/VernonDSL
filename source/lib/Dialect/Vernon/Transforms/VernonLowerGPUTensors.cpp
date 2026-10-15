@@ -246,12 +246,17 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
     bool useSpirv;
 };
 
+// Texture intrinsics stay intrinsics until SPIR-V conversion; this pass only converts their value types.
+bool isGpuTextureIntrinsic(IntrinsicOp op) {
+    return op.getName() == "texture_load" || op.getName() == "texture_store" || op.getName() == "texture_sample";
+}
+
 struct GpuTextureIntrinsicTypePattern final : OpConversionPattern<IntrinsicOp> {
     using OpConversionPattern::OpConversionPattern;
 
     LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        if (op.getName() != "texture_load" && op.getName() != "texture_store")
+        if (!isGpuTextureIntrinsic(op))
             return failure();
         SmallVector<Type> resultTypes;
         if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), resultTypes)))
@@ -833,9 +838,8 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
             [&](Operation *operation) { return converter.isLegal(operation); });
         target.addDynamicallyLegalOp<gpu::GPUFuncOp>(
             [&](gpu::GPUFuncOp op) { return converter.isSignatureLegal(op.getFunctionType()); });
-        target.addDynamicallyLegalOp<IntrinsicOp>([&](IntrinsicOp op) {
-            return (op.getName() == "texture_load" || op.getName() == "texture_store") && converter.isLegal(op);
-        });
+        target.addDynamicallyLegalOp<IntrinsicOp>(
+            [&](IntrinsicOp op) { return isGpuTextureIntrinsic(op) && converter.isLegal(op); });
         target.markUnknownOpDynamicallyLegal([&](Operation *operation) { return converter.isLegal(operation); });
         populateVernonSharedValueStructuralTypeConversions(converter, patterns, target);
 

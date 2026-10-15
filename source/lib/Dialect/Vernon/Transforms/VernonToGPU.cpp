@@ -395,7 +395,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             DenseMap<unsigned, std::pair<unsigned, unsigned>> sourceArgumentRanges;
             SmallVector<InlineTensorArgument> inlineTensorArguments;
             DenseMap<unsigned, Type> aggregateValueArguments;
-            SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>> resourceBindings;
+            SmallVector<unsigned> resourceArguments;
             std::optional<unsigned> metadataSourceIndex;
             std::optional<unsigned> metadataKernelIndex;
             DictionaryAttr metadataKernelAttrs;
@@ -416,7 +416,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     metadataSourceIndex = index;
                     metadataKernelIndex = kernelIndex;
                     if (useSpirvStorage)
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                        resourceArguments.push_back(kernelIndex);
                     continue;
                 }
                 if (!attrs.builtin && isa<TensorType, StructType, TupleType>(type)) {
@@ -432,7 +432,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     }
                     unsigned kernelIndex = kernelArgumentTypes.size();
                     kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), useSpirvStorage));
-                    resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                    resourceArguments.push_back(kernelIndex);
                     sourceArgumentRanges[index] = {kernelIndex, 1};
                     aggregateValueArguments[index] = type;
                     continue;
@@ -449,17 +449,16 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         }
                         unsigned kernelIndex = kernelArgumentTypes.size();
                         kernelArgumentTypes.push_back(convertStorageLeaf(tensor.getElementType(), useSpirvStorage));
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                        resourceArguments.push_back(kernelIndex);
                         inlineTensorArguments.push_back({static_cast<unsigned>(index), kernelIndex, tensor});
                         continue;
                     }
                 }
                 if (kind && kind.getValue() == "resource") {
-                    if (isa<TextureType>(type)) {
+                    if (isa<TextureType, SamplerType>(type)) {
                         unsigned kernelIndex = kernelArgumentTypes.size();
-                        auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
                         kernelArgumentTypes.push_back(type);
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
+                        resourceArguments.push_back(kernelIndex);
                         sourceArgumentRanges[index] = {kernelIndex, 1};
                         continue;
                     }
@@ -471,9 +470,8 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         return signalPassFailure();
                     }
                     unsigned kernelIndex = kernelArgumentTypes.size();
-                    auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
                     kernelArgumentTypes.push_back(view);
-                    resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
+                    resourceArguments.push_back(kernelIndex);
                     sourceArgumentRanges[index] = {kernelIndex, 1};
                 } else if (!attrs.builtin && (type.isIntOrIndexOrFloat() || isa<mlir::VectorType>(type))) {
                     unsigned kernelIndex = kernelArgumentTypes.size();
@@ -764,7 +762,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 for (NamedAttribute attribute : metadataKernelAttrs)
                     kernel.setArgAttr(first, attribute.getName(), attribute.getValue());
             }
-            for (auto [originalIndex, binding] : resourceBindings) {
+            for (unsigned originalIndex : resourceArguments) {
                 if (originalIndex >= convertedArgumentRanges.size()) {
                     source.emitError() << "resource argument index " << originalIndex
                                        << " exceeds converted kernel signature size " << convertedArgumentRanges.size();
@@ -778,9 +776,8 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                                            << " exceeds kernel argument count " << kernel.getNumArguments();
                         return signalPassFailure();
                     }
-                    kernel.setArgAttr(
-                        index, spirv::getInterfaceVarABIAttrName(),
-                        spirv::getInterfaceVarABIAttr(binding.first, index, std::nullopt, source.getContext()));
+                    kernel.setArgAttr(index, spirv::getInterfaceVarABIAttrName(),
+                                      spirv::getInterfaceVarABIAttr(0, index, std::nullopt, source.getContext()));
                 }
             }
             if (useSpirvStorage) {

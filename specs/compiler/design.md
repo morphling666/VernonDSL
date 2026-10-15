@@ -740,7 +740,49 @@ each corresponding texture unit, and Vulkan writes it into each corresponding
 combined-image descriptor. The current SPIR-V representation stores the
 sampled image at the texture binding and does not dynamically select a sampler;
 therefore one texture binding reaching multiple sampler entry arguments is
-rejected during reflection.
+rejected during reflection. Each pair copies the set and binding of its
+texture's own reflected row instead of restating them, so pairs follow the
+stage's numbering: declared bindings in graphics, flattened argument bindings
+in compute.
+
+### Compute bindings
+
+Kernel Resources bind in argument order: the frontend emits set 0 and the
+argument index, validation rejects any other pair on a compute Resource, and
+`VernonToGPU` flattens each argument's storage leaves into consecutive
+interface ABI bindings. The frontend rejects `resource(set, binding)` on
+kernel parameters. Honouring declared sets was rejected: no compute caller
+needs them, and every backend's compute binding plan would have to carry a
+second numbering beside the flattened one.
+
+### Compute sampling
+
+A compute `texture_sample` always takes an explicit LOD and lowers to
+`OpImageSampleExplicitLod`, because compute has no implicit derivatives. The
+sampler stays a kernel argument through GPU lowering, because the
+`texture_sample` verifier needs it as an operand. It therefore takes a
+flattened binding index and leaves a gap, as a graphics sampler occupies its
+declared binding. `VernonToGPU` assigns explicit interface ABI bindings, so
+removing the argument later renumbers nothing.
+
+The sampler has no SPIR-V value. Upstream `gpu.func` conversion is one-to-one
+per argument and replaces the sampler type with a placeholder, so
+`vernon-convert-gpu-to-spirv` marks sampler arguments from their type before
+conversion and erases them afterwards. The mark is private to that pass. A
+public attribute set by `VernonToGPU` was rejected: it restated the type and
+made the GPU lowering depend on the SPIR-V combined image-sampler model.
+Before marking, the pass rejects what compute cannot express: a sampler used
+other than as the sampler operand of `texture_sample`, `texture_sample`
+without a LOD, and any other operation on a sampled Texture, such as
+`texture_load` or `texture_size`.
+Graphics and compute lowering build sampled-image types, samples and fetches
+with the same helpers (`VernonSpirvImageFormat.h`), so the two paths cannot
+disagree on image operands.
+
+Image Storage usage and `sample_result_class` come from endpoint requirements
+that the compute and graphics stage builders plan with one function, so a
+sampled compute Texture requires `sampled` usage and its result class exactly
+as a fragment one does.
 
 ### Generated graphics inputs
 
