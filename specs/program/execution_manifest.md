@@ -1872,7 +1872,7 @@ An invocation completes in `WAIT` or `ASYNCHRONOUS` mode
 ([`../runtime/pipelined_submission.md`](../runtime/pipelined_submission.md)).
 `ASYNCHRONOUS` Execute returns after submission; the transactional rules
 above then hold at the submission's completion instead of at Execute. Until
-guarded deferred copies exist, an asynchronous plan writes only `in_place`
+deferred commit copies exist, an asynchronous plan writes only `in_place`
 boundaries: resolve records the plan's first `commit_after_success`
 boundary or autodiff tape as its wait requirement, and an asynchronous
 Execute of such a plan, or one retaining a pullback, fails before

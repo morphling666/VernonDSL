@@ -3,10 +3,9 @@ from __future__ import annotations
 import ast
 from typing import Protocol
 
-from ..language.ast_utils import dotted_name
+from ..language.ast_utils import assigned_names, dotted_name
 from .control_flow_lowering import (
     ControlFlowEmitter,
-    assigned_names,
     contains_loop_exit,
     contains_return,
     emit_loop_body,

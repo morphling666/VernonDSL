@@ -257,32 +257,86 @@ LogicalResult collectTransportScalarOffsets(const ByteTransportNode &node, uint6
     return success();
 }
 
-struct ScalarBlockMembers {
-    SmallVector<Type> types;
-    SmallVector<uint32_t> offsets;
+/// Where one ValueAbi leaf of a block-wrapped aggregate lives. A vectorized leaf is one 4-vector member, or an array
+/// of them when `vectors` exceeds one; any other leaf is one scalar member per element from `firstMember` on.
+struct BlockLeaf {
+    uint32_t firstMember{};
+    uint32_t elements{};
+    uint32_t vectors{};
 };
 
-// Aggregate Values cross buffer interfaces as their scalar leaves at the planned physical offsets, in the leaf order
+struct BlockMembers {
+    SmallVector<Type> types;
+    SmallVector<uint32_t> offsets;
+    SmallVector<BlockLeaf> leaves;
+};
+
+/// Where a block-wrapped entry argument lives in its block: from member `first` on, with the leaves of an aggregate
+/// Value placed relative to `first`.
+struct BlockArgumentMembers {
+    uint32_t first{};
+    std::shared_ptr<const BlockMembers> aggregate;
+};
+
+enum class LeafVectorization { None, Aligned };
+
+constexpr uint32_t kBlockScalarBytes = 4;
+constexpr uint32_t kBlockVectorWidth = 4;
+
+// Aggregate Values cross buffer interfaces as their leaves at the planned physical offsets, in the leaf order
 // constructComposite consumes. No nested SPIR-V struct layout is portable: std140, std430, HLSL constant-buffer and
 // MSL packing disagree on nested members, and HLSL can only place top-level constant-buffer members explicitly.
-FailureOr<ScalarBlockMembers> getScalarBlockMembers(Type type, ModuleOp module, const ByteTransportNode &physical) {
+// `baseOffset` is where the aggregate starts in its block, which decides the 16-byte alignment of vectorized leaves.
+FailureOr<BlockMembers> getBlockMembers(Type type, ModuleOp module, const ByteTransportNode &physical,
+                                        LeafVectorization vectorization, uint64_t baseOffset = 0) {
     FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
     SmallVector<uint64_t> physicalOffsets;
-    if (failed(layout) || failed(collectTransportScalarOffsets(physical, 0, physicalOffsets)))
+    if (failed(layout) || failed(collectTransportScalarOffsets(physical, baseOffset, physicalOffsets)))
         return failure();
-    ScalarBlockMembers members;
+    if (llvm::any_of(physicalOffsets, [](uint64_t offset) { return offset > std::numeric_limits<uint32_t>::max(); }))
+        return failure();
+    constexpr uint64_t vectorBytes = uint64_t{kBlockScalarBytes} * kBlockVectorWidth;
+    BlockMembers members;
+    size_t cursor = 0;
     for (const ValueAbiLeaf &leaf : layout->leaves) {
         FailureOr<Type> scalar = convertValueType(leaf.scalarType, module);
-        if (failed(scalar))
+        if (failed(scalar) || physicalOffsets.size() - cursor < leaf.scalarCount)
             return failure();
-        members.types.append(leaf.scalarCount, *scalar);
+        ArrayRef<uint64_t> offsets = ArrayRef<uint64_t>(physicalOffsets).slice(cursor, leaf.scalarCount);
+        cursor += leaf.scalarCount;
+        const bool contiguous = llvm::all_of(llvm::seq<size_t>(1, offsets.size()), [&](size_t index) {
+            return offsets[index] == offsets.front() + (index * kBlockScalarBytes);
+        });
+        BlockLeaf placed{static_cast<uint32_t>(members.types.size()), static_cast<uint32_t>(offsets.size()), 0};
+        if (vectorization == LeafVectorization::Aligned && scalar->getIntOrFloatBitWidth() == kBlockScalarBytes * 8 &&
+            !offsets.empty() && offsets.size() % kBlockVectorWidth == 0 && offsets.front() % vectorBytes == 0 &&
+            contiguous) {
+            placed.vectors = static_cast<uint32_t>(offsets.size() / kBlockVectorWidth);
+            Type vector = mlir::VectorType::get({kBlockVectorWidth}, *scalar);
+            members.types.push_back(
+                placed.vectors == 1
+                    ? vector
+                    : Type(spirv::ArrayType::get(vector, placed.vectors, static_cast<unsigned>(vectorBytes))));
+            members.offsets.push_back(static_cast<uint32_t>(offsets.front()));
+        } else {
+            members.types.append(offsets.size(), *scalar);
+            llvm::transform(offsets, std::back_inserter(members.offsets),
+                            [](uint64_t offset) { return static_cast<uint32_t>(offset); });
+        }
+        members.leaves.push_back(placed);
     }
-    if (members.types.empty() || members.types.size() != physicalOffsets.size() ||
-        llvm::any_of(physicalOffsets, [](uint64_t offset) { return offset > std::numeric_limits<uint32_t>::max(); }))
+    if (members.types.empty() || cursor != physicalOffsets.size())
         return failure();
-    llvm::transform(physicalOffsets, std::back_inserter(members.offsets),
-                    [](uint64_t offset) { return static_cast<uint32_t>(offset); });
     return members;
+}
+
+/// Constant access-chain indices of scalar `element` of `leaf`, relative to the first member of the aggregate.
+SmallVector<uint32_t, 3> blockScalarPath(const BlockLeaf &leaf, uint32_t element) {
+    if (leaf.vectors == 0)
+        return {leaf.firstMember + element};
+    if (leaf.vectors == 1)
+        return {leaf.firstMember, element};
+    return {leaf.firstMember, element / kBlockVectorWidth, element % kBlockVectorWidth};
 }
 
 FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
@@ -292,8 +346,8 @@ FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp mo
     if (failed(physicalLayout) || physicalLayout->root->byteStrides.empty() || failed(count) || *count <= 0 ||
         *count > static_cast<int64_t>(std::numeric_limits<unsigned>::max()))
         return failure();
-    FailureOr<ScalarBlockMembers> record =
-        getScalarBlockMembers(tensor.getElementType(), module, *physicalLayout->root->children.front());
+    FailureOr<BlockMembers> record = getBlockMembers(tensor.getElementType(), module,
+                                                     *physicalLayout->root->children.front(), LeafVectorization::None);
     const uint64_t stride = physicalLayout->root->byteStrides.back();
     if (failed(record) || stride > std::numeric_limits<unsigned>::max())
         return failure();
@@ -394,15 +448,15 @@ spirv::StructType createBlockType(MLIRContext *context, StringRef variableName, 
 spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location location, StringRef name, Type valueType,
                                                 spirv::StorageClass storageClass, DictionaryAttr attributes,
                                                 const ByteTransportNode *layout = nullptr,
-                                                const ScalarBlockMembers *scalarMembers = nullptr) {
+                                                const BlockMembers *aggregateMembers = nullptr) {
     auto pointerType = spirv::PointerType::get(valueType, storageClass);
     if (isBlockWrappedStorageClass(storageClass)) {
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
         structDecorations.emplace_back(spirv::Decoration::Block, builder.getUnitAttr());
         spirv::StructType blockType;
-        if (scalarMembers) {
-            blockType = createBlockType(builder.getContext(), name, scalarMembers->types, scalarMembers->offsets, {},
-                                        structDecorations);
+        if (aggregateMembers) {
+            blockType = createBlockType(builder.getContext(), name, aggregateMembers->types, aggregateMembers->offsets,
+                                        {}, structDecorations);
         } else {
             SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
             if (layout)
@@ -587,53 +641,198 @@ Value extractStaticTensorElement(Location location, Value value, RankedTensorTyp
     return spirv::CompositeExtractOp::create(builder, location, value, indices).getResult();
 }
 
-FailureOr<Value> lowerTensorExtract(tensor::ExtractOp extract, OpBuilder &builder, IRMapping &mapping) {
-    auto sourceType = dyn_cast<RankedTensorType>(extract.getTensor().getType());
-    Value input = mapping.lookupOrNull(extract.getTensor());
-    if (!sourceType || !sourceType.hasStaticShape() || !input ||
-        extract.getIndices().size() != static_cast<size_t>(sourceType.getRank()))
-        return failure();
-    if (sourceType.getRank() == 0)
-        return input;
-    Location location = extract.getLoc();
-    int64_t constantLinear = 0;
-    bool hasConstantIndices = true;
+/// Source graphics TensorView argument -> pointers to its storage-leaf buffers,
+/// in ValueAbi leaf order. Every leaf views the whole record buffer as an array
+/// of that leaf's scalar type.
+using StorageLeafMap = DenseMap<Value, SmallVector<Value>>;
+
+struct UniformBlockArgument {
+    Value block;
+    BlockArgumentMembers members;
+};
+
+/// Entry-function state shared by every translated operation. Function-storage variables must be created at the
+/// start of `functionEntry`. `uniforms` maps each aggregate uniform entry argument to its block.
+struct EntryContext {
+    Block *functionEntry{};
+    StorageLeafMap storage;
+    DenseMap<Value, UniformBlockArgument> uniforms;
+};
+
+/// Leaves [first, first + count) of a uniform entry argument's block: the leaves of a Value reached from the argument
+/// through field reads.
+struct UniformBlockLeaves {
+    UniformBlockArgument argument;
+    size_t first{};
+    size_t count{};
+
+    const BlockLeaf &leaf(size_t index) const { return argument.members.aggregate->leaves[first + index]; }
+};
+
+std::optional<UniformBlockLeaves> findUniformBlockLeaves(Value value, const EntryContext &context, ModuleOp module) {
+    FailureOr<ValueAbiLayout> own = getValueStorageLayout(value.getType(), module);
+    if (failed(own))
+        return std::nullopt;
+    size_t first = 0;
+    const auto skipFields = [&](ArrayRef<Type> fields, uint64_t index) {
+        if (index > fields.size())
+            return false;
+        for (Type field : fields.take_front(index)) {
+            FailureOr<ValueAbiLayout> layout = getValueStorageLayout(field, module);
+            if (failed(layout))
+                return false;
+            first += layout->leaves.size();
+        }
+        return true;
+    };
+    while (true) {
+        if (auto get = value.getDefiningOp<StructGetOp>()) {
+            auto structure = dyn_cast<StructType>(get.getInput().getType());
+            FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields =
+                structure ? resolveStructFields(structure, module)
+                          : FailureOr<std::pair<StructDeclOp, SmallVector<Type>>>(failure());
+            if (failed(fields) || !skipFields(fields->second, get.getIndex()))
+                return std::nullopt;
+            value = get.getInput();
+            continue;
+        }
+        if (auto get = value.getDefiningOp<TupleGetOp>()) {
+            auto tuple = dyn_cast<TupleType>(get.getInput().getType());
+            if (!tuple || !skipFields(tuple.getTypes(), get.getIndex()))
+                return std::nullopt;
+            value = get.getInput();
+            continue;
+        }
+        break;
+    }
+    auto found = context.uniforms.find(value);
+    if (found == context.uniforms.end() || first + own->leaves.size() > found->second.members.aggregate->leaves.size())
+        return std::nullopt;
+    return UniformBlockLeaves{found->second, first, own->leaves.size()};
+}
+
+/// The element index of an `extract` whose indices are all in-bounds constants.
+std::optional<int64_t> constantLinearIndex(tensor::ExtractOp extract) {
+    auto sourceType = cast<RankedTensorType>(extract.getTensor().getType());
+    int64_t linear = 0;
     for (auto [dimension, sourceIndex] : llvm::zip_equal(sourceType.getShape(), extract.getIndices())) {
         if (auto cast = sourceIndex.getDefiningOp<arith::IndexCastOp>())
             sourceIndex = cast.getIn();
         auto constant = sourceIndex.getDefiningOp<arith::ConstantOp>();
         auto index = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
-        if (!index || index.getInt() < 0 || index.getInt() >= dimension) {
-            hasConstantIndices = false;
-            break;
-        }
-        constantLinear = constantLinear * dimension + index.getInt();
+        if (!index || index.getInt() < 0 || index.getInt() >= dimension)
+            return std::nullopt;
+        linear = linear * dimension + index.getInt();
     }
-    if (hasConstantIndices)
-        return extractStaticTensorElement(location, input, sourceType, constantLinear, builder);
+    return linear;
+}
+
+/// The uniform block leaf `extract` reads its element from in place. Only a vectorized leaf can be indexed at
+/// runtime, because SPIR-V struct member indices are constants.
+std::optional<UniformBlockLeaves> findExtractedUniformLeaf(tensor::ExtractOp extract, const EntryContext &context) {
+    std::optional<UniformBlockLeaves> leaves =
+        findUniformBlockLeaves(extract.getTensor(), context, extract->getParentOfType<ModuleOp>());
+    if (!leaves || leaves->count != 1 || (leaves->leaf(0).vectors == 0 && !constantLinearIndex(extract)))
+        return std::nullopt;
+    return leaves;
+}
+
+/// True when no use of the uniform-derived `value` needs it as a whole: field reads load their own leaves and
+/// element reads index the block.
+bool isReadThroughUniformBlock(Value value, const EntryContext &context) {
+    return llvm::all_of(value.getUsers(), [&](Operation *user) {
+        if (isa<StructGetOp, TupleGetOp>(user))
+            return true;
+        auto extract = dyn_cast<tensor::ExtractOp>(user);
+        return extract && findExtractedUniformLeaf(extract, context).has_value();
+    });
+}
+
+Value blockIndex(OpBuilder &builder, Location location, uint32_t index) {
+    return spirv::ConstantOp::create(builder, location, builder.getI32Type(),
+                                     builder.getI32IntegerAttr(static_cast<int32_t>(index)));
+}
+
+Value loadUniformScalar(const UniformBlockLeaves &leaves, size_t leaf, uint32_t element, OpBuilder &builder,
+                        Location location) {
+    SmallVector<Value> indices;
+    for (auto [depth, index] : llvm::enumerate(blockScalarPath(leaves.leaf(leaf), element)))
+        indices.push_back(blockIndex(builder, location, depth == 0 ? leaves.argument.members.first + index : index));
+    Value pointer = spirv::AccessChainOp::create(builder, location, leaves.argument.block, indices);
+    return spirv::LoadOp::create(builder, location, pointer).getResult();
+}
+
+FailureOr<Value> loadUniformValue(const UniformBlockLeaves &leaves, Type type, OpBuilder &builder, Location location) {
+    SmallVector<Value> scalars;
+    for (size_t leaf = 0; leaf < leaves.count; ++leaf)
+        for (uint32_t element = 0; element < leaves.leaf(leaf).elements; ++element)
+            scalars.push_back(loadUniformScalar(leaves, leaf, element, builder, location));
+    return constructComposite(location, type, scalars, builder);
+}
+
+FailureOr<Value> lowerTensorExtract(tensor::ExtractOp extract, OpBuilder &builder, IRMapping &mapping,
+                                    const EntryContext &context) {
+    auto sourceType = dyn_cast<RankedTensorType>(extract.getTensor().getType());
+    if (!sourceType || !sourceType.hasStaticShape() ||
+        extract.getIndices().size() != static_cast<size_t>(sourceType.getRank()))
+        return failure();
+    Location location = extract.getLoc();
+    const std::optional<int64_t> constantLinear = constantLinearIndex(extract);
+    std::optional<UniformBlockLeaves> uniform = findExtractedUniformLeaf(extract, context);
+    if (uniform && constantLinear)
+        return loadUniformScalar(*uniform, 0, static_cast<uint32_t>(*constantLinear), builder, location);
+    Value input = mapping.lookupOrNull(extract.getTensor());
+    if (!uniform && !input)
+        return failure();
+    if (sourceType.getRank() == 0)
+        return input;
+    if (constantLinear)
+        return extractStaticTensorElement(location, input, sourceType, *constantLinear, builder);
 
     Value linear = mapping.lookupOrNull(extract.getIndices().front());
     if (!linear)
         return failure();
+    const auto indexConstant = [&](int64_t value) -> Value {
+        return spirv::ConstantOp::create(builder, location, linear.getType(),
+                                         builder.getIntegerAttr(linear.getType(), value));
+    };
     for (auto [extent, sourceIndex] :
          llvm::zip_equal(sourceType.getShape().drop_front(), extract.getIndices().drop_front())) {
         Value index = mapping.lookupOrNull(sourceIndex);
         if (!index)
             return failure();
-        Value extentValue = spirv::ConstantOp::create(builder, location, linear.getType(),
-                                                      builder.getIntegerAttr(linear.getType(), extent));
-        linear = spirv::IMulOp::create(builder, location, linear, extentValue);
+        linear = spirv::IMulOp::create(builder, location, linear, indexConstant(extent));
         linear = spirv::IAddOp::create(builder, location, linear, index);
     }
-    Value selected = extractStaticTensorElement(location, input, sourceType, 0, builder);
-    for (int64_t index = 1; index < sourceType.getNumElements(); ++index) {
-        Value expected = spirv::ConstantOp::create(builder, location, linear.getType(),
-                                                   builder.getIntegerAttr(linear.getType(), index));
-        Value matches = spirv::IEqualOp::create(builder, location, linear, expected);
-        Value candidate = extractStaticTensorElement(location, input, sourceType, index, builder);
-        selected = spirv::SelectOp::create(builder, location, candidate.getType(), matches, candidate, selected);
+    if (uniform) {
+        const BlockLeaf &leaf = uniform->leaf(0);
+        SmallVector<Value> indices{blockIndex(builder, location, uniform->argument.members.first + leaf.firstMember)};
+        if (leaf.vectors == 1) {
+            indices.push_back(linear);
+        } else {
+            Value width = indexConstant(kBlockVectorWidth);
+            indices.push_back(spirv::SDivOp::create(builder, location, linear, width));
+            indices.push_back(spirv::SRemOp::create(builder, location, linear, width));
+        }
+        Value pointer = spirv::AccessChainOp::create(builder, location, uniform->argument.block, indices);
+        return spirv::LoadOp::create(builder, location, pointer).getResult();
     }
-    return selected;
+    if (isa<mlir::VectorType>(input.getType()))
+        return spirv::VectorExtractDynamicOp::create(builder, location, input, linear).getResult();
+    // SPIR-V indexes arrays and matrices dynamically only through a pointer.
+    OpBuilder variableBuilder = OpBuilder::atBlockBegin(context.functionEntry);
+    Value variable = spirv::VariableOp::create(variableBuilder, location,
+                                               spirv::PointerType::get(input.getType(), spirv::StorageClass::Function),
+                                               spirv::StorageClass::Function, /*initializer=*/nullptr);
+    spirv::StoreOp::create(builder, location, variable, input);
+    SmallVector<Value> indices{linear};
+    if (isa<spirv::MatrixType>(input.getType())) {
+        Value columns = indexConstant(sourceType.getDimSize(1));
+        indices = {spirv::SRemOp::create(builder, location, linear, columns),
+                   spirv::SDivOp::create(builder, location, linear, columns)};
+    }
+    Value pointer = spirv::AccessChainOp::create(builder, location, variable, indices);
+    return spirv::LoadOp::create(builder, location, pointer).getResult();
 }
 
 template <typename CreateLeaf>
@@ -672,11 +871,6 @@ FailureOr<Value> lowerCompositeElementwise(Location location, Type resultType, A
     return createLeaf(resultType, operands);
 }
 
-/// Source graphics TensorView argument -> pointers to its storage-leaf buffers,
-/// in ValueAbi leaf order. Every leaf views the whole record buffer as an array
-/// of that leaf's scalar type.
-using StorageLeafMap = DenseMap<Value, SmallVector<Value>>;
-
 FailureOr<Value> translatePhysicalLoad(PhysicalLoadOp load, OpBuilder &builder, IRMapping &mapping,
                                        const StorageLeafMap &storage) {
     ModuleOp sourceModule = load->getParentOfType<ModuleOp>();
@@ -711,10 +905,11 @@ FailureOr<Value> translatePhysicalLoad(PhysicalLoadOp load, OpBuilder &builder, 
     return constructComposite(location, *resultType, scalars, builder);
 }
 
+/// A null result is a uniform field read left unmaterialized because every use reads the block itself.
 FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping,
-                                    const StorageLeafMap &storage) {
+                                    const EntryContext &context) {
     if (auto load = dyn_cast<PhysicalLoadOp>(operation))
-        return translatePhysicalLoad(load, builder, mapping, storage);
+        return translatePhysicalLoad(load, builder, mapping, context.storage);
     Location location = operation.getLoc();
     ModuleOp sourceModule = operation.getParentOfType<ModuleOp>();
     auto mapped = [&](Value value) { return mapping.lookupOrNull(value); };
@@ -848,7 +1043,7 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
     }
 
     if (auto extract = dyn_cast<tensor::ExtractOp>(operation))
-        return lowerTensorExtract(extract, builder, mapping);
+        return lowerTensorExtract(extract, builder, mapping, context);
 
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
         FailureOr<Type> type = convertValueType(constant.getType(), sourceModule);
@@ -908,6 +1103,16 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         if (failed(resultType))
             return failure();
         return spirv::CompositeConstructOp::create(builder, location, *resultType, elements).getResult();
+    }
+
+    if (isa<StructGetOp, TupleGetOp>(operation)) {
+        if (std::optional<UniformBlockLeaves> leaves =
+                findUniformBlockLeaves(operation.getResult(0), context, sourceModule)) {
+            if (isReadThroughUniformBlock(operation.getResult(0), context))
+                return Value{};
+            FailureOr<Type> type = convertValueType(operation.getResult(0).getType(), sourceModule);
+            return failed(type) ? FailureOr<Value>(failure()) : loadUniformValue(*leaves, *type, builder, location);
+        }
     }
 
     if (auto tuple = dyn_cast<TupleGetOp>(operation)) {
@@ -1312,15 +1517,15 @@ LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, I
     return success();
 }
 
-LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         const StorageLeafMap &storage, SmallVectorImpl<Value> &yieldedValues,
+LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, IRMapping &mapping,
+                                         const EntryContext &context, SmallVectorImpl<Value> &yieldedValues,
                                          Value *condition = nullptr);
 
-LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                         const StorageLeafMap &storage, SmallVectorImpl<Value> &results);
+LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, IRMapping &mapping, const EntryContext &context,
+                         SmallVectorImpl<Value> &results);
 
-LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                      const StorageLeafMap &storage, SmallVectorImpl<Value> &results) {
+LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, IRMapping &mapping, const EntryContext &context,
+                      SmallVectorImpl<Value> &results) {
     Value condition = mapping.lookupOrNull(ifOp.getCondition());
     ModuleOp sourceModule = ifOp->getParentOfType<ModuleOp>();
     if (!condition || !ifOp.getThenRegion().hasOneBlock() ||
@@ -1328,7 +1533,7 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
         return failure();
 
     SmallVector<Value> resultVariables;
-    OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
+    OpBuilder variableBuilder = OpBuilder::atBlockBegin(context.functionEntry);
     for (Type sourceType : ifOp.getResultTypes()) {
         FailureOr<Type> type = convertValueType(sourceType, sourceModule);
         if (failed(type))
@@ -1353,8 +1558,8 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
 
         SmallVector<Value> thenValues;
         OpBuilder thenBuilder = OpBuilder::atBlockBegin(thenBlock);
-        if (failed(translateStraightLineBlock(ifOp.getThenRegion().front(), thenBuilder, functionEntry, mapping,
-                                              storage, thenValues)) ||
+        if (failed(
+                translateStraightLineBlock(ifOp.getThenRegion().front(), thenBuilder, mapping, context, thenValues)) ||
             thenValues.size() != resultVariables.size())
             return failure();
         for (auto [variable, value] : llvm::zip_equal(resultVariables, thenValues))
@@ -1366,8 +1571,8 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
         if (ifOp.getElseRegion().empty()) {
             if (!resultVariables.empty())
                 return failure();
-        } else if (failed(translateStraightLineBlock(ifOp.getElseRegion().front(), elseBuilder, functionEntry, mapping,
-                                                     storage, elseValues)) ||
+        } else if (failed(translateStraightLineBlock(ifOp.getElseRegion().front(), elseBuilder, mapping, context,
+                                                     elseValues)) ||
                    elseValues.size() != resultVariables.size()) {
             return failure();
         }
@@ -1384,8 +1589,8 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
     return success();
 }
 
-LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         const StorageLeafMap &storage, SmallVectorImpl<Value> &yieldedValues,
+LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, IRMapping &mapping,
+                                         const EntryContext &context, SmallVectorImpl<Value> &yieldedValues,
                                          Value *condition) {
     for (Operation &operation : source) {
         if (auto conditionOp = dyn_cast<scf::ConditionOp>(operation)) {
@@ -1413,7 +1618,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerIf(ifOp, builder, functionEntry, mapping, storage, translatedResults)))
+            if (failed(lowerIf(ifOp, builder, mapping, context, translatedResults)))
                 return failure();
             if (translatedResults.size() != ifOp.getNumResults())
                 return failure();
@@ -1423,7 +1628,7 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
         }
         if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerWhile(whileOp, builder, functionEntry, mapping, storage, translatedResults)) ||
+            if (failed(lowerWhile(whileOp, builder, mapping, context, translatedResults)) ||
                 translatedResults.size() != whileOp.getNumResults())
                 return failure();
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
@@ -1436,23 +1641,24 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
                        << "operation cannot be translated inside structured control flow: " << operation.getName();
             continue;
         }
-        FailureOr<Value> translated = translateOperation(operation, builder, mapping, storage);
+        FailureOr<Value> translated = translateOperation(operation, builder, mapping, context);
         if (failed(translated) || operation.getNumResults() != 1)
             return operation.emitError() << "operation cannot be translated inside structured control flow: "
                                          << operation.getName();
-        mapping.map(operation.getResult(0), *translated);
+        if (*translated)
+            mapping.map(operation.getResult(0), *translated);
     }
     return success();
 }
 
-LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                         const StorageLeafMap &storage, SmallVectorImpl<Value> &results) {
+LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, IRMapping &mapping, const EntryContext &context,
+                         SmallVectorImpl<Value> &results) {
     if (!whileOp.getBefore().hasOneBlock() || !whileOp.getAfter().hasOneBlock())
         return whileOp.emitError("structured loop regions must contain one block");
 
     ModuleOp sourceModule = whileOp->getParentOfType<ModuleOp>();
     SmallVector<Value> resultVariables;
-    OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
+    OpBuilder variableBuilder = OpBuilder::atBlockBegin(context.functionEntry);
     for (Type sourceType : whileOp.getResultTypes()) {
         FailureOr<Type> type = convertValueType(sourceType, sourceModule);
         if (failed(type))
@@ -1490,8 +1696,8 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
         SmallVector<Value> conditionValues;
         Value condition;
         OpBuilder beforeBuilder = OpBuilder::atBlockBegin(beforeBlock);
-        if (failed(translateStraightLineBlock(whileOp.getBefore().front(), beforeBuilder, functionEntry, mapping,
-                                              storage, conditionValues, &condition)) ||
+        if (failed(translateStraightLineBlock(whileOp.getBefore().front(), beforeBuilder, mapping, context,
+                                              conditionValues, &condition)) ||
             conditionValues.size() != whileOp.getAfter().front().getNumArguments())
             return whileOp.emitError("cannot translate a structured loop condition region");
         for (auto [argument, value] : llvm::zip_equal(whileOp.getAfter().front().getArguments(), conditionValues)) {
@@ -1508,7 +1714,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 
         SmallVector<Value> yieldedValues;
         OpBuilder afterBuilder = OpBuilder::atBlockBegin(afterBlock);
-        if (failed(translateStraightLineBlock(whileOp.getAfter().front(), afterBuilder, functionEntry, mapping, storage,
+        if (failed(translateStraightLineBlock(whileOp.getAfter().front(), afterBuilder, mapping, context,
                                               yieldedValues)) ||
             yieldedValues.size() != beforeBlock->getNumArguments())
             return whileOp.emitError("cannot translate a structured loop body region");
@@ -1541,14 +1747,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     if (!executionModel)
         return source.emitError("unsupported SPIR-V execution model");
 
-    // A block-wrapped argument occupies members [first, first + count) of its block; count exceeds one only for an
-    // aggregate Value, whose scalar members are rebuilt into the logical Value on load.
-    struct BlockMemberRange {
-        uint32_t first;
-        uint32_t count;
-    };
     SmallVector<SmallVector<spirv::GlobalVariableOp>> inputs;
-    SmallVector<std::optional<BlockMemberRange>> inputMembers;
+    SmallVector<std::optional<BlockArgumentMembers>> inputMembers;
     SmallVector<bool> inputAttributes;
     SmallVector<spirv::GlobalVariableOp> outputs;
     SmallVector<Attribute> interfaceSymbols;
@@ -1559,6 +1759,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         std::shared_ptr<const ByteTransportNode> layout;
     };
     SmallVector<PushConstantMember> pushConstantMembers;
+    DenseMap<uint32_t, std::shared_ptr<const BlockMembers>> pushConstantAggregates;
     uint32_t pushConstantSize = 0;
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
         if (!pushConstantUniforms)
@@ -1577,11 +1778,13 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return source.emitError() << "push-constant argument #" << index << " does not have a GPU interface layout";
         pushConstantSize = llvm::alignTo(pushConstantSize, layout->root->alignment);
         if (isa<spirv::StructType>(*converted)) {
-            FailureOr<ScalarBlockMembers> scalars = getScalarBlockMembers(type, sourceModule, *layout->root);
-            if (failed(scalars))
-                return source.emitError() << "push-constant argument #" << index << " has no scalar interface layout";
-            for (auto [scalar, offset] : llvm::zip_equal(scalars->types, scalars->offsets))
-                pushConstantMembers.push_back({static_cast<uint32_t>(index), scalar, pushConstantSize + offset, {}});
+            FailureOr<BlockMembers> members =
+                getBlockMembers(type, sourceModule, *layout->root, LeafVectorization::Aligned, pushConstantSize);
+            if (failed(members))
+                return source.emitError() << "push-constant argument #" << index << " has no leaf interface layout";
+            for (auto [member, offset] : llvm::zip_equal(members->types, members->offsets))
+                pushConstantMembers.push_back({static_cast<uint32_t>(index), member, offset, {}});
+            pushConstantAggregates[index] = std::make_shared<const BlockMembers>(std::move(*members));
         } else {
             pushConstantMembers.push_back({static_cast<uint32_t>(index), *converted, pushConstantSize, layout->root});
         }
@@ -1731,11 +1934,10 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             auto first = llvm::find_if(pushConstantMembers, argumentMember);
             if (first == pushConstantMembers.end())
                 return source.emitError("push-constant member layout is inconsistent");
-            const auto count = std::distance(first, std::find_if_not(first, pushConstantMembers.end(), argumentMember));
             inputs.push_back({pushConstantBlock});
             inputMembers.push_back(
-                BlockMemberRange{static_cast<uint32_t>(std::distance(pushConstantMembers.begin(), first)),
-                                 static_cast<uint32_t>(count)});
+                BlockArgumentMembers{static_cast<uint32_t>(std::distance(pushConstantMembers.begin(), first)),
+                                     pushConstantAggregates.lookup(static_cast<uint32_t>(index))});
             inputAttributes.push_back(false);
             continue;
         }
@@ -1759,7 +1961,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             continue;
         }
         SmallVector<spirv::GlobalVariableOp> globals;
-        std::optional<BlockMemberRange> memberRange;
+        std::optional<BlockArgumentMembers> memberRange;
         auto location = dyn_cast_if_present<IntegerAttr>(attrs.location);
         const bool vertexAttribute =
             stage.getValue() == "vertex" && kind.getValue() == "input" && !attrs.builtin && location;
@@ -1804,23 +2006,26 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                               << " std140 Tensor interface argument #" << index;
                 interfaceType = *physicalType;
             }
-            std::optional<ScalarBlockMembers> scalars;
+            std::shared_ptr<const BlockMembers> aggregate;
             if (isBlockWrappedStorageClass(storageClass) && isa<spirv::StructType>(interfaceType)) {
-                FailureOr<ScalarBlockMembers> members =
-                    succeeded(physicalLayout) ? getScalarBlockMembers(type, sourceModule, *physicalLayout->root)
-                                              : FailureOr<ScalarBlockMembers>(failure());
+                const LeafVectorization vectorization =
+                    storageClass == spirv::StorageClass::Uniform ? LeafVectorization::Aligned : LeafVectorization::None;
+                FailureOr<BlockMembers> members =
+                    succeeded(physicalLayout)
+                        ? getBlockMembers(type, sourceModule, *physicalLayout->root, vectorization)
+                        : FailureOr<BlockMembers>(failure());
                 if (failed(members))
-                    return source.emitError() << "uniform argument #" << index << " has no scalar interface layout";
-                scalars = std::move(*members);
+                    return source.emitError() << "uniform argument #" << index << " has no leaf interface layout";
+                aggregate = std::make_shared<const BlockMembers>(std::move(*members));
             }
             globals.push_back(createInterfaceVariable(
                 moduleBuilder, source.getLoc(), name, interfaceType, storageClass, argumentAttrs,
-                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr, scalars ? &*scalars : nullptr));
+                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr, aggregate.get()));
             if (stage.getValue() == "fragment" && kind.getValue() == "input" && location &&
                 failed(decorateVaryingInterpolation(globals.back(), argumentAttrs, type, sourceModule)))
                 return source.emitError() << "fragment input #" << index << " has no varying interpolation";
-            if (scalars)
-                memberRange = BlockMemberRange{0, static_cast<uint32_t>(scalars->types.size())};
+            if (aggregate)
+                memberRange = BlockArgumentMembers{0, std::move(aggregate)};
         }
         inputs.push_back(globals);
         inputMembers.push_back(memberRange);
@@ -1853,12 +2058,13 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     Block *entry = function.addEntryBlock();
     OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
     IRMapping mapping;
-    StorageLeafMap storage;
+    EntryContext context;
+    context.functionEntry = entry;
     for (auto &[argument, leafGlobals] : storageArguments) {
         SmallVector<Value> pointers;
         for (spirv::GlobalVariableOp global : leafGlobals)
             pointers.push_back(spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global));
-        storage[argument] = std::move(pointers);
+        context.storage[argument] = std::move(pointers);
     }
     // The carrier block holds the i32 fields directly because SPIR-V forbids a
     // Block struct nested in another Block. The tuple value is rebuilt from
@@ -1894,19 +2100,17 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             if (failed(logicalType))
                 return source.emitError("cannot reconstruct logical interface value");
             const bool blockWrapped = isBlockWrappedStorageClass(pointerType.getStorageClass());
-            const BlockMemberRange range = member.value_or(BlockMemberRange{0, 1});
-            const auto memberIndex = [&](uint32_t index) -> Value {
-                return spirv::ConstantOp::create(bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
-                                                 bodyBuilder.getI32IntegerAttr(index));
-            };
+            const BlockArgumentMembers range = member.value_or(BlockArgumentMembers{});
             if (blockWrapped && isa<spirv::StructType>(*logicalType)) {
-                SmallVector<Value> scalars;
-                for (uint32_t index = range.first; index < range.first + range.count; ++index) {
-                    Value scalarPointer =
-                        spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), pointer, memberIndex(index));
-                    scalars.push_back(spirv::LoadOp::create(bodyBuilder, source.getLoc(), scalarPointer));
-                }
-                FailureOr<Value> value = constructComposite(source.getLoc(), *logicalType, scalars, bodyBuilder);
+                if (!range.aggregate)
+                    return source.emitError("aggregate interface value has no block leaf layout");
+                const UniformBlockArgument uniform{pointer, range};
+                context.uniforms[argument] = uniform;
+                if (isReadThroughUniformBlock(argument, context))
+                    continue;
+                FailureOr<Value> value =
+                    loadUniformValue(UniformBlockLeaves{uniform, 0, range.aggregate->leaves.size()}, *logicalType,
+                                     bodyBuilder, source.getLoc());
                 if (failed(value))
                     return source.emitError("cannot reconstruct logical aggregate interface value");
                 mapping.map(argument, *value);
@@ -1915,7 +2119,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             Value loaded;
             if (blockWrapped) {
                 auto block = cast<spirv::StructType>(pointerType.getPointeeType());
-                SmallVector<Value> indices{memberIndex(range.first)};
+                SmallVector<Value> indices{blockIndex(bodyBuilder, source.getLoc(), range.first)};
                 loaded =
                     loadBlockMember(bodyBuilder, source.getLoc(), pointer, indices, block.getElementType(range.first));
             } else {
@@ -1972,7 +2176,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerIf(ifOp, bodyBuilder, entry, mapping, storage, translatedResults)) ||
+            if (failed(lowerIf(ifOp, bodyBuilder, mapping, context, translatedResults)) ||
                 translatedResults.size() != ifOp.getNumResults())
                 return operation.emitError("structured conditional is not supported by SPIR-V lowering");
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(ifOp.getResults(), translatedResults))
@@ -1981,7 +2185,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
             SmallVector<Value> translatedResults;
-            if (failed(lowerWhile(whileOp, bodyBuilder, entry, mapping, storage, translatedResults)) ||
+            if (failed(lowerWhile(whileOp, bodyBuilder, mapping, context, translatedResults)) ||
                 translatedResults.size() != whileOp.getNumResults())
                 return operation.emitError("structured loop is not supported by SPIR-V lowering");
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
@@ -2008,7 +2212,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                        << "operation '" << operation.getName() << "' is not supported by SPIR-V lowering";
             continue;
         }
-        FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping, storage);
+        FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping, context);
         if (failed(translated)) {
             if (auto intrinsic = dyn_cast<IntrinsicOp>(operation))
                 return operation.emitError()
@@ -2016,7 +2220,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return operation.emitError() << "operation '" << operation.getName()
                                          << "' is not supported by SPIR-V lowering";
         }
-        mapping.map(operation.getResult(0), *translated);
+        if (*translated)
+            mapping.map(operation.getResult(0), *translated);
     }
 
     spirv::EntryPointOp::create(moduleBuilder, source.getLoc(), *executionModel, function, interfaceSymbols);

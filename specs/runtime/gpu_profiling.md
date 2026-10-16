@@ -1,9 +1,10 @@
 # Debug labels and timings
 
 Status: labels (section 2) and timings (section 3) implemented (Engine
-extension E8, profiling), awaiting the `PROGRAM_VERSION` cut; Metal is
-unverified on hardware. Timings depend on
-[`pipelined_submission.md`](pipelined_submission.md) for timing readback. The
+extension E8, profiling), and the engine uses them as section 5 describes;
+awaiting the `PROGRAM_VERSION` cut. Metal is unverified on hardware. Timings
+depend on [`pipelined_submission.md`](pipelined_submission.md) for timing
+readback. The
 cut amends the contracts listed in section 7.
 
 A renderer is profiled by pass and inspected by draw: a capture tool

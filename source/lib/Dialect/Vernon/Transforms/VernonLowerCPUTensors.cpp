@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 
 #include "VernonCpuLoweringUtils.h"
+#include "VernonTensorElementAccess.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -210,26 +211,17 @@ struct AggregateTensorGetPattern final : OpConversionPattern<TensorGetOp> {
         auto sourceType = dyn_cast<TensorType>(op.getInput().getType());
         if (!sourceType || adaptor.getIndices().size() != sourceType.getShape().size())
             return failure();
-        Location location = op.getLoc();
-        Value linear = adaptor.getIndices().front();
-        for (auto [dimension, index] :
-             llvm::zip_equal(sourceType.getShape().drop_front(), adaptor.getIndices().drop_front())) {
-            Value extent = arith::ConstantIndexOp::create(rewriter, location, dimension);
-            linear = arith::MulIOp::create(rewriter, location, linear, extent);
-            linear = arith::AddIOp::create(rewriter, location, linear, index);
+        if (!isa<LLVM::LLVMArrayType>(adaptor.getInput().getType()))
+            return failure();
+        if (std::optional<int64_t> linear = constantLinearIndex(sourceType.getShape(), op.getIndices())) {
+            rewriter.replaceOpWithNewOp<LLVM::ExtractValueOp>(op, adaptor.getInput(), ArrayRef<int64_t>{*linear});
+            return success();
         }
-        int64_t elementCount = 1;
-        for (int64_t dimension : sourceType.getShape())
-            elementCount *= dimension;
-        Value selected = LLVM::ExtractValueOp::create(rewriter, location, adaptor.getInput(), ArrayRef<int64_t>{0});
-        for (int64_t index = 1; index < elementCount; ++index) {
-            Value candidate =
-                LLVM::ExtractValueOp::create(rewriter, location, adaptor.getInput(), ArrayRef<int64_t>{index});
-            Value expected = arith::ConstantIndexOp::create(rewriter, location, index);
-            Value matches = arith::CmpIOp::create(rewriter, location, arith::CmpIPredicate::eq, linear, expected);
-            selected = arith::SelectOp::create(rewriter, location, matches, candidate, selected);
-        }
-        rewriter.replaceOp(op, selected);
+        Value linear = linearTensorIndex(op.getLoc(), sourceType.getShape(), adaptor.getIndices(), rewriter);
+        FailureOr<Value> element = extractLLVMArrayElement(op, adaptor.getInput(), linear, rewriter);
+        if (failed(element))
+            return failure();
+        rewriter.replaceOp(op, *element);
         return success();
     }
 };

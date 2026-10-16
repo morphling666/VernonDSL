@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import Protocol
 
+from ..language.ast_utils import assigned_names
 from .lowering_types import DslType, FunctionSignature, ModuleContext, Value
 from .model import Termination, TypedExpression, TypedStatement
 
@@ -329,27 +330,6 @@ def emit_loop_body(
             needs_guard = True
         if typed.termination is not Termination.FALLTHROUGH:
             break
-
-
-def assigned_names(statements: list[ast.stmt]) -> set[str]:
-    result: set[str] = set()
-
-    def target_names(target: ast.expr) -> set[str]:
-        if isinstance(target, ast.Name):
-            return {target.id}
-        if isinstance(target, (ast.Tuple, ast.List)):
-            return set().union(*(target_names(item) for item in target.elts))
-        return set()
-
-    for statement in statements:
-        if isinstance(statement, ast.Assign):
-            for target in statement.targets:
-                result.update(target_names(target))
-        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-            result.add(statement.target.id)
-        elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
-            result.add(statement.target.id)
-    return result
 
 
 def lower_bool_op(emitter: ControlFlowEmitter, node: ast.BoolOp) -> Value:

@@ -87,6 +87,18 @@ def flags_value(
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
+def runtime_indexed_tensors(
+    lanes: vd.Tensor[vd.f32, (3,)],
+    table: vd.Tensor[vd.f32, (2, 4)],
+    wide: vd.Tensor[vd.f32, (20,)],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    output[x] = lanes[x % 3] + table[x % 2, x % 4] * 10.0 + wide[19 - x] * 100.0
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
 def wide_value(
     wide: Wide,
     output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
@@ -130,6 +142,18 @@ class KernelAggregateValueTests(unittest.TestCase):
         )
         flags_value(Flags(True, True, vd.f32(3.0), True), table, output, grid=(4, 1, 1))
         np.testing.assert_allclose(output.to_numpy(), [105.0, 1097.0, 99.0, 1091.0])
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_runtime_indexed_register_tensors(self, backend: BackendRow) -> None:
+        vd.init(arch=backend.architecture)  # type: ignore[arg-type]
+        lanes = np.array((1.0, 2.0, 3.0), dtype=np.float32)
+        table = np.arange(8, dtype=np.float32).reshape(2, 4)
+        wide = np.arange(20, dtype=np.float32)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(20,))
+        runtime_indexed_tensors(lanes, table, wide, output, grid=(20, 1, 1))
+        x = np.arange(20)
+        expected = lanes[x % 3] + table[x % 2, x % 4] * 10.0 + wide[19 - x] * 100.0
+        np.testing.assert_allclose(output.to_numpy(), expected)
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True, f64=True))
     def test_f64_struct_field(self, backend: BackendRow) -> None:

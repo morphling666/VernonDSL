@@ -28,6 +28,7 @@ add_mlir_library(
     VernonSharedValuePatterns.cpp
     VernonSpecializeKernelConstants.cpp
     VernonSpirvMath.cpp
+    VernonTensorElementAccess.cpp
     VernonTensorShapeSemantics.cpp
     VernonValidation.cpp
     VernonVerifyCPUAutodiffABI.cpp

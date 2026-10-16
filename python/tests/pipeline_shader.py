@@ -436,6 +436,33 @@ def array_uniform_fragment(
     return vd.Vector([grid[0, 1] * scale, grid[4, 5], ramp[6], ramp[7]])
 
 
+@vd.struct(shared=True)
+class CascadeTable:
+    # Starts on a 16-byte boundary, so runtime reads index the uniform block.
+    matrices: vd.Tensor[vd.f32, (2, 4, 4)]
+    splits: vd.Vector[vd.f32, 4]
+    bias: vd.f32
+    # Starts off a 16-byte boundary, so runtime reads index a copy.
+    weights: vd.Vector[vd.f32, 4]
+    selector: vd.u32
+
+
+@vd.fragment
+def runtime_indexed_uniform_fragment(
+    table: Annotated[CascadeTable, vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    cascade = vd.i32(table.selector)
+    local = vd.Vector([table.bias, table.splits[0], table.splits[3]])
+    return vd.Vector(
+        [
+            table.matrices[cascade, 2, 3],
+            table.splits[cascade + 1],
+            table.weights[cascade + 2],
+            local[cascade],
+        ]
+    )
+
+
 @vd.fragment
 def mixed_inline_uniform_fragment(
     bias: Annotated[vd.f32, vd.uniform()],

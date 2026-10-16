@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import replace
 
-from ..language.ast_utils import decorator_name, dotted_name, rectangular_literal
+from ..language.ast_utils import assigned_names, decorator_name, dotted_name, rectangular_literal
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, ENTRY_DECORATORS, GRAPHICS_STAGES
 from ..shader_contracts import (
     ATOMIC_OPERATION_NAMES,
@@ -1010,7 +1010,7 @@ class _Inference:
                 returns.extend(self._statements(statement.body, then_environment, loop_depth))
                 returns.extend(self._statements(statement.orelse, else_environment, loop_depth))
                 branch_merges: list[BranchMerge] = []
-                assigned = self._assigned_names((*statement.body, *statement.orelse))
+                assigned = assigned_names((*statement.body, *statement.orelse))
                 for name in sorted(then_environment.keys() & else_environment.keys() & assigned):
                     merged = _common(then_environment[name], else_environment[name])
                     if merged is None:
@@ -1023,7 +1023,7 @@ class _Inference:
                 before = environment.copy()
                 loop_environment = before.copy()
                 loop_returns: list[InferenceType | None] = []
-                assigned = self._assigned_names(statement.body)
+                assigned = assigned_names(statement.body)
                 for _ in range(8):
                     candidate = loop_environment.copy()
                     loop_returns = self._statements(statement.body, candidate, loop_depth + 1)
@@ -1072,7 +1072,7 @@ class _Inference:
                 before = environment.copy()
                 loop_environment = {**before, statement.target.id: range_type}
                 loop_returns: list[InferenceType | None] = []
-                assigned = self._assigned_names(statement.body)
+                assigned = assigned_names(statement.body)
                 for _ in range(8):
                     candidate = loop_environment.copy()
                     loop_returns = self._statements(statement.body, candidate, loop_depth + 1)
@@ -1112,7 +1112,7 @@ class _Inference:
     ) -> list[InferenceType | None]:
         else_environment = {name: value for name, value in loop_environment.items() if name != excluded_name}
         else_returns = self._statements(statement.orelse, else_environment, loop_depth)
-        for name in sorted(before.keys() & else_environment.keys() & self._assigned_names(statement.orelse)):
+        for name in sorted(before.keys() & else_environment.keys() & assigned_names(statement.orelse)):
             merged = _common(loop_environment[name], else_environment[name])
             if merged is None:
                 raise self.error(statement, f"loop-else local '{name}' has incompatible types")
@@ -1154,28 +1154,6 @@ class _Inference:
                 self._bind_destructuring(item, element, environment)
             else:
                 raise self.error(item, "Tuple destructuring targets must be local names")
-
-    @staticmethod
-    def _assigned_names(statements: tuple[ast.stmt, ...] | list[ast.stmt]) -> set[str]:
-        names: set[str] = set()
-
-        def target_names(target: ast.expr) -> set[str]:
-            if isinstance(target, ast.Name):
-                return {target.id}
-            if isinstance(target, (ast.Tuple, ast.List)):
-                return set().union(*(target_names(item) for item in target.elts))
-            return set()
-
-        for statement in statements:
-            for node in ast.walk(statement):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        names.update(target_names(target))
-                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                    names.add(node.target.id)
-                elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-                    names.add(node.target.id)
-        return names
 
     def _expression(self, node: ast.expr, environment: dict[str, InferenceType]) -> InferenceType:
         result = self._infer_expression(node, environment)

@@ -764,7 +764,7 @@ FailureOr<ByteTransportPlan> getByteTransportPlan(Type type, ModuleOp module, Ph
     std::shared_ptr<const ByteTransportNode> root = buildTransportTree(*storage->tree.root, *projection, profile, 0);
     if (!root)
         return failure();
-    if (profile == PhysicalAbiProfile::CudaKernelParameter || profile == PhysicalAbiProfile::OpenGLNativeUniform)
+    if (profile == PhysicalAbiProfile::OpenGLNativeUniform)
         return failure();
     return ByteTransportPlan{profile, storage->layoutHash, std::move(root)};
 }

@@ -29,6 +29,7 @@ from aggregate_vertex_shader import (
 from backend_test_matrix import BackendRequirements, backend_row, probe_backend, require_available
 from pipeline_shader import (
     OPTIONAL_IMAGE,
+    CascadeTable,
     Placement,
     array_layer_fragment,
     array_uniform_fragment,
@@ -64,6 +65,7 @@ from pipeline_shader import (
     optional_texture_fragment,
     oversized_tensor_attribute_vertex,
     rank_three_tensor_attribute_vertex,
+    runtime_indexed_uniform_fragment,
     shared_sampler_fragment,
     solid_fragment,
     spilled_matrix_vertex,
@@ -1081,6 +1083,34 @@ def assert_array_uniform_fragment_renders(test: unittest.TestCase) -> None:
     )
 
 
+def assert_runtime_indexed_uniform_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    matrices = np.linspace(0.05, 0.95, 32, dtype=np.float32).reshape(2, 4, 4)
+    splits = np.array((0.15, 0.35, 0.55, 0.75), dtype=np.float32)
+    bias = np.float32(0.25)
+    weights = np.array((0.1, 0.3, 0.6, 0.9), dtype=np.float32)
+    selector = 1
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, runtime_indexed_uniform_fragment)(
+        position=positions,
+        table=CascadeTable(matrices, splits, vd.f32(bias), weights, vd.u32(selector)),
+        render_pass=render_target(target),
+    )
+
+    local = np.array((bias, splits[0], splits[3]), dtype=np.float32)
+    expected = np.array(
+        (matrices[selector, 2, 3], splits[selector + 1], weights[selector + 2], local[selector]),
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.rint(expected * 255.0).astype(np.uint8),
+        rtol=0.0,
+        atol=1,
+    )
+
+
 def assert_mixed_inline_uniforms_render(test: unittest.TestCase) -> None:
     positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
     bias = np.float32(0.1)
@@ -1431,6 +1461,9 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_array_uniform_fragment_renders(self) -> None:
         assert_array_uniform_fragment_renders(self)
 
+    def test_runtime_indexed_uniform_renders(self) -> None:
+        assert_runtime_indexed_uniform_renders(self)
+
     def test_mixed_inline_uniforms_render(self) -> None:
         assert_mixed_inline_uniforms_render(self)
 
@@ -1752,6 +1785,9 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_array_uniform_fragment_renders(self) -> None:
         assert_array_uniform_fragment_renders(self)
 
+    def test_runtime_indexed_uniform_renders(self) -> None:
+        assert_runtime_indexed_uniform_renders(self)
+
     def test_mixed_inline_uniforms_render(self) -> None:
         assert_mixed_inline_uniforms_render(self)
 
@@ -1920,6 +1956,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_array_uniform_fragment_renders(self) -> None:
         assert_array_uniform_fragment_renders(self)
+
+    def test_runtime_indexed_uniform_renders(self) -> None:
+        assert_runtime_indexed_uniform_renders(self)
 
     def test_mixed_inline_uniforms_render(self) -> None:
         assert_mixed_inline_uniforms_render(self)

@@ -32,6 +32,23 @@ and a training loop run.
 - **Readback into caller memory filled at completion.** Every caller would
   have to keep the destination alive and untouched until completion, a rule
   that fails silently when broken.
+- **Accepting host memory for a writable boundary of an asynchronous
+  invocation and leaving it untouched**, with the bytes only in
+  `vernonSubmissionReadBoundary`. A binding that looks like an output but is
+  never written fails silently.
+- **Runtime guards**: a device status word that device-side checks set,
+  commit copies and later dispatches predicated on it, and readers that
+  inherit the words of the writers they read. No check needs it: a failed
+  submission is almost always device loss, which no predicate recovers, and
+  the one data-dependent check, residual carrier overflow, is confined to
+  `WAIT` (section 4). Predication would need indirect draws, which OpenGL
+  3.3, OpenGL ES 3.0 and WebGL2 lack, and CUDA graph conditional nodes,
+  which need the CUDA device runtime and so a toolkit-dependent build.
+  Render-pass clears cannot be predicated on any API, and inheritance would
+  need caller-resource tracking and acknowledgement rules. A conditional
+  update, such as skipping an optimizer step whose gradients are not finite,
+  is dataflow in the Program (`where(all_finite(g), params - lr * g,
+  params)`), which every backend executes in queue order.
 - **Automatic Runtime retry of a failed asynchronous invocation.** Later
   submissions that read its results are already queued; re-executing it
   after them breaks queue order.
@@ -58,9 +75,8 @@ and a training loop run.
     writable boundary or RenderPass control `UNCHANGED` (it failed before
     submission or is not written) or `SUBMITTED`.
   - **Completion outcome**, read from the submission once it completed:
-    each written boundary `COMMITTED`, `IN_PLACE_COMMITTED`, `UNCHANGED`
-    (a guard rejected the commit, section 3.5, with its reason) or
-    `INDETERMINATE`.
+    each written boundary `COMMITTED`, `IN_PLACE_COMMITTED` or
+    `INDETERMINATE` (section 3.5).
 - A `WAIT` invocation (the C API default) waits before Execute returns and
   reports both phases at once, so existing callers see today's outcomes.
   It is submission followed by a wait, not a separate execution path.
@@ -90,34 +106,40 @@ and a training loop run.
 
 Queue-ordered device writes, including render-pass attachments
 (`VERNON_MUTATION_RENDER_PASS_CONTROL`). Completion reports
-`IN_PLACE_COMMITTED`; a failed submission reports `INDETERMINATE` and
-poisons the owner (section 5).
+`IN_PLACE_COMMITTED`.
 
 ### 3.2 Commit-after-success writes
 
-Results are produced into Runtime staging. The commit that copies staging
-into the destination is recorded in the same submission, after the work, and
-is predicated on the submission's status word (section 3.5):
-
-- Buffer commits are a Runtime copy kernel that reads the status word and
-  copies only when it is clear.
-- Image commits use a predicated compute copy when the format supports
-  storage writes, otherwise a predicated full-screen copy draw.
-- A destination whose format supports neither cannot commit
-  asynchronously; its plan requires `WAIT` (section 4).
-
-A detected failure therefore leaves the destination unchanged without a CPU
-wait. Only a failure the device cannot report through the status word,
-normally device loss, yields `INDETERMINATE`; device loss also poisons the
-context.
+Results are produced into Runtime staging, so the invocation's own reads of
+a destination see its previous contents. The commit is a buffer or image
+copy from staging into the destination, recorded in the same submission
+after the work. Commands of a submission execute in order, so the copy runs
+only after the work it publishes; completion reports `COMMITTED`. Every
+image format supports a transfer copy, so no destination requires `WAIT`.
 
 ### 3.3 Host readbacks
 
-Readbacks are copies into host-visible staging owned by the submission.
-After successful completion, `vernonSubmissionReadBoundary` copies the bytes
-of one boundary out; before completion it returns `VERNON_STATUS_NOT_READY`.
-The staging is released with the submission. Python presents these results
-as values that synchronize on first host access (section 8).
+A writable boundary whose result the caller reads on the host is bound as a
+readback slot: a Tensor argument with storage `VERNON_TENSOR_READBACK`, its
+dtype and shape, and no memory. The submission copies the result into
+host-visible staging it owns. After successful completion,
+`vernonSubmissionReadBoundary(submission, slot, destination, byte_size)`
+copies the slot's bytes, dense in row-major order, into caller memory. It
+returns:
+
+- `VERNON_STATUS_NOT_READY` while the submission is pending;
+- `VERNON_STATUS_INTERNAL_ERROR` once it failed;
+- `VERNON_STATUS_INVALID_ARGUMENT` for a slot that is not a readback slot
+  or a `byte_size` other than the dense size.
+
+The staging is released with the submission. Readback slots work in both
+modes. An asynchronous Execute that binds host memory to a writable
+boundary fails before submission with `VERNON_STATUS_INVALID_ARGUMENT`,
+naming the boundary. The rule holds on every backend, including the CPU
+backend whose work finishes inside Execute, so an invocation that runs
+asynchronously on one backend runs on all of them. `WAIT` invocations keep
+host-memory destinations. Python presents readback slots as values that
+synchronize on first host access (section 8).
 
 ### 3.4 Pullbacks
 
@@ -127,73 +149,34 @@ forward, backward and optimizer invocations of a training step queue back
 to back without a CPU wait. The apply is itself an asynchronous invocation
 with its own submission.
 
-A pullback whose residual carrier may overflow (`design.md` section 1,
-runtime tape validation) records the overflow in its status word. An apply
-of that pullback includes the forward status in its own guard, so its
-commit-after-success gradients are rejected rather than computed from a
-truncated tape. The invocation instance keeps the grown carrier capacity,
-so the caller's next execution of the step fits. `WAIT` invocations keep
-today's automatic replay.
+A static Tape writes compiler-assigned fixed residual offsets and needs no
+validation. A Tape with dynamic regions may overflow its residual carrier,
+which only its lane-status readback reveals, so its plan requires `WAIT`
+(section 4) and keeps today's automatic replay.
 
-### 3.5 Guards
+### 3.5 Failure after submission
 
-Each submission has a status word in device memory, clear at submission. A
-failed check sets it with a reason code and the identity of the first
-failing check; the completion outcome reports both. Checks are:
-
-- **Runtime checks**: residual carrier overflow, and later device bounds
-  checks.
-- **Program guards** (later language extension, `language/contract.md`): a
-  boolean Program Value declared as the commit guard of the invocation, for
-  example "every gradient is finite". Skipping a step on NaN is application
-  policy expressed in the Program, not a Runtime default.
-
-Guards propagate along data:
-
-- **Inheritance.** An invocation that reads an owner whose last guarded
-  writer is unacknowledged inherits that writer's status word: its own word
-  starts as the union of the inherited ones, set by a Runtime kernel at the
-  start of its submission. A rejected step therefore rejects every later
-  invocation that depends on its results, and only those.
-- **Acknowledgement.** A writer stays unacknowledged until the caller
-  observes its completion: a wait, state or outcome query that reports the
-  completed state, or releasing the submission. A writer that completed
-  clean is dropped from its owners at retirement, since inheriting a clear
-  word changes nothing. Whether a reader inherits therefore depends only on
-  the caller's sequence of calls, never on how far the GPU has progressed:
-  until the caller has seen a rejection, everything that reads its results
-  is rejected too. Implicit waits for resource bounds (section 7) do not
-  acknowledge.
-- **Predicated execution.** In a guarded invocation, compute dispatches and
-  draws are issued indirectly with argument buffers that a Runtime kernel
-  zeroes when the status word is set, so the nodes after a failed check do
-  nothing. Commit copies are predicated the same way. This needs no
-  compiler support and costs nothing in unguarded invocations, which
-  includes ordinary graphics frames.
-- **Recovery.** The completion outcome of each rejected invocation reports
-  the reason and the check, inherited or its own. The caller acknowledges
-  the rejected submissions and re-executes from the first one; nothing is
-  poisoned, and the re-executed invocations read the unchanged owners
-  without inheriting anything.
-
-In-place writes made before a check fails in the same invocation have
-already happened, so section 4 restricts that one combination.
+A submission that fails after the device accepted it reports every boundary
+it writes `INDETERMINATE`, in place or commit-after-success alike, in both
+modes: its commands stop at an unknown point, which may be inside a commit
+copy. Its readbacks are unreadable. The owners it writes are poisoned
+(section 5), and a pending submission that reads one of them reports its own
+writes `INDETERMINATE` too, because it may have run on the unfinished data.
+Retirement resolves outcomes in submission order, so that propagation needs
+no device work. A failure after submission is normally device loss, which
+also poisons the context.
 
 ## 4. When an invocation requires `WAIT`
 
 Resolve records on the `ResolvedExecutionPlan` whether the plan can complete
 asynchronously. An asynchronous Execute of a plan that cannot fails before
 submission with `PROGRAM_SUBMISSION_REQUIRES_WAIT`, naming the first
-blocking boundary; it never silently waits. A plan requires `WAIT` when:
-
-1. an in-place write precedes, in node order, a node of the same invocation
-   that raises a check (inherited guards are evaluated before the first
-   node, so they never block), or
-2. a commit-after-success image destination supports no predicated copy
-   (section 3.2).
+blocking Tape; it never silently waits. A plan requires `WAIT` when it
+writes a Tape with dynamic regions (section 3.4).
 
 Everything else is asynchronous: graphics frames, compute with either
-publication mode, readbacks, retained pullbacks and their applies.
+publication mode, readbacks, retained pullbacks of static Tapes and their
+applies.
 
 ## 5. Owners and host access
 
@@ -208,10 +191,10 @@ publication mode, readbacks, retained pullbacks and their applies.
   and queue waits for nothing: queue order already orders it.
 - A completion outcome of `INDETERMINATE` poisons exactly the owners the
   submission writes, through the existing poison path (`design.md`
-  section 1). A guard-rejected commit leaves its owners unchanged and
-  unpoisoned.
-- Caller-owned RHI resources are not tracked. RHI host uploads follow the
-  memory class of the destination:
+  section 1).
+- Caller-owned RHI resources are not tracked; their owner learns a failure
+  from the completion outcome. RHI host uploads follow the memory class of
+  the destination:
   - `VERNON_RHI_MEMORY_DEVICE`: queue-ordered. The upload takes effect after
     all work submitted earlier on the device and before all work submitted
     later, with no CPU wait. CUDA, Vulkan, D3D12 and Metal enqueue the
@@ -229,7 +212,7 @@ publication mode, readbacks, retained pullbacks and their applies.
 Everything an Execute allocates for its own use belongs to its submission and
 is retired when the submission completes: the execution workspace (instance
 workspaces become a pool), endpoint carriers, upload staging, inline uniform
-storage, transient descriptors, readback staging and the status word. No
+storage, transient descriptors, commit staging and readback staging. No
 storage that a pending submission reads is reachable by a later invocation.
 
 ## 7. Resource bounds
@@ -283,6 +266,8 @@ every backend; until then asynchronous execution is opt-in.
   so retirement and later cross-queue dependencies (E9) compare values
   instead of polling objects.
 - Device-memory uploads are queue-ordered without a CPU wait (section 5).
+- Buffer, image and image-to-buffer copies recorded into a submission, for
+  commit copies and readbacks (section 3).
 - Staging and upload rings retire by completion value instead of resetting
   after a wait.
 - An OpenGL or OpenGL ES device is bound to the thread that owns its
@@ -296,11 +281,11 @@ every backend; until then asynchronous execution is opt-in.
   with `completion_mode` (`WAIT` default, `ASYNCHRONOUS`).
 - `VernonInvocationSubmissionState` gains `VERNON_INVOCATION_SUBMITTED`;
   `VernonBoundaryMutationState` gains `VERNON_BOUNDARY_MUTATION_SUBMITTED`.
-  Completion outcomes add a rejection reason and check identity.
 - `vernonRuntimeProgramInvocationTakeSubmission(invocation, output)`, valid
   once after a submitting Execute and before destroy, in both modes.
 - `vernonSubmissionGetMutationOutcome` and `vernonSubmissionReadBoundary`;
   both return `VERNON_STATUS_NOT_READY` while the submission is pending.
+- `VernonTensorStorage` gains `VERNON_TENSOR_READBACK` (section 3.3).
 - `VernonCommon.h` gains `VERNON_STATUS_NOT_READY`.
 - `VernonRuntimeCreateOptions` gains `transient_budget_bytes` and
   `max_pending_submissions`; `vernonRuntimeContextGetSubmissionTelemetry`
@@ -326,25 +311,26 @@ Each phase runs on every GPU backend and keeps the previous phases green.
    - Exceeding either bound waits for the oldest submission and increments
      its counter.
    - A forced submission failure poisons exactly the owners it writes.
-2. **Deferred effects**: guarded commit-after-success copies, readbacks and
-   status words.
+2. **Deferred effects**: commit-after-success copies and readbacks recorded
+   in the submission.
    - A commit-after-success compute invocation followed by one reading its
-     result matches `WAIT` execution with no CPU wait between them.
-   - A forced check failure leaves every commit-after-success destination
-     unchanged and reports the reason; a later queued invocation that reads
-     one of them is rejected with the inherited reason and writes nothing,
-     while a queued invocation that reads none of them completes.
-   - A reader submitted after the rejected writer finished on the GPU but
-     before the caller observed it is still rejected; after the caller
-     observes it, the re-executed writer and reader inherit nothing.
-   - A readback is `NOT_READY` while pending and exact after completion.
-3. **Autodiff**: asynchronous pullbacks and applies, learned carrier
-   capacity.
+     result matches `WAIT` execution with no CPU wait between them, for
+     buffer and image destinations.
+   - A forced failure after submission reports every boundary it writes
+     `INDETERMINATE`, poisons them, and makes a queued reader of one of
+     them report its own writes `INDETERMINATE`; a queued invocation that
+     reads none of them completes. A failure before submission leaves every
+     boundary `UNCHANGED`.
+   - A readback is `NOT_READY` while pending, exact after completion and
+     unreadable after a failure.
+   - An asynchronous Execute that binds host memory to a writable boundary
+     fails before submission and names the boundary.
+3. **Autodiff**: asynchronous pullbacks and applies of static Tapes.
    - 64 training steps (forward, retained pullback, apply, in-place
      optimizer) queued without waits match the same steps under `WAIT`.
-   - A carrier overflow at step k rejects step k's gradient commits and
-     every queued step after it, leaves the parameters of step k
-     unchanged, and the re-executed step k fits without a replay.
+   - An asynchronous Execute of a plan with a dynamic Tape fails with
+     `PROGRAM_SUBMISSION_REQUIRES_WAIT` naming it, and the same plan under
+     `WAIT` still replays after an overflow.
 4. **Python default**: claims held until completion.
    - A host read of a buffer written by a pending submission returns the
      completed contents; a host write to a buffer a pending submission
@@ -354,11 +340,13 @@ Each phase runs on every GPU backend and keeps the previous phases green.
 ## 12. Contract changes on acceptance
 
 - [`design.md`](design.md) sections 1, 2, 6, 8 and 13: two-phase outcomes,
-  pending owners, guarded commits, per-submission storage and resource
+  pending owners, deferred commits, per-submission storage and resource
   bounds.
 - [`../program/execution_manifest.md`](../program/execution_manifest.md):
-  `PROGRAM_SUBMISSION_REQUIRES_WAIT` and the asynchronous publication of
-  commit-after-success boundaries.
+  `PROGRAM_SUBMISSION_REQUIRES_WAIT`, the asynchronous publication of
+  commit-after-success boundaries, and section 3.5's failure rule, which
+  replaces restoring a borrowed destination after a failure that follows
+  submission.
 - [`gpu_profiling.md`](gpu_profiling.md): timings are completion facts of
   the submission.
 - `VernonRuntime.h`, `VernonCommon.h`, the C++ wrapper and the Python
@@ -385,9 +373,6 @@ schedules (section 4.7). This design keeps that split:
   span the queues of several devices, and placed transfer and collective
   tasks join the same dependency model. One context per device is today's
   topology, not part of this contract.
-- Guard predication (section 3.5) is Runtime's publication mechanism for
-  commit-after-success. A task graph that declares its own completion
-  predicates may take it over.
 - This document is the single-device part of the ownership,
   synchronization and failure contract that
   [`../roadmap.md`](../roadmap.md) section 4 requires before distributed
@@ -411,7 +396,7 @@ schedules (section 4.7). This design keeps that split:
 +------------------------------------------------------------------------+
 | RuntimeCore                                                            |
 |   ResolvedExecutionPlan (requires WAIT?), publication modes,           |
-|   pending owners (readers, writers), guards and their inheritance      |
+|   pending owners (readers, writers), poison propagation                |
 +------------------------------------------------------------------------+
 | Runtime provider                                                       |
 |   record and submit, per-submission storage, resource bounds,          |
@@ -437,22 +422,17 @@ CPU, inside Execute                                          returns
      +-- any failure before submit: NOT_SUBMITTED, every boundary UNCHANGED
 
 GPU, one submission, in queue order
-  +----------+-----------+---------------+-------------+----------------+
-  | inherit  | staged    | node work     | guarded     | readback       |
-  | guards   | uploads   | (dispatches,  | commits     | copies into    |
-  | (status  |           | draws; checks | (skipped    | submission     |
-  | word)    |           | may set the   | when the    | staging        |
-  |          |           | status word)  | word is set)|                |
-  +----------+-----------+---------------+-------------+----------------+
+  +-----------+------------------+-------------------+--------------------+
+  | staged    | node work        | commit copies     | readback copies    |
+  | uploads   | (dispatches,     | (staging into     | (into submission   |
+  |           | draws)           | destinations)     | staging)           |
+  +-----------+------------------+-------------------+--------------------+
                                                                -> completion value
 
 On completion
   retire per-submission storage -> resolve the completion outcome
   -> release pending owners -> readback bytes and timings become readable
 ```
-
-Unguarded submissions, such as ordinary graphics frames, have no inherit
-step, no status word and no predicated commands.
 
 ### 14.3 Renderer, two frames in flight
 
@@ -495,33 +475,31 @@ GPU       [ F0 ][ B0 ][ O0 ][ F1 ][ B1 ][ O1 ][ F2 ][ B2 ][ O2 ] ... [F100]
 Data flow of step `k`, all on the device:
 
 ```text
-params_k, batch_k --F_k--> loss_k (readback staging), pullback_k (residuals retained)
-pullback_k        --B_k--> grads_k      commit-after-success, guarded
-params_k, grads_k --O_k--> params_k+1   in place, inherits B_k's guard
+params_k, batch_k --F_k--> loss_k (readback slot), pullback_k (residuals retained)
+pullback_k        --B_k--> grads_k      commit-after-success
+params_k, grads_k --O_k--> params_k+1   in place
 ```
 
 The CPU runs ahead until it reads the loss or reaches a resource bound
 (section 7). Each read of `loss.item()` waits for the forward of that step
 only; the backward and optimizer of the same step keep running.
 
-### 14.5 A rejected step
+### 14.5 Skipping a step
+
+Skipping an optimizer step whose gradients are not finite is part of the
+optimizer Program, not a Runtime feature:
 
 ```text
-                     status word                   effect
-F_k    carrier overflow -> pullback_k failed       loss_k still exact
-B_k    inherits pullback_k's word: set             dispatches zeroed, grads_k unchanged
-O_k    inherits B_k's word: set                    dispatches zeroed, params_k unchanged
-F_k+1  inherits O_k's word (reads params): set     skipped, and so is every later step
-upload of batch_k+2   reads nothing guarded        runs normally
+params_k, grads_k --O_k--> params_k+1 = where(all_finite(grads_k),
+                                              params_k - lr * grads_k,
+                                              params_k)
 ```
 
-The completion outcome of `F_k` reports `CARRIER_OVERFLOW` for its
-pullback; `B_k` and every later step report an inherited rejection. This
-holds even for steps queued after `O_k` already finished on the GPU, because
-the caller has not yet observed it. Nothing is poisoned: once the caller
-observes the rejection it re-executes from step `k`, which reads the
-unchanged `params_k` without inheriting, and the instance's grown carrier
-now fits.
+`F_k+1` reads `params_k+1` in queue order as usual. A skipped step leaves
+the parameters unchanged, so later steps need no rejection and the caller
+re-executes nothing. The optimizer can also return `all_finite(grads_k)`
+in a readback slot, so the caller counts skipped steps without waiting for
+each one.
 
 ### 14.6 Host access (Python, phase 4)
 

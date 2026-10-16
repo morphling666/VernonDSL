@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonSharedValuePatterns.h"
 
+#include "VernonTensorElementAccess.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
@@ -84,14 +85,7 @@ struct ExtractPattern final : OpConversionPattern<tensor::ExtractOp> {
             adaptor.getIndices().size() != static_cast<size_t>(sourceType.getRank()))
             return failure();
 
-        Location location = op.getLoc();
-        Value linear = adaptor.getIndices().front();
-        for (auto [dimension, index] :
-             llvm::zip_equal(sourceType.getShape().drop_front(), adaptor.getIndices().drop_front())) {
-            Value extent = arith::ConstantIndexOp::create(rewriter, location, dimension);
-            linear = arith::MulIOp::create(rewriter, location, linear, extent);
-            linear = arith::AddIOp::create(rewriter, location, linear, index);
-        }
+        Value linear = linearTensorIndex(op.getLoc(), sourceType.getShape(), adaptor.getIndices(), rewriter);
         rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, adaptor.getTensor(), OpFoldResult(linear));
         return success();
     }

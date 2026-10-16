@@ -482,6 +482,27 @@ def range_control_flow(
     output[1] = range_early_return_value(controls[0])
 
 
+@vd.func
+def assignments_after_early_return(stop: vd.i32, threshold: vd.i32) -> vd.i32:
+    if stop < 0:
+        return -1
+    last = 0
+    for index in range(stop):
+        if index >= threshold:
+            last = index
+    if last > threshold:
+        last = last * 10
+    return last
+
+
+@vd.kernel
+def guarded_nested_assignments(
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    controls: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+) -> None:
+    output[0] = assignments_after_early_return(controls[0], controls[1])
+
+
 @vd.struct(shared=True)
 class AggregateRecord:
     vector: vd.Tensor[vd.f32, (2,)]
@@ -1182,6 +1203,16 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         controls = vd.storage.from_numpy(np.array((10,), dtype=np.int32))
         range_control_flow(output, controls, grid=(1, 1, 1))
         np.testing.assert_array_equal(output.to_numpy(), np.array((13, 30), dtype=np.int32))
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_nested_assignments_after_early_return_backend_parity(self, backend: BackendRow) -> None:
+        cases = (((10, 3), 90), ((3, 2), 2), ((-1, 0), -1))
+        for controls, expected in cases:
+            with self.subTest(controls=controls):
+                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
+                guarded_nested_assignments(output, control_values, grid=(1, 1, 1))
+                np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_loop_carried_vector_norm(self, backend: BackendRow) -> None:

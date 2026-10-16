@@ -605,7 +605,9 @@ parameter. Ranked numeric fields use LLVM arrays rather than target-native
 vectors so the recursive struct/tuple/Tensor layout remains identical to the
 canonical host bytes. Reflection records the CUDA parameter size, alignment,
 and row-major byte strides, and Runtime packs host Tensor storage against that
-profile before `cuLaunchKernel`.
+profile before `cuLaunchKernel`. The CUDA prologue reloads the argument with
+those row-major strides, never the std430 ones, whose native matrices are
+column-major.
 
 The SPIR-V path uses vectors only for 2-4 components and reconstructs larger or
 one-element Values as SPIR-V composites. The Vulkan adapter maps compute inline
@@ -702,9 +704,12 @@ block names while retaining Vulkan packed push-constant coverage.
 
 A Struct or Tuple Value crossing a `Uniform` block, the push-constant block, or
 an aggregate Tensor storage-buffer element is emitted as its scalar leaves, one
-top-level member each, at the planned physical offsets. The entry prologue
-loads every scalar and rebuilds the logical Value with the same row-major leaf
-order as `flattenComposite`. A nested SPIR-V struct cannot carry the canonical
+top-level member each, at the planned physical offsets. A graphics field read
+of a block-wrapped uniform loads only that field's leaves from the block and
+rebuilds them with the same row-major leaf order as `flattenComposite`; the
+entry prologue rebuilds the whole Value only when some use needs it whole, and
+a field read is not materialized when every use reads through it into the
+block. A nested SPIR-V struct cannot carry the canonical
 layout portably: canonical Struct placement is dense (a `mat4` may follow an
 `f32` at offset 4), which neither std140, std430, nor HLSL `packoffset` can
 express for a nested member. A scalar at any 4-byte-aligned offset is valid in
@@ -712,6 +717,31 @@ every target, so the physical layout stays the one Runtime already packs. The
 MLIR SPIR-V serializer also decorates every struct reachable from these
 pointers as `Block`, which makes SPIRV-Cross omit nested GLSL declarations, so
 scalarizing removes that failure mode as well.
+
+In a `Uniform` or push-constant block, a Tensor leaf of 32-bit scalars whose
+elements are a whole number of 4-vectors and start on a 16-byte boundary is
+one top-level 4-vector member, or one array of them with stride 16, instead of
+one member per element. Its bytes and every other leaf's offsets are
+unchanged, so Runtime packing does not depend on the choice. A runtime-indexed
+graphics `tensor.extract` whose Tensor is such a leaf, reached from the
+stage-entry argument through Struct or Tuple field reads, is one access chain
+into the block (`block.leaf[i / 4][i % 4]`) rather than a read of a rebuilt
+Value; a constant-indexed one reads its member from any leaf. std140
+cannot index a scalar run in place: its scalar-array stride is 16, which would
+change the canonical layout. Storage-buffer records stay scalar, because their
+loads always read whole records.
+
+Any other runtime-indexed graphics `tensor.extract` of a Value reads a
+4-vector with `OpVectorExtractDynamic` and an array or matrix through a
+function-local variable that holds the Value: SPIR-V can index composites in
+place only through a pointer. Each extract stores the Value again, as glslang
+does for an indexed rvalue array; driver compilers drop the copy. A select
+chain over every element, the earlier lowering, cost one compare and select per
+element on each read. Compute lowering through the GPU dialect follows the
+same rule for register Values: a vector is read with a dynamic
+`vector.extract`, and a SPIR-V array with a `Function` variable or an LLVM
+array with an `alloca`, allocated once in the entry block. CPU lowering reads
+aggregate Tensors through the same `alloca`.
 
 The GLSL identifier of a non-varying interface is the source name with every
 character outside `[A-Za-z0-9_]` replaced by `_` and a leading `_` added when
@@ -1008,8 +1038,8 @@ decisions and cannot affect semantic or cache identity.
 MLIR builtin Tensor types cannot contain Tuple or Struct elements. Vernon
 therefore represents aggregate-element Tensor Values with
 `!vernon.tensor`, then lowers them to LLVM arrays on CPU/CUDA and
-SPIR-V arrays on Vulkan/OpenGL. Dynamic SPIR-V extraction selects recursively
-over scalar leaves because `OpSelect` does not accept composite values. ABI
+SPIR-V arrays on Vulkan/OpenGL. A runtime index reads them through a
+function-local copy, like any other register array. ABI
 boundaries still use the backend-independent product layout from the language
 contract, independent of these internal representations.
 

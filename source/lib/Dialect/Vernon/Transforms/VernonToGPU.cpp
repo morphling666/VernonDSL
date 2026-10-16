@@ -382,6 +382,11 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             const MetadataPhysicalProfile metadataProfile = useSpirvStorage
                                                                 ? MetadataPhysicalProfile::PortableShaderMetadataI32
                                                                 : MetadataPhysicalProfile::CudaKernelMetadata;
+            // Runtime packs Tensor-by-value bytes with the profile it selects per backend, so the prologue must
+            // reload them with the same strides; native matrices are column-major only in the std430 layout.
+            const PhysicalAbiProfile inlineTensorProfile = useSpirvStorage
+                                                               ? PhysicalAbiProfile::VulkanStd430StorageBuffer
+                                                               : PhysicalAbiProfile::CudaKernelParameter;
             if (failed(semanticMetadata)) {
                 source.emitError("cannot build target TensorView metadata ABI plan");
                 return signalPassFailure();
@@ -439,8 +444,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-                        FailureOr<ByteTransportPlan> layout =
-                            getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                        FailureOr<ByteTransportPlan> layout = getByteTransportPlan(tensor, module, inlineTensorProfile);
                         if (failed(layout) ||
                             layout->root->byteStrides.size() != static_cast<size_t>(tensor.getRank())) {
                             source.emitError() << "compute Tensor-by-value argument #" << index
@@ -594,8 +598,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             }
             for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
                 RankedTensorType tensor = inlineTensor.type;
-                FailureOr<ByteTransportPlan> layout =
-                    getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                FailureOr<ByteTransportPlan> layout = getByteTransportPlan(tensor, module, inlineTensorProfile);
                 if (failed(layout) || layout->root->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
                     return signalPassFailure();
                 const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);

@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 
+#include "VernonTensorElementAccess.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -18,7 +19,6 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/MathExtras.h"
 
-#include <functional>
 #include <limits>
 
 namespace mlir::vernon {
@@ -86,44 +86,6 @@ struct SpirvTensorSplatPattern final : OpConversionPattern<tensor::SplatOp> {
     }
 };
 
-struct SpirvTensorExtractPattern final : OpConversionPattern<tensor::ExtractOp> {
-    SpirvTensorExtractPattern(TypeConverter &converter, MLIRContext *context)
-        : OpConversionPattern(converter, context, PatternBenefit(2)) {}
-
-    LogicalResult matchAndRewrite(tensor::ExtractOp op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        auto sourceType = dyn_cast<RankedTensorType>(op.getTensor().getType());
-        std::optional<unsigned> elementCount = spirvCompositeElementCount(adaptor.getTensor().getType());
-        if (!sourceType || !elementCount || adaptor.getIndices().size() != static_cast<size_t>(sourceType.getRank()) ||
-            static_cast<int64_t>(*elementCount) != sourceType.getNumElements())
-            return failure();
-        Location location = op.getLoc();
-        Value linear;
-        if (sourceType.getRank() == 0) {
-            linear = arith::ConstantIndexOp::create(rewriter, location, 0);
-        } else {
-            linear = adaptor.getIndices().front();
-            for (auto [extent, index] :
-                 llvm::zip_equal(sourceType.getShape().drop_front(), adaptor.getIndices().drop_front())) {
-                Value extentValue = arith::ConstantIndexOp::create(rewriter, location, extent);
-                linear = arith::MulIOp::create(rewriter, location, linear, extentValue);
-                linear = arith::AddIOp::create(rewriter, location, linear, index);
-            }
-        }
-        Value selected =
-            spirv::CompositeExtractOp::create(rewriter, location, adaptor.getTensor(), ArrayRef<int32_t>{0});
-        for (int64_t index = 1; index < sourceType.getNumElements(); ++index) {
-            Value candidate = spirv::CompositeExtractOp::create(rewriter, location, adaptor.getTensor(),
-                                                                ArrayRef<int32_t>{static_cast<int32_t>(index)});
-            Value expected = arith::ConstantIndexOp::create(rewriter, location, index);
-            Value matches = arith::CmpIOp::create(rewriter, location, arith::CmpIPredicate::eq, linear, expected);
-            selected = arith::SelectOp::create(rewriter, location, matches, candidate, selected);
-        }
-        rewriter.replaceOp(op, selected);
-        return success();
-    }
-};
-
 template <typename Op> struct SpirvTensorElementwisePattern final : OpConversionPattern<Op> {
     using OpConversionPattern<Op>::OpConversionPattern;
     using OpAdaptor = typename Op::Adaptor;
@@ -154,6 +116,39 @@ Value extractFlatTensorElement(Location location, Value value, int64_t index, bo
         return spirv::CompositeExtractOp::create(rewriter, location, value,
                                                  ArrayRef<int32_t>{static_cast<int32_t>(index)});
     return LLVM::ExtractValueOp::create(rewriter, location, value, ArrayRef<int64_t>{index});
+}
+
+/// Reads one element of the flat register composite of a Tensor with `shape`. A runtime index reads a vector with a
+/// dynamic extract and an array through a function-local copy, because SPIR-V and LLVM index arrays dynamically only
+/// through a pointer.
+FailureOr<Value> extractTensorElement(Operation *op, ArrayRef<int64_t> shape, ValueRange sourceIndices,
+                                      ValueRange indices, Value composite, bool useSpirv,
+                                      ConversionPatternRewriter &rewriter) {
+    Location location = op->getLoc();
+    if (std::optional<int64_t> linear = constantLinearIndex(shape, sourceIndices))
+        return extractFlatTensorElement(location, composite, *linear, useSpirv, rewriter);
+    Value linear = linearTensorIndex(location, shape, indices, rewriter);
+    if (isa<VectorType>(composite.getType()))
+        return vector::ExtractOp::create(rewriter, location, composite, OpFoldResult(linear)).getResult();
+    auto array = dyn_cast<spirv::ArrayType>(composite.getType());
+    auto function = op->getParentOfType<gpu::GPUFuncOp>();
+    if (useSpirv && array && function) {
+        Value variable;
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(&function.getBody().front());
+            variable = spirv::VariableOp::create(rewriter, location,
+                                                 spirv::PointerType::get(array, spirv::StorageClass::Function),
+                                                 spirv::StorageClass::Function, /*initializer=*/nullptr);
+        }
+        spirv::StoreOp::create(rewriter, location, variable, composite);
+        Value index = arith::IndexCastOp::create(rewriter, location, rewriter.getI32Type(), linear);
+        Value element = spirv::AccessChainOp::create(rewriter, location, variable, ValueRange{index});
+        return spirv::LoadOp::create(rewriter, location, element).getResult();
+    }
+    if (!useSpirv)
+        return extractLLVMArrayElement(op, composite, linear, rewriter);
+    return failure();
 }
 
 FailureOr<Value> constructFlatTensor(Location location, Type resultType, ArrayRef<Value> elements, bool useSpirv,
@@ -352,22 +347,11 @@ struct GpuFlatTensorExtractPattern final : OpConversionPattern<tensor::ExtractOp
         if (!sourceType || isa<VectorType>(adaptor.getTensor().getType()) ||
             adaptor.getIndices().size() != static_cast<size_t>(sourceType.getRank()))
             return failure();
-        Location location = op.getLoc();
-        Value linear = adaptor.getIndices().front();
-        for (auto [extent, index] :
-             llvm::zip_equal(sourceType.getShape().drop_front(), adaptor.getIndices().drop_front())) {
-            linear = arith::MulIOp::create(rewriter, location, linear,
-                                           arith::ConstantIndexOp::create(rewriter, location, extent));
-            linear = arith::AddIOp::create(rewriter, location, linear, index);
-        }
-        Value selected = extractFlatTensorElement(location, adaptor.getTensor(), 0, useSpirv, rewriter);
-        for (int64_t index = 1; index < sourceType.getNumElements(); ++index) {
-            Value candidate = extractFlatTensorElement(location, adaptor.getTensor(), index, useSpirv, rewriter);
-            Value expected = arith::ConstantIndexOp::create(rewriter, location, index);
-            Value matches = arith::CmpIOp::create(rewriter, location, arith::CmpIPredicate::eq, linear, expected);
-            selected = arith::SelectOp::create(rewriter, location, matches, candidate, selected);
-        }
-        rewriter.replaceOp(op, selected);
+        FailureOr<Value> element = extractTensorElement(op, sourceType.getShape(), op.getIndices(),
+                                                        adaptor.getIndices(), adaptor.getTensor(), useSpirv, rewriter);
+        if (failed(element))
+            return failure();
+        rewriter.replaceOp(op, *element);
         return success();
     }
 
@@ -531,78 +515,11 @@ struct GpuAggregateTensorGetPattern final : OpConversionPattern<TensorGetOp> {
         auto sourceType = dyn_cast<TensorType>(op.getInput().getType());
         if (!sourceType || adaptor.getIndices().size() != sourceType.getShape().size())
             return failure();
-        Location location = op.getLoc();
-        Value linear = adaptor.getIndices().front();
-        for (auto [dimension, index] :
-             llvm::zip_equal(sourceType.getShape().drop_front(), adaptor.getIndices().drop_front())) {
-            Value extent = arith::ConstantIndexOp::create(rewriter, location, dimension);
-            linear = arith::MulIOp::create(rewriter, location, linear, extent);
-            linear = arith::AddIOp::create(rewriter, location, linear, index);
-        }
-        int64_t elementCount = 1;
-        for (int64_t dimension : sourceType.getShape())
-            elementCount *= dimension;
-        auto extract = [&](int64_t index) -> Value {
-            if (useSpirv)
-                return spirv::CompositeExtractOp::create(rewriter, location, adaptor.getInput(),
-                                                         ArrayRef<int32_t>{static_cast<int32_t>(index)});
-            return LLVM::ExtractValueOp::create(rewriter, location, adaptor.getInput(), ArrayRef<int64_t>{index});
-        };
-        int64_t constantLinear = 0;
-        bool hasConstantIndices = true;
-        for (auto [dimension, index] : llvm::zip_equal(sourceType.getShape(), adaptor.getIndices())) {
-            if (auto cast = index.getDefiningOp<arith::IndexCastOp>())
-                index = cast.getIn();
-            auto constant = index.getDefiningOp<arith::ConstantOp>();
-            auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
-            if (!value || value.getInt() < 0 || value.getInt() >= dimension) {
-                hasConstantIndices = false;
-                break;
-            }
-            constantLinear = constantLinear * dimension + value.getInt();
-        }
-        if (hasConstantIndices) {
-            rewriter.replaceOp(op, extract(constantLinear));
-            return success();
-        }
-        Value selected = extract(0);
-        for (int64_t index = 1; index < elementCount; ++index) {
-            Value candidate = extract(index);
-            Value expected = arith::ConstantIndexOp::create(rewriter, location, index);
-            Value matches = arith::CmpIOp::create(rewriter, location, arith::CmpIPredicate::eq, linear, expected);
-            if (useSpirv) {
-                std::function<Value(Type, Value, Value)> selectValue = [&](Type type, Value whenTrue,
-                                                                           Value whenFalse) -> Value {
-                    if (auto structType = dyn_cast<spirv::StructType>(type)) {
-                        SmallVector<Value> fields;
-                        for (unsigned field = 0; field < structType.getNumElements(); ++field) {
-                            Value trueField = spirv::CompositeExtractOp::create(
-                                rewriter, location, whenTrue, ArrayRef<int32_t>{static_cast<int32_t>(field)});
-                            Value falseField = spirv::CompositeExtractOp::create(
-                                rewriter, location, whenFalse, ArrayRef<int32_t>{static_cast<int32_t>(field)});
-                            fields.push_back(selectValue(structType.getElementType(field), trueField, falseField));
-                        }
-                        return spirv::CompositeConstructOp::create(rewriter, location, structType, fields);
-                    }
-                    if (auto arrayType = dyn_cast<spirv::ArrayType>(type)) {
-                        SmallVector<Value> elements;
-                        for (unsigned element = 0; element < arrayType.getNumElements(); ++element) {
-                            Value trueElement = spirv::CompositeExtractOp::create(
-                                rewriter, location, whenTrue, ArrayRef<int32_t>{static_cast<int32_t>(element)});
-                            Value falseElement = spirv::CompositeExtractOp::create(
-                                rewriter, location, whenFalse, ArrayRef<int32_t>{static_cast<int32_t>(element)});
-                            elements.push_back(selectValue(arrayType.getElementType(), trueElement, falseElement));
-                        }
-                        return spirv::CompositeConstructOp::create(rewriter, location, arrayType, elements);
-                    }
-                    return spirv::SelectOp::create(rewriter, location, type, matches, whenTrue, whenFalse);
-                };
-                selected = selectValue(candidate.getType(), candidate, selected);
-            } else {
-                selected = arith::SelectOp::create(rewriter, location, matches, candidate, selected);
-            }
-        }
-        rewriter.replaceOp(op, selected);
+        FailureOr<Value> element = extractTensorElement(op, sourceType.getShape(), op.getIndices(),
+                                                        adaptor.getIndices(), adaptor.getInput(), useSpirv, rewriter);
+        if (failed(element))
+            return failure();
+        rewriter.replaceOp(op, *element);
         return success();
     }
 
@@ -799,12 +716,11 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
         RewritePatternSet patterns(context);
         populateVernonSharedValuePatterns(converter, patterns);
         if (useSpirvTupleAbi)
-            patterns.add<SpirvTensorConstantPattern, SpirvTensorExtractPattern, SpirvTensorFromElementsPattern,
-                         SpirvTensorSplatPattern, SpirvTensorElementwisePattern<arith::AddFOp>,
-                         SpirvTensorElementwisePattern<arith::SubFOp>, SpirvTensorElementwisePattern<arith::MulFOp>,
-                         SpirvTensorElementwisePattern<arith::DivFOp>, SpirvTensorElementwisePattern<arith::AddIOp>,
-                         SpirvTensorElementwisePattern<arith::SubIOp>, SpirvTensorElementwisePattern<arith::MulIOp>>(
-                converter, context);
+            patterns.add<SpirvTensorConstantPattern, SpirvTensorFromElementsPattern, SpirvTensorSplatPattern,
+                         SpirvTensorElementwisePattern<arith::AddFOp>, SpirvTensorElementwisePattern<arith::SubFOp>,
+                         SpirvTensorElementwisePattern<arith::MulFOp>, SpirvTensorElementwisePattern<arith::DivFOp>,
+                         SpirvTensorElementwisePattern<arith::AddIOp>, SpirvTensorElementwisePattern<arith::SubIOp>,
+                         SpirvTensorElementwisePattern<arith::MulIOp>>(converter, context);
         patterns.add<GpuAggregateTensorConstructPattern, GpuAggregateTensorGetPattern, GpuStructCreatePattern,
                      GpuStructGetPattern, GpuTupleCreatePattern, GpuTupleGetPattern>(converter, context,
                                                                                      useSpirvTupleAbi);
