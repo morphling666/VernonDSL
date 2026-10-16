@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <string>
@@ -47,19 +46,10 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
 
     const std::filesystem::path manifestPath = VERNON_VULKAN_CUBE_MAP_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
-    const std::string bundleDirectory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_TRUE(loaded);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
     const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);

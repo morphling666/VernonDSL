@@ -1,5 +1,7 @@
 #include "opengl_driver.h"
 
+#include <type_traits>
+
 namespace vernon::rhi::opengl {
 namespace {
 
@@ -175,6 +177,46 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         error = "external OpenGL context callback failed";
         return false;
     }
+}
+
+void loadDebugLabelDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, bool khrSuffix) {
+    const auto load = [&](auto &function, const char *core, const char *khr) {
+        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+            callbacks.get_proc_address(callbacks.user_data, khrSuffix ? khr : core));
+    };
+    try {
+        load(driver.pushDebugGroup, "glPushDebugGroup", "glPushDebugGroupKHR");
+        load(driver.popDebugGroup, "glPopDebugGroup", "glPopDebugGroupKHR");
+        load(driver.debugMessageInsert, "glDebugMessageInsert", "glDebugMessageInsertKHR");
+    } catch (...) {
+        driver.pushDebugGroup = nullptr;
+    }
+    if (driver.pushDebugGroup && driver.popDebugGroup && driver.debugMessageInsert)
+        return;
+    driver.pushDebugGroup = nullptr;
+    driver.popDebugGroup = nullptr;
+    driver.debugMessageInsert = nullptr;
+}
+
+void loadTimerQueryDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, bool extSuffix) {
+    const auto load = [&](auto &function, const char *name) {
+        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+            callbacks.get_proc_address(callbacks.user_data, name));
+    };
+    try {
+        load(driver.genQueries, "glGenQueries");
+        load(driver.deleteQueries, "glDeleteQueries");
+        load(driver.queryCounter, extSuffix ? "glQueryCounterEXT" : "glQueryCounter");
+        load(driver.getQueryObjectui64v, extSuffix ? "glGetQueryObjectui64vEXT" : "glGetQueryObjectui64v");
+    } catch (...) {
+        driver.genQueries = nullptr;
+    }
+    if (driver.genQueries && driver.deleteQueries && driver.queryCounter && driver.getQueryObjectui64v)
+        return;
+    driver.genQueries = nullptr;
+    driver.deleteQueries = nullptr;
+    driver.queryCounter = nullptr;
+    driver.getQueryObjectui64v = nullptr;
 }
 
 } // namespace vernon::rhi::opengl

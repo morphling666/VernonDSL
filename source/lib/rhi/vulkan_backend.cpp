@@ -74,6 +74,9 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     portabilityEnumeration = hasExtension(instanceExtensionProperties, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     if (portabilityEnumeration)
         instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    const bool debugUtils = hasExtension(instanceExtensionProperties, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (debugUtils)
+        instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &application;
     instanceInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
@@ -86,6 +89,19 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         error = api.error;
         shutdown();
         return false;
+    }
+    if (debugUtils) {
+        cmdBeginDebugUtilsLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+            api.getInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT"));
+        cmdEndDebugUtilsLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+            api.getInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT"));
+        cmdInsertDebugUtilsLabel = reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(
+            api.getInstanceProcAddr(instance, "vkCmdInsertDebugUtilsLabelEXT"));
+        if (!cmdBeginDebugUtilsLabel || !cmdEndDebugUtilsLabel || !cmdInsertDebugUtilsLabel) {
+            cmdBeginDebugUtilsLabel = nullptr;
+            cmdEndDebugUtilsLabel = nullptr;
+            cmdInsertDebugUtilsLabel = nullptr;
+        }
     }
     uint32_t deviceCount = 0;
     if (!check(api.enumeratePhysicalDevices(instance, &deviceCount, nullptr), "vkEnumeratePhysicalDevices", error)) {
@@ -108,6 +124,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         VkPhysicalDeviceProperties properties{};
         VkDeviceSize deviceLocalMemory{};
         uint32_t queueFamily{};
+        uint32_t timestampValidBits{};
     };
     std::vector<DeviceCandidate> candidates;
     candidates.reserve(devices.size());
@@ -126,6 +143,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         DeviceCandidate candidate;
         candidate.device = candidateDevice;
         candidate.queueFamily = static_cast<uint32_t>(std::distance(candidateQueues.begin(), candidateQueue));
+        candidate.timestampValidBits = candidateQueue->timestampValidBits;
         api.getPhysicalDeviceProperties(candidateDevice, &candidate.properties);
         VkPhysicalDeviceMemoryProperties candidateMemory{};
         api.getPhysicalDeviceMemoryProperties(candidateDevice, &candidateMemory);
@@ -147,7 +165,9 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     }
     physicalDevice = candidates[deviceIndex].device;
     queueFamily = candidates[deviceIndex].queueFamily;
+    timestampValidBits = candidates[deviceIndex].timestampValidBits;
     const VkPhysicalDeviceProperties &properties = candidates[deviceIndex].properties;
+    timestampPeriod = properties.limits.timestampPeriod;
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
@@ -291,6 +311,12 @@ bool DeviceState::initializeBorrowed(VkInstance borrowedInstance, VkPhysicalDevi
     }
     VkPhysicalDeviceProperties properties{};
     api.getPhysicalDeviceProperties(physicalDevice, &properties);
+    uint32_t queueFamilyCount = 0;
+    api.getPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    api.getPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
+    timestampValidBits = queueFamily < queueFamilyCount ? queueFamilies[queueFamily].timestampValidBits : 0;
+    timestampPeriod = properties.limits.timestampPeriod;
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
@@ -347,6 +373,8 @@ void DeviceState::shutdown() {
     physicalDevice = VK_NULL_HANDLE;
     instance = VK_NULL_HANDLE;
     queueFamily = 0;
+    timestampValidBits = 0;
+    timestampPeriod = 0;
     maxPushConstantsSize = 0;
     maxVertexInputAttributes = 0;
     apiVersion = 0;
@@ -357,6 +385,9 @@ void DeviceState::shutdown() {
     portabilityEnumeration = false;
     portabilitySubset = false;
     nativeObjectsBorrowed = false;
+    cmdBeginDebugUtilsLabel = nullptr;
+    cmdEndDebugUtilsLabel = nullptr;
+    cmdInsertDebugUtilsLabel = nullptr;
     borrowedCommandBuffer = VK_NULL_HANDLE;
     std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
     memoryProperties = {};

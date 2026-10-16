@@ -5,15 +5,18 @@
 #include "VernonRuntime.h"
 #include "invocation_outcome.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 struct VernonRuntimeContext;
 
 namespace vernon::execution::detail {
 struct RhiCommandExecutionPlan;
+struct CommandScope;
 } // namespace vernon::execution::detail
 
 namespace vernon::runtime::program_execution {
@@ -26,8 +29,10 @@ enum class CompletionMode : uint8_t { Wait, Asynchronous };
 // query, wait and settle from different threads.
 class SubmissionRecord {
 public:
-    explicit SubmissionRecord(VernonRuntimeContext &context, CompletionMode mode = CompletionMode::Wait) noexcept
-        : context_(&context), mode_(mode) {}
+    // With `timings`, each submitted plan times its scopes and CPU Nodes report their host time.
+    explicit SubmissionRecord(VernonRuntimeContext &context, CompletionMode mode = CompletionMode::Wait,
+                              bool timings = false) noexcept
+        : context_(&context), mode_(mode), timings_(timings) {}
     SubmissionRecord(const SubmissionRecord &) = delete;
     SubmissionRecord &operator=(const SubmissionRecord &) = delete;
     ~SubmissionRecord();
@@ -53,6 +58,13 @@ public:
     VernonStatus completionOutcome(const InvocationMutationOutcome *&output);
     // Retires finished work without reporting it, waiting for it when `block` is set; false while work is pending.
     bool settle(bool block) noexcept;
+    // Reports one CPU Node that ran from `begin` to `end` when the record is timed.
+    void recordHostScope(uint32_t node, std::chrono::steady_clock::time_point begin,
+                         std::chrono::steady_clock::time_point end);
+    // Fills `count` and, with `scopes`, the timed scopes: NOT_READY while any completion is pending,
+    // INTERNAL_ERROR once the submission failed, INVALID_ARGUMENT when `capacity` is short, UNSUPPORTED_TARGET
+    // when the device records no timestamps.
+    VernonStatus scopeTimings(VernonScopeTiming *scopes, size_t capacity, size_t &count);
 
     uint64_t deviceWaitNanoseconds() const noexcept { return deviceWaitNanoseconds_; }
     // The RHI submissions the device accepted for this record; only the producing call may read it.
@@ -62,6 +74,9 @@ private:
     struct Pending {
         VernonRhiCompletion completion;
         std::vector<std::shared_ptr<void>> retained;
+        // In timer order.
+        std::vector<std::shared_ptr<const execution::detail::CommandScope>> timedScopes;
+        uint32_t deviceSubmission{};
     };
 
     // What a retired record held. Releasing it can call back into Runtime, including into this record, so it is
@@ -80,6 +95,8 @@ private:
     // device may still read it, then moves everything the record retains into `released`. Completion-boundary
     // failure injection applies to each completion that succeeded.
     bool retire(Released &released) noexcept;
+    // Appends the scopes of a succeeded completion, or leaves why it could not in `timingStatus_`.
+    void collectTimings(const Pending &pending) noexcept;
     VernonStatus fail(const char *fallback);
 
     std::mutex mutex_;
@@ -94,6 +111,11 @@ private:
     bool injectedCompletionFailure_{};
     uint32_t submitted_{};
     uint64_t deviceWaitNanoseconds_{};
+    bool timings_{};
+    std::vector<VernonScopeTiming> scopeTimings_;
+    VernonStatus timingStatus_{VERNON_STATUS_OK};
+    // The begin of the first CPU Node, which host scopes count from.
+    std::optional<std::chrono::steady_clock::time_point> hostOrigin_;
 };
 
 } // namespace vernon::runtime::program_execution

@@ -339,6 +339,23 @@ It is not serialized as Program topology and is not a public Python authoring
 API. Runtime records and submits commands internally. Engine-owned execution
 graph embedding does not change Program binding semantics.
 
+Debug groups and timings ([`gpu_profiling.md`](gpu_profiling.md) sections 2
+and 3) are a property of DAG encoders, not commands: every encoder of a Node,
+including its transfers and barriers, shares the Node's scope (label, first
+Node, Node count), and submission opens one group, and with timings one timer
+just inside it, for each run of consecutive encoders sharing a scope. A scope
+is shared rather than copied because fusing a later Node extends its label
+(`a+b`) and Node count after the first member's encoders exist. The
+submission record keeps each device submission's scopes in timer order and
+reads their spans when it retires the completion, before destroying it. A
+graphics Node's transfers are
+planned apart and end the open render batch, which is appended before them;
+appending them straight into the plan would place them ahead of the earlier
+Node's draws that the open batch still holds. Label and timer order are tested
+through the native calls a fake OpenGL driver receives, not through an RHI trace,
+because a trace inside the RHI would cost every shipping draw a lock; the
+real backends are only checked to render the same pixels with labels.
+
 Every GPU step of one Execute, pullback apply, or Stage submission goes
 through one submission record: publication initialization and commit copies,
 graph flushes, tape-retry restores, and the immediate Stage encoder. The record

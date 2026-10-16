@@ -441,6 +441,7 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
 
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
     std::map<std::string, BoundParameter> bound;
+    size_t openDebugGroups = 0;
     pass.telemetry = {sizeof(VernonProgramGraphicsNodeTelemetry), 0, 0, 0, 0};
     const auto frameFor = [&](const std::shared_ptr<RuntimeBindingSetState> &set) {
         std::shared_ptr<const RuntimeBindingSetMatch> match = matchBindingSet(*set, pipeline);
@@ -543,8 +544,22 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
             ++pass.telemetry.draws;
             break;
         }
+        case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
+            if (!openDebugGroups)
+                return invalid(path, "pops a debug group that is not open");
+            --openDebugGroups;
+            pass.debugCommands.push_back({command.kind, {}, pass.draws.size()});
+            break;
+        case VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP:
+            ++openDebugGroups;
+            [[fallthrough]];
+        case VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER:
+            pass.debugCommands.push_back({command.kind, command.label, pass.draws.size()});
+            break;
         }
     }
+    if (openDebugGroups)
+        return invalid(nodePath, "pushes debug groups it does not pop");
     return VERNON_STATUS_OK;
 }
 } // namespace
@@ -681,6 +696,14 @@ VernonStatus vernonRuntimeProgramInvocationRecordGraphics(VernonProgramInvocatio
                 command.draw = makeDrawCommandControl(&source.draw);
                 if (!command.draw)
                     return fail(context, path + " has an invalid DrawCommand");
+                break;
+            case VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP:
+            case VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER:
+                if (source.label.size && !source.label.data)
+                    return fail(context, path + " has an invalid label");
+                command.label.assign(source.label.size ? source.label.data : "", source.label.size);
+                break;
+            case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
                 break;
             default:
                 return fail(context, path + " has an unknown kind");

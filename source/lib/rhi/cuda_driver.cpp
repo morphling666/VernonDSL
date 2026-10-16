@@ -57,6 +57,7 @@ bool Driver::load() {
     VERNON_LOAD_CUDA(eventRecord, "cuEventRecord");
     VERNON_LOAD_CUDA(eventQuery, "cuEventQuery");
     VERNON_LOAD_CUDA(eventSynchronize, "cuEventSynchronize");
+    VERNON_LOAD_CUDA(eventElapsedTime, "cuEventElapsedTime");
     VERNON_LOAD_CUDA(launchKernel, "cuLaunchKernel");
 
 #undef VERNON_LOAD_CUDA_VERSIONED

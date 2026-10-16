@@ -30,18 +30,9 @@ std::string lastError(VernonRuntimeContext *context) {
 
 TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -275,16 +266,9 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
     using vernon::runtime::program_execution::clearFailureInjectionForTesting;
     using vernon::runtime::program_execution::FailureBoundary;
     using vernon::runtime::program_execution::setFailureInjectionForTesting;
-    std::ifstream input(VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory =
-        std::filesystem::path(VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST).parent_path().string();
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundleLoadOptions options{sizeof(options), bundleDirectory.c_str(), {}};
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -529,11 +513,6 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
 
 TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExecutedRecords) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     vernon::runtime::ad::HostTapeTraversalMetrics metrics;
@@ -542,11 +521,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
         *context,
         std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
             vernon::runtime::ad::kDefaultHostTapeInvocationLimit, vernon::runtime::ad::kDefaultHostTapeContextLimit));
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -624,21 +599,12 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
 
 TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGradients) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     auto calibrationPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
         std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, calibrationPolicy);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -721,17 +687,9 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
 
 TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtypes) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);

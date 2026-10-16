@@ -1,4 +1,4 @@
-#include "../../lib/runtime/rhi_adapter/adapter_common.h"
+#include "runtime/rhi_adapter/adapter_common.h"
 
 #include <gtest/gtest.h>
 

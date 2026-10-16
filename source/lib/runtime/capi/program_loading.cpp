@@ -577,10 +577,10 @@ void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph) {
 }
 
 VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph, const VernonProgramBundle *bundle,
-                                                 const VernonProgramVariantSelector *selector,
+                                                 const VernonProgramVariantSelector *selector, VernonStringView label,
                                                  VernonProgramNodeId *node) {
     return runtimeStatusBoundary(graph ? graph->context : nullptr, [&] {
-        if (!graph || !bundle || !node)
+        if (!graph || !bundle || !node || (label.size && !label.data))
             return fail(graph ? graph->context : nullptr, "invalid ProgramGraph node");
         auto graphPin = graph->lifecycle.pin();
         auto bundlePin = bundle->lifecycle.pin();
@@ -595,6 +595,7 @@ VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph, cons
         RuntimeProgramGraphNode source;
         source.id = static_cast<uint32_t>(graph->nodes.size());
         source.bundleId = bundle->id;
+        source.label = label.size ? std::string(label.data, label.size) : bundle->id;
         source.contentHash = bundle->contentHash;
         source.deployment = *deployment;
         source.bundleRoot = bundle->bundleRoot;
@@ -788,7 +789,7 @@ ProgramGraphExecutableResult resolveProgramGraphOperation(VernonProgramGraph *gr
     std::vector<ProgramGraphNodeSource> sources;
     sources.reserve(graph->nodes.size());
     for (RuntimeProgramGraphNode &node : graph->nodes) {
-        sources.push_back({node.id, node.bundleId, node.contentHash, &node.deployment, node.bundleRoot});
+        sources.push_back({node.id, node.bundleId, node.label, node.contentHash, &node.deployment, node.bundleRoot});
     }
     std::vector<ProgramGraphConnection> connections;
     for (const RuntimeProgramGraphValue &value : graph->values)

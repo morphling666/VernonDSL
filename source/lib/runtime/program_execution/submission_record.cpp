@@ -25,6 +25,8 @@ bool SubmissionRecord::retire(Released &released) noexcept {
             succeeded = false;
         else if (injectFailure(FailureBoundary::Completion))
             succeeded = false, injectedCompletionFailure_ = true;
+        else if (!pending.timedScopes.empty())
+            collectTimings(pending);
         deviceWaitNanoseconds_ += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
         (void)vernonRhiDeviceDestroyCompletion(context_->rhiDevice, pending.completion);
@@ -38,6 +40,83 @@ bool SubmissionRecord::retire(Released &released) noexcept {
         status_ = VERNON_STATUS_INTERNAL_ERROR;
     }
     return succeeded;
+}
+
+void SubmissionRecord::collectTimings(const Pending &pending) noexcept {
+    if (timingStatus_ != VERNON_STATUS_OK)
+        return;
+    try {
+        std::vector<VernonRhiTimerSpan> spans(pending.timedScopes.size());
+        size_t count = 0;
+        const VernonRhiStatus status =
+            vernonRhiCompletionGetTimers(context_->rhiDevice, pending.completion, spans.data(), spans.size(), &count);
+        if (status == VERNON_RHI_STATUS_UNSUPPORTED) {
+            timingStatus_ = VERNON_STATUS_UNSUPPORTED_TARGET;
+            return;
+        }
+        if (status != VERNON_RHI_STATUS_OK || count != spans.size()) {
+            timingStatus_ = VERNON_STATUS_INTERNAL_ERROR;
+            return;
+        }
+        scopeTimings_.reserve(scopeTimings_.size() + spans.size());
+        for (size_t index = 0; index < spans.size(); ++index) {
+            const execution::detail::CommandScope &scope = *pending.timedScopes[index];
+            scopeTimings_.push_back({scope.firstNode, scope.nodeCount, pending.deviceSubmission, 0,
+                                     spans[index].begin_nanoseconds, spans[index].end_nanoseconds});
+        }
+    } catch (const std::bad_alloc &) {
+        timingStatus_ = VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+void SubmissionRecord::recordHostScope(uint32_t node, std::chrono::steady_clock::time_point begin,
+                                       std::chrono::steady_clock::time_point end) {
+    if (!timings_)
+        return;
+    std::lock_guard lock(mutex_);
+    if (!hostOrigin_)
+        hostOrigin_ = begin;
+    const auto since = [&](std::chrono::steady_clock::time_point point) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(point - *hostOrigin_).count());
+    };
+    try {
+        scopeTimings_.push_back({node, 1, 0, 0, since(begin), since(end)});
+    } catch (const std::bad_alloc &) {
+        timingStatus_ = VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+VernonStatus SubmissionRecord::scopeTimings(VernonScopeTiming *scopes, size_t capacity, size_t &count) {
+    Released released;
+    std::lock_guard lock(mutex_);
+    count = 0;
+    bool finished = false;
+    if (const VernonStatus status = observe(finished, released); status != VERNON_STATUS_OK)
+        return status;
+    if (!finished)
+        return VERNON_STATUS_NOT_READY;
+    if (state_ != VERNON_SUBMISSION_SUCCEEDED) {
+        // The call that retired the failed work already reports why it failed.
+        if (std::string &detail = invocationDiagnostic(*context_); detail.empty())
+            detail = "the submission failed, so its scopes were not timed";
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    if (timingStatus_ != VERNON_STATUS_OK) {
+        invocationDiagnostic(*context_) = timingStatus_ == VERNON_STATUS_UNSUPPORTED_TARGET
+                                              ? "the device cannot time the submission's scopes"
+                                              : "cannot read the submission's scope timings";
+        return timingStatus_;
+    }
+    count = scopeTimings_.size();
+    if (!scopes)
+        return VERNON_STATUS_OK;
+    if (capacity < scopeTimings_.size()) {
+        invocationDiagnostic(*context_) = "scope timing storage is smaller than the timed scopes";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    std::copy(scopeTimings_.begin(), scopeTimings_.end(), scopes);
+    return VERNON_STATUS_OK;
 }
 
 VernonStatus SubmissionRecord::fail(const char *fallback) {
@@ -66,11 +145,11 @@ VernonStatus SubmissionRecord::submit(execution::detail::RhiCommandExecutionPlan
             : VERNON_RHI_QUEUE_COMPUTE;
     pending_.reserve(pending_.size() + 1);
     VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    if (execution::detail::submitRhiCommandPlan(context_->rhiDevice, requiredCapabilities, plan, completion) !=
-        VERNON_RHI_STATUS_OK)
+    execution::detail::TimedCommandScopes timedScopes;
+    if (execution::detail::submitRhiCommandPlan(context_->rhiDevice, requiredCapabilities, plan, completion,
+                                                timings_ ? &timedScopes : nullptr) != VERNON_RHI_STATUS_OK)
         return fail("GPU command program failed");
-    pending_.push_back({completion, std::move(plan.retainedContexts)});
-    ++submitted_;
+    pending_.push_back({completion, std::move(plan.retainedContexts), std::move(timedScopes), submitted_++});
     return VERNON_STATUS_OK;
 }
 
@@ -82,8 +161,7 @@ VernonRhiStatus SubmissionRecord::submit(VernonRhiCommandEncoder encoder) {
         (void)vernonRhiDeviceDestroyCommandEncoder(context_->rhiDevice, encoder);
         return status;
     }
-    pending_.push_back({completion, {}});
-    ++submitted_;
+    pending_.push_back({completion, {}, {}, submitted_++});
     return VERNON_RHI_STATUS_OK;
 }
 

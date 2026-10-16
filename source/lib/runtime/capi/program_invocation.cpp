@@ -173,7 +173,8 @@ VernonStatus vernonRuntimeProgramInvocationSetOptions(VernonProgramInvocation *i
             options->struct_size < sizeof(*options) ||
             options->abi_version != VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION || reservedSet ||
             (options->completion_mode != VERNON_COMPLETION_WAIT &&
-             options->completion_mode != VERNON_COMPLETION_ASYNCHRONOUS))
+             options->completion_mode != VERNON_COMPLETION_ASYNCHRONOUS) ||
+            options->timings > 1)
             return fail(context, "invalid Program invocation options");
         auto invocationPin = invocation->lifecycle.pin();
         if (invocationPin.isErr())
@@ -181,6 +182,7 @@ VernonStatus vernonRuntimeProgramInvocationSetOptions(VernonProgramInvocation *i
         invocation->completionMode = options->completion_mode == VERNON_COMPLETION_ASYNCHRONOUS
                                          ? vernon::runtime::program_execution::CompletionMode::Asynchronous
                                          : vernon::runtime::program_execution::CompletionMode::Wait;
+        invocation->timings = options->timings != 0;
         return VERNON_STATUS_OK;
     });
 }
@@ -487,7 +489,7 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
                         vernon::toVernonStatus(submissionChild.error()));
         auto submission = std::make_unique<VernonSubmission>(
             *pipeline->context, std::make_shared<vernon::runtime::program_execution::SubmissionRecord>(
-                                    *pipeline->context, invocation->completionMode));
+                                    *pipeline->context, invocation->completionMode, invocation->timings));
         submission->lifecycle.emplace(std::move(submissionChild).value());
         invocation->executed = true;
         auto snapshot = invocation->transaction->freeze();
@@ -732,6 +734,20 @@ VernonStatus vernonSubmissionGetMutationOutcome(const VernonSubmission *submissi
             return fail(submission->context, "invalid submission mutation outcome storage");
         vernon::runtime::program_execution::publishPublicOutcome(*completed, outcome);
         return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonSubmissionGetScopeTimings(const VernonSubmission *submission, VernonScopeTiming *scopes,
+                                             size_t capacity, size_t *count) {
+    return runtimeStatusBoundary(submission ? submission->context : nullptr, [&] {
+        if (count)
+            *count = 0;
+        if (!submission || !count || !submission->lifecycle)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto pin = submission->lifecycle.value().pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
+        return submission->record->scopeTimings(scopes, capacity, *count);
     });
 }
 

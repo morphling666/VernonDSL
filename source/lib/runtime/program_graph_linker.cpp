@@ -526,7 +526,9 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
             for (const program::Node &childNode : childGraph.nodes) {
                 program::Node node = childNode;
                 node.id = globalNode(nodeIndex, childGraph.direction, node.id);
-                node.name = prefix + node.name;
+                node.name = childGraph.nodes.size() == 1
+                                ? source.label
+                                : source.label + "/" + (node.name.empty() ? node.stage : node.name);
                 node.stage = prefix + node.stage;
                 for (uint32_t &operand : node.operands)
                     operand = globalValue(nodeIndex, operand);

@@ -185,6 +185,10 @@ if(VERNON_ENABLE_VULKAN_RUNTIME AND NOT TARGET Vulkan::Headers)
     include("${_vernon_repository_root}/cmake/IncludeVulkanHeaders.cmake")
     include_vulkan_headers()
 endif()
+if(VERNON_ENABLE_CUDA_RUNTIME AND NOT TARGET nvtx3::nvtx3-c)
+    include("${_vernon_repository_root}/cmake/IncludeNvtx.cmake")
+    include_nvtx()
+endif()
 
 include("${_vernon_runtime_target_file}")
 vernon_add_runtime()
@@ -314,6 +318,7 @@ if(SKBUILD)
         FILES "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
               "${_vernon_repository_root}/cmake/IncludeNlohmannJson.cmake"
               "${_vernon_repository_root}/cmake/IncludeVulkanHeaders.cmake"
+              "${_vernon_repository_root}/cmake/IncludeNvtx.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake
         COMPONENT VernonWheel)
 endif()

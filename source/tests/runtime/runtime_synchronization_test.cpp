@@ -11,9 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <gtest/gtest.h>
-#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -137,21 +135,13 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
     const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
     ASSERT_NE(fixture, nullptr);
     const std::filesystem::path manifestPath = std::string(fixture->manifestPath);
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    ASSERT_FALSE(manifest.empty());
-    const std::string directory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
     VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime);
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId nodes[2]{};
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &nodes[0]), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &nodes[1]), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &nodes[0]), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &nodes[1]), VERNON_STATUS_OK);
 
     VernonProgramNodeBindingToken outputs[2]{{sizeof(VernonProgramNodeBindingToken)},
                                              {sizeof(VernonProgramNodeBindingToken)}};

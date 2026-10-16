@@ -1,9 +1,10 @@
-#include "../support/runtime_rhi_test_utils.h"
 #include "VernonRuntime.h"
 #include "program_fixture_runtime_test.h"
+#include "rhi/rhi_internal.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -11,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -59,15 +59,7 @@ VernonProgramBindingToken bindingToken(const char *value) {
 void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.runtime();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -145,6 +137,7 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     const VernonProgramInvocationOptions asynchronousOptions{sizeof(VernonProgramInvocationOptions),
                                                              VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
                                                              VERNON_COMPLETION_ASYNCHRONOUS,
+                                                             0,
                                                              {}};
     ASSERT_EQ(vernonRuntimeProgramInvocationSetOptions(asynchronous, &asynchronousOptions), VERNON_STATUS_OK);
     resetOutcome();
@@ -305,15 +298,7 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
 void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.runtime();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(standalone, nullptr) << lastError(context);
@@ -321,7 +306,7 @@ void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const st
     VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(context);
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId node = UINT32_MAX;
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &node), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &node), VERNON_STATUS_OK);
     VernonProgramNodeBindingToken sourceToken{sizeof(VernonProgramNodeBindingToken)};
     VernonProgramNodeBindingToken outputToken{sizeof(VernonProgramNodeBindingToken)};
     ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, VERNON_PROGRAM_BOUNDARY_INPUT,
@@ -423,28 +408,6 @@ void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const st
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
 }
 
-struct LoadedProgram {
-    VernonProgramBundle *bundle{};
-    VernonProgramExecutable *executable{};
-};
-
-LoadedProgram loadProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
-    std::ifstream input(manifestPath, std::ios::binary);
-    if (!input)
-        return {};
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    LoadedProgram result;
-    result.bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(owned.runtime(), manifest.data(), manifest.size(), &options);
-    if (result.bundle)
-        result.executable = vernonRuntimeResolveProgram(result.bundle, nullptr);
-    return result;
-}
-
 VernonProgramArgument bufferArgument(VernonRuntimeContext *context, VernonRhiBuffer buffer,
                                      const VernonProgramParameterView &parameter, const uint64_t *shape,
                                      const int64_t *strides, uint32_t rank, size_t bytes) {
@@ -479,22 +442,13 @@ VernonProgramArgument hostScalarArgument(const VernonProgramParameterView &param
     return result;
 }
 
-void destroyProgram(LoadedProgram &program) {
-    if (program.executable)
-        vernonRuntimeProgramExecutableDestroy(program.executable);
-    if (program.bundle)
-        vernonRuntimeProgramBundleDestroy(program.bundle);
-    program = {};
-}
-
 void runReusedStageModule(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
-    LoadedProgram program = loadProgram(owned, manifestPath);
-    ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
-    ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
+    const vernon::tests::OwnedProgramExecutable program(owned.runtime(), manifestPath);
+    ASSERT_TRUE(program) << lastError(owned.runtime());
 
     using namespace vernon::runtime::program;
-    const ResolvedNodePlan *first = program.executable->executionPlan->node(GraphDirection::Forward, 0);
-    const ResolvedNodePlan *second = program.executable->executionPlan->node(GraphDirection::Forward, 1);
+    const ResolvedNodePlan *first = program.get()->executionPlan->node(GraphDirection::Forward, 0);
+    const ResolvedNodePlan *second = program.get()->executionPlan->node(GraphDirection::Forward, 1);
     ASSERT_NE(first, nullptr);
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(first->stage.get(), second->stage.get());
@@ -524,16 +478,16 @@ void runReusedStageModule(vernon::tests::OwnedRhiRuntime &owned, const std::file
     constexpr uint64_t shape[]{4};
     constexpr int64_t strides[]{sizeof(float)};
     constexpr uint32_t grid[]{4, 1, 1};
-    const VernonProgramParameterView sourceParameter = parameter(program.executable, "source");
-    const VernonProgramParameterView outputParameter = parameter(program.executable, "output");
+    const VernonProgramParameterView sourceParameter = parameter(program.get(), "source");
+    const VernonProgramParameterView outputParameter = parameter(program.get(), "output");
     std::array<VernonProgramArgument, 5> arguments{
         bufferArgument(owned.runtime(), sourceBuffer, sourceParameter, shape, strides, 1, sizeof(source)),
         bufferArgument(owned.runtime(), outputBuffer, outputParameter, shape, strides, 1, sizeof(source)),
-        hostScalarArgument(parameter(program.executable, "grid_x"), &grid[0]),
-        hostScalarArgument(parameter(program.executable, "grid_y"), &grid[1]),
-        hostScalarArgument(parameter(program.executable, "grid_z"), &grid[2]),
+        hostScalarArgument(parameter(program.get(), "grid_x"), &grid[0]),
+        hostScalarArgument(parameter(program.get(), "grid_y"), &grid[1]),
+        hostScalarArgument(parameter(program.get(), "grid_z"), &grid[2]),
     };
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.executable);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.get());
     ASSERT_NE(instance, nullptr);
     VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
     ASSERT_NE(invocation, nullptr);
@@ -556,30 +510,52 @@ void runReusedStageModule(vernon::tests::OwnedRhiRuntime &owned, const std::file
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
-    destroyProgram(program);
 }
 
-void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
-    LoadedProgram program = loadProgram(owned, manifestPath);
-    ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
-    ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
+void expectScopeTimings(vernon::tests::OwnedRhiRuntime &owned, const VernonSubmission *submission, bool timings) {
+    std::array<VernonScopeTiming, 4> scopes{};
+    size_t count = scopes.size();
+    const VernonStatus status = vernonSubmissionGetScopeTimings(submission, scopes.data(), scopes.size(), &count);
+    if (!timings) {
+        ASSERT_EQ(status, VERNON_STATUS_OK) << lastError(owned.runtime());
+        EXPECT_EQ(count, 0u);
+        return;
+    }
+    if (!(vernon::rhi::deviceCommandCapabilities(owned.device()) & vernon::rhi::BackendCommandTimers)) {
+        EXPECT_EQ(status, VERNON_STATUS_UNSUPPORTED_TARGET);
+        return;
+    }
+    ASSERT_EQ(status, VERNON_STATUS_OK) << lastError(owned.runtime());
+    ASSERT_EQ(count, 2u);
+    EXPECT_EQ(scopes[0].begin_nanoseconds, 0u);
+    for (size_t index = 0; index < count; ++index) {
+        EXPECT_EQ(scopes[index].first_node, index);
+        EXPECT_EQ(scopes[index].node_count, 1u);
+        EXPECT_EQ(scopes[index].device_submission, 0u);
+        EXPECT_LE(scopes[index].begin_nanoseconds, scopes[index].end_nanoseconds);
+    }
+}
+
+void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
+                              bool timings) {
+    const vernon::tests::OwnedProgramExecutable program(owned.runtime(), manifestPath);
+    ASSERT_TRUE(program) << lastError(owned.runtime());
 
     using namespace vernon::runtime::program;
-    const ResolvedNodePlan *producer = program.executable->executionPlan->node(GraphDirection::Forward, 0);
-    const ResolvedNodePlan *consumer = program.executable->executionPlan->node(GraphDirection::Forward, 1);
+    const ResolvedNodePlan *producer = program.get()->executionPlan->node(GraphDirection::Forward, 0);
+    const ResolvedNodePlan *consumer = program.get()->executionPlan->node(GraphDirection::Forward, 1);
     ASSERT_NE(producer, nullptr);
     ASSERT_NE(consumer, nullptr);
     EXPECT_NE(producer->stage.get(), consumer->stage.get());
-    const Graph *forward = findGraph(program.executable->executionPlan->resolvedProgram->program, "forward");
+    const Graph *forward = findGraph(program.get()->executionPlan->resolvedProgram->program, "forward");
     ASSERT_NE(forward, nullptr);
     ASSERT_EQ(forward->nodes.size(), 2u);
     const auto intermediate = std::find_first_of(forward->nodes[0].results.begin(), forward->nodes[0].results.end(),
                                                  forward->nodes[1].operands.begin(), forward->nodes[1].operands.end());
     ASSERT_NE(intermediate, forward->nodes[0].results.end());
-    ASSERT_LT(*intermediate, program.executable->executionPlan->resolvedProgram->program.values.size());
-    EXPECT_TRUE(program.executable->executionPlan->resolvedProgram->program.values[*intermediate].storage.has_value());
-    const std::vector<uint32_t> &predecessors =
-        program.executable->executionPlan->predecessors(GraphDirection::Forward, 1);
+    ASSERT_LT(*intermediate, program.get()->executionPlan->resolvedProgram->program.values.size());
+    EXPECT_TRUE(program.get()->executionPlan->resolvedProgram->program.values[*intermediate].storage.has_value());
+    const std::vector<uint32_t> &predecessors = program.get()->executionPlan->predecessors(GraphDirection::Forward, 1);
     EXPECT_NE(std::find(predecessors.begin(), predecessors.end(), 0), predecessors.end());
 
     constexpr float source = 3.0f;
@@ -602,12 +578,12 @@ void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::
     constexpr uint64_t shape[]{1};
     constexpr int64_t strides[]{sizeof(float)};
     std::array<VernonProgramArgument, 2> arguments{
-        bufferArgument(owned.runtime(), sourceBuffer, parameter(program.executable, "source"), shape, strides, 1,
+        bufferArgument(owned.runtime(), sourceBuffer, parameter(program.get(), "source"), shape, strides, 1,
                        sizeof(source)),
-        bufferArgument(owned.runtime(), outputBuffer, parameter(program.executable, "output"), shape, strides, 1,
+        bufferArgument(owned.runtime(), outputBuffer, parameter(program.get(), "output"), shape, strides, 1,
                        sizeof(source)),
     };
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.executable);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.get());
     ASSERT_NE(instance, nullptr);
     VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
     ASSERT_NE(invocation, nullptr);
@@ -617,12 +593,24 @@ void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::
         ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &arguments[index], nullptr, 0, 0),
                   VERNON_STATUS_OK);
     }
+    const VernonProgramInvocationOptions options{sizeof(VernonProgramInvocationOptions),
+                                                 VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
+                                                 VERNON_COMPLETION_WAIT,
+                                                 timings ? 1u : 0u,
+                                                 {}};
+    ASSERT_EQ(vernonRuntimeProgramInvocationSetOptions(invocation, &options), VERNON_STATUS_OK)
+        << lastError(owned.runtime());
     ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
         << lastError(owned.runtime());
     ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
         << lastError(owned.runtime());
+    VernonSubmission *submission = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationTakeSubmission(invocation, &submission), VERNON_STATUS_OK)
+        << lastError(owned.runtime());
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
+    expectScopeTimings(owned, submission, timings);
+    vernonSubmissionDestroy(submission);
 
     float output = 0.0f;
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), outputBuffer, 0, &output, sizeof(output)),
@@ -630,27 +618,25 @@ void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::
     EXPECT_FLOAT_EQ(output, 8.0f);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
-    destroyProgram(program);
 }
 
 void runDynamicShapeGridReuse(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
-    LoadedProgram program = loadProgram(owned, manifestPath);
-    ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
-    ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.executable);
+    const vernon::tests::OwnedProgramExecutable program(owned.runtime(), manifestPath);
+    ASSERT_TRUE(program) << lastError(owned.runtime());
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.get());
     ASSERT_NE(instance, nullptr);
 
-    const VernonProgramParameterView sourceParameter = parameter(program.executable, "source");
-    const VernonProgramParameterView outputParameter = parameter(program.executable, "output");
+    const VernonProgramParameterView sourceParameter = parameter(program.get(), "source");
+    const VernonProgramParameterView outputParameter = parameter(program.get(), "output");
     VernonProgramParameterView publishedOutputParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(program.executable, VERNON_PROGRAM_BOUNDARY_OUTPUT, 0,
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(program.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT, 0,
                                                                &publishedOutputParameter),
               VERNON_STATUS_OK);
-    const VernonProgramParameterView factorParameter = parameter(program.executable, "factor");
+    const VernonProgramParameterView factorParameter = parameter(program.get(), "factor");
     std::array<VernonProgramParameterView, 3> gridParameters{
-        parameter(program.executable, "__grid_x"),
-        parameter(program.executable, "__grid_y"),
-        parameter(program.executable, "__grid_z"),
+        parameter(program.get(), "__grid_x"),
+        parameter(program.get(), "__grid_y"),
+        parameter(program.get(), "__grid_z"),
     };
     constexpr std::array<size_t, 2> counts{3, 5};
     constexpr std::array<float, 2> factors{2, 3};
@@ -718,7 +704,6 @@ void runDynamicShapeGridReuse(vernon::tests::OwnedRhiRuntime &owned, const std::
     EXPECT_EQ(telemetry.prepare_count, 12u);
     EXPECT_EQ(telemetry.reuse_count, 2u);
     vernonRuntimeProgramInstanceDestroy(instance);
-    destroyProgram(program);
 }
 
 const std::vector<vernon::tests::ProgramFixtureManifest> &moduleProgramVjpBackendCases() {
@@ -758,7 +743,11 @@ TEST_P(RuntimeModuleProgramComputeGpuCApi, ReusesOneStageAcrossDifferentNodeProj
 }
 
 TEST_P(RuntimeModuleProgramComputeGpuCApi, ChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(owned(), fixture("tensor_view_chain").manifestPath);
+    runTensorViewChainModule(owned(), fixture("tensor_view_chain").manifestPath, false);
+}
+
+TEST_P(RuntimeModuleProgramComputeGpuCApi, TimesEachComputeNodeOnTheDevice) {
+    runTensorViewChainModule(owned(), fixture("tensor_view_chain").manifestPath, true);
 }
 
 TEST_P(RuntimeModuleProgramComputeGpuCApi, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {

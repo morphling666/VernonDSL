@@ -13,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -76,6 +77,14 @@ struct EncoderSlot {
     std::vector<vernon::rhi::RenderingRead> renderingReads;
     // The native scope, opened by the first draw or by `EndRendering`; `opened.kind` is zero until then.
     vernon::rhi::OpenedRendering opened;
+    uint32_t debugGroupDepth{};
+    // The depth when the rendering scope began; groups above it belong to the scope and close before it ends.
+    uint32_t renderingDebugGroupDepth{};
+    // One entry per begun timer, telling whether it is still open.
+    std::vector<bool> openTimers;
+    uint32_t openTimerCount{};
+    // The backend's timer storage, created by the first timer a timing device records.
+    uint64_t timerStorage{};
     bool alive{true};
     bool initializing{true};
     bool busy{};
@@ -111,6 +120,12 @@ struct CompletionSlot {
     VernonRhiCommandEncoderStats stats{};
     VernonRhiCompletionState state{VERNON_RHI_COMPLETION_PENDING};
     VernonRhiStatus result{VERNON_RHI_STATUS_OK};
+    // The submitted encoder's timer storage until finalization reads it into `timers` and releases it; a read that
+    // failed leaves its status in `timerStatus`.
+    uint64_t timerStorage{};
+    uint32_t timerCount{};
+    std::vector<VernonRhiTimerSpan> timers;
+    VernonRhiStatus timerStatus{VERNON_RHI_STATUS_OK};
     bool externalSignalRequired{};
     bool backendRetirementRequired{};
     bool initializing{};
@@ -433,6 +448,7 @@ vernon::Result<void, vernon::RhiError> teardownEncoder(void *context, EncoderHan
     bool abandonNative{};
     bool activeCounted{};
     uint64_t uploadBytes{};
+    uint64_t timerStorage{};
     std::vector<EncoderSlot::Cleanup> cleanups;
     std::vector<EncoderSlot::Cleanup> rollbacks;
     std::vector<vernon::rhi::RetainedRhiResourceLease> resources;
@@ -452,6 +468,7 @@ vernon::Result<void, vernon::RhiError> teardownEncoder(void *context, EncoderHan
         abandonNative = std::exchange(slot.nativeOwned, false);
         activeCounted = slot.activeCounted;
         uploadBytes = std::exchange(slot.admittedUploadBytes, 0);
+        timerStorage = std::exchange(slot.timerStorage, 0);
         cleanups = std::move(slot.cleanups);
         rollbacks = std::move(slot.rollbacks);
         resources = std::move(slot.retainedResourceLeases);
@@ -459,6 +476,8 @@ vernon::Result<void, vernon::RhiError> teardownEncoder(void *context, EncoderHan
     }
     if (abandonNative)
         vernon::rhi::abandonCommandRecording(device, native);
+    if (timerStorage)
+        vernon::rhi::releaseCommandTimers(device, timerStorage);
     auto deferred = vernon::rhi::drainDeferredRollbackAndCleanup(rollbacks, cleanups);
     auto released = vernon::rhi::releaseRetainedResourcesReverse(resources);
     releaseUploadBytes(*state, uploadBytes);
@@ -530,6 +549,29 @@ vernon::Result<void, vernon::RhiError> teardownCompletion(void *context, Complet
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
+// Reads the spans of a succeeded submission's timers and moves them to the first timer's begin.
+VernonRhiStatus readTimerSpans(VernonRhiDevice device, uint64_t storage, uint32_t count,
+                               std::vector<VernonRhiTimerSpan> &spans) noexcept {
+    try {
+        spans.resize(count);
+    } catch (const std::bad_alloc &) {
+        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+    }
+    auto read = vernon::rhi::readCommandTimers(device, storage, count, spans.data());
+    if (read.isErr()) {
+        spans.clear();
+        return vernon::toVernonRhiStatus(read.error());
+    }
+    const uint64_t origin = spans.empty() ? 0 : spans.front().begin_nanoseconds;
+    for (VernonRhiTimerSpan &span : spans) {
+        span.begin_nanoseconds -= std::min(origin, span.begin_nanoseconds);
+        span.end_nanoseconds -= std::min(origin, span.end_nanoseconds);
+        // Drivers write begin and end at different pipeline stages, so an empty timer may end before it begins.
+        span.end_nanoseconds = std::max(span.end_nanoseconds, span.begin_nanoseconds);
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
 VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
     CompletionSlot *slot = pinned.slot;
     std::vector<EncoderSlot::Cleanup> cleanups;
@@ -537,7 +579,10 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
     bool retireBackend{};
     bool backendCompleted{true};
     bool releaseAdmission{};
+    bool succeeded{};
     uint64_t uploadBytes{};
+    uint64_t timerStorage{};
+    uint32_t timerCount{};
     {
         std::unique_lock lock(slot->mutex);
         if (slot->initializing)
@@ -560,11 +605,21 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
         } else if (slot->state == VERNON_RHI_COMPLETION_PENDING) {
             slot->state = VERNON_RHI_COMPLETION_SUCCEEDED;
         }
+        succeeded = slot->state == VERNON_RHI_COMPLETION_SUCCEEDED;
         cleanups = std::move(slot->cleanups);
         resources = std::move(slot->retainedResourceLeases);
         uploadBytes = std::exchange(slot->admittedUploadBytes, 0);
+        timerStorage = std::exchange(slot->timerStorage, 0);
+        timerCount = slot->timerCount;
         slot->backendRetirementRequired = false;
         releaseAdmission = std::exchange(slot->admissionHeld, false);
+    }
+    std::vector<VernonRhiTimerSpan> timers;
+    VernonRhiStatus timerStatus{VERNON_RHI_STATUS_OK};
+    if (timerStorage) {
+        if (succeeded)
+            timerStatus = readTimerSpans(slot->device, timerStorage, timerCount, timers);
+        vernon::rhi::releaseCommandTimers(slot->device, timerStorage);
     }
     auto cleanedUp = vernon::rhi::drainDeferredActionsReverse(cleanups, "completion_cleanup_callback");
     auto released = vernon::rhi::releaseRetainedResourcesReverse(resources);
@@ -575,6 +630,10 @@ VernonRhiStatus observeCompletion(PinnedCommandSlot<CompletionSlot> &pinned) {
     VernonRhiStatus result{};
     {
         std::lock_guard lock(slot->mutex);
+        if (timerStorage) {
+            slot->timers = std::move(timers);
+            slot->timerStatus = timerStatus;
+        }
         if (cleanedUp.isErr()) {
             slot->state = VERNON_RHI_COMPLETION_FAILED;
             if (slot->result == VERNON_RHI_STATUS_OK)
@@ -709,6 +768,11 @@ static VernonRhiStatus vernonRhiDeviceCreateCommandEncoderBusiness(VernonRhiDevi
         slot->stats = {};
         slot->scope = {};
         slot->opened = {};
+        slot->debugGroupDepth = 0;
+        slot->renderingDebugGroupDepth = 0;
+        slot->openTimers.clear();
+        slot->openTimerCount = 0;
+        slot->timerStorage = 0;
         slot->alive = true;
         slot->initializing = true;
         slot->busy = false;
@@ -1228,6 +1292,7 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(Vernon
     }
     slot->scope = scope;
     slot->opened = {};
+    slot->renderingDebugGroupDepth = slot->debugGroupDepth;
     slot->rendering = true;
     ++slot->stats.rendering_scope_count;
     return Result<void, RhiError>{ok()};
@@ -1356,10 +1421,11 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::endEncoderRendering(VernonRh
             return Result<void, RhiError>{err(std::move(opened).error())};
     }
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!renderingSlotEndable(*slot.slot))
+    if (!renderingSlotEndable(*slot.slot) || (!slot->failed && slot->debugGroupDepth != slot->renderingDebugGroupDepth))
         return invalid();
     auto ended = slot->opened.kind ? endCommandRendering(device, slot->native, slot->scope, slot->opened)
                                    : Result<void, RhiError>{ok()};
+    slot->debugGroupDepth = slot->renderingDebugGroupDepth;
     // A scope the backend failed to end leaves the native recording unusable, but the encoder still leaves rendering
     // so that it can be torn down.
     if (ended.isErr())
@@ -1445,10 +1511,127 @@ static VernonRhiStatus vernonRhiCommandEncoderFinishBusiness(VernonRhiDevice dev
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+    if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed ||
+        slot->debugGroupDepth || slot->openTimerCount)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     slot->finished = true;
     return VERNON_RHI_STATUS_OK;
+}
+
+static bool timerUsable(const EncoderSlot &slot) {
+    return slot.alive && !slot.initializing && !slot.busy && !slot.rendering && !slot.finished && !slot.failed;
+}
+
+static VernonRhiStatus recordTimerEdge(VernonRhiDevice device, EncoderSlot &slot, uint32_t timer,
+                                       vernon::rhi::TimerEdge edge) {
+    if (!(vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandTimers))
+        return VERNON_RHI_STATUS_OK;
+    auto recorded = vernon::rhi::recordCommandTimer(device, slot.native, slot.timerStorage, timer, edge);
+    if (recorded.isOk())
+        return VERNON_RHI_STATUS_OK;
+    slot.failed = true;
+    return vernon::toVernonRhiStatus(recorded.error());
+}
+
+static VernonRhiStatus vernonRhiCommandEncoderBeginTimerBusiness(VernonRhiDevice device,
+                                                                 VernonRhiCommandEncoder encoder, uint32_t *timer) {
+    auto slot = lookup(device, encoder);
+    if (!slot || !timer)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!timerUsable(*slot.slot))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->openTimers.size() >= UINT32_MAX)
+        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+    const auto index = static_cast<uint32_t>(slot->openTimers.size());
+    slot->openTimers.push_back(true);
+    if (const VernonRhiStatus status = recordTimerEdge(device, *slot.slot, index, vernon::rhi::TimerEdge::Begin);
+        status != VERNON_RHI_STATUS_OK)
+        return status;
+    ++slot->openTimerCount;
+    *timer = index;
+    return VERNON_RHI_STATUS_OK;
+}
+
+static VernonRhiStatus vernonRhiCommandEncoderEndTimerBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                               uint32_t timer) {
+    auto slot = lookup(device, encoder);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!timerUsable(*slot.slot) || timer >= slot->openTimers.size() || !slot->openTimers[timer])
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (const VernonRhiStatus status = recordTimerEdge(device, *slot.slot, timer, vernon::rhi::TimerEdge::End);
+        status != VERNON_RHI_STATUS_OK)
+        return status;
+    slot->openTimers[timer] = false;
+    --slot->openTimerCount;
+    return VERNON_RHI_STATUS_OK;
+}
+
+static bool debugCommandUsable(const EncoderSlot &slot, vernon::rhi::DebugCommand command) {
+    if (!slot.alive || slot.initializing || slot.busy || slot.openingRendering || slot.finished || slot.failed)
+        return false;
+    const uint32_t floor = slot.rendering ? slot.renderingDebugGroupDepth : 0;
+    return command != vernon::rhi::DebugCommand::PopGroup || slot.debugGroupDepth > floor;
+}
+
+static VernonRhiStatus recordDebugCommandBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                  vernon::rhi::DebugCommand command, VernonStringView label) {
+    if (label.size && !label.data)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto key = vernon::rhi::commandEncoderKey(device, encoder);
+    if (key.isErr())
+        return vernon::toVernonRhiStatus(key.error());
+    auto slot = lookupKey(device, key.value());
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    bool openScope = false;
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!debugCommandUsable(*slot.slot, command))
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        openScope = slot->rendering && !slot->opened.kind;
+    }
+    // A command inside a rendering scope belongs to its native scope, which therefore opens first, as for a draw;
+    // otherwise Metal would push on the command buffer and pop on the render encoder.
+    if (openScope) {
+        auto opened = openSlotRendering(device, key.value(), *slot.slot);
+        if (opened.isErr())
+            return vernon::toVernonRhiStatus(opened.error());
+    }
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!debugCommandUsable(*slot.slot, command) || (slot->rendering && !slot->opened.kind))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto recorded =
+        vernon::rhi::recordDebugCommand(device, slot->native, slot->rendering ? &slot->opened : nullptr, command,
+                                        std::string_view(label.size ? label.data : "", label.size));
+    if (recorded.isErr()) {
+        slot->failed = true;
+        return vernon::toVernonRhiStatus(recorded.error());
+    }
+    if (command == vernon::rhi::DebugCommand::PushGroup)
+        ++slot->debugGroupDepth;
+    else if (command == vernon::rhi::DebugCommand::PopGroup)
+        --slot->debugGroupDepth;
+    return VERNON_RHI_STATUS_OK;
+}
+
+static VernonRhiStatus vernonRhiCommandEncoderPushDebugGroupBusiness(VernonRhiDevice device,
+                                                                     VernonRhiCommandEncoder encoder,
+                                                                     VernonStringView label) {
+    return recordDebugCommandBusiness(device, encoder, vernon::rhi::DebugCommand::PushGroup, label);
+}
+
+static VernonRhiStatus vernonRhiCommandEncoderPopDebugGroupBusiness(VernonRhiDevice device,
+                                                                    VernonRhiCommandEncoder encoder) {
+    return recordDebugCommandBusiness(device, encoder, vernon::rhi::DebugCommand::PopGroup, {});
+}
+
+static VernonRhiStatus vernonRhiCommandEncoderInsertDebugMarkerBusiness(VernonRhiDevice device,
+                                                                        VernonRhiCommandEncoder encoder,
+                                                                        VernonStringView label) {
+    return recordDebugCommandBusiness(device, encoder, vernon::rhi::DebugCommand::InsertMarker, label);
 }
 
 static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
@@ -1483,6 +1666,10 @@ static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, Ver
         completion->stats = {};
         completion->state = VERNON_RHI_COMPLETION_PENDING;
         completion->result = VERNON_RHI_STATUS_OK;
+        completion->timerStorage = 0;
+        completion->timerCount = 0;
+        completion->timers.clear();
+        completion->timerStatus = VERNON_RHI_STATUS_OK;
         completion->externalSignalRequired = false;
         completion->backendRetirementRequired = false;
         completion->initializing = true;
@@ -1563,6 +1750,8 @@ static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, Ver
     std::vector<EncoderSlot::Cleanup> submittedCleanups;
     std::vector<vernon::rhi::RetainedRhiResourceLease> submittedResources;
     uint64_t submittedUploadBytes{};
+    uint64_t submittedTimerStorage{};
+    uint32_t submittedTimerCount{};
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
@@ -1576,12 +1765,16 @@ static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, Ver
         submittedResources = std::move(slot->retainedResourceLeases);
         slot->retainedResourceIdentities.clear();
         submittedUploadBytes = std::exchange(slot->admittedUploadBytes, 0);
+        submittedTimerStorage = std::exchange(slot->timerStorage, 0);
+        submittedTimerCount = static_cast<uint32_t>(slot->openTimers.size());
     }
     {
         std::lock_guard<std::mutex> guard(completion->mutex);
         completion->backend = submittedBackend;
         completion->native = retirement;
         completion->stats = submittedStats;
+        completion->timerStorage = submittedTimerStorage;
+        completion->timerCount = submittedTimerCount;
         completion->state = completed ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_PENDING;
         completion->externalSignalRequired = externalCompletion;
         completion->backendRetirementRequired = !completed;
@@ -1676,6 +1869,29 @@ static VernonRhiStatus vernonRhiCompletionGetCommandStatsBusiness(VernonRhiDevic
     return VERNON_RHI_STATUS_OK;
 }
 
+static VernonRhiStatus vernonRhiCompletionGetTimersBusiness(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                            VernonRhiTimerSpan *spans, size_t capacity, size_t *count) {
+    if (count)
+        *count = 0;
+    auto slot = lookup(device, completion);
+    if (!slot || !count)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!(vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandTimers))
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (slot->initializing || !slot->finalized || slot->state != VERNON_RHI_COMPLETION_SUCCEEDED)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->timerStatus != VERNON_RHI_STATUS_OK)
+        return slot->timerStatus;
+    *count = slot->timers.size();
+    if (!spans)
+        return VERNON_RHI_STATUS_OK;
+    if (capacity < slot->timers.size())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::copy(slot->timers.begin(), slot->timers.end(), spans);
+    return VERNON_RHI_STATUS_OK;
+}
+
 static VernonRhiStatus vernonRhiDeviceDestroyCompletionBusiness(VernonRhiDevice device,
                                                                 VernonRhiCompletion completion) {
     auto slot = lookup(device, completion);
@@ -1748,6 +1964,20 @@ VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderClearDepthStencilAttachmen
                                (VernonRhiDevice device, VernonRhiCommandEncoder encoder, float clearDepth,
                                 uint32_t clearStencil, uint32_t aspects),
                                (device, encoder, clearDepth, clearStencil, aspects))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderPushDebugGroup,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonStringView label),
+                               (device, encoder, label))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderPopDebugGroup,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder), (device, encoder))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderInsertDebugMarker,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, VernonStringView label),
+                               (device, encoder, label))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderBeginTimer,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, uint32_t *timer),
+                               (device, encoder, timer))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderEndTimer,
+                               (VernonRhiDevice device, VernonRhiCommandEncoder encoder, uint32_t timer),
+                               (device, encoder, timer))
 VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCommandEncoderFinish, (VernonRhiDevice device, VernonRhiCommandEncoder encoder),
                                (device, encoder))
 VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceSubmit,
@@ -1766,6 +1996,10 @@ VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionGetCommandStats,
                                (VernonRhiDevice device, VernonRhiCompletion completion,
                                 VernonRhiCommandEncoderStats *output),
                                (device, completion, output))
+VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiCompletionGetTimers,
+                               (VernonRhiDevice device, VernonRhiCompletion completion, VernonRhiTimerSpan *spans,
+                                size_t capacity, size_t *count),
+                               (device, completion, spans, capacity, count))
 VERNON_COMMAND_STATUS_BOUNDARY(vernonRhiDeviceDestroyCompletion,
                                (VernonRhiDevice device, VernonRhiCompletion completion), (device, completion))
 

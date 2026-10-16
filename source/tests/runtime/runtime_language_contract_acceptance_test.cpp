@@ -1,7 +1,7 @@
-#include "../support/acceptance_descriptor.h"
-#include "../support/program_fixture_runtime_test.h"
-#include "../support/sampled_texture_runtime_oracle.h"
-#include "../support/vernon_test_support.h"
+#include "acceptance_descriptor.h"
+#include "program_fixture_runtime_test.h"
+#include "sampled_texture_runtime_oracle.h"
+#include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
 

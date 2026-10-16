@@ -432,8 +432,8 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId firstNode = UINT32_MAX;
     VernonProgramNodeId secondNode = UINT32_MAX;
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &firstNode), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &secondNode), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &firstNode), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &secondNode), VERNON_STATUS_OK);
     VernonProgramNodeBindingToken firstSource{};
     VernonProgramNodeBindingToken firstOutput{};
     VernonProgramNodeBindingToken secondSource{};
@@ -1460,6 +1460,57 @@ TEST(RuntimeModuleProgramCpuMatrix, ChainsDistinctComputeKernelsThroughTensorVie
         ASSERT_TRUE(commitResult);
         EXPECT_FALSE(commitResult.value());
         EXPECT_FLOAT_EQ(output, 8.0f);
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCpuMatrix, TimesEachComputeNodeOnTheHostClock) {
+    const std::string manifest = fixtureManifest("tensor_view_chain");
+    ASSERT_FALSE(manifest.empty());
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        ASSERT_TRUE(assetResult);
+        auto executableResult = assetResult.value().resolve();
+        ASSERT_TRUE(executableResult);
+        auto executable = std::move(executableResult).value();
+        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
+        ASSERT_TRUE(instanceResult);
+        auto instance = std::move(instanceResult).value();
+        for (const bool timings : {false, true}) {
+            float source = 3.0f;
+            float output = 0.0f;
+            auto invocationResult = instance.begin();
+            ASSERT_TRUE(invocationResult);
+            auto invocation = std::move(invocationResult).value();
+            ASSERT_TRUE(invocation.setOptions({VERNON_COMPLETION_WAIT, timings}));
+            ASSERT_TRUE(invocation.bind(bindingToken("cpu-timed-source"),
+                                        tensorArgument(parameter(executable.get(), "source"), source)));
+            ASSERT_TRUE(invocation.bind(bindingToken("cpu-timed-output"),
+                                        tensorArgument(parameter(executable.get(), "output"), output)));
+            ASSERT_TRUE(invocation.execute(false));
+            ASSERT_TRUE(invocation.commit());
+            auto submission = invocation.takeSubmission();
+            ASSERT_TRUE(submission);
+            auto scopes = submission.value().scopeTimings();
+            ASSERT_TRUE(scopes);
+            if (!timings) {
+                EXPECT_TRUE(scopes.value().empty());
+                continue;
+            }
+            ASSERT_EQ(scopes.value().size(), 2u);
+            EXPECT_EQ(scopes.value()[0].begin_nanoseconds, 0u);
+            for (size_t index = 0; index < scopes.value().size(); ++index) {
+                const VernonScopeTiming &scope = scopes.value()[index];
+                EXPECT_EQ(scope.first_node, index);
+                EXPECT_EQ(scope.node_count, 1u);
+                EXPECT_EQ(scope.device_submission, 0u);
+                EXPECT_LE(scope.begin_nanoseconds, scope.end_nanoseconds);
+                if (index)
+                    EXPECT_GE(scope.begin_nanoseconds, scopes.value()[index - 1].end_nanoseconds);
+            }
+        }
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

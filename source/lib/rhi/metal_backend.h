@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace vernon::rhi::metal {
 
@@ -35,6 +36,9 @@ struct RenderingState {
     id<MTLRenderCommandEncoder> encoder;
     std::array<id<MTLTexture>, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTextures{};
     id<MTLTexture> depthStencilTexture;
+    // Groups open on the encoder, outermost first. An encoder cannot end with groups open, so a restart pops them
+    // and pushes them again on its new encoder.
+    std::vector<NSString *> debugGroups;
 };
 
 struct VERNON_RHI_CAPI DeviceState {

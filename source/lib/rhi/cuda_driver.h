@@ -51,6 +51,7 @@ struct VERNON_RHI_CAPI Driver {
     using EventRecord = Result (*)(Event, Stream);
     using EventQuery = Result (*)(Event);
     using EventSynchronize = Result (*)(Event);
+    using EventElapsedTime = Result (*)(float *, Event, Event);
     using LaunchKernel = Result (*)(Function, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                     Stream, void **, void **);
 
@@ -88,6 +89,7 @@ struct VERNON_RHI_CAPI Driver {
     EventRecord eventRecord{};
     EventQuery eventQuery{};
     EventSynchronize eventSynchronize{};
+    EventElapsedTime eventElapsedTime{};
     LaunchKernel launchKernel{};
 };
 

@@ -62,6 +62,7 @@ function(vernon_add_runtime)
             PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_backend.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_driver.cpp ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_cuda.cpp)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_CUDA_RHI=1)
+        target_link_libraries(VernonRHI PRIVATE $<BUILD_INTERFACE:nvtx3::nvtx3-c>)
     endif()
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
         set(_vernon_hlsl_compiler_hints)

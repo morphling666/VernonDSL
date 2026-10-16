@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <string>
@@ -70,10 +69,6 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
 
     const std::filesystem::path manifestPath = VERNON_VULKAN_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_TRUE(!bundle.empty());
-
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
@@ -100,13 +95,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
         ASSERT_NE(texture.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, texture.handle), VERNON_RHI_STATUS_OK);
     }
-    const std::string bundleDirectory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     if (!loaded) {
         const VernonStringView error = vernonRuntimeGetLastError(runtime);
         std::fwrite(error.data, 1, error.size, stderr);
@@ -327,18 +316,10 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
     const std::filesystem::path manifestPath = VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,

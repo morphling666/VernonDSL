@@ -1,5 +1,5 @@
-#include "../../lib/rhi/rhi_test_hooks.h"
 #include "VernonRuntimeRHIAdapter.h"
+#include "rhi/rhi_test_hooks.h"
 
 #include <gtest/gtest.h>
 

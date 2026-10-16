@@ -50,7 +50,9 @@ and interface plans. Descriptor sets, root parameters, Metal indices, GL
 locations, register numbers, native handles, and native pipeline-state objects
 remain forbidden in Program and portable StageContract/endpoint ABI.
 
-Names are diagnostic labels and never identity. IDs, artifact keys, Parameter
+Names are diagnostic labels and never identity. A Node's `name` is also its
+debug label in GPU captures ([`../runtime/gpu_profiling.md`](../runtime/gpu_profiling.md)
+section 2). IDs, artifact keys, Parameter
 paths, ProgramABI slot IDs and paths, and array position are identity where
 this document says so.
 

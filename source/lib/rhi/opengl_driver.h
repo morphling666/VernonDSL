@@ -109,6 +109,15 @@ constexpr unsigned kFramebufferBarrierBit = 0x00000400;
 constexpr Enum kReadOnly = 0x88B8;
 constexpr Enum kWriteOnly = 0x88B9;
 constexpr Enum kReadWrite = 0x88BA;
+constexpr Enum kDebugSourceApplication = 0x824A;
+constexpr Enum kDebugTypeMarker = 0x8268;
+constexpr Enum kDebugSeverityNotification = 0x826B;
+constexpr Enum kMaxDebugGroupStackDepth = 0x826C;
+constexpr Enum kDebugGroupStackDepth = 0x826D;
+constexpr Enum kMaxDebugMessageLength = 0x9143;
+constexpr Enum kTimestamp = 0x8E28;
+constexpr Enum kQueryResult = 0x8866;
+constexpr Enum kGpuDisjoint = 0x8FBB;
 
 #if defined(_WIN32)
 #define VERNON_GL_CALL __stdcall
@@ -244,11 +253,26 @@ struct Driver {
     Sync(VERNON_GL_CALL *fenceSync)(Enum, Bitfield) {};
     Enum(VERNON_GL_CALL *clientWaitSync)(Sync, Bitfield, Uint64) {};
     void(VERNON_GL_CALL *deleteSync)(Sync){};
+    // Null unless loadDebugLabelDriver found all three.
+    void(VERNON_GL_CALL *pushDebugGroup)(Enum, Uint, Size, const char *){};
+    void(VERNON_GL_CALL *popDebugGroup)(){};
+    void(VERNON_GL_CALL *debugMessageInsert)(Enum, Enum, Uint, Enum, Size, const char *){};
+    // Null unless loadTimerQueryDriver found all four.
+    void(VERNON_GL_CALL *genQueries)(Size, Uint *){};
+    void(VERNON_GL_CALL *deleteQueries)(Size, const Uint *){};
+    void(VERNON_GL_CALL *queryCounter)(Uint, Enum){};
+    void(VERNON_GL_CALL *getQueryObjectui64v)(Uint, Enum, Uint64 *){};
 };
 
 #undef VERNON_GL_CALL
 
 bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, std::string &error);
+// Call only for a context with OpenGL 4.3, OpenGL ES 3.2 or GL_KHR_debug; OpenGL ES exposes the extension through
+// KHR-suffixed names.
+void loadDebugLabelDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, bool khrSuffix);
+// Call only for a context with OpenGL 3.3, GL_ARB_timer_query or GL_EXT_disjoint_timer_query; the OpenGL ES extension
+// names its counter functions with the EXT suffix.
+void loadTimerQueryDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, bool extSuffix);
 
 } // namespace vernon::rhi::opengl
 

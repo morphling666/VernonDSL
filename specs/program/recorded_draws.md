@@ -196,6 +196,8 @@ vernonRuntimeProgramInvocationRecordGraphics(invocation, node, commands, count, 
 | `bind_set` | binding set |
 | `set_viewport`, `set_scissor`, `set_stencil_reference` | dynamic state |
 | `draw` | a `VernonDrawCommand`: `vertex_count`, `instance_count`, `first_instance`, and for an indexed draw an index binding (buffer reference, index type, byte offset of the first index, `index_count`, `base_vertex`) |
+| `push_debug_group`, `insert_debug_marker` | UTF-8 label, copied at record |
+| `pop_debug_group` | none |
 
 A recorded draw is the same `VernonDrawCommand` the draw control binds, with
 the same validation and the same meaning of 0 counts (inferred from vertex
@@ -235,6 +237,10 @@ Rules:
   leases are retained until completion.
 - Recordings are invocation-local. A new invocation starts with an empty
   recording.
+- Debug groups and markers name the draws between them in capture tools and
+  have no effect on rendering. Groups nest inside the Node's own group
+  ([`../runtime/gpu_profiling.md`](../runtime/gpu_profiling.md) section 2),
+  and every push needs a later pop in the same recording.
 
 ## 8. Render scopes and lowering
 
@@ -257,7 +263,7 @@ Rules:
 |---|---|---|
 | `PROGRAM_PIPELINE_CONFORMANCE` | pipeline creation | a rule of section 4 fails |
 | `PROGRAM_BINDING_SET_MISMATCH` | invocation_entry | a set's parameter does not correspond, with equal reflection, to a per-draw parameter of the bound pipeline |
-| `PROGRAM_RECORDING_INVALID` | invocation_entry | a draw without a pipeline, an unbound per-draw parameter, a binding of a fixed endpoint, or unsupported dynamic state |
+| `PROGRAM_RECORDING_INVALID` | invocation_entry | a draw without a pipeline, an unbound per-draw parameter, a binding of a fixed endpoint, unsupported dynamic state, or unbalanced debug groups |
 | `PROGRAM_BINDING_SET_HAZARD` | invocation_entry | a recorded resource is written by a Node of the same invocation |
 | `PROGRAM_GRAPHICS_GROUP_SET_LIMIT` | compile | more group occurrences than the target's set limit allows |
 

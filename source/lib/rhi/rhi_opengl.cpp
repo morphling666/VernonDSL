@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -1468,8 +1469,13 @@ Result<void, RhiError> completeCommands(VernonRhiDevice handle, uint64_t retirem
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) noexcept {
     auto device = lookupDevice(handle);
-    if (device.isOk() && native == reinterpret_cast<uintptr_t>(&device.value().device().state))
+    if (device.isErr() || native != reinterpret_cast<uintptr_t>(&device.value().device().state))
         return;
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    // Debug groups live on the context, not in the abandoned recording, so they would outlive it.
+    state.state.popDebugGroups();
 }
 
 Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
@@ -1819,6 +1825,114 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
     return Result<void, RhiError>{ok()};
 }
 
+Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t native, const OpenedRendering *,
+                                          DebugCommand command, std::string_view label) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&state.state))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command_opengl", native, 0}})};
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    try {
+        switch (command) {
+        case DebugCommand::PushGroup:
+            state.state.pushDebugGroup(label);
+            break;
+        case DebugCommand::PopGroup:
+            state.state.popDebugGroup();
+            break;
+        case DebugCommand::InsertMarker:
+            state.state.insertDebugMarker(label);
+            break;
+        }
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_debug_command_opengl", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
+    auto device = lookupDevice(handle);
+    return device.isOk() && device.value().device().state.driver.queryCounter ? BackendCommandTimers : 0;
+}
+
+// Timestamp query names, the begin of timer `t` at `2 * t` and its end at `2 * t + 1`.
+struct OpenGLTimers {
+    std::vector<Uint> queries;
+};
+
+Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint64_t &storage, uint32_t timer,
+                                   TimerEdge edge) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&state.state))
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"record_opengl_timer", native, 0}})};
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    try {
+        if (!storage) {
+            storage = reinterpret_cast<uintptr_t>(new OpenGLTimers{});
+            // Reading the disjoint flag clears it, so that only disjoint events during these timers invalidate them.
+            if (state.state.embeddedProfile) {
+                Int disjoint = 0;
+                state.state.driver.getIntegerv(gl::kGpuDisjoint, &disjoint);
+            }
+        }
+        auto &timers = *reinterpret_cast<OpenGLTimers *>(static_cast<uintptr_t>(storage));
+        const size_t query = size_t{timer} * 2 + (edge == TimerEdge::End ? 1 : 0);
+        if (timers.queries.size() <= query)
+            timers.queries.resize(size_t{timer} * 2 + 2);
+        state.state.driver.genQueries(1, &timers.queries[query]);
+        state.state.driver.queryCounter(timers.queries[query], gl::kTimestamp);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_opengl_timer", native, timer}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint32_t count,
+                                  VernonRhiTimerSpan *spans) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    const auto &timers = *reinterpret_cast<const OpenGLTimers *>(static_cast<uintptr_t>(storage));
+    if (timers.queries.size() != size_t{count} * 2)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"read_opengl_timers", count, 0}})};
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    for (uint32_t timer = 0; timer < count; ++timer) {
+        state.state.driver.getQueryObjectui64v(timers.queries[size_t{timer} * 2], gl::kQueryResult,
+                                               &spans[timer].begin_nanoseconds);
+        state.state.driver.getQueryObjectui64v(timers.queries[size_t{timer} * 2 + 1], gl::kQueryResult,
+                                               &spans[timer].end_nanoseconds);
+    }
+    Int disjoint = 0;
+    if (state.state.embeddedProfile)
+        state.state.driver.getIntegerv(gl::kGpuDisjoint, &disjoint);
+    if (disjoint)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"read_opengl_timers_disjoint", 0, 0}})};
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseTimers(VernonRhiDevice handle, uint64_t storage) noexcept {
+    std::unique_ptr<OpenGLTimers> timers(reinterpret_cast<OpenGLTimers *>(static_cast<uintptr_t>(storage)));
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return;
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    state.state.driver.deleteQueries(static_cast<Size>(timers->queries.size()), timers->queries.data());
+}
+
 Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
                                   const OpenedRendering &opened, uint32_t location,
                                   const VernonClearColor &color) noexcept {
@@ -2081,6 +2195,11 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
         result.clearDepthStencil.emplace(clearDepthStencil);
+        result.recordDebugCommand.emplace(recordDebugCommand);
+        result.commandCapabilitiesForDevice.emplace(commandCapabilitiesForDevice);
+        result.recordTimer.emplace(recordTimer);
+        result.readTimers.emplace(readTimers);
+        result.releaseTimers.emplace(releaseTimers);
         result.createImageView.emplace(createImageView);
         result.destroyImageView.emplace(destroyImageView);
         result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);

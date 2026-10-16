@@ -85,6 +85,14 @@ VERNON_RHI_CAPI Result<void, RhiError> clearCommandDepthStencil(VernonRhiDevice 
                                                                 const RenderingScope &scope,
                                                                 const OpenedRendering &opened, float depth,
                                                                 uint32_t stencil, uint32_t aspects) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> recordDebugCommand(VernonRhiDevice device, uint64_t native,
+                                                          const OpenedRendering *rendering, DebugCommand command,
+                                                          std::string_view label) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> recordCommandTimer(VernonRhiDevice device, uint64_t native, uint64_t &storage,
+                                                          uint32_t timer, TimerEdge edge) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> readCommandTimers(VernonRhiDevice device, uint64_t storage, uint32_t count,
+                                                         VernonRhiTimerSpan *spans) noexcept;
+VERNON_RHI_CAPI void releaseCommandTimers(VernonRhiDevice device, uint64_t storage) noexcept;
 #if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
 VERNON_RHI_CAPI uint32_t metalTexturePixelFormat(VernonTextureFormat format);
 #endif

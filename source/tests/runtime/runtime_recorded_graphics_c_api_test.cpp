@@ -12,9 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <initializer_list>
-#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -36,18 +34,6 @@ constexpr std::array<float, 6> kRightTriangle{0.1f, -0.9f, 0.9f, -0.9f, 0.5f, 0.
 std::string lastError(VernonRuntimeContext *context) {
     const VernonStringView error = vernonRuntimeGetLastError(context);
     return std::string(error.data ? error.data : "", error.size);
-}
-
-VernonProgramBundle *loadBundle(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    std::ifstream input(manifestPath, std::ios::binary);
-    if (!input)
-        return nullptr;
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string directory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    return vernonRuntimeLoadProgramBundleWithOptions(runtime.runtime, manifest.data(), manifest.size(), &options);
 }
 
 VernonProgramParameterView findParameter(VernonProgramExecutable *executable, std::string_view name) {
@@ -240,7 +226,7 @@ public:
 
     VernonStatus setCompletionMode(VernonCompletionMode mode) {
         const VernonProgramInvocationOptions options{
-            sizeof(options), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, mode, {}};
+            sizeof(options), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, mode, 0, {}};
         return vernonRuntimeProgramInvocationSetOptions(invocation_, &options);
     }
 
@@ -318,6 +304,13 @@ VernonGraphicsCommand draw(uint32_t vertexCount, uint32_t firstInstance = 0) {
     return command;
 }
 
+VernonGraphicsCommand debugCommand(VernonGraphicsCommandKind kind, std::string_view label = {}) {
+    VernonGraphicsCommand command{};
+    command.kind = kind;
+    command.label = {label.data(), label.size()};
+    return command;
+}
+
 VernonIndexBinding indexBinding(VernonRuntimeProviderResourceReference indices, size_t offset, int32_t baseVertex) {
     return {VERNON_INDEX_U32, offset, 3, indices, baseVertex};
 }
@@ -355,7 +348,7 @@ protected:
         ProgramFixtureRuntimeTest::SetUp();
         if (IsSkipped() || HasFatalFailure())
             return;
-        bundle_ = loadBundle(runtime(), GetParam().manifestPath);
+        bundle_ = vernon::tests::loadProgramBundle(runtime().runtime, GetParam().manifestPath);
         ASSERT_NE(bundle_, nullptr) << lastError(runtime().runtime);
         executable_ = vernonRuntimeResolveProgram(bundle_, nullptr);
         ASSERT_NE(executable_, nullptr) << lastError(runtime().runtime);
@@ -459,6 +452,42 @@ TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDrawsMatchSequentialInvocations) {
 
     vernonRuntimeBindingSetDestroy(right);
     vernonRuntimeGraphicsPipelineDestroy(pipeline);
+}
+
+TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDebugGroupsLeaveDrawsUnchanged) {
+    const std::vector<uint8_t> reference = sequentialReference();
+    Target target(runtime());
+    PassInvocation pass(executable_, instance_, target, {passVertices(left_)}, VERNON_RUNTIME_PROVIDER_LOAD_CLEAR,
+                        true);
+    VernonGraphicsPipeline *pipeline = passPipeline(pass.node());
+    ASSERT_NE(pipeline, nullptr);
+    VernonBindingSet *right = verticesSet(runtime(), pipeline, executable_, right_.reference);
+    ASSERT_EQ(pass.record({debugCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"), bindPipeline(nullptr),
+                           debugCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "left"), draw(3), bindSet(right),
+                           draw(3), debugCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP),
+                           debugCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "done")}),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(pass.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+    EXPECT_EQ(pass.telemetry().draws, 2u);
+    EXPECT_EQ(target.pixels(), reference);
+    vernonRuntimeBindingSetDestroy(right);
+    vernonRuntimeGraphicsPipelineDestroy(pipeline);
+}
+
+TEST_P(RuntimeRecordedGraphicsMatrix, UnbalancedDebugGroupsAreInvalidRecordings) {
+    Target target(runtime());
+    for (const auto &[commands, failure] : std::vector<std::pair<std::vector<VernonGraphicsCommand>, std::string>>{
+             {{bindPipeline(nullptr), debugCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "group"), draw(3)},
+              ": pushes debug groups it does not pop"},
+             {{bindPipeline(nullptr), debugCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP), draw(3)},
+              ".commands[1]: pops a debug group that is not open"}}) {
+        PassInvocation pass(executable_, instance_, target, {passVertices(left_)}, VERNON_RUNTIME_PROVIDER_LOAD_CLEAR,
+                            true);
+        ASSERT_EQ(pass.record(commands), VERNON_STATUS_OK);
+        EXPECT_EQ(pass.run(), VERNON_STATUS_INVALID_ARGUMENT);
+        EXPECT_EQ(lastError(runtime().runtime),
+                  "PROGRAM_RECORDING_INVALID at node " + std::to_string(pass.node()) + failure);
+    }
 }
 
 TEST_P(RuntimeRecordedGraphicsMatrix, RecordingSupersedesTheBoundDrawCommand) {
@@ -574,13 +603,14 @@ TEST_P(RuntimeRecordedGraphicsMatrix, InvalidInvocationOptionsAndSubmissionRetri
     EXPECT_EQ(submission, nullptr);
     const auto rejected = [&](auto edit) {
         VernonProgramInvocationOptions options{
-            sizeof(options), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, VERNON_COMPLETION_ASYNCHRONOUS, {}};
+            sizeof(options), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, VERNON_COMPLETION_ASYNCHRONOUS, 0, {}};
         edit(options);
         return vernonRuntimeProgramInvocationSetOptions(pass.handle(), &options) == VERNON_STATUS_INVALID_ARGUMENT;
     };
     EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) { options.struct_size -= 1; }));
     EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) { options.abi_version += 1; }));
-    EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) { options.reserved[3] = 1; }));
+    EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) { options.reserved[2] = 1; }));
+    EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) { options.timings = 2; }));
     EXPECT_TRUE(rejected([](VernonProgramInvocationOptions &options) {
         options.completion_mode = static_cast<VernonCompletionMode>(2);
     }));
@@ -838,7 +868,7 @@ protected:
         EXPECT_NE(manifest, nullptr) << fixtureId;
         if (!manifest)
             return nullptr;
-        VernonProgramBundle *bundle = loadBundle(runtime(), manifest->manifestPath);
+        VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime().runtime, manifest->manifestPath);
         EXPECT_NE(bundle, nullptr) << lastError(runtime().runtime);
         if (!bundle)
             return nullptr;
@@ -1266,7 +1296,7 @@ public:
         EXPECT_NE(runtime_.runtime, nullptr);
         if (!runtime_.runtime)
             return;
-        bundle_ = loadBundle(runtime_, manifestPath);
+        bundle_ = vernon::tests::loadProgramBundle(runtime_.runtime, manifestPath);
         EXPECT_NE(bundle_, nullptr) << lastError(runtime_.runtime);
         executable_ = bundle_ ? vernonRuntimeResolveProgram(bundle_, nullptr) : nullptr;
         EXPECT_NE(executable_, nullptr) << lastError(runtime_.runtime);

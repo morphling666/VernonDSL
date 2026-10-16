@@ -11,7 +11,6 @@
 
 #include <array>
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <limits>
 #include <string>
@@ -240,15 +239,7 @@ void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::
                   const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -353,15 +344,7 @@ void runNoTapeFailureInjection(vernon::tests::OwnedRhiRuntime &owned, const std:
     using namespace vernon::runtime::program_execution;
     VernonRuntimeContext *context = owned.get();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -456,15 +439,7 @@ void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesy
                         const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -574,15 +549,7 @@ void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const s
                                   const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);

@@ -4,6 +4,7 @@
 #include "directx12_mipmap_3d.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
+#include "platform/platform_library.h"
 #include "public_c_boundary.h"
 #include "rhi_test_hooks.h"
 #include "sampler_filter.h"
@@ -13,6 +14,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -2419,6 +2421,128 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
     return Result<void, RhiError>{ok()};
 }
 
+Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t native, const OpenedRendering *,
+                                          DebugCommand command, std::string_view label) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands)
+        return Result<void, RhiError>{err(invalidArgument("record_debug_command_directx12", native, 0))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (command == DebugCommand::PopGroup) {
+        commands->EndEvent();
+        return Result<void, RhiError>{ok()};
+    }
+    try {
+        // PIX and RenderDoc read metadata 0 as a null-terminated UTF-16 string.
+        const std::wstring text = vernon::platform::utf8ToWide(label);
+        const UINT size = static_cast<UINT>((text.size() + 1) * sizeof(wchar_t));
+        if (command == DebugCommand::PushGroup)
+            commands->BeginEvent(0, text.c_str(), size);
+        else
+            commands->SetMarker(0, text.c_str(), size);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_debug_command_directx12", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+// Timestamp query heaps of `queriesPerChunk` queries, each resolved into its chunk's readback buffer as it is written;
+// query `q` of the recording is query `q % queriesPerChunk` of chunk `q / queriesPerChunk`, and timer `t` begins at
+// query `2 * t` and ends at `2 * t + 1`.
+struct DirectX12Timers {
+    static constexpr uint32_t queriesPerChunk = 64;
+    struct Chunk {
+        ID3D12QueryHeap *heap{};
+        vernon::rhi::directx12::Buffer readback;
+    };
+    std::vector<Chunk> chunks;
+};
+
+Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint64_t &storage, uint32_t timer,
+                                   TimerEdge edge) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands || timer > UINT32_MAX / 2 - 1)
+        return Result<void, RhiError>{err(invalidArgument("record_directx12_timer", native, timer))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    try {
+        if (!storage)
+            storage = reinterpret_cast<uintptr_t>(new DirectX12Timers{});
+        auto &timers = *reinterpret_cast<DirectX12Timers *>(static_cast<uintptr_t>(storage));
+        const uint32_t query = timer * 2 + (edge == TimerEdge::End ? 1 : 0);
+        const uint32_t chunk = query / DirectX12Timers::queriesPerChunk;
+        if (chunk == timers.chunks.size()) {
+            timers.chunks.reserve(chunk + 1);
+            DirectX12Timers::Chunk created;
+            D3D12_QUERY_HEAP_DESC description{};
+            description.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            description.Count = DirectX12Timers::queriesPerChunk;
+            if (FAILED(device->state.device->CreateQueryHeap(&description, IID_PPV_ARGS(&created.heap))))
+                return Result<void, RhiError>{err(backendFailure("record_directx12_timer", native))};
+            if (!device->state.createBuffer(created.readback, DirectX12Timers::queriesPerChunk * sizeof(uint64_t),
+                                            false, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            device->error)) {
+                created.heap->Release();
+                return Result<void, RhiError>{err(backendFailure("record_directx12_timer", native))};
+            }
+            timers.chunks.push_back(created);
+        }
+        const DirectX12Timers::Chunk &target = timers.chunks[chunk];
+        const uint32_t index = query % DirectX12Timers::queriesPerChunk;
+        commands->EndQuery(target.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+        commands->ResolveQueryData(target.heap, D3D12_QUERY_TYPE_TIMESTAMP, index, 1, target.readback.resource,
+                                   uint64_t{index} * sizeof(uint64_t));
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_directx12_timer", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint32_t count,
+                                  VernonRhiTimerSpan *spans) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return Result<void, RhiError>{err(invalidArgument("read_directx12_timers", storage, count))};
+    const auto &timers = *reinterpret_cast<const DirectX12Timers *>(static_cast<uintptr_t>(storage));
+    std::lock_guard<std::mutex> guard(device->mutex);
+    UINT64 frequency{};
+    if (FAILED(device->state.queue->GetTimestampFrequency(&frequency)) || !frequency)
+        return Result<void, RhiError>{err(backendFailure("read_directx12_timers", storage))};
+    for (uint32_t first = 0; first < count * 2; first += DirectX12Timers::queriesPerChunk) {
+        const uint32_t queries = std::min(count * 2 - first, DirectX12Timers::queriesPerChunk);
+        const size_t chunk = first / DirectX12Timers::queriesPerChunk;
+        const D3D12_RANGE readRange{0, queries * sizeof(uint64_t)};
+        void *mapped{};
+        if (chunk >= timers.chunks.size() ||
+            FAILED(timers.chunks[chunk].readback.resource->Map(0, &readRange, &mapped)))
+            return Result<void, RhiError>{err(backendFailure("read_directx12_timers", storage))};
+        for (uint32_t query = 0; query < queries; ++query) {
+            uint64_t ticks{};
+            std::memcpy(&ticks, static_cast<const uint8_t *>(mapped) + size_t{query} * sizeof(uint64_t), sizeof(ticks));
+            const uint64_t nanoseconds = ticks / frequency * 1000000000u + ticks % frequency * 1000000000u / frequency;
+            VernonRhiTimerSpan &span = spans[(first + query) / 2];
+            ((first + query) % 2 ? span.end_nanoseconds : span.begin_nanoseconds) = nanoseconds;
+        }
+        const D3D12_RANGE writtenRange{0, 0};
+        timers.chunks[chunk].readback.resource->Unmap(0, &writtenRange);
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseTimers(VernonRhiDevice handle, uint64_t storage) noexcept {
+    std::unique_ptr<DirectX12Timers> timers(reinterpret_cast<DirectX12Timers *>(static_cast<uintptr_t>(storage)));
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    for (DirectX12Timers::Chunk &chunk : timers->chunks) {
+        chunk.heap->Release();
+        device->state.destroyBuffer(chunk.readback);
+    }
+}
+
 Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
                                   const OpenedRendering &opened, uint32_t location,
                                   const VernonClearColor &color) noexcept {
@@ -2748,8 +2872,13 @@ constexpr uint32_t commandCapabilities = BackendCommandConcurrentSubmission;
 
 uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
     auto device = lookupDirectX12Device(handle);
-    return device && device->state.nativeObjectsBorrowed ? commandCapabilities | BackendCommandExternalExecution
-                                                         : commandCapabilities;
+    if (!device)
+        return commandCapabilities;
+    // Copy queues write timestamps only with an optional feature that the RHI does not query.
+    const D3D12_COMMAND_LIST_TYPE queueType = device->state.queue->GetDesc().Type;
+    const bool timers = queueType == D3D12_COMMAND_LIST_TYPE_DIRECT || queueType == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    return commandCapabilities | (device->state.nativeObjectsBorrowed ? BackendCommandExternalExecution : 0) |
+           (timers ? BackendCommandTimers : 0);
 }
 
 } // namespace vernon::rhi::directx12_api
@@ -2807,6 +2936,10 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
         result.clearDepthStencil.emplace(clearDepthStencil);
+        result.recordDebugCommand.emplace(recordDebugCommand);
+        result.recordTimer.emplace(recordTimer);
+        result.readTimers.emplace(readTimers);
+        result.releaseTimers.emplace(releaseTimers);
         result.trackedBufferState.emplace(trackedBufferState);
         result.createImageView.emplace(createImageView);
         result.destroyImageView.emplace(destroyImageView);

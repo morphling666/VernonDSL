@@ -74,19 +74,25 @@ private:
     RhiRuntime context_;
 };
 
+// Loads the cooked bundle whose blobs sit next to `manifestPath`; null when the manifest is unreadable or rejected.
+inline VernonProgramBundle *loadProgramBundle(VernonRuntimeContext *runtime,
+                                              const std::filesystem::path &manifestPath) {
+    std::ifstream input(manifestPath, std::ios::binary);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    if (!runtime || manifest.empty())
+        return nullptr;
+    const std::string directory = manifestPath.parent_path().u8string();
+    VernonProgramBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    return vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
+}
+
 class OwnedProgramExecutable {
 public:
     OwnedProgramExecutable(VernonRuntimeContext *runtime, const std::filesystem::path &manifestPath,
-                           const VernonProgramVariantSelector *selector = nullptr) {
-        std::ifstream input(manifestPath, std::ios::binary);
-        const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-        if (!runtime || manifest.empty())
-            return;
-        const std::string directory = manifestPath.parent_path().string();
-        VernonProgramBundleLoadOptions options{};
-        options.struct_size = sizeof(options);
-        options.bundle_directory = directory.c_str();
-        bundle_ = vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
+                           const VernonProgramVariantSelector *selector = nullptr)
+        : bundle_(loadProgramBundle(runtime, manifestPath)) {
         if (bundle_)
             executable_ = vernonRuntimeResolveProgram(bundle_, selector);
     }

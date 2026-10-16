@@ -1,20 +1,19 @@
-#include "../../lib/rhi/metal_backend.h"
-#include "../../lib/rhi/rhi_internal.h"
-#include "../../lib/rhi/sampler_filter.h"
-#include "../../lib/runtime/program_execution/program_image_binding.h"
-#include "../../lib/runtime/rhi_adapter/adapter_test_hooks.h"
-#include "../../lib/runtime/runtime_dispatch.h"
-#include "../../lib/runtime/runtime_test_hooks.h"
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeRHIAdapter.h"
+#include "rhi/metal_backend.h"
+#include "rhi/rhi_internal.h"
+#include "rhi/sampler_filter.h"
+#include "runtime/program_execution/program_image_binding.h"
+#include "runtime/rhi_adapter/adapter_test_hooks.h"
+#include "runtime/runtime_dispatch.h"
+#include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <string>
@@ -1571,10 +1570,6 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
 #if defined(VERNON_METAL_COMPUTE_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     const std::filesystem::path manifestPath = VERNON_METAL_COMPUTE_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     if (!supportsMetalArgumentBufferEncoding(device)) {
@@ -1588,12 +1583,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     EXPECT_TRUE(capabilities.supports_storage_buffers);
     EXPECT_TRUE(capabilities.supports_graphics);
 
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
@@ -1667,19 +1657,11 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
 #if defined(VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     const std::filesystem::path manifestPath = VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
@@ -1774,10 +1756,6 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
 #if defined(VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     const std::filesystem::path manifestPath = VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     if (!supportsMetalArgumentBufferEncoding(device)) {
@@ -1786,12 +1764,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     }
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device, nullptr);
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);

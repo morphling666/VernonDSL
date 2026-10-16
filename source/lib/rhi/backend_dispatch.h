@@ -117,7 +117,8 @@ enum BackendCommandCapabilityBits : uint32_t {
     // from the thread that owns the device's native context.
     BackendCommandConcurrentSubmission = 1u << 1,
     BackendCommandTimelineCompletion = 1u << 2,
-    BackendCommandGpuTimestamps = 1u << 3,
+    // The device records timers; without it the RHI accepts timers and records nothing.
+    BackendCommandTimers = 1u << 3,
     BackendCommandExplicitComputeDependencies = 1u << 4,
     // The device's host executes its submissions, as on a borrowed device. The RHI cannot wait for them, so it rejects
     // operations whose results the host reads.
@@ -198,6 +199,24 @@ using ClearColorCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t 
 using ClearDepthStencilCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native, const RenderingScope &,
                                                              const OpenedRendering &, float depth, uint32_t stencil,
                                                              uint32_t aspects) noexcept;
+enum class DebugCommand : uint32_t { PushGroup, PopGroup, InsertMarker };
+// Records a debug command on the native recording. `rendering` is the open native scope for commands inside a
+// rendering scope and null outside one; the label is empty for `PopGroup`. It runs under the encoder's lock.
+using RecordDebugCommandCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native,
+                                                              const OpenedRendering *rendering, DebugCommand,
+                                                              std::string_view label) noexcept;
+enum class TimerEdge : uint32_t { Begin, End };
+// Records the begin or end of timer `timer` on the native recording outside rendering scopes, under the encoder's lock.
+// Timers are numbered in begin order. `storage` holds the recording's timer storage, 0 until the first call creates
+// it; the storage outlives the recording until `ReleaseTimersCallback`.
+using RecordTimerCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t native, uint64_t &storage,
+                                                       uint32_t timer, TimerEdge) noexcept;
+// Writes each timer's begin and end in nanoseconds on one device clock with an arbitrary origin, after the storage's
+// submission succeeded. `Unsupported` reports a measurement the device invalidated.
+using ReadTimersCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t storage, uint32_t count,
+                                                      VernonRhiTimerSpan *spans) noexcept;
+// Releases timer storage after its recording was abandoned or its submission retired.
+using ReleaseTimersCallback = void (*)(VernonRhiDevice, uint64_t storage) noexcept;
 using TrackedBufferStateCallback = Result<uint64_t, RhiError> (*)(VernonRhiDevice, VernonRhiBuffer);
 using CreateImageViewCallback = Result<VernonRhiImageView, RhiError> (*)(VernonRhiDevice,
                                                                          const VernonRhiImageViewDescriptor *);
@@ -265,6 +284,10 @@ struct BackendDispatch {
     Option<EndRenderingCallback> endRendering;
     Option<ClearColorCallback> clearColor;
     Option<ClearDepthStencilCallback> clearDepthStencil;
+    Option<RecordDebugCommandCallback> recordDebugCommand;
+    Option<RecordTimerCallback> recordTimer;
+    Option<ReadTimersCallback> readTimers;
+    Option<ReleaseTimersCallback> releaseTimers;
     Option<TrackedBufferStateCallback> trackedBufferState;
 
     Option<CreateImageViewCallback> createImageView;

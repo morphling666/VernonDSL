@@ -1,11 +1,17 @@
 #include "backend_dispatch.h"
 #include "cuda_backend.h"
 
+#include <nvtx3/nvToolsExt.h>
+
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace vernon::rhi {
 const BackendDispatch &cudaBackendDispatch();
@@ -35,6 +41,10 @@ struct CudaDevice {
     vernon::rhi::StableResourceSlotContainer<CudaBufferSlot> buffers;
     vernon::rhi::CommandDeviceStateRef commandState;
     std::string error;
+    // NVTX ranges of the open debug groups, innermost last. A CUDA device records one encoder at a time, so these are
+    // that encoder's groups. Start/end ranges rather than push/pop ones, which belong to the calling thread, because an
+    // encoder may be popped or abandoned on another thread than the one that pushed.
+    std::vector<nvtxRangeId_t> debugRanges;
     std::mutex mutex;
     std::mutex slotMutex;
     std::mutex creationMutex;
@@ -493,6 +503,133 @@ Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native,
     return Result<void, RhiError>{err(backendFailure(device, status, "cuMemcpyDtoDAsync"))};
 }
 
+nvtxDomainHandle_t debugDomain() noexcept {
+    static const nvtxDomainHandle_t domain = nvtxDomainCreateA("Vernon");
+    return domain;
+}
+
+Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t native, const OpenedRendering *,
+                                          DebugCommand command, std::string_view label) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&device.state))
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_debug_command", native, handle.index))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (command == DebugCommand::PopGroup) {
+        if (device.debugRanges.empty())
+            return Result<void, RhiError>{err(invalidArgument("record_cuda_debug_command", native, handle.index))};
+        nvtxDomainRangeEnd(debugDomain(), device.debugRanges.back());
+        device.debugRanges.pop_back();
+        return Result<void, RhiError>{ok()};
+    }
+    try {
+        const std::string message(label);
+        nvtxEventAttributes_t attributes{};
+        attributes.version = NVTX_VERSION;
+        attributes.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        attributes.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        attributes.message.ascii = message.c_str();
+        if (command == DebugCommand::PushGroup) {
+            // Reserved before the range starts so that a started range is always recorded.
+            device.debugRanges.reserve(device.debugRanges.size() + 1);
+            device.debugRanges.push_back(nvtxDomainRangeStartEx(debugDomain(), &attributes));
+        } else {
+            nvtxDomainMarkEx(debugDomain(), &attributes);
+        }
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_cuda_debug_command", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+void abandonCommands(VernonRhiDevice handle, uint64_t native) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr() || native != reinterpret_cast<uintptr_t>(&anchored.value().device().state))
+        return;
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    // NVTX ranges belong to the process, not to the abandoned recording, so they would outlive it.
+    for (auto range = device.debugRanges.rbegin(); range != device.debugRanges.rend(); ++range)
+        nvtxDomainRangeEnd(debugDomain(), *range);
+    device.debugRanges.clear();
+}
+
+// Timing events, the begin of timer `t` at `2 * t` and its end at `2 * t + 1`.
+struct CudaTimers {
+    std::vector<vernon::rhi::cuda::Event> events;
+};
+
+Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint64_t &storage, uint32_t timer,
+                                   TimerEdge edge) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&device.state))
+        return Result<void, RhiError>{err(invalidArgument("record_cuda_timer", native, handle.index))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    try {
+        if (!storage)
+            storage = reinterpret_cast<uintptr_t>(new CudaTimers{});
+        auto &timers = *reinterpret_cast<CudaTimers *>(static_cast<uintptr_t>(storage));
+        const size_t index = size_t{timer} * 2 + (edge == TimerEdge::End ? 1 : 0);
+        if (timers.events.size() <= index)
+            timers.events.resize(size_t{timer} * 2 + 2);
+        vernon::rhi::cuda::Driver &api = vernon::rhi::cuda::driver();
+        auto status = device.state.makeCurrent();
+        if (status == vernon::rhi::cuda::kSuccess)
+            status = api.eventCreate(&timers.events[index], 0);
+        if (status == vernon::rhi::cuda::kSuccess)
+            status = api.eventRecord(timers.events[index], device.state.stream);
+        if (status != vernon::rhi::cuda::kSuccess)
+            return Result<void, RhiError>{err(backendFailure(device, status, "cuEventRecord"))};
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"record_cuda_timer", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint32_t count,
+                                  VernonRhiTimerSpan *spans) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<void, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    const auto &timers = *reinterpret_cast<const CudaTimers *>(static_cast<uintptr_t>(storage));
+    if (timers.events.size() != size_t{count} * 2)
+        return Result<void, RhiError>{err(invalidArgument("read_cuda_timers", storage, count))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    auto status = device.state.makeCurrent();
+    // CUDA events have no clock of their own; they are measured from the first one.
+    for (size_t index = 0; status == vernon::rhi::cuda::kSuccess && index < timers.events.size(); ++index) {
+        float milliseconds{};
+        status =
+            vernon::rhi::cuda::driver().eventElapsedTime(&milliseconds, timers.events.front(), timers.events[index]);
+        const auto nanoseconds = static_cast<uint64_t>(std::max(milliseconds, 0.0f) * 1.0e6f);
+        (index % 2 ? spans[index / 2].end_nanoseconds : spans[index / 2].begin_nanoseconds) = nanoseconds;
+    }
+    if (status != vernon::rhi::cuda::kSuccess)
+        return Result<void, RhiError>{err(backendFailure(device, status, "cuEventElapsedTime"))};
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseTimers(VernonRhiDevice handle, uint64_t storage) noexcept {
+    std::unique_ptr<CudaTimers> timers(reinterpret_cast<CudaTimers *>(static_cast<uintptr_t>(storage)));
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return;
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (device.state.makeCurrent() != vernon::rhi::cuda::kSuccess)
+        return;
+    for (vernon::rhi::cuda::Event event : timers->events)
+        if (event)
+            vernon::rhi::cuda::driver().eventDestroy(event);
+}
+
 Result<uint64_t, RhiError> bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) noexcept {
     auto anchored = lookupCudaDevice(handle);
     if (anchored.isErr())
@@ -550,7 +687,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
     static const BackendDispatch dispatch = [] {
         BackendDispatch result{};
         result.backend = VERNON_RHI_BACKEND_CUDA;
-        result.commandCapabilities = BackendCommandConcurrentSubmission;
+        result.commandCapabilities = BackendCommandConcurrentSubmission | BackendCommandTimers;
         result.ownsDevice = ownsDevice;
         result.createOwnedDevice = createOwnedDevice;
         result.destroyDevice = destroyDevice;
@@ -572,8 +709,13 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         result.submitCommands = submitCommands;
         result.pollCommands.emplace(pollCommands);
         result.completeCommands.emplace(completeCommands);
+        result.abandonCommands.emplace(abandonCommands);
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
+        result.recordDebugCommand.emplace(recordDebugCommand);
+        result.recordTimer.emplace(recordTimer);
+        result.readTimers.emplace(readTimers);
+        result.releaseTimers.emplace(releaseTimers);
         return result;
     }();
     return dispatch;

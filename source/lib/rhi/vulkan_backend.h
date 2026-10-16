@@ -184,6 +184,9 @@ struct VERNON_RHI_CAPI DeviceState {
     VkDevice device{};
     VkQueue queue{};
     uint32_t queueFamily{};
+    // Zero when the queue writes no timestamps.
+    uint32_t timestampValidBits{};
+    float timestampPeriod{};
     uint32_t maxPushConstantsSize{};
     uint32_t maxVertexInputAttributes{};
     uint32_t apiVersion{};
@@ -196,6 +199,11 @@ struct VERNON_RHI_CAPI DeviceState {
     bool portabilityEnumeration{};
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};
+    // Null unless this state created the instance with VK_EXT_debug_utils; the loader may return entry points for an
+    // extension that a borrowed instance never enabled.
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmdBeginDebugUtilsLabel{};
+    PFN_vkCmdEndDebugUtilsLabelEXT cmdEndDebugUtilsLabel{};
+    PFN_vkCmdInsertDebugUtilsLabelEXT cmdInsertDebugUtilsLabel{};
     VkCommandBuffer borrowedCommandBuffer{};
     std::vector<CommandFrame> availableCommandFrames;
     std::unordered_map<uintptr_t, CommandFrame> recordingCommandFrames;

@@ -549,6 +549,11 @@ typedef struct VernonRhiCommandEncoderStats {
     uint32_t submission_count;
 } VernonRhiCommandEncoderStats;
 
+typedef struct VernonRhiTimerSpan {
+    uint64_t begin_nanoseconds;
+    uint64_t end_nanoseconds;
+} VernonRhiTimerSpan;
+
 typedef enum VernonRhiNativeDescriptorHeapType {
     VERNON_RHI_NATIVE_DESCRIPTOR_RESOURCE = 0,
     VERNON_RHI_NATIVE_DESCRIPTOR_SAMPLER = 1,
@@ -681,6 +686,24 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachme
                                                                                    float clear_depth,
                                                                                    uint32_t clear_stencil,
                                                                                    uint32_t aspects);
+// Debug groups and markers name commands in capture tools and have no effect on rendering; a backend without debug
+// labels records nothing. Groups nest, a group pushed inside a rendering scope is popped before the scope ends, and
+// Finish fails while a group is open. Labels are UTF-8 and copied at the call.
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderPushDebugGroup(VernonRhiDevice device,
+                                                                      VernonRhiCommandEncoder encoder,
+                                                                      VernonStringView label);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderPopDebugGroup(VernonRhiDevice device,
+                                                                     VernonRhiCommandEncoder encoder);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderInsertDebugMarker(VernonRhiDevice device,
+                                                                         VernonRhiCommandEncoder encoder,
+                                                                         VernonStringView label);
+// Timers measure the device time of the commands between their begin and end; they begin and end outside rendering
+// scopes, may nest, and Finish fails while one is open. `timer` receives the timer's index in begin order. A device
+// without timing accepts both calls and records nothing.
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBeginTimer(VernonRhiDevice device,
+                                                                  VernonRhiCommandEncoder encoder, uint32_t *timer);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderEndTimer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                                uint32_t timer);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
                                                       VernonRhiCompletion *output);
@@ -692,6 +715,12 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice device,
                                                                    VernonRhiCompletion completion,
                                                                    VernonRhiCommandEncoderStats *output);
+// Reads the spans of the submitted encoder's timers in begin order once the completion succeeded, measured from the
+// first timer's begin. `count` receives the timer count; `spans` may be null to read only the count, and otherwise
+// needs room for all of them. Returns VERNON_RHI_STATUS_UNSUPPORTED on a device without timing and when the device
+// invalidated the measurement.
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetTimers(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                             VernonRhiTimerSpan *spans, size_t capacity, size_t *count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice device,
                                                                  VernonRhiCompletion completion);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice device,

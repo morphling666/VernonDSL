@@ -32,7 +32,7 @@ function(vernon_discover_gtests target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /EHsc)
     endif()
-    gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
+    gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}" ${ARGN})
 endfunction()
 
 function(vernon_enable_glfw_context_owner_for_test target)
@@ -199,6 +199,22 @@ if(TARGET VernonRuntime)
                                                                    Vernon::RuntimeRHIAdapter)
         vernon_stage_target_files(VernonRuntimeRHIAdapterTests VernonRHI)
         vernon_discover_gtests(VernonRuntimeRHIAdapterTests)
+
+        # The executable links the recorder from the path NVTX loads it from, so both share one copy of its state.
+        add_library(VernonNvtxCallRecorder SHARED support/nvtx_call_recorder.cpp)
+        target_compile_definitions(VernonNvtxCallRecorder PRIVATE VERNON_NVTX_CALL_RECORDER_BUILD=1)
+        target_link_libraries(VernonNvtxCallRecorder PRIVATE nvtx3::nvtx3-c)
+        add_executable(VernonCudaDebugLabelTests rhi/cuda_debug_label_test.cpp)
+        set_target_properties(VernonNvtxCallRecorder VernonCudaDebugLabelTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                                          "${CMAKE_BINARY_DIR}/source")
+        target_include_directories(VernonCudaDebugLabelTests PRIVATE "${VERNON_TEST_ROOT}/support")
+        target_link_libraries(VernonCudaDebugLabelTests PRIVATE GTest::gtest_main Vernon::RHI VernonNvtxCallRecorder)
+        vernon_stage_target_files(VernonCudaDebugLabelTests VernonRHI)
+        vernon_discover_gtests(
+            VernonCudaDebugLabelTests
+            PROPERTIES
+            ENVIRONMENT
+            "NVTX_INJECTION64_PATH=$<TARGET_FILE:VernonNvtxCallRecorder>")
     endif()
 
     add_library(vernon-cpu-aot-fixture SHARED fixtures/cpu_aot_fixture.c)
@@ -1139,9 +1155,11 @@ if(TARGET VernonRuntime)
                     VERNON_OPENGL_I32_VERTEX_BUNDLE="${opengl_i32_vertex_manifest}"
                     VERNON_OPENGL_U32_VERTEX_BUNDLE="${opengl_u32_vertex_manifest}"
                     VERNON_OPENGL_F32_VERTEX_BUNDLE="${opengl_f32_vertex_manifest}"
-                    VERNON_OPENGL_STORAGE_IMAGE_BUNDLE="${opengl_storage_image_manifest}")
+                    VERNON_OPENGL_STORAGE_IMAGE_BUNDLE="${opengl_storage_image_manifest}"
+                    VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE="${module_graphics_opengl_manifest}")
         add_dependencies(
             VernonRuntimeTests
+            vernon-module-graphics-opengl-test-bundle
             vernon-opengl-runtime-acceptance-test-bundle
             vernon-opengl-matrix-uniform-test-bundle
             vernon-opengles-matrix-uniform-test-bundle

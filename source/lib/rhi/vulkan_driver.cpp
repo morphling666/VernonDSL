@@ -191,6 +191,11 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(cmdDraw, "vkCmdDraw");
     VERNON_LOAD_VULKAN_DEVICE(cmdDrawIndexed, "vkCmdDrawIndexed");
     VERNON_LOAD_VULKAN_DEVICE(cmdPushConstants, "vkCmdPushConstants");
+    VERNON_LOAD_VULKAN_DEVICE(createQueryPool, "vkCreateQueryPool");
+    VERNON_LOAD_VULKAN_DEVICE(destroyQueryPool, "vkDestroyQueryPool");
+    VERNON_LOAD_VULKAN_DEVICE(cmdResetQueryPool, "vkCmdResetQueryPool");
+    VERNON_LOAD_VULKAN_DEVICE(cmdWriteTimestamp, "vkCmdWriteTimestamp");
+    VERNON_LOAD_VULKAN_DEVICE(getQueryPoolResults, "vkGetQueryPoolResults");
 #undef VERNON_LOAD_VULKAN_DEVICE
     cmdBeginRendering = reinterpret_cast<PFN_vkCmdBeginRendering>(getDeviceProcAddr(device, "vkCmdBeginRendering"));
     cmdEndRendering = reinterpret_cast<PFN_vkCmdEndRendering>(getDeviceProcAddr(device, "vkCmdEndRendering"));

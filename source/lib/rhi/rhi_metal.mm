@@ -1307,6 +1307,8 @@ void endMetalPass(const vernon::rhi::metal::RenderingState &rendering, const Ren
             [rendering.encoder
                 setStencilStoreAction:final ? metalStoreAction(scope.depth.stencilStore, covers) : MTLStoreActionStore];
     }
+    for (size_t index = 0; index < rendering.debugGroups.size(); ++index)
+        [rendering.encoder popDebugGroup];
     [rendering.encoder endEncoding];
 }
 
@@ -1345,6 +1347,8 @@ bool restartMetalRendering(uint64_t native, vernon::rhi::metal::RenderingState &
         }
     }
     rendering.encoder = beginMetalPass(native, pass, scope);
+    for (NSString *group : rendering.debugGroups)
+        [rendering.encoder pushDebugGroup:group];
     return rendering.encoder != nil;
 }
 
@@ -1441,6 +1445,193 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::BackendFailure, {"endRendering_metal_exception", native, 0}})};
     }
+}
+
+Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t native, const OpenedRendering *opened,
+                                          DebugCommand command, std::string_view label) noexcept {
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Result<void, RhiError>{err(std::move(anchor).error())};
+            auto *rendering = opened ? reinterpret_cast<vernon::rhi::metal::RenderingState *>(
+                                           static_cast<uintptr_t>(opened->object))
+                                     : nullptr;
+            if (!native || (opened && (opened->kind != vernon::rhi::CommandRenderingDynamic || !rendering)))
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command_metal", native, 0}})};
+            NSString *text = [[NSString alloc] initWithBytes:label.data()
+                                                      length:label.size()
+                                                    encoding:NSUTF8StringEncoding];
+            if (!text)
+                text = @"";
+            if (rendering) {
+                switch (command) {
+                case DebugCommand::PushGroup:
+                    rendering->debugGroups.push_back(text);
+                    [rendering->encoder pushDebugGroup:text];
+                    break;
+                case DebugCommand::PopGroup:
+                    if (!rendering->debugGroups.empty())
+                        rendering->debugGroups.pop_back();
+                    [rendering->encoder popDebugGroup];
+                    break;
+                case DebugCommand::InsertMarker:
+                    [rendering->encoder insertDebugSignpost:text];
+                    break;
+                }
+                return Result<void, RhiError>{ok()};
+            }
+            id<MTLCommandBuffer> commandBuffer =
+                (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
+            // A command buffer has no signpost, so a marker outside a scope is an empty group.
+            if (command != DebugCommand::PopGroup)
+                [commandBuffer pushDebugGroup:text];
+            if (command != DebugCommand::PushGroup)
+                [commandBuffer popDebugGroup];
+            return Result<void, RhiError>{ok()};
+        } catch (const std::bad_alloc &) {
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"record_debug_command_metal", native, 0}})};
+        }
+    } @catch (NSException *) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"record_debug_command_metal_exception", native, 0}})};
+    }
+}
+
+id<MTLCounterSet> metalTimestampCounterSet(id<MTLDevice> device) {
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+            return nil;
+        for (id<MTLCounterSet> set in device.counterSets)
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp])
+                return set;
+    }
+    return nil;
+}
+
+uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
+    constexpr uint32_t capabilities = BackendCommandIndependentRecording | BackendCommandConcurrentSubmission;
+    auto anchor = lookupMetalDevice(handle);
+    return anchor.isOk() && metalTimestampCounterSet(anchor.value().device().state.device) ? capabilities |
+                                                                                                BackendCommandTimers
+                                                                                          : capabilities;
+}
+
+// Metal samples counters only where an encoder starts or ends, so each timer edge records an empty blit encoder
+// sampled at its start; no encoder is open there, since timers begin and end outside rendering scopes. Sample `s` of
+// the recording is sample `s % samplesPerBuffer` of buffer `s / samplesPerBuffer`, and timer `t` begins at sample
+// `2 * t` and ends at `2 * t + 1`. GPU ticks are scaled to nanoseconds by the CPU and GPU clocks sampled when the
+// storage is created and when it is read.
+struct MetalTimers {
+    static constexpr uint32_t samplesPerBuffer = 64;
+    std::vector<id<MTLCounterSampleBuffer>> buffers;
+    MTLTimestamp cpuOrigin{};
+    MTLTimestamp gpuOrigin{};
+};
+
+Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint64_t &storage, uint32_t timer,
+                                   TimerEdge edge) noexcept {
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Result<void, RhiError>{err(std::move(anchor).error())};
+            id<MTLDevice> device = anchor.value().device().state.device;
+            id<MTLCounterSet> counters = metalTimestampCounterSet(device);
+            if (!native || !counters || timer > UINT32_MAX / 2 - 1)
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"record_metal_timer", native, timer}})};
+            if (@available(macOS 11.0, iOS 14.0, *)) {
+                if (!storage) {
+                    auto *created = new MetalTimers{};
+                    [device sampleTimestamps:&created->cpuOrigin gpuTimestamp:&created->gpuOrigin];
+                    storage = reinterpret_cast<uintptr_t>(created);
+                }
+                auto &timers = *reinterpret_cast<MetalTimers *>(static_cast<uintptr_t>(storage));
+                const uint32_t sample = timer * 2 + (edge == TimerEdge::End ? 1 : 0);
+                const uint32_t buffer = sample / MetalTimers::samplesPerBuffer;
+                if (buffer == timers.buffers.size()) {
+                    timers.buffers.reserve(buffer + 1);
+                    MTLCounterSampleBufferDescriptor *descriptor = [MTLCounterSampleBufferDescriptor new];
+                    descriptor.counterSet = counters;
+                    descriptor.storageMode = MTLStorageModeShared;
+                    descriptor.sampleCount = MetalTimers::samplesPerBuffer;
+                    NSError *error = nil;
+                    id<MTLCounterSampleBuffer> created = [device newCounterSampleBufferWithDescriptor:descriptor
+                                                                                                error:&error];
+                    if (!created)
+                        return Result<void, RhiError>{
+                            err(RhiError{RhiErrorCode::BackendFailure, {"record_metal_timer", native, timer}})};
+                    timers.buffers.push_back(created);
+                }
+                MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
+                pass.sampleBufferAttachments[0].sampleBuffer = timers.buffers[buffer];
+                pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % MetalTimers::samplesPerBuffer;
+                pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = MTLCounterDontSample;
+                id<MTLCommandBuffer> commandBuffer =
+                    (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
+                id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoderWithDescriptor:pass];
+                [encoder endEncoding];
+            }
+            return Result<void, RhiError>{ok()};
+        } catch (const std::bad_alloc &) {
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"record_metal_timer", native, timer}})};
+        }
+    } @catch (NSException *) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"record_metal_timer_exception", native, timer}})};
+    }
+}
+
+Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint32_t count,
+                                  VernonRhiTimerSpan *spans) noexcept {
+    @try {
+        auto anchor = lookupMetalDevice(handle);
+        if (anchor.isErr())
+            return Result<void, RhiError>{err(std::move(anchor).error())};
+        const auto &timers = *reinterpret_cast<const MetalTimers *>(static_cast<uintptr_t>(storage));
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            MTLTimestamp cpu{};
+            MTLTimestamp gpu{};
+            [anchor.value().device().state.device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+            const double nanosecondsPerTick = gpu > timers.gpuOrigin ? static_cast<double>(cpu - timers.cpuOrigin) /
+                                                                           static_cast<double>(gpu - timers.gpuOrigin)
+                                                                     : 1.0;
+            for (uint32_t first = 0; first < count * 2; first += MetalTimers::samplesPerBuffer) {
+                const uint32_t samples = std::min(count * 2 - first, MetalTimers::samplesPerBuffer);
+                const size_t buffer = first / MetalTimers::samplesPerBuffer;
+                NSData *data = buffer < timers.buffers.size()
+                                   ? [timers.buffers[buffer] resolveCounterRange:NSMakeRange(0, samples)]
+                                   : nil;
+                if (!data || data.length < samples * sizeof(MTLCounterResultTimestamp))
+                    return Result<void, RhiError>{
+                        err(RhiError{RhiErrorCode::BackendFailure, {"read_metal_timers", storage, count}})};
+                const auto *results = static_cast<const MTLCounterResultTimestamp *>(data.bytes);
+                for (uint32_t sample = 0; sample < samples; ++sample) {
+                    // A GPU that dropped an empty encoder reports no sample for it.
+                    if (results[sample].timestamp == MTLCounterErrorValue)
+                        return Result<void, RhiError>{
+                            err(RhiError{RhiErrorCode::Unsupported, {"read_metal_timers_dropped", storage, count}})};
+                    const auto nanoseconds =
+                        static_cast<uint64_t>(static_cast<double>(results[sample].timestamp) * nanosecondsPerTick);
+                    VernonRhiTimerSpan &span = spans[(first + sample) / 2];
+                    ((first + sample) % 2 ? span.end_nanoseconds : span.begin_nanoseconds) = nanoseconds;
+                }
+            }
+            return Result<void, RhiError>{ok()};
+        }
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"read_metal_timers", storage, count}})};
+    } @catch (NSException *) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"read_metal_timers_exception", storage, count}})};
+    }
+}
+
+void releaseTimers(VernonRhiDevice, uint64_t storage) noexcept {
+    delete reinterpret_cast<MetalTimers *>(static_cast<uintptr_t>(storage));
 }
 
 Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
@@ -1577,6 +1768,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         BackendDispatch result{};
         result.backend = VERNON_RHI_BACKEND_METAL;
         result.commandCapabilities = BackendCommandIndependentRecording | BackendCommandConcurrentSubmission;
+        result.commandCapabilitiesForDevice.emplace(commandCapabilitiesForDevice);
         result.ownsDevice = ownsDevice;
         result.createOwnedDevice = createOwnedDevice;
         result.destroyDevice = destroyDevice;
@@ -1621,6 +1813,10 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
         result.clearDepthStencil.emplace(clearDepthStencil);
+        result.recordDebugCommand.emplace(recordDebugCommand);
+        result.recordTimer.emplace(recordTimer);
+        result.readTimers.emplace(readTimers);
+        result.releaseTimers.emplace(releaseTimers);
         result.createImageView.emplace(createImageView);
         result.destroyImageView.emplace(destroyImageView);
         result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);

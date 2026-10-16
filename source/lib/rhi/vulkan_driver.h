@@ -108,6 +108,11 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdDraw cmdDraw{};
     PFN_vkCmdDrawIndexed cmdDrawIndexed{};
     PFN_vkCmdPushConstants cmdPushConstants{};
+    PFN_vkCreateQueryPool createQueryPool{};
+    PFN_vkDestroyQueryPool destroyQueryPool{};
+    PFN_vkCmdResetQueryPool cmdResetQueryPool{};
+    PFN_vkCmdWriteTimestamp cmdWriteTimestamp{};
+    PFN_vkGetQueryPoolResults getQueryPoolResults{};
 };
 
 VERNON_RHI_CAPI Driver &driver();

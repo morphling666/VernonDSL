@@ -9,7 +9,6 @@
 
 #include <array>
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -120,20 +119,11 @@ TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
 
 TEST(RuntimeDirectX12Pipeline, RendersSampledTriangle) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
                                                    vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
@@ -261,20 +251,11 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangle) {
 
 TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolution) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
                                                    vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
@@ -353,20 +334,11 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolution) {
 
 TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE;
-    std::ifstream input(manifestPath, std::ios::binary);
-    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    ASSERT_FALSE(bundle.empty());
-
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
                                                    vernon::tests::configuredDirectXTestDevicePreference());
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *loaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);

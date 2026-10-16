@@ -23,6 +23,8 @@ struct ProgramGraphBoundaryKey {
 struct ProgramGraphNodeSource {
     uint32_t id{};
     std::string bundleId;
+    // Names the child's linked Nodes and stays out of the linked identity.
+    std::string label;
     std::string contentHash;
     const ProgramVariantDeployment *deployment{};
     std::filesystem::path bundleRoot;

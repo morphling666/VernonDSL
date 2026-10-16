@@ -2,8 +2,14 @@
 #define VERNON_PLATFORM_LIBRARY_H
 
 #include <string>
+#include <string_view>
 
 namespace vernon::platform {
+
+#if defined(_WIN32)
+// Empty when `value` is not valid UTF-8.
+std::wstring utf8ToWide(std::string_view value);
+#endif
 
 class PlatformLibrary {
 public:

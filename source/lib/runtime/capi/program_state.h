@@ -169,6 +169,7 @@ struct RuntimeRecordedCommand {
     std::array<uint32_t, 4> rect{};
     uint32_t stencilReference{};
     std::shared_ptr<const RuntimeProgramControl> draw;
+    std::string label;
 };
 
 struct RuntimeGraphicsRecording {
@@ -196,9 +197,19 @@ struct RecordedSetFrame {
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
 };
 
+// A debug group push, pop or marker, encoded before draw `draw` of its pass, or after the last draw when `draw` is
+// the draw count.
+struct RecordedDebugCommand {
+    VernonGraphicsCommandKind kind{};
+    std::string label;
+    size_t draw{};
+};
+
 struct RecordedGraphicsPass {
     std::vector<RecordedSetFrame> frames;
     std::vector<RecordedDraw> draws;
+    // Balanced and in recording order.
+    std::vector<RecordedDebugCommand> debugCommands;
     VernonProgramGraphicsNodeTelemetry telemetry{};
 };
 
@@ -261,6 +272,7 @@ struct VernonProgramInvocation {
     std::map<VernonProgramNodeId, VernonProgramGraphicsNodeTelemetry> graphicsTelemetry;
     vernon::runtime::program_execution::CompletionMode completionMode{
         vernon::runtime::program_execution::CompletionMode::Wait};
+    bool timings{};
     // Produced by an Execute that submitted work, until it is taken.
     std::unique_ptr<VernonSubmission> submission;
     bool executed{};
@@ -271,6 +283,7 @@ struct VernonProgramInvocation {
 struct RuntimeProgramGraphNode {
     uint32_t id{};
     std::string bundleId;
+    std::string label;
     std::string contentHash;
     vernon::runtime::ProgramVariantDeployment deployment;
     std::filesystem::path bundleRoot;

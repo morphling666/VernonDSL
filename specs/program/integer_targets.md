@@ -1,11 +1,11 @@
 # Integer color targets
 
 Status: implemented, awaiting the coordinated `COMPILER_CONTRACT_VERSION` and
-`PROGRAM_VERSION` cut (Engine extension E5, ID output). Multisampled parts are
-deferred to the MSAA extension (section 7).
+`PROGRAM_VERSION` cut (Engine extension E5, ID output). Multisampling is not
+planned (section 7).
 
 Picking, outlines and selection need an exact per-pixel identifier written
-next to the scene color in one pass, with or without MSAA. Float targets
+next to the scene color in one pass. Float targets
 cannot carry 32-bit IDs exactly. This document records the design; the rules
 themselves live in the contracts listed in section 6.
 
@@ -16,13 +16,9 @@ themselves live in the contracts listed in section 6.
   integer bits.
 - **A separate ID pass.** It re-rasterizes every object; MRT costs one more
   target write in the pass that already draws it.
-- **Rejecting multisampled integer targets.** A forward MSAA renderer writes
-  IDs at sample rate in the same pass and resolves them itself; only the
-  fixed-function resolve is meaningless for integers.
 - **Implicit flat integers as the only interpolation rule.** Flat floats
-  (per-primitive data), screen-linear varyings and centroid or sample
-  placement under MSAA need the same qualifier, so it is general from the
-  start.
+  (per-primitive data) and screen-linear varyings need the same qualifier, so
+  it is general from the start.
 - **Formats added file by file.** Format facts live in about 22 files across
   Python, compiler, Runtime and four RHI backends; each new format would
   repeat that edit. One X-macro table is the source instead
@@ -118,22 +114,16 @@ On every backend with graphics support:
   `VernonRhiColorAttachment.clear_color` and `VernonColorAttachment.clear_color`
   (`PROGRAM_VERSION`).
 
-## 7. Deferred to MSAA
+## 7. Multisampling is not planned
 
-These parts need multisampled images and arrive with the MSAA extension:
+Nothing consumes multisampled images. The Engine antialiases with TSR rather
+than MSAA, picking reads the single-sample visibility buffer, and the OpenGL
+fallback tier writes IDs as a single-sample color output (Engine
+`specs/render/architecture.md` section 8). The RHI and every provider adapter therefore accept only
+one sample, and the RenderPass has no resolve target.
 
-- Texture dimension `2d_ms`, read by `texture_load(texture, coordinates,
-  sample)` and measured by `texture_samples(texture)`, for every
-  multisample-capable format including depth. `texture_sample` on it fails at
-  typing.
-- `vd.varying(sampling=...)` with `vd.Sampling.CENTER` (default), `CENTROID`
-  or `SAMPLE`, lowered to the SPIR-V `Centroid` and `Sample` decorations.
-  `SAMPLE` runs the fragment stage per sample, and `sampling` does not apply
-  to `FLAT`.
-- A resolve target on an integer attachment fails with
-  `PROGRAM_ATTACHMENT_RESOLVE_FORMAT`; a custom resolve reads the
-  multisampled image as `2d_ms` instead.
-- Acceptance: a 4x MSAA pass writes `r32_uint` IDs, and a custom resolve
-  reading sample 0 through `2d_ms` returns the IDs of a 1x render on interior
-  pixels; centroid and sample placement differ from center only on edge
-  pixels.
+A future consumer would bring a multisampling extension with its own spec. It
+would need multisampled image creation and pipeline sample counts on every
+backend, a RenderPass resolve that integer attachments reject (their samples
+cannot be averaged), and fragment-stage reads of individual samples for
+custom resolves, together with centroid and per-sample varying placement.

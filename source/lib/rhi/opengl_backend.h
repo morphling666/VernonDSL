@@ -91,6 +91,13 @@ struct VERNON_RHI_CAPI DeviceState {
     bool createFramebuffer(Uint &framebuffer, std::string &error);
     void destroyFramebuffer(Uint framebuffer);
 
+    // No-ops without debug labels. A push beyond the context's group stack limit is skipped, and so is its pop, so
+    // that labels never raise a GL error. Labels are cut to the context's message length.
+    void pushDebugGroup(std::string_view label);
+    void popDebugGroup();
+    void popDebugGroups();
+    void insertDebugMarker(std::string_view label);
+
     VernonOpenGLContextCallbacks callbacks{};
     bool embeddedProfile{};
     std::vector<std::string> extensions;
@@ -105,6 +112,12 @@ struct VERNON_RHI_CAPI DeviceState {
 
 private:
     Uint depthStencilCopyProgram(Enum target, DepthStencilAspect aspect, std::string &error);
+    Size debugLabelLength(std::string_view label) const;
+
+    Int maxDebugMessageLength{};
+    Int maxDebugGroupDepth{};
+    // One entry per open group, telling whether its push reached the context.
+    std::vector<bool> debugGroupsPushed;
 };
 
 } // namespace vernon::rhi::opengl

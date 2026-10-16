@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace vernon::execution {
 
@@ -69,9 +70,22 @@ using CpuPassExecutor = VernonRhiStatus (*)(void *context, uint32_t scheduleOffs
                                             ComputeEncoder &encoder, const ExecutionResources &resources);
 using RhiCommandListEncoder = VernonRhiStatus (*)(void *context, VernonRhiCommandEncoder encoder);
 
+// One Program Node, or the contiguous Nodes fused into one render scope. The label and Node count grow until
+// submission as Nodes fuse.
+struct CommandScope {
+    std::string label;
+    uint32_t firstNode{};
+    uint32_t nodeCount{1};
+};
+
+using TimedCommandScopes = std::vector<std::shared_ptr<const CommandScope>>;
+
 struct RhiCommandNodeEncoder {
     RhiCommandListEncoder encode{};
     void *context{};
+    // Consecutive encoders sharing one scope object are recorded inside one debug group with its label, barriers
+    // included, and timed as one scope.
+    std::shared_ptr<const CommandScope> scope;
 };
 
 struct RhiCommandResourceBinding {
@@ -146,8 +160,11 @@ VernonRhiStatus submitRhiCommandDag(VernonRhiDevice device, uint32_t requiredCap
                                     const std::vector<RhiCommandNodeEncoder> &encoders,
                                     VernonRhiCompletion *outputCompletion,
                                     const std::vector<RhiCommandResourceBinding> *resourceBindings = nullptr);
+// With `timedScopes`, each run of encoders sharing a scope records one timer, and the scopes are listed in timer
+// order.
 VernonRhiStatus submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                     const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion);
+                                     const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion,
+                                     TimedCommandScopes *timedScopes = nullptr);
 VernonRhiStatus executeCpuScheduleRange(VernonRhiDevice device, const std::vector<GraphResource> &resources,
                                         const std::vector<std::unique_ptr<ExecutionPass>> &passes,
                                         const std::vector<uint32_t> &schedule,

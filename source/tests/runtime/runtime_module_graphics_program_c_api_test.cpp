@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -41,18 +40,6 @@ VernonProgramParameterView parameter(VernonProgramExecutable *executable, std::s
 
 VernonProgramBindingToken bindingToken(std::string_view value) {
     return {sizeof(VernonProgramBindingToken), value.data(), value.size()};
-}
-
-VernonProgramBundle *loadBundle(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    std::ifstream input(manifestPath, std::ios::binary);
-    if (!input)
-        return nullptr;
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string directory = manifestPath.parent_path().string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    return vernonRuntimeLoadProgramBundleWithOptions(runtime.runtime, manifest.data(), manifest.size(), &options);
 }
 
 VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter,
@@ -95,7 +82,7 @@ void destroyTarget(RhiRuntime &runtime, RhiImageView &view, RhiImage &image) {
 }
 
 void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &manifestPath, bool externalVertices) {
-    VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
@@ -238,7 +225,7 @@ void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &m
 }
 
 void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
@@ -366,14 +353,14 @@ void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, cons
 }
 
 void expectProgramGraphFusion(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime.runtime);
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId scene{};
     VernonProgramNodeId overlay{};
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &scene), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &overlay), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &scene), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &overlay), VERNON_STATUS_OK);
     VernonProgramNodeBindingToken sceneOutput{sizeof(VernonProgramNodeBindingToken)};
     VernonProgramNodeBindingToken overlayOutput{sizeof(VernonProgramNodeBindingToken)};
     VernonProgramNodeBindingToken sceneVertices{sizeof(VernonProgramNodeBindingToken)};

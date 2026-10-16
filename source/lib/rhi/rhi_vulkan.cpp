@@ -2655,6 +2655,113 @@ Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native
     return clearVulkanAttachment(handle, native, scope, opened, clear);
 }
 
+Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t native, const OpenedRendering *,
+                                          DebugCommand debugCommand, std::string_view label) noexcept {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command)
+        return Result<void, RhiError>{err(invalidArgument("record_debug_command_vulkan", native, 0))};
+    if (!device->state.cmdBeginDebugUtilsLabel)
+        return Result<void, RhiError>{ok()};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (debugCommand == DebugCommand::PopGroup) {
+        device->state.cmdEndDebugUtilsLabel(command);
+        return Result<void, RhiError>{ok()};
+    }
+    try {
+        const std::string name(label);
+        VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        info.pLabelName = name.c_str();
+        if (debugCommand == DebugCommand::PushGroup)
+            device->state.cmdBeginDebugUtilsLabel(command, &info);
+        else
+            device->state.cmdInsertDebugUtilsLabel(command, &info);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_debug_command_vulkan", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+// Timestamp query pools of `queriesPerPool` queries; query `q` of the recording is query `q % queriesPerPool` of pool
+// `q / queriesPerPool`, and timer `t` begins at query `2 * t` and ends at `2 * t + 1`.
+struct VulkanTimers {
+    static constexpr uint32_t queriesPerPool = 64;
+    std::vector<VkQueryPool> pools;
+};
+
+Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint64_t &storage, uint32_t timer,
+                                   TimerEdge edge) noexcept {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || timer > UINT32_MAX / 2 - 1)
+        return Result<void, RhiError>{err(invalidArgument("record_vulkan_timer", native, timer))};
+    vernon::rhi::vulkan::Driver &api = vernon::rhi::vulkan::driver();
+    std::lock_guard<std::mutex> guard(device->mutex);
+    try {
+        if (!storage)
+            storage = reinterpret_cast<uintptr_t>(new VulkanTimers{});
+        auto &timers = *reinterpret_cast<VulkanTimers *>(static_cast<uintptr_t>(storage));
+        const uint32_t query = timer * 2 + (edge == TimerEdge::End ? 1 : 0);
+        const uint32_t pool = query / VulkanTimers::queriesPerPool;
+        if (pool == timers.pools.size()) {
+            timers.pools.reserve(pool + 1);
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            info.queryCount = VulkanTimers::queriesPerPool;
+            VkQueryPool created{};
+            if (api.createQueryPool(device->state.device, &info, nullptr, &created) != VK_SUCCESS)
+                return Result<void, RhiError>{err(backendFailure("record_vulkan_timer", native))};
+            timers.pools.push_back(created);
+            api.cmdResetQueryPool(command, created, 0, VulkanTimers::queriesPerPool);
+        }
+        api.cmdWriteTimestamp(command,
+                              edge == TimerEdge::Begin ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                                       : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              timers.pools[pool], query % VulkanTimers::queriesPerPool);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"record_vulkan_timer", native, 0}})};
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint32_t count,
+                                  VernonRhiTimerSpan *spans) noexcept {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return Result<void, RhiError>{err(invalidArgument("read_vulkan_timers", storage, count))};
+    const auto &timers = *reinterpret_cast<const VulkanTimers *>(static_cast<uintptr_t>(storage));
+    vernon::rhi::vulkan::Driver &api = vernon::rhi::vulkan::driver();
+    const uint32_t validBits = device->state.timestampValidBits;
+    const uint64_t mask = validBits >= 64 ? ~uint64_t{0} : (uint64_t{1} << validBits) - 1;
+    const double period = device->state.timestampPeriod;
+    std::array<uint64_t, VulkanTimers::queriesPerPool> ticks{};
+    for (uint32_t first = 0; first < count * 2; first += VulkanTimers::queriesPerPool) {
+        const uint32_t queries = std::min(count * 2 - first, VulkanTimers::queriesPerPool);
+        const size_t pool = first / VulkanTimers::queriesPerPool;
+        if (pool >= timers.pools.size() ||
+            api.getQueryPoolResults(device->state.device, timers.pools[pool], 0, queries, sizeof(ticks), ticks.data(),
+                                    sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+            return Result<void, RhiError>{err(backendFailure("read_vulkan_timers", storage))};
+        for (uint32_t query = 0; query < queries; ++query) {
+            const auto nanoseconds = static_cast<uint64_t>(static_cast<double>(ticks[query] & mask) * period);
+            VernonRhiTimerSpan &span = spans[(first + query) / 2];
+            ((first + query) % 2 ? span.end_nanoseconds : span.begin_nanoseconds) = nanoseconds;
+        }
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseTimers(VernonRhiDevice handle, uint64_t storage) noexcept {
+    std::unique_ptr<VulkanTimers> timers(reinterpret_cast<VulkanTimers *>(static_cast<uintptr_t>(storage)));
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return;
+    for (VkQueryPool pool : timers->pools)
+        vernon::rhi::vulkan::driver().destroyQueryPool(device->state.device, pool, nullptr);
+}
+
 Result<uint64_t, RhiError> bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) noexcept {
     auto device = lookupVulkanDevice(handle);
     if (!device)
@@ -2879,8 +2986,10 @@ constexpr uint32_t commandCapabilities = BackendCommandIndependentRecording | Ba
 
 uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
     auto device = lookupVulkanDevice(handle);
-    return device && device->state.nativeObjectsBorrowed ? commandCapabilities | BackendCommandExternalExecution
-                                                         : commandCapabilities;
+    if (!device)
+        return commandCapabilities;
+    return commandCapabilities | (device->state.nativeObjectsBorrowed ? BackendCommandExternalExecution : 0) |
+           (device->state.timestampValidBits ? BackendCommandTimers : 0);
 }
 
 } // namespace vernon::rhi::vulkan_api
@@ -2938,6 +3047,10 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
         result.clearDepthStencil.emplace(clearDepthStencil);
+        result.recordDebugCommand.emplace(recordDebugCommand);
+        result.recordTimer.emplace(recordTimer);
+        result.readTimers.emplace(readTimers);
+        result.releaseTimers.emplace(releaseTimers);
         result.createImageView.emplace(createImageView);
         result.destroyImageView.emplace(destroyImageView);
         result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);

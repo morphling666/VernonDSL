@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <climits>
 #include <utility>
 
 namespace vernon::platform {
@@ -26,19 +27,24 @@ std::string windowsError(DWORD code) {
         result.pop_back();
     return result;
 }
+#endif
 
-std::wstring utf8ToWide(const char *value) {
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+} // namespace
+
+#if defined(_WIN32)
+std::wstring utf8ToWide(std::string_view value) {
+    if (value.empty() || value.size() > static_cast<size_t>(INT_MAX))
+        return {};
+    const int length = static_cast<int>(value.size());
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), length, nullptr, 0);
     if (!size)
         return {};
     std::wstring result(static_cast<size_t>(size), L'\0');
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, result.data(), size))
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), length, result.data(), size))
         return {};
     return result;
 }
 #endif
-
-} // namespace
 
 PlatformLibrary::~PlatformLibrary() { close(); }
 

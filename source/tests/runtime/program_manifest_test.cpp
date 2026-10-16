@@ -102,8 +102,8 @@ TEST(ProgramGraphLinker, KeepsNodeNamespacesAndInternalizesConnectedBoundaries) 
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphLinkFixture(true);
     ProgramVariantDeployment consumer = graphLinkFixture(false);
-    const std::vector<ProgramGraphNodeSource> nodes{{3, "producer", "producer-hash", &producer, {}},
-                                                    {7, "consumer", "consumer-hash", &consumer, {}}};
+    const std::vector<ProgramGraphNodeSource> nodes{{3, "producer", "producer", "producer-hash", &producer, {}},
+                                                    {7, "consumer", "consumer", "consumer-hash", &consumer, {}}};
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
     ASSERT_TRUE(linkProgramGraph(nodes, {{{3, 0}, {7, 0}}}, {}, {{{3, 0}, "result"}}, linked, diagnostic))
@@ -123,9 +123,9 @@ TEST(ProgramGraphLinker, IdentityDoesNotDependOnConnectionInsertionOrder) {
     ProgramVariantDeployment producer = graphLinkFixture(true);
     ProgramVariantDeployment firstConsumer = graphLinkFixture(false);
     ProgramVariantDeployment secondConsumer = graphLinkFixture(false);
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer, {}},
-                                                    {1, "first", "first-hash", &firstConsumer, {}},
-                                                    {2, "second", "second-hash", &secondConsumer, {}}};
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer", "producer-hash", &producer, {}},
+                                                    {1, "first", "first", "first-hash", &firstConsumer, {}},
+                                                    {2, "second", "second", "second-hash", &secondConsumer, {}}};
     const ProgramGraphConnection first{{0, 0}, {1, 0}};
     const ProgramGraphConnection second{{0, 0}, {2, 0}};
     LinkedProgramDeployment linked;
@@ -149,10 +149,11 @@ TEST(ProgramGraphLinker, RejectsIncompleteNodeIdentityAndAllowsNodeLocalSpeciali
     second.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{2}}};
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
-    EXPECT_FALSE(linkProgramGraph({{0, "first", "", &first, {}}}, {}, {}, {}, linked, diagnostic));
+    EXPECT_FALSE(linkProgramGraph({{0, "first", "first", "", &first, {}}}, {}, {}, {}, linked, diagnostic));
     EXPECT_EQ(diagnostic.path, "/nodes/0");
-    EXPECT_TRUE(linkProgramGraph({{0, "first", "first-hash", &first, {}}, {1, "second", "second-hash", &second, {}}},
-                                 {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic))
+    EXPECT_TRUE(linkProgramGraph(
+        {{0, "first", "first", "first-hash", &first, {}}, {1, "second", "second", "second-hash", &second, {}}},
+        {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic))
         << diagnostic.message;
 }
 
@@ -162,9 +163,9 @@ TEST(ProgramGraphLinker, RejectsExportOfAnInternalizedDestination) {
     ProgramVariantDeployment consumer = graphLinkFixture(false);
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
-    EXPECT_FALSE(linkProgramGraph(
-        {{0, "producer", "producer-hash", &producer, {}}, {1, "consumer", "consumer-hash", &consumer, {}}},
-        {{{0, 0}, {1, 0}}}, {}, {{{1, 0}, "internal"}}, linked, diagnostic));
+    EXPECT_FALSE(linkProgramGraph({{0, "producer", "producer", "producer-hash", &producer, {}},
+                                   {1, "consumer", "consumer", "consumer-hash", &consumer, {}}},
+                                  {{{0, 0}, {1, 0}}}, {}, {{{1, 0}, "internal"}}, linked, diagnostic));
     EXPECT_EQ(diagnostic.path, "/exports/0");
 }
 
@@ -190,9 +191,9 @@ TEST(ProgramGraphLinker, RejectsBranchedAndReversedStorageVersionChains) {
     ProgramVariantDeployment first = graphStorageLinkFixture();
     ProgramVariantDeployment second = graphStorageLinkFixture();
     ProgramVariantDeployment third = graphStorageLinkFixture();
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "first", "first-hash", &first, {}},
-                                                    {1, "second", "second-hash", &second, {}},
-                                                    {2, "third", "third-hash", &third, {}}};
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "first", "first", "first-hash", &first, {}},
+                                                    {1, "second", "second", "second-hash", &second, {}},
+                                                    {2, "third", "third", "third-hash", &third, {}}};
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
     EXPECT_FALSE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}, true}, {{0, 0}, {2, 0}, true}}, {}, {}, linked, diagnostic));
@@ -209,8 +210,8 @@ TEST(ProgramGraphLinker, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
     ProgramVariantDeployment consumer = graphStorageLinkFixture(false);
     producer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
     consumer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer, {}},
-                                                    {1, "consumer", "consumer-hash", &consumer, {}}};
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer", "producer-hash", &producer, {}},
+                                                    {1, "consumer", "consumer", "consumer-hash", &consumer, {}}};
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
     ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {{0, 0}}, {}, linked, diagnostic)) << diagnostic.message;

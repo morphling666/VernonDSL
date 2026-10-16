@@ -333,30 +333,33 @@ public:
     ProgramGraph(ProgramGraph &&) noexcept = default;
     ProgramGraph &operator=(ProgramGraph &&) noexcept = default;
 
-    [[nodiscard]] Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset) noexcept {
-        return add(asset, nullptr);
+    // An empty `label` names the child's Nodes after its bundle id.
+    [[nodiscard]] Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset,
+                                                        std::string_view label = {}) noexcept {
+        return add(asset, nullptr, label);
     }
 
-    [[nodiscard]] Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset,
-                                                        const ProgramVariant &variant) noexcept {
+    [[nodiscard]] Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset, const ProgramVariant &variant,
+                                                        std::string_view label = {}) noexcept {
         auto native = variant.native("ProgramGraph.add");
         if (native.isErr())
             return Result<ProgramNode, RuntimeError>{err(std::move(native).error())};
         const std::vector<VernonProgramSpecialization> specializations = std::move(native).value();
         const VernonProgramVariantSelector selector{
             sizeof(VernonProgramVariantSelector), specializations.data(), specializations.size(), {}};
-        return add(asset, &selector);
+        return add(asset, &selector, label);
     }
 
 private:
     explicit ProgramGraph(std::shared_ptr<detail::ProgramGraphState> state) : state_(std::move(state)) {}
 
-    Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset,
-                                          const VernonProgramVariantSelector *selector) noexcept {
+    Result<ProgramNode, RuntimeError> add(const ProgramAsset &asset, const VernonProgramVariantSelector *selector,
+                                          std::string_view label) noexcept {
         VernonProgramNodeId id{};
         if (!state_ || !state_->handle)
             return Result<ProgramNode, RuntimeError>{err(detail::invalidArgument("ProgramGraph.add"))};
-        const VernonStatus status = vernonRuntimeProgramGraphAddProgram(state_->handle, asset.get(), selector, &id);
+        const VernonStatus status = vernonRuntimeProgramGraphAddProgram(state_->handle, asset.get(), selector,
+                                                                        {label.data(), label.size()}, &id);
         if (status != VERNON_STATUS_OK)
             return Result<ProgramNode, RuntimeError>{err(detail::runtimeError(status, "ProgramGraph.add"))};
         return Result<ProgramNode, RuntimeError>{ok(ProgramNode(state_, id))};
@@ -472,6 +475,7 @@ inline Result<ProgramNodeBinding, RuntimeError> ProgramNode::boundary(VernonProg
 
 struct ProgramInvocationOptions {
     VernonCompletionMode completionMode{VERNON_COMPLETION_WAIT};
+    bool timings{};
 };
 
 class Submission {
@@ -507,6 +511,25 @@ public:
         if (status != VERNON_STATUS_OK)
             return Result<void, RuntimeError>{err(detail::runtimeError(status, "Submission.wait"))};
         return Result<void, RuntimeError>{ok()};
+    }
+
+    [[nodiscard]] Result<std::vector<VernonScopeTiming>, RuntimeError> scopeTimings() const noexcept {
+        using Timings = Result<std::vector<VernonScopeTiming>, RuntimeError>;
+        if (!handle_)
+            return Timings{err(detail::invalidArgument("Submission.scopeTimings"))};
+        size_t count = 0;
+        VernonStatus status = vernonSubmissionGetScopeTimings(handle_, nullptr, 0, &count);
+        if (status != VERNON_STATUS_OK)
+            return Timings{err(detail::runtimeError(status, "Submission.scopeTimings"))};
+        try {
+            std::vector<VernonScopeTiming> scopes(count);
+            status = vernonSubmissionGetScopeTimings(handle_, scopes.data(), scopes.size(), &count);
+            if (status != VERNON_STATUS_OK)
+                return Timings{err(detail::runtimeError(status, "Submission.scopeTimings"))};
+            return Timings{ok(std::move(scopes))};
+        } catch (const std::bad_alloc &) {
+            return Timings{err(detail::resourceExhausted("Submission.scopeTimings"))};
+        }
     }
 
     VernonSubmission *get() const noexcept { return handle_; }
@@ -606,6 +629,7 @@ public:
         const VernonProgramInvocationOptions options{sizeof(VernonProgramInvocationOptions),
                                                      VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
                                                      invocationOptions.completionMode,
+                                                     invocationOptions.timings ? 1u : 0u,
                                                      {}};
         const VernonStatus status = vernonRuntimeProgramInvocationSetOptions(handle_, &options);
         if (status != VERNON_STATUS_OK)

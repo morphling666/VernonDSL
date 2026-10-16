@@ -115,6 +115,16 @@ bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallback
         // exposing discontinuities that Vulkan and D3D12 filter across.
         driver.enable(kTextureCubeMapSeamless);
     }
+    const bool coreDebug = embeddedProfile ? apiVersionAtLeast(3, 2) : apiVersionAtLeast(4, 3);
+    if (coreDebug || hasExtension("GL_KHR_debug"))
+        loadDebugLabelDriver(callbacks, driver, embeddedProfile && !coreDebug);
+    if (driver.pushDebugGroup) {
+        driver.getIntegerv(kMaxDebugMessageLength, &maxDebugMessageLength);
+        driver.getIntegerv(kMaxDebugGroupStackDepth, &maxDebugGroupDepth);
+    }
+    if (embeddedProfile ? hasExtension("GL_EXT_disjoint_timer_query")
+                        : apiVersionAtLeast(3, 3) || hasExtension("GL_ARB_timer_query"))
+        loadTimerQueryDriver(callbacks, driver, embeddedProfile);
     if (!supportsCompute() || (driver.dispatchCompute && driver.memoryBarrier))
         return true;
     error = "OpenGL context reports compute support but required compute functions are missing";
@@ -141,6 +151,46 @@ bool DeviceState::apiVersionAtLeast(uint32_t major, uint32_t minor) const {
 
 bool DeviceState::hasExtension(std::string_view name) const {
     return std::find(extensions.begin(), extensions.end(), name) != extensions.end();
+}
+
+Size DeviceState::debugLabelLength(std::string_view label) const {
+    // The limit counts the terminator; the cut backs off to a UTF-8 code point boundary.
+    size_t length = std::min(label.size(), static_cast<size_t>(std::max<Int>(maxDebugMessageLength - 1, 0)));
+    if (length < label.size())
+        while (length && (static_cast<unsigned char>(label[length]) & 0xC0u) == 0x80u)
+            --length;
+    return static_cast<Size>(length);
+}
+
+void DeviceState::pushDebugGroup(std::string_view label) {
+    if (!driver.pushDebugGroup)
+        return;
+    Int depth = 0;
+    driver.getIntegerv(kDebugGroupStackDepth, &depth);
+    const bool pushed = depth < maxDebugGroupDepth;
+    debugGroupsPushed.push_back(pushed);
+    if (pushed)
+        driver.pushDebugGroup(kDebugSourceApplication, 0, debugLabelLength(label), label.data());
+}
+
+void DeviceState::popDebugGroup() {
+    if (!driver.pushDebugGroup || debugGroupsPushed.empty())
+        return;
+    const bool pushed = debugGroupsPushed.back();
+    debugGroupsPushed.pop_back();
+    if (pushed)
+        driver.popDebugGroup();
+}
+
+void DeviceState::popDebugGroups() {
+    while (!debugGroupsPushed.empty())
+        popDebugGroup();
+}
+
+void DeviceState::insertDebugMarker(std::string_view label) {
+    if (driver.debugMessageInsert)
+        driver.debugMessageInsert(kDebugSourceApplication, kDebugTypeMarker, 0, kDebugSeverityNotification,
+                                  debugLabelLength(label), label.data());
 }
 
 bool DeviceState::createBuffer(Buffer &buffer, size_t size, std::string &error) {

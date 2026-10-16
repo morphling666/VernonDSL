@@ -7,7 +7,6 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -21,18 +20,9 @@ std::string lastError(VernonRuntimeContext *context) {
 
 TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStorageGradient) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -138,18 +128,9 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 
 TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersion) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
@@ -248,20 +229,11 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 TEST(RuntimeStructuredStorageAutodiff, ZeroTapeBudgetRejectsForwardWithoutPublishing) {
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    const std::string bundleDirectory = manifestPath.parent_path().string();
-
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(0, 0);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, tapePolicy);
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);

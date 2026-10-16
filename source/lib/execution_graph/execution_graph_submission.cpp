@@ -279,7 +279,8 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
     VernonRhiDevice device, uint32_t requiredCapabilities, const detail::CommandDag &dag,
     const std::vector<detail::RhiCommandNodeEncoder> &encoders, VernonRhiCompletion *outputCompletion,
     const std::vector<detail::RhiCommandResourceBinding> *resourceBindings,
-    const std::vector<detail::CommandResourceAccess> *initialAccesses) {
+    const std::vector<detail::CommandResourceAccess> *initialAccesses,
+    detail::TimedCommandScopes *timedScopes = nullptr) {
     if (!outputCompletion || dag.nodes.empty() || encoders.size() != dag.nodes.size())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::string error;
@@ -305,8 +306,30 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
     VernonRhiCommandEncoder encoder{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder);
     if (status == VERNON_RHI_STATUS_OK) {
+        const detail::CommandScope *openScope = nullptr;
+        uint32_t openTimer{};
+        const auto closeScope = [&] {
+            VernonRhiStatus closed = VERNON_RHI_STATUS_OK;
+            if (timedScopes)
+                closed = vernonRhiCommandEncoderEndTimer(device, encoder, openTimer);
+            return closed == VERNON_RHI_STATUS_OK ? vernonRhiCommandEncoderPopDebugGroup(device, encoder) : closed;
+        };
         for (uint32_t index = 0; index < encoders.size(); ++index) {
-            if (!nodeBarriers[index].empty())
+            const std::shared_ptr<const detail::CommandScope> &scope = encoders[index].scope;
+            if (scope.get() != openScope) {
+                if (openScope)
+                    status = closeScope();
+                if (status == VERNON_RHI_STATUS_OK && scope)
+                    status = vernonRhiCommandEncoderPushDebugGroup(device, encoder,
+                                                                   {scope->label.data(), scope->label.size()});
+                if (status == VERNON_RHI_STATUS_OK && scope && timedScopes) {
+                    status = vernonRhiCommandEncoderBeginTimer(device, encoder, &openTimer);
+                    if (status == VERNON_RHI_STATUS_OK)
+                        timedScopes->push_back(scope);
+                }
+                openScope = scope.get();
+            }
+            if (status == VERNON_RHI_STATUS_OK && !nodeBarriers[index].empty())
                 status = vernonRhiCommandEncoderBarrier(device, encoder, nodeBarriers[index].data(),
                                                         nodeBarriers[index].size());
             if (status == VERNON_RHI_STATUS_OK)
@@ -314,6 +337,8 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
             if (status != VERNON_RHI_STATUS_OK)
                 break;
         }
+        if (status == VERNON_RHI_STATUS_OK && openScope)
+            status = closeScope();
     }
     if (status == VERNON_RHI_STATUS_OK)
         status = vernonRhiCommandEncoderFinish(device, encoder);
@@ -333,14 +358,14 @@ VernonRhiStatus detail::submitRhiCommandDag(VernonRhiDevice device, uint32_t req
 }
 
 VernonRhiStatus detail::submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                             const RhiCommandExecutionPlan &plan,
-                                             VernonRhiCompletion &outputCompletion) {
+                                             const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion,
+                                             TimedCommandScopes *timedScopes) {
     std::string error;
     if (!validateRhiCommandExecutionPlan(plan, error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return submitRhiCommandDagWithInitialAccesses(device, requiredCapabilities, plan.commands, plan.encoders,
-                                                  &outputCompletion, &plan.bindings,
-                                                  plan.initialAccesses.empty() ? nullptr : &plan.initialAccesses);
+    return submitRhiCommandDagWithInitialAccesses(
+        device, requiredCapabilities, plan.commands, plan.encoders, &outputCompletion, &plan.bindings,
+        plan.initialAccesses.empty() ? nullptr : &plan.initialAccesses, timedScopes);
 }
 
 VernonRhiStatus detail::submitRhiComputeCommandRange(

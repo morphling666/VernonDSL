@@ -713,6 +713,47 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::endCommandRendering(VernonRh
     return backend->endRendering.value()(device, native, scope, opened);
 }
 
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordDebugCommand(VernonRhiDevice device, uint64_t native,
+                                                                       const OpenedRendering *rendering,
+                                                                       DebugCommand command,
+                                                                       std::string_view label) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command", native, 0}})};
+    if (!backend->recordDebugCommand)
+        return Result<void, RhiError>{ok()};
+    return backend->recordDebugCommand.value()(device, native, rendering, command, label);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordCommandTimer(VernonRhiDevice device, uint64_t native,
+                                                                       uint64_t &storage, uint32_t timer,
+                                                                       TimerEdge edge) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"record_timer", native, timer}})};
+    if (!backend->recordTimer)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"record_timer", native, timer}})};
+    return backend->recordTimer.value()(device, native, storage, timer, edge);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::readCommandTimers(VernonRhiDevice device, uint64_t storage,
+                                                                      uint32_t count,
+                                                                      VernonRhiTimerSpan *spans) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"read_timers", storage, count}})};
+    if (!backend->readTimers)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"read_timers", storage, count}})};
+    return backend->readTimers.value()(device, storage, count, spans);
+}
+
+void vernon::rhi::releaseCommandTimers(VernonRhiDevice device, uint64_t storage) noexcept {
+    if (const BackendDispatch *backend = dispatch(device))
+        if (backend->releaseTimers)
+            backend->releaseTimers.value()(device, storage);
+}
+
 vernon::Result<void, vernon::RhiError> vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native,
                                                                       const RenderingScope &scope,
                                                                       const OpenedRendering &opened, uint32_t location,

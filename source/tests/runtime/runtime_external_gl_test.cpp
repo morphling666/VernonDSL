@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 
@@ -10,8 +11,11 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -51,6 +55,13 @@ constexpr GlEnum kSubtract = 0x800A;
 constexpr GlEnum kColorAttachment0 = 0x8CE0;
 constexpr GlEnum kStencilAttachment = 0x8D20;
 constexpr GlEnum kAlreadySignaled = 0x911A;
+constexpr GlEnum kTimeoutExpired = 0x911B;
+constexpr GlEnum kMaxDebugGroupStackDepth = 0x826C;
+constexpr GlEnum kDebugGroupStackDepth = 0x826D;
+constexpr GlEnum kMaxDebugMessageLength = 0x9143;
+constexpr GlEnum kTimestamp = 0x8E28;
+constexpr GlEnum kQueryResult = 0x8866;
+constexpr GlEnum kGpuDisjoint = 0x8FBB;
 
 GlUint nextName = 1;
 uint32_t drawCount = 0;
@@ -87,6 +98,23 @@ std::array<GlInt, 4> viewportUpload{};
 std::array<GlInt, 4> scissorUpload{};
 std::vector<std::string> linkedUniformBlocks;
 std::unordered_map<GlUint, GlUint> uniformBlockBindings;
+std::vector<std::string> exposedExtensions;
+constexpr GlInt kDefaultMaxDebugGroupDepth = 64;
+constexpr GlInt kDefaultMaxDebugMessageLength = 256;
+GlInt maxDebugGroupDepth = kDefaultMaxDebugGroupDepth;
+GlInt maxDebugMessageLength = kDefaultMaxDebugMessageLength;
+// The default debug group of the context counts toward the depth.
+GlInt debugGroupDepth = 1;
+// Debug label calls, timestamp queries and draws, in call order.
+std::vector<std::string> orderedCalls;
+// Each timestamp query advances the GPU clock by ten nanoseconds from an origin that is not zero.
+constexpr uint64_t kGpuClockOrigin = 1'000'000;
+uint64_t gpuClock = kGpuClockOrigin;
+std::unordered_map<GlUint, uint64_t> queryTimestamps;
+std::vector<GlUint> deletedQueries;
+// Reading the flag clears it, like GL_GPU_DISJOINT_EXT.
+GlInt gpuDisjoint = 0;
+bool exposeTimerQueries = true;
 
 using vernon::tests::RhiImage;
 using vernon::tests::RhiRuntime;
@@ -187,7 +215,10 @@ void GL_CALL framebufferTextureLayer(GlEnum, GlEnum, GlUint, GlInt, GlInt layer)
 }
 void GL_CALL blitFramebufferNoop(GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, unsigned, GlEnum) {}
 void GL_CALL drawBuffersNoop(GlSize, const GlEnum *) {}
-void GL_CALL drawArraysInstanced(GlEnum, GlInt, GlSize, GlSize) { ++drawCount; }
+void GL_CALL drawArraysInstanced(GlEnum, GlInt, GlSize, GlSize) {
+    ++drawCount;
+    orderedCalls.emplace_back("draw");
+}
 void GL_CALL uniformFvNoop(GlInt, GlSize, const float *) {}
 void GL_CALL uniformMatrixNoop(GlInt, GlSize, GlBoolean, const float *) {}
 void GL_CALL uniform1iNoop(GlInt, GlInt) {}
@@ -215,12 +246,64 @@ void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) {
                                             : 0;
 }
 void GL_CALL getIntegerv(GlEnum name, GlInt *value) {
-    *value = name == kMaxUniformBlockSize ? 16 * 1024 : name == kNumExtensions ? 0 : 16;
+    switch (name) {
+    case kMaxUniformBlockSize:
+        *value = 16 * 1024;
+        break;
+    case kNumExtensions:
+        *value = static_cast<GlInt>(exposedExtensions.size());
+        break;
+    case kMaxDebugGroupStackDepth:
+        *value = maxDebugGroupDepth;
+        break;
+    case kDebugGroupStackDepth:
+        *value = debugGroupDepth;
+        break;
+    case kMaxDebugMessageLength:
+        *value = maxDebugMessageLength;
+        break;
+    case kGpuDisjoint:
+        *value = std::exchange(gpuDisjoint, 0);
+        break;
+    default:
+        *value = 16;
+    }
 }
-const unsigned char *GL_CALL getStringi(GlEnum, GlUint) { return nullptr; }
+const unsigned char *GL_CALL getStringi(GlEnum, GlUint index) {
+    return index < exposedExtensions.size() ? reinterpret_cast<const unsigned char *>(exposedExtensions[index].c_str())
+                                            : nullptr;
+}
+void GL_CALL pushDebugGroup(GlEnum, GlUint, GlSize length, const char *message) {
+    ++debugGroupDepth;
+    orderedCalls.push_back("push " + std::string(message, static_cast<size_t>(length)));
+}
+void GL_CALL popDebugGroup() {
+    --debugGroupDepth;
+    orderedCalls.emplace_back("pop");
+}
+void GL_CALL debugMessageInsert(GlEnum, GlEnum, GlUint, GlEnum, GlSize length, const char *message) {
+    orderedCalls.push_back("marker " + std::string(message, static_cast<size_t>(length)));
+}
+void GL_CALL pushDebugGroupKhr(GlEnum source, GlUint id, GlSize length, const char *message) {
+    orderedCalls.emplace_back("KHR");
+    pushDebugGroup(source, id, length, message);
+}
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
         *names++ = nextName++;
+}
+void GL_CALL deleteQueries(GlSize count, const GlUint *names) {
+    std::copy_if(names, names + count, std::back_inserter(deletedQueries), [](GlUint name) { return name != 0; });
+}
+void GL_CALL queryCounter(GlUint name, GlEnum target) {
+    if (target != kTimestamp)
+        return;
+    gpuClock += 10;
+    queryTimestamps[name] = gpuClock;
+    orderedCalls.emplace_back("timestamp");
+}
+void GL_CALL getQueryObjectui64v(GlUint name, GlEnum parameter, uint64_t *value) {
+    *value = parameter == kQueryResult ? queryTimestamps.at(name) : 0;
 }
 void GL_CALL deleteBufferNames(GlSize count, const GlUint *names) {
     deletedBuffers.insert(deletedBuffers.end(), names, names + count);
@@ -255,7 +338,11 @@ void *GL_CALL fenceSync(GlEnum, unsigned) {
     ++createdSyncCount;
     return &createdSyncCount;
 }
-GlEnum GL_CALL clientWaitSync(void *, unsigned, uint64_t) { return kAlreadySignaled; }
+// While set, polls report fences unsignaled and only blocking waits complete them.
+bool fencesPending = false;
+GlEnum GL_CALL clientWaitSync(void *, unsigned, uint64_t timeout) {
+    return fencesPending && !timeout ? kTimeoutExpired : kAlreadySignaled;
+}
 void GL_CALL deleteSync(void *) { ++deletedSyncCount; }
 void GL_CALL vertexAttribPointer(GlUint location, GlInt components, GlEnum type, GlBoolean, GlSize stride,
                                  const void *offset) {
@@ -279,6 +366,7 @@ void GL_CALL vertexAttribDivisor(GlUint, GlUint divisor) { capturedVertexAttribu
 void GL_CALL drawElementsInstanced(GlEnum, GlSize count, GlEnum, const void *, GlSize) {
     indexedDrawCount = count;
     ++drawCount;
+    orderedCalls.emplace_back("draw");
 }
 void GL_CALL bufferSubData(GlEnum, std::intptr_t offset, std::intptr_t size, const void *source) {
     std::memcpy(bufferStorage.data() + offset, source, static_cast<size_t>(size));
@@ -319,7 +407,10 @@ void GL_CALL readPixels(GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnu
     std::memcpy(destination, textureStorage.data(), static_cast<size_t>(width) * height * (type == 0x8DAD ? 8 : 4));
 }
 GlEnum GL_CALL framebufferStatus(GlEnum) { return kFramebufferComplete; }
-void GL_CALL drawArrays(GlEnum, GlInt, GlSize) { ++drawCount; }
+void GL_CALL drawArrays(GlEnum, GlInt, GlSize) {
+    ++drawCount;
+    orderedCalls.emplace_back("draw");
+}
 void GL_CALL clearBufferfv(GlEnum, GlInt drawBuffer, const float *value) {
     ++clearCount;
     clearedDrawBuffer = drawBuffer;
@@ -510,6 +601,20 @@ void *getProcAddress(void *, const char *name) {
     PROC("glFenceSync", fenceSync);
     PROC("glClientWaitSync", clientWaitSync);
     PROC("glDeleteSync", deleteSync);
+    PROC("glPushDebugGroup", pushDebugGroup);
+    PROC("glPopDebugGroup", popDebugGroup);
+    PROC("glDebugMessageInsert", debugMessageInsert);
+    PROC("glPushDebugGroupKHR", pushDebugGroupKhr);
+    PROC("glPopDebugGroupKHR", popDebugGroup);
+    PROC("glDebugMessageInsertKHR", debugMessageInsert);
+    if (exposeTimerQueries) {
+        PROC("glGenQueries", genNames);
+        PROC("glDeleteQueries", deleteQueries);
+        PROC("glQueryCounter", queryCounter);
+        PROC("glQueryCounterEXT", queryCounter);
+        PROC("glGetQueryObjectui64v", getQueryObjectui64v);
+        PROC("glGetQueryObjectui64vEXT", getQueryObjectui64v);
+    }
 #undef PROC
     return nullptr;
 }
@@ -531,6 +636,11 @@ VernonRuntimeContext *create(VernonRuntimeBackend backend, uint16_t major, uint1
     if (runtime)
         rhiRuntimes.emplace(runtime, context);
     return runtime;
+}
+
+std::string_view lastError(VernonRuntimeContext *gl) {
+    const VernonStringView error = vernonRuntimeGetLastError(gl);
+    return {error.data, error.size};
 }
 
 VernonStatus destroy(VernonRuntimeContext *runtime) {
@@ -557,7 +667,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *manifest, uint
     ASSERT_TRUE(gl);
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
         const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
                                                                      VERNON_RHI_FORMAT_RGBA8_UNORM);
@@ -580,9 +690,9 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *manifest, uint
         vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
         const GlUint nextNameAfterPreparation = nextName;
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         EXPECT_EQ(nextName, nextNameAfterPreparation);
         EXPECT_EQ(matrixTranspose, expectedTranspose);
         EXPECT_EQ(matrixUpload, expectedUpload);
@@ -603,7 +713,7 @@ void expectIntegerUniformUpload(const char *manifest, const char *name, VernonDa
     ASSERT_TRUE(gl);
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
         const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
                                                                      VERNON_RHI_FORMAT_RGBA8_UNORM);
@@ -636,6 +746,224 @@ void expectIntegerUniformUpload(const char *manifest, const char *name, VernonDa
     }
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
+
+// Records groups "a" and "b", a group "c" past a depth limit of three, and two markers with a five-byte message limit,
+// then returns the debug calls that reached GL.
+std::vector<std::string> recordDebugLabels(VernonRuntimeBackend backend, uint16_t major, uint16_t minor,
+                                           std::vector<std::string> extensions = {}) {
+    exposedExtensions = std::move(extensions);
+    maxDebugGroupDepth = 3;
+    maxDebugMessageLength = 5;
+    debugGroupDepth = 1;
+    orderedCalls.clear();
+    VernonRuntimeContext *gl = create(backend, major, minor);
+    exposedExtensions.clear();
+    maxDebugGroupDepth = kDefaultMaxDebugGroupDepth;
+    maxDebugMessageLength = kDefaultMaxDebugMessageLength;
+    EXPECT_TRUE(gl);
+    if (!gl)
+        return {};
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    EXPECT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+    const auto push = [&](std::string_view label) {
+        EXPECT_EQ(vernonRhiCommandEncoderPushDebugGroup(device, encoder, {label.data(), label.size()}),
+                  VERNON_RHI_STATUS_OK);
+    };
+    const auto marker = [&](std::string_view label) {
+        EXPECT_EQ(vernonRhiCommandEncoderInsertDebugMarker(device, encoder, {label.data(), label.size()}),
+                  VERNON_RHI_STATUS_OK);
+    };
+    EXPECT_EQ(vernonRhiCommandEncoderPopDebugGroup(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    push("a");
+    push("b");
+    push("c");
+    marker("abc\xC3\xA9");
+    marker("d\xC3\xA9");
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    for (int group = 0; group < 3; ++group)
+        EXPECT_EQ(vernonRhiCommandEncoderPopDebugGroup(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    EXPECT_EQ(debugGroupDepth, 1);
+    return orderedCalls;
+}
+
+VernonRhiCommandEncoder createGraphicsEncoder(VernonRhiDevice device) {
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    EXPECT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+    return encoder;
+}
+
+// Submits the finished `encoder`, waits for it and reads its timers into `spans`.
+VernonRhiStatus submitAndReadTimers(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                    std::vector<VernonRhiTimerSpan> &spans) {
+    VernonRhiCompletion completion{};
+    VernonRhiStatus status = vernonRhiDeviceSubmit(device, encoder, &completion);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
+    status = vernonRhiCompletionWait(device, completion);
+    size_t count = 0;
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiCompletionGetTimers(device, completion, nullptr, 0, &count);
+    if (status == VERNON_RHI_STATUS_OK && count) {
+        spans.resize(count);
+        EXPECT_EQ(vernonRhiCompletionGetTimers(device, completion, spans.data(), count - 1, &count),
+                  VERNON_RHI_STATUS_INVALID_ARGUMENT);
+        status = vernonRhiCompletionGetTimers(device, completion, spans.data(), spans.size(), &count);
+    }
+    const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyCompletion(device, completion);
+    return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
+}
+
+#if defined(VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE)
+// Executes `executable` with every graphics Node drawing one triangle into the same target, after `recording` replaces
+// the draws of the first Node, and returns the debug label calls, timestamp queries and draws of that Execute. With
+// `submission`, the Execute's submission is handed out.
+std::vector<std::string> executeModuleGraphics(VernonRuntimeContext *gl, VernonProgramExecutable *executable,
+                                               const std::vector<VernonGraphicsCommand> &recording = {},
+                                               const VernonProgramInvocationOptions *options = nullptr,
+                                               VernonSubmission **submission = nullptr) {
+    RhiRuntime &runtime = rhiRuntime(gl);
+    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+    constexpr std::array<uint64_t, 2> shape{3, 2};
+    constexpr std::array<int64_t, 2> strides{2 * sizeof(float), sizeof(float)};
+    const vernon::tests::RhiBuffer vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float),
+                                                                          VERNON_RHI_BUFFER_VERTEX, positions.data());
+    RhiImage target = createTexture2D(gl, 8, 8, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto view =
+        vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    EXPECT_NE(invocation, nullptr);
+    if (options)
+        EXPECT_EQ(vernonRuntimeProgramInvocationSetOptions(invocation, options), VERNON_STATUS_OK);
+
+    for (size_t index = 0; index < vernonRuntimeProgramExecutableGetParameterCount(executable); ++index) {
+        VernonProgramParameterView parameter{};
+        EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &parameter), VERNON_STATUS_OK);
+        VernonProgramArgument argument{};
+        argument.slot = parameter.slot;
+        if (std::string_view(parameter.name.data, parameter.name.size) == "output") {
+            argument.kind = VERNON_PROGRAM_IMAGE;
+            argument.image = {view.reference};
+        } else {
+            argument.kind = VERNON_PROGRAM_TENSOR;
+            argument.tensor.struct_size = sizeof(argument.tensor);
+            argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+            argument.tensor.resource = vertices.reference;
+            argument.tensor.element_layout = parameter.element_layout;
+            argument.tensor.access = parameter.access;
+            argument.tensor.rank = shape.size();
+            argument.tensor.shape = shape.data();
+            argument.tensor.byte_strides = strides.data();
+            argument.tensor.byte_size = sizeof(positions);
+        }
+        const std::string text = "argument-" + std::to_string(index);
+        const VernonProgramBindingToken token{sizeof(token), text.data(), text.size()};
+        EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &argument, nullptr, 0, 0), VERNON_STATUS_OK);
+    }
+
+    const size_t nodeCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable);
+    std::vector<VernonColorAttachment> attachments(nodeCount);
+    std::vector<vernon::tests::CanonicalGraphicsControls> controls;
+    controls.reserve(nodeCount);
+    for (size_t node = 0; node < nodeCount; ++node) {
+        attachments[node].view = view.reference;
+        attachments[node].load_operation =
+            node == 0 ? VERNON_RUNTIME_PROVIDER_LOAD_CLEAR : VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+        attachments[node].store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+        vernon::tests::CanonicalGraphicsControls &graphics = controls.emplace_back(&attachments[node], 1, 3);
+        graphics.renderPass.render_area[2] = graphics.renderPass.render_area[3] = 8;
+        graphics.dynamic.viewport[2] = graphics.dynamic.viewport[3] = 8;
+        graphics.dynamic.scissor[2] = graphics.dynamic.scissor[3] = 8;
+        VernonProgramGraphicsControlsView slots{};
+        EXPECT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, node, &slots), VERNON_STATUS_OK);
+        EXPECT_EQ(graphics.bind(invocation, slots), VERNON_STATUS_OK);
+        if (node == 0 && !recording.empty())
+            EXPECT_EQ(vernonRuntimeProgramInvocationRecordGraphics(invocation, slots.node, recording.data(),
+                                                                   recording.size(), nullptr, 0),
+                      VERNON_STATUS_OK);
+    }
+
+    orderedCalls.clear();
+    EXPECT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK) << lastError(gl);
+    std::vector<std::string> calls = std::move(orderedCalls);
+    EXPECT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK);
+    if (submission)
+        EXPECT_EQ(vernonRuntimeProgramInvocationTakeSubmission(invocation, submission), VERNON_STATUS_OK);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(runtime.device, view.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(runtime.device, target.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
+    return calls;
+}
+
+// Resolves the graph of Nodes "scene" and "overlay", both drawing `bundle` into one exported framebuffer, so that they
+// fuse into one render scope.
+VernonProgramExecutable *resolveSceneOverlayGraph(VernonRuntimeContext *gl, VernonProgramBundle *bundle,
+                                                  std::array<VernonProgramNodeId, 2> &nodes) {
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(gl);
+    std::array<VernonProgramNodeBindingToken, 2> outputs{};
+    VernonProgramGraphStorage framebuffer{sizeof(framebuffer)};
+    bool built = true;
+    for (size_t node = 0; node < nodes.size() && built; ++node) {
+        const std::string_view label = node == 0 ? "scene" : "overlay";
+        outputs[node].struct_size = sizeof(outputs[node]);
+        VernonProgramNodeBindingToken vertices{sizeof(vertices)};
+        const std::string boundary = std::string(label) + "_vertices";
+        built = vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {label.data(), label.size()},
+                                                    &nodes[node]) == VERNON_STATUS_OK &&
+                vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_OUTPUT, {"output", 6},
+                                                      &outputs[node]) == VERNON_STATUS_OK &&
+                vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                      {"vertices", 8}, &vertices) == VERNON_STATUS_OK &&
+                vernonRuntimeProgramGraphExportBoundary(graph, &vertices, {boundary.data(), boundary.size()}) ==
+                    VERNON_STATUS_OK;
+    }
+    built = built && vernonRuntimeProgramGraphCreateStorage(graph, &outputs[0], &framebuffer) == VERNON_STATUS_OK &&
+            vernonRuntimeProgramGraphAppendStorage(graph, &framebuffer, &outputs[1]) == VERNON_STATUS_OK &&
+            vernonRuntimeProgramGraphExportStorage(graph, &framebuffer, {"output", 6}) == VERNON_STATUS_OK;
+    EXPECT_TRUE(built);
+    VernonProgramExecutable *executable = built ? vernonRuntimeResolveProgramGraph(graph) : nullptr;
+    vernonRuntimeProgramGraphDestroy(graph);
+    return executable;
+}
+
+VernonProgramInvocationOptions invocationOptions(VernonCompletionMode mode, uint32_t timings) {
+    return {sizeof(VernonProgramInvocationOptions), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, mode, timings, {}};
+}
+
+// Reads the scope timings of a completed submission, checking that a short capacity is rejected.
+std::vector<VernonScopeTiming> readScopeTimings(VernonRuntimeContext *gl, VernonSubmission *submission) {
+    size_t count = 0;
+    EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_OK);
+    std::vector<VernonScopeTiming> scopes(count);
+    if (count) {
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, scopes.data(), count - 1, &count),
+                  VERNON_STATUS_INVALID_ARGUMENT);
+        EXPECT_EQ(lastError(gl), "scope timing storage is smaller than the timed scopes");
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, scopes.data(), scopes.size(), &count), VERNON_STATUS_OK);
+        EXPECT_EQ(count, scopes.size());
+    }
+    return scopes;
+}
+
+VernonGraphicsCommand graphicsCommand(VernonGraphicsCommandKind kind, std::string_view label = {}) {
+    VernonGraphicsCommand command{};
+    command.kind = kind;
+    command.label = {label.data(), label.size()};
+    return command;
+}
+#endif
 
 } // namespace
 
@@ -791,7 +1119,7 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
     {
         const size_t bindingCreations = vernon::runtime::getRhiAdapterBindingCreationCount(gl);
         vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
-        ASSERT_TRUE(program) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(program) << lastError(gl);
         EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations);
         auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT, 1,
                                                 1, 1, VERNON_RHI_IMAGE_STORAGE);
@@ -807,14 +1135,14 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
         argument.image.view = imageView.reference;
         ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
                   VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         EXPECT_EQ(dispatchCount, 1u);
         EXPECT_EQ(storageBindingCount, 1u);
         EXPECT_EQ(memoryBarrierCount, 3u);
         EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations + 1);
         ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
                   VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         EXPECT_EQ(dispatchCount, 2u);
         EXPECT_EQ(storageBindingCount, 2u);
         EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
@@ -836,7 +1164,7 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
 
     {
         vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
-        ASSERT_TRUE(program) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(program) << lastError(gl);
         VernonProgramParameterView imageParameter{};
         ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(program.get(), {"image", 5}, &imageParameter),
                   VERNON_STATUS_OK);
@@ -913,9 +1241,9 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     options.bundle_directory = directory.c_str();
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(gl, bundleData.data(), bundleData.size(), &options);
-    ASSERT_TRUE(bundle) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    ASSERT_TRUE(bundle) << lastError(gl);
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    ASSERT_TRUE(pipeline) << lastError(gl);
 
     constexpr std::array<float, 6> positions{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
     auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), sizeof(positions), alignof(float),
@@ -959,7 +1287,7 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
     ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics),
               VERNON_STATUS_OK)
-        << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        << lastError(gl);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
     EXPECT_EQ(signedUniformUpload[0], maxSteps);
 
@@ -997,6 +1325,268 @@ TEST(RuntimeExternalGl, PacksRowMajorMatricesForOpenGlEs) {
     };
     expectMatrixUpload(VERNON_RUNTIME_OPENGL_ES, VERNON_OPENGLES_MATRIX_UNIFORM_BUNDLE, 3, 1, rowMajor, strides, 0,
                        columnMajor);
+}
+#endif
+
+TEST(RuntimeExternalGl, ForwardsDebugLabelsWithinTheContextLimits) {
+    const std::vector<std::string> core{"push a", "push b", "marker abc", "marker d\xC3\xA9", "pop", "pop"};
+    EXPECT_EQ(recordDebugLabels(VERNON_RUNTIME_OPENGL, 4, 3), core);
+    EXPECT_EQ(recordDebugLabels(VERNON_RUNTIME_OPENGL, 4, 1, {"GL_KHR_debug"}), core);
+    EXPECT_EQ(recordDebugLabels(VERNON_RUNTIME_OPENGL_ES, 3, 2), core);
+    EXPECT_EQ(
+        recordDebugLabels(VERNON_RUNTIME_OPENGL_ES, 3, 1, {"GL_KHR_debug"}),
+        (std::vector<std::string>{"KHR", "push a", "KHR", "push b", "marker abc", "marker d\xC3\xA9", "pop", "pop"}));
+}
+
+TEST(RuntimeExternalGl, RecordsNoDebugLabelsWithoutKhrDebug) {
+    EXPECT_TRUE(recordDebugLabels(VERNON_RUNTIME_OPENGL, 4, 1).empty());
+    EXPECT_TRUE(recordDebugLabels(VERNON_RUNTIME_OPENGL_ES, 3, 1).empty());
+}
+
+TEST(RuntimeExternalGl, ClosesTheDebugGroupsOfADestroyedEncoder) {
+    debugGroupDepth = 1;
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_NE(gl, nullptr);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+    orderedCalls.clear();
+    for (const std::string_view label : {"a", "b"})
+        ASSERT_EQ(vernonRhiCommandEncoderPushDebugGroup(device, encoder, {label.data(), label.size()}),
+                  VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(orderedCalls, (std::vector<std::string>{"push a", "push b", "pop", "pop"}));
+    EXPECT_EQ(debugGroupDepth, 1);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, ReportsNestedTimerSpansFromTheFirstTimer) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_NE(gl, nullptr);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    const VernonRhiCommandEncoder encoder = createGraphicsEncoder(device);
+    orderedCalls.clear();
+    deletedQueries.clear();
+    std::array<uint32_t, 2> timers{};
+    ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timers[0]), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timers[1]), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(timers, (std::array<uint32_t, 2>{0, 1}));
+    ASSERT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timers[1]), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timers[0]), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    std::vector<VernonRhiTimerSpan> spans;
+    ASSERT_EQ(submitAndReadTimers(device, encoder, spans), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(spans.size(), 2U);
+    EXPECT_EQ(spans[0].begin_nanoseconds, 0U);
+    EXPECT_EQ(spans[0].end_nanoseconds, 30U);
+    EXPECT_EQ(spans[1].begin_nanoseconds, 10U);
+    EXPECT_EQ(spans[1].end_nanoseconds, 20U);
+    EXPECT_EQ(orderedCalls, std::vector<std::string>(4, "timestamp"));
+    EXPECT_EQ(deletedQueries.size(), 4U);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, RejectsUnbalancedTimersAndReleasesAbandonedQueries) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_NE(gl, nullptr);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    const VernonRhiCommandEncoder encoder = createGraphicsEncoder(device);
+    deletedQueries.clear();
+    EXPECT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, 0), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, nullptr), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    std::array<uint32_t, 2> timers{};
+    ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timers[0]), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timers[0]), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timers[0]), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timers[1]), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_TRUE(deletedQueries.empty());
+    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(deletedQueries.size(), 3U);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, ReportsTimersUnsupportedWithoutTimerQueries) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL_ES, 3, 1);
+    ASSERT_NE(gl, nullptr);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    const VernonRhiCommandEncoder encoder = createGraphicsEncoder(device);
+    orderedCalls.clear();
+    uint32_t timer{};
+    ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    std::vector<VernonRhiTimerSpan> spans;
+    EXPECT_EQ(submitAndReadTimers(device, encoder, spans), VERNON_RHI_STATUS_UNSUPPORTED);
+    EXPECT_TRUE(orderedCalls.empty());
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, FailsOnlyTheTimersThatADisjointEventInterrupts) {
+    exposedExtensions = {"GL_EXT_disjoint_timer_query"};
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL_ES, 3, 1);
+    exposedExtensions.clear();
+    ASSERT_NE(gl, nullptr);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    for (const bool interrupted : {false, true}) {
+        const VernonRhiCommandEncoder encoder = createGraphicsEncoder(device);
+        gpuDisjoint = 1;
+        uint32_t timer{};
+        ASSERT_EQ(vernonRhiCommandEncoderBeginTimer(device, encoder, &timer), VERNON_RHI_STATUS_OK);
+        if (interrupted)
+            gpuDisjoint = 1;
+        ASSERT_EQ(vernonRhiCommandEncoderEndTimer(device, encoder, timer), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+        std::vector<VernonRhiTimerSpan> spans;
+        EXPECT_EQ(submitAndReadTimers(device, encoder, spans),
+                  interrupted ? VERNON_RHI_STATUS_UNSUPPORTED : VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(spans.size(), interrupted ? 0U : 1U);
+    }
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+#if defined(VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE)
+TEST(RuntimeExternalGl, NestsFusedNodeDrawsInTheirLabelledGroups) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+    ASSERT_TRUE(bundle);
+    std::array<VernonProgramNodeId, 2> nodes{};
+    VernonProgramExecutable *executable = resolveSceneOverlayGraph(gl, bundle, nodes);
+    ASSERT_TRUE(executable) << lastError(gl);
+
+    VernonSubmission *submission = nullptr;
+    EXPECT_EQ(executeModuleGraphics(gl, executable, {}, nullptr, &submission),
+              (std::vector<std::string>{"push scene+overlay", "push scene", "draw", "pop", "push overlay", "draw",
+                                        "pop", "pop"}));
+    EXPECT_TRUE(readScopeTimings(gl, submission).empty());
+    vernonSubmissionDestroy(submission);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, TimesFusedNodesAsOneScope) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+    ASSERT_TRUE(bundle);
+    std::array<VernonProgramNodeId, 2> nodes{};
+    VernonProgramExecutable *executable = resolveSceneOverlayGraph(gl, bundle, nodes);
+    ASSERT_TRUE(executable) << lastError(gl);
+
+    const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_WAIT, 1);
+    VernonSubmission *submission = nullptr;
+    EXPECT_EQ(executeModuleGraphics(gl, executable, {}, &options, &submission),
+              (std::vector<std::string>{"push scene+overlay", "timestamp", "push scene", "draw", "pop", "push overlay",
+                                        "draw", "pop", "timestamp", "pop"}));
+    const std::vector<VernonScopeTiming> scopes = readScopeTimings(gl, submission);
+    ASSERT_EQ(scopes.size(), 1U);
+    EXPECT_EQ(scopes[0].first_node, nodes[0]);
+    EXPECT_EQ(scopes[0].node_count, 2U);
+    EXPECT_EQ(scopes[0].device_submission, 0U);
+    EXPECT_EQ(scopes[0].begin_nanoseconds, 0U);
+    EXPECT_EQ(scopes[0].end_nanoseconds, 10U);
+    vernonSubmissionDestroy(submission);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, ReportsScopeTimingsOnceAnAsynchronousSubmissionCompletes) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+        ASSERT_TRUE(pass);
+        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_ASYNCHRONOUS, 1);
+        VernonSubmission *submission = nullptr;
+        fencesPending = true;
+        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
+        size_t count = 1;
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_NOT_READY);
+        EXPECT_EQ(count, 0U);
+        fencesPending = false;
+        const std::vector<VernonScopeTiming> scopes = readScopeTimings(gl, submission);
+        ASSERT_EQ(scopes.size(), 1U);
+        EXPECT_EQ(scopes[0].node_count, 1U);
+        EXPECT_EQ(scopes[0].begin_nanoseconds, 0U);
+        EXPECT_EQ(scopes[0].end_nanoseconds, 10U);
+        vernonSubmissionDestroy(submission);
+    }
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, ReportsNoScopeTimingsForAFailedSubmission) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+        ASSERT_TRUE(pass);
+        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_ASYNCHRONOUS, 1);
+        VernonSubmission *submission = nullptr;
+        fencesPending = true;
+        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
+        fencesPending = false;
+        vernon::runtime::program_execution::setFailureInjectionForTesting(
+            vernon::runtime::program_execution::FailureBoundary::Completion);
+        size_t count = 1;
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_INTERNAL_ERROR);
+        vernon::runtime::program_execution::clearFailureInjectionForTesting();
+        EXPECT_EQ(lastError(gl), "injected GPU command DAG wait failure");
+        EXPECT_EQ(count, 0U);
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_INTERNAL_ERROR);
+        EXPECT_EQ(lastError(gl), "the submission failed, so its scopes were not timed");
+        vernonSubmissionDestroy(submission);
+    }
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, ReportsScopeTimingsUnsupportedWithoutTimerQueries) {
+    exposeTimerQueries = false;
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    exposeTimerQueries = true;
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+        ASSERT_TRUE(pass);
+        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_WAIT, 1);
+        VernonSubmission *submission = nullptr;
+        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
+        size_t count = 1;
+        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_UNSUPPORTED_TARGET);
+        EXPECT_EQ(lastError(gl), "the device cannot time the submission's scopes");
+        EXPECT_EQ(count, 0U);
+        vernonSubmissionDestroy(submission);
+    }
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, KeepsRecordedDebugCommandsBetweenTheirDraws) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
+        ASSERT_TRUE(pass);
+        VernonGraphicsCommand draw{};
+        draw.kind = VERNON_GRAPHICS_COMMAND_DRAW;
+        draw.draw = {sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
+        VernonGraphicsCommand bindPipeline{};
+        bindPipeline.kind = VERNON_GRAPHICS_COMMAND_BIND_PIPELINE;
+        EXPECT_EQ(
+            executeModuleGraphics(gl, pass.get(),
+                                  {graphicsCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"), bindPipeline,
+                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "a"), draw,
+                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "b"), draw,
+                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP),
+                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "c")}),
+            (std::vector<std::string>{"push ExternalVerticesGraphics.graphics", "push triangles", "marker a", "draw",
+                                      "marker b", "draw", "pop", "marker c", "pop"}));
+    }
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif
 
@@ -1057,7 +1647,7 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     ASSERT_TRUE(gl);
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline.get()), 2u);
 
         RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
@@ -1119,9 +1709,9 @@ TEST(RuntimeExternalGl, MirrorsDeclaredFrontFaceForTheFlippedVertexY) {
         cullMode = 0;
         frontWinding = 0;
         vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         EXPECT_EQ(cullMode, kBack) << manifest;
         EXPECT_EQ(frontWinding, expectedWinding) << manifest;
     }
@@ -1164,9 +1754,9 @@ TEST(RuntimeExternalGl, AppliesDeclaredDepthStencilAndBlendState) {
     colorWriteMask = {};
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
     }
     EXPECT_EQ(stencilFuncCount, 2U);
     EXPECT_EQ(stencilReference, 23);
@@ -1212,7 +1802,7 @@ TEST(RuntimeExternalGl, PointsSpilledUniformBlocksAtTheirPlannedBinding) {
     ASSERT_TRUE(gl);
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
         EXPECT_EQ(uniformBlockBindings, (std::unordered_map<GlUint, GlUint>{{0u, 2u}}));
     }
     linkedUniformBlocks.clear();
@@ -1248,7 +1838,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     ASSERT_TRUE(gl);
     {
         vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_INDEXED_VERTEX_BUNDLE);
-        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        ASSERT_TRUE(pipeline) << lastError(gl);
 
         auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), 36, alignof(float), VERNON_RHI_BUFFER_VERTEX);
         auto indices = vernon::tests::createBuffer(rhiRuntime(gl), 12, alignof(uint32_t), VERNON_RHI_BUFFER_INDEX);
@@ -1280,7 +1870,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
         vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 0, 3);
         graphics.draw.index_binding = &indexBinding;
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+            << lastError(gl);
         void *vertexNative = nullptr;
         void *indexNative = nullptr;
         ASSERT_EQ(vernonRhiDeviceGetBufferNativeHandle(rhiRuntime(gl).device, vertices.handle, &vertexNative),
@@ -1332,8 +1922,7 @@ TEST(RuntimeExternalGl, BindsCompilerSupportedVertexNumericFormatsFromCanonicalP
         ASSERT_TRUE(gl);
         {
             vernon::tests::OwnedProgramExecutable pipeline(gl, format.manifest);
-            ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data,
-                                                 vernonRuntimeGetLastError(gl).size);
+            ASSERT_TRUE(pipeline) << lastError(gl);
             const uint32_t stride = 3 * format.size;
             auto vertices =
                 vernon::tests::createBuffer(rhiRuntime(gl), 3 * stride, format.size, VERNON_RHI_BUFFER_VERTEX);
@@ -1363,7 +1952,7 @@ TEST(RuntimeExternalGl, BindsCompilerSupportedVertexNumericFormatsFromCanonicalP
             const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3, 3);
             ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics),
                       VERNON_STATUS_OK)
-                << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+                << lastError(gl);
             EXPECT_EQ(vertexAttributeType, format.nativeType);
             EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
             EXPECT_EQ(vertexAttributeStride, static_cast<GlSize>(stride));

@@ -523,9 +523,24 @@ typedef struct VernonProgramInvocationOptions {
     uint32_t struct_size;
     uint32_t abi_version;
     VernonCompletionMode completion_mode;
+    /* 1 to measure the device time of each scope Execute runs (vernonSubmissionGetScopeTimings), otherwise 0. */
+    uint32_t timings;
     /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
+    uint32_t reserved[3];
 } VernonProgramInvocationOptions;
+
+/* specs/runtime/gpu_profiling.md section 3. A scope is one native render scope, holding `node_count` fused graphics
+ * Nodes from `first_node`, or one compute Node. Begin and end count from the first scope's begin in the same
+ * `device_submission`, the index of the device submission among those the Execute made; clocks of different device
+ * submissions are unrelated. */
+typedef struct VernonScopeTiming {
+    VernonProgramNodeId first_node;
+    uint32_t node_count;
+    uint32_t device_submission;
+    uint32_t reserved;
+    uint64_t begin_nanoseconds;
+    uint64_t end_nanoseconds;
+} VernonScopeTiming;
 
 typedef struct VernonProgramBundleLoadOptions {
     uint32_t struct_size;
@@ -554,10 +569,12 @@ VERNON_RUNTIME_CAPI VernonProgramGraph *vernonRuntimeProgramGraphCreate(VernonRu
 VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeProgramGraphCreateResult(VernonRuntimeContext *context,
                                                                                        VernonProgramGraph **output);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph);
+/* `label` names the child's Nodes in debug groups and diagnostics: the label itself for a child with one Node,
+ * otherwise `label/<Node name>`. An empty label is the child's bundle id. Labels never enter identity. */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph,
                                                                      const VernonProgramBundle *bundle,
                                                                      const VernonProgramVariantSelector *selector,
-                                                                     VernonProgramNodeId *node);
+                                                                     VernonStringView label, VernonProgramNodeId *node);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *graph,
                                                                        VernonProgramNodeId node,
                                                                        VernonProgramBoundaryRole role,
@@ -705,7 +722,12 @@ typedef enum VernonGraphicsCommandKind {
     VERNON_GRAPHICS_COMMAND_SET_VIEWPORT = 2,
     VERNON_GRAPHICS_COMMAND_SET_SCISSOR = 3,
     VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE = 4,
-    VERNON_GRAPHICS_COMMAND_DRAW = 5
+    VERNON_GRAPHICS_COMMAND_DRAW = 5,
+    /* Debug groups and markers name the draws between them in capture tools and have no effect on rendering. Pushes
+     * and pops balance within one recording, which otherwise fails at Execute with PROGRAM_RECORDING_INVALID. */
+    VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP = 6,
+    VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP = 7,
+    VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER = 8
 } VernonGraphicsCommandKind;
 
 typedef struct VernonGraphicsCommand {
@@ -719,6 +741,8 @@ typedef struct VernonGraphicsCommand {
         uint32_t stencil_reference;
         /* Same meaning and validation as vernonRuntimeProgramInvocationBindDrawCommand; copied on record. */
         VernonDrawCommand draw;
+        /* UTF-8, copied on record. */
+        VernonStringView label;
     };
 } VernonGraphicsCommand;
 
@@ -772,6 +796,13 @@ VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submissi
  * pending. `outcome` follows the storage rules of vernonRuntimeProgramInvocationExecute. */
 VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetMutationOutcome(const VernonSubmission *submission,
                                                                     VernonInvocationMutationOutcome *outcome);
+/* The timed scopes of the Execute that produced the submission, in execution order; none when it did not request
+ * `timings`. Null `scopes` queries `count`; a smaller `capacity` than `count` is INVALID_ARGUMENT. NOT_READY while
+ * the submission is pending, INTERNAL_ERROR once it failed, UNSUPPORTED_TARGET when the device could not time its
+ * scopes. */
+VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetScopeTimings(const VernonSubmission *submission,
+                                                                 VernonScopeTiming *scopes, size_t capacity,
+                                                                 size_t *count);
 VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetBoundaryCount(const VernonProgramExecutable *pipeline,
