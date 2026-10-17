@@ -121,7 +121,7 @@ class AutodiffProfilePlan:
 def _gradient_type(value_type: ConcreteType) -> ConcreteType:
     if value_type.kind == "scalar":
         if not value_type.is_float:
-            raise ValueError(f"{value_type.mlir} is not differentiable")
+            raise ValueError(f"{value_type.spelling} is not differentiable")
         return ConcreteType("scalar", "f64" if value_type.name == "f64" else "f32")
     if value_type.kind == "tensor":
         element = value_type.arguments[0]
@@ -135,7 +135,7 @@ def _gradient_type(value_type: ConcreteType) -> ConcreteType:
         if any(not isinstance(extent, int) or extent <= 0 for extent in shape):
             raise ValueError("initial TensorView gradients require a positive static shape")
         return ConcreteType("tensor", "Tensor", (_gradient_type(element), *shape))
-    raise ValueError(f"{value_type.mlir} is not one differentiable ABI leaf")
+    raise ValueError(f"{value_type.spelling} is not one differentiable ABI leaf")
 
 
 def _structured_derivative_type(value_type: ConcreteType, access: str) -> ConcreteType:

@@ -225,6 +225,18 @@ using ImageViewNativeHandleCallback = Result<uint64_t, RhiError> (*)(VernonRhiDe
 using ImageViewResourceCallback = Result<uint64_t, RhiError> (*)(VernonRhiDevice, VernonRhiImageView) noexcept;
 using DescribeImageViewResourceCallback = Result<ImageViewResourceDescription, RhiError> (*)(VernonRhiDevice,
                                                                                              uint64_t) noexcept;
+// The front end checks that the descriptor's backend is the device's and that configurations fit the capabilities.
+using CreateSurfaceCallback = Result<VernonRhiSurface, RhiError> (*)(VernonRhiDevice,
+                                                                     const VernonRhiSurfaceDescriptor &);
+using SurfaceCapabilitiesCallback = Result<VernonRhiSurfaceCapabilities, RhiError> (*)(VernonRhiDevice,
+                                                                                       VernonRhiSurface);
+using ConfigureSurfaceCallback = Result<void, RhiError> (*)(VernonRhiDevice, VernonRhiSurface,
+                                                            const VernonRhiSurfaceConfiguration &);
+using AcquireSurfaceImageCallback = Result<VernonRhiSurfaceImage, RhiError> (*)(VernonRhiDevice, VernonRhiSurface);
+// Releases the acquired image even when presenting fails, and stores it in `released`; it stays invalid when no image
+// was acquired.
+using PresentSurfaceCallback = Result<void, RhiError> (*)(VernonRhiDevice, VernonRhiSurface, VernonRhiImage &released);
+using SurfaceOperationCallback = Result<void, RhiError> (*)(VernonRhiDevice, VernonRhiSurface);
 
 struct BackendDispatch {
     VernonRhiBackend backend;
@@ -295,6 +307,13 @@ struct BackendDispatch {
     Option<ImageViewNativeHandleCallback> getImageViewNativeHandle;
     Option<ImageViewResourceCallback> imageViewResource;
     Option<DescribeImageViewResourceCallback> describeImageViewResource;
+
+    Option<CreateSurfaceCallback> createSurface;
+    Option<SurfaceCapabilitiesCallback> surfaceCapabilities;
+    Option<ConfigureSurfaceCallback> configureSurface;
+    Option<AcquireSurfaceImageCallback> acquireSurfaceImage;
+    Option<PresentSurfaceCallback> presentSurface;
+    Option<SurfaceOperationCallback> destroySurface;
 };
 
 VERNON_RHI_CAPI void setDeviceCreationError(std::string_view error) noexcept;

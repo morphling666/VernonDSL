@@ -164,9 +164,7 @@ class _ForwardInterpreter:
             self._body(function.body, owner, locals_, _forward_function(owner).__globals__)
         except _ForwardReturn as returned:
             return returned.value
-        if self.capture.graphics_calls:
-            return None
-        raise TypeError(f"{type(owner).__name__}.forward must return a value")
+        return None
 
     def _body(
         self,

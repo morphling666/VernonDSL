@@ -157,8 +157,10 @@ vernon::Result<void, vernon::RhiError> dispatchStatusImpl(VernonRhiDevice device
         return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
     }
 
-#define VERNON_OPTIONAL_RESULT_ACCESS_IMPL(name, operation, access, parameters, arguments)                             \
+#define VERNON_OPTIONAL_RESULT_CHECKED_IMPL(name, operation, access, precondition, parameters, arguments)              \
     static vernon::Result<void, vernon::RhiError> name##Impl parameters {                                              \
+        if (auto checked = precondition; checked.isErr())                                                              \
+            return checked;                                                                                            \
         return dispatchStatusImpl(                                                                                     \
             device, #operation,                                                                                        \
             [&](const vernon::rhi::BackendDispatch &backend) {                                                         \
@@ -173,6 +175,9 @@ vernon::Result<void, vernon::RhiError> dispatchStatusImpl(VernonRhiDevice device
         return vernon::rhi::publicStatusBoundary([&] { return name##Impl arguments; });                                \
     }
 
+#define VERNON_OPTIONAL_RESULT_ACCESS_IMPL(name, operation, access, parameters, arguments)                             \
+    VERNON_OPTIONAL_RESULT_CHECKED_IMPL(name, operation, access,                                                       \
+                                        (vernon::Result<void, vernon::RhiError>{vernon::ok()}), parameters, arguments)
 #define VERNON_REQUIRED_RESULT_IMPL(name, operation, parameters, arguments)                                            \
     VERNON_REQUIRED_RESULT_ACCESS_IMPL(name, operation, HostAccess::None, parameters, arguments)
 #define VERNON_OPTIONAL_RESULT_IMPL(name, operation, parameters, arguments)                                            \
@@ -304,14 +309,24 @@ VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceUploadImage, uploadImage,
                             (VernonRhiDevice device, VernonRhiImage image,
                              const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount),
                             (device, image, uploads, uploadCount))
-VERNON_OPTIONAL_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadImage, downloadImage, HostAccess::ReadsResults,
-                                   (VernonRhiDevice device, VernonRhiImage image,
-                                    const VernonRhiImageDownloadDescriptor *descriptor, void *destination, size_t size),
-                                   (device, image, descriptor, destination, size))
-VERNON_OPTIONAL_RESULT_ACCESS_IMPL(vernonRhiDeviceDownloadImageBatch, downloadImageBatch, HostAccess::ReadsResults,
-                                   (VernonRhiDevice device, VernonRhiImage image,
-                                    const VernonRhiImageDownload *downloads, size_t downloadCount),
-                                   (device, image, downloads, downloadCount))
+static vernon::Result<void, vernon::RhiError> definedImageContents(VernonRhiDevice device, VernonRhiImage image,
+                                                                   const char *operation) {
+    if (vernon::rhi::imageContentsUndefined(device, vernon::rhi::encodeResourceKey(image)))
+        return vernon::rhi::invalidResult(operation, image.generation, image.index);
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+VERNON_OPTIONAL_RESULT_CHECKED_IMPL(vernonRhiDeviceDownloadImage, downloadImage, HostAccess::ReadsResults,
+                                    (definedImageContents(device, image, "downloadImage")),
+                                    (VernonRhiDevice device, VernonRhiImage image,
+                                     const VernonRhiImageDownloadDescriptor *descriptor, void *destination,
+                                     size_t size),
+                                    (device, image, descriptor, destination, size))
+VERNON_OPTIONAL_RESULT_CHECKED_IMPL(vernonRhiDeviceDownloadImageBatch, downloadImageBatch, HostAccess::ReadsResults,
+                                    (definedImageContents(device, image, "downloadImageBatch")),
+                                    (VernonRhiDevice device, VernonRhiImage image,
+                                     const VernonRhiImageDownload *downloads, size_t downloadCount),
+                                    (device, image, downloads, downloadCount))
 VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceGenerateImageMipmaps, generateImageMipmaps,
                             (VernonRhiDevice device, VernonRhiImage image), (device, image))
 VERNON_OPTIONAL_RESULT_IMPL(vernonRhiDeviceBindImage, bindImage,
@@ -418,6 +433,173 @@ extern "C" VernonRhiStatus vernonRhiDeviceGetBufferNativeHandle(VernonRhiDevice 
                                                                 void **output) {
     return vernon::rhi::publicStatusBoundary(
         [&] { return vernonRhiDeviceGetBufferNativeHandleImpl(device, buffer, output); });
+}
+
+template <typename Member> const auto *surfaceCallback(const vernon::rhi::BackendDispatch &backend, Member member) {
+    const auto &callback = backend.*member;
+    return callback ? &callback.value() : nullptr;
+}
+
+static vernon::Result<void, vernon::RhiError>
+vernonRhiDeviceCreateSurfaceImpl(VernonRhiDevice device, const VernonRhiSurfaceDescriptor *descriptor,
+                                 VernonRhiSurface *output) {
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !output)
+        return vernon::rhi::invalidResult("createSurface");
+    return dispatchStatusImpl(device, "createSurface", [&](const vernon::rhi::BackendDispatch &backend) {
+        const auto *create = surfaceCallback(backend, &vernon::rhi::BackendDispatch::createSurface);
+        if (!create)
+            return vernon::rhi::unsupportedResult("createSurface");
+        if (dispatch(descriptor->backend) != &backend)
+            return vernon::rhi::invalidResult("createSurface", static_cast<uint64_t>(descriptor->backend));
+        auto reserved = vernon::rhi::reserveUndefinedImage(device);
+        if (reserved.isErr())
+            return reserved;
+        auto created = (*create)(device, *descriptor);
+        if (created.isErr()) {
+            vernon::rhi::releaseUndefinedImage(device);
+            return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(created).error())};
+        }
+        *output = created.value();
+        return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceCreateSurface(VernonRhiDevice device,
+                                                        const VernonRhiSurfaceDescriptor *descriptor,
+                                                        VernonRhiSurface *output) {
+    return vernon::rhi::publicStatusBoundary(
+        [&] { return vernonRhiDeviceCreateSurfaceImpl(device, descriptor, output); });
+}
+
+static vernon::Result<VernonRhiSurfaceCapabilities, vernon::RhiError>
+surfaceCapabilities(const vernon::rhi::BackendDispatch &backend, VernonRhiDevice device, VernonRhiSurface surface) {
+    const auto *query = surfaceCallback(backend, &vernon::rhi::BackendDispatch::surfaceCapabilities);
+    if (!query)
+        return vernon::Result<VernonRhiSurfaceCapabilities, vernon::RhiError>{
+            vernon::err(vernon::rhi::unsupported("surfaceCapabilities"))};
+    return (*query)(device, surface);
+}
+
+static vernon::Result<void, vernon::RhiError>
+vernonRhiSurfaceGetCapabilitiesImpl(VernonRhiDevice device, VernonRhiSurface surface,
+                                    VernonRhiSurfaceCapabilities *output) {
+    if (!output || output->struct_size < sizeof(*output))
+        return vernon::rhi::invalidResult("surfaceCapabilities");
+    return dispatchStatusImpl(device, "surfaceCapabilities", [&](const vernon::rhi::BackendDispatch &backend) {
+        auto queried = surfaceCapabilities(backend, device, surface);
+        if (queried.isErr())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(queried).error())};
+        *output = queried.value();
+        output->struct_size = sizeof(*output);
+        return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiSurfaceGetCapabilities(VernonRhiDevice device, VernonRhiSurface surface,
+                                                           VernonRhiSurfaceCapabilities *output) {
+    return vernon::rhi::publicStatusBoundary(
+        [&] { return vernonRhiSurfaceGetCapabilitiesImpl(device, surface, output); });
+}
+
+static vernon::Result<void, vernon::RhiError>
+supportedSurfaceConfiguration(const VernonRhiSurfaceCapabilities &capabilities,
+                              const VernonRhiSurfaceConfiguration &configuration) {
+    if (!configuration.width || !configuration.height || !(configuration.usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
+        configuration.present_mode > VERNON_RHI_PRESENT_IMMEDIATE)
+        return vernon::rhi::invalidResult("configureSurface");
+    const auto *formatsEnd =
+        capabilities.formats + std::min(size_t{capabilities.format_count}, std::size(capabilities.formats));
+    const bool formatSupported = std::find(capabilities.formats, formatsEnd, configuration.format) != formatsEnd;
+    const bool countSupported =
+        configuration.image_count >= capabilities.min_image_count &&
+        (!capabilities.max_image_count || configuration.image_count <= capabilities.max_image_count);
+    if (!formatSupported || (configuration.usage & ~capabilities.usage) ||
+        !(capabilities.present_modes & (1u << configuration.present_mode)) || !countSupported)
+        return vernon::rhi::unsupportedResult("configureSurface");
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+static vernon::Result<void, vernon::RhiError>
+vernonRhiSurfaceConfigureImpl(VernonRhiDevice device, VernonRhiSurface surface,
+                              const VernonRhiSurfaceConfiguration *configuration) {
+    if (!configuration || configuration->struct_size < sizeof(*configuration))
+        return vernon::rhi::invalidResult("configureSurface");
+    return dispatchStatusImpl(device, "configureSurface", [&](const vernon::rhi::BackendDispatch &backend) {
+        const auto *configure = surfaceCallback(backend, &vernon::rhi::BackendDispatch::configureSurface);
+        if (!configure)
+            return vernon::rhi::unsupportedResult("configureSurface");
+        auto capabilities = surfaceCapabilities(backend, device, surface);
+        if (capabilities.isErr())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(capabilities).error())};
+        auto supported = supportedSurfaceConfiguration(capabilities.value(), *configuration);
+        if (supported.isErr())
+            return supported;
+        return (*configure)(device, surface, *configuration);
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiSurfaceConfigure(VernonRhiDevice device, VernonRhiSurface surface,
+                                                     const VernonRhiSurfaceConfiguration *configuration) {
+    return vernon::rhi::publicStatusBoundary(
+        [&] { return vernonRhiSurfaceConfigureImpl(device, surface, configuration); });
+}
+
+static vernon::Result<void, vernon::RhiError>
+vernonRhiSurfaceAcquireImageImpl(VernonRhiDevice device, VernonRhiSurface surface, VernonRhiSurfaceImage *output) {
+    if (!output || output->struct_size < sizeof(*output))
+        return vernon::rhi::invalidResult("acquireSurfaceImage");
+    return dispatchStatusImpl(device, "acquireSurfaceImage", [&](const vernon::rhi::BackendDispatch &backend) {
+        const auto *acquire = surfaceCallback(backend, &vernon::rhi::BackendDispatch::acquireSurfaceImage);
+        if (!acquire)
+            return vernon::rhi::unsupportedResult("acquireSurfaceImage");
+        auto acquired = (*acquire)(device, surface);
+        if (acquired.isErr())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(acquired).error())};
+        vernon::rhi::markImageContentsUndefined(device, vernon::rhi::encodeResourceKey(acquired.value().image));
+        *output = acquired.value();
+        output->struct_size = sizeof(*output);
+        return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiSurfaceAcquireImage(VernonRhiDevice device, VernonRhiSurface surface,
+                                                        VernonRhiSurfaceImage *output) {
+    return vernon::rhi::publicStatusBoundary([&] { return vernonRhiSurfaceAcquireImageImpl(device, surface, output); });
+}
+
+static vernon::Result<void, vernon::RhiError> vernonRhiSurfacePresentImpl(VernonRhiDevice device,
+                                                                          VernonRhiSurface surface) {
+    return dispatchStatusImpl(device, "presentSurface", [&](const vernon::rhi::BackendDispatch &backend) {
+        const auto *present = surfaceCallback(backend, &vernon::rhi::BackendDispatch::presentSurface);
+        if (!present)
+            return vernon::rhi::unsupportedResult("presentSurface");
+        VernonRhiImage released{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        auto presented = (*present)(device, surface, released);
+        if (released.generation)
+            vernon::rhi::forgetUndefinedImage(device, vernon::rhi::encodeResourceKey(released));
+        return presented;
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiSurfacePresent(VernonRhiDevice device, VernonRhiSurface surface) {
+    return vernon::rhi::publicStatusBoundary([&] { return vernonRhiSurfacePresentImpl(device, surface); });
+}
+
+static vernon::Result<void, vernon::RhiError> vernonRhiDeviceDestroySurfaceImpl(VernonRhiDevice device,
+                                                                                VernonRhiSurface surface) {
+    return dispatchStatusImpl(device, "destroySurface", [&](const vernon::rhi::BackendDispatch &backend) {
+        const auto *destroy = surfaceCallback(backend, &vernon::rhi::BackendDispatch::destroySurface);
+        if (!destroy)
+            return vernon::rhi::unsupportedResult("destroySurface");
+        auto destroyed = (*destroy)(device, surface);
+        if (destroyed.isOk())
+            vernon::rhi::releaseUndefinedImage(device);
+        return destroyed;
+    });
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceDestroySurface(VernonRhiDevice device, VernonRhiSurface surface) {
+    return vernon::rhi::publicStatusBoundary([&] { return vernonRhiDeviceDestroySurfaceImpl(device, surface); });
 }
 
 #undef VERNON_OPTIONAL_RESULT_IMPL

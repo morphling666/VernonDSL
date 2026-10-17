@@ -421,8 +421,12 @@ class OperationGraph:
         for path, value in outputs.items():
             if _resource_owner(value) is not None:
                 resolved[path] = self._current_version(value)
-        if not resolved and not any(isinstance(node, (KernelCallOp, GraphicsCallOp)) for node in self._nodes):
-            raise ValueError("Module.forward() must return at least one Program buffer")
+        # Without outputs, the Program's only effects are its writes to resources the caller passed in.
+        entry_owners = {self._values[value].owner for value in self.entry_values}
+        if not resolved and not any(
+            value.producer is not None and value.owner in entry_owners for value in self._values
+        ):
+            raise ValueError("Module.forward() must return a Program buffer or write one of its inputs")
         self._outputs = resolved
         self._validate()
 

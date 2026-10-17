@@ -233,10 +233,27 @@ class CompiledStage:
 
 
 @dataclass(frozen=True)
+class CompiledProgramVariant:
+    """One variant's compiled stages and the contracts its Program gives them, both keyed by logical stage.
+
+    Contracts belong to the variant, not to the compiled stage: variants that differ only in pipeline state, such as
+    a color target format, share one compiled stage whose bytes do not encode that state.
+    """
+
+    key: tuple[SpecializationAssignment, ...]
+    stages: Mapping[str, CompiledStage]
+    program: Mapping[str, Any]
+    contracts: Mapping[str, Mapping[str, Any]]
+    target_implementations: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProgramVariantPlan:
     key: tuple[SpecializationAssignment, ...]
     program: Mapping[str, Any]
     stage_implementations: Mapping[str, str]
+    stage_contracts: Mapping[str, Mapping[str, Any]]
+    stage_target_implementations: Mapping[str, Mapping[str, Any]]
 
     def __post_init__(self) -> None:
         if tuple(sorted(set(self.key))) != self.key or len({assignment.name for assignment in self.key}) != len(
@@ -261,8 +278,16 @@ class ProgramVariantPlan:
             raise ProgramCompileError("Program stage implementations must exactly cover its logical stages")
         if any(not isinstance(value, str) or not value for value in implementations.values()):
             raise ProgramCompileError("Program stage implementation identities must be non-empty strings")
+        if set(self.stage_contracts) != set(stages) or any(
+            not isinstance(contract, Mapping) for contract in self.stage_contracts.values()
+        ):
+            raise ProgramCompileError("Program stage contracts must exactly cover its logical stages")
+        if not set(self.stage_target_implementations) <= set(stages):
+            raise ProgramCompileError("Program target implementations name stages the Program does not have")
         object.__setattr__(self, "program", frozen_mapping(self.program))
         object.__setattr__(self, "stage_implementations", frozen_mapping(implementations))
+        object.__setattr__(self, "stage_contracts", frozen_mapping(self.stage_contracts))
+        object.__setattr__(self, "stage_target_implementations", frozen_mapping(self.stage_target_implementations))
 
 
 @dataclass(frozen=True)
@@ -295,6 +320,7 @@ class BundlePlan:
 __all__ = [
     "BundlePlan",
     "CompiledArtifact",
+    "CompiledProgramVariant",
     "CompiledStage",
     "CpuTargetOptions",
     "CudaTargetOptions",

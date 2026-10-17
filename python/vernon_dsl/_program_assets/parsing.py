@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .._formats import TEXTURE_FORMATS_BY_NAME
 from ..bundle import ProgramCompileError
 from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
@@ -29,6 +30,7 @@ from ..types import (
     check_type_identity_sources,
     f32,
     f64,
+    format_kind,
     i32,
     specialization_assignment,
     type_kind,
@@ -75,7 +77,15 @@ def _assigned_values(tree: ast.Module, name: str) -> list[ast.expr]:
     return values
 
 
-_SPECIALIZATION_TYPES = {"bool": bool_type, "i32": i32, "u32": u32, "f32": f32, "f64": f64, "type": type_kind}
+_SPECIALIZATION_TYPES = {
+    "bool": bool_type,
+    "i32": i32,
+    "u32": u32,
+    "f32": f32,
+    "f64": f64,
+    "type": type_kind,
+    "format": format_kind,
+}
 
 
 def _variant_parameter(source_path: Path, key: ast.expr) -> Specialization:
@@ -162,6 +172,17 @@ def _linted_assignment(source_path: Path, parameter: Specialization, value: ast.
             )
         identity, declared_in = reference
         return SpecializationAssignment(parameter.name, "type", identity, type_source=declared_in)
+    if parameter.type is format_kind:
+        format = TEXTURE_FORMATS_BY_NAME.get((dotted_name(value) or "").split(".")[-1])
+        if format is None:
+            raise ProgramCompileError(
+                f"variant value for format specialization '{parameter.name}' must name a texture format such as "
+                "vd.rgba8_unorm"
+            )
+        try:
+            return specialization_assignment(parameter, format)
+        except TypeError as error:
+            raise ProgramCompileError(str(error)) from None
     try:
         return specialization_assignment(parameter, ast.literal_eval(value))
     except (ValueError, TypeError, SyntaxError) as error:

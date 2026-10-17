@@ -309,6 +309,21 @@ Layered dimension mappings with backend-specific constraints:
   dimension is `2D`, and reads one layer back through `framebufferTextureLayer`.
 - Metal uses `MTLTextureTypeCubeArray`, whose `arrayLength` counts cubes.
 
+Surface images ([`presentable_surfaces.md`](presentable_surfaces.md)) are
+ordinary `2D` images with one mip level and one layer, so their descriptors,
+views, hazards and readback follow this document. Three rules differ:
+
+- The surface owns the image and its view. Destroying either through the image
+  API fails with `INVALID_ARGUMENT`; configuring or destroying the surface
+  destroys them, and retained records stay valid as for any destroyed image.
+- An acquired image's contents are undefined until a submitted command writes
+  it: a rendering scope that loads it with `CLEAR` or `DISCARD`, or a copy
+  into it. Until then the RHI command layer rejects a rendering scope that
+  preserves it, a sampled read of it, a copy from it and a download of it.
+  An encoder may read the image after its own earlier write.
+- Present transitions the image to `VERNON_RHI_STATE_PRESENT`, so no caller
+  declares that final transition.
+
 ## 8. Synchronization and hazards
 
 The private Command DAG tracks hazards by parent image identity plus overlapping

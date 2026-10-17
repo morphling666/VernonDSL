@@ -355,7 +355,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         from vernon_dsl.bundle import make_target_options
 
         native = import_module("vernon_dsl._native")
-        _, _, _, program = _compile_program_variant(
+        _, variant = _compile_program_variant(
             parsed,
             program_id=pipeline_id,
             variant=(),
@@ -364,7 +364,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             native=native,
             native_target=_native_target(native, "opengl"),
         )
-        return dict(program)
+        return dict(variant.program)
 
     def test_every_managed_invocation_requires_render_pass_control(self) -> None:
         vertices = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32)).view(access="read")
@@ -602,7 +602,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         )
         native = import_module("vernon_dsl._native")
         target = make_target_options("opengl", {"version": 410})
-        reflected_target, key, stages, program = _compile_program_variant(
+        reflected_target, variant = _compile_program_variant(
             parsed,
             program_id="tests/managed-graphics",
             variant=(),
@@ -611,7 +611,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             native=native,
             native_target=_native_target(native, "opengl"),
         )
-        plan = build_program_plan("tests/managed-graphics", reflected_target, ((key, stages, program),))
+        plan = build_program_plan("tests/managed-graphics", reflected_target, (variant,))
 
         self.assertEqual(len(plan.compiled_stages), 1)
         self.assertEqual(plan.compiled_stages[0].stage, "graphics")

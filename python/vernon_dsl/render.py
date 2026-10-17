@@ -9,9 +9,11 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from ._formats import TEXTURE_FORMATS_BY_NAME
 from ._runtime.tensor import TensorStorage, TensorView
 from ._runtime.texture import RenderTarget, TextureView
 from ._texture_format import TextureFormat
+from .types import Specialization, SpecializationAssignment, format_kind
 
 
 class LoadOperation(Enum):
@@ -212,6 +214,9 @@ class GraphicsTargetFormats:
     graphics-only field. Cooking requires them, because an asset has no render target to read them from. A live
     pipeline does have one, so there they are optional: when declared, the bound RenderPass is checked against them,
     the same way a Vulkan pipeline created with a set of formats may only be used in a compatible render pass.
+
+    A color target may name a `vd.format` specialization instead of a format, so one declaration cooks a pipeline
+    per format a presentable surface may be configured with; `resolved` substitutes a key's formats.
     """
 
     colors: tuple[tuple[int, Any], ...] = ()
@@ -225,8 +230,12 @@ class GraphicsTargetFormats:
         if any(location < 0 for location in locations):
             raise ValueError("color target locations must be non-negative")
         for _, format in self.colors:
+            if isinstance(format, Specialization):
+                if format.type is not format_kind:
+                    raise TypeError(f"color target specialization {format.name!r} must be declared as vd.format")
+                continue
             if not isinstance(format, TextureFormat):
-                raise TypeError("color target formats must be TextureFormat values")
+                raise TypeError("color target formats must be TextureFormat values or vd.format specializations")
             if "color" not in format.aspects:
                 raise ValueError(f"color target format {format.name!r} is not a color format")
         if self.depth is not None:
@@ -238,6 +247,34 @@ class GraphicsTargetFormats:
             raise ValueError("graphics target formats require at least one color or depth target")
         if isinstance(self.samples, bool) or not isinstance(self.samples, int) or self.samples < 1:
             raise ValueError("graphics target sample count must be a positive integer")
+
+    @property
+    def format_specializations(self) -> frozenset[str]:
+        return frozenset(format.name for _, format in self.colors if isinstance(format, Specialization))
+
+    def resolved(self, key: tuple[SpecializationAssignment, ...]) -> GraphicsTargetFormats:
+        """These targets with every format specialization replaced by its value in `key`.
+
+        A key must assign exactly the format specializations these targets name, since a format assignment changes
+        nothing but a target format.
+        """
+
+        formats = {assignment.name: assignment.value for assignment in key if assignment.type == "format"}
+        unknown = sorted(set(formats) - self.format_specializations)
+        if unknown:
+            raise ValueError(
+                "requested format specialization(s) the pipeline's color targets do not name: " + ", ".join(unknown)
+            )
+        missing = sorted(self.format_specializations - set(formats))
+        if missing:
+            raise ValueError("missing format specialization(s): " + ", ".join(missing))
+        if not formats:
+            return self
+        colors = tuple(
+            (location, TEXTURE_FORMATS_BY_NAME[formats[format.name]] if isinstance(format, Specialization) else format)
+            for location, format in self.colors
+        )
+        return GraphicsTargetFormats(colors, self.depth, self.samples)
 
 
 def target_formats(

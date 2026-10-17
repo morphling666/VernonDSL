@@ -151,7 +151,9 @@ and infers shape and access. The three-argument form fixes the complete static
 contract. Explicit constraints must agree with every nested kernel, Module,
 and graphics-pipeline use; read and write uses join to `read_write`, while
 `vd.dyn` unifies with a compatible static extent. Cooking rejects any unresolved
-element type, extent, or access instead of consulting runtime values.
+element type, extent, or access instead of consulting runtime values; a `vd.dyn`
+extent is resolved, and cooks as a runtime-bound extent exactly as it does for a
+bare kernel.
 
 `TensorStorage[...]` denotes an owner boundary and rejects borrowed
 `TensorView` values. A Module parameter intended to accept a full view or
@@ -312,6 +314,11 @@ Texture queries and sampling use resource-specific operations; they are not
 ordinary TensorView loads or stores. Sampler state is separate from sampled
 storage. Resource format, dimensions, binding, and backend capabilities are
 validated at entry interfaces and reflected in pipeline metadata.
+
+A Module may pass one Texture to a storage parameter of one call and a sampled
+parameter of a later call, as a bloom chain samples the level it just
+stored. The Module orders the calls by the Texture's resource versions, and
+the image needs both usages (runtime/image_resources.md section 3).
 
 The supported texture operation regions are:
 
@@ -490,6 +497,16 @@ initialized Module, or a supported explicit Program transform. Standalone
 compute and graphics executables normalize to one-node Programs. Modules may
 compose compute and graphics Nodes in one static Program DAG.
 
+`Module.forward()` returns the resources it publishes, or nothing. A forward
+that returns nothing must write one of its inputs: a `write` or `read_write`
+Texture or Tensor argument, or a render pass's attachments. That write is the
+Program's caller-visible side effect and is published `in_place`, so an
+asynchronous invocation accepts it
+([`../program/execution_manifest.md`](../program/execution_manifest.md)
+section 12). A forward that neither returns a resource nor writes an input
+fails with a diagnostic containing `must return a Program buffer or write one
+of its inputs`.
+
 Each graphics entry carries an explicit stage kind. A target-independent stage
 registry validates `vd.pipeline(...)` topology and ordering. The registered
 graphics topology is `vertex -> fragment`. Future stage additions can extend
@@ -511,8 +528,8 @@ module-qualified. The design rationale for sections 6.1 through 6.6 is in
 ### 6.1 Specializations and variants
 
 `vd.specialization(name, kind)` declares a compile-time value whose kind is
-`bool`, `i32`, `u32`, `f32`, `f64`, or `vd.type` (section 6.6);
-`vd.feature(name)` is the `bool` form. A specialization key binds declared
+`bool`, `i32`, `u32`, `f32`, `f64`, `vd.type` (section 6.6), or `vd.format`
+(section 6.6.1); `vd.feature(name)` is the `bool` form. A specialization key binds declared
 names to values. Specialization values and `When` branches are compile-time
 inputs, not runtime Python conditions.
 
@@ -661,6 +678,31 @@ module-level path fails with `type value has no portable identity`, and a value
 that is neither fails with
 `type specialization requires a declared type or scalar type`. A missing
 assignment fails where it is used with `missing type specialization`.
+
+#### 6.6.1 Format specializations
+
+`vd.specialization(name, vd.format)` declares a specialization whose value is a
+color texture format, for example `vd.rgba8_unorm`. It selects pipeline state,
+not source: its only use is as a color format in a graphics Pipeline's
+`vd.target_formats(colors=...)`, so one Pipeline declaration cooks one variant
+per attachment format, for example a format the presentable surface reports.
+
+- A value that is not a color format fails with
+  `requires a color texture format`.
+- A Pipeline's key must assign exactly the format specializations its color
+  targets name: an extra one fails with
+  `requested format specialization(s) the pipeline's color targets do not name`,
+  a missing one with `missing format specialization(s)`.
+- Format assignments are removed from the key before the source module graph
+  binds it, so the shader source and its compiled stages do not depend on them.
+  Naming one in device code fails with `not visible to device code`, and a
+  format assignment in the key of any asset other than a graphics Pipeline
+  fails with
+  `format specialization(s) select graphics pipeline color target formats only`.
+- A format's canonical identity is its format name, such as `rgba8_srgb`.
+
+Variants that differ only in format share compiled stage bytes but each own
+their stage contracts, because the contract records the attachment formats.
 
 ### 6.7 Processing order and identity
 

@@ -39,6 +39,7 @@ using BufferLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::BufferRe
 using ImageLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::ImageResourceTag>;
 using ImageViewLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::ImageViewResourceTag>;
 using SamplerLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::SamplerResourceTag>;
+using SurfaceLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::SurfaceResourceTag>;
 using ImageLease = vernon::rhi::RetainedResourceLease<vernon::rhi::ImageResourceTag>;
 
 constexpr std::size_t kMaximumOpenGLDevices = 256;
@@ -49,6 +50,8 @@ struct ImageSlot {
     Image image;
     VernonRhiImageDescriptor descriptor{};
     Enum target{};
+    // A surface owns the image, so only configuring or destroying the surface destroys it.
+    std::atomic<bool> surfaceOwned{};
 };
 
 struct IdentityImageViewBacking {
@@ -68,6 +71,7 @@ struct ImageViewSlot {
     uint64_t parentKey{};
     Enum target{};
     vernon::Option<ImageLease> parent;
+    std::atomic<bool> surfaceOwned{};
 };
 
 struct BufferSlot {
@@ -81,6 +85,23 @@ struct SamplerSlot {
     explicit SamplerSlot(SamplerLifecycle lifecycle) noexcept : lifecycle(std::move(lifecycle)) {}
     SamplerLifecycle lifecycle;
     vernon::rhi::opengl::Sampler sampler;
+};
+
+struct SurfaceImage {
+    VernonRhiImage image{};
+    VernonRhiImageView view{};
+};
+
+struct SurfaceSlot {
+    explicit SurfaceSlot(SurfaceLifecycle lifecycle) noexcept : lifecycle(std::move(lifecycle)) {}
+    SurfaceLifecycle lifecycle;
+    VernonOpenGLSurfaceCallbacks callbacks{};
+    // Guards the fields below. It is taken before the device's mutexes.
+    std::mutex mutex;
+    VernonRhiSurfaceConfiguration configuration{};
+    std::vector<SurfaceImage> images;
+    size_t next{};
+    bool acquired{};
 };
 
 struct OpenGLScopeAttachments {
@@ -105,6 +126,7 @@ struct OpenGLDevice {
     vernon::rhi::StableResourceSlotContainer<ImageSlot> images;
     vernon::rhi::StableResourceSlotContainer<ImageViewSlot> imageViews;
     vernon::rhi::StableResourceSlotContainer<SamplerSlot> samplers;
+    vernon::rhi::StableResourceSlotContainer<SurfaceSlot> surfaces;
     vernon::rhi::CommandDeviceStateRef commandState;
     std::string error;
     std::mutex resourceAllocationMutex;
@@ -201,6 +223,7 @@ vernon::Result<void, vernon::RhiError> teardownImage(void *context, ImageLifecyc
     slot->image = {};
     slot->descriptor = {};
     slot->target = 0;
+    slot->surfaceOwned.store(false, std::memory_order_relaxed);
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -227,6 +250,7 @@ vernon::Result<void, vernon::RhiError> teardownImageView(void *context, ImageVie
         slot->imageDescriptor = {};
         slot->parentKey = 0;
         slot->target = 0;
+        slot->surfaceOwned.store(false, std::memory_order_relaxed);
     }
     if (prepared.value().commit().isErr())
         vernon::resultContractViolation();
@@ -245,6 +269,41 @@ vernon::Result<void, vernon::RhiError> teardownSampler(void *context, SamplerLif
     device.state.destroySampler(slot->sampler);
     slot->sampler = {};
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+// Encoders that retained a surface image keep it alive until they complete.
+vernon::Result<void, vernon::RhiError> destroySurfaceImages(OpenGLDevice &device,
+                                                            std::vector<SurfaceImage> &images) noexcept {
+    vernon::Option<vernon::RhiError> failure;
+    const auto keep = [&](vernon::Result<void, vernon::RhiError> destroyed) {
+        if (destroyed.isErr() && !failure)
+            failure.emplace(std::move(destroyed).error());
+    };
+    for (const SurfaceImage &image : images) {
+        if (ImageViewSlot *view = indexedSlot(device.imageViews, image.view.index))
+            keep(view->lifecycle.destroyPublic({image.view.index, image.view.generation}));
+        if (ImageSlot *slot = indexedSlot(device.images, image.image.index))
+            keep(slot->lifecycle.destroyPublic({image.image.index, image.image.generation}));
+    }
+    images.clear();
+    if (failure)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(failure).value())};
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+// Runs under the slot's mutex, which destroySurface holds so that no image is acquired meanwhile.
+vernon::Result<void, vernon::RhiError> teardownSurface(void *context, SurfaceLifecycle::Handle handle) noexcept {
+    auto &device = *static_cast<OpenGLDevice *>(context);
+    SurfaceSlot *slot = indexedSlot(device.surfaces, handle.index);
+    if (!slot)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{
+            vernon::RhiErrorCode::LifecycleFailure, {"teardown_opengl_surface", handle.generation, handle.index}})};
+    auto destroyed = destroySurfaceImages(device, slot->images);
+    slot->callbacks = {};
+    slot->configuration = {};
+    slot->next = 0;
+    slot->acquired = false;
+    return destroyed;
 }
 
 vernon::Result<void, vernon::RhiError> teardownDevice(OpenGLDevice &device) noexcept {
@@ -377,6 +436,15 @@ void prepareOpenGLClears(gl::DeviceState &state, const vernon::rhi::RenderingSco
     driver.enable(gl::kScissorTest);
     driver.scissor(static_cast<Int>(scope.x), static_cast<Int>(scope.y), static_cast<Size>(scope.width),
                    static_cast<Size>(scope.height));
+    ++state.drawStateGeneration;
+}
+
+// glBlitFramebuffer honors the scissor test, which holds the last scope's or draw's state, and on desktop GL
+// GL_FRAMEBUFFER_SRGB, which a rendering scope whose native begin failed leaves enabled.
+void prepareOpenGLBlits(gl::DeviceState &state) {
+    state.driver.disable(gl::kScissorTest);
+    if (!state.embeddedProfile)
+        state.driver.disable(gl::kFramebufferSrgb);
     ++state.drawStateGeneration;
 }
 
@@ -1082,7 +1150,7 @@ Result<void, RhiError> destroyImage(VernonRhiDevice handle, VernonRhiImage image
         return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageSlot *slot = indexedSlot(state.images, image.index);
-    if (!slot)
+    if (!slot || slot->surfaceOwned.load(std::memory_order_relaxed))
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_image", image.generation, image.index}})};
     return slot->lifecycle.destroyPublic({image.index, image.generation});
@@ -1334,7 +1402,7 @@ Result<void, RhiError> destroyImageView(VernonRhiDevice handle, VernonRhiImageVi
         return Result<void, RhiError>{err(std::move(device).error())};
     OpenGLDevice &state = device.value().device();
     ImageViewSlot *slot = indexedSlot(state.imageViews, view.index);
-    if (!slot)
+    if (!slot || slot->surfaceOwned.load(std::memory_order_relaxed))
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_opengl_image_view", view.generation, view.index}})};
     return slot->lifecycle.destroyPublic({view.index, view.generation});
@@ -1629,6 +1697,7 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
             return Result<void, RhiError>{
                 err(RhiError{RhiErrorCode::ResourceExhausted, {"recordImageCopy_opengl", native, 0}})};
         }
+        prepareOpenGLBlits(state.state);
     }
     const auto releaseCopyFramebuffers = [&] {
         if (!framebufferCopy)
@@ -1647,8 +1716,8 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
                                     : depth && stencil ? gl::kDepthStencilAttachment
                                     : depth            ? gl::kDepthAttachment
                                                        : gl::kStencilAttachment;
-            const gl::Bitfield mask =
-                (color ? 0x00004000u : 0u) | (depth ? 0x00000100u : 0u) | (stencil ? 0x00000400u : 0u);
+            const gl::Bitfield mask = (color ? gl::kColorBufferBit : 0u) | (depth ? gl::kDepthBufferBit : 0u) |
+                                      (stencil ? gl::kStencilBufferBit : 0u);
             if (!mask) {
                 releaseCopyFramebuffers();
                 return Result<void, RhiError>{err(RhiError{
@@ -1678,7 +1747,7 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
                 static_cast<Int>(region.source_x + region.width), static_cast<Int>(region.source_y + region.height),
                 static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y),
                 static_cast<Int>(region.destination_x + region.width),
-                static_cast<Int>(region.destination_y + region.height), mask, 0x2600);
+                static_cast<Int>(region.destination_y + region.height), mask, gl::kNearest);
             if (auto scopeError = endErrorScope(state, "copy image with framebuffer")) {
                 releaseCopyFramebuffers();
                 return Result<void, RhiError>{err(std::move(*scopeError))};
@@ -1771,6 +1840,11 @@ Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_
         state.scopeGeneration = state.state.framebufferGeneration;
         state.scopeAttachmentsValid = true;
     }
+    // Desktop GL encodes sRGB attachment writes and clears only while GL_FRAMEBUFFER_SRGB is enabled (OpenGL ES always
+    // encodes). Image copies blit through framebuffers and must stay raw, so the state is scoped to rendering and
+    // every blit disables it again.
+    if (!state.state.embeddedProfile)
+        driver.enable(gl::kFramebufferSrgb);
     const bool depthClear = scope.hasDepth && scope.depth.depthLoad == VERNON_RHI_LOAD_CLEAR;
     const bool stencilClear = scope.hasDepth && scope.depth.stencil && scope.depth.stencilLoad == VERNON_RHI_LOAD_CLEAR;
     bool colorClear = false;
@@ -1799,6 +1873,9 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"endRendering_opengl", native, opened.kind}})};
     std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    if (!state.state.embeddedProfile)
+        state.state.driver.disable(gl::kFramebufferSrgb);
     if (!state.state.driver.invalidateFramebuffer)
         return Result<void, RhiError>{ok()};
     std::array<Enum, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 2> discarded{};
@@ -1815,7 +1892,6 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
     }
     if (!discardedCount)
         return Result<void, RhiError>{ok()};
-    state.state.makeCurrent();
     if (auto scopeError = beginErrorScope(state, "end rendering"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     state.state.driver.bindFramebuffer(gl::kFramebuffer, state.scopeFramebuffer);
@@ -2142,6 +2218,228 @@ vernon::Result<ImageViewResourceDescription, vernon::RhiError> describeImageView
         vernon::ok(ImageViewResourceDescription{slot->descriptor, slot->imageDescriptor, slot->parentKey})};
 }
 
+Result<VernonRhiSurface, RhiError> createSurface(VernonRhiDevice handle, const VernonRhiSurfaceDescriptor &descriptor) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(device).error())};
+    const VernonOpenGLSurfaceCallbacks *callbacks = descriptor.native.opengl;
+    if (!callbacks || callbacks->struct_size < sizeof(*callbacks) || !callbacks->make_current ||
+        !callbacks->swap_interval || !callbacks->swap_buffers || !callbacks->drawable_size)
+        return Result<VernonRhiSurface, RhiError>{err(invalidArgument("create_opengl_surface"))};
+    OpenGLDevice &state = device.value().device();
+    if (!state.state.driver.blitFramebuffer)
+        return Result<VernonRhiSurface, RhiError>{err(unsupported("create_opengl_surface"))};
+    auto owner = device.value().retainOwner();
+    if (owner.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(owner).error())};
+    auto reservation = vernon::rhi::ResourceCreationReservation::create(owner.value());
+    if (reservation.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(reservation).error())};
+    std::lock_guard<std::mutex> allocationGuard(state.resourceAllocationMutex);
+    auto available = availableSlot<SurfaceSlot, SurfaceLifecycle>(state.surfaces);
+    if (available.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(available).error())};
+    SurfaceSlot &slot = *available.value();
+    slot.callbacks = *callbacks;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &state, teardownSurface);
+    if (published.isErr()) {
+        slot.callbacks = {};
+        return Result<VernonRhiSurface, RhiError>{err(std::move(published).error())};
+    }
+    return Result<VernonRhiSurface, RhiError>{
+        ok(VernonRhiSurface{published.value().index, published.value().generation})};
+}
+
+Result<VernonRhiSurfaceCapabilities, RhiError> surfaceCapabilities(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<VernonRhiSurfaceCapabilities, RhiError>{err(std::move(device).error())};
+    SurfaceSlot *slot = indexedSlot(device.value().device().surfaces, surface.index);
+    auto pin = pinSlot(slot, surface);
+    if (pin.isErr())
+        return Result<VernonRhiSurfaceCapabilities, RhiError>{err(std::move(pin).error())};
+    VernonRhiSurfaceCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.formats[0] = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    capabilities.format_count = 1;
+    capabilities.present_modes =
+        (1u << VERNON_RHI_PRESENT_FIFO) | (1u << VERNON_RHI_PRESENT_MAILBOX) | (1u << VERNON_RHI_PRESENT_IMMEDIATE);
+    // Without sampled or storage usage, an acquired image is read only by a preserving rendering scope, a copy or a
+    // download, which are the reads the command layer rejects while its contents are undefined.
+    capabilities.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    capabilities.min_image_count = 1;
+    slot->callbacks.drawable_size(slot->callbacks.user_data, &capabilities.current_width, &capabilities.current_height);
+    return Result<VernonRhiSurfaceCapabilities, RhiError>{ok(capabilities)};
+}
+
+Result<SurfaceImage, RhiError> createSurfaceImage(VernonRhiDevice handle, OpenGLDevice &state,
+                                                  const VernonRhiImageDescriptor &descriptor) {
+    auto image = createImage(handle, &descriptor);
+    if (image.isErr())
+        return Result<SurfaceImage, RhiError>{err(std::move(image).error())};
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image.value();
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = descriptor.format;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    auto view = createImageView(handle, &viewDescriptor);
+    if (view.isErr()) {
+        if (destroyImage(handle, image.value()).isErr())
+            vernon::resultContractViolation();
+        return Result<SurfaceImage, RhiError>{err(std::move(view).error())};
+    }
+    indexedSlot(state.images, image.value().index)->surfaceOwned.store(true, std::memory_order_relaxed);
+    indexedSlot(state.imageViews, view.value().index)->surfaceOwned.store(true, std::memory_order_relaxed);
+    return Result<SurfaceImage, RhiError>{ok(SurfaceImage{image.value(), view.value()})};
+}
+
+// The new images replace the old ones only once all of them exist, so a failed configuration keeps the previous one.
+Result<void, RhiError> configureSurface(VernonRhiDevice handle, VernonRhiSurface surface,
+                                        const VernonRhiSurfaceConfiguration &configuration) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    SurfaceSlot *slot = indexedSlot(state.surfaces, surface.index);
+    auto pin = pinSlot(slot, surface);
+    if (pin.isErr())
+        return Result<void, RhiError>{err(std::move(pin).error())};
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (slot->acquired)
+        return invalidResult("configure_opengl_surface", surface.generation, surface.index);
+    std::vector<SurfaceImage> images;
+    try {
+        images.reserve(configuration.image_count);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"configure_opengl_surface", configuration.image_count, 0}})};
+    }
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = configuration.format;
+    descriptor.width = configuration.width;
+    descriptor.height = configuration.height;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage = configuration.usage;
+    for (uint32_t index = 0; index < configuration.image_count; ++index) {
+        auto created = createSurfaceImage(handle, state, descriptor);
+        if (created.isErr()) {
+            if (destroySurfaceImages(state, images).isErr())
+                vernon::resultContractViolation();
+            return Result<void, RhiError>{err(std::move(created).error())};
+        }
+        images.push_back(created.value());
+    }
+    auto destroyed = destroySurfaceImages(state, slot->images);
+    slot->images = std::move(images);
+    slot->configuration = configuration;
+    slot->next = 0;
+    return destroyed;
+}
+
+Result<VernonRhiSurfaceImage, RhiError> acquireSurfaceImage(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<VernonRhiSurfaceImage, RhiError>{err(std::move(device).error())};
+    SurfaceSlot *slot = indexedSlot(device.value().device().surfaces, surface.index);
+    auto pin = pinSlot(slot, surface);
+    if (pin.isErr())
+        return Result<VernonRhiSurfaceImage, RhiError>{err(std::move(pin).error())};
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (slot->acquired || slot->images.empty())
+        return Result<VernonRhiSurfaceImage, RhiError>{
+            err(invalidArgument("acquire_opengl_surface_image", surface.generation, surface.index))};
+    uint32_t width = 0;
+    uint32_t height = 0;
+    slot->callbacks.drawable_size(slot->callbacks.user_data, &width, &height);
+    if (width != slot->configuration.width || height != slot->configuration.height)
+        return Result<VernonRhiSurfaceImage, RhiError>{
+            err(RhiError{RhiErrorCode::SurfaceOutOfDate, {"acquire_opengl_surface_image", width, height}})};
+    slot->acquired = true;
+    VernonRhiSurfaceImage acquired{};
+    acquired.image = slot->images[slot->next].image;
+    acquired.view = slot->images[slot->next].view;
+    return Result<VernonRhiSurfaceImage, RhiError>{ok(acquired)};
+}
+
+// Runs with the window's surface current. Surface images hold the image's top row at row 0, and the window's
+// framebuffer holds its bottom row there, so the blit reverses the rows.
+Result<void, RhiError> blitToWindow(OpenGLDevice &state, const ImageSlot &image, uint32_t width, uint32_t height) {
+    auto &driver = state.state.driver;
+    if (auto scopeError = beginErrorScope(state, "present surface"))
+        return Result<void, RhiError>{err(std::move(*scopeError))};
+    Uint framebuffer{};
+    driver.genFramebuffers(1, &framebuffer);
+    if (!framebuffer)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"present_opengl_surface", 0, 0}})};
+    Int previousReadFramebuffer = 0;
+    Int previousDrawFramebuffer = 0;
+    driver.getIntegerv(gl::kReadFramebufferBinding, &previousReadFramebuffer);
+    driver.getIntegerv(gl::kDrawFramebufferBinding, &previousDrawFramebuffer);
+    prepareOpenGLBlits(state.state);
+    driver.bindFramebuffer(gl::kReadFramebuffer, framebuffer);
+    driver.framebufferTexture2D(gl::kReadFramebuffer, gl::kColorAttachment0, gl::kTexture2D, image.image.name, 0);
+    driver.readBuffer(gl::kColorAttachment0);
+    driver.bindFramebuffer(gl::kDrawFramebuffer, 0);
+    const Int right = static_cast<Int>(width);
+    const Int top = static_cast<Int>(height);
+    driver.blitFramebuffer(0, 0, right, top, 0, top, right, 0, gl::kColorBufferBit, gl::kNearest);
+    driver.bindFramebuffer(gl::kReadFramebuffer, static_cast<Uint>(previousReadFramebuffer));
+    driver.bindFramebuffer(gl::kDrawFramebuffer, static_cast<Uint>(previousDrawFramebuffer));
+    driver.deleteFramebuffers(1, &framebuffer);
+    if (auto scopeError = endErrorScope(state, "present surface"))
+        return Result<void, RhiError>{err(std::move(*scopeError))};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> presentSurface(VernonRhiDevice handle, VernonRhiSurface surface, VernonRhiImage &released) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    SurfaceSlot *slot = indexedSlot(state.surfaces, surface.index);
+    auto pin = pinSlot(slot, surface);
+    if (pin.isErr())
+        return Result<void, RhiError>{err(std::move(pin).error())};
+    std::lock_guard<std::mutex> surfaceGuard(slot->mutex);
+    if (!slot->acquired)
+        return invalidResult("present_opengl_surface", surface.generation, surface.index);
+    const SurfaceImage presented = slot->images[slot->next];
+    released = presented.image;
+    slot->acquired = false;
+    slot->next = (slot->next + 1) % slot->images.size();
+    const VernonOpenGLSurfaceCallbacks &callbacks = slot->callbacks;
+    std::lock_guard<std::mutex> guard(state.mutex);
+    callbacks.make_current(callbacks.user_data);
+    callbacks.swap_interval(callbacks.user_data, slot->configuration.present_mode == VERNON_RHI_PRESENT_FIFO ? 1 : 0);
+    auto blitted = blitToWindow(state, *indexedSlot(state.images, presented.image.index), slot->configuration.width,
+                                slot->configuration.height);
+    if (blitted.isOk())
+        callbacks.swap_buffers(callbacks.user_data);
+    state.state.makeCurrent();
+    return blitted;
+}
+
+Result<void, RhiError> destroySurface(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    SurfaceSlot *slot = indexedSlot(device.value().device().surfaces, surface.index);
+    if (!slot)
+        return invalidResult("destroy_opengl_surface", surface.generation, surface.index);
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (slot->acquired)
+        return invalidResult("destroy_opengl_surface", surface.generation, surface.index);
+    return slot->lifecycle.destroyPublic({surface.index, surface.generation});
+}
+
 } // namespace vernon::rhi::opengl_api
 
 const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
@@ -2205,6 +2503,12 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);
         result.imageViewResource.emplace(imageViewResource);
         result.describeImageViewResource.emplace(describeImageViewResource);
+        result.createSurface.emplace(createSurface);
+        result.surfaceCapabilities.emplace(surfaceCapabilities);
+        result.configureSurface.emplace(configureSurface);
+        result.acquireSurfaceImage.emplace(acquireSurfaceImage);
+        result.presentSurface.emplace(presentSurface);
+        result.destroySurface.emplace(destroySurface);
         return result;
     }();
     return dispatch;

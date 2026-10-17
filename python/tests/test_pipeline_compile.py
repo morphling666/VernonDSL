@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from vernon_dsl.bundle import (
     CompiledArtifact,
+    CompiledProgramVariant,
     CompiledStage,
     MetalTargetOptions,
     OpenGLTargetOptions,
@@ -351,6 +352,8 @@ class PipelineCompileTests(unittest.TestCase):
                     "abi": {},
                     "shape_symbols": [],
                 },
+                {},
+                {},
                 {},
             )
 
@@ -879,7 +882,6 @@ class PipelineCompileTests(unittest.TestCase):
             {"required_features": []},
             {"workgroup_size": [1, 1, 1]},
             artifact,
-            {"program_contracts": {"main": contract}},
         )
         program = {
             "stages": {"main": {"operation": "compute", "contract_hash": contract_hash}},
@@ -899,7 +901,9 @@ class PipelineCompileTests(unittest.TestCase):
             "abi": {"boundary_slots": [], "derivative_projections": [], "tape_plans": []},
         }
         variant = (SpecializationAssignment("FEATURE", "bool", True),)
-        plan = build_program_plan("program", stage.target, [(variant, {"main": stage}, program)])
+        plan = build_program_plan(
+            "program", stage.target, [CompiledProgramVariant(variant, {"main": stage}, program, {"main": contract})]
+        )
         manifest = build_program_manifest(
             plan,
             {

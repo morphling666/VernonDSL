@@ -1,3 +1,4 @@
+#include "VernonFormats.hpp"
 #include "acceptance_descriptor.h"
 #include "program_fixture_runtime_test.h"
 #include "sampled_texture_runtime_oracle.h"
@@ -335,16 +336,17 @@ void runStructuredViewHostOracle(VernonProgramExecutable *executable, const Acce
     EXPECT_EQ(payloads[0].index, 6);
 }
 
+// `format` must transfer as 8-bit RGBA texels.
 void renderArgumentFreeTriangle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
-                                std::array<uint8_t, 4> &centerPixel) {
+                                std::array<uint8_t, 4> &centerPixel,
+                                VernonRhiFormat format = VERNON_RHI_FORMAT_RGBA8_UNORM) {
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
     constexpr uint32_t extent = 32;
-    vernon::tests::RhiImage target =
-        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, extent, extent,
-                                   1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    vernon::tests::RhiImage target = vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, format, extent,
+                                                                extent, 1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     vernon::tests::RhiImageView targetView =
-        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, format);
     ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     VernonColorAttachment attachment{};
@@ -518,12 +520,13 @@ void runFragmentDiscardOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgr
 }
 
 void renderSpecializedVariant(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
-                              const VernonProgramSpecialization &specialization, double expectedRed) {
+                              const VernonProgramSpecialization &specialization, double expectedRed,
+                              VernonRhiFormat format = VERNON_RHI_FORMAT_RGBA8_UNORM) {
     const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
     vernon::tests::OwnedProgramExecutable program(owned.runtime(), std::string(fixture.manifestPath), &selector);
     ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
     std::array<uint8_t, 4> pixel{};
-    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel));
+    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel, format));
     EXPECT_NEAR(pixel[0], expectedRed, 1);
     EXPECT_LT(pixel[1], 10);
 }
@@ -548,15 +551,15 @@ void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const 
     }
 }
 
-// `typeValues[i]` is the type identity selecting one cooked variant through the type specialization
+// `variantValues[i]` is the type identity selecting one cooked variant through the type specialization
 // named by the descriptor, and `expected[i]` is the red channel that variant renders.
 void runTypeSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
                                        const AcceptanceDescriptor &acceptance) {
     ASSERT_FALSE(acceptance.specialization.empty());
-    ASSERT_GT(acceptance.typeValueCount, 0u);
-    ASSERT_EQ(acceptance.expectedCount, acceptance.typeValueCount);
-    for (size_t index = 0; index < acceptance.typeValueCount; ++index) {
-        const std::string_view identity = acceptance.typeValues[index];
+    ASSERT_GT(acceptance.variantValueCount, 0u);
+    ASSERT_EQ(acceptance.expectedCount, acceptance.variantValueCount);
+    for (size_t index = 0; index < acceptance.variantValueCount; ++index) {
+        const std::string_view identity = acceptance.variantValues[index];
         SCOPED_TRACE(std::string(acceptance.specialization) + "=" + std::string(identity));
         VernonProgramSpecialization specialization{};
         specialization.struct_size = sizeof(specialization);
@@ -564,6 +567,28 @@ void runTypeSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, co
         specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
         specialization.value.type_value = {identity.data(), identity.size()};
         ASSERT_NO_FATAL_FAILURE(renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index]));
+    }
+}
+
+// `variantValues[i]` names the color target format selecting one cooked variant through the format specialization
+// named by the descriptor; the variant renders into an image of that format, and `expected[i]` is its red channel.
+void runFormatSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+                                         const AcceptanceDescriptor &acceptance) {
+    ASSERT_FALSE(acceptance.specialization.empty());
+    ASSERT_GT(acceptance.variantValueCount, 0u);
+    ASSERT_EQ(acceptance.expectedCount, acceptance.variantValueCount);
+    for (size_t index = 0; index < acceptance.variantValueCount; ++index) {
+        const std::string_view name = acceptance.variantValues[index];
+        SCOPED_TRACE(std::string(acceptance.specialization) + "=" + std::string(name));
+        const vernon::formats::Format *format = vernon::formats::find(name);
+        ASSERT_NE(format, nullptr);
+        VernonProgramSpecialization specialization{};
+        specialization.struct_size = sizeof(specialization);
+        specialization.name = {acceptance.specialization.data(), acceptance.specialization.size()};
+        specialization.kind = VERNON_PROGRAM_SPECIALIZATION_FORMAT;
+        specialization.value.format_value = format->texture;
+        ASSERT_NO_FATAL_FAILURE(
+            renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index], format->rhi));
     }
 }
 
@@ -793,6 +818,10 @@ TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAs
     }
     if (acceptance.oracle == "type_specialization_pixels") {
         runTypeSpecializationPixelsOracle(owned(), fixture, acceptance);
+        return;
+    }
+    if (acceptance.oracle == "format_specialization_pixels") {
+        runFormatSpecializationPixelsOracle(owned(), fixture, acceptance);
         return;
     }
     vernon::tests::OwnedProgramExecutable program(runtime().runtime, std::string(fixture.manifestPath));

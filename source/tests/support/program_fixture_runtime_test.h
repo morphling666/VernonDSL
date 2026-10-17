@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -93,6 +94,7 @@ protected:
 
     OwnedRhiRuntime &owned() { return runtimeOwner_.owned(); }
     RhiRuntime &runtime() { return runtimeOwner_.context(); }
+    std::optional<VernonOpenGLSurfaceCallbacks> openglSurface() { return runtimeOwner_.openglSurface(); }
 
 private:
     BackendRuntimeOwner runtimeOwner_;

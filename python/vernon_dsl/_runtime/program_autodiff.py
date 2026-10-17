@@ -472,7 +472,7 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
     )
     compiler = native.Compiler()
     retained_programs: list[tuple[Any, Any]] = []
-    reflected_target, variant_key, stages, program = _compile_program_variant(
+    reflected_target, variant = _compile_program_variant(
         parsed,
         program_id=f"interactive/program-ad/{parsed.identity}",
         variant=(),
@@ -485,7 +485,7 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
     plan = build_program_plan(
         f"interactive/program-ad/{parsed.identity}",
         reflected_target,
-        ((variant_key, stages, program),),
+        (variant,),
     )
     directory = tempfile.TemporaryDirectory(prefix="vernon-program-ad-")
     root = Path(directory.name)

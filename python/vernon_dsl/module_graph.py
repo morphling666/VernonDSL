@@ -8,7 +8,14 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, NoReturn
 
-from .diagnostics import CompileError, SourceLocation
+from .diagnostics import (
+    CompileError,
+    SourceLocation,
+    copy_location,
+    fix_missing_locations,
+    mark_source_file,
+    node_location,
+)
 from .frontend.abi import attribute_layout
 from .frontend.model import ConcreteType
 from .language.ast_utils import decorator_name as _decorator_name
@@ -42,7 +49,7 @@ _HOST_MODULES = {
     "unittest",
     "vernon_dsl",
 }
-_SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type"})
+_SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type", "format"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
 _CLASS_DECORATORS = frozenset({"struct", "binding_group"})
@@ -109,7 +116,9 @@ class _TypeReference:
 
 @dataclass(frozen=True)
 class LoadedProject:
-    source: str
+    """`module` combines the reachable definitions of every file, each node located in the file it was written in."""
+
+    module: ast.Module
     dependencies: tuple[tuple[str, str], ...]
     features: tuple[str, ...]
     dependency_files: tuple[tuple[Path, str], ...] = ()
@@ -406,7 +415,7 @@ class _Specializer(ast.NodeTransformer):
         items = self._annotated_items(annotation)
         location_value = ast.Constant(value=location)
         if items is None:
-            return ast.copy_location(
+            return copy_location(
                 ast.Subscript(
                     value=ast.Name(id="Annotated", ctx=ast.Load()),
                     slice=ast.Tuple(
@@ -473,7 +482,7 @@ class _Specializer(ast.NodeTransformer):
         if declaration is not None:
             return self._substituted(node, *declaration)
         if isinstance(node.ctx, ast.Load) and node.id in self.module.constants:
-            return ast.copy_location(ast.Constant(value=self.module.constants[node.id]), node)
+            return copy_location(ast.Constant(value=self.module.constants[node.id]), node)
         return node
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
@@ -484,14 +493,14 @@ class _Specializer(ast.NodeTransformer):
 
     def _substituted(self, node: ast.expr, name: str, kind: str) -> ast.expr:
         if kind != "type":
-            return ast.copy_location(ast.Constant(value=self.graph._scalar_value(self.module, node, name, kind)), node)
+            return copy_location(ast.Constant(value=self.graph._scalar_value(self.module, node, name, kind)), node)
         bound = self.graph._type_value(self.module, node, name)
         symbol = (
             bound.identity
             if bound.declaration is None
             else self.emitted_names[(bound.declaration[0].path, bound.declaration[1].name)]
         )
-        substituted = ast.copy_location(ast.Name(id=symbol, ctx=ast.Load()), node)
+        substituted = copy_location(ast.Name(id=symbol, ctx=ast.Load()), node)
         # The symbol is already the emitted name, which `_ReferenceRewriter` must not resolve again in this module.
         substituted._vernon_emitted = True  # type: ignore[attr-defined]
         return substituted
@@ -614,9 +623,9 @@ class _ReferenceRewriter(ast.NodeTransformer):
             imported = self.module.symbol_imports.get(node.id)
             if imported:
                 target, symbol = imported
-                return ast.copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
+                return copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
             if node.id in self.module.definitions:
-                return ast.copy_location(
+                return copy_location(
                     ast.Name(
                         id=self.emitted_names[(self.module.path, node.id)],
                         ctx=node.ctx,
@@ -635,7 +644,7 @@ class _ReferenceRewriter(ast.NodeTransformer):
                     continue
                 if symbol not in target.definitions:
                     self._error(node, f"module '{target.name}' has no symbol '{symbol}'")
-                return ast.copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
+                return copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
         return node
 
     def _rewrite_annotation(self, node: ast.expr | None) -> ast.expr | None:
@@ -696,14 +705,7 @@ class _ReferenceRewriter(ast.NodeTransformer):
         return node
 
     def _error(self, node: ast.AST, message: str) -> None:
-        raise CompileError(
-            message,
-            SourceLocation(
-                str(self.module.path),
-                getattr(node, "lineno", 1),
-                getattr(node, "col_offset", 0) + 1,
-            ),
-        )
+        raise CompileError(message, node_location(node, str(self.module.path)))
 
 
 class ModuleGraph:
@@ -812,6 +814,13 @@ class ModuleGraph:
         root = self.discover()
         declared = self.declared_specializations()
         declared_features = {name for name, kind in declared.items() if kind == "bool"}
+        formats = sorted(assignment.name for assignment in self.specializations if assignment.type == "format")
+        if formats:
+            self._error(
+                root,
+                root.tree,
+                "format specialization(s) select graphics pipeline color target formats only: " + ", ".join(formats),
+            )
         unknown = sorted(assignment.name for assignment in self.specializations if assignment.name not in declared)
         if unknown:
             self._error(root, root.tree, "requested undeclared specialization(s): " + ", ".join(unknown))
@@ -885,7 +894,7 @@ class ModuleGraph:
             ]
             body = self._prune_emitted(body, reachable)
         self._validate_call_graph(analysis_body, function_sources, entry_names, host_function_names)
-        combined = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+        combined = fix_missing_locations(ast.Module(body=body, type_ignores=[]))
         dependency_records = tuple(
             (
                 module.path,
@@ -895,7 +904,7 @@ class ModuleGraph:
             for module in sorted(self.modules.values(), key=lambda value: self._display_path(value.path))
         )
         return LoadedProject(
-            ast.unparse(combined) + "\n",
+            combined,
             tuple((display_path, digest) for _, display_path, digest in dependency_records),
             tuple(sorted(declared_features)),
             tuple((path, digest) for path, _, digest in dependency_records),
@@ -954,6 +963,7 @@ class ModuleGraph:
                 error.msg,
                 SourceLocation(str(path), error.lineno or 1, error.offset or 1),
             ) from None
+        mark_source_file(tree, str(path))
 
         module = _Module(path, name, source, tree)
         self.modules[path] = module
@@ -1014,7 +1024,7 @@ class ModuleGraph:
             )
         kind = "bool" if declaration == "feature" else (_dotted_name(node.value.args[1]) or "").split(".")[-1]
         if kind not in _SPECIALIZATION_KINDS:
-            self._error(module, node, "specialization type must be bool, i32, u32, f32, f64, or vd.type")
+            self._error(module, node, "specialization type must be bool, i32, u32, f32, f64, vd.type, or vd.format")
         local_name = node.targets[0].id
         specialization_name = node.value.args[0].value
         if not specialization_name or local_name in module.definitions or module.declares_specialization(local_name):
@@ -1192,6 +1202,13 @@ class ModuleGraph:
         return None
 
     def _scalar_value(self, module: _Module, node: ast.AST, name: str, kind: str) -> bool | int | float:
+        if kind == "format":
+            self._error(
+                module,
+                node,
+                f"format specialization '{name}' selects a pipeline color target format and is not visible to "
+                "device code",
+            )
         if kind == "bool":
             return self.specialization_values.get(name, False) is True
         value = self.specialization_values.get(name)
@@ -1546,14 +1563,7 @@ class ModuleGraph:
 
     @staticmethod
     def _error(module: _Module, node: ast.AST, message: str) -> NoReturn:
-        raise CompileError(
-            message,
-            SourceLocation(
-                str(module.path),
-                getattr(node, "lineno", 1),
-                getattr(node, "col_offset", 0) + 1,
-            ),
-        )
+        raise CompileError(message, node_location(node, str(module.path)))
 
 
 def _load_project_graph(

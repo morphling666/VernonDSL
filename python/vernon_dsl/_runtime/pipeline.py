@@ -36,6 +36,7 @@ from ..types import (
     SpecializationAssignment,
     _Scalar,
     dyn,
+    source_key,
     specialization_key,
     specialization_key_data,
 )
@@ -136,12 +137,15 @@ class Pipeline:
         self,
         specializations: tuple[SpecializationAssignment, ...] | None = None,
     ) -> tuple[Any, ...]:
-        selected = self._variant if specializations is None else specializations
+        selected = source_key(self._variant if specializations is None else specializations)
         return self._frontend_cache.get_or_create(
             selected,
             lambda: self._compile_frontends(selected),
             self._frontends_current,
         )
+
+    def _target_formats(self, specializations: tuple[SpecializationAssignment, ...]) -> GraphicsTargetFormats | None:
+        return None if self._targets is None else self._targets.resolved(specializations)
 
     def _compile_frontends(
         self,

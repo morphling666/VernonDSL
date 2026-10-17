@@ -43,8 +43,10 @@ def lower_constant(emitter: NumericEmitter, node: ast.Constant, expected: DslTyp
             expected if expected and expected.kind == "scalar" and expected.is_float else DslType("scalar", "f32")
         )
         literal = f"{node.value:.17g}"
-        if "." not in literal and "e" not in literal.lower():
-            literal += ".0"
+        if "." not in literal:
+            # MLIR float literals need a fraction, also before an exponent: 1e-10 must print as 1.0e-10.
+            mantissa, exponent, power = literal.partition("e")
+            literal = f"{mantissa}.0{exponent}{power}"
     else:
         raise emitter.context.error(node, "only bool, integer, and float constants are supported")
     result = emitter._fresh()

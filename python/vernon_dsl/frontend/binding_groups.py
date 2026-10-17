@@ -14,6 +14,7 @@ import hashlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from ..diagnostics import copy_location, fix_missing_locations
 from ..language.ast_utils import decorator_name, dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, GRAPHICS_STAGES
 from ..struct_methods import method_tables
@@ -101,7 +102,7 @@ class _Flattener:
         while pending:
             pending.extend(self._flatten_function(pending.pop()))
         self.module.body = [statement for statement in self.module.body if not _is_group_declaration(statement)]
-        return ast.fix_missing_locations(self.module)
+        return fix_missing_locations(self.module)
 
     def _fields(self, declaration: ast.ClassDef, names: set[str]) -> tuple[_Field, ...]:
         fields: list[_Field] = []
@@ -222,9 +223,7 @@ class _Flattener:
                 continue
             environment[argument.arg] = _GroupRef(group, argument.arg)
             for path, annotation in self.leaves(group, argument.arg):
-                leaf = ast.copy_location(
-                    ast.arg(arg=path, annotation=self._leaf_annotation(annotation, stage)), argument
-                )
+                leaf = copy_location(ast.arg(arg=path, annotation=self._leaf_annotation(annotation, stage)), argument)
                 leaf._vernon_binding_group = argument.arg
                 arguments.append(leaf)
         rewriter = _BodyRewriter(self, environment)
@@ -306,7 +305,7 @@ class _BodyRewriter(ast.NodeTransformer):
         if not isinstance(node.ctx, ast.Load):
             raise self.owner.error(node, "binding group cannot be reassigned through its fields")
         if isinstance(resolved, str):
-            return ast.copy_location(ast.Name(id=resolved, ctx=ast.Load()), node)
+            return copy_location(ast.Name(id=resolved, ctx=ast.Load()), node)
         if isinstance(resolved, _MethodRef):
             raise self.owner.error(node, "binding group methods cannot be used as first-class values")
         raise self.owner.error(node, "binding group cannot be used as a value")
@@ -348,7 +347,7 @@ class _BodyRewriter(ast.NodeTransformer):
                 helper = self.owner.methods.get(receiver.group, {}).get(node.func.attr)
                 if helper is None:
                     raise self.owner.error(node.func, f"'{receiver.group}' has no method '{node.func.attr}'")
-                node = ast.copy_location(
+                node = copy_location(
                     ast.Call(
                         func=ast.Name(id=helper, ctx=ast.Load()),
                         args=[node.func.value, *node.args],
@@ -386,12 +385,12 @@ class _BodyRewriter(ast.NodeTransformer):
             symbol, clone = self.owner.specialize(callee, tuple(generic))
             if clone is not None:
                 self.clones.append(clone)
-            node.func = ast.copy_location(ast.Name(id=symbol, ctx=ast.Load()), node.func)
+            node.func = copy_location(ast.Name(id=symbol, ctx=ast.Load()), node.func)
         arguments: list[ast.expr] = []
         for argument, (_, reference) in zip(node.args, groups, strict=True):
             if isinstance(reference, _GroupRef):
                 arguments.extend(
-                    ast.copy_location(ast.Name(id=path, ctx=ast.Load()), argument)
+                    copy_location(ast.Name(id=path, ctx=ast.Load()), argument)
                     for path, _ in self.owner.leaves(reference.group, reference.path)
                 )
             else:

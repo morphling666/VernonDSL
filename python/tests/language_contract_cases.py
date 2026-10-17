@@ -54,6 +54,7 @@ class RuntimeOracleKind(Enum):
     SAMPLED_PIXEL = "sampled_pixel"
     SPECIALIZATION_PIXELS = "specialization_pixels"
     TYPE_SPECIALIZATION_PIXELS = "type_specialization_pixels"
+    FORMAT_SPECIALIZATION_PIXELS = "format_specialization_pixels"
     STORAGE_TEXEL = "storage_texel"
     COMPUTE_SAMPLED_TEXELS = "compute_sampled_texels"
     TEXEL_FETCH = "texel_fetch"
@@ -88,22 +89,28 @@ class RuntimeOracle:
     the Texture whose texels it uploads for TEXEL_FETCH.
     For SPECIALIZATION_PIXELS, `specialization` names a u32 specialization and `expected` holds one
     (value, red channel) pair per cooked variant; the runtime resolves and renders each variant.
-    For TYPE_SPECIALIZATION_PIXELS, `specialization` names a type specialization, `type_values` holds
-    the type identity of each cooked variant, and `expected` holds the matching red channels."""
+    For TYPE_SPECIALIZATION_PIXELS, `specialization` names a type specialization, `variant_values` holds
+    the type identity of each cooked variant, and `expected` holds the matching red channels.
+    For FORMAT_SPECIALIZATION_PIXELS, `specialization` names a format specialization, `variant_values` holds the
+    color target format of each cooked variant, which the runtime renders into, and `expected` holds the matching
+    red channels."""
 
     kind: RuntimeOracleKind
     expected: tuple[int | float, ...]
     parameter: str = "output"
     grid: tuple[int, int, int] = (1, 1, 1)
     specialization: str = ""
-    type_values: tuple[str, ...] = ()
+    variant_values: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.kind is RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS:
-            if not self.type_values or len(self.type_values) != len(self.expected):
-                raise ValueError("type specialization oracle needs one expected red channel per type value")
-        elif self.type_values:
-            raise ValueError(f"{self.kind.value} oracle does not take type values")
+        if self.kind in {
+            RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS,
+            RuntimeOracleKind.FORMAT_SPECIALIZATION_PIXELS,
+        }:
+            if not self.variant_values or len(self.variant_values) != len(self.expected):
+                raise ValueError(f"{self.kind.value} oracle needs one expected red channel per variant value")
+        elif self.variant_values:
+            raise ValueError(f"{self.kind.value} oracle does not take variant values")
 
 
 @dataclass(frozen=True)
@@ -550,7 +557,7 @@ def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
         frozenset({"compute"}),
         frozenset({"vertex", "fragment", "func"}),
         frozenset({"compute"}),
-        "requires type tensor<3xi32>",
+        r"requires type Tensor\[u32, \(3,\)\], but argument 'gid' has type u32",
     ),
     LanguageContractCase(
         "LANG-BUILTIN-POSITION",
@@ -565,7 +572,7 @@ def main() -> Vector[f32, 3]:
         frozenset({"vertex"}),
         frozenset({"compute", "fragment", "func"}),
         frozenset({"graphics"}),
-        "builtin 'position' requires type tensor<4xf32>",
+        r"builtin 'position' requires type Tensor\[f32, \(4,\)\], but result has type Tensor\[f32, \(3,\)\]",
     ),
 )
 
@@ -3062,10 +3069,23 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
             RuntimeOracleKind.TYPE_SPECIALIZATION_PIXELS,
             (255, 64),
             specialization="SURFACE",
-            type_values=(
+            variant_values=(
                 "source.tests.fixtures.language_contract_graphics_asset:Warm",
                 "source.tests.fixtures.language_contract_graphics_asset:Cool",
             ),
+        ),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_format_specialization",
+        contract_ids=frozenset({"LANG-SPECIALIZE-001", "LANG-COLOR-TARGET"}),
+        asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:format_specialization_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        # Red 0.25 stores as 64 in rgba8_unorm and, sRGB-encoded, as 137 in rgba8_srgb.
+        oracle=RuntimeOracle(
+            RuntimeOracleKind.FORMAT_SPECIALIZATION_PIXELS,
+            (64, 137),
+            specialization="TARGET",
+            variant_values=("rgba8_unorm", "rgba8_srgb"),
         ),
     ),
     LanguageContractAcceptance(

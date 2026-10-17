@@ -80,6 +80,7 @@ from .types import (
     varying,
     write,
 )
+from .types import format_kind as format
 from .types import type_kind as type
 
 if TYPE_CHECKING:
@@ -340,6 +341,7 @@ __all__ = [
     "f64",
     "feature",
     "floor",
+    "format",
     "metal",
     "fragment",
     "fragment_coord",

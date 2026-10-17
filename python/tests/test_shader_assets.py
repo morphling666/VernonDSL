@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import gc
@@ -28,6 +29,7 @@ from vernon_dsl._program_assets.capture import CapturedProgram, capture_program
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.bundle import (
     CompiledArtifact,
+    CompiledProgramVariant,
     CompiledStage,
     build_program_manifest,
     build_program_plan,
@@ -147,6 +149,11 @@ def _assert_exact_boundary_slot(
             expected["access"] = "read_write" if reads and writes else "write" if writes else "read"
     if not input_direction:
         expected["publication"] = "commit_after_success"
+    elif expected["access"] != "read" and not any(
+        other["direction"] == "output" and other["alias_owner"] == expected["alias_owner"]
+        for other in program["abi"]["boundary_slots"]
+    ):
+        expected["publication"] = "in_place"
     test.assertEqual(slot, expected)
 
 
@@ -207,7 +214,7 @@ class ShaderAssetManifestTests(unittest.TestCase):
             "modules/square",
             target,
             (
-                (
+                CompiledProgramVariant(
                     (),
                     {"Module.square": stage},
                     {
@@ -235,6 +242,7 @@ class ShaderAssetManifestTests(unittest.TestCase):
                         ],
                         "abi": {},
                     },
+                    {"Module.square": {"operation": "compute"}},
                 ),
             ),
         )
@@ -287,8 +295,9 @@ asset = vd.program_asset(
             self.assertEqual(resolution.name, "fullscreen_vertex")
             self.assertEqual(resolution.source_path, (package / "fullscreen.py").resolve())
             promoted = load_project(source, entry="fullscreen_vertex")
-            self.assertIn("@vd.vertex", promoted.source)
-            self.assertIn("def fullscreen_vertex(", promoted.source)
+            promoted_source = ast.unparse(promoted.module)
+            self.assertIn("@vd.vertex", promoted_source)
+            self.assertIn("def fullscreen_vertex(", promoted_source)
             self.assertIn("fullscreen.py", dict(promoted.dependencies))
 
     def test_discovery_follows_files_created_where_a_lookup_missed(self) -> None:
@@ -320,14 +329,15 @@ def fragment_main() -> vd.Vector[vd.f32, 4]:
 
             first = load_project(source, entry="fragment_main")
             self.assertIn("helpers.py", dict(first.dependencies))
-            self.assertIn("0.25", first.source)
+            self.assertIn("0.25", ast.unparse(first.module))
 
             # The importer's own directory is searched before the project root, so this file now wins.
             (game / "helpers.py").write_text(helper.format(value="0.75"), encoding="utf-8")
             shadowed = load_project(source, entry="fragment_main")
             self.assertIn("game/helpers.py", dict(shadowed.dependencies))
-            self.assertIn("0.75", shadowed.source)
-            self.assertNotIn("0.25", shadowed.source)
+            shadowed_source = ast.unparse(shadowed.module)
+            self.assertIn("0.75", shadowed_source)
+            self.assertNotIn("0.25", shadowed_source)
 
             # A nearer pyproject.toml makes game/ the project root, so the module paths are relative to it.
             (game / "pyproject.toml").write_text("[project]\nname = 'game'\n", encoding="utf-8")
@@ -794,6 +804,28 @@ class GraphicsTargetFormatTests(unittest.TestCase):
                 {"control": {"value": values["input.__grid_z"]["id"]}},
             ],
         )
+
+    def test_module_without_outputs_publishes_its_input_writes_in_place(self) -> None:
+        if not native_available():
+            self.skipTest("native Vernon extension is not built")
+        source = Path(__file__).with_name("program_asset_fixture.py")
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = cook_program_asset(
+                program_asset=f"{source}:in_place_scale_asset",
+                output=directory,
+                target="cpu",
+            )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+
+        program = document["variants"][0]["program"]
+        slots = program["abi"]["boundary_slots"]
+        for index, slot in enumerate(slots):
+            self.assertEqual(slot["id"], index)
+            _assert_exact_boundary_slot(self, program, slot)
+        self.assertFalse([slot for slot in slots if slot["direction"] == "output"])
+        values = next(slot for slot in slots if slot["path"] == "values")
+        self.assertEqual((values["access"], values["publication"]), ("read_write", "in_place"))
+        self.assertEqual(values["outer_shape"], [-1])
 
 
 _BARE_PIPELINE_ASSET = """

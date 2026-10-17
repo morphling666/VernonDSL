@@ -4,7 +4,7 @@ import ast
 import copy
 from dataclasses import dataclass
 
-from .diagnostics import CompileError, SourceLocation
+from .diagnostics import CompileError, copy_location, fix_missing_locations, node_location
 
 
 def _name(node: ast.AST | None) -> str | None:
@@ -49,10 +49,7 @@ def _annotation_name(node: ast.expr | None) -> str | None:
 
 
 def _error(filename: str, node: ast.AST, message: str) -> None:
-    raise CompileError(
-        message,
-        SourceLocation(filename, getattr(node, "lineno", 1), getattr(node, "col_offset", 0) + 1),
-    )
+    raise CompileError(message, node_location(node, filename))
 
 
 @dataclass(frozen=True)
@@ -160,7 +157,7 @@ class _MethodCallRewriter(ast.NodeTransformer):
                     args=[self.visit(receiver), *(self.visit(value) for value in node.args)],
                     keywords=[self.visit(keyword) for keyword in node.keywords],
                 )
-                return ast.copy_location(rewritten, node)
+                return copy_location(rewritten, node)
         return self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
@@ -248,7 +245,7 @@ def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
             methods[statement.name] = helper_name
             helper = copy.deepcopy(statement)
             helper.name = helper_name
-            helper.args.args[0].annotation = ast.copy_location(
+            helper.args.args[0].annotation = copy_location(
                 ast.Name(id=node.name, ctx=ast.Load()),
                 helper.args.args[0],
             )
@@ -268,4 +265,4 @@ def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
     }
     rewritten = _MethodCallRewriter(structs, function_results, filename).visit(module)
     assert isinstance(rewritten, ast.Module)
-    return ast.fix_missing_locations(rewritten)
+    return fix_missing_locations(rewritten)

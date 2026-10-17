@@ -32,6 +32,7 @@ from .serialize import (
 from .types import (
     BundlePlan,
     CompiledArtifact,
+    CompiledProgramVariant,
     CompiledStage,
     CpuTargetOptions,
     CudaTargetOptions,
@@ -49,6 +50,7 @@ from .types import (
 __all__ = [
     "BundlePlan",
     "CompiledArtifact",
+    "CompiledProgramVariant",
     "CompiledStage",
     "CpuTargetOptions",
     "CudaTargetOptions",

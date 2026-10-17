@@ -26,7 +26,11 @@ typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_INVALID_ARGUMENT = 1,
     VERNON_RHI_STATUS_UNSUPPORTED = 2,
     VERNON_RHI_STATUS_INTERNAL_ERROR = 3,
-    VERNON_RHI_STATUS_RESOURCE_EXHAUSTED = 4
+    VERNON_RHI_STATUS_RESOURCE_EXHAUSTED = 4,
+    /* The surface no longer matches its window; configure it again, then retry. */
+    VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE = 5,
+    /* The surface's window is gone; destroy the surface and create it again. */
+    VERNON_RHI_STATUS_SURFACE_LOST = 6
 } VernonRhiStatus;
 
 typedef enum VernonRhiCompletionState {
@@ -56,6 +60,7 @@ VERNON_RHI_DECLARE_HANDLE(VernonRhiBindingSet);
 VERNON_RHI_DECLARE_HANDLE(VernonRhiCommandEncoder);
 VERNON_RHI_DECLARE_HANDLE(VernonRhiCompletion);
 VERNON_RHI_DECLARE_HANDLE(VernonRhiNativeDescriptorRange);
+VERNON_RHI_DECLARE_HANDLE(VernonRhiSurface);
 
 #undef VERNON_RHI_DECLARE_HANDLE
 
@@ -634,6 +639,68 @@ typedef struct VernonRhiVulkanBorrowedImageViewDescriptor {
     uint32_t reserved[4];
 } VernonRhiVulkanBorrowedImageViewDescriptor;
 
+typedef enum VernonRhiPresentMode {
+    /* Waits for vertical blank; every surface supports it. */
+    VERNON_RHI_PRESENT_FIFO = 0,
+    VERNON_RHI_PRESENT_MAILBOX = 1,
+    VERNON_RHI_PRESENT_IMMEDIATE = 2
+} VernonRhiPresentMode;
+
+/* `backend` names the member of `native`, and must be the device's backend. */
+typedef struct VernonRhiSurfaceDescriptor {
+    uint32_t struct_size;
+    VernonRhiBackend backend;
+    union {
+        void *win32_window;                         /* HWND */
+        void *metal_layer;                          /* CAMetalLayer */
+        const VernonOpenGLSurfaceCallbacks *opengl; /* copied at creation */
+    } native;
+    uint32_t reserved[4];
+} VernonRhiSurfaceDescriptor;
+
+typedef struct VernonRhiSurfaceCapabilities {
+    uint32_t struct_size;
+    VernonRhiFormat formats[8];
+    uint32_t format_count;
+    /* 1u << VernonRhiPresentMode for each supported mode. */
+    uint32_t present_modes;
+    /* The VernonRhiImageUsageBits a configuration may request; COLOR_ATTACHMENT is always among them. */
+    uint32_t usage;
+    uint32_t min_image_count;
+    /* 0 when unbounded. */
+    uint32_t max_image_count;
+    /* The window's size in pixels; UINT32_MAX when the configuration decides it. */
+    uint32_t current_width;
+    uint32_t current_height;
+    uint32_t reserved[4];
+} VernonRhiSurfaceCapabilities;
+
+typedef struct VernonRhiSurfaceConfiguration {
+    uint32_t struct_size;
+    VernonRhiFormat format;
+    /* Must include COLOR_ATTACHMENT. */
+    uint32_t usage;
+    uint32_t width;
+    uint32_t height;
+    VernonRhiPresentMode present_mode;
+    uint32_t image_count;
+    uint32_t reserved[4];
+} VernonRhiSurfaceConfiguration;
+
+/*
+ * A 2D image with one mip level, layer and sample, in the configured format, extent and usage, and a view of it. Both
+ * handles are valid until the next present. The contents are undefined: the first use must write the image, so a
+ * rendering scope that preserves it, a copy from it and a download of it are rejected until one does.
+ */
+typedef struct VernonRhiSurfaceImage {
+    uint32_t struct_size;
+    VernonRhiImage image;
+    VernonRhiImageView view;
+    /* Still presentable, but configuring again would match the window better. */
+    uint32_t suboptimal;
+    uint32_t reserved[4];
+} VernonRhiSurfaceImage;
+
 VERNON_RHI_CAPI uint32_t vernonRhiGetApiVersion(void);
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateDevice(const VernonRhiOwnedDeviceDescriptor *descriptor);
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
@@ -814,6 +881,31 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyImageView(VernonRhiDevice 
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetImageViewNativeHandle(VernonRhiDevice device,
                                                                         VernonRhiImageView image_view,
                                                                         uint64_t *output);
+/*
+ * A surface presents a host window: the host owns the window and its native handle, and the device owns the images it
+ * presents. A surface has at most one acquired image. Acquire after acquire, present without acquire, and configure or
+ * destroy while an image is acquired return VERNON_RHI_STATUS_INVALID_ARGUMENT. Present is ordered after every
+ * submission made before it. A backend or device that cannot present, including every borrowed device, returns
+ * VERNON_RHI_STATUS_UNSUPPORTED from vernonRhiDeviceCreateSurface.
+ */
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateSurface(VernonRhiDevice device,
+                                                             const VernonRhiSurfaceDescriptor *descriptor,
+                                                             VernonRhiSurface *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiSurfaceGetCapabilities(VernonRhiDevice device, VernonRhiSurface surface,
+                                                                VernonRhiSurfaceCapabilities *output);
+/*
+ * Replaces the surface's images. A format, present mode, usage or image count outside the capabilities returns
+ * VERNON_RHI_STATUS_UNSUPPORTED, and a zero extent, which a minimized window reports, returns
+ * VERNON_RHI_STATUS_INVALID_ARGUMENT.
+ */
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiSurfaceConfigure(VernonRhiDevice device, VernonRhiSurface surface,
+                                                          const VernonRhiSurfaceConfiguration *configuration);
+/* May block until an image is available; a failed acquire leaves no image acquired. */
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiSurfaceAcquireImage(VernonRhiDevice device, VernonRhiSurface surface,
+                                                             VernonRhiSurfaceImage *output);
+/* Releases the acquired image even when it fails. */
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiSurfacePresent(VernonRhiDevice device, VernonRhiSurface surface);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroySurface(VernonRhiDevice device, VernonRhiSurface surface);
 
 #ifdef __cplusplus
 }

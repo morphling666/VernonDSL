@@ -85,6 +85,48 @@ class ConcreteType:
         raise AssertionError(f"unknown type kind {self.kind}")
 
     @property
+    def spelling(self) -> str:
+        """The type as a DSL annotation writes it. Diagnostics name types this way, because MLIR integers are
+        signless and `mlir` spells i32 and u32 alike."""
+
+        def shape(extents: Iterable[object]) -> str:
+            names = ["dyn" if extent == "?" else str(extent) for extent in extents]
+            return f"({names[0]},)" if len(names) == 1 else f"({', '.join(names)})"
+
+        def element_spelling(value: object) -> str:
+            assert isinstance(value, ConcreteType)
+            return value.spelling
+
+        if self.kind in {"scalar", "struct"}:
+            return self.name
+        if self.kind == "index":
+            return "index"
+        if self.kind == "void":
+            return "None"
+        if self.kind == "tensor":
+            return f"Tensor[{element_spelling(self.arguments[0])}, {shape(self.arguments[1:])}]"
+        if self.kind == "tuple":
+            return f"Tuple[{', '.join(element_spelling(element) for element in self.arguments)}]"
+        if self.kind in {"tensor_view", "tensor_view_abi"}:
+            element, extents, access, _ = self.arguments
+            assert isinstance(extents, tuple)
+            return f"TensorView[{element_spelling(element)}, {shape(extents)}, {access}]"
+        if self.kind == "tensor_storage":
+            if len(self.arguments) == 1:
+                return f"TensorStorage[{element_spelling(self.arguments[0])}]"
+            element, extents, access = self.arguments
+            assert isinstance(extents, tuple)
+            return f"TensorStorage[{element_spelling(element)}, {shape(extents)}, {access}]"
+        if self.kind == "texture":
+            dimension, element, format_name, access = self.arguments
+            if access == "sampled":
+                return f"Texture[{dimension}, {element_spelling(element)}]"
+            return f"Texture[{dimension}, {format_name}, {access}]"
+        if self.kind == "sampler":
+            return "Sampler"
+        raise AssertionError(f"unknown type kind {self.kind}")
+
+    @property
     def is_float(self) -> bool:
         if self.kind == "scalar":
             return self.name.startswith("f")

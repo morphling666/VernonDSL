@@ -3,6 +3,7 @@
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
+#include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
 
@@ -28,6 +29,9 @@ using vernon::tests::RhiImageView;
 using vernon::tests::RhiRuntime;
 
 constexpr uint32_t kExtent = 32;
+// Windows widens a titled window to about 120 pixels, so the OpenGL window, and with it the surface, is larger than the
+// ordinary targets.
+constexpr uint32_t kSurfaceExtent = 128;
 constexpr std::array<float, 6> kLeftTriangle{-0.9f, -0.9f, -0.1f, -0.9f, -0.5f, 0.9f};
 constexpr std::array<float, 6> kRightTriangle{0.1f, -0.9f, 0.9f, -0.9f, 0.5f, 0.9f};
 
@@ -114,6 +118,28 @@ std::string argumentToken(const VernonProgramArgument &argument) {
                : resourceToken(name, argument.tensor.resource, argument.tensor.byte_offset);
 }
 
+std::vector<uint8_t> downloadPixels(RhiRuntime &runtime, VernonRhiImage image, uint32_t extent) {
+    std::vector<uint8_t> result(static_cast<size_t>(extent) * extent * 4);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    download.width = extent;
+    download.height = extent;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(runtime.device, image, &download, result.data(), result.size()),
+              VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(runtime.device));
+    return result;
+}
+
+// The square RGBA8 color target a pass draws into, whoever owns its image.
+struct DrawTarget {
+    VernonRuntimeProviderResourceReference view;
+    uint32_t extent;
+};
+
 struct Target {
     RhiRuntime &runtime;
     uint32_t extent;
@@ -134,20 +160,8 @@ struct Target {
             EXPECT_EQ(vernonRhiDeviceDestroyImage(runtime.device, image.handle), VERNON_RHI_STATUS_OK);
     }
 
-    std::vector<uint8_t> pixels() const {
-        std::vector<uint8_t> result(static_cast<size_t>(extent) * extent * 4);
-        VernonRhiImageDownloadDescriptor download{};
-        download.struct_size = sizeof(download);
-        download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-        download.width = extent;
-        download.height = extent;
-        download.depth = 1;
-        download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-        download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-        EXPECT_EQ(vernonRhiDeviceDownloadImage(runtime.device, image.handle, &download, result.data(), result.size()),
-                  VERNON_RHI_STATUS_OK);
-        return result;
-    }
+    operator DrawTarget() const { return {view.reference, extent}; }
+    std::vector<uint8_t> pixels() const { return downloadPixels(runtime, image.handle, extent); }
 };
 
 size_t renderedPixels(const std::vector<uint8_t> &pixels) {
@@ -161,7 +175,7 @@ size_t renderedPixels(const std::vector<uint8_t> &pixels) {
 // plus a DrawCommand of `instances` instances unless the caller records the draws.
 class PassInvocation {
 public:
-    PassInvocation(VernonProgramExecutable *executable, VernonProgramInstance *instance, const Target &target,
+    PassInvocation(VernonProgramExecutable *executable, VernonProgramInstance *instance, const DrawTarget &target,
                    std::initializer_list<VernonProgramArgument> arguments, VernonRuntimeProviderLoadOperation load,
                    bool recorded, uint32_t instances = 1)
         : invocation_(vernonRuntimeProgramInstanceBeginInvocation(instance)) {
@@ -177,14 +191,14 @@ public:
         VernonProgramArgument output{};
         output.slot = findParameter(executable, "output").slot;
         output.kind = VERNON_PROGRAM_IMAGE;
-        output.image = {target.view.reference};
-        const std::string targetText = resourceToken("output-", target.view.reference);
+        output.image = {target.view};
+        const std::string targetText = resourceToken("output-", target.view);
         const std::string renderText = "render-" + std::to_string(load) + targetText;
         const VernonProgramBindingToken outputToken = token(targetText);
         EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation_, &outputToken, &output, nullptr, 0, 0),
                   VERNON_STATUS_OK);
         attachment_.location = 0;
-        attachment_.view = target.view.reference;
+        attachment_.view = target.view;
         attachment_.load_operation = load;
         attachment_.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
         attachment_.clear_color.f32[3] = 1.0f;
@@ -341,7 +355,11 @@ VernonBindingSet *verticesSet(RhiRuntime &runtime, VernonGraphicsPipeline *pipel
 class RuntimeRecordedGraphicsMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
-        return vernon::tests::graphicsImageCopyFixtureRequirements(GetParam().runtime);
+        vernon::tests::BackendTestRequirements result =
+            vernon::tests::graphicsImageCopyFixtureRequirements(GetParam().runtime);
+        result.windowWidth = kSurfaceExtent;
+        result.windowHeight = kSurfaceExtent;
+        return result;
     }
 
     void SetUp() override {
@@ -452,6 +470,63 @@ TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDrawsMatchSequentialInvocations) {
 
     vernonRuntimeBindingSetDestroy(right);
     vernonRuntimeGraphicsPipelineDestroy(pipeline);
+}
+
+TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDrawsIntoAnAcquiredSurfaceImageMatchAnOrdinaryImage) {
+    std::optional<VernonOpenGLSurfaceCallbacks> window = openglSurface();
+    if (!window)
+        GTEST_SKIP() << "only OpenGL devices create surfaces";
+    VernonRhiSurfaceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.backend =
+        GetParam().runtime == VERNON_RUNTIME_OPENGL ? VERNON_RHI_BACKEND_OPENGL : VERNON_RHI_BACKEND_OPENGL_ES;
+    descriptor.native.opengl = &*window;
+    VernonRhiSurface surface{};
+    ASSERT_EQ(vernonRhiDeviceCreateSurface(runtime().device, &descriptor, &surface), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(runtime().device));
+    VernonRhiSurfaceCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    ASSERT_EQ(vernonRhiSurfaceGetCapabilities(runtime().device, surface, &capabilities), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(capabilities.current_width, capabilities.current_height);
+    const uint32_t extent = capabilities.current_width;
+    VernonRhiSurfaceConfiguration configuration{};
+    configuration.struct_size = sizeof(configuration);
+    configuration.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    configuration.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    configuration.width = extent;
+    configuration.height = extent;
+    configuration.present_mode = VERNON_RHI_PRESENT_FIFO;
+    configuration.image_count = 1;
+    ASSERT_EQ(vernonRhiSurfaceConfigure(runtime().device, surface, &configuration), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(runtime().device));
+    VernonRhiSurfaceImage acquired{};
+    acquired.struct_size = sizeof(acquired);
+    ASSERT_EQ(vernonRhiSurfaceAcquireImage(runtime().device, surface, &acquired), VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference acquiredView{};
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(runtime().runtime, acquired.view, &acquiredView), VERNON_STATUS_OK);
+
+    const auto drawBothTriangles = [&](const DrawTarget &target) {
+        PassInvocation pass(executable_, instance_, target, {passVertices(left_)}, VERNON_RUNTIME_PROVIDER_LOAD_CLEAR,
+                            true);
+        VernonGraphicsPipeline *pipeline = passPipeline(pass.node());
+        ASSERT_NE(pipeline, nullptr);
+        VernonBindingSet *right = verticesSet(runtime(), pipeline, executable_, right_.reference);
+        ASSERT_EQ(pass.record({bindPipeline(nullptr), draw(3), bindSet(right), draw(3)}), VERNON_STATUS_OK)
+            << lastError(runtime().runtime);
+        EXPECT_EQ(pass.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        vernonRuntimeBindingSetDestroy(right);
+        vernonRuntimeGraphicsPipelineDestroy(pipeline);
+    };
+    Target ordinary(runtime(), extent);
+    drawBothTriangles(ordinary);
+    drawBothTriangles({acquiredView, extent});
+    const std::vector<uint8_t> reference = ordinary.pixels();
+    EXPECT_GT(renderedPixels(reference), 0u);
+    EXPECT_EQ(downloadPixels(runtime(), acquired.image, extent), reference);
+
+    EXPECT_EQ(vernonRhiSurfacePresent(runtime().device, surface), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(runtime().device));
+    EXPECT_EQ(vernonRhiDeviceDestroySurface(runtime().device, surface), VERNON_RHI_STATUS_OK);
 }
 
 TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDebugGroupsLeaveDrawsUnchanged) {

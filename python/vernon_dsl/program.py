@@ -149,7 +149,9 @@ def _attachment_slots(descriptions: tuple[_AttachmentDescription, ...]) -> tuple
     return tuple((value.aspect, value.location, value.format_name) for value in descriptions)
 
 
-def _resolve_attachments(pipeline: Any, render_pass: Any) -> tuple[_AttachmentDescription, ...]:
+def _resolve_attachments(
+    pipeline: Any, render_pass: Any, specializations: tuple[SpecializationAssignment, ...]
+) -> tuple[_AttachmentDescription, ...]:
     """Determine a graphics node's attachment structure from whichever source is authoritative.
 
     A pipeline that declares target formats is authoritative, and a RenderPass bound to it must agree -- the same
@@ -158,7 +160,10 @@ def _resolve_attachments(pipeline: Any, render_pass: Any) -> tuple[_AttachmentDe
     has no RenderPass to read.
     """
 
-    declared = getattr(pipeline, "_targets", None)
+    try:
+        declared = pipeline._target_formats(specializations)
+    except ValueError as error:
+        raise TypeError(str(error)) from None
     prototype = render_pass.prototype if isinstance(render_pass, GraphControlInput) else render_pass
     if declared is None:
         if prototype is None:
@@ -603,7 +608,7 @@ class ProgramTemplate:
                         graphics_control_slots[ref] = slot
                     control_slots[kind] = slot
                 attachments, color_count = _graphics_attachments(
-                    _resolve_attachments(captured.pipeline, captured.render_pass),
+                    _resolve_attachments(captured.pipeline, captured.render_pass, captured.specializations),
                     captured.render_pass_ref,
                     graphics_attachment_cache,
                 )
@@ -790,14 +795,13 @@ def _resolve_storage_parameter(
     value_dtype: Any | None = None,
     value_shape: tuple[int, ...] | None = None,
     value_access: str | None = None,
-    require_static: bool,
 ) -> Any:
     from .frontend.runtime_types import (
         RuntimeParameterDescriptor,
         StorageParameterConstraint,
         storage_access,
     )
-    from .types import TypeExpr, dyn
+    from .types import TypeExpr
 
     explicit = _module_storage_constraint(annotation)
     reflected = None
@@ -845,8 +849,6 @@ def _resolve_storage_parameter(
             "provide TensorStorage[element, (shape,), access], "
             "use it in a typed Program call, or supply an explicit export argument"
         )
-    if require_static and any(extent is dyn for extent in shape):
-        raise TypeError(f"cannot infer dynamic shape for Module parameter {name!r} without an export argument")
     as_view = explicit.as_view if explicit is not None else False
     return RuntimeParameterDescriptor.storage(dtype, tuple(shape), access, as_view)
 
@@ -912,7 +914,6 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
                     parameter.name,
                     annotation,
                     candidate,
-                    require_static=False,
                 )
                 metadata = descriptor.storage_metadata
                 shape = tuple(dyn if extent == "?" else extent for extent in metadata.shape)
@@ -1007,7 +1008,7 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
     def descriptor(name: str, annotation: Any) -> Any:
         inferred = reflected.get(name)
         if _module_storage_constraint(annotation) is not None or inferred is not None:
-            return _resolve_storage_parameter(name, annotation, inferred, require_static=True)
+            return _resolve_storage_parameter(name, annotation, inferred)
         if annotation is None:
             raise TypeError(
                 f"cannot infer Module parameter {name!r}; annotate it as "
@@ -1090,7 +1091,6 @@ def _parameter_types_from_values(
                 value_dtype=dtype,
                 value_shape=tuple(value.shape),
                 value_access=str(value.access),
-                require_static=False,
             )
         if isinstance(value, TensorStorage):
             return _resolve_storage_parameter(
@@ -1100,7 +1100,6 @@ def _parameter_types_from_values(
                 value_dtype=tensor_dtype(value),
                 value_shape=tuple(value.shape),
                 value_access="read_write",
-                require_static=False,
             )
         if annotation is None:
             raise TypeError(
@@ -1432,7 +1431,7 @@ def _capture_recipes(
     def tree(value: Any) -> _TreeRecipe:
         if value is None:
             return _TreeRecipe("leaf", _ValueRecipe("constant", constant=None))
-        if isinstance(value, (GraphAttachmentOutput, GraphBuffer, TensorStorage, TensorView)):
+        if isinstance(value, (GraphAttachmentOutput, GraphBuffer, GraphResourceInput, TensorStorage, TensorView)):
             return _TreeRecipe("leaf", recipe(value))
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return _TreeRecipe(

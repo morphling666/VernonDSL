@@ -8,6 +8,7 @@
 #endif
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -27,7 +28,8 @@ public:
                                        ? requirements.minimumApiMinor
                                        : static_cast<uint16_t>(backend.runtime == VERNON_RUNTIME_OPENGL ? 1 : 0);
             try {
-                openglContext_ = std::make_unique<host::GlfwContextOwner>(api, major, minor);
+                openglContext_ = std::make_unique<host::GlfwContextOwner>(api, major, minor, requirements.windowWidth,
+                                                                          requirements.windowHeight);
             } catch (const std::runtime_error &error) {
                 return {BackendProbeKind::DeviceOrContextUnavailable,
                         std::string(backend.name) + " context is unavailable: " + error.what()};
@@ -48,6 +50,22 @@ public:
 
     OwnedRhiRuntime &owned() { return *runtime_; }
     RhiRuntime &context() { return runtime_->context(); }
+    // The OpenGL context's window as a surface; empty for other backends.
+    std::optional<VernonOpenGLSurfaceCallbacks> openglSurface() {
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        if (openglContext_)
+            return openglContext_->surfaceCallbacks();
+#endif
+        return std::nullopt;
+    }
+    // The callbacks the OpenGL device was created from; empty for other backends.
+    std::optional<VernonOpenGLContextCallbacks> openglContext() {
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        if (openglContext_)
+            return openglCallbacks_;
+#endif
+        return std::nullopt;
+    }
 
 private:
 #if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)

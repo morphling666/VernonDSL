@@ -138,6 +138,7 @@ struct BufferResourceTag {};
 struct ImageResourceTag {};
 struct ImageViewResourceTag {};
 struct SamplerResourceTag {};
+struct SurfaceResourceTag {};
 struct NativeDescriptorRangeResourceTag {};
 struct CommandEncoderResourceTag {};
 struct CompletionResourceTag {};

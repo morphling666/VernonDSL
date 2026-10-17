@@ -6,6 +6,7 @@ import vernon_dsl as vd  # pyright: ignore[reportMissingImports]
 
 SCALE = vd.specialization("SCALE", vd.u32)
 SURFACE = vd.specialization("SURFACE", vd.type)
+TARGET = vd.specialization("TARGET", vd.format)
 
 
 @vd.struct
@@ -78,6 +79,11 @@ def specialization_fragment() -> vd.Vector[vd.f32, 4]:
 
 
 @vd.fragment
+def quarter_red_fragment() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([0.25, 0.0, 0.0, 1.0])
+
+
+@vd.fragment
 def type_specialization_fragment() -> vd.Vector[vd.f32, 4]:
     surface = SURFACE(1.0)
     return vd.Vector([surface.red(), 0.0, 0.0, 1.0])
@@ -119,4 +125,14 @@ type_specialization_asset = vd.program_asset(
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
     variants=({SURFACE: Warm}, {SURFACE: Cool}),
+)
+
+format_specialization_asset = vd.program_asset(
+    id="runtime/language-contract-format-specialization",
+    program=vd.pipeline(
+        generated_contract_vertex,
+        quarter_red_fragment,
+        targets=vd.target_formats(colors={0: TARGET}),
+    ),
+    variants=({TARGET: vd.rgba8_unorm}, {TARGET: vd.rgba8_srgb}),
 )

@@ -65,6 +65,16 @@ VERNON_RHI_CAPI Result<bool, RhiError> commandEncoderRendering(VernonRhiDevice d
 VERNON_RHI_CAPI Result<void, RhiError> beginEncoderRendering(VernonRhiDevice device, uint64_t key, RenderingScope scope,
                                                              const RenderingRead *reads, size_t readCount) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> endEncoderRendering(VernonRhiDevice device, uint64_t key) noexcept;
+// An acquired surface image's contents are undefined until a submitted command writes it: a rendering scope that
+// loads it with CLEAR or DISCARD, or a copy into it. Until then a rendering scope that preserves it, a read of it in a
+// rendering scope and a copy from it are rejected unless an earlier command of the same encoder wrote it, and a
+// download of it is rejected. Keys are image resource keys. Every surface holds one reservation from creation to
+// destruction, which marking its acquired image uses; present forgets the image whether or not it was written.
+VERNON_RHI_CAPI Result<void, RhiError> reserveUndefinedImage(VernonRhiDevice device) noexcept;
+VERNON_RHI_CAPI void releaseUndefinedImage(VernonRhiDevice device) noexcept;
+VERNON_RHI_CAPI void markImageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept;
+VERNON_RHI_CAPI void forgetUndefinedImage(VernonRhiDevice device, uint64_t imageKey) noexcept;
+VERNON_RHI_CAPI bool imageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept;
 // Opens the native scope of the encoder's rendering scope unless it is open, and returns it. Draws open it before
 // recording; `EndRendering` opens a scope that no draw opened so that its load operations apply.
 VERNON_RHI_CAPI Result<OpenedRendering, RhiError> openCommandRendering(VernonRhiDevice device, uint64_t key) noexcept;

@@ -24,8 +24,8 @@ struct AcceptanceDescriptor {
     const double *expected;
     size_t expectedCount;
     std::string_view specialization;
-    const std::string_view *typeValues;
-    size_t typeValueCount;
+    const std::string_view *variantValues;
+    size_t variantValueCount;
 };
 
 } // namespace vernon::tests

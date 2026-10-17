@@ -238,7 +238,8 @@ typedef enum VernonProgramSpecializationKind {
     VERNON_PROGRAM_SPECIALIZATION_U32 = 2,
     VERNON_PROGRAM_SPECIALIZATION_F32 = 3,
     VERNON_PROGRAM_SPECIALIZATION_F64 = 4,
-    VERNON_PROGRAM_SPECIALIZATION_TYPE = 5
+    VERNON_PROGRAM_SPECIALIZATION_TYPE = 5,
+    VERNON_PROGRAM_SPECIALIZATION_FORMAT = 6
 } VernonProgramSpecializationKind;
 
 typedef union VernonProgramSpecializationValue {
@@ -249,6 +250,8 @@ typedef union VernonProgramSpecializationValue {
     double f64_value;
     /* Canonical type identity, `<module>:<Class>` or a scalar name; compared bytewise. */
     VernonStringView type_value;
+    /* A color format; the specialization selects a graphics pipeline's color target format. */
+    VernonTextureFormat format_value;
 } VernonProgramSpecializationValue;
 
 typedef struct VernonProgramSpecialization {

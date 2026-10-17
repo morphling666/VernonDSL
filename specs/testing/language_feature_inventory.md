@@ -429,11 +429,13 @@ compile failure with the stated stable reason, never a runtime skip.
   static branches over every scalar specialization kind, compile-time `When`
   predicates in Kernels and graphics Pipelines, type-valued specializations
   bound to declared structs, binding groups, or scalar types (compared with
-  `==`/`!=` only), and declared ProgramAsset variants.
+  `==`/`!=` only), format specializations selecting a graphics Pipeline's
+  color target formats, and declared ProgramAsset variants.
 - Invalid: arbitrary Python capture/execution, undeclared or mistyped
   specialization assignments, unassigned scalar or type uses, type values
   without a portable identity, type specializations in arithmetic or truth
-  tests, conditions that mix specializations with runtime values, or disabled
+  tests, format specializations in device code or outside a Pipeline's color
+  targets, conditions that mix specializations with runtime values, or disabled
   values used outside their guard.
 - Capabilities: compile according to entry; runtime matching stage.
 - Layers: `F`, `I`, `C`, `A`, `R`.

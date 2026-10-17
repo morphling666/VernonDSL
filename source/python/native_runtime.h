@@ -1,6 +1,7 @@
 #ifndef VERNON_PYTHON_NATIVE_RUNTIME_H
 #define VERNON_PYTHON_NATIVE_RUNTIME_H
 
+#include "VernonFormats.hpp"
 #include "native_lifecycle_test_hooks.h"
 #include "native_program_autodiff.h"
 #include "runtime/program_execution_backend.h"
@@ -182,6 +183,12 @@ struct Runtime {
                 typeIdentities.push_back(nb::cast<std::string>(value["value"]));
                 specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
                 specialization.value.type_value = {typeIdentities.back().data(), typeIdentities.back().size()};
+            } else if (tag == "format") {
+                const vernon::formats::Format *format = vernon::formats::find(nb::cast<std::string>(value["value"]));
+                if (!format)
+                    throw std::invalid_argument("Program format specialization names an unknown format");
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_FORMAT;
+                specialization.value.format_value = format->texture;
             } else {
                 throw std::invalid_argument("Program specialization tag is invalid");
             }

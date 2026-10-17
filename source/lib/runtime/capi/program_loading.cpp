@@ -1,3 +1,4 @@
+#include "VernonFormats.hpp"
 #include "VernonRuntime.h"
 #include "runtime/capi/boundary.h"
 #include "runtime/capi/program_state.h"
@@ -136,6 +137,13 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
             } else if (tag == "type" && value.is_string() && !value.get_ref<const std::string &>().empty()) {
                 specialization.kind = vernon::runtime::ProgramSpecializationKind::Type;
                 specialization.value = value.get<std::string>();
+            } else if (const vernon::formats::Format *format =
+                           tag == "format" && value.is_string()
+                               ? vernon::formats::find(value.get_ref<const std::string &>())
+                               : nullptr;
+                       format && format->aspects() == VERNON_RHI_IMAGE_ASPECT_COLOR) {
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::Format;
+                specialization.value = format->texture;
             } else {
                 fail(&context, "Program bundle specialization value does not match its tag", VERNON_STATUS_PARSE_ERROR);
                 return false;
@@ -261,6 +269,16 @@ selectProgramDeployment(VernonRuntimeContext &context,
                 }
                 destination.kind = vernon::runtime::ProgramSpecializationKind::Type;
                 destination.value = std::string(source.value.type_value.data, source.value.type_value.size);
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_FORMAT:
+                if (vernon::formats::aspects(source.value.format_value) != VERNON_RHI_IMAGE_ASPECT_COLOR) {
+                    fail(&context, "Program format specialization requires a color format");
+                    return Result{vernon::err(
+                        vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument,
+                                             {"Program format specialization requires a color format", 0, 0}})};
+                }
+                destination.kind = vernon::runtime::ProgramSpecializationKind::Format;
+                destination.value = source.value.format_value;
                 break;
             default:
                 fail(&context, "Program specialization kind is invalid");

@@ -107,6 +107,11 @@ def scale(
     values[index] = values[index] * factor
 
 
+class InPlaceScale(vd.Module):
+    def forward(self, values: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write], factor: vd.f32) -> None:
+        scale(values, factor, grid=(4, 1, 1))
+
+
 @vd.kernel(workgroup_size=(1, 1, 1))
 def write_rgba32_storage_image(
     image: vd.Texture["2d", vd.rgba32_float, vd.write],  # noqa: F722
@@ -302,6 +307,12 @@ opengl_runtime_acceptance_asset = vd.program_asset(
 scale_asset = vd.program_asset(
     id="pipelines/scale",
     program=scale,
+    variants=({},),
+)
+
+in_place_scale_asset = vd.program_asset(
+    id="pipelines/in_place_scale",
+    program=InPlaceScale(),
     variants=({},),
 )
 

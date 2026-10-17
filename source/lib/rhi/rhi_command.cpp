@@ -103,6 +103,9 @@ struct EncoderSlot {
     std::unordered_set<RetainedResource, RetainedResourceHash> retainedResourceIdentities;
     std::vector<vernon::rhi::RetainedRhiResourceLease> retainedResourceLeases;
     std::unordered_set<RetainedResource, RetainedResourceHash> pendingWriteResources;
+    // Image keys this encoder writes while their contents are undefined on the device. Its own later reads of them
+    // are valid, and submitting it makes them defined for every later read.
+    std::vector<uint64_t> definedImages;
     uint64_t admittedUploadBytes{};
     bool unknownPendingWrites{};
 };
@@ -176,6 +179,23 @@ public:
     uint32_t inFlightSubmissionCount{};
     uint32_t liveCompletionCount{};
     uint64_t admittedUploadBytes{};
+
+    [[nodiscard]] bool imageUndefined(uint64_t key) noexcept {
+        std::lock_guard<std::mutex> guard(undefinedImageMutex);
+        return std::find(undefinedImages.begin(), undefinedImages.end(), key) != undefinedImages.end();
+    }
+
+    void defineImage(uint64_t key) noexcept {
+        std::lock_guard<std::mutex> guard(undefinedImageMutex);
+        undefinedImages.erase(std::remove(undefinedImages.begin(), undefinedImages.end(), key), undefinedImages.end());
+    }
+
+    // A leaf lock: it is taken under encoder locks and takes no other lock.
+    std::mutex undefinedImageMutex;
+    // Image resource keys of acquired surface images that no submitted command has written yet. Each surface
+    // reserves one entry at creation and holds at most one acquired image, so marking at acquire never allocates.
+    std::vector<uint64_t> undefinedImages;
+    size_t reservedUndefinedImages{};
 };
 
 CommandDeviceStateRef::CommandDeviceStateRef() noexcept = default;
@@ -232,9 +252,74 @@ CommandDeviceStateControl &commandDeviceState(CommandDeviceStateRef &state) noex
     return state.control_.value().value();
 }
 
+Result<void, RhiError> reserveUndefinedImage(VernonRhiDevice device) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return Result<void, RhiError>{err(std::move(retained).error())};
+    auto stateRef = std::move(retained).value();
+    auto &state = commandDeviceState(stateRef);
+    std::lock_guard<std::mutex> guard(state.undefinedImageMutex);
+    try {
+        state.undefinedImages.reserve(state.reservedUndefinedImages + 1);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{err(
+            RhiError{RhiErrorCode::ResourceExhausted, {"reserve_undefined_image", device.generation, device.index}})};
+    }
+    ++state.reservedUndefinedImages;
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseUndefinedImage(VernonRhiDevice device) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return;
+    auto stateRef = std::move(retained).value();
+    auto &state = commandDeviceState(stateRef);
+    std::lock_guard<std::mutex> guard(state.undefinedImageMutex);
+    --state.reservedUndefinedImages;
+}
+
+void markImageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return;
+    auto stateRef = std::move(retained).value();
+    auto &state = commandDeviceState(stateRef);
+    std::lock_guard<std::mutex> guard(state.undefinedImageMutex);
+    if (std::find(state.undefinedImages.begin(), state.undefinedImages.end(), imageKey) == state.undefinedImages.end())
+        state.undefinedImages.push_back(imageKey);
+}
+
+void forgetUndefinedImage(VernonRhiDevice device, uint64_t imageKey) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return;
+    auto stateRef = std::move(retained).value();
+    commandDeviceState(stateRef).defineImage(imageKey);
+}
+
+bool imageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return false;
+    auto stateRef = std::move(retained).value();
+    return commandDeviceState(stateRef).imageUndefined(imageKey);
+}
+
 } // namespace vernon::rhi
 
 namespace {
+
+// Both run under the slot's lock. Callers of `recordDefinedImage` reserve its capacity first.
+bool encoderSeesUndefinedImage(const EncoderSlot &slot, uint64_t key) noexcept {
+    return slot.commandState->imageUndefined(key) &&
+           std::find(slot.definedImages.begin(), slot.definedImages.end(), key) == slot.definedImages.end();
+}
+
+void recordDefinedImage(EncoderSlot &slot, uint64_t key) noexcept {
+    if (encoderSeesUndefinedImage(slot, key))
+        slot.definedImages.push_back(key);
+}
 
 template <typename Handle> bool validHandle(Handle handle) {
     return handle.index != VERNON_RHI_INVALID_HANDLE_INDEX && handle.generation != 0;
@@ -790,6 +875,7 @@ static VernonRhiStatus vernonRhiDeviceCreateCommandEncoderBusiness(VernonRhiDevi
         slot->retainedResourceIdentities.clear();
         slot->retainedResourceLeases.clear();
         slot->pendingWriteResources.clear();
+        slot->definedImages.clear();
         slot->admittedUploadBytes = 0;
         slot->unknownPendingWrites = false;
     }
@@ -1060,8 +1146,14 @@ static VernonRhiStatus vernonRhiCommandEncoderCopyImageBusiness(VernonRhiDevice 
     size_t resourceCheckpoint{};
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
-        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed ||
+            encoderSeesUndefinedImage(*slot.slot, sourceResource))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        try {
+            slot->definedImages.reserve(slot->definedImages.size() + 1);
+        } catch (const std::bad_alloc &) {
+            return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+        }
         slot->busy = true;
         native = slot->native;
         resourceCheckpoint = slot->retainedResourceLeases.size();
@@ -1090,11 +1182,13 @@ static VernonRhiStatus vernonRhiCommandEncoderCopyImageBusiness(VernonRhiDevice 
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
-        if (recordStatus == VERNON_RHI_STATUS_OK)
+        if (recordStatus == VERNON_RHI_STATUS_OK) {
             vernon::rhi::recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites,
                                             vernon::rhi::ResourceKind::Image, destinationResource);
-        else
+            recordDefinedImage(*slot.slot, destinationResource);
+        } else {
             slot->failed = true;
+        }
     }
     return recordStatus;
 }
@@ -1251,6 +1345,7 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(Vernon
     if (!validRenderingScope(scope) || (readCount && !reads))
         return invalid();
     std::array<RenderingSubresources, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> attachments{};
+    std::array<bool, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> preserves{};
     size_t attachmentCount = 0;
     for (size_t index = 0; index < scope.colorCount; ++index) {
         auto attachment =
@@ -1258,6 +1353,7 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(Vernon
         if (attachment.isErr())
             return Result<void, RhiError>{err(std::move(attachment).error())};
         scope.colors[index].format = attachment.value().format;
+        preserves[attachmentCount] = scope.colors[index].load == VERNON_RHI_LOAD_PRESERVE;
         attachments[attachmentCount++] = attachment.value().subresources;
     }
     if (scope.hasDepth) {
@@ -1269,12 +1365,25 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(Vernon
         scope.depth.stencil = vernon::formats::hasStencil(scope.depth.format);
         if (!scope.depth.stencil && scope.depth.stencilLoad == VERNON_RHI_LOAD_CLEAR)
             return invalid();
+        preserves[attachmentCount] = scope.depth.depthLoad == VERNON_RHI_LOAD_PRESERVE ||
+                                     (scope.depth.stencil && scope.depth.stencilLoad == VERNON_RHI_LOAD_PRESERVE);
         attachments[attachmentCount++] = attachment.value().subresources;
     }
+    // The images whose contents the scope reads: preserved attachments and sampled reads.
+    std::vector<uint64_t> readImages;
+    try {
+        readImages.reserve(attachmentCount + readCount);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
+    }
+    for (size_t index = 0; index < attachmentCount; ++index)
+        if (preserves[index])
+            readImages.push_back(attachments[index].image);
     for (size_t index = 0; index < readCount; ++index) {
         auto read = renderingReadSubresources(device, reads[index]);
         if (read.isErr())
             return Result<void, RhiError>{err(std::move(read).error())};
+        readImages.push_back(read.value().image);
         for (size_t attachment = 0; attachment < attachmentCount; ++attachment)
             if (renderingSubresourcesOverlap(attachments[attachment], read.value()))
                 return invalid();
@@ -1282,19 +1391,27 @@ vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(Vernon
     auto slot = lookupKey(device, key);
     if (!slot)
         return invalid();
-    std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
-        return invalid();
-    try {
-        slot->renderingReads.assign(reads, reads + readCount);
-    } catch (const std::bad_alloc &) {
-        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+            return invalid();
+        for (const uint64_t image : readImages)
+            if (encoderSeesUndefinedImage(*slot.slot, image))
+                return invalid();
+        try {
+            slot->renderingReads.assign(reads, reads + readCount);
+            slot->definedImages.reserve(slot->definedImages.size() + attachmentCount);
+        } catch (const std::bad_alloc &) {
+            return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
+        }
+        for (size_t index = 0; index < attachmentCount; ++index)
+            recordDefinedImage(*slot.slot, attachments[index].image);
+        slot->scope = scope;
+        slot->opened = {};
+        slot->renderingDebugGroupDepth = slot->debugGroupDepth;
+        slot->rendering = true;
+        ++slot->stats.rendering_scope_count;
     }
-    slot->scope = scope;
-    slot->opened = {};
-    slot->renderingDebugGroupDepth = slot->debugGroupDepth;
-    slot->rendering = true;
-    ++slot->stats.rendering_scope_count;
     return Result<void, RhiError>{ok()};
 }
 
@@ -1767,6 +1884,9 @@ static VernonRhiStatus vernonRhiDeviceSubmitBusiness(VernonRhiDevice device, Ver
         submittedUploadBytes = std::exchange(slot->admittedUploadBytes, 0);
         submittedTimerStorage = std::exchange(slot->timerStorage, 0);
         submittedTimerCount = static_cast<uint32_t>(slot->openTimers.size());
+        for (const uint64_t image : slot->definedImages)
+            state.defineImage(image);
+        slot->definedImages.clear();
     }
     {
         std::lock_guard<std::mutex> guard(completion->mutex);

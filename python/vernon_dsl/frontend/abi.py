@@ -96,7 +96,7 @@ def _native_value_abi_nodes(
         for size, alignment, offsets, element_stride in native._plan_value_abi(module, logical_dtypes)
     )
     if not nodes:
-        raise ValueError(f"{value_type.mlir} has no finite canonical Value ABI")
+        raise ValueError(f"{value_type.spelling} has no finite canonical Value ABI")
     return nodes
 
 

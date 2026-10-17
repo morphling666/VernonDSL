@@ -51,6 +51,8 @@ enum class RhiErrorCode : std::uint8_t {
     BackendFailure = 4,
     LifecycleFailure = 5,
     SynchronizationFailure = 6,
+    SurfaceOutOfDate = 7,
+    SurfaceLost = 8,
 };
 
 struct RhiError {
@@ -159,6 +161,8 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
         return {RuntimeErrorCode::LifecycleFailure, error.context};
     case RhiErrorCode::BackendFailure:
     case RhiErrorCode::SynchronizationFailure:
+    case RhiErrorCode::SurfaceOutOfDate:
+    case RhiErrorCode::SurfaceLost:
         return {RuntimeErrorCode::RhiFailure, error.context};
     }
     return {RuntimeErrorCode::InternalFailure, error.context};
@@ -237,6 +241,10 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
     case RhiErrorCode::BackendFailure:
     case RhiErrorCode::SynchronizationFailure:
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    case RhiErrorCode::SurfaceOutOfDate:
+        return VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE;
+    case RhiErrorCode::SurfaceLost:
+        return VERNON_RHI_STATUS_SURFACE_LOST;
     }
     return VERNON_RHI_STATUS_INTERNAL_ERROR;
 }

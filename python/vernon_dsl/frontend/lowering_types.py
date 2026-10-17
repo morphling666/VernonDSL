@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 
-from ..diagnostics import CompileError, SourceLocation
+from ..diagnostics import CompileError, node_location
 from .model import AccessMode, ConcreteType, TypedFunctionInstance
 from .type_parser import AnnotatedType
 
@@ -57,11 +57,4 @@ class ModuleContext:
     typed_functions: dict[str, TypedFunctionInstance] = field(default_factory=dict)
 
     def error(self, node: ast.AST, message: str) -> CompileError:
-        return CompileError(
-            message,
-            SourceLocation(
-                self.filename,
-                getattr(node, "lineno", 1),
-                getattr(node, "col_offset", 0) + 1,
-            ),
-        )
+        return CompileError(message, node_location(node, self.filename))

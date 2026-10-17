@@ -29,6 +29,26 @@ typedef struct VernonOpenGLContextCallbacks {
     uint32_t reserved[4];
 } VernonOpenGLContextCallbacks;
 
+typedef void (*VernonOpenGLSwapIntervalFn)(void *user_data, int32_t interval);
+typedef void (*VernonOpenGLSwapBuffersFn)(void *user_data);
+typedef void (*VernonOpenGLDrawableSizeFn)(void *user_data, uint32_t *width, uint32_t *height);
+
+/*
+ * A window an OpenGL device presents to. `make_current` makes the device's own context current on the window, as
+ * SDL_GL_MakeCurrent(window, device_context) does; framebuffer and vertex-array objects are not shared between
+ * contexts, so the window must accept that context. `swap_interval` and `swap_buffers` act on the window while it is
+ * current, and `drawable_size` reports its size in pixels. The callbacks run on the device's thread.
+ */
+typedef struct VernonOpenGLSurfaceCallbacks {
+    uint32_t struct_size;
+    void *user_data;
+    VernonOpenGLMakeCurrentFn make_current;
+    VernonOpenGLSwapIntervalFn swap_interval;
+    VernonOpenGLSwapBuffersFn swap_buffers;
+    VernonOpenGLDrawableSizeFn drawable_size;
+    uint32_t reserved[4];
+} VernonOpenGLSurfaceCallbacks;
+
 #ifdef __cplusplus
 }
 #endif

@@ -97,6 +97,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
   every Execute returns after submission and completion effects belong to
   the submission. Phase 1, asynchronous plans whose writes are all in
   place, is implemented.
+- [`runtime/presentable_surfaces.md`](runtime/presentable_surfaces.md)
+  proposes RHI-owned swapchains for host windows, whose acquired images
+  Runtime binds as ordinary color targets.
 - [`runtime/gpu_profiling.md`](runtime/gpu_profiling.md) proposes per-Node
   and recorded debug groups and opt-in timed scopes.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)

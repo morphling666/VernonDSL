@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import Iterable
 
+from ..diagnostics import copy_location
 from ..language.stage_registry import GRAPHICS_STAGES
 from ..language.syntax import INTRINSIC_METHODS
 from ..shader_contracts import (
@@ -134,7 +135,8 @@ class _FunctionEmitter:
         if value_type != expected_type:
             raise self.context.error(
                 self.node,
-                f"builtin '{builtin}' requires type {expected_type.mlir}, but {label} has type {value_type.mlir}",
+                f"builtin '{builtin}' requires type {expected_type.spelling}, "
+                f"but {label} has type {value_type.spelling}",
             )
 
     def _validate_builtin_annotation(self, annotation: AnnotatedType, direction: str, label: str) -> None:
@@ -526,7 +528,7 @@ class _FunctionEmitter:
             return
         if isinstance(node, ast.AugAssign):
             operation = ast.BinOp(left=node.target, op=node.op, right=node.value)
-            ast.copy_location(operation, node)
+            copy_location(operation, node)
             typed_statement = self.typed_statements[id(node)]
             if not typed_statement.lvalues:
                 raise self.context.error(node, "internal error: augmented assignment has no typed lvalue")
@@ -682,14 +684,14 @@ class _FunctionEmitter:
                 f"({', '.join(value.type.mlir for value in values)}) -> {value_type.mlir}"
             )
             return Value(result, value_type, tuple(values))
-        raise self.context.error(node, f"cannot create a control-flow payload for {value_type.mlir}")
+        raise self.context.error(node, f"cannot create a control-flow payload for {value_type.spelling}")
 
     def _expression(self, node: ast.expr, expected: DslType | None = None) -> Value:
         typed = self._typed_expression(node)
         if expected is not None and not can_convert(typed.type, expected):
             raise self.context.error(
                 node,
-                f"typed model mismatch: cannot use {typed.type.mlir} as {expected.mlir}",
+                f"typed model mismatch: cannot use {typed.type.spelling} as {expected.spelling}",
             )
         if isinstance(node, ast.Name):
             if node.id not in self.environment:
@@ -1016,7 +1018,7 @@ class _FunctionEmitter:
         elif source_scalar.is_integer and target_scalar.is_integer:
             operation = "arith.bitcast"
         else:
-            raise self.context.error(node, f"cannot convert {value.type.mlir} to {target.mlir}")
+            raise self.context.error(node, f"cannot convert {value.type.spelling} to {target.spelling}")
         result = self._fresh()
         self._line(f"{result} = {operation} {value.name} : {value.type.mlir} to {target.mlir}")
         return Value(result, target)
@@ -1042,7 +1044,7 @@ class _FunctionEmitter:
             return value
         if can_convert(value.type, target):
             return self._cast(node, value, target)
-        raise self.context.error(node, f"unsafe implicit conversion from {value.type.mlir} to {target.mlir}")
+        raise self.context.error(node, f"unsafe implicit conversion from {value.type.spelling} to {target.spelling}")
 
     def _intrinsic(self, node: ast.AST, name: str, arguments: list[Value], result_type: DslType) -> Value:
         result = self._fresh()
@@ -1160,4 +1162,4 @@ class _FunctionEmitter:
 
     def _require_same_type(self, node: ast.AST, expected: DslType, actual: DslType) -> None:
         if expected != actual:
-            raise self.context.error(node, f"type mismatch: expected {expected.mlir}, got {actual.mlir}")
+            raise self.context.error(node, f"type mismatch: expected {expected.spelling}, got {actual.spelling}")

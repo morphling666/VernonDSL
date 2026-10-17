@@ -24,6 +24,7 @@ def _stage_artifact(
     stage: Any,
     descriptor: Mapping[str, Any],
     contract: Mapping[str, Any],
+    implementation: Mapping[str, Any] | None,
     target: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The blob, artifact row, and contract hash one logical Program stage deploys to."""
@@ -77,9 +78,7 @@ def _stage_artifact(
         "modules": modules,
         "reflection": copy.deepcopy(dict(reflection)),
     }
-    implementations = stage.metadata.get("program_implementations")
-    implementation = implementations.get(logical_stage) if isinstance(implementations, Mapping) else None
-    if isinstance(implementation, Mapping):
+    if implementation is not None:
         artifact["implementation"] = copy.deepcopy(dict(implementation))
     return blob, artifact
 
@@ -99,10 +98,8 @@ def _deploy_program_variant(
     for logical_stage, implementation_stage in variant.stage_implementations.items():
         stage = stages.get(implementation_stage)
         descriptor = artifact_descriptors.get(implementation_stage)
-        contracts = stage.metadata.get("program_contracts") if stage is not None else None
-        contract = contracts.get(logical_stage) if isinstance(contracts, Mapping) else None
         canonical_stage = canonical_stage_rows.get(logical_stage)
-        if not isinstance(descriptor, Mapping) or not isinstance(contract, Mapping):
+        if stage is None or not isinstance(descriptor, Mapping):
             raise ProgramCompileError(f"canonical stage {logical_stage} is incomplete")
         if not isinstance(canonical_stage, Mapping):
             raise ProgramCompileError(f"canonical Program has no logical stage {logical_stage!r}")
@@ -110,7 +107,8 @@ def _deploy_program_variant(
             logical_stage,
             stage,
             descriptor,
-            contract,
+            variant.stage_contracts[logical_stage],
+            variant.stage_target_implementations.get(logical_stage),
             plan.target.target,
         )
         if canonical_stage.get("contract_hash") != artifact["contract_hash"]:

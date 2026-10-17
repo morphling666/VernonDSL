@@ -1309,6 +1309,36 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertIn("arith.extf", output)
         self.assertIn("arith.divf", output)
 
+    def test_float_literals_with_exponents_keep_a_fraction(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n@func\ndef tiny(value: f32) -> f32:\n    return value * 1e-10 + 1e20 + 2.5e-5\n",
+            "exponents.py",
+        )
+        self.assertIn("arith.constant 1.0e-10 : f32", output)
+        self.assertIn("arith.constant 1.0e+20 : f32", output)
+        self.assertIn("arith.constant 2.5000000000000001e-05 : f32", output)
+
+    def test_literal_expressions_take_their_context_down_to_each_literal(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def takes_unsigned(value: u32) -> u32:\n"
+            "    return value\n"
+            "@func\n"
+            "def takes_float(value: f32) -> f32:\n"
+            "    return value\n"
+            "@func\n"
+            "def contexts(value: f32) -> f32:\n"
+            "    quotient = takes_unsigned(8 // 2 + 1)\n"
+            "    return takes_float(-(3 * 2)) + value\n",
+            "literal_expression_contexts.py",
+        )
+        self.assertIn("arith.divui", output)
+        self.assertNotIn("arith.floordivsi", output)
+        self.assertIn("arith.constant 3.0 : f32", output)
+        self.assertIn("arith.constant 2.0 : f32", output)
+        self.assertNotIn("arith.sitofp", output)
+
     def test_literals_are_contextual_in_calls_constructors_and_comparisons(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"

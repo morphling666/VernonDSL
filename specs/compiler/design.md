@@ -158,6 +158,14 @@ Neither bundle planning nor serialization imports the Python frontend or
 Runtime, allowing cooked-manifest identity to be tested independently of
 compiler and device availability.
 
+The planner takes one `CompiledProgramVariant` per key: its logical stages,
+canonical Program, stage contracts, and target implementations. Variants whose
+compiled stages have identical bytes share one stage ID, but the contracts stay
+on each variant, because a contract also records state the bytes do not
+encode, such as the color attachment formats a format specialization selects
+(`language/contract.md` section 6.6.1). Storing contracts on the shared stage
+was rejected because two such variants would conflict.
+
 Runtime TensorStorage, TensorView, and TensorLayout implementations live in
 `_runtime.tensor`; Texture and Sampler implementations live in
 `_runtime.texture` and `_runtime.sampler`. There is no aggregate compatibility

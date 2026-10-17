@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import replace
 
+from ..diagnostics import copy_location, fix_missing_locations
 from ..language.ast_utils import assigned_names, decorator_name, dotted_name, rectangular_literal
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, ENTRY_DECORATORS, GRAPHICS_STAGES
 from ..shader_contracts import (
@@ -269,7 +270,7 @@ class _Inference:
             *[statement for statement in retained if isinstance(statement, ast.FunctionDef)],
         ]
         self.module._vernon_typed_functions = self._build_typed_functions()
-        return ast.fix_missing_locations(self.module)
+        return fix_missing_locations(self.module)
 
     def _validate_direct_fragment_discard(self, function: ast.FunctionDef) -> None:
         """Statements after a discard are not typed, so a non-fragment entry is rejected here before its return
@@ -313,7 +314,7 @@ class _Inference:
             if value is None or not can_convert(value, expected):
                 if value is None:
                     raise self.error(function, f"function '{function.name}' requires a return value")
-                raise self.error(function, f"unsafe implicit conversion from {describe(value)} to {expected.mlir}")
+                raise self.error(function, f"unsafe implicit conversion from {describe(value)} to {expected.spelling}")
             if index < len(return_nodes):
                 assert return_nodes[index].value is not None
                 self._constrain_literal(return_nodes[index].value, expected)
@@ -967,14 +968,14 @@ class _Inference:
                     expected = target_type.arguments[0]
                     assert isinstance(expected, ConcreteType)
                     if not can_convert(value_type, expected):
-                        raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.mlir}")
+                        raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.spelling}")
                 else:
                     raise self.error(statement, "assignment target must be a local name or TensorView element")
             elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
                 value_type = self._expression(statement.value, environment)
                 expected = self.parse_type(statement.annotation)
                 if not can_convert(value_type, expected):
-                    raise self.error(statement.value, f"cannot infer assignment as {expected.mlir}")
+                    raise self.error(statement.value, f"cannot infer assignment as {expected.spelling}")
                 self._constrain_literal(statement.value, expected)
                 if isinstance(statement.target, ast.Name):
                     environment[statement.target.id] = expected
@@ -1332,9 +1333,9 @@ class _Inference:
             else None
         )
         if tuple_elements is not None and expected.kind == "tuple" and len(tuple_elements) == len(expected.arguments):
-            for element, element_type in zip(tuple_elements, expected.arguments, strict=True):
-                assert isinstance(element_type, ConcreteType)
-                self._constrain_literal(element, element_type)
+            for element, element_expected in zip(tuple_elements, expected.arguments, strict=True):
+                assert isinstance(element_expected, ConcreteType)
+                self._constrain_literal(element, element_expected)
             self.expression_records[id(node)] = (node, expected, "Tuple" if isinstance(node, ast.Call) else "tuple")
             return
         record = self.expression_records.get(id(node))
@@ -1344,6 +1345,13 @@ class _Inference:
         if not isinstance(inferred, ConcreteType):
             concrete = contextualize(inferred, expected)
             self.expression_records[id(node)] = (source, concrete, operation)
+            # A literal-typed operator takes its type from its literal operands, which lowering emits with their
+            # own records, so the context has to reach them too.
+            if isinstance(node, ast.BinOp):
+                self._constrain_literal(node.left, element_type(concrete))
+                self._constrain_literal(node.right, element_type(concrete))
+            elif isinstance(node, ast.UnaryOp) and not isinstance(node.op, ast.Not):
+                self._constrain_literal(node.operand, concrete)
 
     def _receiver(self, node: ast.expr, environment: dict[str, InferenceType]) -> bool:
         """Whether `node` is a value expression rather than a module path such as `vd.texture_sample`."""
@@ -1363,7 +1371,7 @@ class _Inference:
             suffix = f" (in helper specialization {chain})" if chain else ""
             raise self.error(node.func, f"'{receiver.name}' has no method '{node.func.attr}'{suffix}")
         node.args = [node.func.value, *node.args]
-        node.func = ast.copy_location(ast.Name(id=helper, ctx=ast.Load()), node.func)
+        node.func = copy_location(ast.Name(id=helper, ctx=ast.Load()), node.func)
         return True
 
     def _call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
@@ -1430,7 +1438,7 @@ class _Inference:
                     if not default_type(self._expression(index_node, environment)).is_integer:
                         raise self.error(index_node, f"{name} indices must be integers")
             if not can_convert(value, element):
-                raise self.error(node.args[2], f"{name} value must be {element.mlir}")
+                raise self.error(node.args[2], f"{name} value must be {element.spelling}")
             self._constrain_literal(node.args[2], element)
             return element
         if name in {"workgroup_barrier", "storage_barrier", FRAGMENT_DISCARD_OPERATION}:
@@ -1451,7 +1459,7 @@ class _Inference:
         if name in self.generic:
             symbol, result = self._specialize(name, tuple(arguments), node)
             node._vernon_generic_name = name
-            node.func = ast.copy_location(ast.Name(id=symbol, ctx=ast.Load()), node.func)
+            node.func = copy_location(ast.Name(id=symbol, ctx=ast.Load()), node.func)
             if result is None:
                 return ConcreteType("void", "void")
             return result
@@ -1461,7 +1469,7 @@ class _Inference:
                 raise self.error(node, f"function '{name}' expects {len(parameter_types)} arguments")
             for source, inferred, expected in zip(node.args, arguments, parameter_types, strict=True):
                 if not can_convert(inferred, expected):
-                    raise self.error(node, f"cannot pass {describe(inferred)} as {expected.mlir}")
+                    raise self.error(node, f"cannot pass {describe(inferred)} as {expected.spelling}")
                 self._constrain_literal(source, expected)
             return ConcreteType("void", "void") if result is None else result
         if name in self.functions:
@@ -1475,7 +1483,7 @@ class _Inference:
                     )
                 expected = self.parse_type(parameter.annotation)
                 if not can_convert(argument, expected):
-                    raise self.error(node, f"cannot pass {describe(argument)} as {expected.mlir}")
+                    raise self.error(node, f"cannot pass {describe(argument)} as {expected.spelling}")
                 self._constrain_literal(source, expected)
             result = function.returns
             return (
@@ -1501,7 +1509,7 @@ class _Inference:
                 raise self.error(node, f"{name} constructor requires {len(fields)} arguments")
             for source, inferred, (_, expected) in zip(node.args, arguments, fields, strict=True):
                 if not can_convert(inferred, expected):
-                    raise self.error(node, f"cannot pass {describe(inferred)} as {expected.mlir}")
+                    raise self.error(node, f"cannot pass {describe(inferred)} as {expected.spelling}")
                 self._constrain_literal(source, expected)
             return ConcreteType("struct", name)
         if name == "matmul":
@@ -1560,7 +1568,7 @@ class _Inference:
             if access == "read":
                 raise self.error(node.args[0], "texture_store requires write or read_write access")
             if not can_convert(arguments[2], texel):
-                raise self.error(node.args[2], f"texture_store value must be {texel.mlir}")
+                raise self.error(node.args[2], f"texture_store value must be {texel.spelling}")
             return ConcreteType("void", "void")
         if name == "texture_sample":
             if len(arguments) not in {2, 3, 4} or not isinstance(arguments[0], ConcreteType):
@@ -1705,7 +1713,7 @@ class _Inference:
             concrete = contextualize(inferred, expected)
             if expected is not None:
                 if not can_convert(concrete, expected):
-                    raise self.error(call, f"cannot pass {describe(inferred)} as {expected.mlir}")
+                    raise self.error(call, f"cannot pass {describe(inferred)} as {expected.spelling}")
                 concrete = expected
             resolved_arguments.append(concrete)
         argument_types = tuple(resolved_arguments)
@@ -1725,7 +1733,7 @@ class _Inference:
         clone._vernon_qualified_name = name
         clone.decorator_list = [ast.Name(id="func", ctx=ast.Load())]
         for argument, value_type in zip(clone.args.args, argument_types, strict=True):
-            argument.annotation = ast.copy_location(_annotation(value_type), argument)
+            argument.annotation = copy_location(_annotation(value_type), argument)
         self.instances[key] = clone
         self.active.append(key)
         environment = {
@@ -1746,7 +1754,7 @@ class _Inference:
                     if not can_convert(inferred, result):
                         raise self.error(
                             function,
-                            f"helper '{name}' cannot return {describe(inferred)} as {result.mlir}",
+                            f"helper '{name}' cannot return {describe(inferred)} as {result.spelling}",
                         )
         elif not returns or all(value is None for value in returns):
             result = None
@@ -1763,7 +1771,7 @@ class _Inference:
                     raise self.error(function, f"helper '{name}' has incompatible return types")
                 result = common
             result = default_type(result)
-            clone.returns = ast.copy_location(_annotation(result), function)
+            clone.returns = copy_location(_annotation(result), function)
         self.instance_results[key] = result
         self.specialized_signatures[clone.name] = (argument_types, result)
         return clone.name, result

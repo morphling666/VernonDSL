@@ -240,6 +240,7 @@ if(TARGET VernonRuntime)
         runtime/resolved_execution_plan_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
+        runtime/rhi_surface_test.cpp
         runtime/runtime_architecture_type_test.cpp
         runtime/runtime_autodiff_test.cpp
         runtime/runtime_c_api_test.cpp

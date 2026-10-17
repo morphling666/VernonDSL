@@ -12,6 +12,7 @@ import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ._markers import declaration_source, is_binding_group, is_struct_class
+from ._texture_format import TextureFormat
 from .source_identity import project_module_name, project_root
 
 
@@ -270,16 +271,28 @@ class _TypeKind:
 type_kind = _TypeKind()
 
 
+class _FormatKind:
+    """The kind of a specialization whose value is a texture format; it selects a pipeline's color target format."""
+
+    name = "format"
+
+    def __repr__(self) -> str:
+        return "vernon_dsl.format"
+
+
+format_kind = _FormatKind()
+
+
 @dataclass(frozen=True)
 class Specialization:
     name: str
-    type: _Scalar | _TypeKind
+    type: _Scalar | _TypeKind | _FormatKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("specialization name must be a non-empty string")
-        if self.type not in {bool, i32, u32, f32, f64, type_kind}:
-            raise TypeError("specialization type must be bool, i32, u32, f32, f64, or vd.type")
+        if self.type not in {bool, i32, u32, f32, f64, type_kind, format_kind}:
+            raise TypeError("specialization type must be bool, i32, u32, f32, f64, vd.type, or vd.format")
 
     def _compile_time_only(self, *_: object) -> NoReturn:
         raise TypeError(
@@ -330,6 +343,12 @@ def specialization_key_data(key: tuple[SpecializationAssignment, ...]) -> list[d
     return [assignment.manifest for assignment in key]
 
 
+def source_key(key: tuple[SpecializationAssignment, ...]) -> tuple[SpecializationAssignment, ...]:
+    """The part of a key the source module graph binds; `format` assignments select pipeline state only."""
+
+    return tuple(assignment for assignment in key if assignment.type != "format")
+
+
 def enabled_features(key: tuple[SpecializationAssignment, ...]) -> tuple[str, ...]:
     return tuple(assignment.name for assignment in key if assignment.type == "bool" and assignment.value is True)
 
@@ -355,7 +374,7 @@ def check_type_identity_sources(keys: Iterable[tuple[SpecializationAssignment, .
                 )
 
 
-def specialization(name: str, type: _Scalar | _TypeKind) -> Specialization:
+def specialization(name: str, type: _Scalar | _TypeKind | _FormatKind) -> Specialization:
     return Specialization(name, type)
 
 
@@ -390,6 +409,10 @@ def specialization_assignment(parameter: Specialization, value: object) -> Speci
     if parameter.type is type_kind:
         source = declaration_source(value) if is_struct_class(value) or is_binding_group(value) else None
         return SpecializationAssignment(parameter.name, "type", type_identity(value), value, source)
+    if parameter.type is format_kind:
+        if not isinstance(value, TextureFormat) or "color" not in value.aspects:
+            raise TypeError(f"specialization {parameter.name!r} requires a color texture format")
+        return SpecializationAssignment(parameter.name, "format", value.name)
     if parameter.type is bool:
         if type(value) is not builtins.bool:
             raise TypeError(f"specialization {parameter.name!r} requires a bool value")

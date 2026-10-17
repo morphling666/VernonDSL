@@ -86,28 +86,6 @@ struct SpirvTensorSplatPattern final : OpConversionPattern<tensor::SplatOp> {
     }
 };
 
-template <typename Op> struct SpirvTensorElementwisePattern final : OpConversionPattern<Op> {
-    using OpConversionPattern<Op>::OpConversionPattern;
-    using OpAdaptor = typename Op::Adaptor;
-
-    LogicalResult matchAndRewrite(Op op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
-        auto arrayType =
-            dyn_cast_if_present<spirv::ArrayType>(this->getTypeConverter()->convertType(op.getResult().getType()));
-        if (!arrayType || adaptor.getOperands().size() != 2)
-            return failure();
-        SmallVector<Value> values;
-        for (unsigned index = 0; index < arrayType.getNumElements(); ++index) {
-            Value lhs = spirv::CompositeExtractOp::create(rewriter, op.getLoc(), adaptor.getOperands()[0],
-                                                          ArrayRef<int32_t>{static_cast<int32_t>(index)});
-            Value rhs = spirv::CompositeExtractOp::create(rewriter, op.getLoc(), adaptor.getOperands()[1],
-                                                          ArrayRef<int32_t>{static_cast<int32_t>(index)});
-            values.push_back(Op::create(rewriter, op.getLoc(), lhs, rhs));
-        }
-        rewriter.replaceOpWithNewOp<spirv::CompositeConstructOp>(op, arrayType, values);
-        return success();
-    }
-};
-
 Value extractFlatTensorElement(Location location, Value value, int64_t index, bool useSpirv,
                                ConversionPatternRewriter &rewriter) {
     if (isa<VectorType>(value.getType()))
@@ -366,13 +344,17 @@ template <typename Op> struct GpuFlatTensorElementwisePattern final : OpConversi
     LogicalResult matchAndRewrite(Op op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
         auto sourceType = dyn_cast<RankedTensorType>(op.getResult().getType());
         Type resultType = this->getTypeConverter()->convertType(op.getResult().getType());
-        if (!sourceType || isa<VectorType>(resultType) || adaptor.getOperands().size() != 2)
+        if (!sourceType || !resultType || isa<VectorType>(resultType))
             return failure();
         SmallVector<Value> elements;
+        SmallVector<Value> operands;
         for (int64_t index = 0; index < sourceType.getNumElements(); ++index) {
-            Value lhs = extractFlatTensorElement(op.getLoc(), adaptor.getOperands()[0], index, useSpirv, rewriter);
-            Value rhs = extractFlatTensorElement(op.getLoc(), adaptor.getOperands()[1], index, useSpirv, rewriter);
-            elements.push_back(Op::create(rewriter, op.getLoc(), lhs, rhs));
+            operands.clear();
+            for (Value operand : adaptor.getOperands())
+                operands.push_back(extractFlatTensorElement(op.getLoc(), operand, index, useSpirv, rewriter));
+            elements.push_back(
+                Op::create(rewriter, op.getLoc(), TypeRange{sourceType.getElementType()}, operands, op->getAttrs())
+                    ->getResult(0));
         }
         FailureOr<Value> result = constructFlatTensor(op.getLoc(), resultType, elements, useSpirv, rewriter);
         if (failed(result))
@@ -716,21 +698,15 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
         RewritePatternSet patterns(context);
         populateVernonSharedValuePatterns(converter, patterns);
         if (useSpirvTupleAbi)
-            patterns.add<SpirvTensorConstantPattern, SpirvTensorFromElementsPattern, SpirvTensorSplatPattern,
-                         SpirvTensorElementwisePattern<arith::AddFOp>, SpirvTensorElementwisePattern<arith::SubFOp>,
-                         SpirvTensorElementwisePattern<arith::MulFOp>, SpirvTensorElementwisePattern<arith::DivFOp>,
-                         SpirvTensorElementwisePattern<arith::AddIOp>, SpirvTensorElementwisePattern<arith::SubIOp>,
-                         SpirvTensorElementwisePattern<arith::MulIOp>>(converter, context);
+            patterns.add<SpirvTensorConstantPattern, SpirvTensorFromElementsPattern, SpirvTensorSplatPattern>(converter,
+                                                                                                              context);
         patterns.add<GpuAggregateTensorConstructPattern, GpuAggregateTensorGetPattern, GpuStructCreatePattern,
                      GpuStructGetPattern, GpuTupleCreatePattern, GpuTupleGetPattern>(converter, context,
                                                                                      useSpirvTupleAbi);
         patterns.add<GpuTensorShapeIntrinsicPattern, GpuFlatTensorConstructPattern, GpuFlatTensorFromElementsPattern,
                      GpuFlatTensorSplatPattern, GpuFlatTensorExtractPattern>(converter, context, useSpirvTupleAbi);
         patterns.add<GpuTextureIntrinsicTypePattern>(converter, context);
-        patterns.add<GpuFlatTensorElementwisePattern<arith::AddFOp>, GpuFlatTensorElementwisePattern<arith::SubFOp>,
-                     GpuFlatTensorElementwisePattern<arith::MulFOp>, GpuFlatTensorElementwisePattern<arith::DivFOp>,
-                     GpuFlatTensorElementwisePattern<arith::AddIOp>, GpuFlatTensorElementwisePattern<arith::SubIOp>,
-                     GpuFlatTensorElementwisePattern<arith::MulIOp>>(converter, context, useSpirvTupleAbi);
+        addVernonElementwisePatterns<GpuFlatTensorElementwisePattern>(patterns, converter, context, useSpirvTupleAbi);
         patterns.add<GpuFuncSignatureConversionPattern>(converter, context);
 
         ConversionTarget target(*context);

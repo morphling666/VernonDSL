@@ -38,6 +38,8 @@ vernon::ProviderError providerError(vernon::RhiError error) noexcept {
         return {ProviderErrorCode::LifecycleFailure, error.context};
     case RhiErrorCode::BackendFailure:
     case RhiErrorCode::SynchronizationFailure:
+    case RhiErrorCode::SurfaceOutOfDate:
+    case RhiErrorCode::SurfaceLost:
         return {ProviderErrorCode::BackendFailure, error.context};
     }
     return {ProviderErrorCode::BackendFailure, error.context};

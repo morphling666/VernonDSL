@@ -117,6 +117,15 @@ def storage_texture_round_trip(
     vd.texture_store(image, coordinate, value + vd.Vector([1.0, 2.0, 3.0, 4.0]))
 
 
+class StorageTextureRoundTrip(vd.Module):
+    def forward(
+        self,
+        image: vd.Texture["3d", vd.rgba32_float, vd.read_write],  # noqa: F722
+    ) -> vd.Texture["3d", vd.rgba32_float, vd.read_write]:  # noqa: F722
+        storage_texture_round_trip(image, grid=(2, 2, 1))
+        return image
+
+
 @vd.kernel(workgroup_size=(4, 1, 1))
 def read_only_storage_texture(
     image: vd.Texture["2d", vd.rgba32_float, vd.read],  # noqa: F722
@@ -715,6 +724,25 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         value = vd.storage.from_numpy(np.array(3.0, dtype=np.float32))
         rank_zero_round_trip(value)
         self.assertEqual(value.to_numpy()[()], 6.0)
+
+    @backend_matrix_test(
+        BackendRequirements(
+            gpu=True,
+            compute=True,
+            storage_texture=True,
+            non_r32_read_write_storage_images=True,
+        )
+    )
+    def test_module_returns_the_storage_texture_it_writes(self, backend: BackendRow) -> None:
+        source = np.arange(2 * 4 * 4 * 4, dtype=np.float32).reshape(2, 4, 4, 4)
+        image = vd.Texture.from_numpy(
+            source,
+            dimension="3d",
+            format=vd.rgba32_float,
+            usage=("storage", "transfer_source", "transfer_destination"),
+        )
+        self.assertIs(StorageTextureRoundTrip()(image), image)
+        np.testing.assert_array_equal(image.download(), source + np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
 
     @backend_matrix_test(
         BackendRequirements(

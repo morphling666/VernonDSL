@@ -9,6 +9,7 @@ import numpy as np
 import vernon_dsl as vd
 from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 from language_contract_cases import case_by_id
+from program_asset_fixture import InPlaceScale
 from vernon_dsl._program_assets.capture import capture_program
 
 from python.tests.storage_vjp_direct_fixture import (
@@ -61,6 +62,26 @@ def program_texture_round_trip(
     coordinate = vd.Vector([vd.i32(gid[0]), vd.i32(gid[1]), vd.i32(gid[2])])
     value = vd.texture_load(image, coordinate)
     vd.texture_store(image, coordinate, value + vd.Vector([1.0, 2.0, 3.0, 4.0]))
+
+
+@vd.kernel(workgroup_size=(4, 4, 1))
+def program_texture_fill(
+    image: vd.Texture["2d", vd.rgba32_float, vd.write],  # noqa: F722
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    value = vd.f32(gid[1] * 4 + gid[0]) + 1.0
+    vd.texture_store(image, vd.Vector([vd.i32(gid[0]), vd.i32(gid[1])]), vd.Vector([value, 0.0, 0.0, 1.0]))
+
+
+@vd.kernel(workgroup_size=(4, 4, 1))
+def program_texture_sample_texels(
+    image: vd.Texture["2d", vd.f32],  # noqa: F722
+    linear: vd.Sampler,
+    output: vd.TensorView[vd.f32, (16,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    center = (vd.Vector([vd.f32(gid[0]), vd.f32(gid[1])]) + 0.5) / 4.0
+    output[gid[1] * 4 + gid[0]] = vd.texture_sample(image, linear, center, 0.0)[0]
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
@@ -166,6 +187,11 @@ class DynamicIncrement(vd.Module):
         return output
 
 
+class DiscardedIncrement(vd.Module):
+    def forward(self, source: vd.TensorStorage) -> None:
+        program_increment(vd.empty_like(source), source, grid=(4, 1, 1))
+
+
 class ParameterizedIncrement(vd.Module):
     def forward(self, source: vd.TensorStorage, amount: vd.f32) -> vd.TensorStorage:
         output = vd.empty_like(source)
@@ -264,6 +290,17 @@ class TextureRoundTrip(vd.Module):
         return output
 
 
+class StoreThenSample(vd.Module):
+    def forward(
+        self,
+        image: vd.Texture["2d", vd.rgba32_float, vd.read_write],  # noqa: F722
+        linear: vd.Sampler,
+        output: vd.TensorView[vd.f32, (16,), vd.write],
+    ) -> None:
+        program_texture_fill(image, grid=(1, 1, 1))
+        program_texture_sample_texels(image, linear, output, grid=(1, 1, 1))
+
+
 class AggregateObjective(vd.Module):
     def forward(self, particles: vd.TensorStorage) -> vd.TensorStorage:
         loss = vd.zeros(dtype=vd.f32, shape=(1,))
@@ -339,6 +376,18 @@ class ProgramExecutionTests(unittest.TestCase):
             np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 12.0)
         self.assertEqual(len(module._program_cache._partition(vd.current_session()).snapshot), 1)
+
+    def test_module_without_outputs_writes_its_input_in_place(self) -> None:
+        values = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
+
+        self.assertIsNone(InPlaceScale()(values, np.float32(3.0)))
+
+        np.testing.assert_array_equal(values.to_numpy(), np.arange(4, dtype=np.float32) * 3.0)
+
+    def test_module_without_outputs_must_write_an_input(self) -> None:
+        declaration = vd.program_asset(id="effects/none", program=DiscardedIncrement())
+        with self.assertRaisesRegex(ValueError, "must return a Program buffer or write one of its inputs"):
+            capture_program(declaration)
 
     def test_module_dynamic_tensor_view_shape_reuses_annotation_static_program(self) -> None:
         module = DynamicIncrement()
@@ -686,6 +735,21 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         expected = np.zeros((2, 2, 2, 4), dtype=np.float32)
         expected[...] = [1.0, 2.0, 3.0, 4.0]
         np.testing.assert_array_equal(image.to_numpy(), expected)
+
+    @backend_matrix_test(
+        BackendRequirements(gpu=True, compute=True, storage_texture=True, texture_sampler_operations=True)
+    )
+    def test_gpu_module_samples_the_image_an_earlier_kernel_stored(self, backend: BackendRow) -> None:
+        image = vd.Texture.from_numpy(
+            np.zeros((4, 4, 4), dtype=np.float32),
+            format=vd.rgba32_float,
+            usage=("storage", "sampled", "transfer_source", "transfer_destination"),
+        )
+        output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
+
+        self.assertIsNone(StoreThenSample()(image, vd.sampler(address="clamp_to_edge"), output))
+
+        np.testing.assert_array_equal(output.to_numpy(), np.arange(16, dtype=np.float32) + 1.0)
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
     def test_gpu_module_reuses_unchanged_value_and_storage_bindings(self, backend: BackendRow) -> None:

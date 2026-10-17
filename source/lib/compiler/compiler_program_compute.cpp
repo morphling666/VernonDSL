@@ -258,8 +258,12 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                 compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
             return true;
         }
-        const bool opaqueMatches = opaqueResourceEndpoint && resource && logicalValue &&
-                                   logicalValue->getString("type") == row.getString("type");
+        // One image Value may be a storage image in one kernel and sampled in a later one, so endpoint and Value
+        // types differ in role and format; planProgramImageEndpoint checks both against the image Storage.
+        const llvm::StringRef logicalType = logicalValue ? logicalValue->getString("type").value_or("") : "";
+        const bool opaqueMatches =
+            opaqueResourceEndpoint && resource &&
+            (endpointKind == "image" ? isProgramTextureType(logicalType) : isProgramSamplerType(logicalType));
         const bool byteValueMatches =
             !opaqueResourceEndpoint && logicalValue && wholeLayout && logicalLayout && logicalShape &&
             wholeLayout->getString("layout_hash") == logicalLayout->getString("layout_hash") &&

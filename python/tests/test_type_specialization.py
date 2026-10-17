@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import shutil
@@ -203,7 +204,7 @@ class TypeSpecializationCompilerTests(unittest.TestCase):
         glossy = FrontendCompileRequest(self.template, "main", (_type("MATERIAL", "glossy:Glossy"),))
         matte_result = Compiler().compile_request(matte)
         glossy_result = Compiler().compile_request(glossy)
-        self.assertNotEqual(matte_result.specialized_source, glossy_result.specialized_source)
+        self.assertNotEqual(ast.dump(matte_result.specialized_module), ast.dump(glossy_result.specialized_module))
         self.assertTrue(any(name.endswith("matte.py") for name, _ in matte_result.dependencies))
         self.assertFalse(any(name.endswith("matte.py") for name, _ in glossy_result.dependencies))
 

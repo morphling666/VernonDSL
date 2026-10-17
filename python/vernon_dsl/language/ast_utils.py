@@ -1,6 +1,34 @@
 from __future__ import annotations
 
 import ast
+import copy
+
+# Nodes without fields or a location, which the parser shares across every tree.
+STATELESS_NODES = (ast.expr_context, ast.boolop, ast.operator, ast.unaryop, ast.cmpop)
+
+
+def detach_shared_nodes(tree: ast.AST) -> None:
+    """Copies every node `tree` reaches a second time, so each node has one parent. The frontend keys typing and
+    lowering facts by node identity, and rewrites that insert one node in several places must not share those facts.
+    Stateless nodes stay shared."""
+
+    seen: set[int] = set()
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        for name, value in ast.iter_fields(node):
+            children = value if isinstance(value, list) else [value]
+            for index, child in enumerate(children):
+                if not isinstance(child, ast.AST) or isinstance(child, STATELESS_NODES):
+                    continue
+                if id(child) in seen:
+                    child = copy.deepcopy(child)
+                    if isinstance(value, list):
+                        value[index] = child
+                    else:
+                        setattr(node, name, child)
+                seen.add(id(child))
+                pending.append(child)
 
 
 def dotted_name(node: ast.AST) -> str | None:

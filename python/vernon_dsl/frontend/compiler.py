@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ast
+import copy
 from pathlib import Path
 
 from ..ad import ProgramTransformSpec
 from ..diagnostics import CompileError, SourceLocation
-from ..language.ast_utils import dotted_name
+from ..language.ast_utils import detach_shared_nodes, dotted_name
 from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
@@ -20,7 +21,7 @@ from .model import AccessMode, ConcreteType, StorageEffect, StorageOwnerKind, St
 from .monomorphize import infer_and_monomorphize_helpers
 from .parameter_paths import split_parameter_path
 from .request import FrontendCompileRequest, FrontendCompileResult
-from .specialization import specialize_frontend_source
+from .specialization import specialize_frontend_module
 from .type_parser import AnnotatedType, TypeParser
 
 
@@ -47,6 +48,33 @@ class Compiler:
                 error.msg,
                 SourceLocation(filename, error.lineno or 1, error.offset or 1),
             ) from None
+        return self.compile_module(
+            module,
+            filename,
+            dependencies,
+            declared_features,
+            enabled_features,
+            runtime_entry,
+            runtime_workgroup_size,
+            program_transform,
+            autodiff_planning_policy,
+        )
+
+    def compile_module(
+        self,
+        module: ast.Module,
+        filename: str,
+        dependencies: tuple[tuple[str, str], ...] = (),
+        declared_features: tuple[str, ...] = (),
+        enabled_features: tuple[str, ...] = (),
+        runtime_entry: str | None = None,
+        runtime_workgroup_size: tuple[int, int, int] | None = None,
+        program_transform: ProgramTransformSpec | None = None,
+        autodiff_planning_policy: str | None = None,
+    ) -> str:
+        """Compile a parsed module, which the compile rewrites. Diagnostics name a node's recorded source file, and
+        `filename` for nodes without one."""
+        detach_shared_nodes(module)
         module = normalize_struct_methods(module, filename)
         context = ModuleContext(filename, runtime_entry=runtime_entry)
         module = flatten_binding_groups(module, context.error)
@@ -140,7 +168,9 @@ class Compiler:
             if program_transform is not None:
                 raise ValueError("program transforms require one specialized entry")
             project = load_project(path, canonical, entry)
-            return self.compile(project.source, str(path), project.dependencies, project.features, selected_features)
+            return self.compile_module(
+                project.module, str(path), project.dependencies, project.features, selected_features
+            )
         return self.compile_request(
             FrontendCompileRequest(path, entry, canonical, program_transform=program_transform)
         ).mlir
@@ -156,9 +186,9 @@ class Compiler:
 
         selected_features = enabled_features(request.specializations)
         project = load_project(request.source_path, request.specializations, request.entry)
-        specialized_source = specialize_frontend_source(project.source, request)
-        mlir = self.compile(
-            specialized_source,
+        specialized_module = specialize_frontend_module(project.module, request)
+        mlir = self.compile_module(
+            copy.deepcopy(specialized_module),
             filename=str(request.source_path),
             dependencies=project.dependencies,
             declared_features=project.features,
@@ -170,7 +200,7 @@ class Compiler:
         )
         result = FrontendCompileResult(
             mlir,
-            specialized_source,
+            specialized_module,
             project.dependencies,
             project.features,
             request,

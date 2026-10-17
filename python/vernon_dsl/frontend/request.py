@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,7 @@ class FrontendCompileRequest:
 @dataclass(frozen=True)
 class FrontendCompileResult:
     mlir: str
-    specialized_source: str
+    specialized_module: ast.Module
     dependencies: tuple[tuple[str, str], ...]
     declared_features: tuple[str, ...]
     request: FrontendCompileRequest

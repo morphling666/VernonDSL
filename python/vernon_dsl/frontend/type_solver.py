@@ -122,5 +122,5 @@ def can_convert(value_type: InferenceType, target: ConcreteType) -> bool:
 
 def describe(value_type: InferenceType) -> str:
     if isinstance(value_type, ConcreteType):
-        return value_type.mlir
+        return value_type.spelling
     return f"{value_type.category} literal"

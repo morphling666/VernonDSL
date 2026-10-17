@@ -58,6 +58,9 @@ struct BackendTestRequirements {
     uint16_t minimumApiMajor{};
     uint16_t minimumApiMinor{};
     std::string_view nativeInteropBackend;
+    // The size of the OpenGL context's window, which a surface test that reads the window back draws into.
+    uint32_t windowWidth{1};
+    uint32_t windowHeight{1};
 };
 
 enum class BackendProbeKind {

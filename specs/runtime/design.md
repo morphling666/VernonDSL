@@ -650,6 +650,37 @@ coordinates then count rows from row 0, so `gl_FragCoord`, `glViewport` and
 `glClipControl(GL_UPPER_LEFT)` was rejected because it requires OpenGL 4.5,
 which macOS OpenGL 4.1 and OpenGL ES 3.1 lack.
 
+Writes and clears to an `srgb` color attachment store encoded values on
+every backend. OpenGL ES always encodes, but desktop GL encodes only while
+`GL_FRAMEBUFFER_SRGB` is enabled, so the desktop adapter enables it from
+`beginRendering` to `endRendering`. It is not left enabled across the device:
+2D image copies and present are framebuffer blits, which would then decode and
+re-encode `srgb` texels instead of copying them unchanged, and the host's own
+draws would see the state. Every blit also disables it, because a scope whose
+native begin fails is never ended.
+
+GL surfaces (`presentable_surfaces.md` section 5) map acquire to handing out
+the next RHI texture of the configuration, after comparing `drawable_size`
+with the configured extent, and present to: make the device's context current
+on the window, set the swap interval, blit the texture into framebuffer 0 with
+its rows reversed, swap, and make the device's own target current again. The
+rows are reversed because the negated vertex y above puts image row 0 at the
+top while framebuffer 0 counts rows from the bottom. The blit goes through a
+framebuffer object created and deleted per present, because the device's own
+framebuffer is reserved for rendering scopes and per-present names cost
+nothing next to the blit.
+
+On every backend the command layer keeps the keys of acquired images whose
+contents are still undefined in a per-device list. Each surface reserves one
+entry when it is created, and holds at most one acquired image, so marking at
+acquire never allocates and an acquire cannot fail after the backend has
+handed out the image. Present removes the entry even when nothing wrote the image, which
+keeps the list within its reservation. An encoder lists the undefined images
+it writes and removes them from the device list only when it is submitted, so
+a read in another encoder cannot pass on a write that has not been submitted
+and may never be. The encoder reserves its list entry before it records the
+write, so a write the backend has recorded is always listed.
+
 The GL draw state that Runtime sets on a host context, including the inverted
 front face, persists after Runtime returns. The host re-establishes any state
 its own draws depend on, as with Skia and Qt RHI external commands. Runtime

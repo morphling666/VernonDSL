@@ -17,6 +17,10 @@ inline RhiError publicStatusError(VernonRhiStatus status, const char *operation)
         return {RhiErrorCode::Unsupported, {operation, 0, 0}};
     case VERNON_RHI_STATUS_RESOURCE_EXHAUSTED:
         return {RhiErrorCode::ResourceExhausted, {operation, 0, 0}};
+    case VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE:
+        return {RhiErrorCode::SurfaceOutOfDate, {operation, 0, 0}};
+    case VERNON_RHI_STATUS_SURFACE_LOST:
+        return {RhiErrorCode::SurfaceLost, {operation, 0, 0}};
     case VERNON_RHI_STATUS_INTERNAL_ERROR:
     default:
         return {RhiErrorCode::BackendFailure, {operation, 0, 0}};

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from ..language.stage_registry import validate_stage_target
-from ..types import SpecializationAssignment, specialization_key_data
+from ..types import specialization_key_data
 from .reflection import (
     compiled_stage_from_program,
     parse_reflection_json,
@@ -20,26 +19,29 @@ from .serialize import (
     serialize_bundle,
     with_content_hash,
 )
-from .types import BundlePlan, CompiledArtifact, CompiledStage, ProgramCompileError, ProgramVariantPlan, TargetOptions
+from .types import (
+    BundlePlan,
+    CompiledArtifact,
+    CompiledProgramVariant,
+    CompiledStage,
+    ProgramCompileError,
+    ProgramVariantPlan,
+    TargetOptions,
+)
 
 
 def build_program_plan(
     program_id: str,
     target: TargetOptions,
-    variants: Sequence[
-        tuple[
-            Sequence[SpecializationAssignment],
-            Mapping[str, CompiledStage],
-            Mapping[str, Any],
-        ]
-    ],
+    variants: Sequence[CompiledProgramVariant],
 ) -> BundlePlan:
     """Build one immutable plan containing every canonical Program variant."""
 
     variant_plans: list[ProgramVariantPlan] = []
     unique_stages: dict[str, CompiledStage] = {}
-    for key, stages, program in variants:
-        canonical_stages = program.get("stages")
+    for variant in variants:
+        stages = variant.stages
+        canonical_stages = variant.program.get("stages")
         if not isinstance(canonical_stages, Mapping):
             raise ProgramCompileError("canonical Program has no stage contracts")
         if set(canonical_stages) != set(stages):
@@ -67,26 +69,14 @@ def build_program_plan(
                 raise ProgramCompileError(str(error)) from None
             if stage.target.spec != target.spec:
                 raise ProgramCompileError(f"Program stage {name!r} target does not match the bundle target")
-            existing = unique_stages.get(stage.id)
-            if existing is None:
-                unique_stages[stage.id] = stage
-            else:
-                metadata = dict(existing.metadata)
-                for metadata_name in ("program_contracts", "program_implementations"):
-                    merged = dict(metadata.get(metadata_name, {}))
-                    additions = stage.metadata.get(metadata_name, {})
-                    if isinstance(additions, Mapping):
-                        for logical_stage, value in additions.items():
-                            if logical_stage in merged and merged[logical_stage] != value:
-                                raise ProgramCompileError(f"compiled stage {stage.id} has conflicting {metadata_name}")
-                            merged[logical_stage] = value
-                    metadata[metadata_name] = merged
-                unique_stages[stage.id] = replace(existing, metadata=metadata)
+            unique_stages.setdefault(stage.id, stage)
         variant_plans.append(
             ProgramVariantPlan(
-                tuple(key),
-                copy.deepcopy(dict(program)),
+                tuple(variant.key),
+                copy.deepcopy(dict(variant.program)),
                 {name: stage.id for name, stage in stages.items()},
+                copy.deepcopy(dict(variant.contracts)),
+                copy.deepcopy(dict(variant.target_implementations)),
             )
         )
     variant_plans.sort(key=lambda variant: canonical_json(specialization_key_data(variant.key)))
@@ -101,6 +91,7 @@ def build_program_plan(
 __all__ = [
     "BundlePlan",
     "CompiledArtifact",
+    "CompiledProgramVariant",
     "CompiledStage",
     "ProgramVariantPlan",
     "ProgramCompileError",

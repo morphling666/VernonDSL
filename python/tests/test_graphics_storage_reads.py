@@ -91,14 +91,14 @@ class CollidingProgram(vd.Module):
         colliding_pipeline(scale=scale, tint=tint, render_pass=render_pass)
 
 
-def _cook(module: Any, parameter_types: dict[str, Any], target: str, version: int = 450) -> Mapping[str, Any]:
+def _cook(module: Any, parameter_types: dict[str, Any], target: str, version: int = 450) -> Any:
     from vernon_dsl._program_assets.compile_orchestration import _compile_program_variant, _native_target
     from vernon_dsl.bundle import make_target_options
 
     native = import_module("vernon_dsl._native")
     capture, outputs = interpret_module_forward(module, parameter_types)
     parsed = parse_program(ProgramTemplate.compile(capture).bind(capture, outputs))
-    _, _, stages, _ = _compile_program_variant(
+    _, variant = _compile_program_variant(
         parsed,
         program_id="tests/graphics-storage-reads",
         variant=(),
@@ -107,8 +107,7 @@ def _cook(module: Any, parameter_types: dict[str, Any], target: str, version: in
         native=native,
         native_target=_native_target(native, target),
     )
-    (stage,) = {stage.id: stage for stage in stages.values()}.values()
-    return stage.metadata
+    return variant
 
 
 def _pull_parameter_types() -> dict[str, Any]:
@@ -143,9 +142,9 @@ def _descriptor_bindings(implementation: Mapping[str, Any]) -> dict[tuple[str, i
 
 
 class GraphicsStorageReadCookTests(unittest.TestCase):
-    def _assert_per_stage_storage(self, metadata: Mapping[str, Any]) -> None:
-        (contract,) = metadata["program_contracts"].values()
-        (implementation,) = metadata["program_implementations"].values()
+    def _assert_per_stage_storage(self, variant: Any) -> None:
+        (contract,) = variant.contracts.values()
+        (implementation,) = variant.target_implementations.values()
         reflection = contract["reflection"]
         self.assertIn("tensor_views", reflection["required_features"])
         self.assertEqual(sorted(reflection["metadata_carriers"]), ["fragment", "vertex"])
@@ -187,8 +186,8 @@ class GraphicsStorageReadCookTests(unittest.TestCase):
         }
         for target in ("opengl", "vulkan"):
             with self.subTest(target=target):
-                metadata = _cook(TexturedPullProgram(), parameter_types, target)
-                feature_sets = list(_required_features(metadata))
+                variant = _cook(TexturedPullProgram(), parameter_types, target)
+                feature_sets = list(_required_features((variant.contracts, variant.target_implementations)))
                 self.assertTrue(feature_sets)
                 for features in feature_sets:
                     self.assertEqual(features, sorted(set(features)))
@@ -273,7 +272,7 @@ def main(
         self.assertIn("graphics binding layout does not match", str(result.diagnostics))
 
     def test_shared_parameter_cooks_one_descriptor(self) -> None:
-        metadata = _cook(
+        variant = _cook(
             SharedTableProgram(),
             {
                 "table": RuntimeParameterDescriptor.storage(vd.f32, (vd.dyn, 4), "read", True),
@@ -281,7 +280,7 @@ def main(
             },
             "vulkan",
         )
-        (implementation,) = metadata["program_implementations"].values()
+        (implementation,) = variant.target_implementations.values()
         self.assertEqual(
             _descriptor_bindings(implementation),
             {

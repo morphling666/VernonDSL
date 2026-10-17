@@ -117,9 +117,12 @@ public:
             return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramVariant.setType"))};
         return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_TYPE, std::move(identity));
     }
+    [[nodiscard]] Result<void, RuntimeError> setFormat(std::string name, VernonTextureFormat format) noexcept {
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_FORMAT, format);
+    }
 
 private:
-    using Value = std::variant<bool, int32_t, uint32_t, float, double, std::string>;
+    using Value = std::variant<bool, int32_t, uint32_t, float, double, std::string, VernonTextureFormat>;
     struct Entry {
         std::string name;
         VernonProgramSpecializationKind kind{};
@@ -162,6 +165,8 @@ private:
                             specialization.value.f32_value = value;
                         else if constexpr (std::is_same_v<T, double>)
                             specialization.value.f64_value = value;
+                        else if constexpr (std::is_same_v<T, VernonTextureFormat>)
+                            specialization.value.format_value = value;
                         else
                             specialization.value.type_value = {value.data(), value.size()};
                     },

@@ -985,6 +985,110 @@ TEST_P(RhiResourceLifetime, IntegerImagesRoundTripEveryBit) {
     }
 }
 
+TEST_P(RhiResourceLifetime, ImageCopyIgnoresTheRenderAreaOfAnEarlierScope) {
+    const vernon::tests::BackendProbeResult probe = graphicsProbe();
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+    }
+    const VernonRhiDevice device = this->device();
+    constexpr uint32_t copyExtent = 4;
+    constexpr uint32_t renderExtent = 2;
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    descriptor.width = copyExtent;
+    descriptor.height = copyExtent;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage =
+        VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    std::array<VernonRhiImage, 3> images{};
+    for (VernonRhiImage &image : images)
+        ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &image), VERNON_RHI_STATUS_OK)
+            << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    std::vector<uint8_t> texels(copyExtent * copyExtent * 4);
+    for (size_t index = 0; index < texels.size(); ++index)
+        texels[index] = static_cast<uint8_t>(index * 7 + 1);
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    upload.width = copyExtent;
+    upload.height = copyExtent;
+    upload.depth = 1;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    upload.data = texels.data();
+    ASSERT_EQ(vernonRhiDeviceUploadImage(device, images[0], &upload, 1), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = images[2];
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = descriptor.format;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiColorAttachment color{};
+    color.view = view;
+    color.initial_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
+    color.final_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
+    color.load_operation = VERNON_RHI_LOAD_CLEAR;
+    color.store_operation = VERNON_RHI_STORE_PRESERVE;
+    VernonRhiRenderingDescriptor rendering{};
+    rendering.struct_size = sizeof(rendering);
+    rendering.color_attachments = &color;
+    rendering.color_attachment_count = 1;
+    rendering.width = renderExtent;
+    rendering.height = renderExtent;
+    rendering.layers = 1;
+    ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, encoder, &rendering), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderEndRendering(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiImageCopyRegion region{};
+    region.struct_size = sizeof(region);
+    region.width = copyExtent;
+    region.height = copyExtent;
+    region.depth = 1;
+    region.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    ASSERT_EQ(vernonRhiCommandEncoderCopyImage(device, encoder, images[0], images[1], &region, 1), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    download.width = copyExtent;
+    download.height = copyExtent;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    std::vector<uint8_t> copied(texels.size());
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, images[1], &download, copied.data(), copied.size()),
+              VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    EXPECT_EQ(copied, texels);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+    for (const VernonRhiImage image : images)
+        EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+}
+
 // Both the load-operation clear and the in-scope clear write integer values that a float clear cannot represent.
 TEST_P(RhiResourceLifetime, IntegerColorClearsAreExact) {
     const vernon::tests::BackendProbeResult probe = graphicsProbe();

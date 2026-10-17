@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import atexit
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -430,9 +431,13 @@ class Kernel:
             autodiff_planning_policy=autodiff_planning_policy,
         )
         frontend = Compiler().compile_request(request)
-        specialized_tree = ast.parse(frontend.specialized_source, filename=str(self._file))
-        specialized_function = next(
-            node for node in specialized_tree.body if isinstance(node, ast.FunctionDef) and node.name == self._entry
+        # The frontend cache shares its result, so the kernel works on its own copy.
+        specialized_function = copy.deepcopy(
+            next(
+                node
+                for node in frontend.specialized_module.body
+                if isinstance(node, ast.FunctionDef) and node.name == self._entry
+            )
         )
         return _LoweredKernel(frontend, specialized_function, function, builtins)
 

@@ -11,6 +11,7 @@ from .._versions import PROGRAM_VERSION
 from ..bundle import (
     BundlePlan,
     CompiledArtifact,
+    CompiledProgramVariant,
     CompiledStage,
     ProgramCompileError,
     TargetOptions,
@@ -195,12 +196,7 @@ def _compile_program_variant(
     native: Any,
     native_target: Any,
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
-) -> tuple[
-    TargetOptions,
-    tuple[SpecializationAssignment, ...],
-    Mapping[str, CompiledStage],
-    Mapping[str, Any],
-]:
+) -> tuple[TargetOptions, CompiledProgramVariant]:
     planned = compiler.plan_program_result(parsed.mlir)
     if not bool(planned.ok):
         raise ProgramCompileError(str(planned.diagnostics) or "Program planning failed")
@@ -370,39 +366,15 @@ def _compile_program_variant(
     reflected_target = reflected_targets.pop()
     if set(contracts) != set(stages) or any(not isinstance(contract, Mapping) for contract in contracts.values()):
         raise ProgramCompileError("canonical stage contracts do not exactly cover logical compute requests")
-    contracts_by_implementation: dict[str, dict[str, Mapping[str, Any]]] = {}
-    implementations_by_stage: dict[str, dict[str, Mapping[str, Any]]] = {}
     target_implementations = finalized_reflection.get("target_implementations")
-    for logical_stage, stage in stages.items():
-        contracts_by_implementation.setdefault(stage.id, {})[logical_stage] = contracts[logical_stage]
-        implementation = (
-            target_implementations.get(logical_stage) if isinstance(target_implementations, Mapping) else None
+    implementations = {
+        logical_stage: implementation
+        for logical_stage, implementation in (
+            target_implementations.items() if isinstance(target_implementations, Mapping) else ()
         )
-        if isinstance(implementation, Mapping):
-            implementations_by_stage.setdefault(stage.id, {})[logical_stage] = implementation
-    canonical_stages = {
-        stage.id: CompiledStage(
-            stage.module,
-            stage.entry,
-            stage.stage,
-            stage.target,
-            stage.reflection,
-            stage.interface,
-            stage.artifact,
-            {
-                **stage.metadata,
-                "program_contracts": contracts_by_implementation[stage.id],
-                "program_implementations": implementations_by_stage.get(stage.id, {}),
-            },
-        )
-        for stage in {stage.id: stage for stage in stages.values()}.values()
+        if logical_stage in stages and isinstance(implementation, Mapping)
     }
-    return (
-        reflected_target,
-        variant,
-        {logical_stage: canonical_stages[stage.id] for logical_stage, stage in stages.items()},
-        canonical_program,
-    )
+    return reflected_target, CompiledProgramVariant(variant, stages, canonical_program, contracts, implementations)
 
 
 def compile_captured_program(
@@ -429,11 +401,10 @@ def compile_captured_program(
         )
         for variant in captured.variants
     ]
-    targets = {canonical_json(compiled[0].spec): compiled[0] for compiled in compiled_variants}
+    targets = {canonical_json(target.spec): target for target, _ in compiled_variants}
     if len(targets) != 1:
         raise ProgramCompileError("compiler returned inconsistent target options across Program variants")
-    variants = [(key, stages, program) for _, key, stages, program in compiled_variants]
-    return build_program_plan(captured.id, next(iter(targets.values())), variants)
+    return build_program_plan(captured.id, next(iter(targets.values())), [variant for _, variant in compiled_variants])
 
 
 __all__ = ["compile_captured_program"]

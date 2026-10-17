@@ -270,7 +270,7 @@ Each key entry is exactly:
 ```
 
 Entries are ordered by unique non-empty `name`. `tag` is one of `bool`, `i32`,
-`u32`, `f32`, `f64`, or `type`. For a scalar tag, `value` must have that exact
+`u32`, `f32`, `f64`, `type`, or `format`. For a scalar tag, `value` must have that exact
 finite scalar domain; an `f32` value is rounded to binary32 before key
 construction, and floating-point negative zero is canonicalized to positive
 zero. For `type`, `value` is the non-empty canonical type identity of
@@ -284,7 +284,17 @@ type's `<module>:<Class>` or a scalar type's name:
 Runtime selects a variant by comparing a `type` selector's identity bytewise;
 an empty selector identity is an invalid argument. The C API carries it as
 `VERNON_PROGRAM_SPECIALIZATION_TYPE` with `type_value`, and
-`ProgramVariant::setType` in the C++ wrapper. Boolean feature selection is
+`ProgramVariant::setType` in the C++ wrapper. For `format`, `value` is the
+name of a color texture format, section 6.6.1 of the language contract:
+
+```json
+{"name":"TARGET","value":{"tag":"format","value":"rgba8_srgb"}}
+```
+
+A loader rejects an unknown or non-color format name. The C API carries it as
+`VERNON_PROGRAM_SPECIALIZATION_FORMAT` with `format_value`, and
+`ProgramVariant::setFormat` in the C++ wrapper; a non-color selector is an
+invalid argument. Boolean feature selection is
 represented by a typed `bool` assignment rather than a parallel feature-key
 schema. An empty key is `[]`.
 
@@ -1462,8 +1472,10 @@ outer shape, and ValueLayout when present. Category is `value`,
 `read_write`. Resource slots also contain the matching `storage_id` and
 `storage_descriptor`. `alias_owner` is exactly `value:<id>` for value slots or
 `storage:<id>` for resource slots. Every output-direction slot contains
-`publication`, either `commit_after_success` or `in_place`; input-direction
-slots never contain publication. `in_place` is valid only for a mutable
+`publication`, either `commit_after_success` or `in_place`. An input-direction
+slot contains publication only when it is writable Storage that no output slot
+shares an `alias_owner` with; its write is then the Program's caller-visible
+side effect, and it is `in_place`. `in_place` is valid only for a mutable
 Storage-backed boundary that explicitly exposes a caller-visible side effect.
 It does not promise rollback after submission. Runtime never chooses a mode
 from the concrete host/device resource kind. The compiler emits `in_place`
