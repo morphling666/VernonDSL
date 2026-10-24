@@ -785,6 +785,20 @@ vernon::Result<bool, vernon::RhiError> vernon::rhi::vulkan::imageInLayout(Vernon
     return Result<bool, RhiError>{ok(true)};
 }
 
+vernon::Result<VkDescriptorSet, vernon::RhiError>
+vernon::rhi::vulkan::allocateCommandDescriptorSet(VernonRhiDevice device, VkCommandBuffer command,
+                                                  VkDescriptorSetLayout layout) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice || !command)
+        return Result<VkDescriptorSet, RhiError>{err(invalidResource("allocate_vulkan_command_descriptor_set"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    VkDescriptorSet set{};
+    if (!vulkanDevice->state.allocateFrameDescriptorSet(command, layout, set, vulkanDevice->error))
+        return Result<VkDescriptorSet, RhiError>{
+            err(backendFailure("allocate_vulkan_command_descriptor_set", vulkanHandleBits(command)))};
+    return Result<VkDescriptorSet, RhiError>{ok(set)};
+}
+
 namespace vernon::rhi::vulkan_api {
 
 static VernonRhiDevice
@@ -2425,6 +2439,22 @@ Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native,
     return Result<void, RhiError>{ok()};
 }
 
+Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64_t, uint64_t native, const void *data,
+                                                  uint64_t size, uint64_t alignment) noexcept {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command)
+        return Result<CommandTransient, RhiError>{err(invalidResource("write_vulkan_transient", native))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkBuffer buffer{};
+    VkDeviceSize offset{};
+    uint8_t *mapped{};
+    if (!device->state.acquireStaging(command, true, size, alignment, buffer, offset, mapped, device->error))
+        return Result<CommandTransient, RhiError>{err(backendFailure("write_vulkan_transient", native))};
+    std::memcpy(mapped, data, static_cast<size_t>(size));
+    return Result<CommandTransient, RhiError>{ok(CommandTransient{vulkanHandleBits(buffer), offset})};
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                                        VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
                                        size_t regionCount) noexcept {
@@ -3043,6 +3073,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
+        result.writeTransient.emplace(writeTransient);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

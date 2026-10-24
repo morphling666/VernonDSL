@@ -60,6 +60,14 @@ void DeviceState::shutdown() {
         api.streamDestroy(stream);
         stream = nullptr;
     }
+    const auto freeChunk = [&](TransientChunk &chunk) { api.memoryFree(chunk.pointer); };
+    for (RetiringTransients &retiring : retiringTransients) {
+        api.eventDestroy(retiring.retirement);
+        transientPool.retire(retiring.arena);
+    }
+    retiringTransients.clear();
+    transientPool.retire(recordingTransients);
+    transientPool.clear(freeChunk);
     for (PinnedBlock &block : stagingPool) {
         if (block.retirement)
             api.eventDestroy(block.retirement);
@@ -136,7 +144,10 @@ Result DeviceState::waitCompletion(Event completion) {
 
 Result DeviceState::allocate(DevicePointer &pointer, size_t size) const {
     Result status = makeCurrent();
-    return status == kSuccess && size != 0 ? driver().memoryAllocate(&pointer, size) : kInvalidValue;
+    if (status != kSuccess || size == 0)
+        return kInvalidValue;
+    allocations.fetch_add(1, std::memory_order_relaxed);
+    return driver().memoryAllocate(&pointer, size);
 }
 
 Result DeviceState::free(DevicePointer pointer) const {
@@ -323,6 +334,70 @@ Result DeviceState::copy(DevicePointer destination, DevicePointer source, size_t
         return kInvalidValue;
     Result status = makeCurrent();
     return status == kSuccess ? driver().copyDeviceToDeviceAsync(destination, source, size, stream) : status;
+}
+
+Result DeviceState::reclaimTransients() {
+    while (!retiringTransients.empty()) {
+        RetiringTransients &oldest = retiringTransients.front();
+        const Result status = driver().eventQuery(oldest.retirement);
+        if (status == kNotReady)
+            return kSuccess;
+        if (status != kSuccess)
+            return status;
+        recycleEvent(oldest.retirement, true);
+        transientPool.retire(oldest.arena);
+        retiringTransients.pop_front();
+    }
+    return kSuccess;
+}
+
+Result DeviceState::writeTransient(const void *data, size_t size, size_t alignment, DevicePointer &chunk,
+                                   size_t &offset) {
+    if (!data || size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0)
+        return kInvalidValue;
+    Result status = makeCurrent();
+    if (status != kSuccess)
+        return status;
+    try {
+        status = reclaimTransients();
+        if (status != kSuccess)
+            return status;
+        TransientChunk *acquired = transientPool.acquire(recordingTransients, size, alignment, offset,
+                                                         [&](size_t capacity, TransientChunk &created) {
+                                                             status = allocate(created.pointer, capacity);
+                                                             created.capacity = capacity;
+                                                             return status == kSuccess;
+                                                         });
+        if (!acquired)
+            return status == kSuccess ? kInvalidValue : status;
+        chunk = acquired->pointer;
+    } catch (const std::bad_alloc &) {
+        return kInvalidValue;
+    }
+    return upload(chunk + offset, data, size);
+}
+
+Result DeviceState::retireTransients() {
+    if (recordingTransients.chunks.empty())
+        return kSuccess;
+    try {
+        retiringTransients.emplace_back();
+    } catch (const std::bad_alloc &) {
+        driver().streamSynchronize(stream);
+        transientPool.retire(recordingTransients);
+        return kInvalidValue;
+    }
+    RetiringTransients &retiring = retiringTransients.back();
+    const Result status = recordCompletion(retiring.retirement);
+    if (status != kSuccess) {
+        retiringTransients.pop_back();
+        driver().streamSynchronize(stream);
+        transientPool.retire(recordingTransients);
+        return status;
+    }
+    retiring.arena = std::move(recordingTransients);
+    recordingTransients = {};
+    return kSuccess;
 }
 
 Result PreparedFunction::create(DeviceState &device, const void *artifact, size_t artifactSize, const char *entry) {

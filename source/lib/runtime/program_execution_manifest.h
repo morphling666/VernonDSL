@@ -101,6 +101,8 @@ struct CompiledEndpointAbi {
     uint32_t index{};
     std::string builtin;
     std::string valueTransport;
+    // The access the compiled module declares for a resource; it may be wider than the endpoint's logical access.
+    std::optional<std::string> access;
     uint32_t descriptorSet{UINT32_MAX};
     uint32_t binding{UINT32_MAX};
     std::optional<vernon::runtime::InterfacePlan> interfacePlan;

@@ -2,6 +2,7 @@
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 #include "sampled_texture_runtime_oracle.h"
+#include "spilled_uniform_runtime_oracle.h"
 #include "vernon_test_support.h"
 
 #include <array>
@@ -21,6 +22,9 @@
 #endif
 #ifndef VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE
 #error VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE must name the cooked multi-set texture Program bundle
+#endif
+#ifndef VERNON_VULKAN_SPILLED_UNIFORM_BUNDLE
+#error VERNON_VULKAN_SPILLED_UNIFORM_BUNDLE must name the cooked spilled uniform Program bundle
 #endif
 namespace {
 
@@ -203,7 +207,6 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.descriptorSetLayoutCreations, 1u);
     EXPECT_EQ(firstStats.pipelineLayoutCreations, 1u);
     EXPECT_EQ(firstStats.graphicsPipelineCreations, 1u);
-    EXPECT_EQ(firstStats.bindingSnapshotCreations, 1u);
     // The sampled-image upload may still be in flight when the draw begins recording, so command frames and staging
     // are bounded by the two recordings in flight together rather than fixed.
     constexpr size_t maxConcurrentRecordings = 2;
@@ -235,7 +238,6 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.descriptorSetLayoutCreations, firstStats.descriptorSetLayoutCreations);
     EXPECT_EQ(secondStats.pipelineLayoutCreations, firstStats.pipelineLayoutCreations);
     EXPECT_EQ(secondStats.graphicsPipelineCreations, firstStats.graphicsPipelineCreations);
-    EXPECT_EQ(secondStats.bindingSnapshotCreations, firstStats.bindingSnapshotCreations);
     EXPECT_LE(secondStats.commandBufferAllocations, maxCommandBuffers);
     EXPECT_EQ(secondStats.descriptorPoolCreations, firstStats.descriptorPoolCreations);
     EXPECT_LE(secondStats.stagingBufferAllocations, maxConcurrentRecordings);
@@ -250,7 +252,6 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(warmStats.descriptorSetLayoutCreations, secondStats.descriptorSetLayoutCreations);
     EXPECT_EQ(warmStats.pipelineLayoutCreations, secondStats.pipelineLayoutCreations);
     EXPECT_EQ(warmStats.graphicsPipelineCreations, secondStats.graphicsPipelineCreations);
-    EXPECT_EQ(warmStats.bindingSnapshotCreations, secondStats.bindingSnapshotCreations);
     EXPECT_LE(warmStats.commandBufferAllocations, maxCommandBuffers);
     EXPECT_EQ(warmStats.descriptorPoolCreations, secondStats.descriptorPoolCreations);
     EXPECT_LE(warmStats.stagingBufferAllocations, maxConcurrentRecordings);
@@ -309,6 +310,25 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(runtime), 0u);
     vernonRuntimeProgramBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
+
+// The fragment's three matrices exceed the push constant budget, so they spill to uniform buffers of a transient group.
+TEST(RuntimeVulkanPipeline, SpilledUniformsOfTransientGroupsReuseTheMemoryOfRetiredFrames) {
+    if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
+        GTEST_SKIP() << "Vulkan runtime backend is unavailable";
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
+    VernonRuntimeContext *runtime = context.runtime;
+    ASSERT_NE(runtime, nullptr);
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(runtime, VERNON_VULKAN_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(pipeline) << vernon::test::text(vernonRuntimeGetLastError(runtime));
+        vernon::tests::runSpilledUniformRuntimeOracle(context, pipeline.get(), [&] {
+            const auto stats = vernon::runtime::getVulkanGraphicsCacheStats(runtime, pipeline.get());
+            return std::vector<size_t>{stats.descriptorPoolCreations, stats.stagingBufferAllocations};
+        });
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }
 

@@ -24,20 +24,15 @@ void storeLast(GraphicsRenderScope &scope, const PlannedRenderTargets &last) {
     }
 }
 
-void addRead(GraphicsScopeReads &reads, VernonRuntimeProviderResourceReference image,
-             const ProviderImageSubresources &subresources) {
+} // namespace
+
+void addGraphicsScopeRead(GraphicsScopeReads &reads, VernonRuntimeProviderResourceReference image,
+                          const ProviderImageSubresources &subresources) {
     if (std::any_of(reads.images.begin(), reads.images.end(),
                     [&](VernonRuntimeProviderResourceReference read) { return sameResource(read, image); }))
         return;
     reads.images.push_back(image);
     reads.subresources.push_back(subresources);
-}
-
-} // namespace
-
-void addGraphicsScopeReads(GraphicsScopeReads &reads, const PlannedGraphicsInvocation &invocation) {
-    for (const auto &[binding, resource] : invocation.sampledResources)
-        addRead(reads, resource.imageView, resource.subresources);
 }
 
 bool graphicsScopeReadsOverlap(const GraphicsScopeReads &reads, const PlannedRenderTargets &targets) {
@@ -140,7 +135,7 @@ GraphicsScopeMaterialization GraphicsScopeMaterializer::materialize(uint32_t can
     if (result == GraphicsScopeMaterialization::Fuse) {
         storeLast(scope_, targets);
         for (size_t index = 0; index < reads.images.size(); ++index)
-            addRead(scope_.reads, reads.images[index], reads.subresources[index]);
+            addGraphicsScopeRead(scope_.reads, reads.images[index], reads.subresources[index]);
     } else {
         scope_ = graphicsRenderScope(targets, reads);
     }

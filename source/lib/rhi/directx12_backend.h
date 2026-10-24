@@ -151,6 +151,7 @@ struct VERNON_RHI_CAPI DeviceState {
     StagingPool<StagingChunk> readbackStaging;
     uint64_t submittedValue{};
     uint64_t completedValue{};
+    size_t bufferCreations{};
     bool deviceLost{};
     bool nativeObjectsBorrowed{};
 

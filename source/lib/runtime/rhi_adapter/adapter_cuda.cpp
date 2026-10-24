@@ -6,12 +6,11 @@
 #include "rhi/rhi_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <new>
-#include <unordered_map>
 #include <vector>
 
 namespace vernon::runtime::rhi_adapter {
@@ -21,8 +20,15 @@ using rhi::cuda::DevicePointer;
 using rhi::cuda::DeviceState;
 using rhi::cuda::PreparedFunction;
 
+constexpr size_t kMaxGroups = VERNON_RUNTIME_PROVIDER_MAX_GROUPS;
+// A storage buffer passes as the five fields of a memref descriptor; an inline value passes as itself.
+constexpr size_t kMemRefParameters = 5;
+// cuMemAlloc's alignment, which kernels may assume of every buffer they receive.
+constexpr uint64_t kDeviceAllocationAlignment = 256;
+
 struct CudaAdapterState {
     DeviceState *device{};
+    std::atomic<uint64_t> nextSerial{};
 };
 
 CudaAdapterState &cudaState(VernonRuntimeRhiAdapter &adapter) {
@@ -48,11 +54,10 @@ RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexc
         if (result == rhi::cuda::kSuccess)
             return RhiAdapterResult<void>{vernon::ok()};
         error = rhi::cuda::describeResult(result, "cuStreamSynchronize");
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuStreamSynchronize", static_cast<uint64_t>(result), 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "cuStreamSynchronize",
+                               static_cast<uint64_t>(result));
     } catch (...) {
-        return RhiAdapterResult<void>{vernon::err(
-            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"cuStreamSynchronize", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "cuStreamSynchronize");
     }
 }
 
@@ -67,19 +72,44 @@ struct PreparedShader {
     std::string entry;
 };
 
-struct PreparedLayout {
+// Retained by the groups and pipeline layouts made from it, since commands that used those may still be recording.
+struct GroupLayout : RhiRetainedObject {
     std::vector<VernonRuntimeProviderBindingLayoutEntry> entries;
 };
 
-struct PreparedPipeline {
-    std::atomic<uint32_t> references{1};
-    PreparedFunction function;
-    DeviceState *device{};
-    uint32_t workgroup[3]{1, 1, 1};
+// One kernel parameter run: the entry of the group at a group index that supplies it.
+struct KernelParameter {
+    uint32_t group{};
+    uint32_t entry{};
+    size_t offset{};
 };
 
-struct PreparedBindingSet {
-    std::atomic<uint32_t> references{1};
+// Kernel parameters follow entry bindings, which number the parameters of every group contiguously.
+struct PreparedLayout : RhiRetainedObject {
+    std::array<GroupLayout *, kMaxGroups> groups{};
+    uint32_t groupCount{};
+    std::array<std::vector<KernelParameter>, kMaxGroups> parameters;
+    size_t parameterCount{};
+
+    ~PreparedLayout() override {
+        for (uint32_t group = 0; group < groupCount; ++group)
+            releaseRetainedObject(groups[group]);
+    }
+};
+
+struct PreparedPipeline : RhiRetainedObject {
+    DeviceState *device{};
+    PreparedLayout *layout{};
+    PreparedFunction function;
+    uint32_t workgroup[3]{1, 1, 1};
+
+    ~PreparedPipeline() override {
+        function.destroy(*device);
+        releaseRetainedObject(layout);
+    }
+};
+
+struct CudaGroup : RhiGroup {
     struct MemRefDescriptor {
         DevicePointer allocated{};
         DevicePointer aligned{};
@@ -87,57 +117,39 @@ struct PreparedBindingSet {
         uint64_t size{};
         uint64_t stride{1};
     };
-    struct Slot {
-        VernonRuntimeProviderBindingLayoutEntry layout{};
-        size_t parameterOffset{};
-        size_t descriptorOffset{};
+    // Indexed by entry: the memref of a storage buffer and the bytes of an inline value.
+    struct Value {
+        MemRefDescriptor memref;
         std::vector<uint8_t> inlineStorage;
-        VernonRuntimeProviderResourceReference resourceReference{};
         DevicePointer hostStorage{};
-        size_t hostStorageSize{};
     };
     DeviceState *device{};
-    std::vector<Slot> slots;
-    std::vector<MemRefDescriptor> descriptors;
-    std::vector<void *> parameters;
+    GroupLayout *layout{};
+    uint64_t serial{};
+    std::vector<Value> values;
 
-    ~PreparedBindingSet() {
-        if (!device)
-            return;
-        for (const Slot &slot : slots)
-            if (slot.hostStorage)
-                device->free(slot.hostStorage);
+    ~CudaGroup() override {
+        for (const Value &value : values)
+            if (value.hostStorage)
+                device->free(value.hostStorage);
+        releaseRetainedObject(layout);
     }
 };
 
-void releaseCommandBindings(void *context, uint64_t);
-void releaseCommandPipeline(void *context, uint64_t);
-
-RhiAdapterResult<void> retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                            PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
-    pipeline.references.fetch_add(1, std::memory_order_relaxed);
-    if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
-        releaseCommandPipeline(&pipeline, 0);
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_command_pipeline_cleanup_registration_failed", 0, 0}})};
-    }
-    if (bindings) {
-        bindings->references.fetch_add(1, std::memory_order_relaxed);
-        if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
-            releaseCommandBindings(bindings, 0);
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"cuda_command_bindings_cleanup_registration_failed", 0, 0}})};
-        }
-    }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
+// Applied state holds group serials rather than pointers, because addresses are reused.
+struct CudaCommands : RhiCommands {
+    PreparedPipeline *pipeline{};
+    std::array<CudaGroup *, kMaxGroups> groups{};
+    // The kernel parameter pointers of `parameterLayout`, and the group serial each index filled in.
+    const PreparedLayout *parameterLayout{};
+    std::vector<void *> parameters;
+    std::array<uint64_t, kMaxGroups> parameterGroups{};
+};
 
 RhiAdapterResult<void> cudaResult(rhi::cuda::Result result, const char *operation) {
     return result == rhi::cuda::kSuccess
                ? RhiAdapterResult<void>{vernon::ok()}
-               : RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                     vernon::ProviderErrorCode::BackendFailure, {operation, static_cast<uint64_t>(result), 0}})};
+               : providerFailure(vernon::ProviderErrorCode::BackendFailure, operation, static_cast<uint64_t>(result));
 }
 
 uint32_t getCapabilities(void *) { return VERNON_RUNTIME_PROVIDER_COMPUTE; }
@@ -155,9 +167,8 @@ RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProvid
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         descriptor->stage != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE || !descriptor->data || descriptor->size == 0 ||
         !descriptor->entry.data || descriptor->entry.size == 0)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"cuda_adapter_received_an_invalid_compute_shader_descriptor", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_compute_shader_descriptor");
     try {
         auto shader = std::make_unique<PreparedShader>();
         const auto *bytes = static_cast<const uint8_t *>(descriptor->data);
@@ -167,310 +178,374 @@ RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProvid
         adapter.shaderPreparations.fetch_add(1, std::memory_order_relaxed);
         return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_shader_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "cuda_shader_preparation_ran_out_of_memory");
     }
+}
+
+RhiAdapterResult<void> prepareGroupLayoutResult(void *, const VernonRuntimeProviderGroupLayoutDescriptor *descriptor,
+                                                VernonRuntimeProviderObject *output) {
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
+        (descriptor->entry_count != 0 && !descriptor->entries))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_group_layout");
+    for (size_t index = 0; index < descriptor->entry_count; ++index) {
+        const auto &entry = descriptor->entries[index];
+        if ((entry.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+             entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) ||
+            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE || entry.array_count != 1 ||
+            entry.element_size == 0)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "cuda_group_layout_contains_an_unsupported_binding", index);
+    }
+    try {
+        auto layout = std::make_unique<GroupLayout>();
+        layout->entries.assign(descriptor->entries, descriptor->entries + descriptor->entry_count);
+        *output = toHandle(layout.release());
+        return RhiAdapterResult<void>{vernon::ok()};
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "cuda_group_layout_preparation_ran_out_of_memory");
+    }
+}
+
+RhiAdapterResult<void> prepareLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
+                                               const VernonRuntimeProviderPipelineLayoutDescriptor &descriptor,
+                                               VernonRuntimeProviderObject *output) {
+    auto layout = std::make_unique<PreparedLayout>();
+    std::vector<KernelParameter *> ordered;
+    for (size_t group = 0; group < descriptor.group_layout_count; ++group) {
+        auto *groupLayout = fromHandle<GroupLayout>(descriptor.group_layouts[group]);
+        if (!groupLayout)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "cuda_pipeline_layout_group_layout_is_invalid", group);
+        groupLayout->references.fetch_add(1, std::memory_order_relaxed);
+        layout->groups[group] = groupLayout;
+        layout->groupCount = static_cast<uint32_t>(group + 1);
+        auto &parameters = layout->parameters[group];
+        parameters.resize(groupLayout->entries.size());
+        for (uint32_t entry = 0; entry < parameters.size(); ++entry) {
+            parameters[entry] = {static_cast<uint32_t>(group), entry, 0};
+            ordered.push_back(&parameters[entry]);
+        }
+    }
+    const auto binding = [&](const KernelParameter *parameter) {
+        return layout->groups[parameter->group]->entries[parameter->entry].binding;
+    };
+    std::sort(ordered.begin(), ordered.end(), [&](const KernelParameter *left, const KernelParameter *right) {
+        return binding(left) < binding(right);
+    });
+    for (size_t index = 0; index < ordered.size(); ++index) {
+        if (binding(ordered[index]) != index)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "cuda_adapter_abi_bindings_must_be_contiguous", index);
+        ordered[index]->offset = layout->parameterCount;
+        const auto kind = layout->groups[ordered[index]->group]->entries[ordered[index]->entry].kind;
+        layout->parameterCount += kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? kMemRefParameters : 1;
+    }
+    *output = toHandle(layout.release());
+    adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
                                            VernonRuntimeProviderObject *output) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        (descriptor->binding_count != 0 && !descriptor->bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"cuda_adapter_received_an_invalid_pipeline_layout", 0, 0}})};
+        descriptor->group_layout_count > kMaxGroups ||
+        (descriptor->group_layout_count != 0 && !descriptor->group_layouts) || descriptor->vertex_attribute_count != 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_pipeline_layout");
+    if (descriptor->push_constant_size != 0)
+        return providerFailure(vernon::ProviderErrorCode::Unsupported, "cuda_dispatch_push_constants_are_unsupported");
     try {
-        auto layout = std::make_unique<PreparedLayout>();
-        layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
-        for (const auto &entry : layout->entries)
-            if ((entry.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-                 entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) ||
-                entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE || entry.array_count != 1 ||
-                (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && entry.element_size == 0))
-                return RhiAdapterResult<void>{vernon::err(
-                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                          {"cuda_adapter_pipeline_layout_contains_an_unsupported_binding", 0, 0}})};
-        std::sort(layout->entries.begin(), layout->entries.end(),
-                  [](const auto &left, const auto &right) { return left.binding < right.binding; });
-        for (size_t index = 0; index < layout->entries.size(); ++index)
-            if (layout->entries[index].binding != index)
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"cuda_adapter_abi_bindings_must_be_contiguous", 0, 0}})};
-        *output = toHandle(layout.release());
-        adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
-        return RhiAdapterResult<void>{vernon::ok()};
+        return prepareLayoutImplResult(*static_cast<VernonRuntimeRhiAdapter *>(data), *descriptor, output);
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_layout_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "cuda_layout_preparation_ran_out_of_memory");
     }
 }
 
 RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
                                              VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         descriptor->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE || descriptor->shader_count != 1 ||
-        !descriptor->shaders || !fromHandle<PreparedShader>(descriptor->shaders[0]) ||
-        !fromHandle<PreparedLayout>(descriptor->layout) || descriptor->workgroup_size[0] == 0 ||
-        descriptor->workgroup_size[1] == 0 || descriptor->workgroup_size[2] == 0)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"cuda_adapter_received_an_invalid_compute_pipeline", 0, 0}})};
+        !descriptor->shaders || !fromHandle<PreparedShader>(descriptor->shaders[0]) || !layout ||
+        descriptor->workgroup_size[0] == 0 || descriptor->workgroup_size[1] == 0 || descriptor->workgroup_size[2] == 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_compute_pipeline");
     try {
         auto pipeline = std::make_unique<PreparedPipeline>();
         PreparedShader &shader = *fromHandle<PreparedShader>(descriptor->shaders[0]);
         auto &device = cudaDevice(adapter);
+        pipeline->device = &device;
+        layout->references.fetch_add(1, std::memory_order_relaxed);
+        pipeline->layout = layout;
         auto created = cudaResult(
             pipeline->function.create(device, shader.artifact.data(), shader.artifact.size(), shader.entry.c_str()),
             "CUDA pipeline preparation");
         if (!created)
             return created;
-        pipeline->device = &device;
         std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
         return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_pipeline_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "cuda_pipeline_preparation_ran_out_of_memory");
     }
 }
 
-RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
-                                                const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"cuda_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
-    std::unordered_map<uint32_t, size_t> slotIndices;
-    std::vector<size_t> valueIndices(bindings.slots.size());
-    std::vector<uint8_t> seenSlots(bindings.slots.size());
-    std::vector<DevicePointer> resolvedValues(bindings.slots.size());
-    slotIndices.reserve(bindings.slots.size());
-    for (size_t index = 0; index < bindings.slots.size(); ++index)
-        if (!slotIndices.emplace(bindings.slots[index].layout.slot, index).second)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"cuda_binding_layout_contains_duplicate_slots", 0, 0}})};
-    for (size_t index = 0; index < valueCount; ++index) {
-        const auto found = slotIndices.find(values[index].slot);
-        if (found == slotIndices.end() || seenSlots[found->second])
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"cuda_binding_slot_is_invalid_or_duplicated", 0, 0}})};
-        seenSlots[found->second] = 1;
-        valueIndices[found->second] = index;
+// Host values bound as storage need device memory: a transient group's comes from its encoder's transient memory, and a
+// persistent group allocates its own.
+RhiAdapterResult<DevicePointer> placeHostStorage(VernonRuntimeRhiAdapter &adapter, CudaGroup &group,
+                                                 const VernonRuntimeProviderGroupDescriptor &descriptor,
+                                                 const VernonRuntimeProviderInlineValue &host,
+                                                 CudaGroup::Value &value) {
+    if (descriptor.lifetime == VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT) {
+        auto written = writeCommandTransient(adapter, descriptor.command_encoder, host.data, host.size,
+                                             kDeviceAllocationAlignment);
+        if (!written)
+            return RhiAdapterResult<DevicePointer>{vernon::err(std::move(written).error())};
+        return RhiAdapterResult<DevicePointer>{
+            vernon::ok(static_cast<DevicePointer>(written.value().buffer + written.value().offset))};
     }
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        auto &slot = bindings.slots[index];
-        const auto *value = &values[valueIndices[index]];
-        if (value->kind != slot.layout.kind)
-            return RhiAdapterResult<void>{vernon::err(
-                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                      {"cuda_binding_slot_or_kind_does_not_match_the_prepared_layout", 0, 0}})};
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const bool hostStorage = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
-            if ((value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_flags_are_invalid", 0, 0}})};
-            if (hostStorage) {
-                const auto &inlineValue = value->payload.inline_value;
-                if (!inlineValue.data || !inlineValue.size || inlineValue.size % slot.layout.element_size != 0)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                        vernon::ProviderErrorCode::InvalidArgument,
-                        {"cuda_host_storage_binding_is_invalid", inlineValue.size, slot.layout.element_size}})};
-                if (!slot.hostStorage) {
-                    auto allocated = cudaResult(cudaDevice(adapter).allocate(slot.hostStorage, inlineValue.size),
-                                                "cuMemAlloc host storage binding");
-                    if (!allocated)
-                        return allocated;
-                    slot.hostStorageSize = inlineValue.size;
-                } else if (slot.hostStorageSize != inlineValue.size) {
-                    return RhiAdapterResult<void>{
-                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                          {"cuda_host_storage_binding_size_changed", inlineValue.size,
-                                                           static_cast<uint32_t>(slot.hostStorageSize)}})};
-                }
-                auto uploaded =
-                    cudaResult(cudaDevice(adapter).upload(slot.hostStorage, inlineValue.data, inlineValue.size),
-                               "cuMemcpyHtoDAsync host storage binding");
-                if (!uploaded)
-                    return uploaded;
-                resolvedValues[index] = slot.hostStorage;
+    if (auto allocated =
+            cudaResult(group.device->allocate(value.hostStorage, host.size), "cuMemAlloc host storage binding");
+        !allocated)
+        return RhiAdapterResult<DevicePointer>{vernon::err(std::move(allocated).error())};
+    if (auto uploaded = cudaResult(group.device->upload(value.hostStorage, host.data, host.size),
+                                   "cuMemcpyHtoDAsync host storage binding");
+        !uploaded)
+        return RhiAdapterResult<DevicePointer>{vernon::err(std::move(uploaded).error())};
+    return RhiAdapterResult<DevicePointer>{vernon::ok(value.hostStorage)};
+}
+
+RhiAdapterResult<void> initializeGroupValue(VernonRuntimeRhiAdapter &adapter, CudaGroup &group,
+                                            const VernonRuntimeProviderGroupDescriptor &descriptor,
+                                            const VernonRuntimeProviderBindingLayoutEntry &entry,
+                                            const VernonRuntimeProviderBindingValue &source, CudaGroup::Value &value) {
+    if (source.kind != entry.kind)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_group_value_kind_is_invalid",
+                               entry.slot);
+    if (entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+        if (!source.payload.inline_value.data || source.payload.inline_value.size == 0)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "cuda_inline_binding_requires_initial_storage", entry.slot);
+        const auto *bytes = static_cast<const uint8_t *>(source.payload.inline_value.data);
+        value.inlineStorage.assign(bytes, bytes + source.payload.inline_value.size);
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+    if ((source.flags & ~VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_storage_buffer_flags_are_invalid",
+                               entry.slot);
+    DevicePointer pointer{};
+    uint64_t byteSize = 0;
+    uint64_t byteStride = entry.element_size;
+    if ((source.flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0) {
+        const auto &inlineValue = source.payload.inline_value;
+        if (!inlineValue.data || !inlineValue.size || inlineValue.size % entry.element_size != 0)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_host_storage_binding_is_invalid",
+                                   inlineValue.size, entry.element_size);
+        auto placed = placeHostStorage(adapter, group, descriptor, inlineValue, value);
+        if (!placed)
+            return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
+        pointer = placed.value();
+        byteSize = inlineValue.size;
+    } else {
+        const auto &reference = source.payload.buffer.resource;
+        if ((reference.identity & kRhiResourceKindMask) != kRhiBufferResource || reference.size == 0)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_storage_buffer_binding_is_invalid",
+                                   entry.slot);
+        auto acquired = acquireGroupResource(adapter, group, reference);
+        if (!acquired)
+            return RhiAdapterResult<void>{vernon::err(std::move(acquired).error())};
+        if (!acquired.value())
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_storage_buffer_binding_is_stale",
+                                   entry.slot);
+        if (writesBinding(entry))
+            group.writes.push_back(reference);
+        pointer = static_cast<DevicePointer>(acquired.value()) + reference.offset;
+        byteSize = reference.size;
+        if (source.payload.buffer.stride)
+            byteStride = source.payload.buffer.stride;
+    }
+    if (byteStride < entry.element_size || byteStride % entry.element_size != 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_storage_buffer_stride_is_invalid",
+                               byteStride, entry.element_size);
+    value.memref = {pointer, pointer, 0, byteSize / byteStride, byteStride / entry.element_size};
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> createGroupImplResult(VernonRuntimeRhiAdapter &adapter,
+                                             const VernonRuntimeProviderGroupDescriptor &descriptor,
+                                             VernonRuntimeProviderObject *output) {
+    auto *layout = fromHandle<GroupLayout>(descriptor.group_layout);
+    if (!layout || descriptor.value_count != layout->entries.size() ||
+        (descriptor.value_count != 0 && !descriptor.values))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_group_descriptor");
+    auto group = std::make_unique<CudaGroup>();
+    group->device = &cudaDevice(adapter);
+    layout->references.fetch_add(1, std::memory_order_relaxed);
+    group->layout = layout;
+    group->values.resize(layout->entries.size());
+    for (size_t index = 0; index < layout->entries.size(); ++index)
+        if (auto initialized = initializeGroupValue(adapter, *group, descriptor, layout->entries[index],
+                                                    descriptor.values[index], group->values[index]);
+            !initialized)
+            return initialized;
+    group->serial = cudaState(adapter).nextSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+    *output = toHandle(group.release());
+    adapter.groupCreations.fetch_add(1, std::memory_order_relaxed);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> createGroupResult(void *data, const VernonRuntimeProviderGroupDescriptor *descriptor,
+                                         VernonRuntimeProviderObject *output) {
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "cuda_adapter_received_an_invalid_group_descriptor");
+    try {
+        return createGroupImplResult(*static_cast<VernonRuntimeRhiAdapter *>(data), *descriptor, output);
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "cuda_group_creation_ran_out_of_memory");
+    }
+}
+
+RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObject encoder,
+                                           VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    if (!output)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_begin_commands_output_is_null");
+    std::unique_ptr<CudaCommands> commands(new (std::nothrow) CudaCommands());
+    if (!commands)
+        return providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "cuda_commands_allocation");
+    if (auto begun = beginRhiCommands(adapter, encoder, *commands); !begun)
+        return begun;
+    if (commands->native != reinterpret_cast<uintptr_t>(&cudaDevice(adapter)))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_command_encoder_is_invalid");
+    *output = toHandle(commands.release());
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> endCommandsResult(void *, VernonRuntimeProviderObject handle) {
+    std::unique_ptr<CudaCommands> commands(fromHandle<CudaCommands>(handle));
+    return commands
+               ? RhiAdapterResult<void>{vernon::ok()}
+               : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_end_commands_handle_is_invalid");
+}
+
+RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
+                                          VernonRuntimeProviderObject pipelineHandle) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<CudaCommands>(handle);
+    auto *pipeline = fromHandle<PreparedPipeline>(pipelineHandle);
+    if (!commands || !pipeline)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_bind_pipeline_is_invalid");
+    if (auto retained = retainForCommands(adapter, commands->encoder, *pipeline); !retained)
+        return retained;
+    const PreparedLayout &layout = *pipeline->layout;
+    for (uint32_t group = 0; group < kMaxGroups; ++group)
+        if (commands->groups[group] &&
+            (group >= layout.groupCount || commands->groups[group]->layout != layout.groups[group]))
+            commands->groups[group] = nullptr;
+    commands->pipeline = pipeline;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject handle, uint32_t index,
+                                       VernonRuntimeProviderObject groupHandle) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<CudaCommands>(handle);
+    auto *group = fromHandle<CudaGroup>(groupHandle);
+    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->layout->groupCount ||
+        group->layout != commands->pipeline->layout->groups[index])
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_bind_group_is_invalid", index);
+    if (auto retained = retainForCommands(adapter, commands->encoder, *group); !retained)
+        return retained;
+    commands->groups[index] = group;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+// Points the kernel parameters at the values of the bound groups whose parameters the array lacks.
+RhiAdapterResult<void> fillParameters(CudaCommands &commands) {
+    const PreparedLayout &layout = *commands.pipeline->layout;
+    if (commands.parameterLayout != &layout) {
+        commands.parameters.assign(layout.parameterCount, nullptr);
+        commands.parameterLayout = &layout;
+        commands.parameterGroups.fill(0);
+    }
+    for (uint32_t index = 0; index < layout.groupCount; ++index) {
+        CudaGroup *group = commands.groups[index];
+        if (!group)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_command_group_is_unbound", index);
+        if (commands.parameterGroups[index] == group->serial)
+            continue;
+        for (const KernelParameter &parameter : layout.parameters[index]) {
+            CudaGroup::Value &value = group->values[parameter.entry];
+            void **target = commands.parameters.data() + parameter.offset;
+            if (group->layout->entries[parameter.entry].kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                target[0] = &value.memref.allocated;
+                target[1] = &value.memref.aligned;
+                target[2] = &value.memref.offset;
+                target[3] = &value.memref.size;
+                target[4] = &value.memref.stride;
             } else {
-                const auto &reference = value->payload.buffer.resource;
-                auto resolved = resolveRhiResource(adapter, reference);
-                if (!resolved)
-                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-                const DevicePointer resource = std::move(resolved).value();
-                if (reference.offset >= reference.size)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                        vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_binding_is_invalid", 0, 0}})};
-                resolvedValues[index] = resource + reference.offset;
+                target[0] = value.inlineStorage.data();
             }
-        } else {
-            if (!value->payload.inline_value.data || value->payload.inline_value.size == 0)
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                      {"cuda_inline_binding_requires_initial_storage", 0, 0}})};
-            slot.inlineStorage.resize(value->payload.inline_value.size);
         }
-    }
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        auto &slot = bindings.slots[index];
-        const auto *value = &values[valueIndices[index]];
-        slot.resourceReference = {};
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const DevicePointer pointer = resolvedValues[index];
-            const bool hostStorage = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
-            const uint64_t byteSize = hostStorage
-                                          ? value->payload.inline_value.size
-                                          : value->payload.buffer.resource.size - value->payload.buffer.resource.offset;
-            const uint64_t byteStride =
-                hostStorage || !value->payload.buffer.stride ? slot.layout.element_size : value->payload.buffer.stride;
-            if (byteStride < slot.layout.element_size || byteStride % slot.layout.element_size != 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"cuda_storage_buffer_stride_is_invalid", 0, 0}})};
-            bindings.descriptors[slot.descriptorOffset] = {pointer, pointer, 0, byteSize / byteStride,
-                                                           byteStride / slot.layout.element_size};
-            if (!hostStorage)
-                slot.resourceReference = value->payload.buffer.resource;
-        } else
-            std::memcpy(slot.inlineStorage.data(), value->payload.inline_value.data, value->payload.inline_value.size);
+        commands.parameterGroups[index] = group->serial;
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                                              VernonRuntimeProviderObject *output) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    PreparedLayout *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || !layout)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"cuda_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
-    try {
-        auto bindings = std::make_unique<PreparedBindingSet>();
-        bindings->device = &cudaDevice(adapter);
-        size_t descriptorCount = 0;
-        size_t parameterCount = 0;
-        bindings->slots.reserve(layout->entries.size());
-        for (size_t index = 0; index < layout->entries.size(); ++index) {
-            const auto &entry = layout->entries[index];
-            PreparedBindingSet::Slot slot;
-            slot.layout = entry;
-            slot.parameterOffset = parameterCount;
-            if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-                slot.descriptorOffset = descriptorCount++;
-                parameterCount += 5;
-            } else
-                ++parameterCount;
-            bindings->slots.push_back(std::move(slot));
-        }
-        bindings->descriptors.resize(descriptorCount);
-        bindings->parameters.resize(parameterCount);
-        auto initialized = initializeBindingsResult(adapter, *bindings, descriptor->values, descriptor->value_count);
-        if (!initialized)
-            return initialized;
-        for (PreparedBindingSet::Slot &slot : bindings->slots)
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-                auto &memref = bindings->descriptors[slot.descriptorOffset];
-                bindings->parameters[slot.parameterOffset] = &memref.allocated;
-                bindings->parameters[slot.parameterOffset + 1] = &memref.aligned;
-                bindings->parameters[slot.parameterOffset + 2] = &memref.offset;
-                bindings->parameters[slot.parameterOffset + 3] = &memref.size;
-                bindings->parameters[slot.parameterOffset + 4] = &memref.stride;
-            } else {
-                bindings->parameters[slot.parameterOffset] = slot.inlineStorage.data();
-            }
-        *output = toHandle(bindings.release());
-        adapter.bindingCreations.fetch_add(1, std::memory_order_relaxed);
-        return RhiAdapterResult<void>{vernon::ok()};
-    } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_binding_preparation_ran_out_of_memory", 0, 0}})};
-    }
-}
-
-RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject commandEncoder,
+RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject handle,
                                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    PreparedPipeline *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
-    PreparedBindingSet *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline ||
-        (!bindings && descriptor->bindings.value != 0))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"cuda_adapter_received_an_invalid_dispatch", 0, 0}})};
-    auto native = nativeCommandEncoder(adapter, commandEncoder);
-    if (!native)
-        return RhiAdapterResult<void>{vernon::err(std::move(native).error())};
-    const uint64_t nativeValue = std::move(native).value();
-    auto rendering = commandEncoderRendering(adapter, commandEncoder);
-    if (!rendering)
-        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
-    if (nativeValue != reinterpret_cast<uintptr_t>(pipeline->device) || std::move(rendering).value())
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"cuda_dispatch_command_encoder_is_invalid", 0, 0}})};
-    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"cuda_dispatch_could_not_retain_provider_objects", 0, 0}})};
-    if (bindings)
-        for (const auto &slot : bindings->slots)
-            if (slot.resourceReference.resource.value &&
-                !retainCommandResource(adapter, commandEncoder, slot.resourceReference))
-                return RhiAdapterResult<void>{
-                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                      {"cuda_dispatch_could_not_retain_its_resources", 0, 0}})};
-    auto launched =
-        cudaResult(pipeline->function.launch(*pipeline->device, descriptor->group_count, pipeline->workgroup,
-                                             bindings ? bindings->parameters.data() : nullptr),
-                   "cuLaunchKernel");
-    if (!launched)
+    auto *commands = fromHandle<CudaCommands>(handle);
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
+        commands->rendering || descriptor->push_constant_size != 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_adapter_received_an_invalid_dispatch");
+    if (auto filled = fillParameters(*commands); !filled)
+        return filled;
+    PreparedPipeline &pipeline = *commands->pipeline;
+    if (auto launched = cudaResult(pipeline.function.launch(*pipeline.device, descriptor->group_count,
+                                                            pipeline.workgroup, commands->parameters.data()),
+                                   "cuLaunchKernel");
+        !launched)
         return launched;
-    if (!recordProviderCommand(adapter, commandEncoder, false))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"cuda_dispatch_command_encoder_state_changed", 0, 0}})};
+    for (uint32_t index = 0; index < pipeline.layout->groupCount; ++index)
+        if (!commands->groups[index]->writes.empty())
+            if (auto recorded = recordGroupWrites(adapter, commands->encoder, *commands->groups[index]); !recorded)
+                return recorded;
+    if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
+        return recorded;
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject,
-                                        const VernonRuntimeProviderDrawDescriptor *) {
-    return RhiAdapterResult<void>{vernon::err(
-        vernon::ProviderError{vernon::ProviderErrorCode::Unsupported, {"cuda_does_not_support_graphics", 0, 0}})};
+void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
+void destroyGroupLayout(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<GroupLayout>(handle));
 }
-
-RhiAdapterResult<void> destroyShaderResult(void *, VernonRuntimeProviderObject handle) {
-    delete fromHandle<PreparedShader>(handle);
-    return RhiAdapterResult<void>{vernon::ok()};
+void destroyLayout(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<PreparedLayout>(handle));
 }
-RhiAdapterResult<void> destroyLayoutResult(void *, VernonRuntimeProviderObject handle) {
-    delete fromHandle<PreparedLayout>(handle);
-    return RhiAdapterResult<void>{vernon::ok()};
+void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<PreparedPipeline>(handle));
 }
-void releaseCommandBindings(void *context, uint64_t) {
-    auto *bindings = static_cast<PreparedBindingSet *>(context);
-    if (bindings && bindings->references.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        delete bindings;
-}
-RhiAdapterResult<void> destroyBindingSetResult(void *, VernonRuntimeProviderObject handle) {
-    releaseCommandBindings(fromHandle<PreparedBindingSet>(handle), 0);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-void releaseCommandPipeline(void *context, uint64_t) {
-    auto *pipeline = static_cast<PreparedPipeline *>(context);
-    if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
-        return;
-    pipeline->function.destroy(*pipeline->device);
-    delete pipeline;
-}
-RhiAdapterResult<void> destroyPipelineResult(void *, VernonRuntimeProviderObject handle) {
-    releaseCommandPipeline(fromHandle<PreparedPipeline>(handle), 0);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
+void destroyGroup(void *, VernonRuntimeProviderObject handle) { releaseRetainedObject(fromHandle<CudaGroup>(handle)); }
 
 VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
                            VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, prepareShaderResult(data, descriptor, output), "CUDA shader preparation failed");
+}
+VernonStatus prepareGroupLayout(void *data, const VernonRuntimeProviderGroupLayoutDescriptor *descriptor,
+                                VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, prepareGroupLayoutResult(data, descriptor, output),
+                          "CUDA group layout preparation failed");
 }
 VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
                            VernonRuntimeProviderObject *output) {
@@ -482,46 +557,32 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, preparePipelineResult(data, descriptor, output), "CUDA pipeline preparation failed");
 }
-VernonStatus createBindingSet(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                              VernonRuntimeProviderObject *output) {
+VernonStatus createGroup(void *data, const VernonRuntimeProviderGroupDescriptor *descriptor,
+                         VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, createBindingSetResult(data, descriptor, output),
-                          "CUDA binding-set creation failed");
+    return providerStatus(adapter, createGroupResult(data, descriptor, output), "CUDA group creation failed");
 }
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncoder,
+VernonStatus beginCommands(void *data, VernonRuntimeProviderObject encoder, VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, beginCommandsResult(data, encoder, output), "CUDA commands could not begin");
+}
+VernonStatus endCommands(void *data, VernonRuntimeProviderObject commands) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, endCommandsResult(data, commands), "CUDA commands failed");
+}
+VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "CUDA pipeline binding failed");
+}
+VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_t index,
+                       VernonRuntimeProviderObject group) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, bindGroupResult(data, commands, index, group), "CUDA group binding failed");
+}
+VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDispatchResult(data, commandEncoder, descriptor),
-                          "CUDA dispatch encoding failed");
-}
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
-                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDrawResult(data, commandEncoder, descriptor), "CUDA draw encoding failed");
-}
-void destroyShader(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyShaderResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "CUDA shader destruction failed");
-}
-void destroyLayout(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyLayoutResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "CUDA layout destruction failed");
-}
-void destroyPipeline(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyPipelineResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "CUDA pipeline destruction failed");
-}
-void destroyBindingSet(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyBindingSetResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "CUDA binding-set destruction failed");
+    return providerStatus(adapter, encodeDispatchResult(data, commands, descriptor), "CUDA dispatch encoding failed");
 }
 
 } // namespace
@@ -533,18 +594,20 @@ void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.get_capabilities = getCapabilities;
     adapter.provider.get_device_identity = getDeviceIdentity;
     adapter.provider.prepare_shader = prepareShader;
+    adapter.provider.prepare_group_layout = prepareGroupLayout;
     adapter.provider.prepare_pipeline_layout = prepareLayout;
     adapter.provider.prepare_pipeline = preparePipeline;
-    adapter.provider.retain_resource = retainRhiResourceCallback;
-    adapter.provider.release_resource = releaseRhiResourceCallback;
-    adapter.provider.describe_image = describeProviderImageCallback;
-    adapter.provider.create_binding_set = createBindingSet;
+    adapter.provider.create_group = createGroup;
+    adapter.provider.begin_commands = beginCommands;
+    adapter.provider.end_commands = endCommands;
+    adapter.provider.encode_bind_pipeline = bindPipeline;
+    adapter.provider.encode_bind_group = bindGroup;
     adapter.provider.encode_dispatch = encodeDispatch;
-    adapter.provider.encode_draw = encodeDraw;
     adapter.provider.destroy_shader = destroyShader;
+    adapter.provider.destroy_group_layout = destroyGroupLayout;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;
-    adapter.provider.destroy_binding_set = destroyBindingSet;
+    adapter.provider.destroy_group = destroyGroup;
 }
 
 } // namespace vernon::runtime::rhi_adapter

@@ -114,6 +114,8 @@ struct TargetBinding {
     std::string reflectedKind;
     std::string role;
     std::string access;
+    // The access the compiled module declares for a resource; it may be wider than the logical `access`.
+    std::optional<std::string> nativeAccess;
     std::string dimension;
     std::string imageFormat;
     VernonImageSampleResultClass imageSampleResultClass{VERNON_IMAGE_SAMPLE_NONE};

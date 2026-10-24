@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
+#include "pipeline_groups.h"
 #include "provider_image_description.h"
 #include "resolved_stage_types.h"
 #include "stage_binding_plan.h"
@@ -11,31 +12,29 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace vernon::runtime {
 
-using PipelineArgumentMap = std::unordered_map<uint32_t, const VernonProgramArgument *>;
-
-enum PlannedShaderStage : uint32_t { PLANNED_STAGE_VERTEX = 1u << 0, PLANNED_STAGE_FRAGMENT = 1u << 1 };
-
-struct PlannedSampledResource {
-    VernonRuntimeProviderResourceReference imageView{};
-    ProviderImageSubresources subresources{};
-    VernonRuntimeProviderResourceReference samplerResource{};
-    bool implicitSampler{};
-    bool explicitSampler{};
-    uint32_t stages{};
+// What every draw of one graphics Stage reads, fixed when the Stage is prepared.
+struct GraphicsDrawLayout {
+    struct VertexInput {
+        uint32_t parameter{};
+        uint32_t divisor{};
+    };
+    std::vector<VertexInput> vertexInputs;
+    // Image parameters the draws sample, by index.
+    std::vector<uint32_t> sampledImages;
+    // Parameters bound at one shader descriptor, whose arguments must name the same resource.
+    std::vector<std::pair<uint32_t, uint32_t>> sharedDescriptors;
 };
 
-struct PlannedVertexInput {
-    const ParameterUse *use{};
-    const VernonTensorView *tensor{};
-    bool instanced{};
+// What validating one argument of a graphics Stage found.
+struct PlannedGraphicsArgument {
+    // A sampled image's subresources; empty for every other argument.
+    ProviderImageSubresources subresources{};
 };
 
 // `attachments` are sorted by location, and locations are contiguous from zero. `attachmentSubresources` holds the
@@ -50,28 +49,45 @@ struct PlannedRenderTargets {
     uint32_t attachmentHeight{};
 };
 
-struct PlannedGraphicsInvocation : PlannedRenderTargets {
-    PipelineArgumentMap arguments;
-    std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampledResources;
-    std::vector<PlannedVertexInput> vertexInputs;
+struct PlannedGraphicsDraw {
     std::array<float, 2> resolution{};
     uint32_t vertexCount{};
     uint32_t instanceCount{};
     uint32_t firstInstance{};
+    uint32_t stencilReference{};
     const VernonIndexBinding *indexBinding{};
-    VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
     uint32_t viewport[4]{};
     uint32_t scissor[4]{};
+};
+
+// One draw of a graphics command stream, encoded inside the stream's rendering scope.
+struct GraphicsCommand {
+    // Per Stage parameter.
+    const VernonProgramArgument *const *arguments{};
+    const PlannedRenderTargets *targets{};
+    const VernonGraphicsState *graphicsState{};
+    PlannedGraphicsDraw draw;
+    GroupSources groups;
+    VernonRuntimeProviderObject encoder{};
+};
+
+// What the commands of one stream bound last. A stream renders to targets of one format set, so the variant changes
+// only with the pipeline, its state, or the vertex strides.
+struct GraphicsStream {
+    const void *pipeline{};
+    const VernonGraphicsState *graphicsState{};
+    std::vector<uint32_t> vertexStrides;
+    std::vector<uint32_t> nextVertexStrides;
 };
 
 using DescribeImageResource = VernonStatus (*)(void *userData, VernonRuntimeProviderResourceReference resource,
                                                VernonRuntimeProviderImageDescription *description);
 
 struct PlannedGraphicsState {
+    VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
     VernonRasterizationState rasterization{};
     VernonDepthStencilState depthStencil{};
     std::vector<VernonColorBlendState> colorBlends;
-    uint32_t stencilReference{};
 };
 
 struct PreparedGraphicsVariant {
@@ -79,13 +95,30 @@ struct PreparedGraphicsVariant {
     VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
+// A standalone invocation: a stream of one command.
+struct PlannedGraphicsInvocation {
+    PlannedRenderTargets targets;
+    std::vector<const VernonProgramArgument *> arguments;
+    std::vector<PlannedGraphicsArgument> planned;
+    PlannedGraphicsDraw draw;
+};
+
+bool buildGraphicsDrawLayout(const StageBindingPlan &stagePlan, GraphicsDrawLayout &layout, std::string &error);
+bool planGraphicsArgument(const StageBindingPlan &stagePlan, const GraphicsDrawLayout &layout, uint32_t parameter,
+                          const VernonProgramArgument &argument, DescribeImageResource describeImage,
+                          void *describeImageUserData, PlannedGraphicsArgument &planned, std::string &error);
 bool planRenderTargets(const VernonRenderPass *renderPass, DescribeImageResource describeImage,
                        void *describeImageUserData, PlannedRenderTargets &targets, std::string &error);
-bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
-                            DescribeImageResource describeImage, void *describeImageUserData,
-                            PlannedGraphicsInvocation &plan, std::string &error);
-bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t colorCount, bool hasDepth,
-                       bool hasStencil, PlannedGraphicsState &state, std::string &error);
+// `arguments` holds one validated argument per Stage parameter.
+bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgument *const *arguments,
+                      const PlannedRenderTargets &targets, const VernonRenderPass &renderPass,
+                      const VernonDynamicState *dynamicState, const VernonDrawCommand &draw, PlannedGraphicsDraw &plan,
+                      std::string &error);
+bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const GraphicsDrawLayout &layout,
+                            const VernonStageInvocationDescriptor &invocation, DescribeImageResource describeImage,
+                            void *describeImageUserData, PlannedGraphicsInvocation &plan, std::string &error);
+bool planGraphicsState(const VernonGraphicsState *graphicsState, size_t colorCount, bool hasDepth, bool hasStencil,
+                       PlannedGraphicsState &state, std::string &error);
 VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
                                    PreparedGraphicsVariant &prepared);
 void destroyGraphicsVariant(PreparedGraphicsVariant &prepared);

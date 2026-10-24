@@ -710,7 +710,8 @@ VERNON_RUNTIME_CAPI void vernonRuntimeGraphicsPipelineDestroy(VernonGraphicsPipe
 
 /* `argument->slot` is the slot of a per-draw parameter of the pipeline's Program, found through
  * vernonRuntimeProgramExecutableFindParameter on that Program (`executable` for pipeline 0, otherwise `source`).
- * Validation equals vernonRuntimeProgramInvocationBind, except that the argument must not need a Runtime upload. */
+ * Validation equals vernonRuntimeProgramInvocationBind, except that the argument must not need a Runtime upload. A
+ * host Tensor's bytes are copied when bound; device resources stay borrowed. */
 VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeBindingSetCreate(VernonGraphicsPipeline *pipeline,
                                                                                VernonBindingSet **output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeBindingSetBind(VernonBindingSet *set,

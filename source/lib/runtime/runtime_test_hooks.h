@@ -15,7 +15,6 @@ struct VulkanGraphicsCacheStats {
     size_t descriptorSetLayoutCreations{};
     size_t pipelineLayoutCreations{};
     size_t graphicsPipelineCreations{};
-    size_t bindingSnapshotCreations{};
     size_t commandBufferAllocations{};
     size_t descriptorPoolCreations{};
     size_t stagingBufferAllocations{};
@@ -44,9 +43,10 @@ size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *
 size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline);
 uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
 DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context);
+size_t getDirectX12BufferCreationCount(const VernonRuntimeContext *context);
 size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context);
 size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
-size_t getRhiAdapterBindingCreationCount(const VernonRuntimeContext *context);
+size_t getRhiAdapterGroupCreationCount(const VernonRuntimeContext *context);
 bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures, uint64_t samplers,
                                                  bool writableTexture, uint32_t deviceTier);
 uint64_t diagnosticClockForTesting() noexcept;

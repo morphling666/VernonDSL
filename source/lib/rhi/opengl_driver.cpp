@@ -63,6 +63,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(deleteVertexArrays, "glDeleteVertexArrays");
         LOAD(bindVertexArray, "glBindVertexArray");
         LOAD(enableVertexAttribArray, "glEnableVertexAttribArray");
+        LOAD(disableVertexAttribArray, "glDisableVertexAttribArray");
         LOAD(vertexAttribPointer, "glVertexAttribPointer");
         LOAD(vertexAttribIPointer, "glVertexAttribIPointer");
         driver.vertexAttribLPointer = reinterpret_cast<decltype(driver.vertexAttribLPointer)>(

@@ -5,7 +5,7 @@
 // The sampler binds through the texture's combined image-sampler, so it leaves no SPIR-V argument while the output
 // keeps the binding index that counts it.
 // CHECK-LABEL: spirv.func @sample_main(
-// CHECK-SAME: %[[IMAGE:[a-z0-9]+]]: !spirv.ptr<!spirv.sampled_image<!spirv.image<f32, Dim2D, NoDepth, NonArrayed, SingleSampled, NeedSampler, Unknown>>, UniformConstant> {spirv.interface_var_abi = #spirv.interface_var_abi<(0, 0)>, vernon.texture_access = "sampled"}, %{{[a-z0-9]+}}: !spirv.ptr<!spirv.struct<{{[^{]*}}>, StorageBuffer> {spirv.interface_var_abi = #spirv.interface_var_abi<(0, 2)>})
+// CHECK-SAME: %[[IMAGE:[a-z0-9]+]]: !spirv.ptr<!spirv.sampled_image<!spirv.image<f32, Dim2D, NoDepth, NonArrayed, SingleSampled, NeedSampler, Unknown>>, UniformConstant> {spirv.interface_var_abi = #spirv.interface_var_abi<(0, 0)>, vernon.resource_access = "sampled"}, %{{[a-z0-9]+}}: !spirv.ptr<!spirv.struct<{{[^{]*}}>, StorageBuffer> {spirv.interface_var_abi = #spirv.interface_var_abi<(0, 2)>, vernon.resource_access = "write"})
 // CHECK: %[[SAMPLED:.*]] = spirv.Load "UniformConstant" %[[IMAGE]]
 // CHECK: spirv.ImageSampleExplicitLod %[[SAMPLED]], %{{.*}} ["Lod"], %{{.*}} : {{.*}} -> vector<4xf32>
 

@@ -15,7 +15,8 @@ struct GraphicsScopeReads {
     std::vector<ProviderImageSubresources> subresources;
 };
 
-void addGraphicsScopeReads(GraphicsScopeReads &reads, const PlannedGraphicsInvocation &invocation);
+void addGraphicsScopeRead(GraphicsScopeReads &reads, VernonRuntimeProviderResourceReference image,
+                          const ProviderImageSubresources &subresources);
 // Whether a read covers a subresource that `targets` render to; a scope cannot sample its own attachments.
 bool graphicsScopeReadsOverlap(const GraphicsScopeReads &reads, const PlannedRenderTargets &targets);
 

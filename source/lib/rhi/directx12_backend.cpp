@@ -465,6 +465,7 @@ bool DeviceState::createBuffer(Buffer &buffer, size_t size, bool unorderedAccess
         return false;
     buffer.state = initialState;
     buffer.owned = true;
+    ++bufferCreations;
     return true;
 }
 

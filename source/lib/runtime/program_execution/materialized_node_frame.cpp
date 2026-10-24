@@ -50,10 +50,16 @@ std::optional<shape::DeclaredShape> logicalProjectionShape(const Parameter &para
     return result;
 }
 
+size_t frameEffects(const MaterializedNodeFrame &frame) {
+    return frame.copiesBefore.size() + frame.copiesAfter.size() + frame.deviceCopiesBefore.size() +
+           frame.deviceCopiesAfter.size() + frame.deviceEndpointCarriers.size() + frame.hostEndpointCarrierCount;
+}
+
 } // namespace
 
 void MaterializedNodeFrame::reset(size_t endpointCount) {
     arguments.clear();
+    borrowed.clear();
     shapes.resize(endpointCount);
     strides.resize(endpointCount);
     for (size_t endpoint = 0; endpoint < endpointCount; ++endpoint) {
@@ -136,6 +142,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             VernonProgramArgument placeholder{};
             placeholder.slot = parameter.slot;
             output.arguments.push_back(placeholder);
+            output.borrowed.push_back(0);
             continue;
         }
         if (binding.value >= invocation.arguments().size() || binding.value >= program.values.size())
@@ -144,12 +151,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         VernonProgramArgument controlImage{};
         const VernonProgramArgument *source = nullptr;
         const program::Value &programValue = program.values[binding.value];
-        const bool requiresHostProjection =
-            std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                return use.interfaceKind == "uniform" || use.interfaceKind == "value" ||
-                       use.interfaceKind == "result" ||
-                       (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform);
-            });
+        const bool requiresHostProjection = hostProjected(parameter);
         auto image = programValue.storage
                          ? invocation.controlImage(*programValue.storage)
                          : vernon::Option<std::reference_wrapper<const VernonRuntimeProviderResourceReference>>{};
@@ -171,6 +173,12 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         }
         if (!source)
             return error = "resolved Program endpoint has no physical carrier", false;
+        const auto bound = invocation.argument(binding.value);
+        bool borrowed =
+            !image && binding.target.semantic != program::CarrierSemantic::Tape &&
+            invocation.borrowsBinding(binding.value) &&
+            (source == &invocation.values()[binding.value].argument || (bound && source == &bound.value().get()));
+        const size_t effects = frameEffects(output);
         VernonProgramArgument materialized = *source;
         if (materialized.kind == VERNON_PROGRAM_TENSOR && programValue.canonicalType.rankedValue &&
             binding.value < invocation.values().size()) {
@@ -505,6 +513,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                         return error = "dispatch-derived view axis must "
                                        "broadcast",
                                false;
+                    borrowed = false;
                     outputShape.push_back(dispatchInvocations);
                     outputStrides.push_back(0);
                 } else {
@@ -527,6 +536,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             materialized.tensor.byte_strides = outputStrides.data();
         }
         output.arguments.push_back(materialized);
+        output.borrowed.push_back(borrowed && frameEffects(output) == effects);
     }
     return true;
 }

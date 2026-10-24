@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_BACKEND_STAGE_PIPELINE_H
 
 #include "VernonRuntime.h"
+#include "graphics_invocation_planner.h"
 #include "pipeline_metadata.h"
 #include "resolved_stage_types.h"
 #include "runtime_lifecycle.h"
@@ -60,6 +61,8 @@ struct VernonStageExecutable {
     vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
     VernonRuntimeContext *context{};
     vernon::runtime::StageBindingPlan bindingProjection;
+    // Graphics Stages only.
+    vernon::runtime::GraphicsDrawLayout drawLayout;
     VernonLaunchSize workgroupSize{1, 1, 1};
     vernon::runtime::DispatchContract dispatchContract;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;

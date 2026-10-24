@@ -52,6 +52,7 @@ class _Field:
     name: str
     annotation: ast.expr
     group: str | None
+    attribute: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,9 +123,9 @@ class _Flattener:
             qualified = f"'{declaration.name}.{statement.target.id}'"
             head = _head(statement.annotation)
             if head == "Annotated":
-                raise self.error(
-                    statement.annotation, f"binding group field cannot declare interface metadata: {qualified}"
-                )
+                self._check_attribute(statement.annotation, qualified)
+                fields.append(_Field(statement.target.id, statement.annotation, None, attribute=True))
+                continue
             if head == "When":
                 raise self.error(
                     statement.annotation, f"binding group field cannot declare a When condition: {qualified}"
@@ -133,6 +134,21 @@ class _Flattener:
             group = annotation.id if isinstance(annotation, ast.Name) and annotation.id in names else None
             fields.append(_Field(statement.target.id, annotation, group))
         return tuple(fields)
+
+    def _check_attribute(self, annotation: ast.expr, qualified: str) -> None:
+        assert isinstance(annotation, ast.Subscript)
+        items = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        metadata = items[1:]
+        if len(metadata) != 1 or not isinstance(metadata[0], ast.Call) or decorator_name(metadata[0]) != "attribute":
+            raise self.error(annotation, f"binding group field cannot declare interface metadata: {qualified}")
+        if metadata[0].args or any(keyword.arg == "location" for keyword in metadata[0].keywords):
+            raise self.error(annotation, f"binding group attribute cannot declare a location: {qualified}")
+
+    def _has_attributes(self, group: str) -> bool:
+        return any(
+            field.attribute or (field.group is not None and self._has_attributes(field.group))
+            for field in self.groups[group]
+        )
 
     def _reject_cycles(self) -> None:
         states: dict[str, int] = {}
@@ -221,6 +237,8 @@ class _Flattener:
             if group is None:
                 arguments.append(argument)
                 continue
+            if stage is not None and stage != "vertex" and self._has_attributes(group):
+                raise self.error(argument, "binding group with vertex attributes is only valid in a vertex stage")
             environment[argument.arg] = _GroupRef(group, argument.arg)
             for path, annotation in self.leaves(group, argument.arg):
                 leaf = copy_location(ast.arg(arg=path, annotation=self._leaf_annotation(annotation, stage)), argument)
@@ -235,7 +253,7 @@ class _Flattener:
     @staticmethod
     def _leaf_annotation(annotation: ast.expr, stage: str | None) -> ast.expr:
         annotation = copy.deepcopy(annotation)
-        if stage not in GRAPHICS_STAGES or _head(annotation) in _RESOURCE_CONSTRUCTORS:
+        if stage not in GRAPHICS_STAGES or _head(annotation) in _RESOURCE_CONSTRUCTORS | {"Annotated"}:
             return annotation
         uniform = ast.Call(func=ast.Name(id="uniform", ctx=ast.Load()), args=[], keywords=[])
         return ast.Subscript(

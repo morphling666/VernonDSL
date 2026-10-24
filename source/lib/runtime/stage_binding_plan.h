@@ -189,6 +189,10 @@ struct Parameter {
     std::vector<ParameterUse> uses;
 };
 
+// The Stage packs this parameter's bytes from host memory into an inline value, a native uniform, or a buffer its
+// provider fills, so its Value is read on the host whatever its target carrier is.
+bool hostProjected(const Parameter &parameter);
+
 struct Output {
     std::string name;
     std::string kind;

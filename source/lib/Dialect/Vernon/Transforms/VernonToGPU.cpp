@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonMetadataAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -492,7 +493,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         for (unsigned offset = 0; offset < range.second; ++offset)
                             kernel.setArgAttr(range.first + offset, name, value);
                 if (auto texture = dyn_cast<TextureType>(source.getArgument(sourceIndex).getType()))
-                    kernel.setArgAttr(range.first, "vernon.texture_access",
+                    kernel.setArgAttr(range.first, kResourceAccessAttrName,
                                       moduleBuilder.getStringAttr(texture.getAccess()));
             }
             if (metadataKernelIndex) {
@@ -784,12 +785,26 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
             }
             if (useSpirvStorage) {
+                auto setStorageAccess = [&](unsigned originalIndex, StringRef access) {
+                    auto [first, count] = convertedArgumentRanges[originalIndex];
+                    for (unsigned offset = 0; offset < count; ++offset)
+                        kernel.setArgAttr(first + offset, kResourceAccessAttrName, moduleBuilder.getStringAttr(access));
+                };
+                for (auto [index, type] : llvm::enumerate(kernelArgumentTypes))
+                    if (auto view = dyn_cast<TensorViewType>(type))
+                        setStorageAccess(index, view.getAccess());
+                for (const InlineTensorArgument &inlineTensor : inlineTensorArguments)
+                    setStorageAccess(inlineTensor.kernelIndex, "read");
+                for (const auto &aggregate : aggregateValueArguments)
+                    setStorageAccess(sourceArgumentRanges[aggregate.first].first, "read");
                 for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
                     if (kernel.getArgAttr(index, spirv::getInterfaceVarABIAttrName()))
                         continue;
                     std::optional<spirv::StorageClass> storageClass;
-                    if (kernel.getArgument(index).getType().isIntOrIndexOrFloat())
+                    if (kernel.getArgument(index).getType().isIntOrIndexOrFloat()) {
                         storageClass = spirv::StorageClass::StorageBuffer;
+                        kernel.setArgAttr(index, kResourceAccessAttrName, moduleBuilder.getStringAttr("read"));
+                    }
                     kernel.setArgAttr(index, spirv::getInterfaceVarABIAttrName(),
                                       spirv::getInterfaceVarABIAttr(0, index, storageClass, source.getContext()));
                 }

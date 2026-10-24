@@ -54,6 +54,22 @@ VERNON_RHI_CAPI Result<void, RhiError> recordImageCopy(VernonRhiDevice device, u
                                                        VernonRhiImage source, VernonRhiImage destination,
                                                        const VernonRhiImageCopyRegion *regions,
                                                        size_t region_count) noexcept;
+// Writes `size` bytes for the commands of encoder `key` into memory it owns until it completes or is abandoned; see
+// WriteTransientCallback. A failure fails the encoder.
+VERNON_RHI_CAPI Result<CommandTransient, RhiError> writeCommandTransient(VernonRhiDevice device, uint64_t key,
+                                                                         const void *data, uint64_t size,
+                                                                         uint64_t alignment) noexcept;
+VERNON_RHI_CAPI Result<CommandTransient, RhiError> writeRecordingTransient(VernonRhiDevice device, uint64_t key,
+                                                                           uint64_t native, const void *data,
+                                                                           uint64_t size, uint64_t alignment) noexcept;
+// Reserves transient memory of encoder `key` for the host to fill in place; see ReserveTransientCallback. A failure
+// fails the encoder.
+VERNON_RHI_CAPI Result<CommandTransientReservation, RhiError>
+reserveCommandTransient(VernonRhiDevice device, uint64_t key, uint64_t size, uint64_t alignment) noexcept;
+VERNON_RHI_CAPI Result<CommandTransientReservation, RhiError> reserveRecordingTransient(VernonRhiDevice device,
+                                                                                        uint64_t key, uint64_t native,
+                                                                                        uint64_t size,
+                                                                                        uint64_t alignment) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderKey(VernonRhiDevice device,
                                                              VernonRhiCommandEncoder encoder) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderNative(VernonRhiDevice device, uint64_t key,

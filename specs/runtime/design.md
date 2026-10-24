@@ -257,6 +257,17 @@ execution. Compatible intermediate Values remain device-resident. Runtime does
 not synchronously read a device result to host merely to feed a later device
 Node.
 
+A Value's residency at a Node follows the Stage parameter, not only its
+target carrier. By-value parameters (`hostProjected`: uniforms, values,
+results and native uniforms) are packed by the Stage from host memory, even
+when their carrier is a uniform or storage buffer, because the provider
+places those bytes in a push constant, a native uniform, or a buffer it
+fills, such as its encoder's transient memory. Such a Value therefore needs host
+residency there, and a host argument gets no device copy. Only resource
+parameters require device residency. Materialization uses the same
+predicate, so the plan never uploads a Value that the Stage then reads from
+the host.
+
 Checked arithmetic is required for every address, offset, extent, stride,
 shape product, and transfer range.
 
@@ -606,8 +617,23 @@ layout from the std140 SPIR-V interface decorations, as on every other backend.
 
 Compute and graphics root signatures share one descriptor-table builder: a
 CBV/SRV/UAV table and a sampler table, each in layout entry order. They
-differ only in inline values, which are raw UAV buffers in compute and root
-constants in graphics. Dispatches and draws write storage buffers, images
+differ only in inline values, which are read storage buffers in compute and
+root constants in graphics.
+
+A storage buffer whose layout access has no write is a raw SRV
+(`ByteAddressBuffer`, a `t` register); only written ones are raw UAVs. Reads
+then need no UAV state, so a buffer one dispatch writes and the next reads
+takes an ordinary state transition, and an encoder's transient values can be
+read in place from upload staging, which cannot be a UAV. The compiler matches
+the layout access: VernonToGPU records each texture's and storage argument's
+access (`vernon.resource_access`; by-value storage is `read`), and since the
+generic SPIR-V ABI lowering builds globals without argument attributes, the
+read bindings ride on the entry function until a pass after that lowering
+gives their globals a block type whose members are `NonWritable`, as glslang
+emits `readonly` blocks. A `NonWritable` variable decoration is not enough:
+the lowering shares one block type between equal leaves, and a Vulkan driver
+then served stale reads of the leaves a kernel wrote. Graphics storage reads
+are `NonWritable` blocks too. Dispatches and draws write storage buffers, images
 and samplers through one descriptor writer, so both report the same errors.
 A dispatch or draw that reuses the descriptors an earlier one of its binding
 set wrote in the same encoder still transitions every resource, because a
@@ -695,6 +721,13 @@ is bound to the thread that owns its context; other backends advertise
 concurrent submission instead. A submission inserts a fence sync, which
 completion polls and waits on; GL itself orders later commands after it and
 defers deleting objects that pending commands use.
+
+The spilled uniform bytes of a transient binding group go to its encoder's
+transient memory (`binding_groups.md` section 8) rather than a buffer per
+group. A persistent group still uploads into a buffer of its own, made once
+with the group. Every draw uses one vertex array per adapter, made
+when the first graphics pipeline is prepared, so invocations create no GL
+objects of their own.
 
 GL reports invalid transfers only through `glGetError`, leaving the
 destination untouched, so image uploads and downloads run inside an error
@@ -949,6 +982,17 @@ the published revision unchanged. Unchanged canonical bindings are recognized
 without allocation or provider mutation. Providers expose creation and
 destruction only; in-place binding mutation is not part of the provider
 contract.
+
+A provider with `VERNON_RUNTIME_PROVIDER_PARTIAL_BINDING_SETS` accepts binding
+sets that cover part of a layout (`vernonRuntimeCoreCreateBindingSubset`) and
+draws that compose several of them through `partial_bindings`. Composition,
+not a provider-side merge, is the contract because immutable sets must stay
+shareable between draws and pipelines of one layout; RuntimeCore checks that
+the composed sets cover every slot once before the provider sees the draw.
+Recorded draws use it to bind a sealed set's native state once
+([`../program/recorded_draws.md`](../program/recorded_draws.md) section 13).
+Only OpenGL implements it; set-based backends map it onto per-group
+descriptor sets with the group partitions of the compiler cut.
 
 Backend and built-in provider implementation boundaries return allocation-free
 `Result` errors. Public C ABI and provider-vtable callbacks are the only layers

@@ -131,6 +131,10 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
 }
 
 void DeviceState::shutdown() {
+    for (auto &[native, arena] : recordingTransients)
+        transientPool.retire(arena);
+    recordingTransients.clear();
+    transientPool.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
     queue = nil;
     device = nil;
     maxComputeInvocations = 0;
@@ -946,6 +950,7 @@ bool DeviceState::completeCommands(uint64_t native, std::string &error) {
     const bool succeeded = commandBuffer.status == MTLCommandBufferStatusCompleted;
     if (!succeeded)
         setCommandError(error, commandBuffer, "Metal command buffer failed");
+    retireTransients(native);
     CFBridgingRelease(reinterpret_cast<void *>(native));
     return succeeded;
 }
@@ -953,8 +958,41 @@ bool DeviceState::completeCommands(uint64_t native, std::string &error) {
 void DeviceState::abandonCommands(uint64_t native) {
     if (!native)
         return;
+    retireTransients(native);
     id<MTLCommandBuffer> commandBuffer = CFBridgingRelease(reinterpret_cast<void *>(native));
     (void)commandBuffer;
+}
+
+// Runs once the recording's command buffer has completed or will never be committed, so nothing reads its chunks, and
+// before the command buffer is released, whose address may then key a new recording.
+void DeviceState::retireTransients(uint64_t native) {
+    const auto found = recordingTransients.find(native);
+    if (found == recordingTransients.end())
+        return;
+    transientPool.retire(found->second);
+    recordingTransients.erase(found);
+}
+
+bool DeviceState::reserveTransient(uint64_t native, size_t size, size_t alignment, id<MTLBuffer> &buffer,
+                                   size_t &offset, std::string &error) {
+    if (!native || !size || !alignment || (alignment & (alignment - 1)) != 0) {
+        error = "Metal transient reservation arguments are invalid";
+        return false;
+    }
+    StagingArena<TransientChunk> &arena = recordingTransients[native];
+    TransientChunk *chunk =
+        transientPool.acquire(arena, size, alignment, offset, [&](size_t capacity, TransientChunk &created) {
+            created.buffer = [device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+            created.capacity = capacity;
+            transientChunkCreations += created.buffer != nil;
+            return created.buffer != nil;
+        });
+    if (!chunk) {
+        error = "Metal transient chunk allocation failed";
+        return false;
+    }
+    buffer = chunk->buffer;
+    return true;
 }
 
 } // namespace vernon::rhi::metal

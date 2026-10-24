@@ -143,6 +143,19 @@ struct CommandPoll {
     bool succeeded{};
 };
 
+// Where a recording's transient bytes were written: the backend's native buffer (a VkBuffer, an ID3D12Resource, an
+// OpenGL buffer name) and the byte offset in it.
+struct CommandTransient {
+    uint64_t buffer{};
+    uint64_t offset{};
+};
+
+// Transient memory the host fills in place, at `mapped`, before the encoder is submitted.
+struct CommandTransientReservation {
+    CommandTransient transient;
+    void *mapped{};
+};
+
 struct ImageResourceDescription {
     VernonRhiImageDescriptor image{};
 };
@@ -180,6 +193,17 @@ using RecordBufferCopyCallback = Result<void, RhiError> (*)(VernonRhiDevice, uin
 using RecordImageCopyCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t, uint64_t, VernonRhiImage,
                                                            VernonRhiImage, const VernonRhiImageCopyRegion *,
                                                            size_t) noexcept;
+// Copies `size` bytes into memory that the recording of encoder `encoderKey` owns until the encoder completes or is
+// abandoned, at an offset that is a multiple of `alignment`, a power of two. The memory backs uniform and storage
+// buffer bindings of the recording's commands. It runs outside the encoder's lock, so it may call encoder services.
+using WriteTransientCallback = Result<CommandTransient, RhiError> (*)(VernonRhiDevice, uint64_t encoderKey,
+                                                                      uint64_t native, const void *data, uint64_t size,
+                                                                      uint64_t alignment) noexcept;
+// Reserves memory of the kind WriteTransientCallback writes, with the same lifetime and alignment, without copying into
+// it. Only backends whose transient memory is host-visible provide it.
+using ReserveTransientCallback = Result<CommandTransientReservation, RhiError> (*)(VernonRhiDevice, uint64_t encoderKey,
+                                                                                   uint64_t native, uint64_t size,
+                                                                                   uint64_t alignment) noexcept;
 // Opens the native scope of `scope` on the encoder, applying its load operations, after making `reads` readable by
 // shaders. Attachments and reads are retained and transitioned through the encoder, so a failure leaves rollbacks that
 // restore their state.
@@ -292,6 +316,8 @@ struct BackendDispatch {
     Option<RecordBarriersCallback> recordBarriers;
     Option<RecordBufferCopyCallback> recordBufferCopy;
     Option<RecordImageCopyCallback> recordImageCopy;
+    Option<WriteTransientCallback> writeTransient;
+    Option<ReserveTransientCallback> reserveTransient;
     Option<BeginRenderingCallback> beginRendering;
     Option<EndRenderingCallback> endRendering;
     Option<ClearColorCallback> clearColor;

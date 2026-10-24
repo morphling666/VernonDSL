@@ -2151,6 +2151,57 @@ vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::commandEncoderNative(Ver
     return Result<uint64_t, RhiError>{ok(slot->native)};
 }
 
+namespace {
+
+// Runs `place(native)` for the recording of encoder `key` outside its lock, marking the encoder busy meanwhile and
+// failed when `place` fails.
+template <typename Placed, typename Place>
+vernon::Result<Placed, vernon::RhiError> placeCommandTransient(VernonRhiDevice device, uint64_t key, uint64_t size,
+                                                               uint64_t alignment, const char *operation,
+                                                               Place &&place) noexcept {
+    using vernon::err;
+    using vernon::RhiError;
+    using vernon::RhiErrorCode;
+    using Result = vernon::Result<Placed, RhiError>;
+    auto slot = lookupKey(device, key);
+    if (!slot || !size || !alignment || (alignment & (alignment - 1)) != 0)
+        return Result{err(RhiError{RhiErrorCode::InvalidArgument, {operation, key, 0}})};
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->finished || slot->failed)
+            return Result{err(RhiError{RhiErrorCode::LifecycleFailure, {operation, key, 0}})};
+        slot->busy = true;
+        native = slot->native;
+    }
+    Result placed = place(native);
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    slot->busy = false;
+    if (placed.isErr())
+        slot->failed = true;
+    return placed;
+}
+
+} // namespace
+
+vernon::Result<vernon::rhi::CommandTransient, vernon::RhiError>
+vernon::rhi::writeCommandTransient(VernonRhiDevice device, uint64_t key, const void *data, uint64_t size,
+                                   uint64_t alignment) noexcept {
+    if (!data)
+        return Result<CommandTransient, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_command_transient", key, 0}})};
+    return placeCommandTransient<CommandTransient>(
+        device, key, size, alignment, "write_command_transient",
+        [&](uint64_t native) { return writeRecordingTransient(device, key, native, data, size, alignment); });
+}
+
+vernon::Result<vernon::rhi::CommandTransientReservation, vernon::RhiError>
+vernon::rhi::reserveCommandTransient(VernonRhiDevice device, uint64_t key, uint64_t size, uint64_t alignment) noexcept {
+    return placeCommandTransient<CommandTransientReservation>(
+        device, key, size, alignment, "reserve_command_transient",
+        [&](uint64_t native) { return reserveRecordingTransient(device, key, native, size, alignment); });
+}
+
 vernon::Result<bool, vernon::RhiError> vernon::rhi::commandEncoderRendering(VernonRhiDevice device,
                                                                             uint64_t key) noexcept {
     auto slot = lookupKey(device, key);

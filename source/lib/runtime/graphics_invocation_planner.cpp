@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <optional>
+#include <map>
 
 namespace vernon::runtime {
 namespace {
@@ -30,13 +30,7 @@ bool validTensor(const VernonTensorView &tensor) {
            tensor.byte_size <= tensor.resource.size;
 }
 
-uint32_t shaderStage(const ParameterUse &use) {
-    if (use.stage == "vertex")
-        return PLANNED_STAGE_VERTEX;
-    if (use.stage == "fragment")
-        return PLANNED_STAGE_FRAGMENT;
-    return 0;
-}
+bool shaderStage(const ParameterUse &use) { return use.stage == "vertex" || use.stage == "fragment"; }
 
 bool fail(std::string &error, const char *message) {
     error = message;
@@ -45,24 +39,24 @@ bool fail(std::string &error, const char *message) {
 
 } // namespace
 
-bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t colorCount, bool hasDepth,
-                       bool hasStencil, PlannedGraphicsState &state, std::string &error) {
+bool planGraphicsState(const VernonGraphicsState *graphicsState, size_t colorCount, bool hasDepth, bool hasStencil,
+                       PlannedGraphicsState &state, std::string &error) {
     state = {};
     state.depthStencil.depth_test = hasDepth;
     state.depthStencil.depth_write = hasDepth;
     state.depthStencil.depth_compare = VERNON_RHI_COMPARE_LESS;
     state.depthStencil.stencil_read_mask = 0xff;
     state.depthStencil.stencil_write_mask = 0xff;
-    if (invocation.dynamic_state && invocation.dynamic_state->struct_size < sizeof(VernonDynamicState))
-        return fail(error, "DynamicState control metadata is incomplete");
-    state.stencilReference = invocation.dynamic_state ? invocation.dynamic_state->stencil_reference : 0;
     state.colorBlends.resize(colorCount);
     for (auto &blend : state.colorBlends)
         blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
-    if (invocation.graphics_state) {
-        const VernonGraphicsState &source = *invocation.graphics_state;
+    if (graphicsState) {
+        const VernonGraphicsState &source = *graphicsState;
         if (source.struct_size < sizeof(source))
             return fail(error, "graphics state metadata is incomplete");
+        if (source.topology > VERNON_TOPOLOGY_POINT_LIST)
+            return fail(error, "graphics pipeline topology is invalid");
+        state.topology = source.topology;
         if (source.color_blend_count != colorCount || (colorCount && !source.color_blends))
             return fail(error, "graphics state color blend count does not match the color attachment count");
         state.rasterization = source.rasterization;
@@ -87,7 +81,7 @@ bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t
         state.depthStencil.depth_write > 1 || state.depthStencil.depth_compare > VERNON_RHI_COMPARE_ALWAYS ||
         state.depthStencil.stencil_test > 1 || !validFace(state.depthStencil.front) ||
         !validFace(state.depthStencil.back) || state.depthStencil.stencil_read_mask > 0xff ||
-        state.depthStencil.stencil_write_mask > 0xff || state.stencilReference > 0xff)
+        state.depthStencil.stencil_write_mask > 0xff)
         return fail(error, "graphics state contains an invalid or unsupported value");
     for (const auto &blend : state.colorBlends)
         if (blend.blend_enabled > 1 || blend.source_color_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
@@ -252,199 +246,197 @@ bool planRenderTargets(const VernonRenderPass *source, DescribeImageResource des
     return true;
 }
 
-bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &source,
-                            DescribeImageResource describeImage, void *describeImageUserData,
-                            PlannedGraphicsInvocation &plan, std::string &error) {
-    plan = {};
-    for (size_t index = 0; index < source.argument_count; ++index)
-        if (!plan.arguments.emplace(source.arguments[index].slot, &source.arguments[index]).second)
-            return fail(error, "duplicate pipeline argument slot");
-    if (plan.arguments.size() != stagePlan.parameters.size())
-        return fail(error, "pipeline argument count does not match layout");
-
-    for (const Parameter &parameter : stagePlan.parameters) {
-        const auto found = plan.arguments.find(parameter.slot);
-        if (found == plan.arguments.end()) {
-            error = "graphics pipeline argument '" + parameter.name + "' is missing at slot " +
-                    std::to_string(parameter.slot);
-            return false;
-        }
-        if (!kindMatches(parameter, *found->second)) {
-            error = "graphics pipeline argument '" + parameter.name + "' expects " + parameter.kind +
-                    " but received kind " + std::to_string(found->second->kind);
-            return false;
-        }
-        const VernonProgramArgument &argument = *found->second;
-        if (argument.kind == VERNON_PROGRAM_TENSOR) {
-            const ValueLayout &expectedLayout = parameter.tensorArgument == TensorRepresentation::WholeValue
-                                                    ? *parameter.valueLayout
-                                                    : parameter.elementLayout;
-            if (!valueLayoutsEqual(argument.tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
-                !validTensor(argument.tensor))
-                return fail(error, "pipeline Tensor argument does not match layout");
-            if (parameter.source != StageParameterSource::Direct &&
-                parameter.tensorArgument != TensorRepresentation::WholeValue) {
-                const bool allowLeading =
-                    std::any_of(parameter.uses.begin(), parameter.uses.end(),
-                                [](const ParameterUse &use) { return use.interfaceKind == "input"; });
-                const size_t offset = allowLeading && argument.tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
-                if (argument.tensor.rank != parameter.shape.size() + offset) {
-                    error = "pipeline Tensor '" + parameter.name + "' rank " + std::to_string(argument.tensor.rank) +
-                            " does not match layout rank " + std::to_string(parameter.shape.size());
-                    return false;
-                }
-                for (size_t dimension = 0; dimension < parameter.shape.size(); ++dimension)
-                    if (parameter.shape[dimension] &&
-                        parameter.shape[dimension] != argument.tensor.shape[dimension + offset])
-                        return fail(error, "pipeline Tensor shape does not match layout");
-            }
-        } else if (argument.kind == VERNON_PROGRAM_IMAGE) {
-            if (!argument.image.view.identity || !argument.image.view.resource.value)
-                return fail(error, "pipeline image argument does not match layout");
-        } else if (!argument.resource.identity || !argument.resource.resource.value) {
-            return fail(error, "pipeline sampler belongs to another runtime");
-        }
-    }
-
-    if (stagePlan.vertex.empty())
-        return true;
-
-    if (!source.graphics_state || source.graphics_state->struct_size < sizeof(VernonGraphicsState))
-        return fail(error, "graphics pipeline state is missing or incomplete");
-    if (!source.render_pass || source.render_pass->struct_size < sizeof(VernonRenderPass))
-        return fail(error, "RenderPass control is missing or incomplete");
-    if (!source.draw_command || source.draw_command->struct_size < sizeof(VernonDrawCommand))
-        return fail(error, "DrawCommand control is missing or incomplete");
-    if (source.dynamic_state && source.dynamic_state->struct_size < sizeof(VernonDynamicState))
-        return fail(error, "DynamicState control metadata is incomplete");
-    const VernonGraphicsState &graphicsState = *source.graphics_state;
-    const VernonRenderPass &renderPass = *source.render_pass;
-    const VernonDrawCommand &draw = *source.draw_command;
-    if (graphicsState.topology > VERNON_TOPOLOGY_POINT_LIST)
-        return fail(error, "graphics pipeline topology is invalid");
-    plan.topology = graphicsState.topology;
-    if (!planRenderTargets(source.render_pass, describeImage, describeImageUserData, plan, error))
-        return false;
-    const uint32_t *dynamicViewport = source.dynamic_state ? source.dynamic_state->viewport : nullptr;
-    const uint32_t *dynamicScissor = source.dynamic_state ? source.dynamic_state->scissor : nullptr;
-    const bool hasViewport = dynamicViewport && dynamicViewport[2] && dynamicViewport[3];
-    const uint32_t *viewport = hasViewport ? dynamicViewport : renderPass.render_area;
-    plan.viewport[0] = viewport[0];
-    plan.viewport[1] = viewport[1];
-    plan.viewport[2] = viewport[2] ? viewport[2] : plan.attachmentWidth;
-    plan.viewport[3] = viewport[3] ? viewport[3] : plan.attachmentHeight;
-    const bool hasScissor = dynamicScissor && dynamicScissor[2] && dynamicScissor[3];
-    for (size_t index = 0; index < 4; ++index)
-        plan.scissor[index] = hasScissor ? dynamicScissor[index] : plan.viewport[index];
-    plan.resolution = {static_cast<float>(plan.viewport[2]), static_cast<float>(plan.viewport[3])};
-    plan.vertexCount = draw.vertex_count;
-    plan.instanceCount = draw.instance_count;
-    plan.firstInstance = draw.first_instance;
-
-    std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampled;
-    for (const Parameter &parameter : stagePlan.parameters) {
-        const VernonProgramArgument &argument = *plan.arguments.at(parameter.slot);
+bool buildGraphicsDrawLayout(const StageBindingPlan &stagePlan, GraphicsDrawLayout &layout, std::string &error) {
+    layout = {};
+    struct Descriptor {
+        uint32_t image{UINT32_MAX};
+        uint32_t sampler{UINT32_MAX};
+        bool implicitSampler{};
+    };
+    std::map<std::pair<uint32_t, uint32_t>, Descriptor> descriptors;
+    const auto share = [&](uint32_t &bound, uint32_t parameter) {
+        if (bound != UINT32_MAX && bound != parameter)
+            layout.sharedDescriptors.emplace_back(bound, parameter);
+        bound = parameter;
+    };
+    for (uint32_t index = 0; index < stagePlan.parameters.size(); ++index) {
+        const Parameter &parameter = stagePlan.parameters[index];
         for (const ParameterUse &use : parameter.uses) {
-            const uint32_t stage = shaderStage(use);
-            if (!stage)
+            if (!shaderStage(use))
                 continue;
-            if (argument.kind == VERNON_PROGRAM_IMAGE) {
+            if (parameter.kind == "image") {
                 if (use.binding == UINT32_MAX)
                     return fail(error, "sampled image is missing set/binding");
-                PlannedSampledResource &resource = sampled[{use.descriptorSet, use.binding}];
-                if (resource.imageView.resource.value &&
-                    resource.imageView.resource.value != argument.image.view.resource.value)
-                    return fail(error, "sampled image binding is ambiguous");
-                resource.imageView = argument.image.view;
-                resource.stages |= stage;
+                share(descriptors[{use.descriptorSet, use.binding}].image, index);
+                if (std::find(layout.sampledImages.begin(), layout.sampledImages.end(), index) ==
+                    layout.sampledImages.end())
+                    layout.sampledImages.push_back(index);
                 continue;
             }
-            if (argument.kind == VERNON_PROGRAM_SAMPLER) {
-                for (const SampledImageBinding &binding : use.sampledImageBindings) {
-                    PlannedSampledResource &resource = sampled[{binding.descriptorSet, binding.binding}];
-                    if (resource.explicitSampler &&
-                        resource.samplerResource.resource.value != argument.resource.resource.value)
-                        return fail(error, "sampler pairing is ambiguous");
-                    resource.samplerResource = argument.resource;
-                    resource.explicitSampler = true;
-                    resource.stages |= stage;
-                }
+            if (parameter.kind == "sampler") {
+                for (const SampledImageBinding &binding : use.sampledImageBindings)
+                    share(descriptors[{binding.descriptorSet, binding.binding}].sampler, index);
                 continue;
             }
             if (use.interfaceKind != "input")
                 continue;
-            const VernonTensorView &tensor = argument.tensor;
-            if (argument.kind != VERNON_PROGRAM_TENSOR || tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
-                !tensor.resource.resource.value || !tensor.rank || !tensor.shape || !tensor.byte_strides ||
-                use.location == UINT32_MAX || use.attributeLeaves.empty())
+            if (parameter.kind != "tensor" || use.location == UINT32_MAX || use.attributeLeaves.empty())
                 return fail(error, "graphics Tensor view is invalid");
             for (const AttributeLeaf &leaf : use.attributeLeaves)
                 if (leaf.dtype != "i32" && leaf.dtype != "u32" && leaf.dtype != "f16" && leaf.dtype != "f32" &&
                     leaf.dtype != "f64")
                     return fail(error, "graphics Tensor dtype is unsupported");
-            for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
-                if (tensor.byte_strides[dimension] <= 0)
-                    return fail(error, "graphics Tensor strides must be positive");
-            if (tensor.shape[0] > std::numeric_limits<uint32_t>::max())
-                return fail(error, "graphics Tensor leading dimension is too large");
-            const uint32_t leading = static_cast<uint32_t>(tensor.shape[0]);
-            const bool instanced = use.divisor != 0;
-            uint32_t &inferred = instanced ? plan.instanceCount : plan.vertexCount;
-            const uint32_t divisor = instanced ? std::max(use.divisor, 1u) : 1u;
-            const uint64_t base = instanced ? plan.firstInstance : 0;
-            if (inferred) {
-                const uint64_t requiredRecords = (base + inferred - 1) / divisor + 1;
-                if (base ? requiredRecords > leading : requiredRecords != leading)
-                    return fail(error, "graphics Tensor leading dimensions conflict");
-            } else {
-                const uint64_t records = static_cast<uint64_t>(leading) * divisor;
-                if (records < base || records - base > std::numeric_limits<uint32_t>::max())
-                    return fail(error, "graphics inferred draw count is out of range");
-                inferred = static_cast<uint32_t>(records - base);
-            }
-            uint64_t expectedStride = tensor.element_layout.byte_size;
-            for (uint32_t dimension = tensor.rank; dimension-- > 1;) {
-                if (tensor.byte_strides[dimension] != static_cast<int64_t>(expectedStride))
-                    return fail(error, "graphics Tensor inner dimensions must be contiguous row-major");
-                if (tensor.shape[dimension] > std::numeric_limits<uint64_t>::max() / expectedStride)
-                    return fail(error, "graphics Tensor shape is too large");
-                expectedStride *= tensor.shape[dimension];
-            }
-            if (static_cast<uint64_t>(tensor.byte_strides[0]) < expectedStride)
-                return fail(error, "graphics Tensor record stride is too small");
-            plan.vertexInputs.push_back({&use, &tensor, instanced});
+            layout.vertexInputs.push_back({index, use.divisor});
         }
     }
-
     for (const Parameter &parameter : stagePlan.runtimeParameters) {
         if (parameter.source != StageParameterSource::ImplicitSampler)
             continue;
         for (const ParameterUse &use : parameter.uses) {
-            const uint32_t stage = shaderStage(use);
-            if (!stage)
+            if (!shaderStage(use))
                 continue;
             for (const SampledImageBinding &binding : use.sampledImageBindings) {
-                PlannedSampledResource &resource = sampled[{binding.descriptorSet, binding.binding}];
-                if (resource.explicitSampler)
+                Descriptor &descriptor = descriptors[{binding.descriptorSet, binding.binding}];
+                if (descriptor.sampler != UINT32_MAX)
                     return fail(error, "implicit and explicit samplers conflict");
-                resource.implicitSampler = true;
-                resource.stages |= stage;
+                descriptor.implicitSampler = true;
             }
         }
     }
-    for (auto &[binding, resource] : sampled) {
-        if (!resource.imageView.resource.value ||
-            (!resource.samplerResource.resource.value && !resource.implicitSampler))
+    for (const auto &[binding, descriptor] : descriptors)
+        if (descriptor.image == UINT32_MAX || (descriptor.sampler == UINT32_MAX && !descriptor.implicitSampler))
             return fail(error, "sampled image requires paired image view and sampler");
+    return true;
+}
+
+bool planGraphicsArgument(const StageBindingPlan &stagePlan, const GraphicsDrawLayout &layout, uint32_t index,
+                          const VernonProgramArgument &argument, DescribeImageResource describeImage,
+                          void *describeImageUserData, PlannedGraphicsArgument &planned, std::string &error) {
+    planned = {};
+    const Parameter &parameter = stagePlan.parameters[index];
+    if (!kindMatches(parameter, argument)) {
+        error = "graphics pipeline argument '" + parameter.name + "' expects " + parameter.kind +
+                " but received kind " + std::to_string(argument.kind);
+        return false;
+    }
+    if (argument.kind == VERNON_PROGRAM_IMAGE) {
+        if (!argument.image.view.identity || !argument.image.view.resource.value)
+            return fail(error, "pipeline image argument does not match layout");
+        if (std::find(layout.sampledImages.begin(), layout.sampledImages.end(), index) == layout.sampledImages.end())
+            return true;
+        if (!describeImage)
+            return fail(error, "graphics image descriptor resolver is missing");
         VernonRuntimeProviderImageDescription description{};
         description.struct_size = sizeof(description);
-        if (describeImage(describeImageUserData, resource.imageView, &description) != VERNON_STATUS_OK ||
+        if (describeImage(describeImageUserData, argument.image.view, &description) != VERNON_STATUS_OK ||
             !providerImageDescriptionIsCanonical(description) || !(description.image.usage & VERNON_IMAGE_SAMPLED))
             return fail(error, "sampled image is stale or lacks sampled usage");
-        resource.subresources = providerImageSubresources(description);
-        plan.sampledResources.emplace(binding, resource);
+        planned.subresources = providerImageSubresources(description);
+        return true;
     }
+    if (argument.kind == VERNON_PROGRAM_SAMPLER) {
+        if (!argument.resource.identity || !argument.resource.resource.value)
+            return fail(error, "pipeline sampler belongs to another runtime");
+        return true;
+    }
+    const VernonTensorView &tensor = argument.tensor;
+    const ValueLayout &expectedLayout =
+        parameter.tensorArgument == TensorRepresentation::WholeValue ? *parameter.valueLayout : parameter.elementLayout;
+    if (!valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)) || !validTensor(tensor))
+        return fail(error, "pipeline Tensor argument does not match layout");
+    if (parameter.source != StageParameterSource::Direct &&
+        parameter.tensorArgument != TensorRepresentation::WholeValue) {
+        const bool allowLeading = std::any_of(parameter.uses.begin(), parameter.uses.end(),
+                                              [](const ParameterUse &use) { return use.interfaceKind == "input"; });
+        const size_t offset = allowLeading && tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
+        if (tensor.rank != parameter.shape.size() + offset) {
+            error = "pipeline Tensor '" + parameter.name + "' rank " + std::to_string(tensor.rank) +
+                    " does not match layout rank " + std::to_string(parameter.shape.size());
+            return false;
+        }
+        for (size_t dimension = 0; dimension < parameter.shape.size(); ++dimension)
+            if (parameter.shape[dimension] && parameter.shape[dimension] != tensor.shape[dimension + offset])
+                return fail(error, "pipeline Tensor shape does not match layout");
+    }
+    if (std::none_of(layout.vertexInputs.begin(), layout.vertexInputs.end(),
+                     [&](const GraphicsDrawLayout::VertexInput &input) { return input.parameter == index; }))
+        return true;
+    if (tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !tensor.resource.resource.value || !tensor.rank ||
+        !tensor.shape || !tensor.byte_strides)
+        return fail(error, "graphics Tensor view is invalid");
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
+        if (tensor.byte_strides[dimension] <= 0)
+            return fail(error, "graphics Tensor strides must be positive");
+    if (tensor.shape[0] > std::numeric_limits<uint32_t>::max())
+        return fail(error, "graphics Tensor leading dimension is too large");
+    uint64_t expectedStride = tensor.element_layout.byte_size;
+    for (uint32_t dimension = tensor.rank; dimension-- > 1;) {
+        if (tensor.byte_strides[dimension] != static_cast<int64_t>(expectedStride))
+            return fail(error, "graphics Tensor inner dimensions must be contiguous row-major");
+        if (tensor.shape[dimension] > std::numeric_limits<uint64_t>::max() / expectedStride)
+            return fail(error, "graphics Tensor shape is too large");
+        expectedStride *= tensor.shape[dimension];
+    }
+    if (static_cast<uint64_t>(tensor.byte_strides[0]) < expectedStride)
+        return fail(error, "graphics Tensor record stride is too small");
+    if (static_cast<uint64_t>(tensor.byte_strides[0]) > std::numeric_limits<uint32_t>::max() ||
+        tensor.byte_offset >= tensor.resource.size)
+        return fail(error, "graphics vertex argument is missing or invalid");
+    return true;
+}
 
+bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgument *const *arguments,
+                      const PlannedRenderTargets &targets, const VernonRenderPass &renderPass,
+                      const VernonDynamicState *dynamicState, const VernonDrawCommand &draw, PlannedGraphicsDraw &plan,
+                      std::string &error) {
+    plan = {};
+    if (draw.struct_size < sizeof(VernonDrawCommand))
+        return fail(error, "DrawCommand control is missing or incomplete");
+    if (dynamicState && dynamicState->struct_size < sizeof(VernonDynamicState))
+        return fail(error, "DynamicState control metadata is incomplete");
+    for (const auto &[first, second] : layout.sharedDescriptors) {
+        const VernonProgramArgument &left = *arguments[first];
+        const VernonProgramArgument &right = *arguments[second];
+        const bool image = left.kind == VERNON_PROGRAM_IMAGE;
+        if ((image ? left.image.view.resource.value : left.resource.resource.value) !=
+            (image ? right.image.view.resource.value : right.resource.resource.value))
+            return fail(error, image ? "sampled image binding is ambiguous" : "sampler pairing is ambiguous");
+    }
+    const uint32_t *dynamicViewport = dynamicState ? dynamicState->viewport : nullptr;
+    const uint32_t *dynamicScissor = dynamicState ? dynamicState->scissor : nullptr;
+    const bool hasViewport = dynamicViewport && dynamicViewport[2] && dynamicViewport[3];
+    const uint32_t *viewport = hasViewport ? dynamicViewport : renderPass.render_area;
+    plan.viewport[0] = viewport[0];
+    plan.viewport[1] = viewport[1];
+    plan.viewport[2] = viewport[2] ? viewport[2] : targets.attachmentWidth;
+    plan.viewport[3] = viewport[3] ? viewport[3] : targets.attachmentHeight;
+    const bool hasScissor = dynamicScissor && dynamicScissor[2] && dynamicScissor[3];
+    for (size_t index = 0; index < 4; ++index)
+        plan.scissor[index] = hasScissor ? dynamicScissor[index] : plan.viewport[index];
+    plan.resolution = {static_cast<float>(plan.viewport[2]), static_cast<float>(plan.viewport[3])};
+    plan.stencilReference = dynamicState ? dynamicState->stencil_reference : 0;
+    if (plan.stencilReference > 0xff)
+        return fail(error, "graphics state contains an invalid or unsupported value");
+    plan.vertexCount = draw.vertex_count;
+    plan.instanceCount = draw.instance_count;
+    plan.firstInstance = draw.first_instance;
+    for (const GraphicsDrawLayout::VertexInput &input : layout.vertexInputs) {
+        const uint32_t leading = static_cast<uint32_t>(arguments[input.parameter]->tensor.shape[0]);
+        const bool instanced = input.divisor != 0;
+        uint32_t &inferred = instanced ? plan.instanceCount : plan.vertexCount;
+        const uint32_t divisor = instanced ? input.divisor : 1u;
+        const uint64_t base = instanced ? plan.firstInstance : 0;
+        if (inferred) {
+            const uint64_t requiredRecords = (base + inferred - 1) / divisor + 1;
+            if (base ? requiredRecords > leading : requiredRecords != leading)
+                return fail(error, "graphics Tensor leading dimensions conflict");
+        } else {
+            const uint64_t records = static_cast<uint64_t>(leading) * divisor;
+            if (records < base || records - base > std::numeric_limits<uint32_t>::max())
+                return fail(error, "graphics inferred draw count is out of range");
+            inferred = static_cast<uint32_t>(records - base);
+        }
+    }
     if (!plan.instanceCount)
         plan.instanceCount = 1;
     if (!plan.vertexCount && !draw.index_binding)
@@ -457,6 +449,39 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
         plan.indexBinding = &index;
     }
     return true;
+}
+
+bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const GraphicsDrawLayout &layout,
+                            const VernonStageInvocationDescriptor &source, DescribeImageResource describeImage,
+                            void *describeImageUserData, PlannedGraphicsInvocation &plan, std::string &error) {
+    plan = {};
+    if (source.argument_count != stagePlan.parameters.size())
+        return fail(error, "pipeline argument count does not match layout");
+    plan.arguments.assign(stagePlan.parameters.size(), nullptr);
+    plan.planned.resize(stagePlan.parameters.size());
+    for (size_t index = 0; index < source.argument_count; ++index) {
+        const VernonProgramArgument &argument = source.arguments[index];
+        const auto parameter =
+            std::find_if(stagePlan.parameters.begin(), stagePlan.parameters.end(),
+                         [&](const Parameter &candidate) { return candidate.slot == argument.slot; });
+        if (parameter == stagePlan.parameters.end())
+            return fail(error, "pipeline argument count does not match layout");
+        const VernonProgramArgument *&bound = plan.arguments[parameter - stagePlan.parameters.begin()];
+        if (bound)
+            return fail(error, "duplicate pipeline argument slot");
+        bound = &argument;
+    }
+    for (uint32_t index = 0; index < stagePlan.parameters.size(); ++index)
+        if (!planGraphicsArgument(stagePlan, layout, index, *plan.arguments[index], describeImage,
+                                  describeImageUserData, plan.planned[index], error))
+            return false;
+    if (!source.graphics_state || source.graphics_state->struct_size < sizeof(VernonGraphicsState))
+        return fail(error, "graphics pipeline state is missing or incomplete");
+    if (!source.draw_command)
+        return fail(error, "DrawCommand control is missing or incomplete");
+    return planRenderTargets(source.render_pass, describeImage, describeImageUserData, plan.targets, error) &&
+           planGraphicsDraw(layout, plan.arguments.data(), plan.targets, *source.render_pass, source.dynamic_state,
+                            *source.draw_command, plan.draw, error);
 }
 
 } // namespace vernon::runtime

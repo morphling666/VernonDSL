@@ -48,16 +48,17 @@ BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, con
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
-                                          const VernonStageInvocationDescriptor &invocation,
-                                          const PlannedGraphicsInvocation &plan) {
+VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                          const GraphicsCommand &command, GraphicsStream &stream) {
     return invokeRhiGraphicsPipeline(*pipeline.context, openGLState(*pipeline.context).adapter, kOpenGLGraphics,
-                                     invocation, plan, runtimeBackendState<OpenGLPipelineState>(pipeline).rhiGraphics);
+                                     commands, command, stream,
+                                     runtimeBackendState<OpenGLPipelineState>(pipeline).rhiGraphics);
 }
 
-VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+                                         const ArgumentOwner *owners) {
     return invokeRhiComputePipeline(*pipeline.context, openGLState(*pipeline.context).adapter, kOpenGLCompute,
-                                    pipeline.bindingProjection, launch,
+                                    pipeline.bindingProjection, launch, owners,
                                     runtimeBackendState<OpenGLPipelineState>(pipeline).rhiCompute);
 }
 

@@ -18,6 +18,9 @@ struct MaterializedNodeFrame {
     };
 
     std::vector<VernonProgramArgument> arguments;
+    // Per argument, whether it is its Value's bound argument lowered by the plan alone, with no carrier, copy or
+    // dispatch-derived extent.
+    std::vector<char> borrowed;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<int64_t>> strides;
     std::vector<std::vector<uint8_t>> hostEndpointCarriers;

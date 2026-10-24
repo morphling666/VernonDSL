@@ -351,10 +351,12 @@ void DeviceState::shutdown() {
     if (device) {
         for (StagingPool<StagingChunk> *pool : {&uploadStaging, &readbackStaging})
             pool->clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
-        for (VkDescriptorPool pool : descriptorPools)
-            api.destroyDescriptorPool(device, pool, nullptr);
+        for (const std::vector<VkDescriptorPool> *pools : {&descriptorPools, &freeFrameDescriptorPools})
+            for (VkDescriptorPool pool : *pools)
+                api.destroyDescriptorPool(device, pool, nullptr);
     }
     descriptorPools.clear();
+    freeFrameDescriptorPools.clear();
     currentDescriptorPool = 0;
     if (device && !nativeObjectsBorrowed && api.destroyDevice)
         api.destroyDevice(device, nullptr);
@@ -426,7 +428,7 @@ bool DeviceState::createCommandFrame(CommandFrame &frame, std::string &error) {
 
 void DeviceState::destroyCommandFrame(CommandFrame &frame) {
     Driver &api = driver();
-    retireStaging(frame);
+    retireFrameMemory(frame.upload, frame.readback, frame.descriptorPools);
     if (frame.fence && api.destroyFence)
         api.destroyFence(device, frame.fence, nullptr);
     if (frame.pool && api.destroyCommandPool)
@@ -437,7 +439,7 @@ void DeviceState::destroyCommandFrame(CommandFrame &frame) {
 void DeviceState::recycleCommandFrame(CommandFrame frame) {
     frame.serial = 0;
     frame.imageLayouts.clear();
-    retireStaging(frame);
+    retireFrameMemory(frame.upload, frame.readback, frame.descriptorPools);
     availableCommandFrames.push_back(std::move(frame));
 }
 
@@ -548,9 +550,16 @@ void DeviceState::commitImageLayouts(CommandFrame &frame) {
     frame.imageLayouts.clear();
 }
 
-void DeviceState::retireStaging(CommandFrame &frame) {
-    uploadStaging.retire(frame.upload);
-    readbackStaging.retire(frame.readback);
+void DeviceState::retireFrameMemory(StagingArena<StagingChunk> &upload, StagingArena<StagingChunk> &readback,
+                                    std::vector<VkDescriptorPool> &pools) {
+    uploadStaging.retire(upload);
+    readbackStaging.retire(readback);
+    freeFrameDescriptorPools.reserve(freeFrameDescriptorPools.size() + pools.size());
+    for (VkDescriptorPool pool : pools) {
+        (void)driver().resetDescriptorPool(device, pool, 0);
+        freeFrameDescriptorPools.push_back(pool);
+    }
+    pools.clear();
 }
 
 namespace {
@@ -616,8 +625,9 @@ bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std:
             return false;
         commitImageLayouts(borrowedCommandFrame);
         serial = ++borrowedSubmissions;
-        borrowedStaging.push_back(
-            {serial, std::exchange(borrowedCommandFrame.upload, {}), std::exchange(borrowedCommandFrame.readback, {})});
+        borrowedStaging.push_back({serial, std::exchange(borrowedCommandFrame.upload, {}),
+                                   std::exchange(borrowedCommandFrame.readback, {}),
+                                   std::exchange(borrowedCommandFrame.descriptorPools, {})});
         return true;
     }
     Driver &api = driver();
@@ -697,8 +707,8 @@ bool DeviceState::pollSerial(uint64_t serial, bool &completed, std::string &erro
 
 void DeviceState::retireBorrowedCommands(uint64_t serial) {
     while (!borrowedStaging.empty() && borrowedStaging.front().serial <= serial) {
-        uploadStaging.retire(borrowedStaging.front().upload);
-        readbackStaging.retire(borrowedStaging.front().readback);
+        BorrowedStaging &front = borrowedStaging.front();
+        retireFrameMemory(front.upload, front.readback, front.descriptorPools);
         borrowedStaging.pop_front();
     }
 }
@@ -890,7 +900,9 @@ bool DeviceState::acquireStaging(VkCommandBuffer command, bool upload, VkDeviceS
 bool DeviceState::createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error) {
     chunk.capacity = capacity;
     if (!createBuffer(chunk.buffer, capacity,
-                      upload ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      upload ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                             : VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, error,
                       upload ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
         return false;
@@ -904,9 +916,8 @@ bool DeviceState::createStagingChunk(bool upload, VkDeviceSize capacity, Staging
     return true;
 }
 
-bool DeviceState::createDescriptorPool(std::string &error) {
-    // Each pool doubles the last, up to 16 times the first, so many live binding sets need few pools.
-    const uint32_t scale = uint32_t{1} << (std::min)(descriptorPools.size(), size_t{4});
+bool DeviceState::createDescriptorPool(VkDescriptorPoolCreateFlags flags, uint32_t scale, VkDescriptorPool &pool,
+                                       std::string &error) {
     const VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024 * scale},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256 * scale},
@@ -915,17 +926,43 @@ bool DeviceState::createDescriptorPool(std::string &error) {
         {VK_DESCRIPTOR_TYPE_SAMPLER, 256 * scale},
     };
     VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    info.flags = flags;
     info.maxSets = 256 * scale;
     info.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
     info.pPoolSizes = sizes;
-    VkDescriptorPool pool{};
     if (!check(driver().createDescriptorPool(device, &info, nullptr, &pool), "vkCreateDescriptorPool", error))
         return false;
-    descriptorPools.push_back(pool);
-    currentDescriptorPool = descriptorPools.size() - 1;
     ++descriptorPoolCreations;
     return true;
+}
+
+bool DeviceState::allocateFrameDescriptorSet(VkCommandBuffer command, VkDescriptorSetLayout layout,
+                                             VkDescriptorSet &set, std::string &error) {
+    CommandFrame *frame = recordingFrame(command);
+    if (!frame || !layout) {
+        error = "Vulkan frame descriptor sets require an active recording";
+        return false;
+    }
+    VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocation.descriptorSetCount = 1;
+    allocation.pSetLayouts = &layout;
+    if (!frame->descriptorPools.empty()) {
+        allocation.descriptorPool = frame->descriptorPools.back();
+        const VkResult result = driver().allocateDescriptorSets(device, &allocation, &set);
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)
+            return check(result, "vkAllocateDescriptorSets", error);
+    }
+    frame->descriptorPools.reserve(frame->descriptorPools.size() + 1);
+    VkDescriptorPool pool{};
+    if (!freeFrameDescriptorPools.empty()) {
+        pool = freeFrameDescriptorPools.back();
+        freeFrameDescriptorPools.pop_back();
+    } else if (!createDescriptorPool(0, 1, pool, error)) {
+        return false;
+    }
+    frame->descriptorPools.push_back(pool);
+    allocation.descriptorPool = pool;
+    return check(driver().allocateDescriptorSets(device, &allocation, &set), "vkAllocateDescriptorSets", error);
 }
 
 bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, DescriptorSet &set, std::string &error) {
@@ -951,12 +988,18 @@ bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, Descriptor
         if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)
             return check(result, "vkAllocateDescriptorSets", error);
     }
-    if (!createDescriptorPool(error))
+    descriptorPools.reserve(poolCount + 1);
+    VkDescriptorPool pool{};
+    // Each pool doubles the last, up to 16 times the first, so many live binding sets need few pools.
+    if (!createDescriptorPool(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                              uint32_t{1} << (std::min)(poolCount, size_t{4}), pool, error))
         return false;
-    allocation.descriptorPool = descriptorPools.back();
+    descriptorPools.push_back(pool);
+    currentDescriptorPool = poolCount;
+    allocation.descriptorPool = pool;
     if (!check(driver().allocateDescriptorSets(device, &allocation, &set.set), "vkAllocateDescriptorSets", error))
         return false;
-    set.pool = descriptorPools.back();
+    set.pool = pool;
     return true;
 }
 

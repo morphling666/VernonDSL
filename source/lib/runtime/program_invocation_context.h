@@ -15,6 +15,7 @@ class CanonicalProgramExecutionWorkspace;
 namespace vernon::runtime {
 
 struct RecordedGraphicsPasses;
+class InstanceGroups;
 
 struct ProgramInvocationContext {
     const program::InvocationSnapshot &bindings;
@@ -23,6 +24,8 @@ struct ProgramInvocationContext {
     ad::CanonicalProgramExecutionWorkspace *executionWorkspace{};
     // Validated recordings by graphics Node; the executor also writes their telemetry here.
     RecordedGraphicsPasses *recordedGraphics{};
+    // The instance's persistent groups, which its bindings in `bindings` decide.
+    InstanceGroups *groups{};
 };
 
 } // namespace vernon::runtime

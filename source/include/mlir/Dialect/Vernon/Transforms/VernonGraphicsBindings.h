@@ -29,9 +29,13 @@ inline constexpr llvm::StringLiteral kGeneratedBindingAttrName = "vernon.generat
 /// parameter path) that a flattened leaf or its implicit sampler belongs to.
 inline constexpr llvm::StringLiteral kBindingGroupAttrName = "vernon.binding_group";
 
-/// One generated set-0 binding request of a graphics entry. `argument` is
-/// empty for the entry's TensorView metadata carrier, which exists only after
-/// target preparation. `group` is the binding-group occurrence, or empty.
+/// Descriptor sets a graphics pipeline may use: set 0 for ungrouped bindings
+/// and one set per binding-group occurrence. Metal argument buffers bound it.
+inline constexpr uint32_t kGraphicsDescriptorSetLimit = 8;
+
+/// One generated binding request of a graphics entry. `argument` is empty for
+/// the entry's TensorView metadata carrier, which exists only after target
+/// preparation. `group` is the binding-group occurrence, or empty.
 struct GraphicsBindingRequest {
     std::string entry;
     std::optional<unsigned> argument;
@@ -56,33 +60,42 @@ struct GraphicsBindingRequests {
     std::vector<GraphicsAuthoredBinding> authored;
 };
 
-/// Set-0 bindings generated for graphics entry arguments. Reflection and SPIR-V
+/// Generated bindings of one request. Binding numbers are unique across every
+/// set of a pipeline, because OpenGL-family targets ignore the set.
+struct GraphicsBindingAssignment {
+    uint32_t set{};
+    SmallVector<uint32_t> bindings;
+};
+
+/// Bindings generated for graphics entry arguments. Reflection and SPIR-V
 /// lowering both read bindings from this plan; neither may assign its own.
 struct GraphicsBindingPlan {
     /// (entry symbol, argument index) -> generated bindings: one for a uniform
-    /// spilled to a buffer, a texture, or a sampler without an authored
-    /// binding; one per storage leaf for a TensorView; one for the TensorView
-    /// metadata carrier.
-    std::map<std::pair<std::string, unsigned>, SmallVector<uint32_t>> arguments;
+    /// spilled to a buffer (every by-value binding-group leaf spills), a
+    /// texture, or a sampler without an authored binding; one per storage leaf
+    /// for a TensorView; one for the TensorView metadata carrier.
+    std::map<std::pair<std::string, unsigned>, GraphicsBindingAssignment> arguments;
 
-    const SmallVector<uint32_t> *find(StringRef entry, unsigned argument) const;
+    const GraphicsBindingAssignment *find(StringRef entry, unsigned argument) const;
 };
 
 /// Per-entry generated bindings of one module of a linked pipeline, in the
 /// order of that module's requests.
 struct GraphicsBindingLayout {
-    std::vector<std::pair<GraphicsBindingRequest, SmallVector<uint32_t>>> assignments;
+    std::vector<std::pair<GraphicsBindingRequest, GraphicsBindingAssignment>> assignments;
 };
 
 FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp module);
 
-/// Assigns one set-0 layout to the modules of a pipeline, in module order.
+/// Assigns one layout to the modules of a pipeline, in module order.
 /// Authored bindings stay fixed and may be shared across modules only by
 /// endpoints with the same pipeline parameter name. A generated request reuses
 /// the bindings of an earlier module's request with the same parameter name,
 /// kind, type, and count; every other request takes the lowest free bindings.
-/// Each binding-group occurrence takes one consecutive range covering the
-/// union of its requests in every module, so both stages share it.
+/// Ungrouped requests are in set 0. Each binding-group occurrence takes set
+/// 1 + its first-appearance order across the modules, and one consecutive
+/// range covering the union of its requests in every module, so both stages
+/// share it.
 FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<GraphicsBindingRequests> modules,
                                                                    std::string &error);
 
@@ -91,7 +104,7 @@ void attachGraphicsBindingLayout(ModuleOp module, const GraphicsBindingLayout &l
 
 FailureOr<GraphicsBindingPlan> planGraphicsBindings(ModuleOp module);
 
-/// Writes planned set-0 bindings onto graphics texture and sampler arguments
+/// Writes planned bindings onto graphics texture and sampler arguments
 /// that have none, so code that reads authored bindings sees them. Run once
 /// per module before reflection and lowering.
 LogicalResult materializeGraphicsResourceBindings(ModuleOp module);

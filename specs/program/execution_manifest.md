@@ -2300,7 +2300,13 @@ physical ABI:
 - `endpoints` maps each compiled module interface/index to its portable
   endpoint and may include target locations such as descriptor set/binding,
   packed-frame offset, value transport, element layout, or sampled-image
-  bindings;
+  bindings, and the `access` the compiled module declares for a resource. That
+  access may be wider than the endpoint `access`, which is the logical access
+  a node binding must match: a `read_write` TensorView may carry a logical
+  read, and a tape carrier's declared access is unrelated to the tape Value's.
+  Native binding layouts (for example D3D12 SRV versus UAV, Vulkan and Metal
+  write hazards) follow the declared access; an absent `access` equals the
+  endpoint `access`;
 - `metadata_carriers`, when required, maps each module's semantic metadata
   ordinals bijectively to one physical aggregate and records its profile,
   layout, interface plan, and target location.

@@ -359,6 +359,13 @@ bool isScalarLayout(const ValueLayout &layout, const char *dtype) {
 
 } // namespace
 
+bool hostProjected(const Parameter &parameter) {
+    return std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
+        return use.interfaceKind == "uniform" || use.interfaceKind == "value" || use.interfaceKind == "result" ||
+               (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform);
+    });
+}
+
 void rebuildValueLayoutPathViews(ValueLayout &layout) {
     for (ValueLeaf &leaf : layout.leaves) {
         leaf.abiPath.clear();

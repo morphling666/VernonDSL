@@ -65,9 +65,9 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, co
 
 llvm::json::Value graphicsBindingLayoutJson(const mlir::vernon::GraphicsBindingLayout &layout) {
     llvm::json::Array rows;
-    for (const auto &[request, bindings] : layout.assignments) {
+    for (const auto &[request, assignment] : layout.assignments) {
         llvm::json::Array values;
-        for (uint32_t binding : bindings)
+        for (uint32_t binding : assignment.bindings)
             values.emplace_back(static_cast<int64_t>(binding));
         rows.emplace_back(llvm::json::Object{
             {"entry", request.entry},
@@ -75,6 +75,7 @@ llvm::json::Value graphicsBindingLayoutJson(const mlir::vernon::GraphicsBindingL
                                           : llvm::json::Value(nullptr)},
             {"kind", request.kind},
             {"source_name", request.sourceName},
+            {"set", static_cast<int64_t>(assignment.set)},
             {"bindings", std::move(values)},
         });
     }
@@ -97,7 +98,9 @@ std::optional<mlir::vernon::GraphicsBindingLayout> parseGraphicsBindingLayout(ll
         std::optional<llvm::StringRef> entry = row ? row->getString("entry") : std::nullopt;
         const llvm::json::Value *argument = row ? row->get("argument") : nullptr;
         const llvm::json::Array *bindings = row ? row->getArray("bindings") : nullptr;
-        if (!entry || !argument || !bindings)
+        const std::optional<int64_t> set = row ? row->getInteger("set") : std::nullopt;
+        if (!entry || !argument || !bindings || !set || *set < 0 ||
+            *set >= int64_t{mlir::vernon::kGraphicsDescriptorSetLimit})
             return std::nullopt;
         mlir::vernon::GraphicsBindingRequest request;
         request.entry = entry->str();
@@ -108,14 +111,14 @@ std::optional<mlir::vernon::GraphicsBindingLayout> parseGraphicsBindingLayout(ll
         } else {
             return std::nullopt;
         }
-        llvm::SmallVector<uint32_t> values;
+        mlir::vernon::GraphicsBindingAssignment assignment{static_cast<uint32_t>(*set), {}};
         for (const llvm::json::Value &binding : *bindings) {
             std::optional<int64_t> value = binding.getAsInteger();
             if (!value || *value < 0 || *value > std::numeric_limits<int32_t>::max())
                 return std::nullopt;
-            values.push_back(static_cast<uint32_t>(*value));
+            assignment.bindings.push_back(static_cast<uint32_t>(*value));
         }
-        layout.assignments.emplace_back(std::move(request), std::move(values));
+        layout.assignments.emplace_back(std::move(request), std::move(assignment));
     }
     return layout;
 }

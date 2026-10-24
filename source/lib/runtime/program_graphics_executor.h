@@ -8,8 +8,21 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace vernon::runtime {
+
+// A graphics Node's compiled pipeline state as drawn; `state` points into `colorBlends`, so it never moves.
+struct ProgramGraphicsState {
+    ProgramGraphicsState() = default;
+    ProgramGraphicsState(const ProgramGraphicsState &) = delete;
+    ProgramGraphicsState &operator=(const ProgramGraphicsState &) = delete;
+
+    void describe(const program::GraphicsOperation &operation);
+
+    VernonGraphicsState state{};
+    std::vector<VernonColorBlendState> colorBlends;
+};
 
 using ResolveProgramRenderPass = std::function<const VernonRenderPass *(uint32_t control)>;
 

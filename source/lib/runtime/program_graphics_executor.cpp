@@ -111,4 +111,19 @@ bool checkProgramGraphicsAttachmentSignature(const program::GraphicsOperation &g
     return checkAttachmentFormat(*graphics.depthStencilAttachment, plan.depthFormat, "depth", error);
 }
 
+void ProgramGraphicsState::describe(const program::GraphicsOperation &operation) {
+    const program::GraphicsPipelineState &source = operation.pipelineState;
+    colorBlends.clear();
+    colorBlends.reserve(source.colorBlends.size());
+    for (size_t location = 0; location < source.colorBlends.size(); ++location)
+        colorBlends.push_back(source.colorBlends.at(static_cast<uint32_t>(location)));
+    state = {};
+    state.struct_size = sizeof(state);
+    state.topology = source.topology;
+    state.rasterization = source.rasterization;
+    state.depth_stencil = source.depthStencil;
+    state.color_blends = colorBlends.data();
+    state.color_blend_count = colorBlends.size();
+}
+
 } // namespace vernon::runtime

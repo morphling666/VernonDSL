@@ -20,9 +20,11 @@
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <optional>
 
@@ -384,7 +386,7 @@ LogicalResult materializeStorageImageInterfaceVariables(ModuleOp module) {
                 return function.emitError() << "storage image argument #" << index << " has no interface ABI";
             OpBuilder moduleBuilder(function);
             const std::string name = (function.getName() + "_storage_image_" + Twine(index)).str();
-            auto access = function.getArgAttrOfType<StringAttr>(index, "vernon.texture_access");
+            auto access = function.getArgAttrOfType<StringAttr>(index, kResourceAccessAttrName);
             OpBuilder bodyBuilder = OpBuilder::atBlockBegin(&function.front());
             auto global = spirv::GlobalVariableOp::create(moduleBuilder, function.getLoc(), pointer, name,
                                                           abi.getDescriptorSet(), abi.getBinding());
@@ -400,6 +402,31 @@ LogicalResult materializeStorageImageInterfaceVariables(ModuleOp module) {
             return function.emitError("cannot remove materialized storage image arguments");
     }
     return success();
+}
+
+LogicalResult recordNonWritableStorageBindings(ModuleOp module) {
+    const StringRef abiName = spirv::getInterfaceVarABIAttrName();
+    WalkResult result = module.walk([&](spirv::FuncOp function) {
+        SmallVector<Attribute> bindings;
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            auto access = function.getArgAttrOfType<StringAttr>(index, kResourceAccessAttrName);
+            auto abi = function.getArgAttrOfType<spirv::InterfaceVarABIAttr>(index, abiName);
+            auto pointer = dyn_cast<spirv::PointerType>(function.getArgument(index).getType());
+            const bool storage = pointer ? pointer.getStorageClass() == spirv::StorageClass::StorageBuffer
+                                         : abi && abi.getStorageClass() == spirv::StorageClass::StorageBuffer;
+            if (!access || access.getValue() != "read" || !storage)
+                continue;
+            if (!abi) {
+                function.emitError() << "read storage argument #" << index << " has no interface ABI";
+                return WalkResult::interrupt();
+            }
+            bindings.push_back(abi);
+        }
+        if (!bindings.empty())
+            function->setAttr(kNonWritableStorageBindingsAttrName, ArrayAttr::get(function.getContext(), bindings));
+        return WalkResult::advance();
+    });
+    return failure(result.wasInterrupted());
 }
 
 struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, OperationPass<ModuleOp>> {
@@ -476,7 +503,74 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
         }
         if (failed(eraseCombinedSamplerArguments(getOperation())) ||
             failed(materializeMetadataInterfaceVariables(getOperation())) ||
-            failed(materializeStorageImageInterfaceVariables(getOperation())))
+            failed(materializeStorageImageInterfaceVariables(getOperation())) ||
+            failed(recordNonWritableStorageBindings(getOperation())))
+            signalPassFailure();
+    }
+};
+
+// The generic ABI lowering gives equal storage leaves one block type, and drivers may apply a decoration of one
+// variable to every variable of its block type: a NonWritable variable then makes the reads of written leaves stale.
+// So NonWritable decorates the members of a block type that only read buffers use, as glslang emits it.
+spirv::PointerType nonWritableStoragePointer(spirv::PointerType pointer) {
+    auto block = cast<spirv::StructType>(pointer.getPointeeType());
+    SmallVector<Type> members(block.getElementTypes());
+    SmallVector<spirv::StructType::OffsetInfo> offsets;
+    for (unsigned member = 0; member < block.getNumElements(); ++member)
+        offsets.push_back(static_cast<spirv::StructType::OffsetInfo>(block.getMemberOffset(member)));
+    SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+    block.getMemberDecorations(memberDecorations);
+    for (unsigned member = 0; member < block.getNumElements(); ++member)
+        memberDecorations.emplace_back(member, spirv::Decoration::NonWritable, UnitAttr::get(block.getContext()));
+    SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
+    block.getStructDecorations(structDecorations);
+    return spirv::PointerType::get(spirv::StructType::get(members, offsets, memberDecorations, structDecorations),
+                                   pointer.getStorageClass());
+}
+
+// Kernels of one module number their bindings independently, so a function's bindings match only the globals it
+// references.
+struct DecorateNonWritableStoragePass final
+    : PassWrapper<DecorateNonWritableStoragePass, OperationPass<spirv::ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DecorateNonWritableStoragePass)
+
+    StringRef getArgument() const override { return "vernon-decorate-non-writable-storage"; }
+    StringRef getDescription() const override {
+        return "Decorate the storage globals of read kernel arguments NonWritable";
+    }
+
+    void runOnOperation() override {
+        SymbolTable symbols(getOperation());
+        WalkResult result = getOperation().walk([&](spirv::FuncOp function) {
+            auto bindings = function->getAttrOfType<ArrayAttr>(kNonWritableStorageBindingsAttrName);
+            if (!bindings)
+                return WalkResult::advance();
+            function->removeAttr(kNonWritableStorageBindingsAttrName);
+            llvm::SmallPtrSet<Operation *, 8> decorated;
+            function.walk([&](spirv::AddressOfOp address) {
+                auto global = symbols.lookup<spirv::GlobalVariableOp>(address.getVariable());
+                auto pointer = global ? dyn_cast<spirv::PointerType>(global.getType()) : spirv::PointerType();
+                if (!pointer || pointer.getStorageClass() != spirv::StorageClass::StorageBuffer ||
+                    !global.getDescriptorSet() || !global.getBinding())
+                    return;
+                const bool nonWritable = llvm::any_of(bindings, [&](Attribute binding) {
+                    auto abi = cast<spirv::InterfaceVarABIAttr>(binding);
+                    return abi.getDescriptorSet() == *global.getDescriptorSet() &&
+                           abi.getBinding() == *global.getBinding();
+                });
+                if (!nonWritable)
+                    return;
+                if (decorated.insert(global).second)
+                    global.setTypeAttr(TypeAttr::get(nonWritableStoragePointer(pointer)));
+                address.getPointer().setType(global.getType());
+            });
+            if (decorated.size() != bindings.size()) {
+                function.emitError("a read storage argument has no storage-buffer global");
+                return WalkResult::interrupt();
+            }
+            return WalkResult::advance();
+        });
+        if (result.wasInterrupted())
             signalPassFailure();
     }
 };
@@ -486,5 +580,11 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
 std::unique_ptr<Pass> createVernonConvertGPUToSPIRVPass() { return std::make_unique<ConvertGPUToSPIRVPass>(); }
 
 void registerVernonConvertGPUToSPIRVPass() { PassRegistration<ConvertGPUToSPIRVPass>(); }
+
+std::unique_ptr<Pass> createVernonDecorateNonWritableStoragePass() {
+    return std::make_unique<DecorateNonWritableStoragePass>();
+}
+
+void registerVernonDecorateNonWritableStoragePass() { PassRegistration<DecorateNonWritableStoragePass>(); }
 
 } // namespace mlir::vernon

@@ -17,9 +17,11 @@
 extern "C" {
 #endif
 
+typedef struct VernonRuntimeCoreGroupLayout VernonRuntimeCoreGroupLayout;
 typedef struct VernonRuntimeCorePipeline VernonRuntimeCorePipeline;
-typedef struct VernonRuntimeCoreBindings VernonRuntimeCoreBindings;
+typedef struct VernonRuntimeCoreGroup VernonRuntimeCoreGroup;
 typedef struct VernonRuntimeCoreGraphicsVariant VernonRuntimeCoreGraphicsVariant;
+typedef struct VernonRuntimeCoreCommands VernonRuntimeCoreCommands;
 
 typedef struct VernonRuntimeCoreGraphicsCompatibility {
     uint32_t struct_size;
@@ -39,7 +41,6 @@ typedef struct VernonRuntimeCoreGraphicsCompatibility {
 
 typedef struct VernonRuntimeCoreDrawInvocation {
     uint32_t struct_size;
-    VernonRuntimeProviderObject command_encoder;
     uint32_t vertex_count;
     uint32_t instance_count;
     uint32_t first_instance;
@@ -60,8 +61,9 @@ typedef struct VernonRuntimeCorePipelineDescriptor {
     uint32_t required_capabilities;
     const VernonRuntimeProviderShaderDescriptor *shaders;
     size_t shader_count;
-    const VernonRuntimeProviderBindingLayoutEntry *bindings;
-    size_t binding_count;
+    /* Group layout g binds at group index g; an index without bindings takes a group layout without entries. */
+    VernonRuntimeCoreGroupLayout *const *group_layouts;
+    size_t group_layout_count;
     const VernonRuntimeProviderVertexAttribute *vertex_attributes;
     size_t vertex_attribute_count;
     uint32_t push_constant_size;
@@ -78,6 +80,17 @@ typedef struct VernonRuntimeCorePipelineDescriptor {
     uint32_t reserved[4];
 } VernonRuntimeCorePipelineDescriptor;
 
+/*
+ * Equal entries prepare the same group layout object, which is what makes two
+ * pipelines compatible at a group index. Entry `slot` is the entry's index;
+ * `set` is ignored. Group layouts are reference counted: pipelines and groups
+ * keep theirs alive.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePrepareGroupLayout(
+    const VernonRuntimeDeviceProvider *provider, const VernonRuntimeProviderBindingLayoutEntry *entries,
+    size_t entry_count, VernonRuntimeCoreGroupLayout **group_layout);
+VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCoreGroupLayoutDestroy(VernonRuntimeCoreGroupLayout *group_layout);
+
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePreparePipeline(
     const VernonRuntimeDeviceProvider *provider, const VernonRuntimeCorePipelineDescriptor *descriptor,
     VernonRuntimeCorePipeline **pipeline);
@@ -85,42 +98,56 @@ VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCorePipelineDestroy(VernonRuntimeCore
 VERNON_RUNTIME_CORE_CAPI VernonRuntimeProviderDeviceIdentity
 vernonRuntimeCorePipelineGetDeviceIdentity(const VernonRuntimeCorePipeline *pipeline);
 
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipeline *pipeline,
-                                                                      const VernonRuntimeProviderBindingValue *values,
-                                                                      size_t value_count,
-                                                                      VernonRuntimeCoreBindings **bindings);
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBindings *bindings,
-                                                                      const VernonRuntimeProviderBindingValue *values,
-                                                                      size_t value_count);
-VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCoreBindingsDestroy(VernonRuntimeCoreBindings *bindings);
+/*
+ * An immutable group of values for one group layout, index-aligned with its
+ * entries. A transient group is bound only by commands of `command_encoder`.
+ * Destroying a group that pending commands bound keeps it alive until they
+ * complete.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreCreateGroup(VernonRuntimeCoreGroupLayout *group_layout,
+                                                                   const VernonRuntimeProviderBindingValue *values,
+                                                                   size_t value_count,
+                                                                   VernonRuntimeProviderGroupLifetime lifetime,
+                                                                   VernonRuntimeProviderObject command_encoder,
+                                                                   VernonRuntimeCoreGroup **group);
+VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCoreGroupDestroy(VernonRuntimeCoreGroup *group);
 
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePrepareGraphicsVariant(
     VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreGraphicsCompatibility *compatibility,
     VernonRuntimeCoreGraphicsVariant **variant);
 VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCoreGraphicsVariantDestroy(VernonRuntimeCoreGraphicsVariant *variant);
 
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDispatch(const VernonRuntimeCorePipeline *pipeline,
-                                                                      const VernonRuntimeCoreBindings *bindings,
-                                                                      VernonRuntimeProviderObject command_encoder,
-                                                                      const uint32_t group_count[3],
-                                                                      const void *push_constants,
-                                                                      size_t push_constant_size);
 /*
- * Draw invocations are encoded between these calls and render into the
- * rendering descriptor's attachments, which Core validates against each other
- * and the render area.
+ * The command state of one command encoder; see VernonRuntimeDeviceProvider.
+ * A bind of the pipeline or group already bound is free, and binding a
+ * pipeline keeps the groups bound at the indices whose group layouts it
+ * shares. A dispatch or draw requires a group at every index of the bound
+ * pipeline whose group layout has entries.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBeginCommands(const VernonRuntimeDeviceProvider *provider,
+                                                                     VernonRuntimeProviderObject command_encoder,
+                                                                     VernonRuntimeCoreCommands **commands);
+/* Ends and destroys the command state, even when it reports a failure. */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEndCommands(VernonRuntimeCoreCommands *commands);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindPipeline(VernonRuntimeCoreCommands *commands,
+                                                                    VernonRuntimeCorePipeline *pipeline);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindGraphicsVariant(VernonRuntimeCoreCommands *commands,
+                                                                           VernonRuntimeCoreGraphicsVariant *variant);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindGroup(VernonRuntimeCoreCommands *commands, uint32_t index,
+                                                                 VernonRuntimeCoreGroup *group);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreDispatch(VernonRuntimeCoreCommands *commands,
+                                                                const uint32_t group_count[3],
+                                                                const void *push_constants, size_t push_constant_size);
+/*
+ * Draws are encoded between these calls and render into the rendering
+ * descriptor's attachments, which Core validates against each other and the
+ * render area.
  */
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBeginRendering(
-    const VernonRuntimeDeviceProvider *provider, VernonRuntimeProviderObject command_encoder,
-    const VernonRuntimeProviderRenderingDescriptor *descriptor);
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEndRendering(const VernonRuntimeDeviceProvider *provider,
-                                                                    VernonRuntimeProviderObject command_encoder);
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDrawInvocation(
-    const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
-    const VernonRuntimeCoreDrawInvocation *invocation);
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(
-    const VernonRuntimeCoreGraphicsVariant *variant, const VernonRuntimeCoreBindings *bindings,
-    const VernonRuntimeCoreDrawInvocation *invocation);
+    VernonRuntimeCoreCommands *commands, const VernonRuntimeProviderRenderingDescriptor *descriptor);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEndRendering(VernonRuntimeCoreCommands *commands);
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreDraw(VernonRuntimeCoreCommands *commands,
+                                                            const VernonRuntimeCoreDrawInvocation *invocation);
 
 #ifdef __cplusplus
 }

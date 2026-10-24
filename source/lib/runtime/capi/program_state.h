@@ -4,10 +4,14 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/execution_workspace_pool.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
+#include "runtime/graphics_invocation_planner.h"
+#include "runtime/pipeline_groups.h"
+#include "runtime/program_execution/materialized_node_frame.h"
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/submission_record.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/program_graph_linker.h"
+#include "runtime/program_graphics_executor.h"
 #include "runtime/program_instance.h"
 #include "runtime/program_invocation_context.h"
 #include "runtime/recorded_graphics.h"
@@ -42,6 +46,8 @@ struct RuntimeProgramBinding {
     VernonProgramArgument argument{};
     std::shared_ptr<const RuntimeProgramBindingMetadata> metadata;
     std::shared_ptr<void> lease;
+    // A binding set's host Tensor points here: a sealed set's values never change after seal.
+    std::vector<uint8_t> ownedHostBytes;
 
     void refresh() {
         if (argument.kind != VERNON_PROGRAM_TENSOR)
@@ -123,6 +129,7 @@ struct RuntimeGraphicsPipelineState {
     std::vector<vernon::runtime::recorded::NodeEndpoint> passEndpoints;
     // Empty for pipeline 0, which `pass` caches; see VernonProgramExecutable::passPipelines.
     std::vector<std::unique_ptr<RuntimeExecutableLease>> leases;
+    vernon::runtime::ProgramGraphicsState graphicsState;
 };
 
 struct VernonGraphicsPipeline {
@@ -137,6 +144,13 @@ struct RuntimeBindingSetEntry {
     std::shared_ptr<RuntimeProgramBinding> binding;
 };
 
+// A match's argument frame lowered for its pipeline's Stage once, then read by every invocation that draws with it.
+struct RuntimeLoweredSetFrame {
+    vernon::runtime::program_execution::MaterializedNodeFrame frame;
+    // Per Stage parameter; meaningful for the parameters the match supplies.
+    std::vector<vernon::runtime::PlannedGraphicsArgument> planned;
+};
+
 // A sealed set prepared for one pipeline: the set's values inside that pipeline's Program.
 struct RuntimeBindingSetMatch {
     std::weak_ptr<const RuntimeGraphicsPipelineState> pipeline;
@@ -145,7 +159,15 @@ struct RuntimeBindingSetMatch {
     // Per entry: why it does not correspond to a per-draw parameter of the pipeline; empty when it does. A
     // corresponding entry stays bound across a switch to this pipeline even if other entries of its set do not.
     std::vector<vernon::runtime::program::Diagnostic> failures;
+    // Per entry: the pipeline endpoints it supplies; empty for an entry that fails.
+    std::vector<std::vector<uint32_t>> entryEndpoints;
     std::shared_ptr<const vernon::runtime::program_execution::ProgramInvocationState> values;
+    // The groups whose values only this match decides; draws in flight share them.
+    mutable vernon::runtime::GroupStore groups{VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT};
+    mutable std::mutex loweringMutex;
+    // Made by the first invocation that draws with the match; stays null for a frame that needs per-invocation
+    // copies or Runtime carriers, which every invocation lowers again.
+    mutable std::shared_ptr<const RuntimeLoweredSetFrame> lowered;
 };
 
 struct RuntimeBindingSetState {
@@ -187,7 +209,8 @@ struct RecordedArgumentSource {
 
 struct RecordedDraw {
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
-    std::vector<RecordedArgumentSource> arguments;
+    // Per Stage parameter; consecutive draws with no bind between them share one vector.
+    std::shared_ptr<const std::vector<RecordedArgumentSource>> arguments;
     std::shared_ptr<const RuntimeProgramControl> draw;
     std::shared_ptr<const RuntimeProgramControl> dynamic;
 };
@@ -238,6 +261,7 @@ struct RuntimeProgramInstanceState {
     vernon::OwnerRef owner;
     VernonProgramExecutable *pipeline;
     vernon::runtime::program::ProgramInstance bindings;
+    vernon::runtime::InstanceGroups groups;
     const std::shared_ptr<vernon::runtime::ad::ExecutionWorkspacePool> workspaces;
     // Measured on the instance's last Execute; admission charges the next one with them before it allocates. Before
     // the first Execute one RHI submission is assumed.

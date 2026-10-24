@@ -26,6 +26,8 @@ struct ReflectedArgument {
     std::string kind;
     std::string builtin;
     std::string autodiffRole;
+    // The access the compiled module declares, which selects native descriptor kinds and write hazards.
+    std::string access;
     std::optional<VernonDataType> dtype;
     bool result{};
     uint32_t index{UINT32_MAX};

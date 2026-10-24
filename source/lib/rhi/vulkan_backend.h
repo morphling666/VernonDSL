@@ -77,7 +77,7 @@ struct Sampler {
     bool owned{true};
 };
 
-// A descriptor set and the pool that frees it.
+// A descriptor set and the pool that frees it, which is null when a command frame owns the set.
 struct DescriptorSet {
     VkDescriptorSet set{};
     VkDescriptorPool pool{};
@@ -106,15 +106,18 @@ struct VERNON_RHI_CAPI DeviceState {
         uint64_t serial{};
         StagingArena<StagingChunk> upload;
         StagingArena<StagingChunk> readback;
+        // The recording's descriptor sets come from the last pool; all are reset when the frame retires.
+        std::vector<VkDescriptorPool> descriptorPools;
         // Keyed by the image tracking the layouts; the encoder retains every image it uses until it completes.
         std::unordered_map<Image *, ImageLayoutUse> imageLayouts;
     };
 
-    // The staging a borrowed device's recordings acquired up to the submission numbered `serial`.
+    // The staging and descriptor pools a borrowed device's recordings acquired up to the submission numbered `serial`.
     struct BorrowedStaging {
         uint64_t serial{};
         StagingArena<StagingChunk> upload;
         StagingArena<StagingChunk> readback;
+        std::vector<VkDescriptorPool> descriptorPools;
     };
 
     // A native object that submitted work may still use; it is destroyed once the queue reaches `serial`.
@@ -160,9 +163,13 @@ struct VERNON_RHI_CAPI DeviceState {
     void destroyImage(Image &image);
     bool createSampler(Sampler &sampler, const VkSamplerCreateInfo &createInfo, std::string &error);
     void destroySampler(Sampler &sampler);
-    // Staging owned by the frame recording `command`, valid until that frame retires.
+    // Staging owned by the frame recording `command`, valid until that frame retires. Upload staging can also back
+    // uniform and storage buffer descriptors.
     bool acquireStaging(VkCommandBuffer command, bool upload, VkDeviceSize size, VkDeviceSize alignment,
                         VkBuffer &buffer, VkDeviceSize &offset, uint8_t *&mapped, std::string &error);
+    // A descriptor set owned by the frame recording `command`, valid until that frame retires.
+    bool allocateFrameDescriptorSet(VkCommandBuffer command, VkDescriptorSetLayout layout, VkDescriptorSet &set,
+                                    std::string &error);
     // Allocates from a chain of pools that grows once every pool is exhausted; sets live until they are freed.
     bool allocateDescriptorSet(VkDescriptorSetLayout layout, DescriptorSet &set, std::string &error);
     void freeDescriptorSet(DescriptorSet &set);
@@ -224,6 +231,8 @@ struct VERNON_RHI_CAPI DeviceState {
     // The pool allocations try first: the last one that had room.
     size_t currentDescriptorPool{};
     std::mutex descriptorMutex;
+    // Reset pools that retired frames returned, for the descriptor sets of later frames.
+    std::vector<VkDescriptorPool> freeFrameDescriptorPools;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     Sampler defaultImplicitSampler;
     size_t defaultImplicitSamplerCreations{};
@@ -238,9 +247,11 @@ private:
     CommandFrame *recordingFrame(VkCommandBuffer command);
     bool recordLayoutPrologue(CommandFrame &frame, bool &recorded, std::string &error);
     void commitImageLayouts(CommandFrame &frame);
-    void retireStaging(CommandFrame &frame);
+    void retireFrameMemory(StagingArena<StagingChunk> &upload, StagingArena<StagingChunk> &readback,
+                           std::vector<VkDescriptorPool> &descriptorPools);
     bool createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error);
-    bool createDescriptorPool(std::string &error);
+    bool createDescriptorPool(VkDescriptorPoolCreateFlags flags, uint32_t scale, VkDescriptorPool &pool,
+                              std::string &error);
     bool retireCommandFrames(uint64_t through, std::string &error);
     void destroyDeferred(bool all);
     void destroyNow(DeferredDestruction &destruction);
@@ -252,6 +263,9 @@ VERNON_RHI_CAPI Result<void, RhiError> transitionCommandImage(VernonRhiDevice de
 // Whether every subresource of `image`, an image or a view, is in `layout` at this point of recording `command`.
 VERNON_RHI_CAPI Result<bool, RhiError> imageInLayout(VernonRhiDevice device, VkCommandBuffer command, Image &image,
                                                      VkImageLayout layout) noexcept;
+// A descriptor set of `layout` that recording `command` owns until its frame retires.
+VERNON_RHI_CAPI Result<VkDescriptorSet, RhiError>
+allocateCommandDescriptorSet(VernonRhiDevice device, VkCommandBuffer command, VkDescriptorSetLayout layout) noexcept;
 
 } // namespace vernon::rhi::vulkan
 

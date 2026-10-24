@@ -2,6 +2,7 @@
 #define VERNON_RHI_METAL_BACKEND_H
 
 #include "VernonRHI.h"
+#include "staging_pool.h"
 
 #import <Metal/Metal.h>
 
@@ -9,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vernon::rhi::metal {
@@ -81,6 +83,10 @@ struct VERNON_RHI_CAPI DeviceState {
     bool pollCommands(uint64_t native, bool &completed, bool &succeeded, std::string &error);
     bool completeCommands(uint64_t native, std::string &error);
     void abandonCommands(uint64_t native);
+    // Reserves `size` bytes of shared memory that recording `native` holds until it completes or is abandoned, at
+    // `offset` in `buffer`, a multiple of `alignment`.
+    bool reserveTransient(uint64_t native, size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset,
+                          std::string &error);
 
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -89,6 +95,18 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t operatingSystemVersion[2]{};
     uint32_t argumentBuffersTier{};
     bool argumentBufferEncodingSupported{};
+    size_t transientChunkCreations{};
+
+private:
+    struct TransientChunk {
+        id<MTLBuffer> buffer;
+        size_t capacity{};
+    };
+    void retireTransients(uint64_t native);
+
+    StagingPool<TransientChunk> transientPool;
+    // Keyed by the recording's command buffer; recordings of a device are open concurrently.
+    std::unordered_map<uint64_t, StagingArena<TransientChunk>> recordingTransients;
 };
 
 } // namespace vernon::rhi::metal

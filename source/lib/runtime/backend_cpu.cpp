@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -63,11 +64,12 @@ struct CpuPreparedShader {
     ReflectedEntry reflection;
 };
 
-struct CpuPreparedPipeline;
+struct CpuGroupLayout {
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> entries;
+};
 
 struct CpuPreparedLayout {
-    std::vector<VernonRuntimeProviderBindingLayoutEntry> entries;
-    CpuPreparedPipeline *pipeline{};
+    std::vector<const CpuGroupLayout *> groups;
 };
 
 struct CpuPreparedPipeline {
@@ -76,7 +78,15 @@ struct CpuPreparedPipeline {
     uint32_t workgroup[3]{1, 1, 1};
 };
 
-struct CpuPreparedBindings {
+// Inputs own their inline bytes. Result values are destinations that the dispatch writes, so they keep the caller's
+// storage, which a synchronous CPU dispatch reaches before the invocation returns.
+struct CpuGroup {
+    const CpuGroupLayout *layout{};
+    std::vector<VernonRuntimeProviderBindingValue> values;
+    std::vector<std::vector<unsigned char>> bytes;
+};
+
+struct CpuCommands {
     struct ResultFrameCommit {
         void *data{};
         size_t frameOffset{};
@@ -84,6 +94,7 @@ struct CpuPreparedBindings {
     };
 
     CpuPreparedPipeline *pipeline{};
+    std::array<const CpuGroup *, VERNON_RUNTIME_PROVIDER_MAX_GROUPS> groups{};
     std::vector<unsigned char> packed;
     std::vector<unsigned char> results;
     std::vector<ResultFrameCommit> resultFrameCommits;
@@ -121,28 +132,36 @@ VernonStatus prepareCpuShader(void *data, const VernonRuntimeProviderShaderDescr
     return VERNON_STATUS_OK;
 }
 
+VernonStatus prepareCpuGroupLayout(void *data, const VernonRuntimeProviderGroupLayoutDescriptor *descriptor,
+                                   VernonRuntimeProviderObject *output) {
+    auto &context = *static_cast<CpuContextState *>(data);
+    if (output)
+        *output = {};
+    if (!descriptor || !output || (descriptor->entry_count && !descriptor->entries))
+        return fail(context.error, "invalid CPU provider group layout");
+    for (size_t index = 0; index < descriptor->entry_count; ++index) {
+        const auto &entry = descriptor->entries[index];
+        if ((entry.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+             entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) ||
+            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
+            return fail(context.error, "CPU provider group layout is not a canonical compute ABI");
+    }
+    auto layout = std::make_unique<CpuGroupLayout>();
+    layout->entries.assign(descriptor->entries, descriptor->entries + descriptor->entry_count);
+    *output = toHandle(layout.release());
+    return VERNON_STATUS_OK;
+}
+
 VernonStatus prepareCpuLayout(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
                               VernonRuntimeProviderObject *output) {
     auto &context = *static_cast<CpuContextState *>(data);
     if (output)
         *output = {};
-    if (!descriptor || !output || (descriptor->binding_count && !descriptor->bindings))
+    if (!descriptor || !output || (descriptor->group_layout_count && !descriptor->group_layouts))
         return fail(context.error, "invalid CPU provider pipeline layout");
-    auto layout = std::unique_ptr<CpuPreparedLayout>(new (std::nothrow) CpuPreparedLayout());
-    if (!layout)
-        return fail(context.error, "cannot allocate CPU provider layout", VERNON_STATUS_INTERNAL_ERROR);
-    try {
-        if (descriptor->binding_count)
-            layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
-    } catch (const std::bad_alloc &) {
-        return fail(context.error, "cannot allocate CPU provider bindings", VERNON_STATUS_INTERNAL_ERROR);
-    }
-    for (const auto &entry : layout->entries) {
-        if ((entry.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-             entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) ||
-            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
-            return fail(context.error, "CPU provider layout is not a canonical compute ABI");
-    }
+    auto layout = std::make_unique<CpuPreparedLayout>();
+    for (size_t index = 0; index < descriptor->group_layout_count; ++index)
+        layout->groups.push_back(fromHandle<CpuGroupLayout>(descriptor->group_layouts[index]));
     *output = toHandle(layout.release());
     return VERNON_STATUS_OK;
 }
@@ -164,50 +183,105 @@ VernonStatus prepareCpuPipeline(void *data, const VernonRuntimeProviderPipelineD
     if (!pipeline->shader || !pipeline->layout)
         return fail(context.error, "CPU provider pipeline references invalid prepared objects");
     std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
-    pipeline->layout->pipeline = pipeline.get();
     *output = toHandle(pipeline.release());
     return VERNON_STATUS_OK;
 }
 
-VernonStatus retainCpuResource(void *data, VernonRuntimeProviderResourceReference resource) {
+VernonStatus createCpuGroup(void *data, const VernonRuntimeProviderGroupDescriptor *descriptor,
+                            VernonRuntimeProviderObject *output) {
     auto &context = *static_cast<CpuContextState *>(data);
-    if (resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)) || !resource.resource.value)
-        return fail(context.error, "CPU provider resource reference is invalid");
+    if (output)
+        *output = {};
+    auto *layout = descriptor ? fromHandle<CpuGroupLayout>(descriptor->group_layout) : nullptr;
+    if (!descriptor || !output || !layout || descriptor->value_count != layout->entries.size())
+        return fail(context.error, "invalid CPU provider group descriptor");
+    auto group = std::make_unique<CpuGroup>();
+    group->layout = layout;
+    group->values.assign(descriptor->values, descriptor->values + descriptor->value_count);
+    group->bytes.resize(group->values.size());
+    for (size_t index = 0; index < group->values.size(); ++index) {
+        VernonRuntimeProviderBindingValue &value = group->values[index];
+        if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const auto &resource = value.payload.buffer.resource;
+            if (!resource.resource.value ||
+                resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)))
+                return fail(context.error, "CPU provider storage binding is invalid");
+            continue;
+        }
+        const auto *bytes = static_cast<const unsigned char *>(value.payload.inline_value.data);
+        group->bytes[index].assign(bytes, bytes + value.payload.inline_value.size);
+    }
+    *output = toHandle(group.release());
     return VERNON_STATUS_OK;
 }
 
-void releaseCpuResource(void *, VernonRuntimeProviderResourceReference) {}
+VernonStatus beginCpuCommands(void *data, VernonRuntimeProviderObject, VernonRuntimeProviderObject *output) {
+    auto &context = *static_cast<CpuContextState *>(data);
+    if (output)
+        *output = {};
+    if (!output)
+        return fail(context.error, "invalid CPU provider commands");
+    *output = toHandle(new CpuCommands());
+    return VERNON_STATUS_OK;
+}
 
-VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings &bindings,
-                                   const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    if (!bindings.pipeline || !bindings.pipeline->shader || !bindings.pipeline->layout ||
-        valueCount != bindings.pipeline->layout->entries.size() || (valueCount && !values))
-        return fail(context.error, "CPU provider binding set does not match its layout");
-    const ReflectedEntry &reflection = bindings.pipeline->shader->reflection;
-    bindings.resultFrameCommits.clear();
+VernonStatus endCpuCommands(void *, VernonRuntimeProviderObject commands) {
+    delete fromHandle<CpuCommands>(commands);
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus bindCpuPipeline(void *, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+    fromHandle<CpuCommands>(commands)->pipeline = fromHandle<CpuPreparedPipeline>(pipeline);
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus bindCpuGroup(void *, VernonRuntimeProviderObject commands, uint32_t index,
+                          VernonRuntimeProviderObject group) {
+    fromHandle<CpuCommands>(commands)->groups[index] = fromHandle<CpuGroup>(group);
+    return VERNON_STATUS_OK;
+}
+
+// Values of the bound groups, in group order, follow the reflected arguments and then the metadata carrier.
+VernonStatus packCpuFrame(CpuContextState &context, CpuCommands &commands) {
+    const CpuPreparedPipeline &pipeline = *commands.pipeline;
+    const ReflectedEntry &reflection = pipeline.shader->reflection;
+    if (!reflection.packedArguments)
+        return fail(context.error, "CPU reflection has no packed argument layout");
+    commands.packed.assign(reflection.packedArguments->size, 0);
+    commands.results.assign(reflection.packedResults ? reflection.packedResults->size : 0, 0);
+    commands.resultFrameCommits.clear();
+    struct Bound {
+        const VernonRuntimeProviderBindingLayoutEntry *layout{};
+        const VernonRuntimeProviderBindingValue *value{};
+        const std::vector<unsigned char> *bytes{};
+    };
+    std::vector<Bound> bound;
+    for (size_t group = 0; group < pipeline.layout->groups.size(); ++group) {
+        const CpuGroupLayout &layout = *pipeline.layout->groups[group];
+        if (layout.entries.empty())
+            continue;
+        const CpuGroup &values = *commands.groups[group];
+        for (size_t index = 0; index < layout.entries.size(); ++index)
+            bound.push_back({&layout.entries[index], &values.values[index], &values.bytes[index]});
+    }
     size_t reflectedIndex = 0;
     for (const ReflectedArgument &argument : reflection.arguments) {
         const bool tapeBuiltin = argument.kind == "builtin" && (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
                                                                 argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN);
         if (argument.kind == "builtin" && !tapeBuiltin)
             continue;
-        if (reflectedIndex >= valueCount)
+        if (reflectedIndex >= bound.size())
             return fail(context.error, "CPU provider reflection exceeds its binding layout");
-        const auto &layout = bindings.pipeline->layout->entries[reflectedIndex];
-        const auto &value = values[reflectedIndex];
-        std::vector<unsigned char> &frame = argument.result ? bindings.results : bindings.packed;
-        if (value.slot != layout.slot || value.kind != layout.kind || argument.physical.offset > frame.size() ||
-            argument.physical.size > frame.size() - argument.physical.offset)
+        const Bound &entry = bound[reflectedIndex];
+        std::vector<unsigned char> &frame = argument.result ? commands.results : commands.packed;
+        if (argument.physical.offset > frame.size() || argument.physical.size > frame.size() - argument.physical.offset)
             return fail(context.error, "CPU provider binding does not match reflection");
-        if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const auto &resource = value.payload.buffer.resource;
-            if (!resource.resource.value ||
-                resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)))
-                return fail(context.error, "CPU provider storage binding is invalid");
+        if (entry.value->kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const auto &resource = entry.value->payload.buffer.resource;
             const auto *storage =
                 reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(resource.resource.value) + resource.offset);
             if (argument.result)
-                bindings.resultFrameCommits.push_back(
+                commands.resultFrameCommits.push_back(
                     {const_cast<uint8_t *>(storage), argument.physical.offset, argument.physical.size});
             if (argument.physical.size == sizeof(uintptr_t)) {
                 const uintptr_t pointer = reinterpret_cast<uintptr_t>(storage);
@@ -218,86 +292,54 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
                 std::memcpy(frame.data() + argument.physical.offset, storage, argument.physical.size);
             }
         } else {
-            if (!value.payload.inline_value.data || value.payload.inline_value.size != argument.physical.size)
+            if (entry.bytes->size() != argument.physical.size)
                 return fail(context.error, "CPU provider inline binding is invalid");
             if (argument.result)
-                bindings.resultFrameCommits.push_back({const_cast<void *>(value.payload.inline_value.data),
+                commands.resultFrameCommits.push_back({const_cast<void *>(entry.value->payload.inline_value.data),
                                                        argument.physical.offset, argument.physical.size});
-            std::memcpy(frame.data() + argument.physical.offset, value.payload.inline_value.data,
-                        value.payload.inline_value.size);
+            std::memcpy(frame.data() + argument.physical.offset, entry.bytes->data(), entry.bytes->size());
         }
         ++reflectedIndex;
     }
     if (reflection.metadataCarrier) {
-        if (reflectedIndex >= valueCount)
+        if (reflectedIndex >= bound.size())
             return fail(context.error, "CPU metadata carrier exceeds its binding layout");
         const auto &carrier = *reflection.metadataCarrier;
-        const auto &layout = bindings.pipeline->layout->entries[reflectedIndex];
-        const auto &value = values[reflectedIndex];
+        const Bound &entry = bound[reflectedIndex];
         if (carrier.interfacePlan.frameOffset > std::numeric_limits<size_t>::max() ||
             carrier.size > std::numeric_limits<size_t>::max())
             return fail(context.error, "CPU metadata carrier exceeds the host address range");
         const size_t offset = static_cast<size_t>(carrier.interfacePlan.frameOffset);
-        if (layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE || value.slot != layout.slot ||
-            value.kind != layout.kind || !value.payload.inline_value.data ||
-            value.payload.inline_value.size != carrier.size || layout.element_size != carrier.size ||
-            layout.element_alignment != carrier.alignment || offset > bindings.packed.size() ||
-            carrier.size > bindings.packed.size() - offset)
+        if (entry.layout->kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE || entry.bytes->size() != carrier.size ||
+            entry.layout->element_size != carrier.size || entry.layout->element_alignment != carrier.alignment ||
+            offset > commands.packed.size() || carrier.size > commands.packed.size() - offset)
             return fail(context.error, "CPU metadata carrier does not match its packed frame ABI");
-        std::memcpy(bindings.packed.data() + offset, value.payload.inline_value.data, value.payload.inline_value.size);
+        std::memcpy(commands.packed.data() + offset, entry.bytes->data(), entry.bytes->size());
         ++reflectedIndex;
     }
-    return reflectedIndex == valueCount ? VERNON_STATUS_OK
-                                        : fail(context.error, "CPU provider binding layout exceeds reflection");
+    return reflectedIndex == bound.size() ? VERNON_STATUS_OK
+                                          : fail(context.error, "CPU provider binding layout exceeds reflection");
 }
 
-VernonStatus createCpuBindingSet(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                                 VernonRuntimeProviderObject *output) {
-    auto &context = *static_cast<CpuContextState *>(data);
-    if (output)
-        *output = {};
-    auto *layout = descriptor ? fromHandle<CpuPreparedLayout>(descriptor->layout) : nullptr;
-    if (!descriptor || !output || !layout)
-        return fail(context.error, "invalid CPU provider binding descriptor");
-    if (!layout->pipeline || !layout->pipeline->shader)
-        return fail(context.error, "CPU provider binding set is missing its pipeline");
-    auto bindings = std::unique_ptr<CpuPreparedBindings>(new (std::nothrow) CpuPreparedBindings());
-    if (!bindings)
-        return fail(context.error, "cannot allocate CPU provider binding set", VERNON_STATUS_INTERNAL_ERROR);
-    bindings->pipeline = layout->pipeline;
-    if (!layout->pipeline->shader->reflection.packedArguments)
-        return fail(context.error, "CPU reflection has no packed argument layout");
-    try {
-        bindings->packed.resize(layout->pipeline->shader->reflection.packedArguments->size);
-        if (layout->pipeline->shader->reflection.packedResults)
-            bindings->results.resize(layout->pipeline->shader->reflection.packedResults->size);
-    } catch (const std::bad_alloc &) {
-        return fail(context.error, "cannot allocate CPU invocation storage", VERNON_STATUS_INTERNAL_ERROR);
-    }
-    const VernonStatus status = updateCpuBindingsImpl(context, *bindings, descriptor->values, descriptor->value_count);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    *output = toHandle(bindings.release());
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
+VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject handle,
                                const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &context = *static_cast<CpuContextState *>(data);
-    auto *pipeline = descriptor ? fromHandle<CpuPreparedPipeline>(descriptor->pipeline) : nullptr;
-    auto *bindings = descriptor ? fromHandle<CpuPreparedBindings>(descriptor->bindings) : nullptr;
-    if (!descriptor || !pipeline || !bindings || bindings->pipeline != pipeline)
+    CpuCommands &commands = *fromHandle<CpuCommands>(handle);
+    if (!descriptor || !commands.pipeline)
         return fail(context.error, "invalid CPU provider dispatch");
-    const VernonStatus status =
-        context.scheduler->dispatch(descriptor->group_count, pipeline->workgroup, [&](VernonCpuRange &range) {
-            range.arguments = bindings->packed.data();
-            range.arguments_size = bindings->packed.size();
-            range.results = bindings->results.empty() ? nullptr : bindings->results.data();
-            range.results_size = bindings->results.size();
-            range.textures = nullptr;
-            const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
-            return pipeline->shader->kernel.entry(&invocation);
-        });
+    VernonStatus status = packCpuFrame(context, commands);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    const CpuPreparedPipeline &pipeline = *commands.pipeline;
+    status = context.scheduler->dispatch(descriptor->group_count, pipeline.workgroup, [&](VernonCpuRange &range) {
+        range.arguments = commands.packed.data();
+        range.arguments_size = commands.packed.size();
+        range.results = commands.results.empty() ? nullptr : commands.results.data();
+        range.results_size = commands.results.size();
+        range.textures = nullptr;
+        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE, nullptr, 0, nullptr};
+        return pipeline.shader->kernel.entry(&invocation);
+    });
     if (status != VERNON_STATUS_OK)
         return fail(context.error,
                     context.scheduler->lastDiagnostic().empty()
@@ -305,8 +347,8 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
                                                                     : "CPU provider entry invocation failed")
                         : context.scheduler->lastDiagnostic(),
                     status);
-    for (const CpuPreparedBindings::ResultFrameCommit &destination : bindings->resultFrameCommits)
-        std::memcpy(destination.data, bindings->results.data() + destination.frameOffset, destination.size);
+    for (const CpuCommands::ResultFrameCommit &destination : commands.resultFrameCommits)
+        std::memcpy(destination.data, commands.results.data() + destination.frameOffset, destination.size);
     return status;
 }
 
@@ -315,9 +357,10 @@ VernonStatus unsupportedCpuDraw(void *, VernonRuntimeProviderObject, const Verno
 }
 
 void destroyCpuShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPreparedShader>(handle); }
+void destroyCpuGroupLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuGroupLayout>(handle); }
 void destroyCpuLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPreparedLayout>(handle); }
 void destroyCpuPipeline(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPreparedPipeline>(handle); }
-void destroyCpuBindings(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPreparedBindings>(handle); }
+void destroyCpuGroup(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuGroup>(handle); }
 
 } // namespace
 
@@ -336,17 +379,21 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     state->provider.get_capabilities = cpuCapabilities;
     state->provider.get_device_identity = cpuDeviceIdentity;
     state->provider.prepare_shader = prepareCpuShader;
+    state->provider.prepare_group_layout = prepareCpuGroupLayout;
     state->provider.prepare_pipeline_layout = prepareCpuLayout;
     state->provider.prepare_pipeline = prepareCpuPipeline;
-    state->provider.retain_resource = retainCpuResource;
-    state->provider.release_resource = releaseCpuResource;
-    state->provider.create_binding_set = createCpuBindingSet;
+    state->provider.create_group = createCpuGroup;
+    state->provider.begin_commands = beginCpuCommands;
+    state->provider.end_commands = endCpuCommands;
+    state->provider.encode_bind_pipeline = bindCpuPipeline;
+    state->provider.encode_bind_group = bindCpuGroup;
     state->provider.encode_dispatch = encodeCpuDispatch;
     state->provider.encode_draw = unsupportedCpuDraw;
     state->provider.destroy_shader = destroyCpuShader;
+    state->provider.destroy_group_layout = destroyCpuGroupLayout;
     state->provider.destroy_pipeline_layout = destroyCpuLayout;
     state->provider.destroy_pipeline = destroyCpuPipeline;
-    state->provider.destroy_binding_set = destroyCpuBindings;
+    state->provider.destroy_group = destroyCpuGroup;
     installRuntimeBackendState(context, state.release());
     return true;
 }
@@ -375,6 +422,10 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
                                          invocationDiagnostic(context)))
         return false;
     state.values.resize(state.bindingPlan.size());
+    if (!state.groups.prepare(*cpuProvider(context), state.bindingPlan.layouts,
+                              std::vector<PipelineGroups::SlotDependencies>(state.bindingPlan.size()),
+                              invocationDiagnostic(context)))
+        return false;
     std::copy_n(reflection.workgroup, 3, state.workgroup);
     CpuProviderShaderPayload payload{&kernel, &reflection};
     const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
@@ -391,8 +442,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_COMPUTE;
     descriptor.shaders = &shader;
     descriptor.shader_count = 1;
-    descriptor.bindings = state.bindingPlan.layouts.data();
-    descriptor.binding_count = state.bindingPlan.size();
+    descriptor.group_layouts = state.groups.layouts();
+    descriptor.group_layout_count = state.groups.size();
     descriptor.push_constant_size = sizeof(VernonLaunchSize);
     std::copy_n(state.workgroup, 3, descriptor.workgroup_size);
     const VernonStatus status = vernonRuntimeCorePreparePipeline(cpuProvider(context), &descriptor, &state.pipeline);

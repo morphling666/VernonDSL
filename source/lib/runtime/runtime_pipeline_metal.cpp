@@ -75,7 +75,6 @@ bool resolveMetalComputeNativeBinding(const void *userData, const PreparedBindin
     if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind, layout.set,
                                       layout.binding, location, error))
         return false;
-    layout.set = location.argumentBufferIndex;
     layout.binding = location.memberId;
     layout.array_count = location.count;
     return true;
@@ -102,7 +101,6 @@ bool resolveMetalGraphicsNativeBinding(void *userData, std::string_view stage, s
                                       std::string(kind).c_str(), descriptorSet, descriptorBinding, location, error,
                                       name))
         return false;
-    layout.set = descriptorSet == UINT32_MAX ? UINT32_MAX : location.argumentBufferIndex;
     layout.binding = descriptorSet == UINT32_MAX ? location.directBufferIndex : location.memberId;
     layout.array_count = descriptorSet == UINT32_MAX ? 1 : location.count;
     return true;
@@ -220,28 +218,30 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
-                                         const VernonStageInvocationDescriptor &invocation,
-                                         const PlannedGraphicsInvocation &plan) {
+VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                         const GraphicsCommand &command, GraphicsStream &stream) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    return invokeRhiGraphicsPipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalGraphics,
-                                     invocation, plan, runtimeBackendState<MetalPipelineState>(pipeline).rhiGraphics);
+    return invokeRhiGraphicsPipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalGraphics, commands,
+                                     command, stream, runtimeBackendState<MetalPipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
-    (void)invocation;
-    (void)plan;
+    (void)command;
+    (void)stream;
+    (void)commands;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+                                        const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalCompute,
-                                    pipeline.bindingProjection, launch,
+                                    pipeline.bindingProjection, launch, owners,
                                     runtimeBackendState<MetalPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
     (void)launch;
+    (void)owners;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }

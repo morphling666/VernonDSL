@@ -7,6 +7,7 @@
 
 #include <array>
 #include <limits>
+#include <vector>
 namespace {
 
 using namespace vernon::runtime;
@@ -33,8 +34,13 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
 }
 
 bool planForTest(const StageBindingPlan &variant, const VernonStageInvocationDescriptor &invocation,
-                 PlannedGraphicsInvocation &plan, std::string &error) {
-    return planGraphicsInvocation(variant, invocation, describeTestImage, nullptr, plan, error);
+                 PlannedGraphicsInvocation &plan, std::string &error, GraphicsDrawLayout *planned = nullptr) {
+    GraphicsDrawLayout layout;
+    if (!buildGraphicsDrawLayout(variant, layout, error))
+        return false;
+    if (planned)
+        *planned = layout;
+    return planGraphicsInvocation(variant, layout, invocation, describeTestImage, nullptr, plan, error);
 }
 
 bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vector<uint64_t> &valueShape,
@@ -193,25 +199,24 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     invocation.dynamic_state = &dynamic;
 
     PlannedGraphicsInvocation plan;
+    GraphicsDrawLayout layout;
     std::string error;
-    ASSERT_TRUE(planForTest(variant, invocation, plan, error)) << error;
-    ASSERT_EQ(plan.attachments.size(), 2u);
-    EXPECT_EQ(plan.attachments[0]->location, 0u);
-    EXPECT_EQ(plan.attachments[1]->location, 1u);
-    EXPECT_EQ(plan.attachmentWidth, 64u);
-    EXPECT_EQ(plan.attachmentHeight, 32u);
-    EXPECT_EQ(plan.resolution, (std::array<float, 2>{20.0f, 10.0f}));
-    EXPECT_EQ(plan.vertexCount, 4u);
-    EXPECT_EQ(plan.instanceCount, 1u);
-    EXPECT_EQ(plan.indexBinding, &index);
-    ASSERT_EQ(plan.vertexInputs.size(), 1u);
-    EXPECT_EQ(plan.vertexInputs[0].use->attributeLeaves.size(), 1u);
-    const auto sampled = plan.sampledResources.find({0, 5});
-    ASSERT_NE(sampled, plan.sampledResources.end());
-    EXPECT_EQ(sampled->second.imageView.identity, sampledTexture.identity);
-    EXPECT_EQ(sampled->second.samplerResource.identity, 0u);
-    EXPECT_TRUE(sampled->second.implicitSampler);
-    EXPECT_EQ(sampled->second.stages, PLANNED_STAGE_FRAGMENT);
+    ASSERT_TRUE(planForTest(variant, invocation, plan, error, &layout)) << error;
+    ASSERT_EQ(plan.targets.attachments.size(), 2u);
+    EXPECT_EQ(plan.targets.attachments[0]->location, 0u);
+    EXPECT_EQ(plan.targets.attachments[1]->location, 1u);
+    EXPECT_EQ(plan.targets.attachmentWidth, 64u);
+    EXPECT_EQ(plan.targets.attachmentHeight, 32u);
+    EXPECT_EQ(plan.draw.resolution, (std::array<float, 2>{20.0f, 10.0f}));
+    EXPECT_EQ(plan.draw.vertexCount, 4u);
+    EXPECT_EQ(plan.draw.instanceCount, 1u);
+    EXPECT_EQ(plan.draw.indexBinding, &index);
+    ASSERT_EQ(layout.vertexInputs.size(), 1u);
+    EXPECT_EQ(layout.vertexInputs[0].parameter, 0u);
+    EXPECT_EQ(layout.sampledImages, std::vector<uint32_t>{1});
+    EXPECT_TRUE(layout.sharedDescriptors.empty());
+    EXPECT_EQ(plan.arguments[1], &arguments[1]);
+    EXPECT_EQ(plan.planned[1].subresources.parent, sampledTexture.resource.value);
 
     index.type = static_cast<VernonIndexType>(1);
     EXPECT_FALSE(planForTest(variant, invocation, plan, error));
@@ -246,8 +251,7 @@ TEST(GraphicsInvocationPlanner, AcceptsFormalVertexNumericTypesAndRejectsNonVert
         ASSERT_TRUE(planVertexTensor(format.name, format.type, {3}, {{0, format.name, 3, 0}}, shape, strides, 0, 0,
                                      plan, error))
             << format.name << ": " << error;
-        ASSERT_EQ(plan.vertexInputs.size(), 1u);
-        EXPECT_EQ(plan.vertexCount, 4u);
+        EXPECT_EQ(plan.draw.vertexCount, 4u);
     }
 
     for (const Format format : {Format{"bool", VERNON_DATA_BOOL, 1}, Format{"u8", VERNON_DATA_U8, 1}}) {
@@ -267,8 +271,7 @@ TEST(GraphicsInvocationPlanner, PlansNonSquareAttributesWithInterleavedRecordPad
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {2, 3}, {{0, "f32", 4, 0}, {1, "f32", 2, 16}}, shape, strides,
                                  0, 0, plan, error))
         << error;
-    ASSERT_EQ(plan.vertexInputs.size(), 1u);
-    EXPECT_EQ(plan.vertexCount, 5u);
+    EXPECT_EQ(plan.draw.vertexCount, 5u);
 }
 
 TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsToInferredAndExplicitCounts) {
@@ -278,10 +281,10 @@ TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsToInferredAndExplicitCoun
     const std::vector<int64_t> strides{24, 4};
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 0, plan, error))
         << error;
-    EXPECT_EQ(plan.instanceCount, 6u);
+    EXPECT_EQ(plan.draw.instanceCount, 6u);
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 5, plan, error))
         << error;
-    EXPECT_EQ(plan.instanceCount, 5u);
+    EXPECT_EQ(plan.draw.instanceCount, 5u);
     EXPECT_FALSE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 7, plan, error));
     EXPECT_EQ(error, "graphics Tensor leading dimensions conflict");
 }
@@ -312,24 +315,17 @@ TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
     source.depth_stencil.back = source.depth_stencil.front;
     source.color_blends = blends;
     source.color_blend_count = std::size(blends);
-    VernonStageInvocationDescriptor invocation{};
-    invocation.graphics_state = &source;
-    VernonDynamicState dynamic{};
-    dynamic.struct_size = sizeof(dynamic);
-    dynamic.stencil_reference = 3;
-    invocation.dynamic_state = &dynamic;
 
     PlannedGraphicsState planned;
     std::string error;
-    ASSERT_TRUE(planGraphicsState(invocation, std::size(blends), true, true, planned, error)) << error;
+    ASSERT_TRUE(planGraphicsState(&source, std::size(blends), true, true, planned, error)) << error;
     EXPECT_EQ(planned.rasterization.cull_mode, VERNON_RHI_CULL_BACK);
     EXPECT_EQ(planned.depthStencil.depth_compare, VERNON_RHI_COMPARE_GREATER_EQUAL);
-    EXPECT_EQ(planned.stencilReference, 3u);
     ASSERT_EQ(planned.colorBlends.size(), std::size(blends));
     EXPECT_EQ(planned.colorBlends[0].write_mask, VERNON_RHI_COLOR_WRITE_RED | VERNON_RHI_COLOR_WRITE_GREEN);
 
     source.color_blend_count = 1;
-    EXPECT_FALSE(planGraphicsState(invocation, std::size(blends), true, true, planned, error));
+    EXPECT_FALSE(planGraphicsState(&source, std::size(blends), true, true, planned, error));
     EXPECT_EQ(error, "graphics state color blend count does not match the color attachment count");
 }
 
@@ -348,11 +344,9 @@ TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
     source.depth_stencil.stencil_write_mask = 0xff;
     source.color_blends = &blend;
     source.color_blend_count = 1;
-    VernonStageInvocationDescriptor invocation{};
-    invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
-    ASSERT_TRUE(planGraphicsState(invocation, 1, true, false, planned, error)) << error;
+    ASSERT_TRUE(planGraphicsState(&source, 1, true, false, planned, error)) << error;
     EXPECT_EQ(planned.rasterization.depth_bias_constant, 0);
     EXPECT_EQ(planned.depthStencil.depth_compare, VERNON_RHI_COMPARE_ALWAYS);
     EXPECT_EQ(planned.depthStencil.stencil_read_mask, 0u);
@@ -369,20 +363,16 @@ TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
     VernonGraphicsState source{};
     source.struct_size = sizeof(source);
     source.rasterization.depth_bias_constant = std::numeric_limits<float>::infinity();
-    VernonStageInvocationDescriptor invocation{};
-    invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
-    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+    EXPECT_FALSE(planGraphicsState(&source, 0, false, false, planned, error));
     source.rasterization.depth_bias_constant = 0;
     source.depth_stencil.stencil_read_mask = 0x100;
-    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+    EXPECT_FALSE(planGraphicsState(&source, 0, false, false, planned, error));
     source.depth_stencil.stencil_read_mask = 0;
-    VernonDynamicState dynamic{};
-    dynamic.struct_size = sizeof(dynamic);
-    dynamic.stencil_reference = 0x100;
-    invocation.dynamic_state = &dynamic;
-    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+    source.topology = static_cast<VernonPrimitiveTopology>(VERNON_TOPOLOGY_POINT_LIST + 1);
+    EXPECT_FALSE(planGraphicsState(&source, 0, false, false, planned, error));
+    EXPECT_EQ(error, "graphics pipeline topology is invalid");
 }
 
 TEST(GraphicsInvocationPlanner, StageBindingPlanKeyUsesOnlyCanonicalStaticFields) {
@@ -406,12 +396,12 @@ TEST(GraphicsScopeMaterializer, SelectsFusedOrSplitResolvedCandidatePath) {
     previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     VernonColorAttachment following = previous;
     following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
-    PlannedGraphicsInvocation first;
+    PlannedRenderTargets first;
     first.attachments = {&previous};
     first.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
     first.attachmentWidth = 16;
     first.attachmentHeight = 16;
-    PlannedGraphicsInvocation second = first;
+    PlannedRenderTargets second = first;
     second.attachments = {&following};
 
     GraphicsScopeMaterializer materializer;
@@ -419,14 +409,14 @@ TEST(GraphicsScopeMaterializer, SelectsFusedOrSplitResolvedCandidatePath) {
     EXPECT_EQ(materializer.materialize(0, second, {}), GraphicsScopeMaterialization::Fuse);
     EXPECT_EQ(materializer.materialize(0, second, {}, true), GraphicsScopeMaterialization::Begin);
     VernonColorAttachment clearing = following;
-    PlannedGraphicsInvocation clearingInvocation = second;
+    PlannedRenderTargets clearingInvocation = second;
     clearingInvocation.attachments = {&clearing};
     clearing.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
     EXPECT_EQ(materializer.materialize(0, clearingInvocation, {}), GraphicsScopeMaterialization::Split);
     VernonColorAttachment differentView = clearing;
     differentView.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
     differentView.view.identity = 8;
-    PlannedGraphicsInvocation differentViewInvocation = second;
+    PlannedRenderTargets differentViewInvocation = second;
     differentViewInvocation.attachments = {&differentView};
     EXPECT_EQ(materializer.materialize(0, differentViewInvocation, {}), GraphicsScopeMaterialization::Split);
     EXPECT_EQ(materializer.materialize(1, differentViewInvocation, {}), GraphicsScopeMaterialization::Begin);
@@ -438,26 +428,25 @@ TEST(GraphicsScopeMaterializer, FusedScopeDeclaresTheReadsOfEveryNode) {
     previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     VernonColorAttachment following = previous;
     following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
-    PlannedGraphicsInvocation first;
+    PlannedRenderTargets first;
     first.attachments = {&previous};
     first.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
     first.attachmentSubresources = {{11, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}}};
     first.attachmentWidth = 16;
     first.attachmentHeight = 16;
-    PlannedGraphicsInvocation second = first;
+    PlannedRenderTargets second = first;
     second.attachments = {&following};
     const VernonRuntimeProviderResourceReference albedo{21, {31}, 0, 0};
     const VernonRuntimeProviderResourceReference normal{22, {32}, 0, 0};
-    first.sampledResources[{0, 0}].imageView = albedo;
-    first.sampledResources[{0, 0}].subresources = {31, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
-    second.sampledResources[{0, 0}] = first.sampledResources[{0, 0}];
-    second.sampledResources[{0, 1}].imageView = normal;
-    second.sampledResources[{0, 1}].subresources = {32, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
+    const ProviderImageSubresources albedoSubresources{31, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
 
     GraphicsScopeReads firstReads;
-    addGraphicsScopeReads(firstReads, first);
+    addGraphicsScopeRead(firstReads, albedo, albedoSubresources);
     GraphicsScopeReads secondReads;
-    addGraphicsScopeReads(secondReads, second);
+    addGraphicsScopeRead(secondReads, albedo, albedoSubresources);
+    addGraphicsScopeRead(secondReads, albedo, albedoSubresources);
+    addGraphicsScopeRead(secondReads, normal, {32, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}});
+    EXPECT_EQ(secondReads.images.size(), 2u);
     GraphicsScopeMaterializer materializer;
     EXPECT_EQ(materializer.materialize(0, first, firstReads), GraphicsScopeMaterialization::Begin);
     EXPECT_EQ(materializer.materialize(0, second, secondReads), GraphicsScopeMaterialization::Fuse);
@@ -502,6 +491,7 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     dynamic.struct_size = sizeof(dynamic);
     dynamic.viewport[2] = 12;
     dynamic.viewport[3] = 13;
+    dynamic.stencil_reference = 3;
     VernonGraphicsState state{};
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_LINE_LIST;
@@ -516,11 +506,14 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     PlannedGraphicsInvocation planned;
     std::string error;
     ASSERT_TRUE(planForTest(variant, invocation, planned, error)) << error;
-    EXPECT_EQ(planned.vertexCount, 3u);
-    EXPECT_EQ(planned.instanceCount, 2u);
-    EXPECT_EQ(planned.topology, VERNON_TOPOLOGY_LINE_LIST);
-    EXPECT_EQ(planned.resolution[0], 12.0f);
-    EXPECT_EQ(planned.resolution[1], 13.0f);
+    EXPECT_EQ(planned.draw.vertexCount, 3u);
+    EXPECT_EQ(planned.draw.instanceCount, 2u);
+    EXPECT_EQ(planned.draw.stencilReference, 3u);
+    EXPECT_EQ(planned.draw.resolution[0], 12.0f);
+    EXPECT_EQ(planned.draw.resolution[1], 13.0f);
+    dynamic.stencil_reference = 0x100;
+    EXPECT_FALSE(planForTest(variant, invocation, planned, error));
+    EXPECT_EQ(error, "graphics state contains an invalid or unsupported value");
 }
 
 program::GraphicsOperation operationForFormats(const std::vector<VernonTextureFormat> &colors,
@@ -546,7 +539,7 @@ program::GraphicsOperation operationForFormats(const std::vector<VernonTextureFo
 
 TEST(ProgramGraphicsAttachmentSignature, AcceptsABoundTargetInTheCompiledFormatSet) {
     const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA16_FLOAT});
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA16_FLOAT};
     std::string error;
     EXPECT_TRUE(checkProgramGraphicsAttachmentSignature(graphics, plan, error)) << error;
@@ -555,7 +548,7 @@ TEST(ProgramGraphicsAttachmentSignature, AcceptsABoundTargetInTheCompiledFormatS
 TEST(ProgramGraphicsAttachmentSignature, AcceptsAnyFormatTheSignatureDeclaresCompatible) {
     program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA8_UNORM});
     graphics.colorAttachments[0].formats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA8_SRGB};
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_SRGB};
     std::string error;
     EXPECT_TRUE(checkProgramGraphicsAttachmentSignature(graphics, plan, error)) << error;
@@ -563,7 +556,7 @@ TEST(ProgramGraphicsAttachmentSignature, AcceptsAnyFormatTheSignatureDeclaresCom
 
 TEST(ProgramGraphicsAttachmentSignature, RejectsAColorFormatTheProgramWasNotCompiledFor) {
     const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA16_FLOAT});
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
     std::string error;
     EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
@@ -574,7 +567,7 @@ TEST(ProgramGraphicsAttachmentSignature, RejectsAColorFormatTheProgramWasNotComp
 TEST(ProgramGraphicsAttachmentSignature, RejectsAMismatchedFormatOnALaterAttachment) {
     const program::GraphicsOperation graphics =
         operationForFormats({VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA16_FLOAT});
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_R32_FLOAT};
     std::string error;
     EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
@@ -585,7 +578,7 @@ TEST(ProgramGraphicsAttachmentSignature, RejectsAMismatchedDepthFormat) {
     const program::GraphicsOperation graphics =
         operationForFormats({VERNON_TEXTURE_RGBA8_UNORM}, VERNON_TEXTURE_D32_FLOAT);
     const VernonDepthAttachment depth{};
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
     plan.depthAttachment = &depth;
     plan.depthFormat = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
@@ -597,7 +590,7 @@ TEST(ProgramGraphicsAttachmentSignature, RejectsAMismatchedDepthFormat) {
 TEST(ProgramGraphicsAttachmentSignature, RejectsAMissingDepthAttachment) {
     const program::GraphicsOperation graphics =
         operationForFormats({VERNON_TEXTURE_RGBA8_UNORM}, VERNON_TEXTURE_D32_FLOAT);
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
     std::string error;
     EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
@@ -606,7 +599,7 @@ TEST(ProgramGraphicsAttachmentSignature, RejectsAMissingDepthAttachment) {
 
 TEST(ProgramGraphicsAttachmentSignature, RejectsABoundColorAttachmentCountMismatch) {
     const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA8_UNORM});
-    PlannedGraphicsInvocation plan;
+    PlannedRenderTargets plan;
     plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA8_UNORM};
     std::string error;
     EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));

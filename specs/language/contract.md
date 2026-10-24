@@ -522,7 +522,15 @@ constant-expression subset and are part of specialization identity. A Struct
 keeps its declared class name in emitted source, reflection, and host Values
 whichever module declares it, so two different reachable Structs with one name
 are rejected with `conflicting declarations named`; imported helpers are
-module-qualified. The design rationale for sections 6.1 through 6.6 is in
+module-qualified. A module-level `NAME = expression` is a module constant when
+the expression is a compile-time expression (section 6.2) over literals and
+other module constants, local or imported, that folds to an `int`, `float`, or
+`bool`; `INV_PI = 1.0 / PI` with `PI` imported from another file is one. Other
+modules import a constant by name or read it through an imported module, and
+every use is replaced by its value. Importing an assignment that does not fold
+is rejected with `is not a compile-time constant`, and a constant whose value
+depends on itself with `depends on itself`. The design rationale for
+sections 6.1 through 6.6 is in
 [`static_specialization.md`](static_specialization.md).
 
 ### 6.1 Specializations and variants
@@ -549,11 +557,13 @@ false, and a type specialization has no default.
 
 ### 6.2 Compile-time expressions and static branches
 
-A compile-time expression contains only literals, captured constants,
-specialization names, and these operators:
+A compile-time expression contains only literals, module constants,
+specialization names, and these operators, which evaluate with Python
+semantics:
 
 - `==` and `!=` on every specialization kind;
-- `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `//`, and `%` on numeric kinds;
+- `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `//`, `%`, and `**` on numeric
+  kinds;
 - `and`, `or`, `not`.
 
 A type specialization compares only with `==` and `!=` against a type
@@ -597,11 +607,25 @@ annotations contain conditions other than `==` and `!=` needs
 A `@vd.binding_group` class declares a named group of entry interface items.
 Its fields are `TensorView`, `Texture`, and `Sampler` resources; Values,
 including Structs, which bind as immutable uniforms in graphics stages and as
-ordinary Value parameters in Kernels; and nested binding groups. Fields carry
-no `attribute`, `varying`, `builtin`, `set`, or `binding` metadata, so one
-group is valid in every stage. Graphics TensorView fields follow the read-only
-rule of
+ordinary Value parameters in Kernels; vertex attributes; and nested binding
+groups. A vertex attribute field is `Annotated[T, attribute()]` or
+`Annotated[T, attribute(divisor=n)]` with a Value type `T`; it binds as a
+vertex buffer, as an ungrouped attribute parameter does. Fields carry no
+other metadata (`varying`, `builtin`, `uniform`, `resource`, `set`,
+`binding`), and an attribute field takes no explicit location
+(`binding group attribute cannot declare a location`), so a group's
+locations follow from where it is used. Graphics TensorView fields follow
+the read-only rule of
 [`../program/graphics_storage_reads.md`](../program/graphics_storage_reads.md).
+
+A group whose leaves include a vertex attribute is a *vertex group*. It is
+valid only as a vertex-stage parameter, and helpers that take it are
+reachable only from vertex stages (`binding group with vertex attributes is
+only valid in a vertex stage`). Every other group stays valid in every stage.
+A vertex group is how a geometry source keeps its per-vertex buffers and
+the data that goes with them (a bone palette, an index range) in one group,
+so one bound group object serves a draw, rather than every draw binding its
+vertex buffers next to the pass-wide values of group 0.
 
 A binding group is not a Value. It appears only as an entry parameter, a
 helper parameter, a forwarded argument, or the receiver of a field access or
@@ -619,7 +643,10 @@ derivative paths. On the host the class is a plain container:
 group occurrence takes one consecutive binding range in field order, including
 spilled uniforms, storage leaves, and nested groups, and the same group under
 the same name in both stages of a pipeline reuses that range. All ranges are in
-descriptor set 0.
+descriptor set 0. Attribute leaves take vertex-input locations instead of
+bindings: after the entry's explicit locations and its ungrouped attributes
+are placed, group attribute leaves take the first free ranges in flattened
+declaration order.
 
 Every backend accepts every group leaf kind, including Struct and Tuple Value
 leaves in GPU Kernels; leaf scalar types still follow target capabilities.
@@ -736,6 +763,11 @@ indexed assignment, annotated assignment, augmented assignment, `return`,
 `if`, `range` loops, `while`, loop `else`, `break`, and `continue`. Return may
 terminate a nested structured region; break and continue target the nearest
 enclosing loop.
+
+A string literal that is the first statement of a module, function or class
+is a docstring, as in Python. It is documentation only: the frontend drops it
+before typing, and a body that holds only a docstring is empty. Any other
+string expression statement is rejected.
 
 The expression subset includes names, numeric and Boolean literals, arithmetic,
 unary operations, one comparison, calls, indexing, Tensor/Tuple/Struct

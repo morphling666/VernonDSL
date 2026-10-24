@@ -523,7 +523,7 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
         const ProgramInvocationContext programContext{
             *invocation->snapshot,        invocation->checkpointMemoryBudget,
             invocation->checkpointPolicy, invocation->executionWorkspace.get(),
-            recordedGraphics.get(),
+            recordedGraphics.get(),       &invocation->instance->groups,
         };
         VernonPullback *pullback = nullptr;
         vernon::runtime::program_execution::InvocationMutationOutcome outcome;

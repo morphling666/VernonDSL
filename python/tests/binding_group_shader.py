@@ -58,6 +58,17 @@ def surface_fragment(surface: Surface, flat: Flat) -> vd.Vector[vd.f32, 4]:
 
 
 @vd.binding_group
+class Layered:
+    params: SurfaceParams
+    weights: vd.Texture["2d", vd.f32]  # noqa: F722
+
+
+@vd.fragment
+def layered_fragment(layered: Layered) -> vd.Vector[vd.f32, 4]:
+    return layered.params.tint
+
+
+@vd.binding_group
 class Accumulator:
     params: SurfaceParams
     lookup: Lookup

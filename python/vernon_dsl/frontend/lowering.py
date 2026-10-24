@@ -69,6 +69,7 @@ class _FunctionEmitter:
         stage: str | None,
         workgroup_size: tuple[int, int, int] | None,
         planning_policy: str | None = None,
+        textures_read_elsewhere: frozenset[str] = frozenset(),
     ):
         self.context = context
         self.node = typed_function.source
@@ -89,7 +90,7 @@ class _FunctionEmitter:
         self.generated_values: dict[str, Value] = {}
         self.implicit_samplers: dict[str, Value] = {}
         self.interface_plan = plan_generated_interface(
-            context, self.node, argument_annotations, stage, typed_function.effects
+            context, self.node, argument_annotations, stage, typed_function.effects, textures_read_elsewhere
         )
         self.returned = False
         self.loop_controls: list[str] = []
@@ -229,9 +230,13 @@ class _FunctionEmitter:
                 argument_locations[index] = explicit
 
             next_location = 0
-            for index, _, span, explicit in candidates:
-                if explicit is not None:
-                    continue
+            # Group leaves follow every ungrouped attribute, matching the module graph, which places ungrouped
+            # parameters before the entry is flattened.
+            automatic = [candidate for candidate in candidates if candidate[3] is None]
+            automatic.sort(
+                key=lambda candidate: binding_group_occurrence(self.node.args.args[candidate[0]]) is not None
+            )
+            for index, _, span, _ in automatic:
                 while occupied & set(range(next_location, next_location + span)):
                     next_location += 1
                 argument_locations[index] = next_location

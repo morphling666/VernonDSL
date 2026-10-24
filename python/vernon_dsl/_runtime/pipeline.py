@@ -12,12 +12,14 @@ from .._markers import dsl_kind, is_struct_class
 from ..binding_groups import expand_binding_group_arguments
 from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest
+from ..frontend.interfaces import read_sampled_textures, unread_sampled_textures
 from ..frontend.runtime_types import (
     RuntimeParameterDescriptor,
     resolved_leaf_annotations,
     runtime_parameter_descriptor,
 )
 from ..language.stage_registry import validate_graphics_topology
+from ..module_graph import project_declared_specializations
 from ..operation_graph import ProgramControlDescriptor
 from ..render import (
     DrawCommand,
@@ -152,11 +154,36 @@ class Pipeline:
         specializations: tuple[SpecializationAssignment, ...],
     ) -> tuple[Any, ...]:
         compiler = Compiler()
+        entries = [
+            (Path(inspect.getsourcefile(stage.function) or "").resolve(), stage.function.__name__)
+            for stage in self._stages
+        ]
+        # The stages share one key, but each module graph knows only its own declarations. A name no stage declares
+        # stays in every request, so the frontend still rejects it as undeclared.
+        declared = [set(project_declared_specializations(source, specializations, entry)) for source, entry in entries]
+        anywhere = set().union(*declared)
         result = []
-        for stage in self._stages:
-            function = stage.function
-            source = Path(inspect.getsourcefile(function) or "").resolve()
-            result.append(compiler.compile_request(FrontendCompileRequest(source, function.__name__, specializations)))
+        for (source, entry), names in zip(entries, declared, strict=True):
+            selected = tuple(
+                assignment
+                for assignment in specializations
+                if assignment.name in names or assignment.name not in anywhere
+            )
+            result.append(compiler.compile_request(FrontendCompileRequest(source, entry, selected)))
+        # A stage plans an implicit sampler for each sampled texture it leaves unread, so the combined image-sampler
+        # binding has one; when another stage reads that texture, that stage pairs it instead, so this one is
+        # recompiled without it.
+        typed_entries = [
+            next(typed for typed in frontend.typed_functions if typed.symbol == frontend.request.entry)
+            for frontend in result
+        ]
+        read = [read_sampled_textures(typed) for typed in typed_entries]
+        for index, typed in enumerate(typed_entries):
+            read_elsewhere = frozenset().union(*(textures for other, textures in enumerate(read) if other != index))
+            paired = unread_sampled_textures(typed) & read_elsewhere
+            if paired:
+                request = dataclasses.replace(result[index].request, textures_read_elsewhere=tuple(paired))
+                result[index] = compiler.compile_request(request)
         return tuple(result)
 
     @staticmethod

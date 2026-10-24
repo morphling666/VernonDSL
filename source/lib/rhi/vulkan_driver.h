@@ -71,6 +71,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkDestroyPipeline destroyPipeline{};
     PFN_vkCreateDescriptorPool createDescriptorPool{};
     PFN_vkDestroyDescriptorPool destroyDescriptorPool{};
+    PFN_vkResetDescriptorPool resetDescriptorPool{};
     PFN_vkAllocateDescriptorSets allocateDescriptorSets{};
     PFN_vkFreeDescriptorSets freeDescriptorSets{};
     PFN_vkUpdateDescriptorSets updateDescriptorSets{};

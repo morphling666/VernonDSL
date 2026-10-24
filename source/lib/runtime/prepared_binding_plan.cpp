@@ -17,19 +17,21 @@ bool isOpenGLBackend(VernonRuntimeBackend backend) {
     return backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES;
 }
 
-uint32_t accessMask(const Parameter &parameter) {
-    return parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
-}
+uint32_t accessMask(const std::string &access) { return access == "read" ? 1u : access == "write" ? 2u : 3u; }
 
 bool appendBinding(PreparedComputeBindingPlan &plan, VernonRuntimeProviderBindingLayoutEntry layout,
-                   uint32_t argumentIndex, uint64_t resourceOffset, std::string &error) {
+                   uint32_t argumentIndex, uint32_t parameter, std::string &error) {
     if (!layout.element_size) {
         error = "prepared compute binding has zero element size";
         return false;
     }
     plan.layouts.push_back(layout);
-    plan.sources.push_back({argumentIndex, resourceOffset, false});
+    plan.sources.push_back({argumentIndex, 0, false, parameter});
     return true;
+}
+
+uint32_t parameterIndex(const StageBindingPlan &stagePlan, const Parameter &parameter) {
+    return static_cast<uint32_t>(&parameter - stagePlan.parameters.data());
 }
 
 std::optional<VernonRuntimeProviderBindingKind> graphicsProviderKind(std::string_view transport) {
@@ -226,7 +228,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                 if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER && use.interfaceKind == "value")
                     layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-                layout.access = accessMask(parameter);
+                layout.access = accessMask(argument.access);
                 layout.array_count = 1;
                 layout.argument_index = use.index;
                 layout.element_size = static_cast<uint32_t>(
@@ -243,7 +245,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                     error = "prepared compute native binding is incomplete";
                     return false;
                 }
-                if (!appendBinding(output, layout, use.index, 0, error))
+                if (!appendBinding(output, layout, use.index, parameterIndex(stagePlan, parameter), error))
                     return false;
             }
         }
@@ -281,7 +283,7 @@ bool buildPreparedComputeBindingPlan(const StageBindingPlan &stagePlan, const Re
                 layout.array_count = 1;
                 layout.argument_index = use.index;
                 layout.element_size = 1;
-                if (!appendBinding(output, layout, use.index, 0, error))
+                if (!appendBinding(output, layout, use.index, parameterIndex(stagePlan, parameter), error))
                     return false;
                 firstLayout = false;
             }
@@ -350,78 +352,99 @@ bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &l
     return true;
 }
 
-bool fillPreparedComputeBindingValues(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
-                                      const PlannedComputeLaunch &launch,
-                                      std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error) {
-    values.resize(prepared.size());
-    for (size_t index = 0; index < prepared.size(); ++index) {
-        const VernonRuntimeProviderBindingLayoutEntry &layout = prepared.layouts[index];
-        const PreparedBindingSource &source = prepared.sources[index];
-        VernonRuntimeProviderBindingValue &value = values[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (source.metadataCarrier) {
-            if (!bindComputeMetadataCarrier(layout, source, launch, value)) {
-                error = "metadata carrier payload does not match its compiled ABI";
-                return false;
-            }
-            continue;
-        }
-        if (source.argumentIndex >= launch.arguments.size()) {
-            error = "prepared argument index is invalid";
+bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
+                                     const PlannedComputeLaunch &launch, size_t slot,
+                                     VernonRuntimeProviderBindingValue &value, std::string &error) {
+    const VernonRuntimeProviderBindingLayoutEntry &layout = prepared.layouts[slot];
+    const PreparedBindingSource &source = prepared.sources[slot];
+    value = {};
+    value.slot = layout.slot;
+    value.kind = layout.kind;
+    if (source.metadataCarrier) {
+        if (!bindComputeMetadataCarrier(layout, source, launch, value)) {
+            error = "metadata carrier payload does not match its compiled ABI";
             return false;
         }
-        const ComputeLaunchArgument &argument = launch.arguments[source.argumentIndex];
-        if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-            layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
-            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
-            if (!tensor || !tensor->resource.resource.value) {
-                error = "prepared storage binding requires an RHI Tensor";
-                return false;
-            }
-            value.payload.buffer.resource = tensor->resource;
-            VernonRuntimeProviderResourceReference &resource = value.payload.buffer.resource;
-            if (resource.offset > resource.size || source.resourceOffset > resource.size - resource.offset) {
-                error = "aggregate storage leaf exceeds its Tensor resource";
-                return false;
-            }
-            resource.offset += source.resourceOffset;
-        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto *image = std::get_if<ComputeImageArgument>(&argument);
-            if (!image || !image->view.resource.value) {
-                error = "prepared image binding requires an RHI Texture";
-                return false;
-            }
-            value.payload.image.view = image->view;
-        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
-            const auto *sampler = std::get_if<ComputeSamplerArgument>(&argument);
-            if (!sampler || !sampler->resource.resource.value) {
-                error = "prepared sampler binding requires an RHI Sampler";
-                return false;
-            }
-            value.payload.sampler.resource = sampler->resource;
-        } else {
-            // A Value-storage buffer carries its packed bytes inline, exactly like an inline value.
-            const bool valueStorage = layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar || !scalar->data || !scalar->size || (valueStorage && scalar->size != layout.element_size)) {
-                error = "prepared inline binding requires host data at argument " +
-                        std::to_string(layout.argument_index) + " (kind " + std::to_string(argument.index()) +
-                        ", size " + std::to_string(scalar ? scalar->size : 0) + ")";
-                for (const Parameter &parameter : projection.parameters)
-                    for (const ParameterUse &use : parameter.uses)
-                        if (use.index == layout.argument_index)
-                            error += " for parameter '" + parameter.name + "' (interface " + use.interfaceKind +
-                                     ", transport " + use.transport + ")";
-                return false;
-            }
-            value.payload.inline_value.data = scalar->data;
-            value.payload.inline_value.size = scalar->size;
+        return true;
+    }
+    if (source.argumentIndex >= launch.arguments.size()) {
+        error = "prepared argument index is invalid";
+        return false;
+    }
+    const ComputeLaunchArgument &argument = launch.arguments[source.argumentIndex];
+    if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+        layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+        const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+        if (!tensor || !tensor->resource.resource.value) {
+            error = "prepared storage binding requires an RHI Tensor";
+            return false;
         }
+        value.payload.buffer.resource = tensor->resource;
+        VernonRuntimeProviderResourceReference &resource = value.payload.buffer.resource;
+        if (source.resourceOffset >= resource.size) {
+            error = "aggregate storage leaf exceeds its Tensor resource";
+            return false;
+        }
+        resource.offset += source.resourceOffset;
+        resource.size -= source.resourceOffset;
+    } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+               layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+        const auto *image = std::get_if<ComputeImageArgument>(&argument);
+        if (!image || !image->view.resource.value) {
+            error = "prepared image binding requires an RHI Texture";
+            return false;
+        }
+        value.payload.image.view = image->view;
+    } else if (layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
+        const auto *sampler = std::get_if<ComputeSamplerArgument>(&argument);
+        if (!sampler || !sampler->resource.resource.value) {
+            error = "prepared sampler binding requires an RHI Sampler";
+            return false;
+        }
+        value.payload.sampler.resource = sampler->resource;
+    } else {
+        // A Value-storage buffer carries its packed bytes inline, exactly like an inline value.
+        const bool valueStorage = layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+        const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+        if (!scalar || !scalar->data || !scalar->size || (valueStorage && scalar->size != layout.element_size)) {
+            error = "prepared inline binding requires host data at argument " + std::to_string(layout.argument_index) +
+                    " (kind " + std::to_string(argument.index()) + ", size " +
+                    std::to_string(scalar ? scalar->size : 0) + ")";
+            for (const Parameter &parameter : projection.parameters)
+                for (const ParameterUse &use : parameter.uses)
+                    if (use.index == layout.argument_index)
+                        error += " for parameter '" + parameter.name + "' (interface " + use.interfaceKind +
+                                 ", transport " + use.transport + ")";
+            return false;
+        }
+        value.payload.inline_value.data = scalar->data;
+        value.payload.inline_value.size = scalar->size;
     }
     return true;
+}
+
+std::vector<PipelineGroups::SlotDependencies>
+preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &stagePlan) {
+    std::vector<PipelineGroups::SlotDependencies> result(prepared.size());
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        const PreparedBindingSource &source = prepared.sources[index];
+        PipelineGroups::SlotDependencies &dependencies = result[index];
+        if (source.parameter != UINT32_MAX) {
+            dependencies.parameters.push_back(source.parameter);
+        } else if (source.metadataCarrier && prepared.metadataCarrier) {
+            for (const MetadataFieldIdentity &field : prepared.metadataCarrier->plan.fields) {
+                const size_t known = dependencies.parameters.size();
+                for (size_t parameter = 0; parameter < stagePlan.parameters.size(); ++parameter)
+                    for (const ParameterUse &use : stagePlan.parameters[parameter].uses)
+                        if ((use.stage == "compute" || use.stage == stagePlan.compute) && use.index == field.argument)
+                            dependencies.parameters.push_back(static_cast<uint32_t>(parameter));
+                dependencies.command = dependencies.command || dependencies.parameters.size() == known;
+            }
+        } else {
+            dependencies.command = true;
+        }
+    }
+    return result;
 }
 
 bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, std::string &error) {
@@ -528,6 +551,15 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 return true;
             }
         }
+        // OpenGL ignores the set, so a binding point names one descriptor across every set of the pipeline.
+        if (openGL && layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+            layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+            std::any_of(output.layouts.begin(), output.layouts.end(), [&](const auto &existing) {
+                return existing.kind == layout.kind && existing.binding == layout.binding && existing.set != layout.set;
+            })) {
+            error = "OpenGL binding " + std::to_string(layout.binding) + " is used by several descriptor sets";
+            return false;
+        }
         if (std::any_of(output.layouts.begin(), output.layouts.end(),
                         [&](const auto &existing) { return existing.slot == layout.slot; }) &&
             !allocateSlot(layout.slot))
@@ -547,15 +579,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             error = "graphics parameter references an unsupported stage";
             return false;
         }
-        if ((openGL || directX12) &&
-            ((use.binding != UINT32_MAX && use.descriptorSet != 0) ||
-             std::any_of(use.sampledImageBindings.begin(), use.sampledImageBindings.end(),
-                         [](const SampledImageBinding &binding) { return binding.descriptorSet != 0; }))) {
-            error = openGL ? "OpenGL supports reflected resources only in descriptor set 0"
-                           : "D3D12 graphics resources must use descriptor set 0";
-            return false;
-        }
-
         VernonRuntimeProviderBindingLayoutEntry layout{};
         if (usesSequentialGraphicsSlots(options.backend) || internal) {
             if (!allocateSlot(layout.slot))
@@ -567,7 +590,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         layout.stage_mask = stageMask;
         layout.array_count = 1;
         PreparedGraphicsBindingSource source;
-        source.externalSlot = parameter.slot;
+        source.parameter = internal ? UINT32_MAX : parameterIndex(stagePlan, parameter);
         source.descriptorSet = use.descriptorSet;
         source.descriptorBinding = use.binding;
 
@@ -640,7 +663,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 layout.set = use.descriptorSet;
                 layout.binding = use.binding;
             }
-            source.storage.resize(layout.element_size);
             return append(layout, std::move(source), {});
         }
 
@@ -692,7 +714,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 return false;
             }
             source.packing = std::move(packing).value();
-            source.storage.resize(layout.element_size);
             if (metal) {
                 const char *kind = layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER   ? "uniform_buffer"
                                    : layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? "storage_buffer"
@@ -714,6 +735,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
             layout.element_size = parameter.elementLayout.byteSize;
             layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
+            layout.set = use.descriptorSet;
             if (!layout.element_size) {
                 error = "graphics vertex element size is zero";
                 return false;
@@ -823,18 +845,18 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         PreparedGraphicsMetadataCarrier prepared;
         prepared.plan = carrier;
         for (const MetadataFieldIdentity &field : carrier.fields) {
-            uint32_t slot = UINT32_MAX;
+            uint32_t found = UINT32_MAX;
             for (const Parameter &parameter : stagePlan.parameters)
                 for (const ParameterUse &use : parameter.uses)
                     if (parameter.kind == "tensor" && use.stage == stage && use.index == field.argument)
-                        slot = parameter.slot;
-            if (slot == UINT32_MAX) {
+                        found = parameterIndex(stagePlan, parameter);
+            if (found == UINT32_MAX) {
                 error = "graphics module metadata field does not name a Tensor use of its module";
                 return false;
             }
-            if (prepared.argumentSlots.size() <= field.argument)
-                prepared.argumentSlots.resize(static_cast<size_t>(field.argument) + 1, UINT32_MAX);
-            prepared.argumentSlots[field.argument] = slot;
+            if (prepared.argumentParameters.size() <= field.argument)
+                prepared.argumentParameters.resize(static_cast<size_t>(field.argument) + 1, UINT32_MAX);
+            prepared.argumentParameters[field.argument] = found;
         }
         VernonRuntimeProviderBindingLayoutEntry layout{};
         if (!allocateSlot(layout.slot))
@@ -849,16 +871,11 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         layout.argument_index = UINT32_MAX;
         if (!setMetadataLayoutSize(carrier, layout, error))
             return false;
-        if (openGL && layout.set != 0) {
-            error = "OpenGL supports reflected resources only in descriptor set 0";
-            return false;
-        }
         PreparedGraphicsBindingSource source;
         source.kind = PreparedGraphicsBindingSourceKind::ModuleMetadata;
         source.metadataCarrier = static_cast<uint32_t>(output.metadataCarriers.size());
         source.descriptorSet = carrier.descriptorSet;
         source.descriptorBinding = carrier.binding;
-        source.storage.resize(layout.element_size);
         output.metadataCarriers.push_back(std::move(prepared));
         if (!append(layout, std::move(source), {}))
             return false;
@@ -906,8 +923,15 @@ bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan
         }
         if ((source.kind == PreparedGraphicsBindingSourceKind::ExternalUniform ||
              source.kind == PreparedGraphicsBindingSourceKind::Resolution) &&
-            (!layout.element_size || source.storage.size() != layout.element_size)) {
+            !layout.element_size) {
             error = "prepared graphics inline storage disagrees with its provider layout";
+            return false;
+        }
+        const bool external = source.kind != PreparedGraphicsBindingSourceKind::ImplicitSampler &&
+                              source.kind != PreparedGraphicsBindingSourceKind::Resolution &&
+                              source.kind != PreparedGraphicsBindingSourceKind::ModuleMetadata;
+        if (external != (source.parameter != UINT32_MAX)) {
+            error = "prepared graphics binding source has no Stage parameter";
             return false;
         }
         if ((source.kind == PreparedGraphicsBindingSourceKind::ImplicitSampler ||
@@ -926,7 +950,6 @@ bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan
         if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata &&
             (layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
              source.metadataCarrier >= plan.metadataCarriers.size() || !layout.element_size ||
-             source.storage.size() != layout.element_size ||
              plan.metadataCarriers[source.metadataCarrier].plan.size != layout.element_size)) {
             error = "prepared graphics metadata carrier disagrees with its provider layout";
             return false;
@@ -935,119 +958,129 @@ bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan
     return true;
 }
 
-bool fillPreparedGraphicsBindingValues(PreparedGraphicsBindingPlan &prepared,
-                                       const PlannedGraphicsInvocation &invocation,
-                                       std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error) {
-    if (values.size() != prepared.size()) {
-        error = "prepared graphics value array has the wrong length";
-        return false;
-    }
-    for (size_t index = 0; index < prepared.size(); ++index) {
-        const auto &layout = prepared.layouts[index];
-        auto &source = prepared.sources[index];
-        auto &value = values[index];
-        value = {};
-        value.slot = layout.slot;
-        value.kind = layout.kind;
-        if (source.kind == PreparedGraphicsBindingSourceKind::ExternalVertex) {
-            const auto found = invocation.arguments.find(source.externalSlot);
-            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
-                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
-                !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
-                found->second->tensor.byte_strides[0] <= 0 ||
-                static_cast<uint64_t>(found->second->tensor.byte_strides[0]) > UINT32_MAX) {
-                error = "graphics vertex argument is missing or invalid";
-                return false;
-            }
-            const VernonTensorView &tensor = found->second->tensor;
-            value.payload.buffer.resource = tensor.resource;
-            value.payload.buffer.resource.offset += tensor.byte_offset;
-            value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ExternalImage) {
-            const auto found = invocation.arguments.find(source.externalSlot);
-            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
-                !found->second->image.view.resource.value) {
-                error = "graphics image argument is missing";
-                return false;
-            }
-            value.payload.image.view = found->second->image.view;
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ExternalSampler) {
-            const auto found = invocation.arguments.find(source.externalSlot);
-            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
-                !found->second->resource.resource.value) {
-                error = "graphics sampler argument is missing";
-                return false;
-            }
-            value.payload.sampler.resource = found->second->resource;
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ImplicitSampler) {
-            const auto sampled = invocation.sampledResources.find({source.descriptorSet, source.descriptorBinding});
-            if (sampled == invocation.sampledResources.end()) {
-                error = "graphics implicit sampler binding is missing";
-                return false;
-            }
-            if (sampled->second.samplerResource.resource.value)
-                value.payload.sampler.resource = sampled->second.samplerResource;
-            else
-                value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::Resolution) {
-            if (source.storage.size() < sizeof(invocation.resolution)) {
-                error = "graphics resolution storage is too small";
-                return false;
-            }
-            std::memcpy(source.storage.data(), invocation.resolution.data(), sizeof(invocation.resolution));
-            value.payload.inline_value.data = source.storage.data();
-            value.payload.inline_value.size = source.storage.size();
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ExternalUniform) {
-            const auto found = invocation.arguments.find(source.externalSlot);
-            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR) {
-                error = "graphics uniform argument is missing";
-                return false;
-            }
-            auto packed = packTensor(found->second->tensor, source.packing);
-            if (packed.isErr() || packed.value().size() != source.storage.size()) {
-                error = "graphics uniform Tensor does not satisfy its prepared packing plan";
-                return false;
-            }
-            source.storage = std::move(packed).value();
-            value.payload.inline_value.data = source.storage.data();
-            value.payload.inline_value.size = source.storage.size();
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ExternalStorage) {
-            const auto found = invocation.arguments.find(source.externalSlot);
-            if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
-                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
-                !found->second->tensor.resource.resource.value ||
-                found->second->tensor.resource.offset >= found->second->tensor.resource.size ||
-                found->second->tensor.byte_size >
-                    found->second->tensor.resource.size - found->second->tensor.resource.offset) {
-                error = "graphics TensorView storage argument must be an RHI Tensor within its resource";
-                return false;
-            }
-            // The view offset travels in the metadata carrier, so every leaf
-            // binds the base of the record buffer.
-            value.payload.buffer.resource = found->second->tensor.resource;
-        } else if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata) {
-            const PreparedGraphicsMetadataCarrier &carrier = prepared.metadataCarriers[source.metadataCarrier];
-            std::vector<const VernonTensorView *> views(carrier.argumentSlots.size());
-            for (size_t argument = 0; argument < carrier.argumentSlots.size(); ++argument) {
-                if (carrier.argumentSlots[argument] == UINT32_MAX)
-                    continue;
-                const auto found = invocation.arguments.find(carrier.argumentSlots[argument]);
-                if (found == invocation.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR) {
-                    error = "graphics metadata carrier source is not a TensorView argument";
-                    return false;
-                }
-                views[argument] = &found->second->tensor;
-            }
-            if (!materializeTensorViewMetadata(carrier.plan, views, source.storage, error))
-                return false;
-            value.payload.inline_value.data = source.storage.data();
-            value.payload.inline_value.size = source.storage.size();
-        } else {
-            error = "prepared graphics binding source is invalid";
+bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
+                                      size_t slot, VernonRuntimeProviderBindingValue &value,
+                                      std::vector<uint8_t> &storage, std::string &error) {
+    const auto &layout = prepared.layouts[slot];
+    const auto &source = prepared.sources[slot];
+    value = {};
+    value.slot = layout.slot;
+    value.kind = layout.kind;
+    const VernonProgramArgument *argument =
+        source.parameter == UINT32_MAX ? nullptr : inputs.arguments[source.parameter];
+    const auto setInline = [&]() {
+        value.payload.inline_value.data = storage.data();
+        value.payload.inline_value.size = storage.size();
+    };
+    switch (source.kind) {
+    case PreparedGraphicsBindingSourceKind::ExternalVertex: {
+        if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
+            argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
+            !argument->tensor.byte_strides || argument->tensor.byte_strides[0] <= 0 ||
+            static_cast<uint64_t>(argument->tensor.byte_strides[0]) > UINT32_MAX ||
+            argument->tensor.byte_offset >= argument->tensor.resource.size) {
+            error = "graphics vertex argument is missing or invalid";
             return false;
         }
+        const VernonTensorView &tensor = argument->tensor;
+        value.payload.buffer.resource = tensor.resource;
+        value.payload.buffer.resource.offset += tensor.byte_offset;
+        value.payload.buffer.resource.size -= tensor.byte_offset;
+        value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+        return true;
     }
-    return true;
+    case PreparedGraphicsBindingSourceKind::ExternalImage:
+        if (!argument || argument->kind != VERNON_PROGRAM_IMAGE || !argument->image.view.resource.value) {
+            error = "graphics image argument is missing";
+            return false;
+        }
+        value.payload.image.view = argument->image.view;
+        return true;
+    case PreparedGraphicsBindingSourceKind::ExternalSampler:
+        if (!argument || argument->kind != VERNON_PROGRAM_SAMPLER || !argument->resource.resource.value) {
+            error = "graphics sampler argument is missing";
+            return false;
+        }
+        value.payload.sampler.resource = argument->resource;
+        return true;
+    // An implicit sampler never shares its image with an explicit one, so it always binds the default sampler.
+    case PreparedGraphicsBindingSourceKind::ImplicitSampler:
+        value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
+        return true;
+    case PreparedGraphicsBindingSourceKind::Resolution:
+        storage.assign(layout.element_size, 0);
+        if (storage.size() < sizeof(inputs.resolution)) {
+            error = "graphics resolution storage is too small";
+            return false;
+        }
+        std::memcpy(storage.data(), inputs.resolution.data(), sizeof(inputs.resolution));
+        setInline();
+        return true;
+    case PreparedGraphicsBindingSourceKind::ExternalUniform: {
+        if (!argument || argument->kind != VERNON_PROGRAM_TENSOR) {
+            error = "graphics uniform argument is missing";
+            return false;
+        }
+        auto packed = packTensor(argument->tensor, source.packing);
+        if (packed.isErr() || packed.value().size() != layout.element_size) {
+            error = "graphics uniform Tensor does not satisfy its prepared packing plan";
+            return false;
+        }
+        storage = std::move(packed).value();
+        setInline();
+        return true;
+    }
+    case PreparedGraphicsBindingSourceKind::ExternalStorage:
+        if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
+            argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
+            argument->tensor.byte_size > argument->tensor.resource.size) {
+            error = "graphics TensorView storage argument must be an RHI Tensor within its resource";
+            return false;
+        }
+        // The view offset travels in the metadata carrier, so every leaf
+        // binds the base of the record buffer.
+        value.payload.buffer.resource = argument->tensor.resource;
+        return true;
+    case PreparedGraphicsBindingSourceKind::ModuleMetadata: {
+        const PreparedGraphicsMetadataCarrier &carrier = prepared.metadataCarriers[source.metadataCarrier];
+        std::vector<const VernonTensorView *> views(carrier.argumentParameters.size());
+        for (size_t endpoint = 0; endpoint < carrier.argumentParameters.size(); ++endpoint) {
+            if (carrier.argumentParameters[endpoint] == UINT32_MAX)
+                continue;
+            const VernonProgramArgument *viewed = inputs.arguments[carrier.argumentParameters[endpoint]];
+            if (!viewed || viewed->kind != VERNON_PROGRAM_TENSOR) {
+                error = "graphics metadata carrier source is not a TensorView argument";
+                return false;
+            }
+            views[endpoint] = &viewed->tensor;
+        }
+        storage.resize(layout.element_size);
+        if (!materializeTensorViewMetadata(carrier.plan, views, storage, error))
+            return false;
+        setInline();
+        return true;
+    }
+    }
+    error = "prepared graphics binding source is invalid";
+    return false;
+}
+
+std::vector<PipelineGroups::SlotDependencies>
+preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared) {
+    std::vector<PipelineGroups::SlotDependencies> result(prepared.size());
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        const PreparedGraphicsBindingSource &source = prepared.sources[index];
+        PipelineGroups::SlotDependencies &dependencies = result[index];
+        if (source.parameter != UINT32_MAX)
+            dependencies.parameters.push_back(source.parameter);
+        else if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata)
+            for (uint32_t parameter : prepared.metadataCarriers[source.metadataCarrier].argumentParameters)
+                if (parameter != UINT32_MAX)
+                    dependencies.parameters.push_back(parameter);
+        // The resolution follows the command's viewport.
+        dependencies.command = source.kind == PreparedGraphicsBindingSourceKind::Resolution;
+    }
+    return result;
 }
 
 } // namespace vernon::runtime

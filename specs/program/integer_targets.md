@@ -71,6 +71,16 @@ attachment, with `PROGRAM_OPERATION_UNSUPPORTED`
   `texture_sample` pairs with an explicit sampler; the Runtime binds its
   default sampler, and reflection pairs it with the texture its
   `vernon.implicit_texture` names.
+- Pairing is per Program, because the Runtime pairs a sampled image across
+  all Stages by its native binding and rejects one paired both implicitly
+  and explicitly. A sampled texture a Stage never reads, such as a
+  binding-group leaf only the other Stage uses, gets an implicit sampler
+  unless another Stage of the pipeline reads it. The pipeline compiles its
+  Stages, then recompiles each Stage with the textures it leaves unread that
+  others read (`FrontendCompileRequest.textures_read_elsewhere`), so the
+  Stage that reads a texture is the only one that pairs it. Pairing in the
+  graphics-binding link pass was rejected: it receives Stage MLIR whose
+  generated interface is already lowered.
 - The MLIR texture element type is signless, so the frontend records the
   sample type as `vernon.dtype` on the argument. Reflection derives the
   sample result class from it (`float` for `f32`, `sint` for `i32`, `uint`

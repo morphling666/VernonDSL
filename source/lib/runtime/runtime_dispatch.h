@@ -1,9 +1,11 @@
 #ifndef VERNON_RUNTIME_RUNTIME_DISPATCH_H
 #define VERNON_RUNTIME_RUNTIME_DISPATCH_H
 
+#include "VernonRuntimeCore.h"
 #include "backend_stage_pipeline.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "pipeline_groups.h"
 #include "program_execution/invocation_outcome.h"
 #include "program_execution/materialized_node_frame.h"
 #include "program_execution/program_invocation_state.h"
@@ -14,6 +16,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct VernonProgramExecutable;
@@ -49,10 +52,12 @@ BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &con
 BackendPipelineResult resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                              VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);
-RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline,
-                                          const VernonStageInvocationDescriptor &invocation,
-                                          const PlannedGraphicsInvocation &plan);
-RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
+// Encodes one draw of `stream` on `commands`, inside its rendering scope.
+RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                          const GraphicsCommand &command, GraphicsStream &stream);
+// `owners`, when given, holds the owner of each Stage parameter's argument; otherwise the launch owns them all.
+RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+                                                 const ArgumentOwner *owners);
 
 RuntimeResult<VernonRuntimeProviderResourceReference>
 referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size);
@@ -67,9 +72,31 @@ RuntimeResult<VernonRuntimeProviderImageDescription>
 describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
 RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
                                                                           VernonRhiCommandEncoder encoder);
-RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder,
+// The RuntimeCore command state of one command encoder, ended on destruction when end() was not called.
+class BackendCommands {
+public:
+    BackendCommands() = default;
+    BackendCommands(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands) noexcept
+        : context_(&context), commands_(commands) {}
+    BackendCommands(BackendCommands &&other) noexcept
+        : context_(other.context_), commands_(std::exchange(other.commands_, nullptr)) {}
+    BackendCommands &operator=(BackendCommands &&other) noexcept;
+    BackendCommands(const BackendCommands &) = delete;
+    BackendCommands &operator=(const BackendCommands &) = delete;
+    ~BackendCommands();
+
+    VernonRuntimeCoreCommands *get() const { return commands_; }
+    RuntimeResult<void> end();
+
+private:
+    VernonRuntimeContext *context_{};
+    VernonRuntimeCoreCommands *commands_{};
+};
+
+RuntimeResult<BackendCommands> beginBackendCommands(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
+RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,
                                           const VernonRuntimeProviderRenderingDescriptor &descriptor);
-RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
+RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands);
 
 } // namespace vernon::runtime
 

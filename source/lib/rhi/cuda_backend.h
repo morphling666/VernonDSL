@@ -3,7 +3,9 @@
 
 #include "VernonRHI.h"
 #include "cuda_driver.h"
+#include "staging_pool.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -19,6 +21,15 @@ struct VERNON_RHI_CAPI DeviceState {
         size_t size{};
         bool inUse{};
         // Recorded after the stream work that reads the block; the block is reusable once it completes.
+        Event retirement{};
+    };
+    struct TransientChunk {
+        DevicePointer pointer{};
+        size_t capacity{};
+    };
+    // The transient chunks of a submitted or abandoned recording, reusable once `retirement` completes.
+    struct RetiringTransients {
+        StagingArena<TransientChunk> arena;
         Event retirement{};
     };
 
@@ -41,6 +52,12 @@ struct VERNON_RHI_CAPI DeviceState {
     Result download(void *destination, DevicePointer source, size_t size);
     Result downloadRanges(DevicePointer source, const VernonRhiBufferDownloadRange *ranges, size_t rangeCount);
     Result copy(DevicePointer destination, DevicePointer source, size_t size);
+    // Uploads `size` bytes into device memory that the open recording holds until `retireTransients`, at `offset` in
+    // `chunk`, a multiple of `alignment`.
+    Result writeTransient(const void *data, size_t size, size_t alignment, DevicePointer &chunk, size_t &offset);
+    // Ends the open recording's hold on its transient memory, which is reused once the stream work enqueued so far
+    // completes. A device records one encoder at a time, so this runs when it is submitted or abandoned.
+    Result retireTransients();
 
     Device device{};
     Context context{};
@@ -48,6 +65,8 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t computeCapabilityMajor{};
     uint32_t computeCapabilityMinor{};
     uint32_t driverVersion{};
+    // Device allocations made through `allocate`, transient chunks included.
+    mutable std::atomic<size_t> allocations{};
 
 private:
     PinnedBlock *acquirePinned(size_t size, Result &status);
@@ -56,10 +75,15 @@ private:
     Result retirePinned(PinnedBlock &block);
     Result acquireEvent(Event &event);
     void recycleEvent(Event event, bool reusable);
+    // Returns the chunks of the retiring recordings whose work has completed to `transientPool`.
+    Result reclaimTransients();
 
     std::mutex poolMutex;
     std::deque<PinnedBlock> stagingPool;
     std::vector<Event> eventPool;
+    StagingPool<TransientChunk> transientPool;
+    StagingArena<TransientChunk> recordingTransients;
+    std::deque<RetiringTransients> retiringTransients;
 };
 
 struct VERNON_RHI_CAPI PreparedFunction {

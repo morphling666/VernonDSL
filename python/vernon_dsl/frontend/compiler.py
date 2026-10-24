@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..ad import ProgramTransformSpec
 from ..diagnostics import CompileError, SourceLocation
-from ..language.ast_utils import detach_shared_nodes, dotted_name
+from ..language.ast_utils import detach_shared_nodes, dotted_name, strip_docstrings
 from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
@@ -71,10 +71,12 @@ class Compiler:
         runtime_workgroup_size: tuple[int, int, int] | None = None,
         program_transform: ProgramTransformSpec | None = None,
         autodiff_planning_policy: str | None = None,
+        textures_read_elsewhere: tuple[str, ...] = (),
     ) -> str:
         """Compile a parsed module, which the compile rewrites. Diagnostics name a node's recorded source file, and
         `filename` for nodes without one."""
         detach_shared_nodes(module)
+        strip_docstrings(module)
         module = normalize_struct_methods(module, filename)
         context = ModuleContext(filename, runtime_entry=runtime_entry)
         module = flatten_binding_groups(module, context.error)
@@ -136,6 +138,7 @@ class Compiler:
                     if node.name == runtime_entry
                     else None
                 ),
+                frozenset(textures_read_elsewhere) if node.name == runtime_entry else frozenset(),
             ).emit()
 
         return emit_mlir_module(
@@ -197,6 +200,7 @@ class Compiler:
             runtime_workgroup_size=request.workgroup_size,
             program_transform=request.program_transform,
             autodiff_planning_policy=request.autodiff_planning_policy,
+            textures_read_elsewhere=request.textures_read_elsewhere,
         )
         result = FrontendCompileResult(
             mlir,

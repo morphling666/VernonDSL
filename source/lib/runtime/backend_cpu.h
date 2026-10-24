@@ -5,6 +5,7 @@
 #include "VernonRuntimeCore.h"
 #include "VernonRuntimeProvider.h"
 #include "cpu_workgroup_dispatch.h"
+#include "pipeline_groups.h"
 #include "pipeline_metadata.h"
 #include "platform/platform_library.h"
 #include "prepared_binding_plan.h"
@@ -34,7 +35,7 @@ struct CpuContextState {
 
 struct CpuPipelineState {
     VernonRuntimeCorePipeline *pipeline{};
-    VernonRuntimeCoreBindings *bindings{};
+    PipelineGroups groups;
     VernonCpuEntryPoint entry{};
     PreparedComputeBindingPlan bindingPlan;
     std::vector<VernonRuntimeProviderBindingValue> values;

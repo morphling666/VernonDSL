@@ -298,24 +298,61 @@ RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(Vernon
                                             err(runtimeErrorFromStatus(status, {"reference_command_encoder", 0, 0}))};
 }
 
-RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder,
+BackendCommands &BackendCommands::operator=(BackendCommands &&other) noexcept {
+    if (this != &other) {
+        if (commands_)
+            (void)vernonRuntimeCoreEndCommands(commands_);
+        context_ = other.context_;
+        commands_ = std::exchange(other.commands_, nullptr);
+    }
+    return *this;
+}
+
+BackendCommands::~BackendCommands() {
+    if (commands_)
+        (void)vernonRuntimeCoreEndCommands(commands_);
+}
+
+RuntimeResult<void> BackendCommands::end() {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(*context_);
+    const VernonStatus status = vernonRuntimeCoreEndCommands(std::exchange(commands_, nullptr));
+    if (!adapter)
+        return status == VERNON_STATUS_OK ? RuntimeResult<void>{ok()}
+                                          : runtimeFailure(RuntimeErrorCode::InvalidArgument, "end_backend_commands");
+    return renderingResult(*context_, *adapter, status, "end_backend_commands", "failed to end commands");
+}
+
+RuntimeResult<BackendCommands> beginBackendCommands(VernonRuntimeContext &context,
+                                                    VernonRuntimeProviderObject encoder) {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    if (!adapter)
+        return RuntimeResult<BackendCommands>{
+            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"begin_backend_commands", 0, 0}})};
+    VernonRuntimeCoreCommands *commands = nullptr;
+    auto begun =
+        renderingResult(context, *adapter,
+                        vernonRuntimeCoreBeginCommands(vernonRuntimeRhiAdapterGetProvider(adapter), encoder, &commands),
+                        "begin_backend_commands", "failed to begin commands");
+    if (begun.isErr())
+        return RuntimeResult<BackendCommands>{err(std::move(begun).error())};
+    return RuntimeResult<BackendCommands>{ok(BackendCommands(context, commands))};
+}
+
+RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,
                                           const VernonRuntimeProviderRenderingDescriptor &descriptor) {
     VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
     if (!adapter)
         return runtimeFailure(RuntimeErrorCode::InvalidArgument, "begin_backend_rendering");
-    return renderingResult(
-        context, *adapter,
-        vernonRuntimeCoreBeginRendering(vernonRuntimeRhiAdapterGetProvider(adapter), encoder, &descriptor),
-        "begin_backend_rendering", "failed to begin rendering");
+    return renderingResult(context, *adapter, vernonRuntimeCoreBeginRendering(commands, &descriptor),
+                           "begin_backend_rendering", "failed to begin rendering");
 }
 
-RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder) {
+RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands) {
     VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
     if (!adapter)
         return runtimeFailure(RuntimeErrorCode::InvalidArgument, "end_backend_rendering");
-    return renderingResult(context, *adapter,
-                           vernonRuntimeCoreEndRendering(vernonRuntimeRhiAdapterGetProvider(adapter), encoder),
-                           "end_backend_rendering", "failed to end rendering");
+    return renderingResult(context, *adapter, vernonRuntimeCoreEndRendering(commands), "end_backend_rendering",
+                           "failed to end rendering");
 }
 
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {

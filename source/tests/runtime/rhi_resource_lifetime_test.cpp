@@ -1,4 +1,5 @@
 #include "VernonFormats.hpp"
+#include "VernonRuntimeCore.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_runtime_owner.h"
 #include "backend_test_matrix.h"
@@ -18,6 +19,48 @@
 #include <vector>
 
 namespace {
+
+// A persistent group naming the resource, which keeps it alive until the group is destroyed.
+class GroupHold {
+public:
+    GroupHold(const VernonRuntimeDeviceProvider *provider, VernonRuntimeProviderBindingKind kind,
+              VernonRuntimeProviderResourceReference resource) {
+        VernonRuntimeProviderBindingLayoutEntry entry{};
+        entry.kind = kind;
+        entry.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+        entry.access = 1;
+        entry.array_count = 1;
+        entry.element_size = 4;
+        VernonRuntimeProviderBindingValue value{};
+        value.kind = kind;
+        if (kind == VERNON_RUNTIME_PROVIDER_SAMPLER)
+            value.payload.sampler.resource = resource;
+        else if (kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)
+            value.payload.image.view = resource;
+        else
+            value.payload.buffer.resource = resource;
+        status_ = vernonRuntimeCorePrepareGroupLayout(provider, &entry, 1, &layout_);
+        if (status_ == VERNON_STATUS_OK)
+            status_ =
+                vernonRuntimeCoreCreateGroup(layout_, &value, 1, VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT, {}, &group_);
+    }
+    GroupHold(const GroupHold &) = delete;
+    GroupHold &operator=(const GroupHold &) = delete;
+    ~GroupHold() { release(); }
+
+    VernonStatus status() const { return status_; }
+    void release() {
+        vernonRuntimeCoreGroupDestroy(group_);
+        vernonRuntimeCoreGroupLayoutDestroy(layout_);
+        group_ = nullptr;
+        layout_ = nullptr;
+    }
+
+private:
+    VernonRuntimeCoreGroupLayout *layout_{};
+    VernonRuntimeCoreGroup *group_{};
+    VernonStatus status_{VERNON_STATUS_OK};
+};
 
 class RhiResourceLifetime : public testing::TestWithParam<vernon::tests::BackendTestRow> {
 protected:
@@ -601,7 +644,7 @@ TEST_P(RhiResourceLifetime, ImageAndSamplerSupportMatchesGraphicsCapability) {
         EXPECT_EQ(samplerStatus, VERNON_RHI_STATUS_UNSUPPORTED);
 }
 
-TEST_P(RhiResourceLifetime, RetainedBufferDelaysSlotReuse) {
+TEST_P(RhiResourceLifetime, GroupDelaysBufferSlotReuse) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
 
@@ -619,14 +662,15 @@ TEST_P(RhiResourceLifetime, RetainedBufferDelaysSlotReuse) {
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &first), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference reference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, first, 0, 64, &reference), VERNON_STATUS_OK);
-    ASSERT_EQ(provider->retain_resource(provider->user_data, reference), VERNON_STATUS_OK);
+    GroupHold hold(provider, VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER, reference);
+    ASSERT_EQ(hold.status(), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, first), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, first), 0u);
 
     VernonRhiBuffer replacement{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &replacement), VERNON_RHI_STATUS_OK);
     EXPECT_NE(replacement.index, first.index);
-    provider->release_resource(provider->user_data, reference);
+    hold.release();
 
     VernonRhiBuffer recycled{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
@@ -663,7 +707,7 @@ TEST_P(RhiResourceLifetime, ResolveRequiresExactRetainedLeaseAfterPublicDestroy)
     EXPECT_TRUE(retained.value().release().isOk());
 }
 
-TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
+TEST_P(RhiResourceLifetime, GroupDelaysSamplerSlotReuse) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
     const vernon::tests::BackendProbeResult probe = graphicsProbe();
@@ -679,57 +723,30 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
     const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
     ASSERT_NE(provider, nullptr);
 
-    VernonRhiImageDescriptor imageDescriptor{};
-    imageDescriptor.struct_size = sizeof(imageDescriptor);
-    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
-    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
-    imageDescriptor.width = 1;
-    imageDescriptor.height = 1;
-    imageDescriptor.depth = 1;
-    imageDescriptor.mip_levels = 1;
-    imageDescriptor.array_layers = 1;
-    imageDescriptor.sample_count = 1;
-    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
-    VernonRhiImage firstImage{};
-    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &firstImage), VERNON_RHI_STATUS_OK);
-    VernonRuntimeProviderResourceReference imageReference{};
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, firstImage, &imageReference), VERNON_STATUS_OK);
-    ASSERT_EQ(provider->retain_resource(provider->user_data, imageReference), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(device, firstImage), VERNON_RHI_STATUS_OK);
-    VernonRhiImage replacementImage{};
-    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacementImage), VERNON_RHI_STATUS_OK);
-    EXPECT_NE(replacementImage.index, firstImage.index);
-    provider->release_resource(provider->user_data, imageReference);
-    VernonRhiImage recycledImage{};
-    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycledImage), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(recycledImage.index, firstImage.index);
-    EXPECT_NE(recycledImage.generation, firstImage.generation);
-
     VernonRhiSamplerDescriptor samplerDescriptor{};
     samplerDescriptor.struct_size = sizeof(samplerDescriptor);
     VernonRhiSampler firstSampler{};
     ASSERT_EQ(vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &firstSampler), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference samplerReference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceSampler(adapter, firstSampler, &samplerReference), VERNON_STATUS_OK);
-    ASSERT_EQ(provider->retain_resource(provider->user_data, samplerReference), VERNON_STATUS_OK);
+    GroupHold samplerHold(provider, VERNON_RUNTIME_PROVIDER_SAMPLER, samplerReference);
+    ASSERT_EQ(samplerHold.status(), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(device, firstSampler), VERNON_RHI_STATUS_OK);
     VernonRhiSampler replacementSampler{};
     ASSERT_EQ(vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &replacementSampler), VERNON_RHI_STATUS_OK);
     EXPECT_NE(replacementSampler.index, firstSampler.index);
-    provider->release_resource(provider->user_data, samplerReference);
+    samplerHold.release();
     VernonRhiSampler recycledSampler{};
     ASSERT_EQ(vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &recycledSampler), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(recycledSampler.index, firstSampler.index);
     EXPECT_NE(recycledSampler.generation, firstSampler.generation);
 
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacementImage), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycledImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroySampler(device, replacementSampler), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroySampler(device, recycledSampler), VERNON_RHI_STATUS_OK);
     vernonRuntimeRhiAdapterDestroy(adapter);
 }
 
-TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
+TEST_P(RhiResourceLifetime, GroupImageViewKeepsParentImageAlive) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
     const vernon::tests::BackendProbeResult probe = imageSubresourceViewProbe();
@@ -768,21 +785,15 @@ TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
     ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference reference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &reference), VERNON_STATUS_OK);
-    ASSERT_EQ(provider->retain_resource(provider->user_data, reference), VERNON_STATUS_OK);
+    GroupHold hold(provider, VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE, reference);
+    ASSERT_EQ(hold.status(), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
-
-    VernonRuntimeProviderImageDescription description{};
-    description.struct_size = sizeof(description);
-    ASSERT_EQ(provider->describe_image(provider->user_data, reference, &description), VERNON_STATUS_OK);
-    EXPECT_NE(description.parent_identity, 0u);
-    EXPECT_EQ(description.view.subresources.base_mip_level, 1u);
-    EXPECT_EQ(description.view.subresources.mip_level_count, 1u);
 
     VernonRhiImage replacement{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
     EXPECT_NE(replacement.index, image.index);
-    provider->release_resource(provider->user_data, reference);
+    hold.release();
     VernonRhiImage recycled{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(recycled.index, image.index);

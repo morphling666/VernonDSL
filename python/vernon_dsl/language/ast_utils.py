@@ -7,6 +7,19 @@ import copy
 STATELESS_NODES = (ast.expr_context, ast.boolop, ast.operator, ast.unaryop, ast.cmpop)
 
 
+def strip_docstrings(tree: ast.Module) -> None:
+    """Removes the docstrings of the module and of its functions and classes, which device code has no value for. A
+    body that held only a docstring becomes `pass`."""
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+            ast.get_docstring(node, clean=False) is not None
+        ):
+            docstring = node.body.pop(0)
+            if not node.body:
+                node.body.append(ast.copy_location(ast.Pass(), docstring))
+
+
 def detach_shared_nodes(tree: ast.AST) -> None:
     """Copies every node `tree` reaches a second time, so each node has one parent. The frontend keys typing and
     lowering facts by node identity, and rewrites that insert one node in several places must not share those facts.

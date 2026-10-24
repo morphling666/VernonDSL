@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "execution_graph/execution_command_model.h"
+#include "runtime/pipeline_groups.h"
 #include "runtime/resolved_stage_types.h"
 
 #include <cstddef>
@@ -61,16 +62,16 @@ VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,
 VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies,
                                             const std::vector<DeviceBufferUpload> &uploads,
                                             execution::detail::RhiCommandExecutionPlan &plan);
+// `owners`, when not empty, holds the owner of each argument; otherwise the command owns them all.
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                    VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
-                                   VernonLaunchSize grid);
-VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                      const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                      VernonStageExecutable &pipeline,
-                                      const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
-                                      const std::vector<DeviceBufferCopy> &copiesAfter,
-                                      execution::detail::CommandNodeKind kind,
-                                      execution::detail::RhiCommandExecutionPlan &plan);
+                                   const std::vector<ArgumentOwner> &owners, VernonLaunchSize grid);
+VernonStatus
+buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
+                         const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
+                         const std::vector<VernonProgramArgument> &arguments, std::vector<ArgumentOwner> owners,
+                         VernonLaunchSize grid, const std::vector<DeviceBufferCopy> &copiesAfter,
+                         execution::detail::CommandNodeKind kind, execution::detail::RhiCommandExecutionPlan &plan);
 
 } // namespace vernon::runtime::program_execution
 

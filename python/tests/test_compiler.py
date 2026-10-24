@@ -14,6 +14,7 @@ from language_contract_runner import assert_frontend_rejects, assert_verified_ir
 from language_contract_traceability import covers_case, covers_case_group
 from vernon_dsl import CompileError, compile_file, compile_source
 from vernon_dsl.cli import main
+from vernon_dsl.compiler import Compiler, FrontendCompileRequest
 from vernon_dsl.types import SpecializationAssignment
 
 
@@ -274,6 +275,28 @@ def main(
         self.assertIn('vernon.implicit_texture = "measured"', output)
         self.assertNotIn('vernon.implicit_texture = "explicit"', output)
 
+    def test_unread_sampled_texture_gets_an_implicit_sampler_unless_read_elsewhere(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@fragment
+def main(
+    unread: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    tint: Annotated[Vector[f32, 4], uniform(set=0, binding=1)],
+) -> Vector[f32, 4]:
+    return tint
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unread_sampled_texture.py"
+            path.write_text(source, encoding="utf-8")
+            compiler = Compiler()
+            alone = compiler.compile_request(FrontendCompileRequest(path, "main")).mlir
+            paired = compiler.compile_request(
+                FrontendCompileRequest(path, "main", textures_read_elsewhere=("unread",))
+            ).mlir
+        self.assertIn('vernon.implicit_texture = "unread"', alone)
+        self.assertNotIn("vernon.implicit_texture", paired)
+
     def test_swizzle_aliases_are_canonicalized(self) -> None:
         source = """
 from vernon_dsl import *
@@ -344,6 +367,34 @@ def main() -> u32:
 """
         with self.assertRaisesRegex(CompileError, "only in vertex shaders"):
             compile_source(invalid, "bad_builtin_stage.py")
+
+    def test_docstrings_are_not_device_code(self) -> None:
+        source = '''
+"""Module docstring."""
+from vernon_dsl import *
+
+@struct
+class Pair:
+    """Struct docstring."""
+
+    a: f32
+    b: f32
+
+@func
+def total(pair: Pair) -> f32:
+    """Helper docstring."""
+    return pair.a + pair.b
+
+@kernel
+def documented(values: TensorView[f32, (4,), read_write]) -> None:
+    """Kernel docstring."""
+    values[0] = total(Pair(1.0, 2.0))
+
+@kernel
+def only_docstring(values: TensorView[f32, (4,), read_write]) -> None:
+    """A body that is only a docstring is empty."""
+'''
+        assert_verified_ir(self, compile_source(source, "docstrings.py"))
 
     def test_graphics_intrinsics_and_bound_uniforms(self) -> None:
         source = """
@@ -706,6 +757,56 @@ class ModuleGraphTests(unittest.TestCase):
             self.assertIn("vernon.source_dependencies", output)
             self.assertIn("lighting.py=", output)
             self.assertIn("shader.py=", output)
+
+    def test_project_local_constants_fold_at_compile_time_across_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "base.py").write_text("SCALE = 4.0\n", encoding="utf-8")
+            (root / "units.py").write_text(
+                "from base import SCALE\nINVERSE = 1.0 / SCALE\nOFFSET = -(SCALE - 3.25) ** 2\n",
+                encoding="utf-8",
+            )
+            shader = root / "shader.py"
+            shader.write_text(
+                "from vernon_dsl import *\n"
+                "import units\n"
+                "from units import INVERSE\n"
+                "DOUBLE = 2.0 * INVERSE\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return value * DOUBLE + units.OFFSET\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(shader)
+
+            self.assertIn("arith.constant 0.5 : f32", output)
+            self.assertIn("arith.constant -0.5625 : f32", output)
+            self.assertIn("base.py=", output)
+            self.assertIn("units.py=", output)
+
+    def test_project_local_constant_imports_reject_values_that_do_not_fold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "units.py").write_text(
+                "import numpy\nRUNTIME = numpy.ones(3)\nFIRST = SECOND + 1\nSECOND = FIRST * 2\n",
+                encoding="utf-8",
+            )
+            shader = root / "shader.py"
+            for name, message in (
+                ("RUNTIME", "module 'units' assigns 'RUNTIME' a value that is not a compile-time constant"),
+                ("FIRST", "module constant 'FIRST' depends on itself"),
+            ):
+                shader.write_text(
+                    "from vernon_dsl import *\n"
+                    f"from units import {name}\n"
+                    "@fragment\n"
+                    "def main(value: f32) -> f32:\n"
+                    f"    return value * {name}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(name), self.assertRaisesRegex(CompileError, message):
+                    compile_file(shader)
 
     def test_unreferenced_project_import_is_not_loaded_or_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

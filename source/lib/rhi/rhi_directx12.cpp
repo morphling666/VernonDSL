@@ -2239,6 +2239,28 @@ Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native,
     return Result<void, RhiError>{ok()};
 }
 
+// Upload-heap memory stays in GENERIC_READ, so the bytes serve constant-buffer and raw-SRV reads without a transition.
+Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64_t, uint64_t native, const void *data,
+                                                  uint64_t size, uint64_t alignment) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands)
+        return Result<CommandTransient, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_directx12_transient", native, 0}})};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (commands != device->state.commandList())
+        return Result<CommandTransient, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_directx12_transient", native, 0}})};
+    ID3D12Resource *upload{};
+    size_t offset{};
+    uint8_t *mapped{};
+    if (!device->state.acquireStaging(true, static_cast<size_t>(size), static_cast<size_t>(alignment), upload, offset,
+                                      mapped, device->error))
+        return Result<CommandTransient, RhiError>{err(backendFailure("write_directx12_transient", native))};
+    std::memcpy(mapped, data, static_cast<size_t>(size));
+    return Result<CommandTransient, RhiError>{ok(CommandTransient{reinterpret_cast<uint64_t>(upload), offset})};
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
                                        VernonRhiImage source, VernonRhiImage destination,
                                        const VernonRhiImageCopyRegion *regions, size_t regionCount) noexcept {
@@ -2931,6 +2953,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         result.abandonCommands.emplace(abandonCommands);
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
+        result.writeTransient.emplace(writeTransient);
         result.recordImageCopy.emplace(recordImageCopy);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
@@ -2949,4 +2972,12 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         return result;
     }();
     return dispatch;
+}
+
+size_t vernon::rhi::getDirectX12BufferCreationCount(VernonRhiDevice handle) {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return 0;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return device->state.bufferCreations;
 }

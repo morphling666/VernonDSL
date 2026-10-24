@@ -552,6 +552,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         target.kind = endpoint.role == "sampler" ? "sampler" : !endpoint.imageDimension.empty() ? "image" : "tensor";
         target.stageSourceName = endpoint.sourceName;
         const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
+        if (binding->tag == BindingTag::Resource && compiled)
+            target.nativeAccess = compiled->access;
         if (binding->tag == BindingTag::Value && target.projection.leaf && compiled && compiled->interfacePlan &&
             compiled->interfacePlan->root && value.layout && *target.projection.leaf < value.layout->leaves.size()) {
             std::vector<PhysicalValueLeaf> physicalLeaves;
@@ -762,6 +764,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 if (compiled && compiled->binding != UINT32_MAX)
                     target.native = {compiled->descriptorSet == UINT32_MAX ? 0 : compiled->descriptorSet,
                                      compiled->binding, target.native.location};
+                else if (compiled && vertexBuffer)
+                    target.native.descriptorSet = compiled->descriptorSet;
                 for (size_t leaf = 0; leaf < target.elementLayout.leaves.size(); ++leaf) {
                     const vernon::runtime::ValueLeaf &layoutLeaf = target.elementLayout.leaves[leaf];
                     const uint64_t elementSize = scalarByteSize(layoutLeaf.dtype);
@@ -985,8 +989,10 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
     for (uint32_t bindingIndex = 0; bindingIndex < plan.bindings.size(); ++bindingIndex) {
         const TargetBinding &binding = plan.bindings[bindingIndex];
         const uint32_t runtimeArgumentIndex = static_cast<uint32_t>(reflection.arguments.size());
+        const std::string access = binding.access.empty() ? "read" : binding.access;
         ReflectedArgument argument;
         argument.sourceName = binding.name;
+        argument.access = binding.nativeAccess.value_or(access);
         argument.index = runtimeArgumentIndex;
         argument.kind = binding.reflectedKind.empty() ? binding.kind : binding.reflectedKind;
         if (plan.backend != VERNON_RUNTIME_CPU && binding.carrier == TargetCarrier::StorageBuffer)
@@ -1030,7 +1036,7 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         parameter.source = StageParameterSource::Direct;
         parameter.kind = binding.kind;
         parameter.tensorArgument = tensorArgumentRepresentation(binding);
-        parameter.access = binding.access.empty() ? "read" : binding.access;
+        parameter.access = access;
         parameter.elementLayout = !binding.elementLayout.leaves.empty() || !binding.wholeValueLayout
                                       ? binding.elementLayout
                                       : *binding.wholeValueLayout;

@@ -3,6 +3,7 @@
 #include "image_descriptor_validation.h"
 #include "opengl_backend.h"
 #include "public_c_boundary.h"
+#include "staging_pool.h"
 
 #include <algorithm>
 #include <array>
@@ -114,6 +115,17 @@ struct OpenGLScopeAttachments {
     }
 };
 
+struct TransientChunk {
+    Buffer buffer;
+    size_t capacity{};
+};
+
+// The transient bytes of encoder `encoder`, or of no encoder when it is zero, so that the arena is reused.
+struct TransientArena {
+    uint64_t encoder{};
+    vernon::rhi::StagingArena<TransientChunk> arena;
+};
+
 struct OpenGLDevice {
     OpenGLDevice() noexcept = default;
     OpenGLDevice(const OpenGLDevice &) = delete;
@@ -138,6 +150,9 @@ struct OpenGLDevice {
     OpenGLScopeAttachments scopeAttachments{};
     uint64_t scopeGeneration{};
     bool scopeAttachmentsValid{};
+    // Guarded by `mutex`. An encoder's arena returns its chunks to the pool when the encoder completes or is abandoned.
+    vernon::rhi::StagingPool<TransientChunk> transientPool;
+    std::vector<TransientArena> transients;
 };
 
 using OpenGLDeviceRegistry = vernon::rhi::DeviceRegistry<OpenGLDevice, kMaximumOpenGLDevices>;
@@ -313,6 +328,10 @@ vernon::Result<void, vernon::RhiError> teardownDevice(OpenGLDevice &device) noex
     device.scopeFramebuffer = 0;
     device.scopeAttachmentsValid = false;
     device.state.destroyDepthStencilCopyObjects();
+    for (TransientArena &transient : device.transients)
+        device.transientPool.retire(transient.arena);
+    device.transients.clear();
+    device.transientPool.clear([&](TransientChunk &chunk) { device.state.destroyBuffer(chunk.buffer); });
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -1654,6 +1673,65 @@ Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native,
     return Result<void, RhiError>{ok()};
 }
 
+void retireTransients(void *context, uint64_t encoder) {
+    auto &device = *static_cast<OpenGLDevice *>(context);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    for (TransientArena &transient : device.transients)
+        if (transient.encoder == encoder) {
+            device.transientPool.retire(transient.arena);
+            transient.encoder = 0;
+            return;
+        }
+}
+
+Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                                  const void *data, uint64_t size, uint64_t alignment) noexcept {
+    using Written = Result<CommandTransient, RhiError>;
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Written{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&state.state) || size > (std::numeric_limits<size_t>::max)() ||
+        alignment > (std::numeric_limits<size_t>::max)())
+        return Written{err(RhiError{RhiErrorCode::InvalidArgument, {"write_opengl_transient", native, 0}})};
+    const auto owned = [&] {
+        return std::find_if(state.transients.begin(), state.transients.end(),
+                            [&](const TransientArena &transient) { return transient.encoder == encoderKey; });
+    };
+    bool registered{};
+    {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        registered = owned() != state.transients.end();
+    }
+    // The encoder lock is held before the device mutex elsewhere, so the cleanup is registered without the mutex.
+    if (!registered)
+        if (auto deferred = deferCommandCleanup(handle, encoderKey, &state, encoderKey, retireTransients);
+            deferred.isErr())
+            return Written{err(std::move(deferred).error())};
+    std::lock_guard<std::mutex> guard(state.mutex);
+    auto transient = owned();
+    if (transient == state.transients.end()) {
+        transient = std::find_if(state.transients.begin(), state.transients.end(),
+                                 [](const TransientArena &candidate) { return candidate.encoder == 0; });
+        if (transient == state.transients.end())
+            transient = state.transients.emplace(state.transients.end());
+        transient->encoder = encoderKey;
+    }
+    state.state.makeCurrent();
+    size_t offset{};
+    TransientChunk *chunk =
+        state.transientPool.acquire(transient->arena, static_cast<size_t>(size), static_cast<size_t>(alignment), offset,
+                                    [&](size_t capacity, TransientChunk &created) {
+                                        created.capacity = capacity;
+                                        return state.state.createBuffer(created.buffer, capacity, state.error);
+                                    });
+    if (!chunk)
+        return Written{err(RhiError{RhiErrorCode::ResourceExhausted, {"write_opengl_transient", native, 0}})};
+    if (!state.state.uploadBuffer(chunk->buffer, offset, data, static_cast<size_t>(size), state.error))
+        return Written{err(RhiError{RhiErrorCode::BackendFailure, {"write_opengl_transient", native, 0}})};
+    return Written{ok(CommandTransient{chunk->buffer.name, offset})};
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                                        VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
                                        size_t regionCount) noexcept {
@@ -2489,6 +2567,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
+        result.writeTransient.emplace(writeTransient);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

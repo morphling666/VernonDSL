@@ -53,29 +53,31 @@ BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, 
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
-                                             const VernonStageInvocationDescriptor &invocation,
-                                             const PlannedGraphicsInvocation &plan) {
+VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                             const GraphicsCommand &command, GraphicsStream &stream) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     return invokeRhiGraphicsPipeline(*pipeline.context, directX12State(*pipeline.context).adapter, kDirectX12Graphics,
-                                     invocation, plan,
+                                     commands, command, stream,
                                      runtimeBackendState<DirectX12PipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
-    (void)invocation;
-    (void)plan;
+    (void)command;
+    (void)stream;
+    (void)commands;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }
 
-VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+                                            const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, directX12State(*pipeline.context).adapter, kDirectX12Compute,
-                                    pipeline.bindingProjection, launch,
+                                    pipeline.bindingProjection, launch, owners,
                                     runtimeBackendState<DirectX12PipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
     (void)launch;
+    (void)owners;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }

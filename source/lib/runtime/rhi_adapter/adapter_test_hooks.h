@@ -11,8 +11,7 @@ struct RhiAdapterPreparationStats {
     size_t shaderPreparations{};
     size_t layoutPreparations{};
     size_t pipelinePreparations{};
-    size_t bindingCreations{};
-    size_t bindingSnapshotCreations{};
+    size_t groupCreations{};
     size_t dispatches{};
     size_t livePreparedPipelines{};
     uint32_t lastStencilReference{};
@@ -20,7 +19,6 @@ struct RhiAdapterPreparationStats {
 };
 
 RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiAdapter &adapter);
-size_t getRhiAdapterRetainedLeaseCount(const VernonRuntimeRhiAdapter &adapter);
 
 } // namespace vernon::runtime
 

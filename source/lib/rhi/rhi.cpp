@@ -858,6 +858,32 @@ vernon::rhi::recordBufferCopy(VernonRhiDevice device, uint64_t native, VernonRhi
                                              size);
 }
 
+vernon::Result<vernon::rhi::CommandTransient, vernon::RhiError>
+vernon::rhi::writeRecordingTransient(VernonRhiDevice device, uint64_t key, uint64_t native, const void *data,
+                                     uint64_t size, uint64_t alignment) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<CommandTransient, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_recording_transient", key, 0}})};
+    if (!backend->writeTransient)
+        return Result<CommandTransient, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"write_recording_transient", key, 0}})};
+    return backend->writeTransient.value()(device, key, native, data, size, alignment);
+}
+
+vernon::Result<vernon::rhi::CommandTransientReservation, vernon::RhiError>
+vernon::rhi::reserveRecordingTransient(VernonRhiDevice device, uint64_t key, uint64_t native, uint64_t size,
+                                       uint64_t alignment) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<CommandTransientReservation, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"reserve_recording_transient", key, 0}})};
+    if (!backend->reserveTransient)
+        return Result<CommandTransientReservation, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"reserve_recording_transient", key, 0}})};
+    return backend->reserveTransient.value()(device, key, native, size, alignment);
+}
+
 vernon::Result<void, vernon::RhiError> vernon::rhi::recordImageCopy(VernonRhiDevice device, uint64_t encoderKey,
                                                                     uint64_t native, VernonRhiImage source,
                                                                     VernonRhiImage destination,

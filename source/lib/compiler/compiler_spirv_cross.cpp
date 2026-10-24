@@ -147,7 +147,6 @@ bool assignMetalArgumentBindings(std::vector<MetalBinding> &bindings, std::strin
     using SetKey = std::tuple<std::string, spv::ExecutionModel, uint32_t>;
     using MemberKey =
         std::tuple<std::string, spv::ExecutionModel, uint32_t, uint32_t, MetalResourceClass, std::string, std::string>;
-    std::map<EntryKey, std::set<uint32_t>> entrySets;
     std::map<MemberKey, uint32_t> memberCounts;
     for (const auto &binding : bindings) {
         if (binding.pushConstant || binding.descriptorSet == UINT32_MAX)
@@ -156,7 +155,6 @@ bool assignMetalArgumentBindings(std::vector<MetalBinding> &bindings, std::strin
             diagnostics = "Metal argument buffers support descriptor set indices 0-7";
             return false;
         }
-        entrySets[{binding.entryPoint, binding.stage}].insert(binding.descriptorSet);
         const MemberKey key{binding.entryPoint,    binding.stage, binding.descriptorSet, binding.binding,
                             binding.resourceClass, binding.kind,  binding.name};
         const auto [iterator, inserted] = memberCounts.emplace(key, binding.count);
@@ -166,12 +164,6 @@ bool assignMetalArgumentBindings(std::vector<MetalBinding> &bindings, std::strin
         }
     }
 
-    std::map<SetKey, uint32_t> argumentBufferIndices;
-    for (const auto &[entry, sets] : entrySets) {
-        uint32_t index = 0;
-        for (uint32_t set : sets)
-            argumentBufferIndices[{entry.first, entry.second, set}] = index++;
-    }
     std::map<MemberKey, uint32_t> memberIds;
     std::map<SetKey, uint32_t> nextMemberId;
     for (const auto &[key, count] : memberCounts) {
@@ -185,22 +177,21 @@ bool assignMetalArgumentBindings(std::vector<MetalBinding> &bindings, std::strin
         next += count;
     }
 
+    // Descriptor set g is group g, which every stage binds as argument buffer g, so direct buffers start after the
+    // argument-buffer indices of every group.
     std::map<EntryKey, uint32_t> nextDirectBuffer;
-    for (const auto &[entry, sets] : entrySets)
-        nextDirectBuffer[entry] = static_cast<uint32_t>(sets.size());
     for (auto &binding : bindings) {
         if (binding.pushConstant)
             continue;
         const EntryKey entry{binding.entryPoint, binding.stage};
         if (binding.descriptorSet != UINT32_MAX) {
-            const SetKey setKey{binding.entryPoint, binding.stage, binding.descriptorSet};
             const MemberKey memberKey{binding.entryPoint,    binding.stage, binding.descriptorSet, binding.binding,
                                       binding.resourceClass, binding.kind,  binding.name};
-            binding.argumentBufferIndex = argumentBufferIndices.at(setKey);
+            binding.argumentBufferIndex = binding.descriptorSet;
             binding.memberId = memberIds.at(memberKey);
             continue;
         }
-        uint32_t &index = nextDirectBuffer[entry];
+        uint32_t &index = nextDirectBuffer.try_emplace(entry, metalMaxArgumentBuffers).first->second;
         if (index == metalPushConstantBufferIndex)
             ++index;
         if ((binding.stage != spv::ExecutionModelGLCompute && index >= metalPushConstantBufferIndex) ||
@@ -227,7 +218,7 @@ void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entr
                         const std::vector<MetalBinding> &bindings) {
     using ResourceKey = std::pair<uint32_t, uint32_t>;
     std::map<ResourceKey, spirv_cross::MSLResourceBinding> resources;
-    std::map<uint32_t, uint32_t> argumentBuffers;
+    std::set<uint32_t> argumentBuffers;
     for (const MetalBinding &binding : bindings) {
         if (binding.entryPoint != entryPoint || binding.stage != stage)
             continue;
@@ -253,11 +244,7 @@ void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entr
             resource.msl_buffer = binding.directBufferIndex;
             continue;
         }
-        const auto [setIterator, inserted] =
-            argumentBuffers.emplace(binding.descriptorSet, binding.argumentBufferIndex);
-        if (!inserted && setIterator->second != binding.argumentBufferIndex) {
-            throw std::runtime_error("Metal descriptor set has inconsistent argument-buffer indices");
-        }
+        argumentBuffers.insert(binding.argumentBufferIndex);
         auto iterator = resources.try_emplace({binding.descriptorSet, binding.binding}).first;
         auto &resource = iterator->second;
         resource.stage = stage;
@@ -271,10 +258,10 @@ void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entr
         else
             resource.msl_sampler = binding.memberId;
     }
-    for (const auto &[set, index] : argumentBuffers) {
+    for (uint32_t index : argumentBuffers) {
         spirv_cross::MSLResourceBinding resource;
         resource.stage = stage;
-        resource.desc_set = set;
+        resource.desc_set = index;
         resource.binding = spirv_cross::kArgumentBufferBinding;
         resource.count = 1;
         resource.msl_buffer = index;
@@ -415,9 +402,6 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     bindDirectXRootConstants(compiler, entry.execution_model);
                     spirv_cross::CompilerHLSL::Options options;
                     options.shader_model = hlslShaderModel;
-                    // The D3D12 provider binds every storage buffer as a raw UAV range; a NonWritable block would
-                    // otherwise become a t-register SRV that the root signature does not declare.
-                    options.force_storage_buffer_as_uav = true;
                     compiler.set_hlsl_options(options);
                     source = compiler.compile();
                     extension = "hlsl";

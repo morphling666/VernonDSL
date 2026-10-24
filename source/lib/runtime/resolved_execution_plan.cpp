@@ -13,10 +13,13 @@ bool reject(Diagnostic &diagnostic, std::string path, std::string message) {
     return false;
 }
 
-ResidencyRequirement bindingResidency(const ResolvedNodePlan &node, const TargetBinding &binding) {
+ResidencyRequirement bindingResidency(const ResolvedNodePlan &node, size_t projection) {
     if (!node.stage || !node.stage->context || node.stage->context->backend == VERNON_RUNTIME_CPU)
         return ResidencyRequirement::Host;
-    switch (binding.carrier) {
+    const std::vector<vernon::runtime::Parameter> &parameters = node.stage->bindingProjection.parameters;
+    if (projection < parameters.size() && hostProjected(parameters[projection]))
+        return ResidencyRequirement::Host;
+    switch (node.projections[projection].target.carrier) {
     case TargetCarrier::StorageBuffer:
     case TargetCarrier::UniformBuffer:
     case TargetCarrier::VertexBuffer:
@@ -175,11 +178,12 @@ static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diag
                 return reject(diagnostic,
                               "/graphs/" + std::to_string(graphIndex) + "/nodes/" + std::to_string(canonicalNode.id),
                               "canonical Node has no resolved plan");
-            for (const NodeEndpointProjection &projection : resolvedNode->second.projections) {
+            for (size_t index = 0; index < resolvedNode->second.projections.size(); ++index) {
+                const NodeEndpointProjection &projection = resolvedNode->second.projections[index];
                 if (projection.value >= program.values.size())
                     return reject(diagnostic, "/graphs/" + std::to_string(graphIndex),
                                   "Node projection references an unknown Value");
-                const ResidencyRequirement required = bindingResidency(resolvedNode->second, projection.target);
+                const ResidencyRequirement required = bindingResidency(resolvedNode->second, index);
                 auto mark = [&](uint32_t value) {
                     const GraphValueKey valueKey{*direction, value};
                     auto existing = plan.residency.find(valueKey);
@@ -203,8 +207,9 @@ static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diag
         for (const Node &canonicalNode : graph.nodes) {
             const NodeKey key{*direction, canonicalNode.id};
             const ResolvedNodePlan &resolvedNode = plan.nodes.at(key);
-            for (const NodeEndpointProjection &projection : resolvedNode.projections) {
-                const ResidencyRequirement required = bindingResidency(resolvedNode, projection.target);
+            for (size_t index = 0; index < resolvedNode.projections.size(); ++index) {
+                const NodeEndpointProjection &projection = resolvedNode.projections[index];
+                const ResidencyRequirement required = bindingResidency(resolvedNode, index);
                 if (projection.target.projection.direction == ValueBindingDirection::Result) {
                     currentResidency[projection.value] = required;
                     continue;

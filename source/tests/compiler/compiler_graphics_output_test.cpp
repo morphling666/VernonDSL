@@ -414,6 +414,43 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerGraphicsOutput, BindsMetalDescriptorSetAtTheArgumentBufferOfItsGroup) {
+    static constexpr char sparseSetModule[] = R"(
+module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
+  func.func @sparse_set_fragment(
+      %value: tensor<4xf32> {
+        vernon.interface = "uniform", vernon.set = 2 : i64, vernon.binding = 0 : i64
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.location = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "fragment"
+      } {
+    return %value : tensor<4xf32>
+  }
+}
+)";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, sparseSetModule, sizeof(sparseSetModule) - 1, VERNON_TARGET_METAL);
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const std::string output = artifacts(result);
+    EXPECT_NE(output.find("spvDescriptorSetBuffer2"), std::string::npos);
+    EXPECT_NE(output.find("[[buffer(2)]]"), std::string::npos);
+    EXPECT_EQ(output.find("[[buffer(0)]]"), std::string::npos);
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+    const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
+    EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [](const nlohmann::json &slot) {
+        return slot.value("kind", "") == "uniform_buffer" && slot.value("set", UINT32_MAX) == 2 &&
+               slot.value("argument_buffer_index", UINT32_MAX) == 2 && slot.value("member_id", UINT32_MAX) == 0;
+    })) << slots.dump();
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerGraphicsOutput, LowersSamplingBuiltinsTextureSizeAndMath) {
     constexpr std::string_view samplingModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {

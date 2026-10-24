@@ -259,6 +259,12 @@ StageLoadResult loadGraphicsProgramPipeline(VernonRuntimeContext &context, const
     pipeline->context = &context;
     pipeline->bindingProjection = std::move(stagePlan);
     rebuildStageBindingLayoutViews(pipeline->bindingProjection);
+    std::string layoutError;
+    if (!buildGraphicsDrawLayout(pipeline->bindingProjection, pipeline->drawLayout, layoutError)) {
+        reject(diagnostic, "PROGRAM_STAGE_BINDING", "/artifact_system/artifacts/" + resolvedStage.artifact,
+               layoutError);
+        return StageLoadResult{vernon::err(diagnostic)};
+    }
     auto resolved = resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline);
     if (resolved.isErr()) {
         reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,

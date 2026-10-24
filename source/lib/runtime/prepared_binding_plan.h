@@ -3,11 +3,12 @@
 
 #include "VernonRuntimeProvider.h"
 #include "compute_launch_planner.h"
-#include "graphics_invocation_planner.h"
+#include "pipeline_groups.h"
 #include "pipeline_metadata.h"
 #include "stage_binding_plan.h"
 #include "tensor_bridge.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -22,6 +23,8 @@ struct PreparedBindingSource {
     uint32_t argumentIndex{UINT32_MAX};
     uint64_t resourceOffset{};
     bool metadataCarrier{};
+    // The Stage parameter, by index, whose argument alone decides the value; UINT32_MAX when none does.
+    uint32_t parameter{UINT32_MAX};
 };
 
 struct PreparedCpuBinding {
@@ -69,21 +72,28 @@ enum class PreparedGraphicsBindingSourceKind : uint8_t {
 struct PreparedGraphicsMetadataCarrier {
     MetadataCarrier plan;
     // Indexed by the module endpoint index that MetadataFieldIdentity::argument
-    // names; UINT32_MAX for endpoints without metadata fields.
-    std::vector<uint32_t> argumentSlots;
+    // names: the Stage parameter index, or UINT32_MAX for endpoints without metadata fields.
+    std::vector<uint32_t> argumentParameters;
 };
 
 struct PreparedGraphicsBindingSource {
     PreparedGraphicsBindingSourceKind kind{PreparedGraphicsBindingSourceKind::ExternalUniform};
-    uint32_t externalSlot{};
+    // The Stage parameter, by index, of an external source; UINT32_MAX for the rest.
+    uint32_t parameter{UINT32_MAX};
     uint32_t metadataCarrier{UINT32_MAX};
     // Canonical shader descriptor identity. This intentionally remains unchanged when a
     // backend remaps the provider layout (for example, Metal argument buffers).
     uint32_t descriptorSet{UINT32_MAX};
     uint32_t descriptorBinding{UINT32_MAX};
     TensorCopyPlan packing;
-    std::vector<uint8_t> storage;
     std::string nativeName;
+};
+
+// What one graphics command fills its binding values from.
+struct GraphicsSlotInputs {
+    // Per Stage parameter.
+    const VernonProgramArgument *const *arguments{};
+    std::array<float, 2> resolution{};
 };
 
 struct OpenGLNativeUniformShape {
@@ -123,19 +133,24 @@ bool validatePreparedComputeBindingPlan(const PreparedComputeBindingPlan &plan, 
 bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &layout,
                                 const PreparedBindingSource &source, const PlannedComputeLaunch &launch,
                                 VernonRuntimeProviderBindingValue &value);
-// `projection` only enriches diagnostics; `values` is resized to one provider value per prepared layout.
-bool fillPreparedComputeBindingValues(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
-                                      const PlannedComputeLaunch &launch,
-                                      std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error);
+// Fills the provider value of prepared layout `slot`; `projection` only enriches diagnostics.
+bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
+                                     const PlannedComputeLaunch &launch, size_t slot,
+                                     VernonRuntimeProviderBindingValue &value, std::string &error);
+std::vector<PipelineGroups::SlotDependencies>
+preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &stagePlan);
 
 bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
                                      OpenGLNativeUniformShape &result);
 bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const PreparedGraphicsBindingOptions &options,
                                       PreparedGraphicsBindingPlan &output, std::string &error);
 bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan, std::string &error);
-bool fillPreparedGraphicsBindingValues(PreparedGraphicsBindingPlan &prepared,
-                                       const PlannedGraphicsInvocation &invocation,
-                                       std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error);
+// Fills the provider value of prepared layout `slot`; packed inline bytes go to `storage`.
+bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
+                                      size_t slot, VernonRuntimeProviderBindingValue &value,
+                                      std::vector<uint8_t> &storage, std::string &error);
+std::vector<PipelineGroups::SlotDependencies>
+preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared);
 
 } // namespace vernon::runtime
 

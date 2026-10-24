@@ -39,7 +39,6 @@ struct RhiAdapterBackendStorage {
 
 struct VernonRuntimeRhiAdapter {
     VernonRuntimeRhiAdapter() = default;
-    ~VernonRuntimeRhiAdapter();
     VernonRuntimeRhiAdapter(const VernonRuntimeRhiAdapter &) = delete;
     VernonRuntimeRhiAdapter &operator=(const VernonRuntimeRhiAdapter &) = delete;
 
@@ -49,23 +48,10 @@ struct VernonRuntimeRhiAdapter {
     RhiAdapterBackendStorage backend;
     VernonRuntimeDeviceProvider provider{};
     std::string error;
-    struct RetainedLeaseEntry {
-        RetainedLeaseEntry(vernon::rhi::ResourceKind newKind, uint64_t newKey,
-                           vernon::rhi::RetainedRhiResourceLease newLease) noexcept
-            : kind(newKind), key(newKey), lease(std::move(newLease)) {}
-
-        vernon::rhi::ResourceKind kind;
-        uint64_t key;
-        vernon::rhi::RetainedRhiResourceLease lease;
-        std::unique_ptr<RetainedLeaseEntry> next;
-    };
-    mutable std::mutex retainedLeaseMutex;
-    std::unique_ptr<RetainedLeaseEntry> retainedLeaseHead;
     std::atomic<size_t> shaderPreparations{};
     std::atomic<size_t> layoutPreparations{};
     std::atomic<size_t> pipelinePreparations{};
-    std::atomic<size_t> bindingCreations{};
-    std::atomic<size_t> bindingSnapshotCreations{};
+    std::atomic<size_t> groupCreations{};
     std::atomic<size_t> dispatches{};
     std::atomic<size_t> livePreparedPipelines{};
     std::atomic<uint32_t> lastStencilReference{};
@@ -110,12 +96,6 @@ VernonStatus providerStatus(VernonRuntimeRhiAdapter &adapter, vernon::ProviderEr
                             const char *diagnostic) noexcept;
 RhiAdapterResult<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiAdapter &adapter,
                                                          VernonRuntimeProviderResourceReference resource) noexcept;
-RhiAdapterResult<void> retainRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                         VernonRuntimeProviderResourceReference resource) noexcept;
-RhiAdapterResult<void> releaseRetainedRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                                  VernonRuntimeProviderResourceReference resource) noexcept;
-RhiAdapterResult<uint64_t> resolveRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                              VernonRuntimeProviderResourceReference resource) noexcept;
 RhiAdapterResult<uint64_t> resolveCommandRhiResource(VernonRuntimeRhiAdapter &adapter,
                                                      VernonRuntimeProviderObject encoder,
                                                      VernonRuntimeProviderResourceReference resource) noexcept;
@@ -124,15 +104,9 @@ struct RhiImageBinding {
     VernonRhiFormat format{VERNON_RHI_FORMAT_UNDEFINED};
 };
 
-// The dimension and format shaders observe: an image view's own, or the image's for a raw image.
-RhiAdapterResult<void> describeRhiImageBinding(VernonRuntimeRhiAdapter &adapter,
-                                               VernonRuntimeProviderResourceReference resource,
-                                               RhiImageBinding &binding) noexcept;
 RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
                                              VernonRuntimeProviderResourceReference resource,
                                              VernonRuntimeProviderImageDescription &description) noexcept;
-VernonStatus retainRhiResourceCallback(void *data, VernonRuntimeProviderResourceReference resource);
-void releaseRhiResourceCallback(void *data, VernonRuntimeProviderResourceReference resource);
 VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderResourceReference resource,
                                            VernonRuntimeProviderImageDescription *description);
 const VernonRuntimeProviderResourceReference *providerBindingResource(const VernonRuntimeProviderBindingValue &value);
@@ -140,10 +114,11 @@ RhiAdapterResult<uint64_t> nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter
                                                 VernonRuntimeProviderObject encoder) noexcept;
 RhiAdapterResult<bool> commandEncoderRendering(VernonRuntimeRhiAdapter &adapter,
                                                VernonRuntimeProviderObject encoder) noexcept;
-// The provider's rendering callbacks begin and end the RHI rendering scope of the encoder.
-VernonStatus beginRenderingCallback(void *data, VernonRuntimeProviderObject encoder,
-                                    const VernonRuntimeProviderRenderingDescriptor *descriptor);
-VernonStatus endRenderingCallback(void *data, VernonRuntimeProviderObject encoder);
+// Begin and end the RHI rendering scope of the encoder.
+RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                             const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept;
+RhiAdapterResult<void> endEncoderRendering(VernonRuntimeRhiAdapter &adapter,
+                                           VernonRuntimeProviderObject encoder) noexcept;
 // Opens the encoder's native rendering scope unless it is open; draws open it before recording.
 RhiAdapterResult<vernon::rhi::OpenedRendering> openCommandRendering(VernonRuntimeRhiAdapter &adapter,
                                                                     VernonRuntimeProviderObject encoder) noexcept;
@@ -153,12 +128,71 @@ RhiAdapterResult<void> recordCommandWriteResource(VernonRuntimeRhiAdapter &adapt
                                                   VernonRuntimeProviderResourceReference resource) noexcept;
 RhiAdapterResult<void> retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                              VernonRuntimeProviderResourceReference resource) noexcept;
-bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor);
+// Writes bytes for the encoder's commands into memory its RHI recording owns until the encoder retires.
+RhiAdapterResult<vernon::rhi::CommandTransient> writeCommandTransient(VernonRuntimeRhiAdapter &adapter,
+                                                                      VernonRuntimeProviderObject encoder,
+                                                                      const void *data, uint64_t size,
+                                                                      uint64_t alignment) noexcept;
+// Reserves such memory for the adapter to fill in place, on backends whose transient memory is host-visible.
+RhiAdapterResult<vernon::rhi::CommandTransientReservation> reserveCommandTransient(VernonRuntimeRhiAdapter &adapter,
+                                                                                   VernonRuntimeProviderObject encoder,
+                                                                                   uint64_t size,
+                                                                                   uint64_t alignment) noexcept;
 RhiAdapterResult<void> deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                            void *context, uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept;
 RhiAdapterResult<void> deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                             void *context, uint64_t object,
                                             void (*rollback)(void *, uint64_t)) noexcept;
+
+// A provider object that commands which used it keep alive until their command encoder retires.
+struct RhiRetainedObject {
+    RhiRetainedObject() = default;
+    RhiRetainedObject(const RhiRetainedObject &) = delete;
+    RhiRetainedObject &operator=(const RhiRetainedObject &) = delete;
+    virtual ~RhiRetainedObject() = default;
+
+    std::atomic<uint32_t> references{1};
+};
+
+void releaseRetainedObject(RhiRetainedObject *object) noexcept;
+RhiAdapterResult<void> retainForCommands(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                         RhiRetainedObject &object) noexcept;
+
+// Layout entry access is a mask: bit 0 reads, bit 1 writes.
+inline bool writesBinding(const VernonRuntimeProviderBindingLayoutEntry &entry) noexcept {
+    return (entry.access & 2u) != 0;
+}
+
+// A group keeps every resource its values name alive for as long as it exists.
+struct RhiGroup : RhiRetainedObject {
+    std::vector<vernon::rhi::RetainedRhiResourceLease> leases;
+    // Resources the group's writable bindings name; every command that binds the group writes them.
+    std::vector<VernonRuntimeProviderResourceReference> writes;
+};
+
+// Retains the resource for the group and returns its backend object; `image` receives an image's view description.
+RhiAdapterResult<uint64_t> acquireGroupResource(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
+                                                VernonRuntimeProviderResourceReference resource,
+                                                RhiImageBinding *image = nullptr) noexcept;
+// Records the group's written resources against the encoder of a command that bound it.
+RhiAdapterResult<void> recordGroupWrites(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                         const RhiGroup &group) noexcept;
+
+// The command state every RHI provider keeps between begin_commands and end_commands.
+struct RhiCommands {
+    VernonRuntimeProviderObject encoder{};
+    // The backend's command encoder: a VkCommandBuffer, ID3D12GraphicsCommandList, or the OpenGL device.
+    uint64_t native{};
+    bool rendering{};
+};
+
+RhiAdapterResult<void> beginRhiCommands(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                        RhiCommands &commands) noexcept;
+
+inline RhiAdapterResult<void> providerFailure(vernon::ProviderErrorCode code, const char *operation, uint64_t value = 0,
+                                              uint32_t detail = 0) noexcept {
+    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{code, {operation, value, detail}})};
+}
 
 } // namespace vernon::runtime::rhi_adapter
 

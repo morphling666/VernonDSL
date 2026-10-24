@@ -14,6 +14,9 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -78,6 +81,7 @@ PipelineStateResult passPipelineState(VernonProgramExecutable &executable, Verno
     state->sourcePlan = node->plan;
     state->passEndpoints = std::move(endpoints).value();
     state->endpoints = recorded::passPipelineEndpoints(state->passEndpoints);
+    state->graphicsState.describe(program::graphicsOperation(*state->sourceNode));
     executable.passPipelines.emplace(nodeId, state);
     return PipelineStateResult{vernon::ok(std::move(state))};
 }
@@ -160,6 +164,7 @@ matchBindingSet(RuntimeBindingSetState &set, const std::shared_ptr<const Runtime
     match->pipeline = pipeline;
     match->endpoints.assign(pipeline->endpoints.size(), 0);
     match->failures.resize(set.entries.size());
+    match->entryEndpoints.resize(set.entries.size());
     std::vector<vernon::runtime::program_execution::ProgramValueState> values(program.values.size());
     std::vector<char> supplied;
     for (size_t entryIndex = 0; entryIndex < set.entries.size(); ++entryIndex) {
@@ -176,8 +181,11 @@ matchBindingSet(RuntimeBindingSetState &set, const std::shared_ptr<const Runtime
                                            "Tensor rank is lower than the pipeline parameter's shape"};
             continue;
         }
-        for (size_t index = 0; index < supplied.size(); ++index)
-            match->endpoints[index] |= supplied[index];
+        for (uint32_t index = 0; index < supplied.size(); ++index)
+            if (supplied[index]) {
+                match->endpoints[index] = 1;
+                match->entryEndpoints[entryIndex].push_back(index);
+            }
         for (uint32_t alias : boundSlotsOf(executable, target->id)) {
             const program::BoundarySlot &boundary = program.abi.boundarySlots[alias];
             if (boundary.role != program::BoundaryRole::Input || boundary.value >= values.size())
@@ -280,6 +288,7 @@ GraphicsPipelineHandleResult createGraphicsPipelineOperation(VernonProgramExecut
     state->sourceNode = sourceNode->node;
     state->sourcePlan = sourceNode->plan;
     state->endpoints = std::move(endpoints).value();
+    state->graphicsState.describe(program::graphicsOperation(*state->sourceNode));
     state->leases.push_back(std::move(passLease).value());
     state->leases.push_back(std::move(sourceLease).value());
     handle->state = std::move(state);
@@ -411,9 +420,28 @@ bool collectWrittenResources(VernonRuntimeContext &context, const VernonProgramE
     return true;
 }
 
+// The set entry that supplies one endpoint of the bound pipeline; null `set` leaves the endpoint unbound.
 struct BoundParameter {
-    std::shared_ptr<RuntimeBindingSetState> set;
+    RuntimeBindingSetState *set{};
     size_t entry{};
+    size_t frame{};
+};
+
+const std::string &endpointPath(const RuntimeGraphicsPipelineState &pipeline, size_t endpoint) {
+    return executableProgram(*pipeline.source)->abi.boundarySlots[*pipeline.endpoints[endpoint].parameterSlot].path;
+}
+
+struct SetPipelineKey {
+    const RuntimeBindingSetState *set{};
+    const RuntimeGraphicsPipelineState *pipeline{};
+
+    bool operator==(const SetPipelineKey &other) const { return set == other.set && pipeline == other.pipeline; }
+};
+
+struct SetPipelineHash {
+    size_t operator()(const SetPipelineKey &key) const {
+        return std::hash<const void *>{}(key.set) * 31 + std::hash<const void *>{}(key.pipeline);
+    }
 };
 
 VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, VernonProgramNodeId nodeId,
@@ -440,16 +468,22 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
     }
 
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
-    std::map<std::string, BoundParameter> bound;
+    // Per endpoint of `pipeline`.
+    std::vector<BoundParameter> bound;
+    std::unordered_map<SetPipelineKey, size_t, SetPipelineHash> frames;
+    std::vector<char> frameChecked;
+    std::unordered_set<const RuntimeBindingSetState *> hazardChecked;
+    // Shared by consecutive draws until a bind changes what their parameters take.
+    std::shared_ptr<const std::vector<RecordedArgumentSource>> arguments;
     size_t openDebugGroups = 0;
     pass.telemetry = {sizeof(VernonProgramGraphicsNodeTelemetry), 0, 0, 0, 0};
-    const auto frameFor = [&](const std::shared_ptr<RuntimeBindingSetState> &set) {
-        std::shared_ptr<const RuntimeBindingSetMatch> match = matchBindingSet(*set, pipeline);
-        for (size_t index = 0; index < pass.frames.size(); ++index)
-            if (pass.frames[index].match == match)
-                return index;
-        pass.frames.push_back({std::move(match), pipeline});
-        return pass.frames.size() - 1;
+    const auto frameFor = [&](RuntimeBindingSetState &set) {
+        const auto [found, inserted] = frames.try_emplace({&set, pipeline.get()}, pass.frames.size());
+        if (inserted) {
+            pass.frames.push_back({matchBindingSet(set, pipeline), pipeline});
+            frameChecked.push_back(0);
+        }
+        return found->second;
     };
     for (size_t index = 0; index < recording.commands.size(); ++index) {
         const RuntimeRecordedCommand &command = recording.commands[index];
@@ -460,32 +494,54 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
                 command.pipeline ? command.pipeline : passPipeline.value();
             if (next->pass != &executable || next->node != nodeId)
                 return invalid(path, "pipeline was created for another graphics Node");
+            // A parameter stays bound across the switch, by name, when its entry corresponds in the new pipeline.
+            std::unordered_map<std::string_view, BoundParameter> named;
+            for (size_t endpoint = 0; endpoint < bound.size(); ++endpoint)
+                if (bound[endpoint].set)
+                    named[endpointPath(*pipeline, endpoint)] = bound[endpoint];
             pipeline = std::move(next);
-            ++pass.telemetry.pipeline_binds;
-            for (auto entry = bound.begin(); entry != bound.end();) {
-                const bool keeps = !matchBindingSet(*entry->second.set, pipeline)->failures[entry->second.entry];
-                entry = keeps ? std::next(entry) : bound.erase(entry);
+            bound.assign(pipeline->endpoints.size(), {});
+            for (size_t endpoint = 0; endpoint < bound.size() && !named.empty(); ++endpoint) {
+                if (!pipeline->endpoints[endpoint].parameterSlot)
+                    continue;
+                const auto found = named.find(endpointPath(*pipeline, endpoint));
+                if (found == named.end())
+                    continue;
+                const size_t frame = frameFor(*found->second.set);
+                const RuntimeBindingSetMatch &match = *pass.frames[frame].match;
+                if (!match.failures[found->second.entry] && match.endpoints[endpoint])
+                    bound[endpoint] = {found->second.set, found->second.entry, frame};
             }
+            arguments.reset();
+            ++pass.telemetry.pipeline_binds;
             break;
         }
         case VERNON_GRAPHICS_COMMAND_BIND_SET: {
             if (!pipeline)
                 return invalid(path, "binding set is bound before any pipeline");
-            const RecordedSetFrame &frame = pass.frames[frameFor(command.set)];
-            for (const program::Diagnostic &failure : frame.match->failures)
-                if (failure)
-                    return failDiagnostic(&context, prefixedDiagnostic(failure, path));
+            const size_t frame = frameFor(*command.set);
+            const RuntimeBindingSetMatch &match = *pass.frames[frame].match;
+            if (!std::exchange(frameChecked[frame], 1))
+                for (const program::Diagnostic &failure : match.failures)
+                    if (failure)
+                        return failDiagnostic(&context, prefixedDiagnostic(failure, path));
+            const bool checkHazards = hazardChecked.insert(command.set.get()).second;
             for (size_t entry = 0; entry < command.set->entries.size(); ++entry) {
                 const RuntimeBindingSetEntry &binding = command.set->entries[entry];
-                const std::optional<bool> isWritten = argumentIsWritten(context, binding.binding->argument, written);
-                if (!isWritten)
-                    return invalid(path + "." + binding.boundary->path, "cannot describe the bound image");
-                if (*isWritten)
-                    return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase,
-                                                     path + "." + binding.boundary->path,
-                                                     "resource is written by a Node of the same invocation"});
-                bound[binding.boundary->path] = {command.set, entry};
+                if (checkHazards) {
+                    const std::optional<bool> isWritten =
+                        argumentIsWritten(context, binding.binding->argument, written);
+                    if (!isWritten)
+                        return invalid(path + "." + binding.boundary->path, "cannot describe the bound image");
+                    if (*isWritten)
+                        return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase,
+                                                         path + "." + binding.boundary->path,
+                                                         "resource is written by a Node of the same invocation"});
+                }
+                for (uint32_t endpoint : match.entryEndpoints[entry])
+                    bound[endpoint] = {command.set.get(), entry, frame};
             }
+            arguments.reset();
             ++pass.telemetry.set_binds;
             break;
         }
@@ -516,31 +572,27 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
                 control->dynamic = dynamic;
                 dynamicControl = std::move(control);
             }
-            RecordedDraw draw;
-            draw.pipeline = pipeline;
-            draw.draw = command.draw;
-            draw.dynamic = dynamicControl;
-            const program::Program &program = *executableProgram(*pipeline->source);
-            for (size_t parameter = 0; parameter < pipeline->endpoints.size(); ++parameter) {
-                const recorded::PipelineEndpoint &endpoint = pipeline->endpoints[parameter];
-                if (endpoint.fixedPassParameter) {
-                    draw.arguments.push_back({false, 0, *endpoint.fixedPassParameter});
-                    continue;
-                }
-                const std::string &name = program.abi.boundarySlots[*endpoint.parameterSlot].path;
-                const auto binding = bound.find(name);
-                if (binding != bound.end()) {
-                    const size_t frame = frameFor(binding->second.set);
-                    if (pass.frames[frame].match->endpoints[parameter]) {
-                        draw.arguments.push_back({true, frame, parameter});
+            if (!arguments) {
+                auto sources = std::make_shared<std::vector<RecordedArgumentSource>>();
+                sources->reserve(pipeline->endpoints.size());
+                for (size_t parameter = 0; parameter < pipeline->endpoints.size(); ++parameter) {
+                    const recorded::PipelineEndpoint &endpoint = pipeline->endpoints[parameter];
+                    if (endpoint.fixedPassParameter) {
+                        sources->push_back({false, 0, *endpoint.fixedPassParameter});
                         continue;
                     }
+                    if (bound[parameter].set) {
+                        sources->push_back({true, bound[parameter].frame, parameter});
+                        continue;
+                    }
+                    if (!endpoint.initialPassParameter)
+                        return invalid(path,
+                                       "per-draw parameter '" + endpointPath(*pipeline, parameter) + "' is unbound");
+                    sources->push_back({false, 0, *endpoint.initialPassParameter});
                 }
-                if (!endpoint.initialPassParameter)
-                    return invalid(path, "per-draw parameter '" + name + "' is unbound");
-                draw.arguments.push_back({false, 0, *endpoint.initialPassParameter});
+                arguments = std::move(sources);
             }
-            pass.draws.push_back(std::move(draw));
+            pass.draws.push_back({pipeline, arguments, command.draw, dynamicControl});
             ++pass.telemetry.draws;
             break;
         }
@@ -622,13 +674,20 @@ VernonStatus vernonRuntimeBindingSetBind(VernonBindingSet *set, const VernonProg
         auto made = makeProgramBinding(*argument, lease);
         if (made.isErr())
             return publishRuntimeError(context, std::move(made).error());
+        std::shared_ptr<RuntimeProgramBinding> binding = std::move(made).value();
+        VernonTensorView &tensor = binding->argument.tensor;
+        if (binding->argument.kind == VERNON_PROGRAM_TENSOR && tensor.storage == VERNON_TENSOR_HOST) {
+            const auto *bytes = static_cast<const uint8_t *>(tensor.host_data);
+            binding->ownedHostBytes.assign(bytes, bytes + tensor.byte_size);
+            tensor.host_data = binding->ownedHostBytes.data();
+        }
         const auto existing =
             std::find_if(state.entries.begin(), state.entries.end(),
                          [&](const RuntimeBindingSetEntry &entry) { return entry.boundary == &boundary; });
         if (existing != state.entries.end())
-            existing->binding = std::move(made).value();
+            existing->binding = std::move(binding);
         else
-            state.entries.push_back({&boundary, std::move(made).value()});
+            state.entries.push_back({&boundary, std::move(binding)});
         return VERNON_STATUS_OK;
     });
 }

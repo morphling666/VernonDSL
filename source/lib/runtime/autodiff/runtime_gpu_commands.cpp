@@ -177,8 +177,10 @@ struct TransferCommandContext {
 
 struct PipelineCommandContext {
     PipelineCommandContext(VernonRuntimeContext &runtimeValue, VernonStageExecutable &pipelineValue,
-                           const std::vector<VernonProgramArgument> &argumentValues, VernonLaunchSize gridValue)
-        : runtime(runtimeValue), pipeline(pipelineValue), arguments(argumentValues), grid(gridValue) {
+                           const std::vector<VernonProgramArgument> &argumentValues,
+                           std::vector<ArgumentOwner> ownerValues, VernonLaunchSize gridValue)
+        : runtime(runtimeValue), pipeline(pipelineValue), arguments(argumentValues), owners(std::move(ownerValues)),
+          grid(gridValue) {
         shapes.resize(arguments.size());
         strides.resize(arguments.size());
         for (size_t index = 0; index < arguments.size(); ++index) {
@@ -195,6 +197,7 @@ struct PipelineCommandContext {
     VernonRuntimeContext &runtime;
     VernonStageExecutable &pipeline;
     std::vector<VernonProgramArgument> arguments;
+    std::vector<ArgumentOwner> owners;
     VernonLaunchSize grid;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<int64_t>> strides;
@@ -261,7 +264,7 @@ VernonRhiStatus encodeTransferCommand(void *opaque, VernonRhiCommandEncoder enco
 
 VernonRhiStatus encodePipelinePlanCommand(void *opaque, VernonRhiCommandEncoder encoder) {
     auto &state = *static_cast<PipelineCommandContext *>(opaque);
-    return encodePipelineCommand(state.runtime, encoder, state.pipeline, state.arguments, state.grid) ==
+    return encodePipelineCommand(state.runtime, encoder, state.pipeline, state.arguments, state.owners, state.grid) ==
                    VERNON_STATUS_OK
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -273,7 +276,7 @@ VernonRhiStatus encodeNoopCommand(void *, VernonRhiCommandEncoder) { return VERN
 
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                    VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
-                                   VernonLaunchSize grid) {
+                                   const std::vector<ArgumentOwner> &owners, VernonLaunchSize grid) {
     auto provider = referenceBackendCommandEncoder(context, encoder);
     if (provider.isErr())
         return fail(context, "cannot reference GPU autodiff command encoder", VERNON_STATUS_INTERNAL_ERROR);
@@ -283,7 +286,7 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return encodeResolvedStage(provider.value(), &pipeline, &invocation);
+    return encodeResolvedStage(provider.value(), &pipeline, &invocation, owners.empty() ? nullptr : owners.data());
 }
 
 VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,
@@ -325,13 +328,12 @@ VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const
     return buildDeviceTransferCommandPlan(context, copies, {}, uploads, plan);
 }
 
-VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                      const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                      VernonStageExecutable &pipeline,
-                                      const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
-                                      const std::vector<DeviceBufferCopy> &copiesAfter,
-                                      execution::detail::CommandNodeKind kind,
-                                      execution::detail::RhiCommandExecutionPlan &plan) {
+VernonStatus
+buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
+                         const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
+                         const std::vector<VernonProgramArgument> &arguments, std::vector<ArgumentOwner> owners,
+                         VernonLaunchSize grid, const std::vector<DeviceBufferCopy> &copiesAfter,
+                         execution::detail::CommandNodeKind kind, execution::detail::RhiCommandExecutionPlan &plan) {
     plan = {};
     for (const DeviceBufferUpload &upload : uploadsBefore)
         if (!upload.source || !upload.size)
@@ -355,7 +357,8 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
         plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
         plan.retainedContexts.push_back(std::move(transferContext));
     }
-    auto pipelineContext = std::make_shared<PipelineCommandContext>(context, pipeline, arguments, grid);
+    auto pipelineContext =
+        std::make_shared<PipelineCommandContext>(context, pipeline, arguments, std::move(owners), grid);
     execution::detail::CommandNode derivative;
     derivative.kind = kind;
     derivative.queue = execution::detail::CommandQueueClass::Compute;

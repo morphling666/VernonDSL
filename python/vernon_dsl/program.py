@@ -930,8 +930,10 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
                 metadata = descriptor.storage_metadata
                 shape = tuple(dyn if extent == "?" else extent for extent in metadata.shape)
                 reflected[name] = TypeExpr("TensorView", (metadata.dtype, shape, metadata.access))
+            # Binding-group leaves are reflected by dotted path; the call binds their root parameter.
+            roots = dict.fromkeys(name.split(".", 1)[0] for name in reflected)
             signature = inspect.Signature(
-                inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD) for name in reflected
+                inspect.Parameter(root, inspect.Parameter.POSITIONAL_OR_KEYWORD) for root in roots
             )
             return signature, reflected
         function = getattr(target, "_function", None)
@@ -985,9 +987,11 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
             for expression, target_name in bindings:
                 if not isinstance(expression, ast.Name) or expression.id not in parameters:
                     continue
-                candidate = types.get(target_name)
-                if candidate is not None:
-                    merge(constraints, expression.id, candidate, owner)
+                for leaf, candidate in types.items():
+                    if leaf == target_name:
+                        merge(constraints, expression.id, candidate, owner)
+                    elif leaf.startswith(target_name + "."):
+                        merge(constraints, expression.id + leaf[len(target_name) :], candidate, owner)
         active.remove(identity)
         cache[identity] = constraints
         return constraints

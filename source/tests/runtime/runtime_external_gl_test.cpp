@@ -98,6 +98,8 @@ std::array<GlInt, 4> viewportUpload{};
 std::array<GlInt, 4> scissorUpload{};
 std::vector<std::string> linkedUniformBlocks;
 std::unordered_map<GlUint, GlUint> uniformBlockBindings;
+// The buffer bound at each indexed GL_UNIFORM_BUFFER binding point.
+std::unordered_map<GlUint, GlUint> uniformBufferBindings;
 std::vector<std::string> exposedExtensions;
 constexpr GlInt kDefaultMaxDebugGroupDepth = 64;
 constexpr GlInt kDefaultMaxDebugMessageLength = 256;
@@ -326,8 +328,14 @@ void GL_CALL bindBuffer(GlEnum target, GlUint name) {
 void GL_CALL bindVertexArray(GlUint name) { boundVertexArray = name; }
 void GL_CALL useProgram(GlUint) { ++programBindCount; }
 void GL_CALL bindFramebuffer(GlEnum, GlUint) { ++framebufferBindCount; }
-void GL_CALL bindBufferBase(GlEnum, GlUint, GlUint) { ++storageBindingCount; }
-void GL_CALL bindBufferRange(GlEnum, GlUint, GlUint, std::intptr_t, std::intptr_t) { ++storageBindingCount; }
+void GL_CALL bindBufferBase(GlEnum target, GlUint index, GlUint buffer) {
+    ++storageBindingCount;
+    if (target == 0x8A11)
+        uniformBufferBindings[index] = buffer;
+}
+void GL_CALL bindBufferRange(GlEnum target, GlUint index, GlUint buffer, std::intptr_t, std::intptr_t) {
+    bindBufferBase(target, index, buffer);
+}
 void GL_CALL bindImageTexture(GlUint, GlUint, GlInt, GlBoolean, GlInt, GlEnum, GlEnum) { ++storageBindingCount; }
 void GL_CALL dispatchCompute(GlUint, GlUint, GlUint) { ++dispatchCount; }
 void GL_CALL memoryBarrier(unsigned bits) {
@@ -373,6 +381,7 @@ void GL_CALL bufferSubData(GlEnum, std::intptr_t offset, std::intptr_t size, con
 }
 void GL_CALL copyImageSubData(GlUint, GlEnum, GlInt, GlInt, GlInt, GlInt, GlUint, GlEnum, GlInt, GlInt, GlInt, GlInt,
                               GlSize, GlSize, GlSize) {}
+void GL_CALL copyBufferSubData(GlEnum, GlEnum, std::intptr_t, std::intptr_t, std::intptr_t) {}
 void *GL_CALL mapBufferRange(GlEnum, std::intptr_t offset, std::intptr_t, unsigned) {
     return bufferStorage.data() + offset;
 }
@@ -498,6 +507,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glDeleteVertexArrays", deleteNamesNoop);
     PROC("glBindVertexArray", bindVertexArray);
     PROC("glEnableVertexAttribArray", objectNoop);
+    PROC("glDisableVertexAttribArray", objectNoop);
     PROC("glUseProgram", useProgram);
     PROC("glGenFramebuffers", genNames);
     PROC("glDeleteFramebuffers", deleteNamesNoop);
@@ -509,6 +519,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glDeleteBuffers", deleteBufferNames);
     PROC("glBufferData", bufferData);
     PROC("glBufferSubData", bufferSubData);
+    PROC("glCopyBufferSubData", copyBufferSubData);
     PROC("glCopyImageSubData", copyImageSubData);
     PROC("glMapBufferRange", mapBufferRange);
     PROC("glUnmapBuffer", unmapBuffer);
@@ -1117,10 +1128,10 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
     VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
     ASSERT_TRUE(gl);
     {
-        const size_t bindingCreations = vernon::runtime::getRhiAdapterBindingCreationCount(gl);
+        const size_t groupCreations = vernon::runtime::getRhiAdapterGroupCreationCount(gl);
         vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
         ASSERT_TRUE(program) << lastError(gl);
-        EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations);
+        EXPECT_EQ(vernon::runtime::getRhiAdapterGroupCreationCount(gl), groupCreations);
         auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT, 1,
                                                 1, 1, VERNON_RHI_IMAGE_STORAGE);
         const auto imageView =
@@ -1139,7 +1150,7 @@ TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider
         EXPECT_EQ(dispatchCount, 1u);
         EXPECT_EQ(storageBindingCount, 1u);
         EXPECT_EQ(memoryBarrierCount, 3u);
-        EXPECT_EQ(vernon::runtime::getRhiAdapterBindingCreationCount(gl), bindingCreations + 1);
+        EXPECT_EQ(vernon::runtime::getRhiAdapterGroupCreationCount(gl), groupCreations + 1);
         ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
                   VERNON_STATUS_OK)
             << lastError(gl);
@@ -1804,6 +1815,82 @@ TEST(RuntimeExternalGl, PointsSpilledUniformBlocksAtTheirPlannedBinding) {
         vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
         ASSERT_TRUE(pipeline) << lastError(gl);
         EXPECT_EQ(uniformBlockBindings, (std::unordered_map<GlUint, GlUint>{{0u, 2u}}));
+    }
+    linkedUniformBlocks.clear();
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, InvocationsReuseTheTransientMemoryOfCompletedEncoders) {
+    linkedUniformBlocks = {"vernon_uniform_binding_2"};
+    uniformBufferBindings.clear();
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(pipeline) << lastError(gl);
+        RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+        RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+        const auto sampledView =
+            vernon::tests::createImageView(rhiRuntime(gl), sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+        const auto targetView =
+            vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+        auto sampler = vernon::tests::createSampler(rhiRuntime(gl));
+
+        std::array<float, 16> identity{};
+        for (size_t index = 0; index < 4; ++index)
+            identity[index * 5] = 1.0F;
+        constexpr std::array<uint64_t, 2> shape = {4, 4};
+        constexpr std::array<int64_t, 2> strides = {16, 4};
+        std::array<VernonProgramArgument, 5> arguments{};
+        const std::array<std::string_view, 5> names = {"projection", "view", "model", "image", "sampler"};
+        for (size_t index = 0; index < names.size(); ++index) {
+            VernonProgramParameterView parameter{};
+            ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
+                          pipeline.get(), {names[index].data(), names[index].size()}, &parameter),
+                      VERNON_STATUS_OK)
+                << names[index];
+            arguments[index].slot = parameter.slot;
+        }
+        for (size_t index = 0; index < 3; ++index) {
+            VernonProgramArgument &argument = arguments[index];
+            argument.kind = VERNON_PROGRAM_TENSOR;
+            argument.tensor.struct_size = sizeof(VernonTensorView);
+            argument.tensor.storage = VERNON_TENSOR_HOST;
+            argument.tensor.host_data = identity.data();
+            argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+            argument.tensor.access = VERNON_ACCESS_READ;
+            argument.tensor.rank = 2;
+            argument.tensor.shape = shape.data();
+            argument.tensor.byte_strides = strides.data();
+            argument.tensor.byte_size = sizeof(identity);
+        }
+        arguments[3].kind = VERNON_PROGRAM_IMAGE;
+        arguments[3].image = {sampledView.reference};
+        arguments[4].kind = VERNON_PROGRAM_SAMPLER;
+        arguments[4].resource = sampler.reference;
+        VernonColorAttachment attachment{0, targetView.reference};
+        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+
+        ASSERT_EQ(
+            vernon::tests::completeCanonicalInvocation(pipeline.get(), arguments.data(), arguments.size(), graphics),
+            VERNON_STATUS_OK)
+            << lastError(gl);
+        const GlUint firstPage = uniformBufferBindings[2];
+        EXPECT_NE(firstPage, 0u);
+        uniformBufferBindings.clear();
+        const GlUint nextNameAfterFirstInvocation = nextName;
+        ASSERT_EQ(
+            vernon::tests::completeCanonicalInvocation(pipeline.get(), arguments.data(), arguments.size(), graphics),
+            VERNON_STATUS_OK)
+            << lastError(gl);
+        EXPECT_EQ(uniformBufferBindings[2], firstPage);
+        EXPECT_EQ(nextName, nextNameAfterFirstInvocation);
+
+        ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, sampler.handle), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView.handle), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     }
     linkedUniformBlocks.clear();
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);

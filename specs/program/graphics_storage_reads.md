@@ -190,11 +190,9 @@ rejects these bundles at the version check instead of misreading them.
   render system targets OpenGL 4.5.
 - Vulkan uses the same SPIR-V lowering (StorageBuffer runtime arrays and a
   Uniform carrier block).
-- DirectX 12 compiles every storage block, including the `NonWritable`
-  graphics reads, as `RWByteAddressBuffer` and binds it as a raw UAV. A
-  `NonWritable` block would otherwise become a `t`-register SRV, and the D3D12
-  provider's binding model has one descriptor kind per storage buffer for
-  compute and graphics alike. The root signature is one table visible to all
+- DirectX 12 compiles the `NonWritable` graphics reads as `ByteAddressBuffer`
+  and binds them as raw SRVs, the rule for every read storage buffer (runtime
+  design, DirectX 12). The root signature is one table visible to all
   stages, so a descriptor that both stages use is one range (section 3).
   Inline values stay per-stage root constants. Storage leaves after the first,
   extra samplers, and metadata carriers take provider slots after the highest

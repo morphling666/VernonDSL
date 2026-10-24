@@ -1,5 +1,6 @@
 #include "backend_dispatch.h"
 #include "cuda_backend.h"
+#include "rhi_test_hooks.h"
 
 #include <nvtx3/nvToolsExt.h>
 
@@ -429,8 +430,11 @@ Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint6
         return Result<CommandSubmission, RhiError>{err(invalidArgument("submit_cuda_commands", native, handle.index))};
     CudaDevice &device = anchored.value().device();
     std::lock_guard<std::mutex> guard(device.mutex);
+    auto status = device.state.retireTransients();
+    if (status != vernon::rhi::cuda::kSuccess)
+        return Result<CommandSubmission, RhiError>{err(backendFailure(device, status, "retire_cuda_transients"))};
     vernon::rhi::cuda::Event completion{};
-    const auto status = device.state.recordCompletion(completion);
+    status = device.state.recordCompletion(completion);
     if (status != vernon::rhi::cuda::kSuccess)
         return Result<CommandSubmission, RhiError>{err(backendFailure(device, status, "cuEventRecord"))};
     return Result<CommandSubmission, RhiError>{
@@ -503,6 +507,24 @@ Result<void, RhiError> recordBufferCopy(VernonRhiDevice handle, uint64_t native,
     return Result<void, RhiError>{err(backendFailure(device, status, "cuMemcpyDtoDAsync"))};
 }
 
+Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64_t, uint64_t native, const void *data,
+                                                  uint64_t size, uint64_t alignment) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<CommandTransient, RhiError>{err(std::move(anchored).error())};
+    CudaDevice &device = anchored.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&device.state))
+        return Result<CommandTransient, RhiError>{err(invalidArgument("write_cuda_transient", native, handle.index))};
+    std::lock_guard<std::mutex> guard(device.mutex);
+    vernon::rhi::cuda::DevicePointer chunk{};
+    size_t offset{};
+    const auto status =
+        device.state.writeTransient(data, static_cast<size_t>(size), static_cast<size_t>(alignment), chunk, offset);
+    if (status != vernon::rhi::cuda::kSuccess)
+        return Result<CommandTransient, RhiError>{err(backendFailure(device, status, "write_cuda_transient"))};
+    return Result<CommandTransient, RhiError>{ok(CommandTransient{static_cast<uint64_t>(chunk), offset})};
+}
+
 nvtxDomainHandle_t debugDomain() noexcept {
     static const nvtxDomainHandle_t domain = nvtxDomainCreateA("Vernon");
     return domain;
@@ -551,6 +573,9 @@ void abandonCommands(VernonRhiDevice handle, uint64_t native) noexcept {
         return;
     CudaDevice &device = anchored.value().device();
     std::lock_guard<std::mutex> guard(device.mutex);
+    // The abandoned recording's uploads are already on the stream, so its transient memory retires behind them.
+    if (const auto status = device.state.retireTransients(); status != vernon::rhi::cuda::kSuccess)
+        (void)backendFailure(device, status, "retire_cuda_transients");
     // NVTX ranges belong to the process, not to the abandoned recording, so they would outlive it.
     for (auto range = device.debugRanges.rbegin(); range != device.debugRanges.rend(); ++range)
         nvtxDomainRangeEnd(debugDomain(), *range);
@@ -712,6 +737,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         result.abandonCommands.emplace(abandonCommands);
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
+        result.writeTransient.emplace(writeTransient);
         result.recordDebugCommand.emplace(recordDebugCommand);
         result.recordTimer.emplace(recordTimer);
         result.readTimers.emplace(readTimers);
@@ -719,4 +745,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         return result;
     }();
     return dispatch;
+}
+
+size_t vernon::rhi::getCudaAllocationCount(VernonRhiDevice handle) {
+    auto anchored = lookupCudaDevice(handle);
+    return anchored.isOk() ? anchored.value().device().state.allocations.load(std::memory_order_relaxed) : 0;
 }

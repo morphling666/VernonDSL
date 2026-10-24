@@ -344,11 +344,11 @@ BackendPipelineResult resolveCpuPipeline(BackendStageBuildInputs &inputs, const 
 
 void destroyCpuPipeline(VernonStageExecutable &pipeline) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
-    vernonRuntimeCoreBindingsDestroy(state.bindings);
     vernonRuntimeCorePipelineDestroy(state.pipeline);
 }
 
-VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+                                      const ArgumentOwner *) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     const PreparedComputeBindingPlan &plan = state.bindingPlan;
     for (size_t index = 0; index < plan.size(); ++index) {
@@ -420,17 +420,28 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const Pla
     if (std::any_of(plan.cpuBindings.begin(), plan.cpuBindings.end(),
                     [](const PreparedCpuBinding &binding) { return binding.resultReduction.has_value(); }))
         return dispatchCpuReducedCompute(*pipeline.context, state, groups);
+    GroupStore transient(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
+    const auto filled = [](const void *userData, size_t slot, VernonRuntimeProviderBindingValue &value,
+                           std::vector<uint8_t> &, std::string &) {
+        value = (*static_cast<const std::vector<VernonRuntimeProviderBindingValue> *>(userData))[slot];
+        return true;
+    };
+    const GroupSources sources{nullptr, &launch, &transient, {filled, &state.values}};
+    VernonRuntimeCoreCommands *commands = nullptr;
     VernonStatus status =
-        state.bindings ? vernonRuntimeCoreUpdateBindings(state.bindings, state.values.data(), state.values.size())
-                       : vernonRuntimeCoreCreateBindings(state.pipeline, state.values.data(), state.values.size(),
-                                                         &state.bindings);
-    if (status != VERNON_STATUS_OK) {
-        return fail(
-            *pipeline.context,
-            providerDiagnostic(cpuProviderLastError(*pipeline.context), "failed to prepare CPU provider bindings"),
-            status);
+        vernonRuntimeCoreBeginCommands(cpuProvider(*pipeline.context), launch.commandEncoder, &commands);
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeCoreBindPipeline(commands, state.pipeline);
+    std::string groupError;
+    if (status == VERNON_STATUS_OK)
+        status = state.groups.bind(commands, launch.commandEncoder, sources, groupError);
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeCoreDispatch(commands, groups, nullptr, 0);
+    if (commands) {
+        const VernonStatus ended = vernonRuntimeCoreEndCommands(commands);
+        if (status == VERNON_STATUS_OK)
+            status = ended;
     }
-    status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
         return fail(
             *pipeline.context,

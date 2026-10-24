@@ -97,6 +97,15 @@ def sampled_fragment(
     return vd.texture_sample(image, sampler, vd.Vector([0.5, 0.5]))
 
 
+@vd.fragment
+def spilled_uniform_fragment(
+    first: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    second: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    third: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.matmul(first, vd.matmul(second, vd.matmul(third, vd.Vector([0.0, 0.0, 0.0, 1.0]))))
+
+
 @vd.kernel(workgroup_size=(1, 1, 1))
 def scale(
     values: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write],
@@ -245,6 +254,16 @@ spilled_uniform_asset = vd.program_asset(
     program=vd.pipeline(
         spilled_uniform_vertex,
         sampled_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=({},),
+)
+
+spilled_uniform_color_asset = vd.program_asset(
+    id="pipelines/spilled_uniform_color",
+    program=vd.pipeline(
+        triangle_vertex,
+        spilled_uniform_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
     variants=({},),

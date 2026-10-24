@@ -154,7 +154,8 @@ the recording refers to. Nothing else about binding changes:
   (set, pipeline), so one geometry set serves depth, shadow, and forward
   passes without revalidation.
 - Resources in a set are borrowed and read-only for every invocation that
-  records the set (section 7).
+  records the set (section 7). Host data is copied when it is bound, so a
+  sealed set's values never change and its native state is built once.
 - A set never needs a Runtime upload: host data binds only endpoints carried
   inline or in a uniform buffer; anything else binds a device resource. An
   upload would be a per-draw transfer outside the static hazard plan.
@@ -324,9 +325,11 @@ Pending:
 
 - **Base constants (section 7)** and **group partitions (section 6, acceptance
   8)** belong to the compiler cut, which is deferred until an Engine renderer
-  needs them. Until then every set composes per-parameter native state, and
-  D3D12 and OpenGL reject draws with a nonzero `first_instance` (D3D12 also a
-  nonzero `base_vertex`).
+  needs them. Until then a set's native state is per-parameter: on providers
+  with partial binding sets (OpenGL) it is built once per set, pipeline and
+  slot group; Vulkan, D3D12 and Metal still compose one full binding set per
+  draw until they implement the capability. D3D12 and OpenGL reject draws with
+  a nonzero `first_instance` (D3D12 also a nonzero `base_vertex`).
 - A Program parameter typed as a TensorView that feeds a `uniform()` Stage
   parameter cooks with a descriptor TensorView reflection but a push-constant
   implementation and no metadata carrier, so the bundle fails to load
@@ -347,6 +350,13 @@ Decisions:
 - A set's match against a pipeline is cached per (set, pipeline serial) and
   records a result per parameter, which is what per-parameter stickiness on a
   pipeline switch reads. Entries of destroyed pipelines are pruned on insert.
+- The match also owns the set's native state for that pipeline: a binding
+  subset per distinct group of slots that draws take from the set, since a
+  later set can override part of it. A slot belongs to a set when every
+  parameter its value depends on comes from that set; the pass Node's values,
+  the resolution, implicit samplers and slots mixing sources go through the
+  pipeline's own subset, which updates only when its values change. Recreating
+  native bindings per draw cost about 30 µs per draw on OpenGL.
 - Endpoint classification compares Storage, not Value identity: a Node that
   writes a parameter in place makes the endpoint read a later Value of the
   same Storage, so that endpoint is fixed, and a set that binds the parameter

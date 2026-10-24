@@ -2241,7 +2241,7 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                 const std::string endpointPath = implementationPath + "/endpoints/" + std::to_string(index);
                 CompiledEndpointAbi compiled;
                 if (!exactObject(rowValue, {"module", "interface", "index"},
-                                 {"builtin", "value_transport", "set", "binding", "interface_plan",
+                                 {"builtin", "value_transport", "access", "set", "binding", "interface_plan",
                                   "packed_frame_offset", "element_layout", "sampled_image_bindings", "storage_leaves"},
                                  diagnostic, endpointPath) ||
                     !rowValue["module"].is_string() || !rowValue["interface"].is_string() ||
@@ -2261,6 +2261,13 @@ static bool parseArtifactSystemImpl(const nlohmann::json &target, const nlohmann
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
                                     endpointPath + "/value_transport", "invalid compiled value transport");
                     compiled.valueTransport = rowValue["value_transport"].get<std::string>();
+                }
+                if (rowValue.contains("access")) {
+                    const auto &access = rowValue["access"];
+                    if (!access.is_string() || (access != "read" && access != "write" && access != "read_write"))
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/access",
+                                    "invalid compiled resource access");
+                    compiled.access = access.get<std::string>();
                 }
                 if (rowValue.contains("set") && !uint32Value(rowValue["set"], compiled.descriptorSet))
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/set",

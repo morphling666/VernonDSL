@@ -762,7 +762,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         llvm::json::Array arguments;
         std::map<std::string, std::string> reflectedTensorViewOwners;
         uint64_t argumentOffset = 0;
-        std::map<unsigned, uint32_t> generatedUniformBindings;
+        std::map<unsigned, std::pair<uint32_t, uint32_t>> generatedUniformBindings;
         std::map<unsigned, InterfaceExtent> physicalValueLayouts;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             if (stage.getValue() == "compute")
@@ -787,7 +787,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 invalid = true;
                 return;
             }
-            const llvm::SmallVector<uint32_t> *generatedBinding = graphicsBindings->find(function.getSymName(), index);
+            const mlir::vernon::GraphicsBindingAssignment *generatedBinding =
+                graphicsBindings->find(function.getSymName(), index);
             if (attrs.get("vernon.binding")) {
                 layout = physicalLayout(type,
                                         mlir::isa<mlir::vernon::TensorType>(type)
@@ -803,7 +804,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 continue;
             }
             if (generatedBinding) {
-                generatedUniformBindings[index] = generatedBinding->front();
+                generatedUniformBindings[index] = {generatedBinding->set, generatedBinding->bindings.front()};
                 layout = physicalLayout(type,
                                         mlir::isa<mlir::vernon::TensorType>(type)
                                             ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
@@ -818,6 +819,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             physicalValueLayouts.emplace(index, std::move(*layout));
         }
         llvm::SmallVector<std::optional<uint32_t>> computeBindings(function.getNumArguments());
+        uint32_t metadataCarrierSet = 0;
         std::optional<uint32_t> metadataCarrierBinding;
         std::optional<unsigned> metadataCarrierArgumentIndex;
         uint32_t nextComputeBinding = 0;
@@ -860,13 +862,15 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
                 if (!function.getArgAttr(index, mlir::vernon::kTensorMetadataCarrierAttrName))
                     continue;
-                const llvm::SmallVector<uint32_t> *planned = graphicsBindings->find(function.getSymName(), index);
-                if (metadataCarrierBinding || !planned || planned->size() != 1) {
+                const mlir::vernon::GraphicsBindingAssignment *planned =
+                    graphicsBindings->find(function.getSymName(), index);
+                if (metadataCarrierBinding || !planned || planned->bindings.size() != 1) {
                     function.emitError("graphics TensorView metadata carrier has no binding plan");
                     invalid = true;
                     return;
                 }
-                metadataCarrierBinding = planned->front();
+                metadataCarrierSet = planned->set;
+                metadataCarrierBinding = planned->bindings.front();
                 metadataCarrierArgumentIndex = index;
             }
         }
@@ -923,7 +927,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 for (auto [profile, hostIndexBitWidth] : profiles) {
                     mlir::vernon::MetadataNativeLocation nativeLocation;
                     if (profile == mlir::vernon::MetadataPhysicalProfile::PortableShaderMetadataI32) {
-                        nativeLocation.descriptorSet = 0;
+                        nativeLocation.descriptorSet = metadataCarrierSet;
                         nativeLocation.binding = *metadataCarrierBinding;
                     } else if (profile == mlir::vernon::MetadataPhysicalProfile::CudaKernelMetadata) {
                         mlir::FailureOr<uint32_t> ordinal = mlir::vernon::getCudaMetadataKernelParameterOrdinal(
@@ -1220,9 +1224,13 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 }
             }
             if (auto generated = generatedUniformBindings.find(index); generated != generatedUniformBindings.end()) {
-                argument["vernon.set"] = int64_t{0};
-                argument["vernon.binding"] = static_cast<int64_t>(generated->second);
+                argument["vernon.set"] = static_cast<int64_t>(generated->second.first);
+                argument["vernon.binding"] = static_cast<int64_t>(generated->second.second);
             }
+            if (stage.getValue() == "vertex" && argumentAttrs && argumentAttrs.get("vernon.location"))
+                if (const mlir::vernon::GraphicsBindingAssignment *grouped =
+                        graphicsBindings->find(function.getSymName(), index))
+                    argument["vernon.set"] = static_cast<int64_t>(grouped->set);
             if (computeBindings[index]) {
                 argument["vernon.set"] = int64_t{0};
                 argument["vernon.binding"] = static_cast<int64_t>(*computeBindings[index]);
@@ -1383,7 +1391,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["kind"] = "sampler";
                 argument["access"] = "read";
             }
-            const llvm::SmallVector<uint32_t> *graphicsStorageBindings =
+            const mlir::vernon::GraphicsBindingAssignment *graphicsStorageBindings =
                 stage.getValue() == "compute" ? nullptr : graphicsBindings->find(function.getSymName(), index);
             if (stage.getValue() == "compute" ||
                 (graphicsStorageBindings && mlir::isa<mlir::vernon::TensorViewType>(argumentType))) {
@@ -1440,15 +1448,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         return;
                     }
                     argument["alignment"] = static_cast<int64_t>(storageLayout->alignment);
-                    if (graphicsStorageBindings && graphicsStorageBindings->size() != storageLayout->leaves.size()) {
+                    if (graphicsStorageBindings &&
+                        graphicsStorageBindings->bindings.size() != storageLayout->leaves.size()) {
                         function.emitError("graphics TensorView binding plan does not match its storage leaves");
                         invalid = true;
                         return;
                     }
                     if (graphicsStorageBindings) {
                         argument["binding_role"] = "storage";
-                        argument["vernon.set"] = int64_t{0};
-                        argument["vernon.binding"] = static_cast<int64_t>(graphicsStorageBindings->front());
+                        argument["vernon.set"] = static_cast<int64_t>(graphicsStorageBindings->set);
+                        argument["vernon.binding"] = static_cast<int64_t>(graphicsStorageBindings->bindings.front());
                     }
                     const uint32_t firstBinding =
                         computeBindings[index] ? *computeBindings[index]
@@ -1462,7 +1471,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                             static_cast<int64_t>(std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
                         reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
                         reflectedLeaf["binding"] =
-                            static_cast<int64_t>(graphicsStorageBindings  ? (*graphicsStorageBindings)[leafIndex]
+                            static_cast<int64_t>(graphicsStorageBindings  ? graphicsStorageBindings->bindings[leafIndex]
                                                  : computeBindings[index] ? firstBinding + leafIndex
                                                  : leafIndex == 0         ? firstBinding
                                                                           : nextBinding++);

@@ -56,8 +56,7 @@ bool metadataTensorValid(const VernonTensorView &tensor, uint32_t rank, int64_t 
         (rank && (!tensor.shape || !tensor.byte_strides)) || tensor.byte_offset % tensor.element_layout.byte_size ||
         tensor.byte_offset > tensor.byte_size || (tensor.storage == VERNON_TENSOR_HOST && !tensor.host_data) ||
         (tensor.storage == VERNON_TENSOR_RHI_RESOURCE &&
-         (tensor.resource.offset >= tensor.resource.size ||
-          tensor.byte_size > tensor.resource.size - tensor.resource.offset))) {
+         (tensor.resource.size == 0 || tensor.byte_size > tensor.resource.size))) {
         error = "TensorView metadata source has an invalid rank or element layout";
         return false;
     }
@@ -208,8 +207,7 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const VernonStageIn
                 return fail(error, "compute argument kind is unsupported");
             if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 if (!supplied.tensor.resource.identity || !supplied.tensor.resource.resource.value ||
-                    supplied.tensor.resource.offset >= supplied.tensor.resource.size ||
-                    supplied.tensor.byte_offset > supplied.tensor.resource.size ||
+                    supplied.tensor.resource.size == 0 || supplied.tensor.byte_offset > supplied.tensor.resource.size ||
                     supplied.tensor.byte_size > supplied.tensor.resource.size || !tensorFitsAllocation(supplied.tensor))
                     return fail(error, "compute RHI Tensor view is invalid");
                 argument = ComputeTensorArgument{supplied.tensor.resource};

@@ -989,6 +989,85 @@ asset = vd.program_asset(
                 [[], [{"name": "TINTED", "value": {"tag": "bool", "value": True}}]],
             )
 
+    def test_a_specialization_only_one_stage_module_declares_selects_that_stage(self) -> None:
+        """Each stage compiled the whole key against its own module graph, so a vertex stage imported from a module
+        without the fragment's specialization rejected it as undeclared."""
+
+        if not native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "screen.py").write_text(
+                """
+from typing import Annotated
+
+import vernon_dsl as vd
+
+
+@vd.vertex
+def fullscreen_vertex(
+    vertex_index: Annotated[vd.u32, vd.builtin("vertex_index")],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    x = 3.0 if vertex_index == 1 else -1.0
+    y = 3.0 if vertex_index == 2 else -1.0
+    return vd.Vector([x, y, 0.0, 1.0])
+""",
+                encoding="utf-8",
+            )
+            source = root / "tinted.py"
+            asset = """
+import vernon_dsl as vd
+from screen import fullscreen_vertex
+
+TINTED = vd.specialization("tinted", vd.bool)
+
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    if TINTED:
+        return vd.Vector([1.0, 0.0, 0.0, 1.0])
+    return vd.Vector([1.0, 1.0, 1.0, 1.0])
+
+
+asset = vd.program_asset(
+    id="shaders/tinted",
+    program=vd.pipeline(
+        fullscreen_vertex,
+        fragment_main,
+        targets=vd.target_formats(colors={{0: vd.rgba8_unorm}}),
+    ),
+    variants={variants},
+)
+"""
+            source.write_text(asset.format(variants="({TINTED: True}, {TINTED: False})"), encoding="utf-8")
+            manifest = cook_program_asset(program_asset=f"{source}:asset", output=root / "out", target="vulkan")
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [variant["key"] for variant in document["variants"]],
+                [
+                    [{"name": "tinted", "value": {"tag": "bool", "value": False}}],
+                    [{"name": "tinted", "value": {"tag": "bool", "value": True}}],
+                ],
+            )
+            deployed = {
+                canonical_json(
+                    [
+                        module["blob"]
+                        for artifact in variant["artifact_system"]["artifacts"].values()
+                        for module in artifact["modules"]
+                    ]
+                )
+                for variant in document["variants"]
+            }
+            self.assertEqual(len(deployed), 2)
+
+            source.write_text(
+                asset.format(variants='({TINTED: True, vd.specialization("absent", vd.bool): True},)'),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(vd.CompileError, "requested undeclared specialization"):
+                cook_program_asset(program_asset=f"{source}:asset", output=root / "rejected", target="vulkan")
+
     def test_typed_specialization_cooks_distinct_program_variants(self) -> None:
         if not native_available():
             self.skipTest("native Vernon extension is not built")

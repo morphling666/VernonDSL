@@ -12,17 +12,18 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <new>
-#include <type_traits>
-#include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace vernon::runtime::rhi_adapter {
 namespace {
 
+constexpr size_t kMaxGroups = VERNON_RUNTIME_PROVIDER_MAX_GROUPS;
+
 struct VulkanAdapterState {
     rhi::vulkan::DeviceState *device{};
+    std::atomic<uint64_t> nextSerial{};
 };
 
 VulkanAdapterState &vulkanState(VernonRuntimeRhiAdapter &adapter) {
@@ -47,11 +48,9 @@ RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexc
     try {
         if (static_cast<VulkanAdapterState *>(state)->device->synchronize(error))
             return RhiAdapterResult<void>{vernon::ok()};
-        return RhiAdapterResult<void>{vernon::err(
-            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"vulkan_synchronize", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "vulkan_synchronize");
     } catch (...) {
-        return RhiAdapterResult<void>{vernon::err(
-            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"vulkan_synchronize", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "vulkan_synchronize");
     }
 }
 uint64_t resourceIdentity(const void *state) noexcept {
@@ -81,108 +80,170 @@ struct PreparedShader {
     std::string entry;
     std::vector<uint32_t> words;
 };
-struct PreparedLayout {
+
+// Graphics inline values travel as push constants; the pipeline layout places them.
+struct GroupPushValue {
+    uint32_t entry{};
+    uint32_t dataOffset{};
+    uint32_t size{};
+};
+
+// Retained by the groups and pipeline layouts made from it, since commands that used those may still be recording.
+struct GroupLayout : RhiRetainedObject {
     struct Entry {
         VernonRuntimeProviderBindingLayoutEntry layout{};
-        uint32_t inlineOffset{UINT32_MAX};
-    };
-    struct PushRange {
-        uint32_t stage{};
-        uint32_t offset{};
-        uint32_t size{};
+        // The sampler entry that shares this sampled image's binding as a combined image sampler.
+        uint32_t combinedSampler{UINT32_MAX};
+        bool combinedWithImage{};
+        bool inlineBuffer{};
     };
     rhi::vulkan::DeviceState *device{};
     std::vector<Entry> entries;
-    std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
-    std::vector<PushRange> pushRanges;
-    std::vector<VkDescriptorSetLayout> descriptorSetLayouts;
-    std::vector<uint8_t> descriptorSetsUsed;
-    uint32_t pushConstantSize{};
+    std::vector<GroupPushValue> pushValues;
+    uint32_t pushDataSize{};
+    VkDescriptorSetLayout setLayout{};
+    bool hasDescriptors{};
+    bool hasVertexBuffers{};
 
-    ~PreparedLayout();
+    ~GroupLayout() override {
+        if (setLayout)
+            rhi::vulkan::driver().destroyDescriptorSetLayout(device->device, setLayout, nullptr);
+    }
 };
-struct PreparedPipeline {
-    std::atomic<uint32_t> references{1};
+
+struct PushPlacement {
+    uint32_t dataOffset{};
+    uint32_t offset{};
+    uint32_t size{};
+    uint32_t stage{};
+};
+
+struct PushRange {
+    VkShaderStageFlags stages{};
+    uint32_t offset{};
+    uint32_t size{};
+
+    bool operator==(const PushRange &other) const {
+        return stages == other.stages && offset == other.offset && size == other.size;
+    }
+};
+
+struct PreparedLayout : RhiRetainedObject {
+    rhi::vulkan::DeviceState *device{};
+    std::array<GroupLayout *, kMaxGroups> groups{};
+    uint32_t groupCount{};
+    // Per group index, in the order of the group layout's push values.
+    std::array<std::vector<PushPlacement>, kMaxGroups> pushPlacements;
+    std::vector<PushRange> pushRanges;
+    uint32_t pushConstantSize{};
+    uint32_t pushGroupMask{};
+    uint32_t vertexGroupMask{};
+    std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
+    VkPipelineLayout pipelineLayout{};
+
+    ~PreparedLayout() override {
+        if (pipelineLayout)
+            rhi::vulkan::driver().destroyPipelineLayout(device->device, pipelineLayout, nullptr);
+        for (uint32_t group = 0; group < groupCount; ++group)
+            releaseRetainedObject(groups[group]);
+    }
+};
+
+// The number of leading group indices at which descriptor sets bound with one layout remain valid for the other.
+uint32_t compatibleGroups(const PreparedLayout *bound, const PreparedLayout &next) {
+    if (!bound)
+        return 0;
+    if (bound == &next)
+        return next.groupCount;
+    if (bound->pushRanges != next.pushRanges)
+        return 0;
+    uint32_t count = 0;
+    while (count < bound->groupCount && count < next.groupCount && bound->groups[count] == next.groups[count])
+        ++count;
+    return count;
+}
+
+struct PreparedPipeline : RhiRetainedObject {
     VernonRuntimeRhiAdapter *adapter{};
     rhi::vulkan::DeviceState *device{};
     PreparedLayout *layout{};
-    VkPipelineLayout pipelineLayout{};
     VkPipeline pipeline{};
     VkRenderPass renderPass{};
     std::vector<VkShaderModule> specializedShaderModules;
     bool graphics{};
 
-    ~PreparedPipeline();
+    ~PreparedPipeline() override {
+        adapter->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
+        if (pipeline)
+            rhi::vulkan::driver().destroyPipeline(device->device, pipeline, nullptr);
+        if (renderPass)
+            rhi::vulkan::driver().destroyRenderPass(device->device, renderPass, nullptr);
+        for (VkShaderModule module : specializedShaderModules)
+            rhi::vulkan::driver().destroyShaderModule(device->device, module, nullptr);
+        releaseRetainedObject(layout);
+    }
 };
 
-struct PreparedBindingSet {
-    std::atomic<uint32_t> references{1};
-    struct Slot {
-        PreparedLayout::Entry entry{};
-        VernonRuntimeProviderBindingValue value{};
-        std::vector<uint8_t> inlineStorage;
+struct VulkanGroup : RhiGroup {
+    struct ImageUse {
+        rhi::vulkan::Image *image{};
+        VkImageLayout layout{};
     };
-    struct Snapshot {
-        rhi::vulkan::DeviceState *device{};
-        std::vector<rhi::vulkan::DescriptorSet> descriptorSets;
-        std::vector<Slot> slots;
-        rhi::vulkan::Buffer inlineBuffer;
-        std::vector<VkDeviceSize> inlineOffsets;
-        size_t commandReferences{};
-
-        ~Snapshot();
+    struct VertexBuffer {
+        uint32_t binding{};
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
     };
     rhi::vulkan::DeviceState *device{};
-    PreparedLayout *layout{};
-    std::vector<Slot> slots;
-    std::unordered_map<uint64_t, size_t> samplerByBinding;
-    std::vector<uint8_t> pushConstantStorage;
-    std::unique_ptr<Snapshot> snapshot;
-    std::mutex mutex;
+    GroupLayout *layout{};
+    uint64_t serial{};
+    rhi::vulkan::DescriptorSet descriptorSet;
+    rhi::vulkan::Buffer inlineBuffer;
+    std::vector<uint8_t> pushData;
+    std::vector<ImageUse> images;
+    std::vector<VertexBuffer> vertexBuffers;
 
-    ~PreparedBindingSet();
+    ~VulkanGroup() override {
+        if (inlineBuffer.buffer)
+            device->destroyBuffer(inlineBuffer);
+        if (descriptorSet.set)
+            device->freeDescriptorSet(descriptorSet);
+        releaseRetainedObject(layout);
+    }
 };
 
-uint64_t descriptorBindingKey(uint32_t set, uint32_t binding) { return (static_cast<uint64_t>(set) << 32) | binding; }
+// Descriptor sets bound at a bind point stay valid across pipelines whose layouts are compatible at their index.
+struct BindPointState {
+    const PreparedLayout *layout{};
+    std::array<uint64_t, kMaxGroups> sets{};
+};
 
-void releaseCommandBindings(void *context, uint64_t);
-void releaseCommandBindingSnapshot(void *context, uint64_t object);
-void releaseCommandPipeline(void *context, uint64_t);
-
-RhiAdapterResult<void> retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                            PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
-    pipeline.references.fetch_add(1, std::memory_order_relaxed);
-    if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
-        releaseCommandPipeline(&pipeline, 0);
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_command_pipeline_cleanup_registration_failed", 0, 0}})};
-    }
-    if (bindings) {
-        bindings->references.fetch_add(1, std::memory_order_relaxed);
-        if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
-            releaseCommandBindings(bindings, 0);
-            return RhiAdapterResult<void>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"vulkan_command_bindings_cleanup_registration_failed", 0, 0}})};
-        }
-    }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-VkAttachmentLoadOp attachmentLoad(uint32_t operation) {
-    switch (operation) {
-    case VERNON_RHI_LOAD_CLEAR:
-        return VK_ATTACHMENT_LOAD_OP_CLEAR;
-    case VERNON_RHI_LOAD_PRESERVE:
-        return VK_ATTACHMENT_LOAD_OP_LOAD;
-    default:
-        return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    }
-}
-
-VkAttachmentStoreOp attachmentStore(uint32_t operation) {
-    return operation == VERNON_RHI_STORE_PRESERVE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-}
+// Applied state holds group serials rather than pointers, because addresses are reused.
+struct VulkanCommands : RhiCommands {
+    VkCommandBuffer command{};
+    PreparedPipeline *pipeline{};
+    std::array<VulkanGroup *, kMaxGroups> groups{};
+    BindPointState graphicsState;
+    BindPointState computeState;
+    // The layout whose push constant placement `pushData` follows, and the group serial each index copied in.
+    const PreparedLayout *pushLayout{};
+    std::array<uint64_t, kMaxGroups> pushGroups{};
+    std::vector<uint8_t> pushData;
+    std::array<uint64_t, kMaxGroups> vertexGroups{};
+    // Rendering scopes begun so far, and the scope in which each group index's sampled images were last checked.
+    uint64_t scope{};
+    std::array<uint64_t, kMaxGroups> checkedGroups{};
+    std::array<uint64_t, kMaxGroups> checkedScopes{};
+    bool viewportValid{};
+    bool scissorValid{};
+    bool stencilValid{};
+    std::array<uint32_t, 4> viewport{};
+    std::array<uint32_t, 4> scissor{};
+    uint32_t stencilReference{};
+    uint64_t indexBufferKey{};
+    uint64_t indexBufferOffset{};
+    VkBuffer indexBuffer{};
+};
 
 VkShaderStageFlags stages(uint32_t value) {
     VkShaderStageFlags result = 0;
@@ -201,8 +262,7 @@ VkDescriptorType descriptorType(VernonRuntimeProviderBindingKind kind) {
         return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
     case VERNON_RUNTIME_PROVIDER_INLINE_VALUE:
-        // Compute inline values use an internally owned storage buffer;
-        // graphics inline values take the push-constant path instead.
+        // Compute inline values use a storage buffer the group owns; graphics inline values are push constants.
         return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     case VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE:
         return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -214,6 +274,11 @@ VkDescriptorType descriptorType(VernonRuntimeProviderBindingKind kind) {
         return VK_DESCRIPTOR_TYPE_MAX_ENUM;
     }
     return VK_DESCRIPTOR_TYPE_MAX_ENUM;
+}
+
+bool pushValue(const VernonRuntimeProviderBindingLayoutEntry &entry) {
+    return entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+           entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
 }
 
 VkFormat vertexFormat(uint32_t dtype, uint32_t components) {
@@ -280,8 +345,7 @@ bool relocatePushConstantOffsets(std::vector<uint32_t> &words, uint32_t delta) {
 RhiAdapterResult<void> failureResult(VkResult result, const char *operation) {
     return result == VK_SUCCESS
                ? RhiAdapterResult<void>{vernon::ok()}
-               : RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                     vernon::ProviderErrorCode::BackendFailure, {operation, static_cast<uint64_t>(result), 0}})};
+               : providerFailure(vernon::ProviderErrorCode::BackendFailure, operation, static_cast<uint64_t>(result));
 }
 
 uint32_t getCapabilities(void *) {
@@ -301,12 +365,12 @@ RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProvid
         descriptor->size < sizeof(uint32_t) || descriptor->size % sizeof(uint32_t) != 0 || !descriptor->entry.data ||
         descriptor->entry.size == 0 || descriptor->format.size != 5 ||
         std::memcmp(descriptor->format.data, "spirv", 5) != 0)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_adapter_received_an_invalid_spirv_shader", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_spirv_shader");
     auto shader = std::unique_ptr<PreparedShader>(new (std::nothrow) PreparedShader());
     if (!shader)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_shader_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_shader_preparation_ran_out_of_memory");
     shader->device = &vulkanDevice(adapter);
     shader->stage = descriptor->stage;
     shader->entry.assign(descriptor->entry.data, descriptor->entry.size);
@@ -324,178 +388,233 @@ RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProvid
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
-                                           VernonRuntimeProviderObject *output) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        (descriptor->binding_count != 0 && !descriptor->bindings) ||
-        (descriptor->vertex_attribute_count != 0 && !descriptor->vertex_attributes))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_adapter_received_an_invalid_pipeline_layout", 0, 0}})};
-    auto layout = std::unique_ptr<PreparedLayout>(new (std::nothrow) PreparedLayout());
+RhiAdapterResult<void> prepareGroupLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
+                                                    const VernonRuntimeProviderGroupLayoutDescriptor &descriptor,
+                                                    VernonRuntimeProviderObject *output) {
+    std::unique_ptr<GroupLayout> layout(new (std::nothrow) GroupLayout());
     if (!layout)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_layout_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_group_layout_preparation_ran_out_of_memory");
     layout->device = &vulkanDevice(adapter);
-    std::vector<std::vector<VkDescriptorSetLayoutBinding>> nativeBindings;
-    try {
-        layout->entries.reserve(descriptor->binding_count);
-        for (size_t index = 0; index < descriptor->binding_count; ++index) {
-            const auto &source = descriptor->bindings[index];
-            const bool supported = source.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ||
-                                   source.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-            if (!supported || source.array_count != 1)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::Unsupported, {"vulkan_layout_contains_an_unsupported_binding", 0, 0}})};
-            PreparedLayout::Entry entry;
-            entry.layout = source;
-            if (source.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-                if (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
-                    if (source.set == UINT32_MAX)
-                        return RhiAdapterResult<void>{
-                            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                                              {"vulkan_descriptor_set_index_is_invalid", 0, 0}})};
-                    if (nativeBindings.size() <= source.set)
-                        nativeBindings.resize(static_cast<size_t>(source.set) + 1);
-                    nativeBindings[source.set].push_back(
-                        {source.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-                }
-            } else if (source.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-                if (source.set == UINT32_MAX)
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                        vernon::ProviderErrorCode::InvalidArgument, {"vulkan_descriptor_set_index_is_invalid", 0, 0}})};
-                if (nativeBindings.size() <= source.set)
-                    nativeBindings.resize(static_cast<size_t>(source.set) + 1);
-                auto &setBindings = nativeBindings[source.set];
-                const auto existing = std::find_if(setBindings.begin(), setBindings.end(), [&](const auto &binding) {
-                    return binding.binding == source.binding;
-                });
-                // The compiler links one descriptor per Program Value across a
-                // pipeline, so a repeated binding of the same type is one value
-                // read by several stages.
-                if (existing == setBindings.end())
-                    setBindings.push_back(
-                        {source.binding, descriptorType(source.kind), 1, stages(source.stage_mask), nullptr});
-                else if (existing->descriptorType == descriptorType(source.kind) ||
-                         (existing->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-                          (source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                           source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)))
-                    existing->stageFlags |= stages(source.stage_mask);
-                else if ((existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
-                          source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) ||
-                         (existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER &&
-                          source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)) {
-                    existing->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                    existing->stageFlags |= stages(source.stage_mask);
-                } else
-                    return RhiAdapterResult<void>{vernon::err(
-                        vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_layout_contains_duplicate_descriptor_bindings", 0, 0}})};
+    std::vector<VkDescriptorSetLayoutBinding> nativeBindings;
+    layout->entries.reserve(descriptor.entry_count);
+    for (size_t index = 0; index < descriptor.entry_count; ++index) {
+        const auto &source = descriptor.entries[index];
+        if (descriptorType(source.kind) == VK_DESCRIPTOR_TYPE_MAX_ENUM &&
+            source.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "vulkan_group_layout_contains_an_unsupported_binding", index);
+        if (source.array_count != 1)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "vulkan_group_layout_contains_an_unsupported_binding", index);
+        GroupLayout::Entry entry;
+        entry.layout = source;
+        entry.inlineBuffer = !pushValue(source) && packedUniformBytes(source.kind, source.interface_kind);
+        if (pushValue(source)) {
+            const uint32_t alignment = source.element_alignment;
+            if (!alignment || (alignment & (alignment - 1)) != 0 || source.element_size == 0)
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                       "vulkan_inline_uniform_alignment_is_invalid", index);
+            layout->pushValues.push_back({static_cast<uint32_t>(index), layout->pushDataSize, source.element_size});
+            layout->pushDataSize += source.element_size;
+        } else if (source.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
+            layout->hasVertexBuffers = true;
+        } else {
+            const auto existing = std::find_if(nativeBindings.begin(), nativeBindings.end(),
+                                               [&](const auto &binding) { return binding.binding == source.binding; });
+            // The compiler links one descriptor per Program Value across a pipeline, so a repeated binding of the
+            // same type is one value read by several stages.
+            if (existing == nativeBindings.end())
+                nativeBindings.push_back(
+                    {source.binding, descriptorType(source.kind), 1, stages(source.stage_mask), nullptr});
+            else if (existing->descriptorType == descriptorType(source.kind) ||
+                     (existing->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                      (source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                       source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)))
+                existing->stageFlags |= stages(source.stage_mask);
+            else if ((existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+                      source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) ||
+                     (existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER &&
+                      source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)) {
+                existing->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                existing->stageFlags |= stages(source.stage_mask);
+            } else
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                       "vulkan_group_layout_contains_duplicate_descriptor_bindings", index);
+        }
+        layout->entries.push_back(entry);
+    }
+    for (uint32_t image = 0; image < layout->entries.size(); ++image) {
+        auto &entry = layout->entries[image];
+        if (entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)
+            continue;
+        for (uint32_t sampler = 0; sampler < layout->entries.size(); ++sampler)
+            if (layout->entries[sampler].layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
+                layout->entries[sampler].layout.binding == entry.layout.binding) {
+                entry.combinedSampler = sampler;
+                layout->entries[sampler].combinedWithImage = true;
             }
-            layout->entries.push_back(entry);
-        }
-        std::vector<size_t> pushEntries;
-        for (size_t index = 0; index < layout->entries.size(); ++index)
-            if (layout->entries[index].layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-                layout->entries[index].layout.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
-                pushEntries.push_back(index);
-        std::sort(pushEntries.begin(), pushEntries.end(), [&](size_t left, size_t right) {
-            const auto &leftLayout = layout->entries[left].layout;
-            const auto &rightLayout = layout->entries[right].layout;
-            if (leftLayout.stage_mask != rightLayout.stage_mask)
-                return leftLayout.stage_mask < rightLayout.stage_mask;
-            // Shader push-constant members follow entry argument order, while provider slots are name-sorted.
-            return leftLayout.argument_index < rightLayout.argument_index;
-        });
-        for (size_t index : pushEntries) {
-            PreparedLayout::Entry &entry = layout->entries[index];
-            const uint32_t alignment = entry.layout.element_alignment;
-            if (!alignment || (alignment & (alignment - 1)) != 0 ||
-                layout->pushConstantSize > UINT32_MAX - (alignment - 1))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"vulkan_inline_uniform_alignment_is_invalid", 0, 0}})};
-            entry.inlineOffset = (layout->pushConstantSize + alignment - 1) & ~(alignment - 1);
-            if (entry.layout.element_size > UINT32_MAX - entry.inlineOffset)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"vulkan_push_constant_layout_size_overflow", 0, 0}})};
-            layout->pushConstantSize = entry.inlineOffset + entry.layout.element_size;
-            const uint32_t entryEnd = entry.inlineOffset + entry.layout.element_size;
-            if (layout->pushRanges.empty() || layout->pushRanges.back().stage != entry.layout.stage_mask)
-                layout->pushRanges.push_back({entry.layout.stage_mask, entry.inlineOffset, entry.layout.element_size});
-            else
-                layout->pushRanges.back().size = entryEnd - layout->pushRanges.back().offset;
-        }
-        for (size_t index = 0; index < descriptor->vertex_attribute_count; ++index) {
-            const auto &attribute = descriptor->vertex_attributes[index];
-            const VkFormat format = vertexFormat(attribute.dtype, attribute.component_count);
-            const bool bindingExists =
-                std::any_of(layout->entries.begin(), layout->entries.end(), [&](const PreparedLayout::Entry &entry) {
-                    return entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
-                           entry.layout.binding == attribute.binding;
-                });
-            std::string capabilityDiagnostic;
-            if (!bindingExists)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument,
-                    {"vulkan_validate_vertex_attribute_binding", attribute.binding, attribute.location}})};
-            if (!validateVertexAttributeCapability(VertexAttributeBackend::Vulkan, attribute,
-                                                   layout->device->maxVertexInputAttributes, true,
-                                                   capabilityDiagnostic))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument,
-                    {"vulkan_validate_vertex_attribute_capability", attribute.location, attribute.binding}})};
-            VkFormatProperties properties{};
-            if (format != VK_FORMAT_UNDEFINED)
-                rhi::vulkan::driver().getPhysicalDeviceFormatProperties(layout->device->physicalDevice, format,
-                                                                        &properties);
-            if (format == VK_FORMAT_UNDEFINED || !(properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument,
-                    {"vulkan_vertex_attribute_format_is_unsupported_by_the_selected_device", 0, 0}})};
-            layout->vertexAttributes.push_back(attribute);
-        }
+    }
+    layout->hasDescriptors = !nativeBindings.empty();
+    const VkDescriptorSetLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
+                                                     static_cast<uint32_t>(nativeBindings.size()),
+                                                     nativeBindings.data()};
+    if (auto created = failureResult(rhi::vulkan::driver().createDescriptorSetLayout(
+                                         layout->device->device, &createInfo, nullptr, &layout->setLayout),
+                                     "vkCreateDescriptorSetLayout");
+        !created)
+        return created;
+    *output = toHandle(layout.release());
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> prepareGroupLayoutResult(void *data,
+                                                const VernonRuntimeProviderGroupLayoutDescriptor *descriptor,
+                                                VernonRuntimeProviderObject *output) {
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
+        (descriptor->entry_count != 0 && !descriptor->entries))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_group_layout");
+    try {
+        return prepareGroupLayoutImplResult(*static_cast<VernonRuntimeRhiAdapter *>(data), *descriptor, output);
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_layout_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_group_layout_preparation_ran_out_of_memory");
+    }
+}
+
+// Places the graphics inline values of every group: sorted by stage, then by entry argument order, which shader
+// push-constant members follow, while each stage's block is relocated to its offset.
+RhiAdapterResult<void> placePushValues(PreparedLayout &layout) {
+    struct Candidate {
+        uint32_t group{};
+        uint32_t value{};
+        const VernonRuntimeProviderBindingLayoutEntry *entry{};
+    };
+    std::vector<Candidate> candidates;
+    for (uint32_t group = 0; group < layout.groupCount; ++group) {
+        const auto &values = layout.groups[group]->pushValues;
+        layout.pushPlacements[group].resize(values.size());
+        for (uint32_t value = 0; value < values.size(); ++value)
+            candidates.push_back({group, value, &layout.groups[group]->entries[values[value].entry].layout});
+        if (!values.empty())
+            layout.pushGroupMask |= 1u << group;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate &left, const Candidate &right) {
+        if (left.entry->stage_mask != right.entry->stage_mask)
+            return left.entry->stage_mask < right.entry->stage_mask;
+        return left.entry->argument_index < right.entry->argument_index;
+    });
+    for (const Candidate &candidate : candidates) {
+        const uint32_t alignment = candidate.entry->element_alignment;
+        if (layout.pushConstantSize > UINT32_MAX - (alignment - 1))
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_push_constant_layout_size_overflow");
+        const uint32_t offset = (layout.pushConstantSize + alignment - 1) & ~(alignment - 1);
+        if (candidate.entry->element_size > UINT32_MAX - offset)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_push_constant_layout_size_overflow");
+        const GroupPushValue &value = layout.groups[candidate.group]->pushValues[candidate.value];
+        layout.pushPlacements[candidate.group][candidate.value] = {value.dataOffset, offset, value.size,
+                                                                   candidate.entry->stage_mask};
+        layout.pushConstantSize = offset + value.size;
+        const VkShaderStageFlags stageFlags = stages(candidate.entry->stage_mask);
+        if (layout.pushRanges.empty() || layout.pushRanges.back().stages != stageFlags)
+            layout.pushRanges.push_back({stageFlags, offset, value.size});
+        else
+            layout.pushRanges.back().size = offset + value.size - layout.pushRanges.back().offset;
+    }
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> prepareLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
+                                               const VernonRuntimeProviderPipelineLayoutDescriptor &descriptor,
+                                               VernonRuntimeProviderObject *output) {
+    std::unique_ptr<PreparedLayout> layout(new (std::nothrow) PreparedLayout());
+    if (!layout)
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_layout_preparation_ran_out_of_memory");
+    layout->device = &vulkanDevice(adapter);
+    std::array<VkDescriptorSetLayout, kMaxGroups> setLayouts{};
+    for (size_t group = 0; group < descriptor.group_layout_count; ++group) {
+        auto *groupLayout = fromHandle<GroupLayout>(descriptor.group_layouts[group]);
+        if (!groupLayout)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_pipeline_layout_group_layout_is_invalid", group);
+        groupLayout->references.fetch_add(1, std::memory_order_relaxed);
+        layout->groups[group] = groupLayout;
+        layout->groupCount = static_cast<uint32_t>(group + 1);
+        setLayouts[group] = groupLayout->setLayout;
+        if (groupLayout->hasVertexBuffers)
+            layout->vertexGroupMask |= 1u << group;
+    }
+    if (auto placed = placePushValues(*layout); !placed)
+        return placed;
+    if (descriptor.push_constant_size != 0) {
+        if (layout->pushConstantSize != 0)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_pipeline_layout_mixes_push_constants_and_inline_values");
+        layout->pushConstantSize = descriptor.push_constant_size;
+        layout->pushRanges.push_back({VK_SHADER_STAGE_COMPUTE_BIT, 0, descriptor.push_constant_size});
     }
     if (layout->pushConstantSize > layout->device->maxPushConstantsSize)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::Unsupported, {"vulkan_push_constants_exceed_the_device_limit", 0, 0}})};
-    layout->descriptorSetLayouts.resize(nativeBindings.size());
-    layout->descriptorSetsUsed.resize(nativeBindings.size());
-    for (size_t set = 0; set < nativeBindings.size(); ++set) {
-        const auto &setBindings = nativeBindings[set];
-        const VkDescriptorSetLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
-                                                         0, static_cast<uint32_t>(setBindings.size()),
-                                                         setBindings.data()};
-        const VkResult result = rhi::vulkan::driver().createDescriptorSetLayout(
-            layout->device->device, &createInfo, nullptr, &layout->descriptorSetLayouts[set]);
-        if (result != VK_SUCCESS)
-            return failureResult(result, "vkCreateDescriptorSetLayout");
-        layout->descriptorSetsUsed[set] = !setBindings.empty();
+        return providerFailure(vernon::ProviderErrorCode::Unsupported, "vulkan_push_constants_exceed_the_device_limit");
+    for (size_t index = 0; index < descriptor.vertex_attribute_count; ++index) {
+        const auto &attribute = descriptor.vertex_attributes[index];
+        bool bindingExists = false;
+        for (uint32_t group = 0; group < layout->groupCount; ++group)
+            for (const GroupLayout::Entry &entry : layout->groups[group]->entries)
+                bindingExists |= entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+                                 entry.layout.binding == attribute.binding;
+        if (!bindingExists)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_validate_vertex_attribute_binding", attribute.binding, attribute.location);
+        std::string capabilityDiagnostic;
+        if (!validateVertexAttributeCapability(VertexAttributeBackend::Vulkan, attribute,
+                                               layout->device->maxVertexInputAttributes, true, capabilityDiagnostic))
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_validate_vertex_attribute_capability", attribute.location,
+                                   attribute.binding);
+        const VkFormat format = vertexFormat(attribute.dtype, attribute.component_count);
+        VkFormatProperties properties{};
+        if (format != VK_FORMAT_UNDEFINED)
+            rhi::vulkan::driver().getPhysicalDeviceFormatProperties(layout->device->physicalDevice, format,
+                                                                    &properties);
+        if (format == VK_FORMAT_UNDEFINED || !(properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_vertex_attribute_format_is_unsupported_by_the_selected_device");
+        layout->vertexAttributes.push_back(attribute);
     }
+    std::vector<VkPushConstantRange> ranges;
+    for (const PushRange &range : layout->pushRanges)
+        ranges.push_back({range.stages, range.offset, range.size});
+    const VkPipelineLayoutCreateInfo createInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr,      0, layout->groupCount, setLayouts.data(),
+        static_cast<uint32_t>(ranges.size()),          ranges.data()};
+    if (auto created = failureResult(rhi::vulkan::driver().createPipelineLayout(layout->device->device, &createInfo,
+                                                                                nullptr, &layout->pipelineLayout),
+                                     "vkCreatePipelineLayout");
+        !created)
+        return created;
     *output = toHandle(layout.release());
     adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> createPipelineLayoutResult(VernonRuntimeRhiAdapter &adapter, PreparedPipeline &pipeline) {
-    VkPushConstantRange range{VK_SHADER_STAGE_ALL, 0, pipeline.layout->pushConstantSize};
-    const VkPipelineLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                                nullptr,
-                                                0,
-                                                static_cast<uint32_t>(pipeline.layout->descriptorSetLayouts.size()),
-                                                pipeline.layout->descriptorSetLayouts.data(),
-                                                pipeline.layout->pushConstantSize ? 1u : 0u,
-                                                pipeline.layout->pushConstantSize ? &range : nullptr};
-    return failureResult(rhi::vulkan::driver().createPipelineLayout(pipeline.device->device, &createInfo, nullptr,
-                                                                    &pipeline.pipelineLayout),
-                         "vkCreatePipelineLayout");
+RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
+                                           VernonRuntimeProviderObject *output) {
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
+        descriptor->group_layout_count > kMaxGroups ||
+        (descriptor->group_layout_count != 0 && !descriptor->group_layouts) ||
+        (descriptor->vertex_attribute_count != 0 && !descriptor->vertex_attributes))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_pipeline_layout");
+    try {
+        return prepareLayoutImplResult(*static_cast<VernonRuntimeRhiAdapter *>(data), *descriptor, output);
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_layout_preparation_ran_out_of_memory");
+    }
 }
 
 RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
@@ -513,12 +632,9 @@ RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntime
     pipeline->adapter = &adapter;
     adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
     pipeline->device = &vulkanDevice(adapter);
+    layout->references.fetch_add(1, std::memory_order_relaxed);
     pipeline->layout = layout;
     pipeline->graphics = descriptor->kind == VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
-    pipeline->specializedShaderModules.reserve(2);
-    auto pipelineLayout = createPipelineLayoutResult(adapter, *pipeline);
-    if (!pipelineLayout)
-        return pipelineLayout;
     if (pipeline->graphics && descriptor->color_format_count == 0 && descriptor->depth_stencil_format == 0) {
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
@@ -538,7 +654,7 @@ RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntime
                                                     shader->entry.c_str(),
                                                     nullptr};
         const VkComputePipelineCreateInfo createInfo{
-            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stage, pipeline->pipelineLayout, {}, 0};
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stage, layout->pipelineLayout, {}, 0};
         auto created = failureResult(rhi::vulkan::driver().createComputePipelines(
                                          pipeline->device->device, {}, 1, &createInfo, nullptr, &pipeline->pipeline),
                                      "vkCreateComputePipelines");
@@ -566,10 +682,10 @@ RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntime
                 {"vulkan_graphics_pipeline_uses_an_unsupported_attachment_configuration", 0, 0}})};
         const auto stageOffset = [&](uint32_t stage) {
             uint32_t offset = UINT32_MAX;
-            for (const auto &entry : layout->entries)
-                if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE && entry.layout.stage_mask == stage &&
-                    entry.inlineOffset != UINT32_MAX)
-                    offset = std::min(offset, entry.inlineOffset);
+            for (uint32_t group = 0; group < layout->groupCount; ++group)
+                for (const PushPlacement &placement : layout->pushPlacements[group])
+                    if (placement.stage == stage)
+                        offset = std::min(offset, placement.offset);
             return offset == UINT32_MAX ? 0u : offset;
         };
         const auto specializeShader = [&](PreparedShader &shader, uint32_t offset, VkShaderModule &module) {
@@ -608,12 +724,12 @@ RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntime
                                 VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, fragment->entry.c_str(), nullptr});
         std::vector<VkVertexInputBindingDescription> vertexBindings;
         std::vector<VkVertexInputAttributeDescription> vertexAttributes;
-        for (const auto &entry : layout->entries)
-            if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-                vertexBindings.push_back(
-                    {entry.layout.binding, 0,
-                     entry.layout.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
-            }
+        for (uint32_t group = 0; group < layout->groupCount; ++group)
+            for (const GroupLayout::Entry &entry : layout->groups[group]->entries)
+                if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+                    vertexBindings.push_back(
+                        {entry.layout.binding, 0,
+                         entry.layout.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
         for (const VernonRuntimeProviderVertexAttribute &attribute : layout->vertexAttributes)
             vertexAttributes.push_back({attribute.location, attribute.binding,
                                         vertexFormat(attribute.dtype, attribute.component_count),
@@ -836,7 +952,7 @@ RhiAdapterResult<void> preparePipelineImplResult(void *data, const VernonRuntime
                                                       hasDepth ? &depthStencil : nullptr,
                                                       &blend,
                                                       &dynamic,
-                                                      pipeline->pipelineLayout,
+                                                      layout->pipelineLayout,
                                                       pipeline->renderPass,
                                                       0,
                                                       {},
@@ -858,595 +974,551 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     try {
         return preparePipelineImplResult(data, descriptor, output);
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_pipeline_preparation_ran_out_of_memory", 0, 0}})};
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure,
+                               "vulkan_pipeline_preparation_ran_out_of_memory");
     }
 }
 
-RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
-                                                const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
-    std::unordered_map<uint32_t, size_t> slotIndices;
-    std::vector<size_t> valueIndices(bindings.slots.size());
-    std::vector<uint8_t> seenSlots(bindings.slots.size());
-    slotIndices.reserve(bindings.slots.size());
-    for (size_t index = 0; index < bindings.slots.size(); ++index)
-        if (!slotIndices.emplace(bindings.slots[index].entry.layout.slot, index).second)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_layout_contains_duplicate_slots", 0, 0}})};
-    for (size_t index = 0; index < valueCount; ++index) {
-        const auto found = slotIndices.find(values[index].slot);
-        if (found == slotIndices.end() || seenSlots[found->second])
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_slot_is_invalid_or_duplicated", 0, 0}})};
-        seenSlots[found->second] = 1;
-        valueIndices[found->second] = index;
+RhiAdapterResult<void> validateGroupValue(const GroupLayout::Entry &entry,
+                                          const VernonRuntimeProviderBindingValue &value) {
+    const auto &layout = entry.layout;
+    if (value.kind != layout.kind)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_group_value_kind_is_invalid",
+                               layout.slot);
+    if (packedUniformBytes(layout.kind, layout.interface_kind)) {
+        if (!value.payload.inline_value.data || value.payload.inline_value.size != layout.element_size)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "vulkan_inline_or_uniform_buffer_binding_size_is_invalid", layout.slot);
+        return RhiAdapterResult<void>{vernon::ok()};
     }
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        const auto &slot = bindings.slots[index];
-        const auto *value = &values[valueIndices[index]];
-        if (value->kind != slot.entry.layout.kind)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_slot_or_kind_is_invalid", 0, 0}})};
-        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind)) {
-            if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.inlineStorage.size())
-                return RhiAdapterResult<void>{vernon::err(
-                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                          {"vulkan_inline_or_uniform_buffer_binding_size_is_invalid", 0, 0}})};
-        } else if ((value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
-            const auto *resource = providerBindingResource(*value);
-            const bool buffer = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-                                slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-            if (!resource || !resource->identity || !resource->resource.value ||
-                (buffer && resource->offset >= resource->size))
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"vulkan_resource_binding_is_invalid", 0, 0}})};
-            if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->payload.buffer.stride == 0)
-                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"vulkan_vertex_binding_has_no_stride", 0, 0}})};
-        }
-    }
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        auto &slot = bindings.slots[index];
-        slot.value = values[valueIndices[index]];
-        if (slot.value.payload.inline_value.data &&
-            packedUniformBytes(slot.value.kind, slot.entry.layout.interface_kind)) {
-            std::memcpy(slot.inlineStorage.data(), slot.value.payload.inline_value.data,
-                        slot.value.payload.inline_value.size);
-            if (slot.entry.inlineOffset != UINT32_MAX)
-                std::memcpy(bindings.pushConstantStorage.data() + slot.entry.inlineOffset,
-                            slot.value.payload.inline_value.data, slot.value.payload.inline_value.size);
-            slot.value.payload = {};
-        }
-    }
+    const bool defaultResource = (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
+    if (defaultResource)
+        return layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER
+                   ? RhiAdapterResult<void>{vernon::ok()}
+                   : providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                     "vulkan_default_resource_is_supported_only_for_samplers", layout.slot);
+    const auto *resource = providerBindingResource(value);
+    const bool image =
+        layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE || layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+    const bool sampler = layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER;
+    const uint64_t expectedKind = sampler ? kRhiSamplerResource : kRhiBufferResource;
+    if (!resource || !resource->resource.value ||
+        (image ? !isRhiImageReference(*resource) : (resource->identity & kRhiResourceKindMask) != expectedKind) ||
+        (!image && !sampler && resource->offset >= resource->size))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_resource_binding_is_invalid",
+                               layout.slot);
+    if (layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value.payload.buffer.stride == 0)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_vertex_binding_has_no_stride",
+                               layout.slot);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> retainBindingResources(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                              const PreparedBindingSet *bindings) {
-    if (!bindings)
+// Places the inline buffer values, and `ranges` receives each one's buffer range. A transient group writes them to its
+// encoder's transient memory; a persistent group uploads them into one host-visible buffer it owns.
+RhiAdapterResult<void> placeInlineValues(VernonRuntimeRhiAdapter &adapter, VulkanGroup &group,
+                                         const VernonRuntimeProviderGroupDescriptor &descriptor,
+                                         std::vector<VkDescriptorBufferInfo> &ranges) {
+    const auto &entries = group.layout->entries;
+    const VernonRuntimeProviderBindingValue *values = descriptor.values;
+    const VkDeviceSize alignment = group.device->descriptorBufferOffsetAlignment;
+    ranges.assign(entries.size(), {});
+    if (descriptor.lifetime == VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT) {
+        for (size_t index = 0; index < entries.size(); ++index) {
+            if (!entries[index].inlineBuffer)
+                continue;
+            const VkDeviceSize size = entries[index].layout.element_size;
+            auto written = writeCommandTransient(adapter, descriptor.command_encoder,
+                                                 values[index].payload.inline_value.data, size, alignment);
+            if (!written)
+                return RhiAdapterResult<void>{vernon::err(std::move(written).error())};
+            ranges[index] = {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(written.value().buffer)),
+                             written.value().offset, size};
+        }
         return RhiAdapterResult<void>{vernon::ok()};
-    for (const auto &slot : bindings->slots) {
-        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind))
-            continue;
-        const auto *resource = providerBindingResource(slot.value);
-        if (!resource || !resource->resource.value)
-            continue;
-        auto retained = retainCommandResource(adapter, encoder, *resource);
-        if (!retained)
-            return retained;
     }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-PreparedBindingSet::Snapshot::~Snapshot() {
-    if (!device)
-        return;
-    if (inlineBuffer.buffer)
-        device->destroyBuffer(inlineBuffer);
-    for (rhi::vulkan::DescriptorSet &descriptorSet : descriptorSets)
-        device->freeDescriptorSet(descriptorSet);
-}
-
-PreparedBindingSet::~PreparedBindingSet() = default;
-
-void recordPushConstants(VkCommandBuffer command, const PreparedPipeline &pipeline,
-                         const PreparedBindingSet &bindings) {
-    for (const auto &range : pipeline.layout->pushRanges)
-        rhi::vulkan::driver().cmdPushConstants(command, pipeline.pipelineLayout, stages(range.stage), range.offset,
-                                               range.size, bindings.pushConstantStorage.data() + range.offset);
-}
-
-void releaseCommandBindingSnapshot(void *context, uint64_t object) {
-    auto *bindings = static_cast<PreparedBindingSet *>(context);
-    auto *snapshot = reinterpret_cast<PreparedBindingSet::Snapshot *>(static_cast<uintptr_t>(object));
-    if (!bindings || !snapshot)
-        return;
-    std::lock_guard<std::mutex> guard(bindings->mutex);
-    if (bindings->snapshot.get() != snapshot || snapshot->commandReferences == 0)
-        return;
-    --snapshot->commandReferences;
-}
-
-RhiAdapterResult<void> retainBindingSnapshot(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                             PreparedBindingSet &bindings, PreparedBindingSet::Snapshot &snapshot) {
-    ++snapshot.commandReferences;
-    if (deferCommandCleanup(adapter, encoder, &bindings, reinterpret_cast<uintptr_t>(&snapshot),
-                            releaseCommandBindingSnapshot))
+    VkDeviceSize size = 0;
+    VkBufferUsageFlags usage = 0;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        if (!entries[index].inlineBuffer)
+            continue;
+        size = (size + alignment - 1) & ~(alignment - 1);
+        ranges[index] = {VK_NULL_HANDLE, size, entries[index].layout.element_size};
+        size += entries[index].layout.element_size;
+        usage |= entries[index].layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                     ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                     : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    }
+    if (size == 0)
         return RhiAdapterResult<void>{vernon::ok()};
-    --snapshot.commandReferences;
-    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-        vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_cleanup_allocation_failed", 0, 0}})};
-}
-
-RhiAdapterResult<PreparedBindingSet::Snapshot *>
-snapshotBindings(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, PreparedPipeline &pipeline,
-                 PreparedBindingSet &bindings, VkCommandBuffer command) {
     std::string backendDiagnostic;
-    std::lock_guard<std::mutex> guard(bindings.mutex);
-    if (!retainBindingResources(adapter, encoder, &bindings))
-        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_could_not_retain_resources", 0, 0}})};
-    if (bindings.snapshot) {
-        if (!retainBindingSnapshot(adapter, encoder, bindings, *bindings.snapshot))
-            return RhiAdapterResult<PreparedBindingSet::Snapshot *>{
-                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                  {"vulkan_binding_snapshot_cleanup_registration_failed", 0, 0}})};
-        recordPushConstants(command, pipeline, bindings);
-        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::ok(bindings.snapshot.get())};
-    }
-
-    auto snapshot = std::make_unique<PreparedBindingSet::Snapshot>();
-    snapshot->device = bindings.device;
-    snapshot->slots = bindings.slots;
-    snapshot->inlineOffsets.resize(snapshot->slots.size(), VK_WHOLE_SIZE);
-    VkDeviceSize inlineSize = 0;
-    VkBufferUsageFlags inlineUsage = 0;
-    const VkDeviceSize alignment = bindings.device->descriptorBufferOffsetAlignment;
-    for (size_t index = 0; index < snapshot->slots.size(); ++index) {
-        const auto &slot = snapshot->slots[index];
-        if (!packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind) ||
-            (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE && slot.entry.inlineOffset != UINT32_MAX))
-            continue;
-        inlineSize = (inlineSize + alignment - 1) & ~(alignment - 1);
-        snapshot->inlineOffsets[index] = inlineSize;
-        inlineSize += slot.inlineStorage.size();
-        inlineUsage |= slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                           ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
-                           : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    }
-    if (inlineSize) {
-        if (!bindings.device->createBuffer(snapshot->inlineBuffer, inlineSize, inlineUsage,
-                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                           backendDiagnostic))
-            return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure,
-                {"vulkan_create_inline_binding_buffer", inlineSize, static_cast<uint32_t>(inlineUsage)}})};
-        void *mapped = nullptr;
-        const VkResult result = rhi::vulkan::driver().mapMemory(bindings.device->device, snapshot->inlineBuffer.memory,
-                                                                0, inlineSize, 0, &mapped);
-        if (result != VK_SUCCESS) {
-            auto failed = failureResult(result, "vkMapMemory");
-            return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(std::move(failed).error())};
+    if (!group.device->createBuffer(group.inlineBuffer, size, usage,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                    backendDiagnostic))
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "vulkan_create_inline_binding_buffer", size,
+                               static_cast<uint32_t>(usage));
+    void *mapped = nullptr;
+    if (auto result = failureResult(
+            rhi::vulkan::driver().mapMemory(group.device->device, group.inlineBuffer.memory, 0, size, 0, &mapped),
+            "vkMapMemory");
+        !result)
+        return result;
+    for (size_t index = 0; index < entries.size(); ++index)
+        if (entries[index].inlineBuffer) {
+            ranges[index].buffer = group.inlineBuffer.buffer;
+            std::memcpy(static_cast<uint8_t *>(mapped) + ranges[index].offset, values[index].payload.inline_value.data,
+                        values[index].payload.inline_value.size);
         }
-        for (size_t index = 0; index < snapshot->slots.size(); ++index)
-            if (snapshot->inlineOffsets[index] != VK_WHOLE_SIZE)
-                std::memcpy(static_cast<uint8_t *>(mapped) + snapshot->inlineOffsets[index],
-                            snapshot->slots[index].inlineStorage.data(), snapshot->slots[index].inlineStorage.size());
-        rhi::vulkan::driver().unmapMemory(bindings.device->device, snapshot->inlineBuffer.memory);
-    }
-    snapshot->descriptorSets.resize(bindings.layout->descriptorSetLayouts.size());
-    for (size_t set = 0; set < bindings.layout->descriptorSetLayouts.size(); ++set)
-        if (bindings.layout->descriptorSetsUsed[set] &&
-            !bindings.device->allocateDescriptorSet(bindings.layout->descriptorSetLayouts[set],
-                                                    snapshot->descriptorSets[set], backendDiagnostic))
-            return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"vulkan_allocate_binding_descriptor_set", set, 0}})};
+    rhi::vulkan::driver().unmapMemory(group.device->device, group.inlineBuffer.memory);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
 
+// A transient group's set belongs to its encoder's command frame, which resets it when it retires.
+RhiAdapterResult<void> allocateGroupDescriptorSet(VernonRuntimeRhiAdapter &adapter, VulkanGroup &group,
+                                                  const VernonRuntimeProviderGroupDescriptor &descriptor) {
+    if (descriptor.lifetime != VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT) {
+        std::string backendDiagnostic;
+        if (!group.device->allocateDescriptorSet(group.layout->setLayout, group.descriptorSet, backendDiagnostic))
+            return providerFailure(vernon::ProviderErrorCode::BackendFailure, "vulkan_allocate_group_descriptor_set");
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+    auto native = nativeCommandEncoder(adapter, descriptor.command_encoder);
+    if (!native)
+        return RhiAdapterResult<void>{vernon::err(std::move(native).error())};
+    auto set = rhi::vulkan::allocateCommandDescriptorSet(
+        adapter.rhiDevice, reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(native.value())),
+        group.layout->setLayout);
+    if (!set)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(set).error()))};
+    group.descriptorSet.set = set.value();
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> createGroupImplResult(VernonRuntimeRhiAdapter &adapter,
+                                             const VernonRuntimeProviderGroupDescriptor &descriptor,
+                                             VernonRuntimeProviderObject *output) {
+    auto *layout = fromHandle<GroupLayout>(descriptor.group_layout);
+    if (!layout || descriptor.value_count != layout->entries.size() ||
+        (descriptor.value_count != 0 && !descriptor.values))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_group_descriptor");
+    const VernonRuntimeProviderBindingValue *values = descriptor.values;
+    for (size_t index = 0; index < layout->entries.size(); ++index)
+        if (auto valid = validateGroupValue(layout->entries[index], values[index]); !valid)
+            return valid;
+    auto group = std::make_unique<VulkanGroup>();
+    group->device = &vulkanDevice(adapter);
+    layout->references.fetch_add(1, std::memory_order_relaxed);
+    group->layout = layout;
+    std::vector<uint64_t> natives(layout->entries.size());
+    for (size_t index = 0; index < layout->entries.size(); ++index) {
+        const auto &entry = layout->entries[index].layout;
+        const bool defaultResource = (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
+        if (packedUniformBytes(entry.kind, entry.interface_kind) || defaultResource)
+            continue;
+        auto acquired = acquireGroupResource(adapter, *group, *providerBindingResource(values[index]));
+        if (!acquired)
+            return RhiAdapterResult<void>{vernon::err(std::move(acquired).error())};
+        natives[index] = acquired.value();
+        if (!natives[index])
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_resource_binding_is_stale",
+                                   entry.slot);
+        if (writesBinding(entry))
+            group->writes.push_back(*providerBindingResource(values[index]));
+    }
+    std::vector<VkDescriptorBufferInfo> inlineRanges;
+    if (auto placed = placeInlineValues(adapter, *group, descriptor, inlineRanges); !placed)
+        return placed;
+    group->pushData.resize(layout->pushDataSize);
+    for (const GroupPushValue &value : layout->pushValues)
+        std::memcpy(group->pushData.data() + value.dataOffset, values[value.entry].payload.inline_value.data,
+                    value.size);
+    if (layout->hasDescriptors)
+        if (auto allocated = allocateGroupDescriptorSet(adapter, *group, descriptor); !allocated)
+            return allocated;
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
-    writes.reserve(snapshot->slots.size());
-    buffers.reserve(snapshot->slots.size());
-    images.reserve(snapshot->slots.size());
-    for (size_t index = 0; index < snapshot->slots.size(); ++index) {
-        auto &slot = snapshot->slots[index];
-        if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER ||
-            (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE && slot.entry.inlineOffset != UINT32_MAX) ||
-            slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)
+    writes.reserve(layout->entries.size());
+    buffers.reserve(layout->entries.size());
+    images.reserve(layout->entries.size());
+    for (size_t index = 0; index < layout->entries.size(); ++index) {
+        const GroupLayout::Entry &entry = layout->entries[index];
+        const auto kind = entry.layout.kind;
+        if (kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
+            const auto &buffer = values[index].payload.buffer.resource;
+            group->vertexBuffers.push_back(
+                {entry.layout.binding, reinterpret_cast<rhi::vulkan::Buffer *>(natives[index])->buffer, buffer.offset});
+            continue;
+        }
+        if (pushValue(entry.layout) || (kind == VERNON_RUNTIME_PROVIDER_SAMPLER && entry.combinedWithImage))
             continue;
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = snapshot->descriptorSets[slot.entry.layout.set].set;
-        write.dstBinding = slot.entry.layout.binding;
+        write.dstSet = group->descriptorSet.set;
+        write.dstBinding = entry.layout.binding;
         write.descriptorCount = 1;
-        write.descriptorType = descriptorType(slot.entry.layout.kind);
-        if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
-            slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-            slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-            const bool internallyOwned = packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind);
-            rhi::vulkan::Buffer *buffer = &snapshot->inlineBuffer;
-            if (!internallyOwned) {
-                auto resolved = resolveCommandRhiResource(adapter, encoder, slot.value.payload.buffer.resource);
-                if (!resolved) {
-                    return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(std::move(resolved).error())};
-                }
-                buffer = reinterpret_cast<rhi::vulkan::Buffer *>(static_cast<uintptr_t>(std::move(resolved).value()));
+        write.descriptorType = descriptorType(kind);
+        const auto samplerOf = [&](size_t samplerIndex) {
+            return (values[samplerIndex].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0
+                       ? group->device->defaultImplicitSampler.sampler
+                       : reinterpret_cast<rhi::vulkan::Sampler *>(natives[samplerIndex])->sampler;
+        };
+        if (kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER || kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+            kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+            if (entry.inlineBuffer) {
+                buffers.push_back(inlineRanges[index]);
+            } else {
+                const auto &resource = values[index].payload.buffer.resource;
+                buffers.push_back(
+                    {reinterpret_cast<rhi::vulkan::Buffer *>(natives[index])->buffer, resource.offset, resource.size});
             }
-            if (!buffer)
-                return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-                    vernon::ProviderErrorCode::InvalidArgument, {"vulkan_buffer_binding_is_stale", 0, 0}})};
-            buffers.push_back(
-                {buffer->buffer,
-                 internallyOwned ? snapshot->inlineOffsets[index] : slot.value.payload.buffer.resource.offset,
-                 internallyOwned
-                     ? slot.inlineStorage.size()
-                     : slot.value.payload.buffer.resource.size - slot.value.payload.buffer.resource.offset});
             write.pBufferInfo = &buffers.back();
+        } else if (kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
+            images.push_back({samplerOf(index), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+            write.pImageInfo = &images.back();
         } else {
-            VkDescriptorImageInfo info{};
-            auto resolvedImage = resolveCommandRhiResource(adapter, encoder, slot.value.payload.image.view);
-            if (!resolvedImage) {
-                return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(std::move(resolvedImage).error())};
-            }
-            auto *image =
-                reinterpret_cast<rhi::vulkan::Image *>(static_cast<uintptr_t>(std::move(resolvedImage).value()));
-            info.imageView = image->view;
-            info.imageLayout = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
-                                   ? VK_IMAGE_LAYOUT_GENERAL
-                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            const auto samplerIndex =
-                bindings.samplerByBinding.find(descriptorBindingKey(slot.entry.layout.set, slot.entry.layout.binding));
-            if (samplerIndex != bindings.samplerByBinding.end()) {
-                const auto &sampler = snapshot->slots[samplerIndex->second];
+            auto *image = reinterpret_cast<rhi::vulkan::Image *>(natives[index]);
+            const VkImageLayout imageLayout = kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                                                  ? VK_IMAGE_LAYOUT_GENERAL
+                                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            group->images.push_back({image, imageLayout});
+            VkDescriptorImageInfo info{VK_NULL_HANDLE, image->view, imageLayout};
+            if (entry.combinedSampler != UINT32_MAX) {
                 write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                if ((sampler.value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0)
-                    info.sampler = bindings.device->defaultImplicitSampler.sampler;
-                else {
-                    auto resolvedSampler =
-                        resolveCommandRhiResource(adapter, encoder, sampler.value.payload.sampler.resource);
-                    if (!resolvedSampler) {
-                        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{
-                            vernon::err(std::move(resolvedSampler).error())};
-                    }
-                    auto *nativeSampler = reinterpret_cast<rhi::vulkan::Sampler *>(
-                        static_cast<uintptr_t>(std::move(resolvedSampler).value()));
-                    info.sampler = nativeSampler->sampler;
-                }
+                info.sampler = samplerOf(entry.combinedSampler);
             }
             images.push_back(info);
             write.pImageInfo = &images.back();
         }
         writes.push_back(write);
     }
-    size_t bufferIndex = 0;
-    size_t imageIndex = 0;
-    for (auto &write : writes) {
-        if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-            write.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
-            write.pBufferInfo = &buffers[bufferIndex++];
-        else
-            write.pImageInfo = &images[imageIndex++];
-    }
     if (!writes.empty())
-        rhi::vulkan::driver().updateDescriptorSets(bindings.device->device, static_cast<uint32_t>(writes.size()),
+        rhi::vulkan::driver().updateDescriptorSets(group->device->device, static_cast<uint32_t>(writes.size()),
                                                    writes.data(), 0, nullptr);
-
-    bindings.snapshot = std::move(snapshot);
-    PreparedBindingSet::Snapshot *result = bindings.snapshot.get();
-    adapter.bindingSnapshotCreations.fetch_add(1, std::memory_order_relaxed);
-    if (!retainBindingSnapshot(adapter, encoder, bindings, *result)) {
-        bindings.snapshot.reset();
-        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_cleanup_registration_failed", 0, 0}})};
-    }
-    recordPushConstants(command, pipeline, bindings);
-    return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::ok(result)};
+    group->serial = vulkanState(adapter).nextSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+    *output = toHandle(group.release());
+    adapter.groupCreations.fetch_add(1, std::memory_order_relaxed);
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                                            VernonRuntimeProviderObject *output) {
+RhiAdapterResult<void> createGroupResult(void *data, const VernonRuntimeProviderGroupDescriptor *descriptor,
+                                         VernonRuntimeProviderObject *output) {
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_group_descriptor");
+    try {
+        return createGroupImplResult(*static_cast<VernonRuntimeRhiAdapter *>(data), *descriptor, output);
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::BackendFailure, "vulkan_group_creation_ran_out_of_memory");
+    }
+}
+
+RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObject encoder,
+                                           VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
-    if (!descriptor || !output || !layout)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
-    auto bindings = std::unique_ptr<PreparedBindingSet>(new (std::nothrow) PreparedBindingSet());
-    if (!bindings)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_preparation_ran_out_of_memory", 0, 0}})};
-    bindings->device = &vulkanDevice(adapter);
-    bindings->layout = layout;
-    bindings->slots.reserve(layout->entries.size());
-    bindings->samplerByBinding.reserve(layout->entries.size());
-    bindings->pushConstantStorage.resize(layout->pushConstantSize);
-    for (size_t index = 0; index < layout->entries.size(); ++index) {
-        const auto &entry = layout->entries[index];
-        PreparedBindingSet::Slot slot;
-        slot.entry = entry;
-        if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
-            !bindings->samplerByBinding.emplace(descriptorBindingKey(entry.layout.set, entry.layout.binding), index)
-                 .second)
-            return RhiAdapterResult<void>{vernon::err(
-                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                      {"vulkan_binding_layout_contains_duplicate_sampler_bindings", 0, 0}})};
-        if (packedUniformBytes(entry.layout.kind, entry.layout.interface_kind))
-            slot.inlineStorage.resize(entry.layout.element_size);
-        bindings->slots.push_back(std::move(slot));
+    if (!output)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_begin_commands_output_is_null");
+    std::unique_ptr<VulkanCommands> commands(new (std::nothrow) VulkanCommands());
+    if (!commands)
+        return providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "vulkan_commands_allocation");
+    if (auto begun = beginRhiCommands(adapter, encoder, *commands); !begun)
+        return begun;
+    commands->command = reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(commands->native));
+    try {
+        commands->pushData.resize(vulkanDevice(adapter).maxPushConstantsSize);
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "vulkan_commands_allocation");
     }
-    auto status = initializeBindingsResult(adapter, *bindings, descriptor->values, descriptor->value_count);
-    if (!status)
-        return status;
-    *output = toHandle(bindings.release());
-    adapter.bindingCreations.fetch_add(1, std::memory_order_relaxed);
+    *output = toHandle(commands.release());
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> transitionImage(VernonRuntimeRhiAdapter &adapter, VkCommandBuffer command,
-                                       rhi::vulkan::Image &image, VkImageLayout newLayout) {
-    auto transitioned = rhi::vulkan::transitionCommandImage(adapter.rhiDevice, command, image, newLayout);
-    if (transitioned.isErr())
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(transitioned).error()))};
+RhiAdapterResult<void> endCommandsResult(void *, VernonRuntimeProviderObject handle) {
+    std::unique_ptr<VulkanCommands> commands(fromHandle<VulkanCommands>(handle));
+    return commands
+               ? RhiAdapterResult<void>{vernon::ok()}
+               : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_end_commands_handle_is_invalid");
+}
+
+RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
+                                          VernonRuntimeProviderObject pipelineHandle) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    auto *pipeline = fromHandle<PreparedPipeline>(pipelineHandle);
+    if (!commands || !pipeline || !pipeline->pipeline)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_bind_pipeline_is_invalid");
+    if (auto retained = retainForCommands(adapter, commands->encoder, *pipeline); !retained)
+        return retained;
+    const PreparedLayout &layout = *pipeline->layout;
+    BindPointState &bindPoint = pipeline->graphics ? commands->graphicsState : commands->computeState;
+    if (bindPoint.layout != &layout) {
+        const uint32_t kept = compatibleGroups(bindPoint.layout, layout);
+        std::fill(bindPoint.sets.begin() + kept, bindPoint.sets.end(), 0);
+        bindPoint.layout = &layout;
+    }
+    for (uint32_t group = 0; group < kMaxGroups; ++group)
+        if (commands->groups[group] &&
+            (group >= layout.groupCount || commands->groups[group]->layout != layout.groups[group]))
+            commands->groups[group] = nullptr;
+    rhi::vulkan::driver().cmdBindPipeline(
+        commands->command, pipeline->graphics ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline->pipeline);
+    commands->pipeline = pipeline;
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-void bindDescriptorSets(VkCommandBuffer command, PreparedPipeline &pipeline,
-                        const PreparedBindingSet::Snapshot *snapshot, VkPipelineBindPoint bindPoint) {
-    if (!snapshot)
-        return;
-    for (uint32_t set = 0; set < snapshot->descriptorSets.size(); ++set)
-        if (snapshot->descriptorSets[set].set)
-            rhi::vulkan::driver().cmdBindDescriptorSets(command, bindPoint, pipeline.pipelineLayout, set, 1,
-                                                        &snapshot->descriptorSets[set].set, 0, nullptr);
+RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject handle, uint32_t index,
+                                       VernonRuntimeProviderObject groupHandle) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    auto *group = fromHandle<VulkanGroup>(groupHandle);
+    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->layout->groupCount ||
+        group->layout != commands->pipeline->layout->groups[index])
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_bind_group_is_invalid", index);
+    if (auto retained = retainForCommands(adapter, commands->encoder, *group); !retained)
+        return retained;
+    commands->groups[index] = group;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject commandEncoder,
+// Binds the descriptor sets and pushes the inline values of the bound groups that the native state lacks.
+RhiAdapterResult<void> flushGroups(VulkanCommands &commands, VkPipelineBindPoint bindPoint, BindPointState &state) {
+    const PreparedLayout &layout = *commands.pipeline->layout;
+    auto &driver = rhi::vulkan::driver();
+    if (commands.pushLayout != &layout) {
+        commands.pushLayout = &layout;
+        commands.pushGroups.fill(0);
+    }
+    bool pushed = false;
+    for (uint32_t index = 0; index < layout.groupCount; ++index) {
+        const VulkanGroup *group = commands.groups[index];
+        if (!group)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_command_group_is_unbound",
+                                   index);
+        if (group->layout->hasDescriptors && state.sets[index] != group->serial) {
+            driver.cmdBindDescriptorSets(commands.command, bindPoint, layout.pipelineLayout, index, 1,
+                                         &group->descriptorSet.set, 0, nullptr);
+            state.sets[index] = group->serial;
+        }
+        if ((layout.pushGroupMask & (1u << index)) == 0 || commands.pushGroups[index] == group->serial)
+            continue;
+        for (const PushPlacement &placement : layout.pushPlacements[index])
+            std::memcpy(commands.pushData.data() + placement.offset, group->pushData.data() + placement.dataOffset,
+                        placement.size);
+        commands.pushGroups[index] = group->serial;
+        pushed = true;
+    }
+    if (pushed)
+        for (const PushRange &range : layout.pushRanges)
+            driver.cmdPushConstants(commands.command, layout.pipelineLayout, range.stages, range.offset, range.size,
+                                    commands.pushData.data() + range.offset);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> recordBoundGroupWrites(VernonRuntimeRhiAdapter &adapter, const VulkanCommands &commands) {
+    for (uint32_t index = 0; index < commands.pipeline->layout->groupCount; ++index)
+        if (!commands.groups[index]->writes.empty())
+            if (auto recorded = recordGroupWrites(adapter, commands.encoder, *commands.groups[index]); !recorded)
+                return recorded;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject handle,
                                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
-    auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!descriptor || !pipeline || pipeline->graphics)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_adapter_received_an_invalid_dispatch", 0, 0}})};
-    auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
-    if (!nativeCommand)
-        return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
-    const VkCommandBuffer command =
-        reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(std::move(nativeCommand).value()));
-    auto rendering = commandEncoderRendering(adapter, commandEncoder);
-    if (!rendering)
-        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
-    if (std::move(rendering).value())
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_dispatch_command_encoder_is_invalid", 0, 0}})};
-    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_dispatch_could_not_retain_provider_objects", 0, 0}})};
-    PreparedBindingSet::Snapshot *bindingSnapshot = nullptr;
-    if (bindings) {
-        auto snapshot = snapshotBindings(adapter, commandEncoder, *pipeline, *bindings, command);
-        if (!snapshot)
-            return RhiAdapterResult<void>{vernon::err(std::move(snapshot).error())};
-        bindingSnapshot = std::move(snapshot).value();
-    }
-    if (bindings)
-        for (const auto &slot : bindings->slots)
-            if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
-                auto resolved = resolveCommandRhiResource(adapter, commandEncoder, slot.value.payload.image.view);
-                if (!resolved)
-                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-                auto *image =
-                    reinterpret_cast<rhi::vulkan::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-                const VkImageLayout layout = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
-                                                 ? VK_IMAGE_LAYOUT_GENERAL
-                                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                if (!image || !transitionImage(adapter, command, *image, layout))
-                    return RhiAdapterResult<void>{
-                        vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
-                                                          {"vulkan_dispatch_could_not_track_image_layout", 0, 0}})};
-            }
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
+        commands->pipeline->graphics || commands->rendering ||
+        descriptor->push_constant_size > commands->pipeline->layout->pushConstantSize ||
+        (descriptor->push_constant_size != 0 && !descriptor->push_constants))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_dispatch");
+    if (auto flushed = flushGroups(*commands, VK_PIPELINE_BIND_POINT_COMPUTE, commands->computeState); !flushed)
+        return flushed;
+    for (uint32_t index = 0; index < commands->pipeline->layout->groupCount; ++index)
+        for (const VulkanGroup::ImageUse &use : commands->groups[index]->images) {
+            auto transitioned =
+                rhi::vulkan::transitionCommandImage(adapter.rhiDevice, commands->command, *use.image, use.layout);
+            if (transitioned.isErr())
+                return RhiAdapterResult<void>{vernon::err(providerError(std::move(transitioned).error()))};
+        }
     auto &driver = rhi::vulkan::driver();
-    driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-    bindDescriptorSets(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_COMPUTE);
-    driver.cmdDispatch(command, descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
-    if (!recordProviderCommand(adapter, commandEncoder, false))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_dispatch_command_encoder_state_changed", 0, 0}})};
+    if (descriptor->push_constant_size != 0)
+        driver.cmdPushConstants(commands->command, commands->pipeline->layout->pipelineLayout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<uint32_t>(descriptor->push_constant_size),
+                                descriptor->push_constants);
+    driver.cmdDispatch(commands->command, descriptor->group_count[0], descriptor->group_count[1],
+                       descriptor->group_count[2]);
+    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
+        return recorded;
+    if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
+        return recorded;
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject commandEncoder,
+// A render pass cannot change image layouts, so the images a scope's draws sample became readable when it began.
+RhiAdapterResult<void> checkSampledImages(VernonRuntimeRhiAdapter &adapter, VulkanCommands &commands) {
+    for (uint32_t index = 0; index < commands.pipeline->layout->groupCount; ++index) {
+        const VulkanGroup &group = *commands.groups[index];
+        if (commands.checkedGroups[index] == group.serial && commands.checkedScopes[index] == commands.scope)
+            continue;
+        for (const VulkanGroup::ImageUse &use : group.images) {
+            if (use.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                continue;
+            auto readable = rhi::vulkan::imageInLayout(adapter.rhiDevice, commands.command, *use.image,
+                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (readable.isErr())
+                return RhiAdapterResult<void>{vernon::err(providerError(std::move(readable).error()))};
+            if (!readable.value())
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                       "vulkan_draw_samples_an_image_its_rendering_scope_does_not_declare");
+        }
+        commands.checkedGroups[index] = group.serial;
+        commands.checkedScopes[index] = commands.scope;
+    }
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+void bindVertexBuffers(VulkanCommands &commands) {
+    const PreparedLayout &layout = *commands.pipeline->layout;
+    for (uint32_t index = 0; index < layout.groupCount; ++index) {
+        const VulkanGroup &group = *commands.groups[index];
+        if ((layout.vertexGroupMask & (1u << index)) == 0 || commands.vertexGroups[index] == group.serial)
+            continue;
+        for (const VulkanGroup::VertexBuffer &buffer : group.vertexBuffers)
+            rhi::vulkan::driver().cmdBindVertexBuffers(commands.command, buffer.binding, 1, &buffer.buffer,
+                                                       &buffer.offset);
+        commands.vertexGroups[index] = group.serial;
+    }
+}
+
+RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject handle,
                                         const VernonRuntimeProviderDrawDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
-    auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!validCommonDrawDescriptor(descriptor))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_adapter_received_an_invalid_draw_descriptor", 0, 0}})};
-    if (!pipeline)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_adapter_received_an_invalid_prepared_pipeline", 0, 0}})};
-    if (!pipeline->graphics)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_adapter_received_a_compute_pipeline_for_a_draw", 0, 0}})};
-    if (!pipeline->pipeline)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
-                                              {"vulkan_adapter_received_an_uninitialized_graphics_pipeline", 0, 0}})};
-    auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
-    if (!nativeCommand)
-        return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
-    const VkCommandBuffer command =
-        reinterpret_cast<VkCommandBuffer>(static_cast<uintptr_t>(std::move(nativeCommand).value()));
-    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_draw_could_not_retain_provider_objects", 0, 0}})};
-    PreparedBindingSet::Snapshot *bindingSnapshot = nullptr;
-    if (bindings) {
-        auto snapshot = snapshotBindings(adapter, commandEncoder, *pipeline, *bindings, command);
-        if (!snapshot)
-            return RhiAdapterResult<void>{vernon::err(std::move(snapshot).error())};
-        bindingSnapshot = std::move(snapshot).value();
-    }
-    auto &driver = rhi::vulkan::driver();
-    auto opened = openCommandRendering(adapter, commandEncoder);
-    if (!opened)
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
+        !commands->pipeline->graphics || !commands->rendering)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "vulkan_adapter_received_an_invalid_draw_descriptor");
+    if (auto opened = openCommandRendering(adapter, commands->encoder); !opened)
         return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
-    driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-    bindDescriptorSets(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_GRAPHICS);
-    if (bindingSnapshot)
-        for (const auto &slot : bindingSnapshot->slots) {
-            if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-                auto resolved = resolveCommandRhiResource(adapter, commandEncoder, slot.value.payload.image.view);
-                if (!resolved)
-                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-                auto *image =
-                    reinterpret_cast<rhi::vulkan::Image *>(static_cast<uintptr_t>(std::move(resolved).value()));
-                // A render pass cannot change layouts, so the scope's sampled images became readable when it began.
-                auto readable = rhi::vulkan::imageInLayout(adapter.rhiDevice, command, *image,
-                                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                if (readable.isErr())
-                    return RhiAdapterResult<void>{vernon::err(providerError(std::move(readable).error()))};
-                if (!readable.value())
-                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                        vernon::ProviderErrorCode::InvalidArgument,
-                        {"vulkan_draw_samples_an_image_its_rendering_scope_does_not_declare", 0, 0}})};
-            } else if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-                auto resolved = resolveCommandRhiResource(adapter, commandEncoder, slot.value.payload.buffer.resource);
-                if (!resolved)
-                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-                auto *buffer =
-                    reinterpret_cast<rhi::vulkan::Buffer *>(static_cast<uintptr_t>(std::move(resolved).value()));
-                const VkDeviceSize offset = slot.value.payload.buffer.resource.offset;
-                driver.cmdBindVertexBuffers(command, slot.entry.layout.binding, 1, &buffer->buffer, &offset);
-            }
-        }
-    const VkViewport viewport{static_cast<float>(descriptor->viewport[0]),
-                              static_cast<float>(descriptor->viewport[1] + descriptor->viewport[3]),
-                              static_cast<float>(descriptor->viewport[2]),
-                              -static_cast<float>(descriptor->viewport[3]),
-                              0,
-                              1};
-    const VkRect2D scissor{{static_cast<int32_t>(descriptor->scissor[0]), static_cast<int32_t>(descriptor->scissor[1])},
-                           {descriptor->scissor[2], descriptor->scissor[3]}};
-    driver.cmdSetViewport(command, 0, 1, &viewport);
-    driver.cmdSetScissor(command, 0, 1, &scissor);
-    driver.cmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor->stencil_reference);
-    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
-    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
+    if (auto flushed = flushGroups(*commands, VK_PIPELINE_BIND_POINT_GRAPHICS, commands->graphicsState); !flushed)
+        return flushed;
+    if (auto checked = checkSampledImages(adapter, *commands); !checked)
+        return checked;
+    bindVertexBuffers(*commands);
+    auto &driver = rhi::vulkan::driver();
+    const VkCommandBuffer command = commands->command;
+    const std::array<uint32_t, 4> viewport{descriptor->viewport[0], descriptor->viewport[1], descriptor->viewport[2],
+                                           descriptor->viewport[3]};
+    if (!commands->viewportValid || commands->viewport != viewport) {
+        const VkViewport native{static_cast<float>(viewport[0]),
+                                static_cast<float>(viewport[1] + viewport[3]),
+                                static_cast<float>(viewport[2]),
+                                -static_cast<float>(viewport[3]),
+                                0,
+                                1};
+        driver.cmdSetViewport(command, 0, 1, &native);
+        commands->viewport = viewport;
+        commands->viewportValid = true;
+    }
+    const std::array<uint32_t, 4> scissor{descriptor->scissor[0], descriptor->scissor[1], descriptor->scissor[2],
+                                          descriptor->scissor[3]};
+    if (!commands->scissorValid || commands->scissor != scissor) {
+        const VkRect2D native{{static_cast<int32_t>(scissor[0]), static_cast<int32_t>(scissor[1])},
+                              {scissor[2], scissor[3]}};
+        driver.cmdSetScissor(command, 0, 1, &native);
+        commands->scissor = scissor;
+        commands->scissorValid = true;
+    }
+    if (!commands->stencilValid || commands->stencilReference != descriptor->stencil_reference) {
+        driver.cmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor->stencil_reference);
+        commands->stencilReference = descriptor->stencil_reference;
+        commands->stencilValid = true;
+    }
     if (descriptor->index_count) {
-        if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::BackendFailure, {"vulkan_draw_could_not_retain_its_index_buffer", 0, 0}})};
-        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->index_buffer);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        auto *buffer = reinterpret_cast<rhi::vulkan::Buffer *>(static_cast<uintptr_t>(std::move(resolved).value()));
-        driver.cmdBindIndexBuffer(command, buffer->buffer, descriptor->index_buffer.offset, VK_INDEX_TYPE_UINT32);
+        const auto &indexBuffer = descriptor->index_buffer;
+        if (commands->indexBufferKey != indexBuffer.resource.value) {
+            if (auto retained = retainCommandResource(adapter, commands->encoder, indexBuffer); !retained)
+                return retained;
+            auto resolved = resolveCommandRhiResource(adapter, commands->encoder, indexBuffer);
+            if (!resolved)
+                return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+            commands->indexBuffer = reinterpret_cast<rhi::vulkan::Buffer *>(resolved.value())->buffer;
+            commands->indexBufferKey = indexBuffer.resource.value;
+            commands->indexBufferOffset = UINT64_MAX;
+        }
+        if (commands->indexBufferOffset != indexBuffer.offset) {
+            driver.cmdBindIndexBuffer(command, commands->indexBuffer, indexBuffer.offset, VK_INDEX_TYPE_UINT32);
+            commands->indexBufferOffset = indexBuffer.offset;
+        }
         driver.cmdDrawIndexed(command, descriptor->index_count, descriptor->instance_count, 0, descriptor->base_vertex,
                               descriptor->first_instance);
-    } else
+    } else {
         driver.cmdDraw(command, descriptor->vertex_count, descriptor->instance_count, 0, descriptor->first_instance);
-    if (!recordProviderCommand(adapter, commandEncoder, true))
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_draw_command_encoder_state_changed", 0, 0}})};
+    }
+    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
+        return recorded;
+    if (auto recorded = recordProviderCommand(adapter, commands->encoder, true); !recorded)
+        return recorded;
+    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
+    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> destroyShaderResult(void *, VernonRuntimeProviderObject handle) {
-    auto *shader = fromHandle<PreparedShader>(handle);
-    if (!shader)
-        return RhiAdapterResult<void>{vernon::ok()};
-    rhi::vulkan::driver().destroyShaderModule(shader->device->device, shader->module, nullptr);
-    delete shader;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-RhiAdapterResult<void> destroyLayoutResult(void *, VernonRuntimeProviderObject handle) {
-    auto *layout = fromHandle<PreparedLayout>(handle);
-    if (!layout)
-        return RhiAdapterResult<void>{vernon::ok()};
-    delete layout;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-PreparedLayout::~PreparedLayout() {
-    if (!device)
-        return;
-    for (VkDescriptorSetLayout descriptorSetLayout : descriptorSetLayouts)
-        if (descriptorSetLayout)
-            rhi::vulkan::driver().destroyDescriptorSetLayout(device->device, descriptorSetLayout, nullptr);
-}
-PreparedPipeline::~PreparedPipeline() {
-    if (adapter)
-        adapter->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
-    if (!device)
-        return;
-    if (pipeline)
-        rhi::vulkan::driver().destroyPipeline(device->device, pipeline, nullptr);
-    if (renderPass)
-        rhi::vulkan::driver().destroyRenderPass(device->device, renderPass, nullptr);
-    for (VkShaderModule module : specializedShaderModules)
-        rhi::vulkan::driver().destroyShaderModule(device->device, module, nullptr);
-    if (pipelineLayout)
-        rhi::vulkan::driver().destroyPipelineLayout(device->device, pipelineLayout, nullptr);
-}
-void releaseCommandPipeline(void *context, uint64_t) {
-    auto *pipeline = static_cast<PreparedPipeline *>(context);
-    if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
-        return;
-    delete pipeline;
-}
-RhiAdapterResult<void> destroyPipelineResult(void *, VernonRuntimeProviderObject handle) {
-    releaseCommandPipeline(fromHandle<PreparedPipeline>(handle), 0);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-void releaseCommandBindings(void *context, uint64_t) {
-    auto *bindings = static_cast<PreparedBindingSet *>(context);
-    if (!bindings || bindings->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
-        return;
-    delete bindings;
-}
-RhiAdapterResult<void> destroyBindingsResult(void *, VernonRuntimeProviderObject handle) {
-    releaseCommandBindings(fromHandle<PreparedBindingSet>(handle), 0);
+RhiAdapterResult<void> beginRenderingResult(void *data, VernonRuntimeProviderObject handle,
+                                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    if (!commands || !descriptor || commands->rendering)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_begin_rendering_is_invalid");
+    if (auto begun = beginEncoderRendering(adapter, commands->encoder, *descriptor); !begun)
+        return begun;
+    commands->rendering = true;
+    ++commands->scope;
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-void destroyShader(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyShaderResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "Vulkan shader destruction failed");
+RhiAdapterResult<void> endRenderingResult(void *data, VernonRuntimeProviderObject handle) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<VulkanCommands>(handle);
+    if (!commands || !commands->rendering)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "vulkan_end_rendering_is_invalid");
+    commands->rendering = false;
+    return endEncoderRendering(adapter, commands->encoder);
 }
-void destroyLayout(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyLayoutResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "Vulkan layout destruction failed");
+
+void destroyShader(void *, VernonRuntimeProviderObject handle) {
+    auto *shader = fromHandle<PreparedShader>(handle);
+    if (!shader)
+        return;
+    rhi::vulkan::driver().destroyShaderModule(shader->device->device, shader->module, nullptr);
+    delete shader;
 }
-void destroyPipeline(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyPipelineResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "Vulkan pipeline destruction failed");
+void destroyGroupLayout(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<GroupLayout>(handle));
 }
-void destroyBindings(void *data, VernonRuntimeProviderObject handle) {
-    auto result = destroyBindingsResult(data, handle);
-    if (!result)
-        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
-                            "Vulkan binding-set destruction failed");
+void destroyLayout(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<PreparedLayout>(handle));
+}
+void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<PreparedPipeline>(handle));
+}
+void destroyGroup(void *, VernonRuntimeProviderObject handle) {
+    releaseRetainedObject(fromHandle<VulkanGroup>(handle));
 }
 
 VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
                            VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, prepareShaderResult(data, descriptor, output), "Vulkan shader preparation failed");
+}
+VernonStatus prepareGroupLayout(void *data, const VernonRuntimeProviderGroupLayoutDescriptor *descriptor,
+                                VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, prepareGroupLayoutResult(data, descriptor, output),
+                          "Vulkan group layout preparation failed");
 }
 VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
                            VernonRuntimeProviderObject *output) {
@@ -1459,21 +1531,47 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
     return providerStatus(adapter, preparePipelineResult(data, descriptor, output),
                           "Vulkan pipeline preparation failed");
 }
-VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                            VernonRuntimeProviderObject *output) {
+VernonStatus createGroup(void *data, const VernonRuntimeProviderGroupDescriptor *descriptor,
+                         VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, createBindingsResult(data, descriptor, output),
-                          "Vulkan binding-set creation failed");
+    return providerStatus(adapter, createGroupResult(data, descriptor, output), "Vulkan group creation failed");
 }
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
+VernonStatus beginCommands(void *data, VernonRuntimeProviderObject encoder, VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, beginCommandsResult(data, encoder, output), "Vulkan commands could not begin");
+}
+VernonStatus endCommands(void *data, VernonRuntimeProviderObject commands) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, endCommandsResult(data, commands), "Vulkan commands failed");
+}
+VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "Vulkan pipeline binding failed");
+}
+VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_t index,
+                       VernonRuntimeProviderObject group) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, bindGroupResult(data, commands, index, group), "Vulkan group binding failed");
+}
+VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDispatchResult(data, encoder, descriptor), "Vulkan dispatch encoding failed");
+    return providerStatus(adapter, encodeDispatchResult(data, commands, descriptor), "Vulkan dispatch encoding failed");
 }
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject encoder,
+VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commands,
                         const VernonRuntimeProviderDrawDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDrawResult(data, encoder, descriptor), "Vulkan draw encoding failed");
+    return providerStatus(adapter, encodeDrawResult(data, commands, descriptor), "Vulkan draw encoding failed");
+}
+VernonStatus beginRendering(void *data, VernonRuntimeProviderObject commands,
+                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, beginRenderingResult(data, commands, descriptor),
+                          "Vulkan rendering could not begin");
+}
+VernonStatus endRendering(void *data, VernonRuntimeProviderObject commands) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, endRenderingResult(data, commands), "Vulkan rendering could not end");
 }
 
 } // namespace
@@ -1485,20 +1583,24 @@ void initializeVulkanProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.get_capabilities = getCapabilities;
     adapter.provider.get_device_identity = getDeviceIdentity;
     adapter.provider.prepare_shader = prepareShader;
+    adapter.provider.prepare_group_layout = prepareGroupLayout;
     adapter.provider.prepare_pipeline_layout = prepareLayout;
     adapter.provider.prepare_pipeline = preparePipeline;
-    adapter.provider.retain_resource = retainRhiResourceCallback;
-    adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
-    adapter.provider.create_binding_set = createBindings;
+    adapter.provider.create_group = createGroup;
+    adapter.provider.begin_commands = beginCommands;
+    adapter.provider.end_commands = endCommands;
+    adapter.provider.encode_bind_pipeline = bindPipeline;
+    adapter.provider.encode_bind_group = bindGroup;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
-    adapter.provider.begin_rendering = beginRenderingCallback;
-    adapter.provider.end_rendering = endRenderingCallback;
+    adapter.provider.begin_rendering = beginRendering;
+    adapter.provider.end_rendering = endRendering;
     adapter.provider.destroy_shader = destroyShader;
+    adapter.provider.destroy_group_layout = destroyGroupLayout;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;
-    adapter.provider.destroy_binding_set = destroyBindings;
+    adapter.provider.destroy_group = destroyGroup;
 }
 
 } // namespace vernon::runtime::rhi_adapter

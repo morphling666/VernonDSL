@@ -2,6 +2,8 @@
 #include "runtime/rhi_adapter/adapter_directx12_test_hooks.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
+#include "spilled_uniform_runtime_oracle.h"
+#include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
 
@@ -21,6 +23,9 @@
 #endif
 #ifndef VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE
 #error VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE must name the cooked resolution Program bundle
+#endif
+#ifndef VERNON_DIRECTX_SPILLED_UNIFORM_BUNDLE
+#error VERNON_DIRECTX_SPILLED_UNIFORM_BUNDLE must name the cooked spilled uniform Program bundle
 #endif
 namespace {
 
@@ -328,6 +333,23 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolution) {
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(loaded);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
+
+// The third matrix exceeds the root-constant budget, so it spills to a constant buffer of a transient group.
+TEST(RuntimeDirectX12Pipeline, SpilledUniformsOfTransientGroupsReadTheEncoderUploadMemory) {
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr,
+                                                   vernon::tests::configuredDirectXTestDevicePreference());
+    VernonRuntimeContext *runtime = context.runtime;
+    ASSERT_NE(runtime, nullptr);
+    {
+        vernon::tests::OwnedProgramExecutable pipeline(runtime, VERNON_DIRECTX_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(pipeline) << vernon::test::text(vernonRuntimeGetLastError(runtime));
+        vernon::tests::runSpilledUniformRuntimeOracle(context, pipeline.get(), [&] {
+            return std::vector<size_t>{vernon::runtime::getDirectX12BufferCreationCount(runtime)};
+        });
+    }
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }

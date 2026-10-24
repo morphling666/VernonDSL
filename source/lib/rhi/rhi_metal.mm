@@ -1683,6 +1683,41 @@ Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native
     }
 }
 
+Result<CommandTransientReservation, RhiError> reserveTransient(VernonRhiDevice handle, uint64_t, uint64_t native,
+                                                               uint64_t size, uint64_t alignment) noexcept {
+    using Reserved = Result<CommandTransientReservation, RhiError>;
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Reserved{err(std::move(anchor).error())};
+            MetalDevice &device = anchor.value().device();
+            std::lock_guard<std::mutex> guard(device.mutex);
+            id<MTLBuffer> buffer;
+            size_t offset{};
+            if (!device.state.reserveTransient(native, static_cast<size_t>(size), static_cast<size_t>(alignment),
+                                               buffer, offset, device.error))
+                return Reserved{err(RhiError{RhiErrorCode::BackendFailure, {"reserve_metal_transient", native, 0}})};
+            return Reserved{ok(CommandTransientReservation{
+                {static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)buffer)), offset},
+                static_cast<uint8_t *>(buffer.contents) + offset})};
+        } catch (const std::bad_alloc &) {
+            return Reserved{err(RhiError{RhiErrorCode::ResourceExhausted, {"reserve_metal_transient", native, 0}})};
+        }
+    } @catch (NSException *) {
+        return Reserved{err(RhiError{RhiErrorCode::BackendFailure, {"reserve_metal_transient_exception", native, 0}})};
+    }
+}
+
+Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                                  const void *data, uint64_t size, uint64_t alignment) noexcept {
+    auto reserved = reserveTransient(handle, encoderKey, native, size, alignment);
+    if (reserved.isErr())
+        return Result<CommandTransient, RhiError>{err(std::move(reserved).error())};
+    std::memcpy(reserved.value().mapped, data, static_cast<size_t>(size));
+    return Result<CommandTransient, RhiError>{ok(reserved.value().transient)};
+}
+
 Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
     @try {
         auto anchor = lookupMetalDevice(handle);
@@ -1809,6 +1844,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
+        result.writeTransient.emplace(writeTransient);
+        result.reserveTransient.emplace(reserveTransient);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

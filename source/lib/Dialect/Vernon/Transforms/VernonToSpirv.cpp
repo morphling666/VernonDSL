@@ -448,17 +448,22 @@ spirv::StructType createBlockType(MLIRContext *context, StringRef variableName, 
 spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location location, StringRef name, Type valueType,
                                                 spirv::StorageClass storageClass, DictionaryAttr attributes,
                                                 const ByteTransportNode *layout = nullptr,
-                                                const BlockMembers *aggregateMembers = nullptr) {
+                                                const BlockMembers *aggregateMembers = nullptr,
+                                                bool nonWritable = false) {
     auto pointerType = spirv::PointerType::get(valueType, storageClass);
     if (isBlockWrappedStorageClass(storageClass)) {
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
         structDecorations.emplace_back(spirv::Decoration::Block, builder.getUnitAttr());
+        SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+        const size_t memberCount = aggregateMembers ? aggregateMembers->types.size() : 1;
+        if (nonWritable)
+            for (uint32_t member = 0; member < memberCount; ++member)
+                memberDecorations.emplace_back(member, spirv::Decoration::NonWritable, builder.getUnitAttr());
         spirv::StructType blockType;
         if (aggregateMembers) {
             blockType = createBlockType(builder.getContext(), name, aggregateMembers->types, aggregateMembers->offsets,
-                                        {}, structDecorations);
+                                        memberDecorations, structDecorations);
         } else {
-            SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
             if (layout)
                 appendMemberDecorations(builder, 0, valueType, *layout, memberDecorations);
             blockType =
@@ -1734,11 +1739,11 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                          const GraphicsBindingPlan &bindings) {
     ModuleOp sourceModule = source->getParentOfType<ModuleOp>();
     const bool pushConstantUniforms = abi != SpirvInterfaceAbi::NativeUniforms;
-    const auto generatedBinding = [&](unsigned index) -> std::optional<uint32_t> {
-        const SmallVector<uint32_t> *planned = bindings.find(source.getSymName(), index);
-        if (!planned || planned->size() != 1)
+    const auto generatedBinding = [&](unsigned index) -> std::optional<std::pair<uint32_t, uint32_t>> {
+        const GraphicsBindingAssignment *planned = bindings.find(source.getSymName(), index);
+        if (!planned || planned->bindings.size() != 1)
             return std::nullopt;
-        return planned->front();
+        return std::pair{planned->set, planned->bindings.front()};
     };
     auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
     if (!stage)
@@ -1816,7 +1821,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     SmallVector<std::pair<BlockArgument, SmallVector<spirv::GlobalVariableOp>>> storageArguments;
     SmallVector<std::pair<BlockArgument, spirv::GlobalVariableOp>> carrierArguments;
     const auto createBlockGlobal = [&](StringRef name, ArrayRef<Type> memberTypes, ArrayRef<uint32_t> memberOffsets,
-                                       spirv::StorageClass storageClass, uint32_t binding, bool nonWritable) {
+                                       spirv::StorageClass storageClass, uint32_t set, uint32_t binding,
+                                       bool nonWritable) {
         SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
         if (nonWritable)
             for (uint32_t member = 0; member < memberTypes.size(); ++member)
@@ -1827,14 +1833,14 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                          structDecorations);
         auto global = spirv::GlobalVariableOp::create(
             moduleBuilder, source.getLoc(), spirv::PointerType::get(blockType, storageClass), name, FlatSymbolRefAttr(),
-            IntegerAttr(), moduleBuilder.getI32IntegerAttr(binding), moduleBuilder.getI32IntegerAttr(0), StringAttr(),
+            IntegerAttr(), moduleBuilder.getI32IntegerAttr(binding), moduleBuilder.getI32IntegerAttr(set), StringAttr(),
             spirv::LinkageAttributesAttr());
         interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
         return global;
     };
     const auto createDescriptorBlock = [&](StringRef name, Type memberType, spirv::StorageClass storageClass,
-                                           uint32_t binding, bool nonWritable) {
-        return createBlockGlobal(name, {memberType}, {0}, storageClass, binding, nonWritable);
+                                           uint32_t set, uint32_t binding, bool nonWritable) {
+        return createBlockGlobal(name, {memberType}, {0}, storageClass, set, binding, nonWritable);
     };
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
         if (isa<SamplerType>(type)) {
@@ -1845,12 +1851,12 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         if (source.getArgAttr(index, kTensorMetadataCarrierAttrName)) {
             FailureOr<std::shared_ptr<const SemanticMetadataPlan>> semantic = getSemanticMetadataPlan(source);
-            std::optional<uint32_t> binding = generatedBinding(index);
+            std::optional<std::pair<uint32_t, uint32_t>> binding = generatedBinding(index);
             if (failed(semantic) || (*semantic)->empty() || !binding)
                 return source.emitError("graphics TensorView metadata carrier has no binding plan");
             MetadataNativeLocation nativeLocation;
-            nativeLocation.descriptorSet = 0;
-            nativeLocation.binding = *binding;
+            nativeLocation.descriptorSet = binding->first;
+            nativeLocation.binding = binding->second;
             FailureOr<std::shared_ptr<const PhysicalMetadataPlan>> physical =
                 getPhysicalMetadataPlan(**semantic, MetadataPhysicalProfile::PortableShaderMetadataI32, nativeLocation);
             if (failed(physical))
@@ -1865,18 +1871,19 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                 memberOffsets.push_back(static_cast<uint32_t>(member.byteOffset));
             std::string name = uniqueInterfaceName((source.getSymName() + "_tensor_metadata").str(), stage.getValue(),
                                                    usedInterfaceNames);
-            carrierArguments.emplace_back(
-                source.getArgument(index),
-                createBlockGlobal(name, memberTypes, memberOffsets, spirv::StorageClass::Uniform, *binding, false));
+            carrierArguments.emplace_back(source.getArgument(index),
+                                          createBlockGlobal(name, memberTypes, memberOffsets,
+                                                            spirv::StorageClass::Uniform, binding->first,
+                                                            binding->second, false));
             inputs.emplace_back();
             inputMembers.push_back(std::nullopt);
             inputAttributes.push_back(false);
             continue;
         }
         if (auto view = dyn_cast<TensorViewType>(type); view && view.getAddressSpace() == "device") {
-            const SmallVector<uint32_t> *planned = bindings.find(source.getSymName(), index);
+            const GraphicsBindingAssignment *planned = bindings.find(source.getSymName(), index);
             FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), sourceModule);
-            if (!planned || failed(layout) || planned->size() != layout->leaves.size())
+            if (!planned || failed(layout) || planned->bindings.size() != layout->leaves.size())
                 return source.emitError() << "graphics TensorView argument #" << index << " has no binding plan";
             std::string fallback = (source.getSymName() + "_arg_" + Twine(index)).str();
             auto sourceName = source.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
@@ -1893,8 +1900,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                 std::string leafName = uniqueInterfaceName(name + "_leaf_" + std::to_string(leafIndex),
                                                            stage.getValue(), usedInterfaceNames);
                 leafGlobals.push_back(createDescriptorBlock(leafName, spirv::RuntimeArrayType::get(*scalar, scalarSize),
-                                                            spirv::StorageClass::StorageBuffer, (*planned)[leafIndex],
-                                                            true));
+                                                            spirv::StorageClass::StorageBuffer, planned->set,
+                                                            planned->bindings[leafIndex], true));
             }
             storageArguments.emplace_back(source.getArgument(index), std::move(leafGlobals));
             inputs.emplace_back();
@@ -1907,9 +1914,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return source.emitError() << "cannot lower argument #" << index << " type " << type << " to SPIR-V";
         Type convertedType = *converted;
         NamedAttrList effectiveAttrs(source.getArgAttrDict(index));
-        if (std::optional<uint32_t> generated = generatedBinding(index)) {
-            effectiveAttrs.set(kDescriptorSetAttrName, moduleBuilder.getI64IntegerAttr(0));
-            effectiveAttrs.set(kBindingAttrName, moduleBuilder.getI64IntegerAttr(*generated));
+        if (std::optional<std::pair<uint32_t, uint32_t>> generated = generatedBinding(index)) {
+            effectiveAttrs.set(kDescriptorSetAttrName, moduleBuilder.getI64IntegerAttr(generated->first));
+            effectiveAttrs.set(kBindingAttrName, moduleBuilder.getI64IntegerAttr(generated->second));
         }
         DictionaryAttr argumentAttrs = effectiveAttrs.getDictionary(source.getContext());
         InterfaceAttrs attrs = parseInterfaceAttrs(argumentAttrs);
@@ -1951,9 +1958,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             if (failed(storageType) || !attrs.binding)
                 return source.emitError() << "aggregate Tensor uniform #" << index
                                           << " requires a descriptor-backed canonical storage layout";
-            auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name, *storageType,
-                                                  spirv::StorageClass::StorageBuffer, argumentAttrs,
-                                                  succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr);
+            auto global = createInterfaceVariable(
+                moduleBuilder, source.getLoc(), name, *storageType, spirv::StorageClass::StorageBuffer, argumentAttrs,
+                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr, nullptr, true);
             inputs.push_back({global});
             inputMembers.push_back(std::nullopt);
             inputAttributes.push_back(false);

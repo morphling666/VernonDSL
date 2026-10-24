@@ -42,7 +42,7 @@ bool isNativeUniformShape(RankedTensorType tensor) {
 
 } // namespace
 
-const SmallVector<uint32_t> *GraphicsBindingPlan::find(StringRef entry, unsigned argument) const {
+const GraphicsBindingAssignment *GraphicsBindingPlan::find(StringRef entry, unsigned argument) const {
     auto found = arguments.find({entry.str(), argument});
     return found == arguments.end() ? nullptr : &found->second;
 }
@@ -101,10 +101,17 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
                     request(isa<TextureType>(type) ? "texture" : "sampler", 1);
                 continue;
             }
+            // A vertex group's attribute takes no descriptor binding, but it belongs to the group's set, so the
+            // group object that binds it also binds the vertex buffer.
+            if (group && kind && kind.getValue() == "input") {
+                request("vertex_input", 0);
+                continue;
+            }
             if (!kind || kind.getValue() != "uniform" || attrs.binding)
                 continue;
-            // Aggregates are not native inline uniforms on OpenGL, OpenGL ES, or Metal, so they always spill.
-            if (isa<TensorType, StructType, TupleType>(type)) {
+            // Aggregates are not native inline uniforms on OpenGL, OpenGL ES, or Metal, so they always spill. A
+            // binding-group leaf spills too: inline values belong to the pipeline, not to its group's set.
+            if (group || isa<TensorType, StructType, TupleType>(type)) {
                 request("uniform_buffer", 1);
                 continue;
             }
@@ -166,8 +173,25 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
                         ") for different Program Values";
                 return failure();
             }
-            if (binding.set == 0)
-                used.insert(static_cast<uint32_t>(binding.binding));
+            used.insert(static_cast<uint32_t>(binding.binding));
+        }
+
+    std::map<std::string, uint32_t> groupSets;
+    for (const GraphicsBindingRequests &module : modules)
+        for (const GraphicsBindingRequest &request : module.requests)
+            if (request.argument && !request.group.empty())
+                groupSets.try_emplace(request.group, static_cast<uint32_t>(groupSets.size() + 1));
+    if (groupSets.size() + 1 > kGraphicsDescriptorSetLimit) {
+        error = "PROGRAM_GRAPHICS_GROUP_SET_LIMIT: a graphics pipeline takes at most " +
+                std::to_string(kGraphicsDescriptorSetLimit - 1) + " binding-group occurrences, found " +
+                std::to_string(groupSets.size());
+        return failure();
+    }
+    for (const auto &[location, owner] : authored)
+        if (location.first != 0 && location.first <= static_cast<int64_t>(groupSets.size())) {
+            error = "graphics endpoint " + owner.stage + " '" + owner.sourceName + "' uses descriptor set " +
+                    std::to_string(location.first) + ", which belongs to a binding group";
+            return failure();
         }
 
     using ShareKey = std::tuple<std::string, std::string, std::string, uint32_t>;
@@ -228,13 +252,15 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
             if (request.argument && !request.group.empty()) {
                 if (!groupBindings.count(request.group))
                     allocateGroup(request.group);
-                layout.assignments.emplace_back(request, groupBindings[request.group].at(shareKey(request)));
+                layout.assignments.emplace_back(
+                    request, GraphicsBindingAssignment{groupSets.at(request.group),
+                                                       groupBindings[request.group].at(shareKey(request))});
                 continue;
             }
             const bool shareable = request.argument && !request.sourceName.empty();
             const ShareKey key = shareKey(request);
             if (auto found = shareable ? shared.find(key) : shared.end(); found != shared.end()) {
-                layout.assignments.emplace_back(request, found->second);
+                layout.assignments.emplace_back(request, GraphicsBindingAssignment{0, found->second});
                 continue;
             }
             SmallVector<uint32_t> bindings;
@@ -243,7 +269,7 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
                     bindings.push_back(candidate);
             if (shareable)
                 shared.emplace(key, bindings);
-            layout.assignments.emplace_back(request, std::move(bindings));
+            layout.assignments.emplace_back(request, GraphicsBindingAssignment{0, std::move(bindings)});
         }
     }
     return layouts;
@@ -252,13 +278,14 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
 void attachGraphicsBindingLayout(ModuleOp module, const GraphicsBindingLayout &layout) {
     Builder builder(module.getContext());
     SmallVector<Attribute> rows;
-    for (const auto &[request, bindings] : layout.assignments) {
-        SmallVector<int32_t> values(bindings.begin(), bindings.end());
+    for (const auto &[request, assignment] : layout.assignments) {
+        SmallVector<int32_t> values(assignment.bindings.begin(), assignment.bindings.end());
         rows.push_back(builder.getDictionaryAttr({
             builder.getNamedAttr("entry", builder.getStringAttr(request.entry)),
             builder.getNamedAttr(
                 "argument",
                 builder.getI64IntegerAttr(request.argument ? static_cast<int64_t>(*request.argument) : int64_t{-1})),
+            builder.getNamedAttr("set", builder.getI64IntegerAttr(assignment.set)),
             builder.getNamedAttr("bindings", builder.getDenseI32ArrayAttr(values)),
         }));
     }
@@ -269,22 +296,24 @@ FailureOr<GraphicsBindingPlan> planGraphicsBindings(ModuleOp module) {
     FailureOr<GraphicsBindingRequests> requests = collectGraphicsBindingRequests(module);
     if (failed(requests))
         return failure();
-    std::map<std::pair<std::string, int64_t>, SmallVector<uint32_t>> assigned;
+    std::map<std::pair<std::string, int64_t>, GraphicsBindingAssignment> assigned;
     if (auto rows = module->getAttrOfType<ArrayAttr>(kGraphicsBindingLayoutAttrName)) {
         for (Attribute rowAttr : rows) {
             auto row = dyn_cast<DictionaryAttr>(rowAttr);
             auto entry = row ? row.getAs<StringAttr>("entry") : nullptr;
             auto argument = row ? row.getAs<IntegerAttr>("argument") : nullptr;
+            auto set = row ? row.getAs<IntegerAttr>("set") : nullptr;
             auto bindings = row ? row.getAs<DenseI32ArrayAttr>("bindings") : nullptr;
-            if (!entry || !argument || !bindings)
+            if (!entry || !argument || !set || !bindings || set.getInt() < 0 ||
+                set.getInt() >= int64_t{kGraphicsDescriptorSetLimit})
                 return module.emitError("graphics binding layout has a malformed row");
-            SmallVector<uint32_t> values;
+            GraphicsBindingAssignment assignment{static_cast<uint32_t>(set.getInt()), {}};
             for (int32_t binding : bindings.asArrayRef()) {
                 if (binding < 0)
                     return module.emitError("graphics binding layout has a negative binding");
-                values.push_back(static_cast<uint32_t>(binding));
+                assignment.bindings.push_back(static_cast<uint32_t>(binding));
             }
-            if (!assigned.emplace(std::pair{entry.getValue().str(), argument.getInt()}, std::move(values)).second)
+            if (!assigned.emplace(std::pair{entry.getValue().str(), argument.getInt()}, std::move(assignment)).second)
                 return module.emitError("graphics binding layout assigns one argument twice");
         }
         if (assigned.size() != requests->requests.size())
@@ -294,17 +323,17 @@ FailureOr<GraphicsBindingPlan> planGraphicsBindings(ModuleOp module) {
         FailureOr<std::vector<GraphicsBindingLayout>> layouts = linkGraphicsBindings({*requests}, error);
         if (failed(layouts))
             return module.emitError(error);
-        for (const auto &[request, bindings] : layouts->front().assignments)
+        for (const auto &[request, assignment] : layouts->front().assignments)
             assigned.emplace(
                 std::pair{request.entry, request.argument ? static_cast<int64_t>(*request.argument) : int64_t{-1}},
-                bindings);
+                assignment);
     }
 
     GraphicsBindingPlan plan;
     for (const GraphicsBindingRequest &request : requests->requests) {
         auto found =
             assigned.find({request.entry, request.argument ? static_cast<int64_t>(*request.argument) : int64_t{-1}});
-        if (found == assigned.end() || found->second.size() != request.count)
+        if (found == assigned.end() || found->second.bindings.size() != request.count)
             return module.emitError() << "graphics binding layout does not cover " << request.kind
                                       << " request of entry '" << request.entry << "'";
         if (request.argument)
@@ -336,12 +365,12 @@ LogicalResult materializeGraphicsResourceBindings(ModuleOp module) {
         for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
             if (!isa<TextureType, SamplerType>(type))
                 continue;
-            const SmallVector<uint32_t> *planned = plan->find(function.getSymName(), static_cast<unsigned>(index));
+            const GraphicsBindingAssignment *planned = plan->find(function.getSymName(), static_cast<unsigned>(index));
             if (!planned)
                 continue;
             NamedAttrList attrs(function.getArgAttrDict(index));
-            attrs.set(kDescriptorSetAttrName, builder.getI64IntegerAttr(0));
-            attrs.set(kBindingAttrName, builder.getI64IntegerAttr(planned->front()));
+            attrs.set(kDescriptorSetAttrName, builder.getI64IntegerAttr(planned->set));
+            attrs.set(kBindingAttrName, builder.getI64IntegerAttr(planned->bindings.front()));
             attrs.set(kGeneratedBindingAttrName, builder.getUnitAttr());
             function.setArgAttrs(index, attrs.getDictionary(module.getContext()));
         }

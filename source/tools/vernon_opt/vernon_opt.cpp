@@ -95,6 +95,7 @@ int main(int argc, char **argv) {
     vernon::registerVernonLowerCPUResourcesPass();
     vernon::registerVernonCpuPassPipeline();
     vernon::registerVernonConvertGPUToSPIRVPass();
+    vernon::registerVernonDecorateNonWritableStoragePass();
     vernon::registerVernonLowerCUDAMathPass();
     vernon::registerVernonLowerGPUAutodiffPass();
     vernon::registerVernonLowerGPUTensorsPass();

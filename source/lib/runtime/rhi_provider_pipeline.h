@@ -4,10 +4,12 @@
 #include "VernonRuntimeCore.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "pipeline_groups.h"
 #include "prepared_binding_plan.h"
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -19,9 +21,7 @@ struct VernonRuntimeRhiAdapter;
 
 namespace vernon::runtime {
 
-// Each Stage prepared on a RuntimeCore provider owns its provider objects and releases them on destruction. The binding
-// set is created at the first invocation and updated in place afterwards; every invocation rewrites all values, so
-// resolve never creates placeholder bindings.
+// Each Stage prepared on a RuntimeCore provider owns its provider objects and releases them on destruction.
 struct RhiComputePipeline {
     RhiComputePipeline() = default;
     RhiComputePipeline(const RhiComputePipeline &) = delete;
@@ -29,9 +29,8 @@ struct RhiComputePipeline {
     ~RhiComputePipeline();
 
     VernonRuntimeCorePipeline *pipeline{};
-    VernonRuntimeCoreBindings *bindings{};
+    PipelineGroups groups;
     PreparedComputeBindingPlan bindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> values;
 };
 
 struct RhiGraphicsPipeline {
@@ -41,15 +40,14 @@ struct RhiGraphicsPipeline {
     ~RhiGraphicsPipeline();
 
     VernonRuntimeCorePipeline *pipeline{};
-    VernonRuntimeCoreBindings *bindings{};
+    PipelineGroups groups;
     PreparedGraphicsVariant variant;
     PreparedGraphicsBindingPlan bindingPlan;
-    std::vector<VernonRuntimeProviderBindingValue> values;
 };
 
-using FillRhiComputeValues = bool (*)(const PreparedComputeBindingPlan &plan, const StageBindingPlan &projection,
-                                      const PlannedComputeLaunch &launch,
-                                      std::vector<VernonRuntimeProviderBindingValue> &values, std::string &error);
+using FillRhiComputeValue = bool (*)(const PreparedComputeBindingPlan &plan, const StageBindingPlan &projection,
+                                     const PlannedComputeLaunch &launch, size_t slot,
+                                     VernonRuntimeProviderBindingValue &value, std::string &error);
 // Returns the provider's native attachment format, or nullopt when the provider cannot render to `format`.
 using MapRhiAttachmentFormat = std::optional<uint32_t> (*)(VernonTextureFormat format);
 
@@ -57,7 +55,7 @@ using MapRhiAttachmentFormat = std::optional<uint32_t> (*)(VernonTextureFormat f
 struct RhiComputeTarget {
     std::string_view name;
     std::string_view artifactKind;
-    FillRhiComputeValues fillValues{fillPreparedComputeBindingValues};
+    FillRhiComputeValue fillValue{fillPreparedComputeBindingValue};
 };
 
 struct RhiGraphicsTarget {
@@ -80,18 +78,21 @@ bool prepareRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAd
                                const RhiComputeTarget &target, const LoadedStageArtifact &stage,
                                const StageBindingPlan &plan, RhiComputePipeline &output,
                                RhiComputeNativeBindingResolver resolver = {});
+// `owners`, when given, holds the owner of each Stage parameter's argument; otherwise the launch owns them all.
 VernonStatus invokeRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                       const RhiComputeTarget &target, const StageBindingPlan &projection,
-                                      const PlannedComputeLaunch &launch, RhiComputePipeline &pipeline);
+                                      const PlannedComputeLaunch &launch, const ArgumentOwner *owners,
+                                      RhiComputePipeline &pipeline);
 
 bool prepareRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                 const RhiGraphicsTarget &target, const LoadedStageArtifact &vertex,
                                 const LoadedStageArtifact &fragment, const StageBindingPlan &plan,
                                 const PreparedGraphicsBindingOptions &options, RhiGraphicsPipeline &output);
+// Encodes one draw of `stream` on `commands`, inside its rendering scope.
 VernonStatus invokeRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
-                                       const RhiGraphicsTarget &target,
-                                       const VernonStageInvocationDescriptor &invocation,
-                                       const PlannedGraphicsInvocation &plan, RhiGraphicsPipeline &pipeline);
+                                       const RhiGraphicsTarget &target, VernonRuntimeCoreCommands *commands,
+                                       const GraphicsCommand &command, GraphicsStream &stream,
+                                       RhiGraphicsPipeline &pipeline);
 
 } // namespace vernon::runtime
 

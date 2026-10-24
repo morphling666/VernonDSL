@@ -92,36 +92,39 @@ void destroyBackendPipeline(VernonStageExecutable &pipeline) {
     destroyRuntimeBackendState(pipeline);
 }
 
-RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline,
-                                          const VernonStageInvocationDescriptor &invocation,
-                                          const PlannedGraphicsInvocation &plan) {
+RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                          const GraphicsCommand &command, GraphicsStream &stream) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA)
         return RuntimeResult<void>{vernon::ok()};
     if (pipeline.context->backend == VERNON_RUNTIME_VULKAN)
-        return invocationResult(invokeVulkanGraphicsPipeline(pipeline, invocation, plan), "invoke_vulkan_graphics");
+        return invocationResult(invokeVulkanGraphicsPipeline(pipeline, commands, command, stream),
+                                "invoke_vulkan_graphics");
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return invocationResult(invokeDirectX12GraphicsPipeline(pipeline, invocation, plan),
+        return invocationResult(invokeDirectX12GraphicsPipeline(pipeline, commands, command, stream),
                                 "invoke_directx12_graphics");
     if (pipeline.context->backend == VERNON_RUNTIME_METAL)
-        return invocationResult(invokeMetalGraphicsPipeline(pipeline, invocation, plan), "invoke_metal_graphics");
-    return invocationResult(invokeOpenGLGraphicsPipeline(pipeline, invocation, plan), "invoke_opengl_graphics");
+        return invocationResult(invokeMetalGraphicsPipeline(pipeline, commands, command, stream),
+                                "invoke_metal_graphics");
+    return invocationResult(invokeOpenGLGraphicsPipeline(pipeline, commands, command, stream),
+                            "invoke_opengl_graphics");
 }
 
-RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan) {
+RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+                                                 const ArgumentOwner *owners) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU)
-        return invocationResult(invokeCpuComputePipeline(pipeline, plan), "invoke_cpu_compute");
+        return invocationResult(invokeCpuComputePipeline(pipeline, plan, owners), "invoke_cpu_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_CUDA)
-        return invocationResult(invokeCudaComputePipeline(pipeline, plan), "invoke_cuda_compute");
+        return invocationResult(invokeCudaComputePipeline(pipeline, plan, owners), "invoke_cuda_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_VULKAN)
-        return invocationResult(invokeVulkanComputePipeline(pipeline, plan), "invoke_vulkan_compute");
+        return invocationResult(invokeVulkanComputePipeline(pipeline, plan, owners), "invoke_vulkan_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return invocationResult(invokeDirectX12ComputePipeline(pipeline, plan), "invoke_directx12_compute");
+        return invocationResult(invokeDirectX12ComputePipeline(pipeline, plan, owners), "invoke_directx12_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_METAL)
-        return invocationResult(invokeMetalComputePipeline(pipeline, plan), "invoke_metal_compute");
+        return invocationResult(invokeMetalComputePipeline(pipeline, plan, owners), "invoke_metal_compute");
     if (!isOpenGLBackend(pipeline.context->backend))
         return RuntimeResult<void>{
             vernon::err(vernon::RuntimeError{vernon::RuntimeErrorCode::Unsupported, {"invoke_compute", 0, 0}})};
-    return invocationResult(invokeOpenGLComputePipeline(pipeline, plan), "invoke_opengl_compute");
+    return invocationResult(invokeOpenGLComputePipeline(pipeline, plan, owners), "invoke_opengl_compute");
 }
 
 #if defined(VERNON_RUNTIME_TESTING)
@@ -154,7 +157,6 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     result.pipelineLayoutCreations = state.rhiGraphics.pipeline ? 1 : 0;
     result.graphicsPipelineCreations = state.rhiGraphics.variant.handle ? 1 : 0;
     const RhiAdapterPreparationStats adapterStats = getRhiAdapterPreparationStats(*vulkanState(*context).adapter);
-    result.bindingSnapshotCreations = adapterStats.bindingSnapshotCreations;
     result.commandBufferAllocations = rhiStats.commandBufferAllocations;
     result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
     result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;
@@ -223,6 +225,16 @@ DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonR
     return result;
 }
 
+size_t getDirectX12BufferCreationCount(const VernonRuntimeContext *context) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (context && context->backend == VERNON_RUNTIME_DIRECTX12)
+        return vernon::rhi::getDirectX12BufferCreationCount(context->rhiDevice);
+#else
+    (void)context;
+#endif
+    return 0;
+}
+
 namespace {
 
 std::optional<RhiAdapterPreparationStats> rhiAdapterPreparationStats(const VernonRuntimeContext *context) {
@@ -264,9 +276,9 @@ size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context) {
     return stats ? stats->dispatches : 0;
 }
 
-size_t getRhiAdapterBindingCreationCount(const VernonRuntimeContext *context) {
+size_t getRhiAdapterGroupCreationCount(const VernonRuntimeContext *context) {
     const auto stats = rhiAdapterPreparationStats(context);
-    return stats ? stats->bindingCreations : 0;
+    return stats ? stats->groupCreations : 0;
 }
 #endif
 

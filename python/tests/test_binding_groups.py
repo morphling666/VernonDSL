@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from importlib import import_module
@@ -22,12 +24,14 @@ from binding_group_shader import (
     Accumulator,
     Affine,
     Flat,
+    Layered,
     Lookup,
     Surface,
     SurfaceParams,
     Volume,
     accumulate,
     affine,
+    layered_fragment,
     sample_volume,
     surface_fragment,
     surface_vertex,
@@ -82,6 +86,28 @@ def main(
 """
 )
 
+_SHAPE = """
+from vernon_dsl import *
+
+@binding_group
+class Shape:
+    vertices: Annotated[Vector[f32, 2], attribute()]
+    weights: Annotated[Vector[f32, 4], attribute()]
+    offset: Vector[f32, 2]
+"""
+
+_SHAPE_VERTEX = (
+    _SHAPE
+    + """
+@vertex
+def main(
+    shape: Shape,
+    position: Annotated[Vector[f32, 2], attribute()],
+) -> Annotated[Vector[f32, 4], builtin("position")]:
+    return Vector([shape.vertices + shape.offset + position * shape.weights[0], 0.0, 1.0])
+"""
+)
+
 _FULL_SCREEN = np.array(((-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)), dtype=np.float32)
 
 
@@ -103,6 +129,25 @@ def _link(modules: list[str]) -> list[dict[str, Any]]:
     if not linked.ok:
         raise AssertionError(str(linked.diagnostics))
     return list(json.loads(linked.reflection)["layouts"])
+
+
+def _stage_entry(path: Path, source: str) -> Any:
+    path.write_text(source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(f"_binding_group_{path.stem}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[spec.name]
+    return module.main
+
+
+def _pipeline_frontends(directory: Path, vertex: str, fragment: str) -> tuple[Any, ...]:
+    """Compile two Stage sources as one pipeline, which pairs sampled textures across its Stages."""
+    stages = (_stage_entry(directory / "vertex.py", vertex), _stage_entry(directory / "fragment.py", fragment))
+    return vd.pipeline(*stages)._frontends(())
 
 
 def _assignments(layout: dict[str, Any]) -> dict[str, list[int]]:
@@ -139,8 +184,11 @@ class BindingGroupCompileTests(unittest.TestCase):
         self.assertIn('vernon.interface = "resource"', arguments["material.linear"])
 
     def test_one_contiguous_range_per_occurrence_shared_by_both_stages(self) -> None:
-        vertex = vd.compile_source(_VERTEX, "material_vertex.py")
-        fragment = vd.compile_source(_FRAGMENT, "material_fragment.py")
+        with tempfile.TemporaryDirectory() as directory:
+            frontends = _pipeline_frontends(Path(directory), _VERTEX, _FRAGMENT)
+        vertex, fragment = (frontend.mlir for frontend in frontends)
+        # The vertex Stage does not read material.albedo; the fragment Stage's explicit pairing covers it.
+        self.assertNotIn("vernon.implicit_texture", vertex)
         vertex_layout, fragment_layout = (_assignments(layout) for layout in _link([vertex, fragment]))
         leaves = ("material.params", "material.albedo", "material.linear", "material.lookup.weights")
         self.assertEqual(
@@ -149,6 +197,63 @@ class BindingGroupCompileTests(unittest.TestCase):
         bindings = [binding for name in leaves for binding in fragment_layout[name]]
         self.assertEqual(bindings, list(range(bindings[0], bindings[0] + len(bindings))))
         self.assertNotIn(1, bindings)
+
+    def test_texture_no_stage_reads_gets_an_implicit_sampler(self) -> None:
+        _, fragment = vd.pipeline(surface_vertex, layered_fragment)._frontends(())
+        self.assertIn('vernon.implicit_texture = "layered.weights"', fragment.mlir)
+
+    def test_each_occurrence_takes_its_own_descriptor_set(self) -> None:
+        fragment = vd.compile_source(
+            _GROUPS
+            + """
+@binding_group
+class Flat:
+    params: Params
+
+@fragment
+def main(base: TensorView[f32, (dyn,), read], flat: Flat, material: Material) -> Vector[f32, 4]:
+    return material.shade(Vector([0.5, 0.5])) * flat.params.tint * base[0]
+""",
+            "two_groups.py",
+        )
+        (layout,) = _link([fragment])
+        sets = {row["source_name"]: row["set"] for row in layout["assignments"] if row["source_name"]}
+        self.assertEqual(sets["base"], 0)
+        self.assertEqual(sets["flat.params"], 1)
+        for name in ("material.params", "material.albedo", "material.linear", "material.lookup.weights"):
+            self.assertEqual(sets[name], 2)
+        bindings = [binding for row in layout["assignments"] for binding in row["bindings"]]
+        self.assertEqual(len(bindings), len(set(bindings)))
+
+    def test_attribute_fields_take_locations_after_ungrouped_attributes(self) -> None:
+        mlir = vd.compile_source(_SHAPE_VERTEX, "shape_vertex.py")
+        arguments = _entry_arguments(mlir)
+        self.assertIn("vernon.location = 0 : i64", arguments["position"])
+        self.assertIn("vernon.location = 1 : i64", arguments["shape.vertices"])
+        self.assertIn("vernon.location = 2 : i64", arguments["shape.weights"])
+        self.assertIn('vernon.binding_group = "shape"', arguments["shape.vertices"])
+        (layout,) = _link([mlir])
+        rows = {row["source_name"]: row for row in layout["assignments"]}
+        for name in ("shape.vertices", "shape.weights"):
+            self.assertEqual((rows[name]["kind"], rows[name]["set"], rows[name]["bindings"]), ("vertex_input", 1, []))
+        self.assertEqual(rows["shape.offset"]["set"], 1)
+        self.assertNotIn("position", rows)
+
+    def test_too_many_occurrences_exceed_the_descriptor_set_limit(self) -> None:
+        parameters = ", ".join(f"g{index}: Lookup" for index in range(8))
+        reads = " + ".join(f"g{index}.weights[0]" for index in range(8))
+        fragment = vd.compile_source(
+            _GROUPS
+            + f"""
+@fragment
+def main({parameters}) -> Vector[f32, 4]:
+    return Vector([{reads}, 0.0, 0.0, 1.0])
+""",
+            "many_groups.py",
+        )
+        linked = _native().Compiler().link_graphics_bindings_result([fragment])
+        self.assertFalse(linked.ok)
+        self.assertIn("PROGRAM_GRAPHICS_GROUP_SET_LIMIT", str(linked.diagnostics))
 
     def test_generic_helper_is_specialized_per_group_type(self) -> None:
         mlir = vd.compile_source(
@@ -238,6 +343,48 @@ def main(bad: Bad) -> Vector[f32, 4]:
 """,
                 "field_metadata.py",
             )
+
+    def test_attribute_field_cannot_declare_a_location(self) -> None:
+        for located in ("attribute(location=3)", "attribute(3)"):
+            source = _SHAPE_VERTEX.replace(
+                "weights: Annotated[Vector[f32, 4], attribute()]", f"weights: Annotated[Vector[f32, 4], {located}]"
+            )
+            with self.assertRaisesRegex(
+                CompileError, r"binding group attribute cannot declare a location: 'Shape.weights'"
+            ):
+                vd.compile_source(source, "located.py")
+
+    def test_attribute_field_cannot_carry_other_metadata(self) -> None:
+        source = _SHAPE_VERTEX.replace(
+            "weights: Annotated[Vector[f32, 4], attribute()]",
+            "weights: Annotated[Vector[f32, 4], attribute(), uniform()]",
+        )
+        with self.assertRaisesRegex(
+            CompileError, r"binding group field cannot declare interface metadata: 'Shape.weights'"
+        ):
+            vd.compile_source(source, "mixed_metadata.py")
+
+    def test_vertex_group_is_only_valid_in_a_vertex_stage(self) -> None:
+        for body in (
+            """
+@fragment
+def main(shape: Shape) -> Vector[f32, 4]:
+    return Vector([shape.offset, 0.0, 1.0])
+""",
+            """
+@binding_group
+class Holder:
+    shape: Shape
+
+@fragment
+def main(holder: Holder) -> Vector[f32, 4]:
+    return Vector([holder.shape.offset, 0.0, 1.0])
+""",
+        ):
+            with self.assertRaisesRegex(
+                CompileError, "binding group with vertex attributes is only valid in a vertex stage"
+            ):
+                vd.compile_source(_SHAPE + body, "fragment_shape.py")
 
     def test_group_cannot_be_a_struct_field(self) -> None:
         self._assert_rejected(
@@ -564,6 +711,20 @@ class _GraphicsGroupRuntimeCases:
             render_pass=_render_pass(target),
         )
         expected = np.round(np.array((0.5 * 128 / 255 + 0.125, 0.375, 0.25, 0.75)) * 255.0)
+        np.testing.assert_allclose(target.to_numpy()[4, 4].astype(np.float64), expected, atol=1.0)
+
+    def test_group_texture_no_stage_reads_renders(self) -> None:
+        target = vd.Texture.zeros(shape=(8, 8))
+        vd.pipeline(surface_vertex, layered_fragment)(
+            position=vd.storage.from_numpy(_FULL_SCREEN),
+            surface=_surface(),
+            layered=Layered(
+                params=SurfaceParams(np.array((1.0, 0.5, 0.25, 1.0), dtype=np.float32), vd.f32(0.0)),
+                weights=vd.Texture.from_numpy(np.zeros((2, 2, 4), dtype=np.uint8)),
+            ),
+            render_pass=_render_pass(target),
+        )
+        expected = np.round(np.array((1.0, 0.5, 0.25, 1.0)) * 255.0)
         np.testing.assert_allclose(target.to_numpy()[4, 4].astype(np.float64), expected, atol=1.0)
 
     def test_module_forwards_group_arguments_to_a_pipeline(self) -> None:

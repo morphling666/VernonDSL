@@ -26,9 +26,38 @@ def packed_tint_fragment(
     return vd.Vector([vd.f32(tint.x), vd.f32(tint.y), vd.f32(tint.z), vd.f32(tint.w)]) / 255.0
 
 
+@vd.binding_group
+class Tint:
+    color: vd.Vector[vd.f32, 4]
+
+
+@vd.fragment
+def grouped_tint_fragment(tint: Tint) -> vd.Vector[vd.f32, 4]:
+    return tint.color
+
+
+@vd.binding_group
+class Shape:
+    vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()]
+    offset: vd.Vector[vd.f32, 2]
+
+    @vd.func
+    def position(self) -> vd.Vector[vd.f32, 4]:
+        return vd.Vector([self.vertices + self.offset, 0.0, 1.0])
+
+
+@vd.vertex
+def shape_vertex(shape: Shape) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return shape.position()
+
+
 _targets = vd.target_formats(colors={0: vd.rgba8_unorm})
 
 opaque_pipeline = vd.pipeline(surface_vertex, tinted_fragment, targets=_targets)
+
+grouped_tint_pipeline = vd.pipeline(surface_vertex, grouped_tint_fragment, targets=_targets)
+
+shape_pipeline = vd.pipeline(shape_vertex, tinted_fragment, targets=_targets)
 
 blended_pipeline = vd.pipeline(
     surface_vertex,
@@ -95,6 +124,38 @@ class OpaquePass(vd.Module):
         dynamic_state: vd.DynamicState,
     ) -> Any:
         opaque_pipeline(vertices=vertices, tint=tint, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
+        return vd.color_output(render_pass)
+
+
+class GroupedTintPass(vd.Module):
+    """`vertices` alone fills group 0 and `tint` fills group 1, so a set binding either one covers a whole group."""
+
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        tint: Tint,
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> Any:
+        grouped_tint_pipeline(
+            vertices=vertices, tint=tint, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state
+        )
+        return vd.color_output(render_pass)
+
+
+class VertexGroupPass(vd.Module):
+    """`shape` fills group 1 with its vertex buffer and offset, and `tint` alone fills group 0."""
+
+    def forward(
+        self,
+        shape: Shape,
+        tint: vd.Vector[vd.f32, 4],
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> Any:
+        shape_pipeline(shape=shape, tint=tint, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
         return vd.color_output(render_pass)
 
 
@@ -198,6 +259,10 @@ class ScratchWritingPass(vd.Module):
 
 
 opaque_pass_asset = vd.program_asset(id="runtime/recorded-graphics-opaque-pass", program=OpaquePass())
+
+grouped_tint_pass_asset = vd.program_asset(id="runtime/recorded-graphics-grouped-tint-pass", program=GroupedTintPass())
+
+vertex_group_pass_asset = vd.program_asset(id="runtime/recorded-graphics-vertex-group-pass", program=VertexGroupPass())
 
 blended_surface_asset = vd.program_asset(id="runtime/recorded-graphics-blended-surface", program=BlendedSurface())
 

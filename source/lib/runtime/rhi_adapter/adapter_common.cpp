@@ -108,15 +108,6 @@ RhiAdapterResult<void> RhiAdapterBackendStorage::adopt(void *newState, const Rhi
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-VernonRuntimeRhiAdapter::~VernonRuntimeRhiAdapter() {
-    std::lock_guard<std::mutex> guard(retainedLeaseMutex);
-    for (RetainedLeaseEntry *entry = retainedLeaseHead.get(); entry; entry = entry->next.get()) {
-        auto released = entry->lease.release();
-        (void)released;
-    }
-    retainedLeaseHead.reset();
-}
-
 extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(VernonRhiDevice device,
                                                                            VernonRhiBackend backend) {
     auto deviceLease = vernon::rhi::retainDeviceLease(device);
@@ -221,84 +212,6 @@ RhiAdapterResult<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiA
         vernon::ProviderErrorCode::InvalidArgument, {"rhi_adapter_resource_kind", resource.resource.value, 0}})};
 }
 
-RhiAdapterResult<void> retainRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                         VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kindResult = resourceKind(adapter, resource);
-    if (!kindResult)
-        return RhiAdapterResult<void>{vernon::err(std::move(kindResult).error())};
-    const auto kind = std::move(kindResult).value();
-    auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, resource.resource.value);
-    if (!retained)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
-    auto lease = std::move(retained).value();
-    auto entry = std::unique_ptr<VernonRuntimeRhiAdapter::RetainedLeaseEntry>(new (
-        std::nothrow) VernonRuntimeRhiAdapter::RetainedLeaseEntry(kind, resource.resource.value, std::move(lease)));
-    if (!entry) {
-        auto released = lease.release();
-        (void)released;
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
-                                              {"store_retained_rhi_resource", resource.resource.value, 0}})};
-    }
-    std::lock_guard<std::mutex> guard(adapter.retainedLeaseMutex);
-    entry->next = std::move(adapter.retainedLeaseHead);
-    adapter.retainedLeaseHead = std::move(entry);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> releaseRetainedRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                                  VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kindResult = resourceKind(adapter, resource);
-    if (!kindResult)
-        return RhiAdapterResult<void>{vernon::err(std::move(kindResult).error())};
-    const auto kind = std::move(kindResult).value();
-    std::lock_guard<std::mutex> guard(adapter.retainedLeaseMutex);
-    auto *entry = &adapter.retainedLeaseHead;
-    while (*entry && ((*entry)->kind != kind || (*entry)->key != resource.resource.value || !(*entry)->lease.active()))
-        entry = &(*entry)->next;
-    if (!*entry)
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::LifecycleFailure,
-                                              {"release_retained_rhi_resource", resource.resource.value, 0}})};
-    auto released = (*entry)->lease.release();
-    if (!released)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(released).error()))};
-    auto removed = std::move(*entry);
-    *entry = std::move(removed->next);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<uint64_t> resolveRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                              VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kindResult = resourceKind(adapter, resource);
-    if (!kindResult)
-        return RhiAdapterResult<uint64_t>{vernon::err(std::move(kindResult).error())};
-    const auto kind = std::move(kindResult).value();
-    {
-        std::lock_guard<std::mutex> guard(adapter.retainedLeaseMutex);
-        for (auto *entry = adapter.retainedLeaseHead.get(); entry; entry = entry->next.get()) {
-            if (entry->kind != kind || entry->key != resource.resource.value || !entry->lease.active())
-                continue;
-            auto resolved =
-                vernon::rhi::resolveResource(adapter.rhiDevice, kind, resource.resource.value, entry->lease);
-            if (!resolved)
-                return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(resolved).error()))};
-            return RhiAdapterResult<uint64_t>{vernon::ok(std::move(resolved).value())};
-        }
-    }
-    auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, resource.resource.value);
-    if (!retained)
-        return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(retained).error()))};
-    auto lease = std::move(retained).value();
-    auto resolved = vernon::rhi::resolveResource(adapter.rhiDevice, kind, resource.resource.value, lease);
-    auto released = lease.release();
-    if (!resolved)
-        return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(resolved).error()))};
-    if (!released)
-        return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(released).error()))};
-    return RhiAdapterResult<uint64_t>{vernon::ok(std::move(resolved).value())};
-}
-
 RhiAdapterResult<uint64_t> resolveCommandRhiResource(VernonRuntimeRhiAdapter &adapter,
                                                      VernonRuntimeProviderObject encoder,
                                                      VernonRuntimeProviderResourceReference resource) noexcept {
@@ -310,73 +223,6 @@ RhiAdapterResult<uint64_t> resolveCommandRhiResource(VernonRuntimeRhiAdapter &ad
     if (!resolved)
         return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(resolved).error()))};
     return RhiAdapterResult<uint64_t>{vernon::ok(std::move(resolved).value())};
-}
-
-VernonRuntimeRhiAdapter::RetainedLeaseEntry *findRetainedLease(VernonRuntimeRhiAdapter &adapter,
-                                                               vernon::rhi::ResourceKind kind, uint64_t key) noexcept {
-    for (auto *entry = adapter.retainedLeaseHead.get(); entry; entry = entry->next.get())
-        if (entry->kind == kind && entry->key == key && entry->lease.active())
-            return entry;
-    return nullptr;
-}
-
-template <typename Operation>
-RhiAdapterResult<void> withDescriptorLease(VernonRuntimeRhiAdapter &adapter, vernon::rhi::ResourceKind kind,
-                                           uint64_t key, Operation &&operation) noexcept {
-    {
-        std::lock_guard<std::mutex> guard(adapter.retainedLeaseMutex);
-        if (auto *retained = findRetainedLease(adapter, kind, key))
-            return operation(retained->lease);
-    }
-    auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, key);
-    if (!retained)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
-    auto lease = std::move(retained).value();
-    auto result = operation(lease);
-    auto released = lease.release();
-    if (!result)
-        return result;
-    if (!released)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(released).error()))};
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> describeRhiImageBinding(VernonRuntimeRhiAdapter &adapter,
-                                               VernonRuntimeProviderResourceReference resource,
-                                               RhiImageBinding &binding) noexcept {
-    auto kindResult = resourceKind(adapter, resource);
-    if (!kindResult)
-        return RhiAdapterResult<void>{vernon::err(std::move(kindResult).error())};
-    const auto kind = std::move(kindResult).value();
-    if (kind == vernon::rhi::ResourceKind::Image) {
-        return withDescriptorLease(
-            adapter, kind, resource.resource.value,
-            [&](vernon::rhi::RetainedRhiResourceLease &lease) noexcept -> RhiAdapterResult<void> {
-                VernonRhiImageDescriptor descriptor{};
-                auto described =
-                    vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor, lease);
-                if (!described)
-                    return RhiAdapterResult<void>{vernon::err(providerError(std::move(described).error()))};
-                binding = {descriptor.dimension, descriptor.format};
-                return RhiAdapterResult<void>{vernon::ok()};
-            });
-    }
-    if (kind != vernon::rhi::ResourceKind::ImageView)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"describe_rhi_image", resource.resource.value, 0}})};
-    return withDescriptorLease(
-        adapter, kind, resource.resource.value,
-        [&](vernon::rhi::RetainedRhiResourceLease &lease) noexcept -> RhiAdapterResult<void> {
-            VernonRhiImageViewDescriptor view{};
-            VernonRhiImageDescriptor descriptor{};
-            uint64_t parentKey = 0;
-            auto described = vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, view,
-                                                                    descriptor, parentKey, lease);
-            if (!described)
-                return RhiAdapterResult<void>{vernon::err(providerError(std::move(described).error()))};
-            binding = {view.dimension, view.format};
-            return RhiAdapterResult<void>{vernon::ok()};
-        });
 }
 
 RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
@@ -393,19 +239,16 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
         return RhiAdapterResult<void>{vernon::err(std::move(kindResult).error())};
     const auto kind = std::move(kindResult).value();
     const bool view = kind == vernon::rhi::ResourceKind::ImageView;
-    auto described = withDescriptorLease(
-        adapter, kind, resource.resource.value,
-        [&](vernon::rhi::RetainedRhiResourceLease &lease) noexcept -> RhiAdapterResult<void> {
-            auto result =
-                view ? vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, sourceView,
-                                                              source, parentKey, lease)
-                     : vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, source, lease);
-            if (!result)
-                return RhiAdapterResult<void>{vernon::err(providerError(std::move(result).error()))};
-            return RhiAdapterResult<void>{vernon::ok()};
-        });
+    auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, resource.resource.value);
+    if (!retained)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
+    auto lease = std::move(retained).value();
+    auto described =
+        view ? vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, sourceView, source,
+                                                      parentKey, lease)
+             : vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, source, lease);
     if (!described)
-        return described;
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(described).error()))};
     const auto format = providerTextureFormat(source.format);
     if (!format)
         return RhiAdapterResult<void>{vernon::err(
@@ -447,24 +290,6 @@ RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
     description.parent_identity = parentKey ? parentKey : resource.resource.value;
     description.resource_kind = view ? VERNON_RUNTIME_PROVIDER_IMAGE_VIEW : VERNON_RUNTIME_PROVIDER_IMAGE_OWNER;
     return RhiAdapterResult<void>{vernon::ok()};
-}
-
-VernonStatus retainRhiResourceCallback(void *data, VernonRuntimeProviderResourceReference resource) {
-    if (!data)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, retainRhiResource(adapter, resource),
-                          "RHI adapter could not retain the provider resource");
-}
-
-void releaseRhiResourceCallback(void *data, VernonRuntimeProviderResourceReference resource) {
-    if (!data)
-        return;
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto released = releaseRetainedRhiResource(adapter, resource);
-    if (!released)
-        recordProviderError(adapter, std::move(released).error(),
-                            "RHI adapter release callback found no releasable retained resource lease");
 }
 
 VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderResourceReference resource,
@@ -536,8 +361,10 @@ static_assert(VERNON_RUNTIME_PROVIDER_LOAD_CLEAR == static_cast<int>(VERNON_RHI_
               VERNON_RUNTIME_PROVIDER_STORE_PRESERVE == static_cast<int>(VERNON_RHI_STORE_PRESERVE) &&
               VERNON_RUNTIME_PROVIDER_STORE_DISCARD == static_cast<int>(VERNON_RHI_STORE_DISCARD));
 
-RhiAdapterResult<void> beginRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                      const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept {
+} // namespace
+
+RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                             const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept {
     const auto invalid = [](const char *operation) {
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {operation, 0, 0}})};
@@ -604,29 +431,12 @@ RhiAdapterResult<void> beginRendering(VernonRuntimeRhiAdapter &adapter, VernonRu
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> endRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) noexcept {
+RhiAdapterResult<void> endEncoderRendering(VernonRuntimeRhiAdapter &adapter,
+                                           VernonRuntimeProviderObject encoder) noexcept {
     auto ended = vernon::rhi::endEncoderRendering(adapter.rhiDevice, encoder.value);
     if (!ended)
         return RhiAdapterResult<void>{vernon::err(providerError(std::move(ended).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
-}
-
-} // namespace
-
-VernonStatus beginRenderingCallback(void *data, VernonRuntimeProviderObject encoder,
-                                    const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    if (!data || !descriptor)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, beginRendering(adapter, encoder, *descriptor),
-                          "RHI adapter could not begin the rendering scope");
-}
-
-VernonStatus endRenderingCallback(void *data, VernonRuntimeProviderObject encoder) {
-    if (!data)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, endRendering(adapter, encoder), "RHI adapter could not end the rendering scope");
 }
 
 RhiAdapterResult<void> recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -661,11 +471,25 @@ RhiAdapterResult<void> retainCommandResource(VernonRuntimeRhiAdapter &adapter, V
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    return descriptor && descriptor->struct_size >= sizeof(*descriptor) && descriptor->instance_count != 0 &&
-           (descriptor->vertex_count != 0 || descriptor->index_count != 0) &&
-           (descriptor->index_count != 0 || descriptor->base_vertex == 0) &&
-           ((descriptor->index_count != 0) == (descriptor->index_buffer.resource.value != 0));
+RhiAdapterResult<vernon::rhi::CommandTransient> writeCommandTransient(VernonRuntimeRhiAdapter &adapter,
+                                                                      VernonRuntimeProviderObject encoder,
+                                                                      const void *data, uint64_t size,
+                                                                      uint64_t alignment) noexcept {
+    auto written = vernon::rhi::writeCommandTransient(adapter.rhiDevice, encoder.value, data, size, alignment);
+    if (!written)
+        return RhiAdapterResult<vernon::rhi::CommandTransient>{vernon::err(providerError(std::move(written).error()))};
+    return RhiAdapterResult<vernon::rhi::CommandTransient>{vernon::ok(written.value())};
+}
+
+RhiAdapterResult<vernon::rhi::CommandTransientReservation> reserveCommandTransient(VernonRuntimeRhiAdapter &adapter,
+                                                                                   VernonRuntimeProviderObject encoder,
+                                                                                   uint64_t size,
+                                                                                   uint64_t alignment) noexcept {
+    auto reserved = vernon::rhi::reserveCommandTransient(adapter.rhiDevice, encoder.value, size, alignment);
+    if (!reserved)
+        return RhiAdapterResult<vernon::rhi::CommandTransientReservation>{
+            vernon::err(providerError(std::move(reserved).error()))};
+    return RhiAdapterResult<vernon::rhi::CommandTransientReservation>{vernon::ok(reserved.value())};
 }
 
 RhiAdapterResult<void> deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -684,6 +508,92 @@ RhiAdapterResult<void> deferCommandRollback(VernonRuntimeRhiAdapter &adapter, Ve
         return RhiAdapterResult<void>{vernon::err(providerError(std::move(deferred).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
 }
+
+void releaseRetainedObject(RhiRetainedObject *object) noexcept {
+    if (object && object->references.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete object;
+}
+
+namespace {
+
+void releaseCommandObject(void *context, uint64_t) { releaseRetainedObject(static_cast<RhiRetainedObject *>(context)); }
+
+} // namespace
+
+RhiAdapterResult<void> retainForCommands(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                         RhiRetainedObject &object) noexcept {
+    object.references.fetch_add(1, std::memory_order_relaxed);
+    auto deferred = deferCommandCleanup(adapter, encoder, &object, 0, releaseCommandObject);
+    if (!deferred)
+        releaseRetainedObject(&object);
+    return deferred;
+}
+
+RhiAdapterResult<uint64_t> acquireGroupResource(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
+                                                VernonRuntimeProviderResourceReference resource,
+                                                RhiImageBinding *image) noexcept {
+    using Acquired = RhiAdapterResult<uint64_t>;
+    auto kindResult = resourceKind(adapter, resource);
+    if (!kindResult)
+        return Acquired{vernon::err(std::move(kindResult).error())};
+    const vernon::rhi::ResourceKind kind = kindResult.value();
+    if (image && kind != vernon::rhi::ResourceKind::Image && kind != vernon::rhi::ResourceKind::ImageView)
+        return Acquired{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                          {"group_image_binding_is_not_an_image", 0, 0}})};
+    auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, resource.resource.value);
+    if (!retained)
+        return Acquired{vernon::err(providerError(std::move(retained).error()))};
+    try {
+        group.leases.push_back(std::move(retained).value());
+    } catch (const std::bad_alloc &) {
+        return Acquired{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
+                                                          {"group_resource_lease_allocation", 0, 0}})};
+    }
+    auto &lease = group.leases.back();
+    auto resolved = vernon::rhi::resolveResource(adapter.rhiDevice, kind, resource.resource.value, lease);
+    if (!resolved)
+        return Acquired{vernon::err(providerError(std::move(resolved).error()))};
+    if (image) {
+        VernonRhiImageDescriptor descriptor{};
+        VernonRhiImageViewDescriptor view{};
+        uint64_t parentKey = 0;
+        auto described =
+            kind == vernon::rhi::ResourceKind::Image
+                ? vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor, lease)
+                : vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, view, descriptor,
+                                                         parentKey, lease);
+        if (!described)
+            return Acquired{vernon::err(providerError(std::move(described).error()))};
+        *image = kind == vernon::rhi::ResourceKind::Image ? RhiImageBinding{descriptor.dimension, descriptor.format}
+                                                          : RhiImageBinding{view.dimension, view.format};
+    }
+    return Acquired{vernon::ok(resolved.value())};
+}
+
+RhiAdapterResult<void> recordGroupWrites(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                         const RhiGroup &group) noexcept {
+    for (const VernonRuntimeProviderResourceReference &resource : group.writes)
+        if (auto recorded = recordCommandWriteResource(adapter, encoder, resource); !recorded)
+            return recorded;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> beginRhiCommands(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                        RhiCommands &commands) noexcept {
+    auto native = nativeCommandEncoder(adapter, encoder);
+    if (!native)
+        return RhiAdapterResult<void>{vernon::err(std::move(native).error())};
+    auto rendering = commandEncoderRendering(adapter, encoder);
+    if (!rendering)
+        return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+    if (rendering.value())
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "begin_commands_inside_a_rendering_scope");
+    commands.encoder = encoder;
+    commands.native = native.value();
+    commands.rendering = false;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
 } // namespace vernon::runtime::rhi_adapter
 
 extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRuntimeRhiAdapter *adapter,
@@ -756,21 +666,12 @@ RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiA
     RhiAdapterPreparationStats result{adapter.shaderPreparations.load(std::memory_order_relaxed),
                                       adapter.layoutPreparations.load(std::memory_order_relaxed),
                                       adapter.pipelinePreparations.load(std::memory_order_relaxed),
-                                      adapter.bindingCreations.load(std::memory_order_relaxed),
-                                      adapter.bindingSnapshotCreations.load(std::memory_order_relaxed),
+                                      adapter.groupCreations.load(std::memory_order_relaxed),
                                       adapter.dispatches.load(std::memory_order_relaxed),
                                       adapter.livePreparedPipelines.load(std::memory_order_relaxed),
                                       adapter.lastStencilReference.load(std::memory_order_relaxed),
                                       adapter.lastDrawIndexed.load(std::memory_order_relaxed)};
     return result;
-}
-
-size_t getRhiAdapterRetainedLeaseCount(const VernonRuntimeRhiAdapter &adapter) {
-    std::lock_guard<std::mutex> guard(adapter.retainedLeaseMutex);
-    size_t count = 0;
-    for (auto *entry = adapter.retainedLeaseHead.get(); entry; entry = entry->next.get())
-        count += entry->lease.active();
-    return count;
 }
 
 } // namespace vernon::runtime

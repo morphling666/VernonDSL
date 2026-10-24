@@ -25,6 +25,9 @@ class FrontendCompileRequest:
     workgroup_size: tuple[int, int, int] | None = None
     program_transform: ProgramTransformSpec | None = None
     autodiff_planning_policy: str | None = None
+    # Sampled textures the entry does not read but another Stage of its pipeline reads, which pairs their combined
+    # image-sampler bindings; the entry plans no implicit sampler for them.
+    textures_read_elsewhere: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path).resolve())
@@ -42,6 +45,7 @@ class FrontendCompileRequest:
             "captured_constants",
             tuple(sorted(self.captured_constants, key=lambda value: value[0])),
         )
+        object.__setattr__(self, "textures_read_elsewhere", tuple(sorted(set(self.textures_read_elsewhere))))
         if self.autodiff_planning_policy not in {None, "min_memory", "balanced", "min_runtime"}:
             raise ValueError("autodiff planning policy must be 'min_memory', 'balanced', or 'min_runtime'")
 
@@ -85,6 +89,7 @@ class FrontendCompileResult:
                 self.request.program_transform.to_dict() if self.request.program_transform is not None else None
             ),
             "autodiff_planning_policy": self.request.autodiff_planning_policy,
+            "textures_read_elsewhere": list(self.request.textures_read_elsewhere),
             "autodiff_profiles": (
                 self.autodiff_profiles.manifest_dict() if self.autodiff_profiles is not None else None
             ),

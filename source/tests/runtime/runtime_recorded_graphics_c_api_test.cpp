@@ -76,8 +76,8 @@ VernonProgramArgument verticesArgument(const VernonProgramParameterView &paramet
 }
 
 // `value` must outlive the argument.
-template <typename T>
-VernonProgramArgument hostArgument(const VernonProgramParameterView &parameter, const std::array<T, 4> &value) {
+template <typename T, size_t N>
+VernonProgramArgument hostArgument(const VernonProgramParameterView &parameter, const std::array<T, N> &value) {
     VernonProgramArgument argument{};
     argument.slot = parameter.slot;
     argument.kind = VERNON_PROGRAM_TENSOR;
@@ -986,13 +986,15 @@ protected:
         return result;
     }
 
-    VernonProgramArgument vertices(VernonProgramExecutable *program, const RhiBuffer &resource) const {
-        return verticesArgument(findParameter(program, "vertices"), resource.reference);
+    VernonProgramArgument vertices(VernonProgramExecutable *program, const RhiBuffer &resource,
+                                   std::string_view name = "vertices") const {
+        return verticesArgument(findParameter(program, name), resource.reference);
     }
 
     template <typename T>
-    static VernonProgramArgument tint(VernonProgramExecutable *program, const std::array<T, 4> &value) {
-        return hostArgument(findParameter(program, "tint"), value);
+    static VernonProgramArgument tint(VernonProgramExecutable *program, const std::array<T, 4> &value,
+                                      std::string_view name = "tint") {
+        return hostArgument(findParameter(program, name), value);
     }
 
     static VernonProgramArgument image(VernonProgramExecutable *program, std::string_view name,
@@ -1145,6 +1147,120 @@ TEST_P(RuntimeRecordedSurfaceMatrix, SurfaceTypesSharingParameterNamesBindTheirO
         EXPECT_EQ(error.rfind("PROGRAM_RECORDING_INVALID at " + node + ".commands[1]", 0), 0u) << error;
         EXPECT_NE(error.find("tint"), std::string::npos) << error;
     }
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, SealedSetsCreateTheirGroupsOnce) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_grouped_tint_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *grouped = pipeline(pass, nullptr);
+    ASSERT_NE(grouped, nullptr);
+    VernonBindingSet *left = set(grouped, {vertices(pass, left_)});
+    VernonBindingSet *right = set(grouped, {vertices(pass, right_)});
+    VernonBindingSet *red = set(grouped, {tint(pass, kRed, "tint.color")});
+    VernonBindingSet *blue = set(grouped, {tint(pass, kBlue, "tint.color")});
+
+    const auto render = [&](size_t repeats) {
+        const size_t before = vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime);
+        Target target(runtime());
+        PassInvocation invocation(pass, passInstance, target,
+                                  {vertices(pass, fullscreen_), tint(pass, kRed, "tint.color")},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        std::vector<VernonGraphicsCommand> commands{bindPipeline(grouped)};
+        for (size_t repeat = 0; repeat < repeats; ++repeat)
+            commands.insert(commands.end(), {bindSet(left), bindSet(red), draw(3), bindSet(right), bindSet(blue),
+                                             draw(3), bindSet(left), draw(3)});
+        EXPECT_EQ(invocation.record(commands), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.telemetry().draws, 3 * repeats);
+        const std::vector<uint8_t> pixels = target.pixels();
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), {0, 0, 255, 255}));
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), {0, 0, 255, 255}));
+        return vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime) - before;
+    };
+
+    EXPECT_EQ(render(1), 4u);
+    EXPECT_EQ(render(1), 0u);
+    EXPECT_EQ(render(16), 0u);
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, VertexGroupsBindTheirVertexBuffersInOnePersistentGroup) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_vertex_group_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *shaped = pipeline(pass, nullptr);
+    ASSERT_NE(shaped, nullptr);
+    constexpr std::array<float, 2> kInPlace{0.0f, 0.0f};
+    constexpr std::array<float, 2> kToTheRight{1.0f, 0.0f};
+    const auto shape = [&](const RhiBuffer &resource, const std::array<float, 2> &offset) {
+        return set(shaped, {vertices(pass, resource, "shape.vertices"),
+                            hostArgument(findParameter(pass, "shape.offset"), offset)});
+    };
+    VernonBindingSet *left = shape(left_, kInPlace);
+    VernonBindingSet *movedRight = shape(left_, kToTheRight);
+    VernonBindingSet *red = set(shaped, {tint(pass, kRed)});
+    VernonBindingSet *blue = set(shaped, {tint(pass, kBlue)});
+
+    const auto render = [&](size_t repeats) {
+        const size_t before = vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime);
+        Target target(runtime());
+        PassInvocation invocation(pass, passInstance, target,
+                                  {vertices(pass, fullscreen_, "shape.vertices"),
+                                   hostArgument(findParameter(pass, "shape.offset"), kInPlace), tint(pass, kRed)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        std::vector<VernonGraphicsCommand> commands{bindPipeline(shaped)};
+        for (size_t repeat = 0; repeat < repeats; ++repeat)
+            commands.insert(commands.end(),
+                            {bindSet(left), bindSet(red), draw(3), bindSet(movedRight), bindSet(blue), draw(3)});
+        EXPECT_EQ(invocation.record(commands), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.telemetry().draws, 2 * repeats);
+        const std::vector<uint8_t> pixels = target.pixels();
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), {255, 0, 0, 255}));
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), {0, 0, 255, 255}));
+        return vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime) - before;
+    };
+
+    // Each set covers a whole group, so its group is made once and kept across invocations.
+    EXPECT_EQ(render(1), 4u);
+    EXPECT_EQ(render(1), 0u);
+    EXPECT_EQ(render(16), 0u);
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, SetsSharingAGroupMakeItOncePerCombinationAndInvocation) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *opaque = pipeline(pass, nullptr);
+    ASSERT_NE(opaque, nullptr);
+    VernonBindingSet *left = set(opaque, {vertices(pass, left_)});
+    VernonBindingSet *right = set(opaque, {vertices(pass, right_)});
+    VernonBindingSet *red = set(opaque, {tint(pass, kRed)});
+    VernonBindingSet *blue = set(opaque, {tint(pass, kBlue)});
+
+    const auto render = [&](size_t repeats) {
+        const size_t before = vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime);
+        Target target(runtime());
+        PassInvocation invocation(pass, passInstance, target, {vertices(pass, fullscreen_), tint(pass, kRed)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        std::vector<VernonGraphicsCommand> commands{bindPipeline(opaque)};
+        for (size_t repeat = 0; repeat < repeats; ++repeat)
+            commands.insert(commands.end(), {bindSet(left), bindSet(red), draw(3), bindSet(right), bindSet(blue),
+                                             draw(3), bindSet(left), draw(3)});
+        EXPECT_EQ(invocation.record(commands), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        const std::vector<uint8_t> pixels = target.pixels();
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), {0, 0, 255, 255}));
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), {0, 0, 255, 255}));
+        return vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime) - before;
+    };
+
+    // `vertices` and `tint` share group 0, which the draws bind in three combinations.
+    EXPECT_EQ(render(1), 3u);
+    EXPECT_EQ(render(16), 3u);
 }
 
 TEST_P(RuntimeRecordedSurfaceMatrix, ComputeWriteIsOrderedBeforeRecordedDraws) {

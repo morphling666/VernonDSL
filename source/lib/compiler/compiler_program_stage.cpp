@@ -109,6 +109,8 @@ llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llv
         compiled["builtin"] = builtin->str();
     if (const std::optional<llvm::StringRef> transport = row.getString("value_transport"))
         compiled["value_transport"] = transport->str();
+    if (std::optional<std::string> access = reflectedProgramResourceAccess(row))
+        compiled["access"] = std::move(*access);
     if (const std::optional<int64_t> set = row.getInteger("vernon.set"))
         compiled["set"] = *set;
     if (const std::optional<int64_t> binding = row.getInteger("vernon.binding"))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, RLock
@@ -90,13 +91,20 @@ class _Module:
     host_functions: set[str] = field(default_factory=set)
     # Local name -> (specialization name, kind), where kind is a scalar name or "type".
     specializations: dict[str, tuple[str, str]] = field(default_factory=dict)
-    constants: dict[str, int | float | bool] = field(default_factory=dict)
+    # Module-level `NAME = expression` other than specialization declarations. The ones that fold at compile time
+    # are module constants; folding needs the import graph, so `ModuleGraph._constant_value` does it.
+    assignments: dict[str, ast.expr] = field(default_factory=dict)
     import_specs: dict[str, _ImportSpec] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module", str]] = field(default_factory=dict)
     module_imports: dict[str, "_Module"] = field(default_factory=dict)
 
     def declares_specialization(self, name: str) -> bool:
         return name in self.specializations
+
+    def declares_symbol(self, name: str) -> bool:
+        """Whether this module binds `name` at top level; an assignment only exports a value if it folds."""
+
+        return name in self.definitions or name in self.specializations or name in self.assignments
 
 
 @dataclass(frozen=True)
@@ -251,8 +259,10 @@ _STATIC_BINARY_OPERATORS = {
     ast.Add: lambda left, right: left + right,
     ast.Sub: lambda left, right: left - right,
     ast.Mult: lambda left, right: left * right,
+    ast.Div: lambda left, right: left / right,
     ast.FloorDiv: lambda left, right: left // right,
     ast.Mod: lambda left, right: left % right,
+    ast.Pow: lambda left, right: left**right,
 }
 _STATIC_COMPARISONS = {
     ast.Eq: lambda left, right: left == right,
@@ -262,6 +272,77 @@ _STATIC_COMPARISONS = {
     ast.Gt: lambda left, right: left > right,
     ast.GtE: lambda left, right: left >= right,
 }
+
+
+def _fold_static(
+    node: ast.expr,
+    leaf: Callable[[ast.Name | ast.Attribute], object],
+    fail: Callable[[ast.AST, str], NoReturn],
+) -> object:
+    """Evaluates a compile-time expression with Python semantics, or returns `_NOT_STATIC`.
+
+    `leaf` gives the value a name stands for, or `_NOT_STATIC`; a `_TypeReference` it returns only compares with
+    `==` and `!=` against another one.
+    """
+
+    def untyped(at: ast.AST, *values: object) -> None:
+        if any(isinstance(value, _TypeReference) for value in values):
+            fail(at, "a type specialization compares only with == and != against a type reference")
+
+    def fold(node: ast.expr) -> object:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
+            return node.value
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return leaf(node)
+        if isinstance(node, ast.UnaryOp):
+            operand = fold(node.operand)
+            if operand is _NOT_STATIC:
+                return _NOT_STATIC
+            untyped(node, operand)
+            if isinstance(node.op, ast.Not):
+                return not operand
+            if isinstance(node.op, ast.USub):
+                return -operand  # type: ignore[operator]
+            if isinstance(node.op, ast.UAdd):
+                return operand
+            return _NOT_STATIC
+        if isinstance(node, ast.BoolOp):
+            values = [fold(value) for value in node.values]
+            if any(value is _NOT_STATIC for value in values):
+                return _NOT_STATIC
+            untyped(node, *values)
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.BinOp):
+            operator = _STATIC_BINARY_OPERATORS.get(type(node.op))
+            left, right = fold(node.left), fold(node.right)
+            if operator is None or left is _NOT_STATIC or right is _NOT_STATIC:
+                return _NOT_STATIC
+            untyped(node, left, right)
+            try:
+                value = operator(left, right)
+            except ZeroDivisionError:
+                fail(node, "division by zero in a compile-time expression")
+            # A negative base to a fractional power is complex, which no DSL scalar holds.
+            return value if isinstance(value, (bool, int, float)) else _NOT_STATIC
+        if isinstance(node, ast.Compare):
+            left = fold(node.left)
+            if left is _NOT_STATIC:
+                return _NOT_STATIC
+            for operator_node, comparator in zip(node.ops, node.comparators, strict=True):
+                operator = _STATIC_COMPARISONS.get(type(operator_node))
+                right = fold(comparator)
+                if operator is None or right is _NOT_STATIC:
+                    return _NOT_STATIC
+                typed = isinstance(left, _TypeReference), isinstance(right, _TypeReference)
+                if any(typed) and (not all(typed) or not isinstance(operator_node, (ast.Eq, ast.NotEq))):
+                    untyped(node, left, right)
+                if not operator(left, right):
+                    return False
+                left = right
+            return True
+        return _NOT_STATIC
+
+    return fold(node)
 
 
 class _Specializer(ast.NodeTransformer):
@@ -481,15 +562,20 @@ class _Specializer(ast.NodeTransformer):
         declaration = self.graph._resolve_specialization(self.module, node)
         if declaration is not None:
             return self._substituted(node, *declaration)
-        if isinstance(node.ctx, ast.Load) and node.id in self.module.constants:
-            return copy_location(ast.Constant(value=self.module.constants[node.id]), node)
-        return node
+        return self._inlined_constant(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
         declaration = self.graph._resolve_specialization(self.module, node)
         if declaration is not None:
             return self._substituted(node, *declaration)
-        return self.generic_visit(node)
+        inlined = self._inlined_constant(node)
+        return inlined if inlined is not node else self.generic_visit(node)
+
+    def _inlined_constant(self, node: ast.Name | ast.Attribute) -> ast.expr:
+        if not isinstance(node.ctx, ast.Load):
+            return node
+        value = self.graph._resolve_constant(self.module, node)
+        return node if value is None else copy_location(ast.Constant(value=value), node)
 
     def _substituted(self, node: ast.expr, name: str, kind: str) -> ast.expr:
         if kind != "type":
@@ -520,74 +606,25 @@ class _Specializer(ast.NodeTransformer):
     def _static_condition(
         self, expression: ast.expr, message: str = "specialization condition mixes runtime values"
     ) -> bool:
-        value = self._static_value(expression)
+        value = _fold_static(expression, self._static_leaf, self._fail)
         if value is _NOT_STATIC:
             self.graph._error(self.module, expression, message)
-        self._require_untyped(expression, value)
+        if isinstance(value, _TypeReference):
+            self._fail(expression, "a type specialization compares only with == and != against a type reference")
         return bool(value)
 
-    def _require_untyped(self, node: ast.expr, *values: object) -> None:
-        if any(isinstance(value, _TypeReference) for value in values):
-            self.graph._error(
-                self.module, node, "a type specialization compares only with == and != against a type reference"
-            )
+    def _static_leaf(self, node: ast.Name | ast.Attribute) -> object:
+        declaration = self.graph._resolve_specialization(self.module, node)
+        if declaration is not None:
+            return self._specialization_value(node, *declaration)
+        constant = self.graph._resolve_constant(self.module, node)
+        if constant is not None:
+            return constant
+        reference = self.graph._type_reference(self.module, node)
+        return _TypeReference(reference[0]) if reference is not None else _NOT_STATIC
 
-    def _static_value(self, node: ast.expr) -> object:
-        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
-            return node.value
-        if isinstance(node, (ast.Name, ast.Attribute)):
-            declaration = self.graph._resolve_specialization(self.module, node)
-            if declaration is not None:
-                return self._specialization_value(node, *declaration)
-            if isinstance(node, ast.Name) and node.id in self.module.constants:
-                return self.module.constants[node.id]
-            reference = self.graph._type_reference(self.module, node)
-            return _TypeReference(reference[0]) if reference is not None else _NOT_STATIC
-        if isinstance(node, ast.UnaryOp):
-            operand = self._static_value(node.operand)
-            if operand is _NOT_STATIC:
-                return _NOT_STATIC
-            self._require_untyped(node, operand)
-            if isinstance(node.op, ast.Not):
-                return not operand
-            if isinstance(node.op, ast.USub):
-                return -operand  # type: ignore[operator]
-            if isinstance(node.op, ast.UAdd):
-                return operand
-            return _NOT_STATIC
-        if isinstance(node, ast.BoolOp):
-            values = [self._static_value(value) for value in node.values]
-            if any(value is _NOT_STATIC for value in values):
-                return _NOT_STATIC
-            self._require_untyped(node, *values)
-            return all(values) if isinstance(node.op, ast.And) else any(values)
-        if isinstance(node, ast.BinOp):
-            operator = _STATIC_BINARY_OPERATORS.get(type(node.op))
-            left, right = self._static_value(node.left), self._static_value(node.right)
-            if operator is None or left is _NOT_STATIC or right is _NOT_STATIC:
-                return _NOT_STATIC
-            self._require_untyped(node, left, right)
-            try:
-                return operator(left, right)
-            except ZeroDivisionError:
-                self.graph._error(self.module, node, "division by zero in a compile-time expression")
-        if isinstance(node, ast.Compare):
-            left = self._static_value(node.left)
-            if left is _NOT_STATIC:
-                return _NOT_STATIC
-            for operator_node, comparator in zip(node.ops, node.comparators, strict=True):
-                operator = _STATIC_COMPARISONS.get(type(operator_node))
-                right = self._static_value(comparator)
-                if operator is None or right is _NOT_STATIC:
-                    return _NOT_STATIC
-                typed = isinstance(left, _TypeReference), isinstance(right, _TypeReference)
-                if any(typed) and (not all(typed) or not isinstance(operator_node, (ast.Eq, ast.NotEq))):
-                    self._require_untyped(node, left, right)
-                if not operator(left, right):
-                    return False
-                left = right
-            return True
-        return _NOT_STATIC
+    def _fail(self, node: ast.AST, message: str) -> NoReturn:
+        self.graph._error(self.module, node, message)
 
     def _specialize_statements(self, statements: list[ast.stmt]) -> list[ast.stmt]:
         result: list[ast.stmt] = []
@@ -738,6 +775,9 @@ class ModuleGraph:
         self._abi_structs: dict[str, tuple[_Module, ast.ClassDef]] = {}
         self.reachable_symbols: set[tuple[Path, str]] = set()
         self._resolving_symbols: list[tuple[Path, str]] = []
+        # A folded value depends on other files' constants, so it is cached per graph and not on the shared module.
+        self._constant_values: dict[tuple[Path, str], int | float | bool | None] = {}
+        self._folding_constants: set[tuple[Path, str]] = set()
         self.absent_files = _AbsentFiles()
 
     def _is_file(self, path: Path) -> bool:
@@ -980,10 +1020,9 @@ class ModuleGraph:
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
-                    and isinstance(node.value, ast.Constant)
-                    and isinstance(node.value.value, (int, float, bool))
+                    and not module.declares_specialization(node.targets[0].id)
                 ):
-                    module.constants[node.targets[0].id] = node.value.value
+                    module.assignments[node.targets[0].id] = node.value
                 continue
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 continue
@@ -1057,11 +1096,7 @@ class ModuleGraph:
                     )
 
     def _add_import_spec(self, module: _Module, spec: _ImportSpec) -> None:
-        if (
-            spec.local_name in module.definitions
-            or module.declares_specialization(spec.local_name)
-            or spec.local_name in module.import_specs
-        ):
+        if module.declares_symbol(spec.local_name) or spec.local_name in module.import_specs:
             self._error(module, spec.node, f"duplicate imported symbol '{spec.local_name}'")
         module.import_specs[spec.local_name] = spec
 
@@ -1086,8 +1121,19 @@ class ModuleGraph:
         if spec.symbol_name is None:
             self._add_module_import(module, local_name, target, spec.node)
             return target, None
-        if spec.symbol_name not in target.definitions and not target.declares_specialization(spec.symbol_name):
-            self._error(module, spec.node, f"module '{target.name}' has no symbol '{spec.symbol_name}'")
+        symbol = spec.symbol_name
+        if not target.declares_symbol(symbol):
+            self._error(module, spec.node, f"module '{target.name}' has no symbol '{symbol}'")
+        if (
+            symbol not in target.definitions
+            and not target.declares_specialization(symbol)
+            and self._constant_value(target, symbol) is None
+        ):
+            self._error(
+                module,
+                spec.node,
+                f"module '{target.name}' assigns '{symbol}' a value that is not a compile-time constant",
+            )
         self._add_symbol_import(module, local_name, target, spec.symbol_name, spec.node)
         return target, spec.symbol_name
 
@@ -1113,7 +1159,8 @@ class ModuleGraph:
                 ):
                     self._follow_references(module, definition)
                 return
-            if module.declares_specialization(name) or name in module.constants:
+            if module.declares_symbol(name):
+                # Folding during discovery loads the modules a constant's value comes from, so they are hashed.
                 return
             imported = self._materialize_import(module, name)
             if imported is not None and imported[1] is not None:
@@ -1130,15 +1177,10 @@ class ModuleGraph:
                     imported = self._materialize_import(module, root)
                     if imported is not None and imported[1] is None:
                         symbol = remainder.split(".", 1)[0]
-                        if symbol in imported[0].definitions or imported[0].declares_specialization(symbol):
+                        if imported[0].declares_symbol(symbol):
                             self._touch_symbol(imported[0], symbol)
             elif isinstance(value, ast.Name) and isinstance(value.ctx, ast.Load):
-                if (
-                    value.id in module.definitions
-                    or module.declares_specialization(value.id)
-                    or value.id in module.constants
-                    or value.id in module.import_specs
-                ):
+                if module.declares_symbol(value.id) or value.id in module.import_specs:
                     self._touch_symbol(module, value.id)
 
     def _find_local_path(self, module: _Module, dotted: str, level: int) -> Path | None:
@@ -1163,8 +1205,7 @@ class ModuleGraph:
 
     def _add_symbol_import(self, module: _Module, local_name: str, target: _Module, symbol: str, node: ast.AST) -> None:
         if (
-            local_name in module.definitions
-            or module.declares_specialization(local_name)
+            module.declares_symbol(local_name)
             or local_name in module.symbol_imports
             or local_name in module.module_imports
         ):
@@ -1173,33 +1214,67 @@ class ModuleGraph:
 
     def _add_module_import(self, module: _Module, local_name: str, target: _Module, node: ast.AST) -> None:
         if (
-            local_name in module.definitions
-            or module.declares_specialization(local_name)
+            module.declares_symbol(local_name)
             or local_name in module.symbol_imports
             or local_name in module.module_imports
         ):
             self._error(module, node, f"duplicate imported symbol '{local_name}'")
         module.module_imports[local_name] = target
 
-    def _resolve_specialization(self, module: _Module, node: ast.AST) -> tuple[str, str] | None:
-        """Returns the (name, kind) of the specialization `node` names, if any."""
+    @staticmethod
+    def _named_member(module: _Module, node: ast.AST) -> tuple[_Module, str] | None:
+        """The declaring module and symbol `node` names: local, imported by name, or a member of an imported module."""
 
         if isinstance(node, ast.Name):
-            local = module.specializations.get(node.id)
-            if local is not None:
-                return local
-            imported = module.symbol_imports.get(node.id)
-            if imported:
-                target, symbol = imported
-                return target.specializations.get(symbol)
-            return None
+            return module.symbol_imports.get(node.id, (module, node.id))
         if isinstance(node, ast.Attribute):
             dotted = _dotted_name(node) or ""
             for alias, target in module.module_imports.items():
                 prefix = alias + "."
                 if dotted.startswith(prefix):
-                    return target.specializations.get(dotted.removeprefix(prefix))
+                    return target, dotted.removeprefix(prefix)
         return None
+
+    def _resolve_specialization(self, module: _Module, node: ast.AST) -> tuple[str, str] | None:
+        """Returns the (name, kind) of the specialization `node` names, if any."""
+
+        member = self._named_member(module, node)
+        return member[0].specializations.get(member[1]) if member is not None else None
+
+    def _resolve_constant(self, module: _Module, node: ast.AST) -> int | float | bool | None:
+        """Returns the value of the module constant `node` names, if any."""
+
+        member = self._named_member(module, node)
+        return self._constant_value(*member) if member is not None else None
+
+    def _constant_value(self, module: _Module, name: str) -> int | float | bool | None:
+        """The compile-time value of the top-level assignment `name`, or None when it does not fold to a scalar."""
+
+        expression = module.assignments.get(name)
+        if expression is None:
+            return None
+        key = (module.path, name)
+        if key in self._constant_values:
+            return self._constant_values[key]
+        if key in self._folding_constants:
+            self._error(module, expression, f"module constant '{name}' depends on itself")
+        self._folding_constants.add(key)
+        try:
+            value = _fold_static(
+                expression,
+                lambda leaf: self._constant_leaf(module, leaf),
+                lambda at, message: self._error(module, at, message),
+            )
+        finally:
+            self._folding_constants.discard(key)
+        folded = value if isinstance(value, (bool, int, float)) else None
+        self._constant_values[key] = folded
+        return folded
+
+    def _constant_leaf(self, module: _Module, node: ast.Name | ast.Attribute) -> object:
+        self._materialize_reference(module, node)
+        value = self._resolve_constant(module, node)
+        return _NOT_STATIC if value is None else value
 
     def _scalar_value(self, module: _Module, node: ast.AST, name: str, kind: str) -> bool | int | float:
         if kind == "format":
@@ -1388,14 +1463,9 @@ class ModuleGraph:
             fields.append((statement.target.id, self._parse_abi_type(module, statement.annotation)))
         return tuple(fields)
 
-    @staticmethod
-    def _constant_int(module: _Module, node: ast.AST) -> int | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
-            return node.value
-        if isinstance(node, ast.Name):
-            value = module.constants.get(node.id)
-            return value if isinstance(value, int) and not isinstance(value, bool) else None
-        return None
+    def _constant_int(self, module: _Module, node: ast.AST) -> int | None:
+        value = node.value if isinstance(node, ast.Constant) else self._resolve_constant(module, node)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     def _reachable_functions(
         self, body: list[ast.stmt], entry: str, root: _Module, methods: dict[str, dict[str, str]]
@@ -1584,6 +1654,16 @@ def load_project(
 ) -> LoadedProject:
     graph, _ = _load_project_graph(input_path, specializations, entry)
     return graph.load()
+
+
+def project_declared_specializations(
+    input_path: str | Path, specializations: tuple[SpecializationAssignment, ...], entry: str
+) -> dict[str, str]:
+    """Maps every specialization reachable from `entry` to its kind, without checking `specializations` against
+    them."""
+
+    graph, _ = _load_project_graph(input_path, specializations, entry)
+    return graph.declared_specializations()
 
 
 def _private_project_root(input_path: str | Path) -> tuple[ModuleGraph, _Module]:

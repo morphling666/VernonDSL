@@ -345,6 +345,8 @@ if(TARGET VernonRuntime)
             APPEND
             cross_backend_fixture_specs
             "module_graphics|recorded_graphics_opaque_pass|${recorded_graphics_asset}:opaque_pass_asset|graphics"
+            "module_graphics|recorded_graphics_grouped_tint_pass|${recorded_graphics_asset}:grouped_tint_pass_asset|graphics"
+            "module_graphics|recorded_graphics_vertex_group_pass|${recorded_graphics_asset}:vertex_group_pass_asset|graphics"
             "module_graphics|recorded_graphics_blended_surface|${recorded_graphics_asset}:blended_surface_asset|graphics"
             "module_graphics|recorded_graphics_packed_tint_surface|${recorded_graphics_asset}:packed_tint_surface_asset|graphics"
             "module_graphics|recorded_graphics_float_target_surface|${recorded_graphics_asset}:float_target_surface_asset|graphics"
@@ -991,18 +993,26 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
                 directx_resolution_program_bundle
                 directx_resolution_program_test_manifest)
+            vernon_add_program_asset_test_bundle(
+                directx-spilled-uniform
+                directx
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:spilled_uniform_color_asset"
+                directx_spilled_uniform_bundle
+                directx_spilled_uniform_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
             target_compile_definitions(
                 VernonRuntimeTests
                 PRIVATE VERNON_DIRECTX_PROGRAM_BUNDLE="${directx_program_test_manifest}"
                         VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE="${directx_compute_program_test_manifest}"
-                        VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE="${directx_resolution_program_test_manifest}")
+                        VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE="${directx_resolution_program_test_manifest}"
+                        VERNON_DIRECTX_SPILLED_UNIFORM_BUNDLE="${directx_spilled_uniform_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
             add_dependencies(
                 VernonRuntimeTests
                 vernon-directx-pipeline-test-bundle
                 vernon-directx-compute-pipeline-test-bundle
-                vernon-directx-resolution-pipeline-test-bundle)
+                vernon-directx-resolution-pipeline-test-bundle
+                vernon-directx-spilled-uniform-test-bundle)
         endif()
     endif()
 
@@ -1033,6 +1043,12 @@ if(TARGET VernonRuntime)
             "${VERNON_TEST_ROOT}/fixtures/language_contract_texture_asset.py:multiset_asset"
             vulkan_multiset_texture_bundle
             vulkan_multiset_texture_test_manifest)
+        vernon_add_program_asset_test_bundle(
+            vulkan-spilled-uniform
+            vulkan
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:spilled_uniform_color_asset"
+            vulkan_spilled_uniform_bundle
+            vulkan_spilled_uniform_test_manifest)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(
@@ -1040,13 +1056,15 @@ if(TARGET VernonRuntime)
             PRIVATE VERNON_VULKAN_PROGRAM_BUNDLE="${vulkan_program_test_manifest}"
                     VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}"
                     VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE="${vulkan_compute_program_test_manifest}"
-                    VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE="${vulkan_multiset_texture_test_manifest}")
+                    VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE="${vulkan_multiset_texture_test_manifest}"
+                    VERNON_VULKAN_SPILLED_UNIFORM_BUNDLE="${vulkan_spilled_uniform_test_manifest}")
         add_dependencies(
             VernonRuntimeTests
             vernon-vulkan-pipeline-test-bundle
             vernon-vulkan-cube-map-test-bundle
             vernon-vulkan-compute-pipeline-test-bundle
-            vernon-vulkan-multiset-texture-test-bundle)
+            vernon-vulkan-multiset-texture-test-bundle
+            vernon-vulkan-spilled-uniform-test-bundle)
     endif()
 
     if(TARGET vernon-dsl-native AND Python_FOUND)

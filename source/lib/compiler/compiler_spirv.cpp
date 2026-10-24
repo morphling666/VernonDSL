@@ -326,6 +326,7 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
             : target == VERNON_TARGET_DIRECTX ? mlir::vernon::SpirvInterfaceAbi::DirectX
                                               : mlir::vernon::SpirvInterfaceAbi::NativeUniforms));
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::vernon::createVernonDecorateNonWritableStoragePass());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>(requireF32AtomicAdd));
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVUpdateVCEPass());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<RequireImageCapabilitiesPass>());

@@ -369,4 +369,11 @@ vernon::Option<VernonRhiBuffer> ProgramInvocationState::buffer(uint32_t value) c
     return {};
 }
 
+bool ProgramInvocationState::borrowsBinding(uint32_t value) const {
+    if (value >= values_.size() || deviceValues_[value])
+        return false;
+    const ProgramValueOwnership ownership = values_[value].ownership;
+    return ownership == ProgramValueOwnership::BorrowedHost || ownership == ProgramValueOwnership::BorrowedDevice;
+}
+
 } // namespace vernon::runtime::program_execution

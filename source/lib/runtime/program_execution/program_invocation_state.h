@@ -123,6 +123,8 @@ public:
     vernon::Option<std::reference_wrapper<const VernonProgramArgument>> argument(uint32_t value) const;
     vernon::Option<std::reference_wrapper<VernonProgramArgument>> argument(uint32_t value);
     vernon::Option<VernonRhiBuffer> buffer(uint32_t value) const;
+    // Whether the argument of `value` is the caller's bound argument itself, not staged by the invocation.
+    bool borrowsBinding(uint32_t value) const;
 
     const program::ResolvedExecutionPlan &plan() const { return *plan_; }
     const std::vector<VernonProgramArgument> &arguments() const { return arguments_; }

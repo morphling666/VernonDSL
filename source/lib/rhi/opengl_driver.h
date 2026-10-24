@@ -165,6 +165,7 @@ struct Driver {
     void(VERNON_GL_CALL *deleteVertexArrays)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindVertexArray)(Uint){};
     void(VERNON_GL_CALL *enableVertexAttribArray)(Uint){};
+    void(VERNON_GL_CALL *disableVertexAttribArray)(Uint){};
     void(VERNON_GL_CALL *vertexAttribPointer)(Uint, Int, Enum, Boolean, Size, const void *){};
     void(VERNON_GL_CALL *vertexAttribIPointer)(Uint, Int, Enum, Size, const void *){};
     void(VERNON_GL_CALL *vertexAttribLPointer)(Uint, Int, Enum, Size, const void *){};

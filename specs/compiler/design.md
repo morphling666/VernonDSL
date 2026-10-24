@@ -118,7 +118,11 @@ frontend's row-major linearization; dynamic local value Tensors are rejected.
 annotation. A zero divisor advances per vertex; a positive divisor advances
 per that many instances. Explicit attribute ranges are reserved first, then
 automatic locations use declaration-order first-fit over the remaining
-contiguous ranges. Uniforms, resources, and builtins never consume locations.
+contiguous ranges. Binding-group attribute fields are always automatic and
+take the ranges left free by the ungrouped parameters, in flattened
+declaration order, because a group's leaves exist only once the entry is
+flattened while the module graph places ungrouped parameters before it.
+Uniforms, resources, and builtins never consume locations.
 Stage outputs and varyings use the same declaration-order location planning;
 the removed `location()` and `instance()` annotations have no compatibility
 aliases.
