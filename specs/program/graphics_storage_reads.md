@@ -72,8 +72,9 @@ pipeline as a whole, before any of its modules is compiled:
    takes one; a TensorView parameter takes one per storage leaf, in leaf
    order; the module's metadata carrier takes one, after all arguments. An
    implicit sampler is listed right after the texture it samples. Each
-   request carries the parameter's pipeline name, kind, type, and outermost
-   binding group, if any. Authored bindings are listed separately.
+   request carries the parameter's pipeline name, kind, type, and `set`
+   (0 when it declares none); the metadata carrier is in set 0. Authored
+   bindings are listed separately.
 
    A Struct, Tuple, or Tensor uniform always spills to a buffer, because
    OpenGL, OpenGL ES, and Metal have no native inline uniform for aggregates.
@@ -87,13 +88,15 @@ pipeline as a whole, before any of its modules is compiled:
    other request, including every metadata carrier, takes the lowest free
    bindings.
 
-   Requests of one binding group occurrence are allocated together instead:
-   the link forms the union of the group's requests over all modules, in
-   field order (a request seen only in a later module, such as an implicit
-   sampler of one stage, joins after the request that precedes it there),
-   and assigns the whole union the lowest free consecutive range. Each module
-   takes its own requests' bindings from that range, so both stages agree on
-   every leaf even when one stage uses only some of them.
+   Requests of every other set are allocated together instead: the link
+   forms the union of the set's requests over all modules, in request order
+   (a request seen only in a later module, such as an implicit sampler of one
+   stage, joins after the request that precedes it there), and assigns the
+   whole union the lowest free consecutive range. Each module takes its own
+   requests' bindings from that range, so both stages agree on every leaf
+   even when one stage uses only some of them. Binding numbers stay unique
+   across sets, because OpenGL-family targets ignore the set. A by-value leaf
+   outside set 0 always spills to a buffer.
 3. *Compile.* Each module is compiled with its own layout from the link. The
    compiler checks that the layout covers exactly that module's requests,
    writes texture and sampler bindings onto their arguments before reflection
@@ -120,7 +123,7 @@ several stages use into one descriptor visible to each of those stages.
 
 An explicit `Sampler` parameter binds through the images it samples. A stage
 that declares one but never samples with it, which happens when a stage uses
-only part of a binding group, contributes no sampler slot in that stage. An
+only some leaves of a params parameter, contributes no sampler slot in that stage. An
 implicit sampler always pairs with its texture.
 
 The OpenGL-family Runtime binds named uniforms and textures by the shader's

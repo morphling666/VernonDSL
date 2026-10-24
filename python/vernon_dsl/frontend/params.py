@@ -1,7 +1,9 @@
-"""Flattens `@binding_group` parameters into dotted leaf parameters before typed inference.
+"""Flattens `@params` parameters into dotted leaf parameters before typed inference.
 
-A binding group is never a Value, so its type is always visible in source: it can only reach code as an annotated
-parameter, a forwarded argument, or a field of another group. That makes flattening exact without inference.
+A params class has no physical meaning: a parameter of its type is exactly its leaves, each carrying its field's
+annotation as a plain parameter would. It is never a Value, so its type is always visible in source: it can only
+reach code as an annotated parameter, a forwarded argument, or a field of another params class. That makes
+flattening exact without inference.
 Leaf parameters are named by their dotted path (`material.noise`); a dot cannot occur in a source identifier, so leaf
 names never collide with user names, and lowering, reflection, and host binding see the dotted names directly.
 """
@@ -31,7 +33,7 @@ def _head(annotation: ast.AST) -> str:
 
 def _is_group_declaration(node: ast.AST) -> bool:
     return isinstance(node, ast.ClassDef) and any(
-        decorator_name(decorator) == "binding_group" for decorator in node.decorator_list
+        decorator_name(decorator) == "params" for decorator in node.decorator_list
     )
 
 
@@ -52,7 +54,6 @@ class _Field:
     name: str
     annotation: ast.expr
     group: str | None
-    attribute: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,36 +120,16 @@ class _Flattener:
                 or not isinstance(statement.target, ast.Name)
                 or statement.value is not None
             ):
-                raise self.error(statement, "@binding_group bodies may contain only annotation-only fields and methods")
-            qualified = f"'{declaration.name}.{statement.target.id}'"
-            head = _head(statement.annotation)
-            if head == "Annotated":
-                self._check_attribute(statement.annotation, qualified)
-                fields.append(_Field(statement.target.id, statement.annotation, None, attribute=True))
-                continue
-            if head == "When":
+                raise self.error(statement, "@params bodies may contain only annotation-only fields and methods")
+            if _head(statement.annotation) == "When":
                 raise self.error(
-                    statement.annotation, f"binding group field cannot declare a When condition: {qualified}"
+                    statement.annotation,
+                    f"params field cannot declare a When condition: '{declaration.name}.{statement.target.id}'",
                 )
             annotation = statement.annotation
             group = annotation.id if isinstance(annotation, ast.Name) and annotation.id in names else None
             fields.append(_Field(statement.target.id, annotation, group))
         return tuple(fields)
-
-    def _check_attribute(self, annotation: ast.expr, qualified: str) -> None:
-        assert isinstance(annotation, ast.Subscript)
-        items = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
-        metadata = items[1:]
-        if len(metadata) != 1 or not isinstance(metadata[0], ast.Call) or decorator_name(metadata[0]) != "attribute":
-            raise self.error(annotation, f"binding group field cannot declare interface metadata: {qualified}")
-        if metadata[0].args or any(keyword.arg == "location" for keyword in metadata[0].keywords):
-            raise self.error(annotation, f"binding group attribute cannot declare a location: {qualified}")
-
-    def _has_attributes(self, group: str) -> bool:
-        return any(
-            field.attribute or (field.group is not None and self._has_attributes(field.group))
-            for field in self.groups[group]
-        )
 
     def _reject_cycles(self) -> None:
         states: dict[str, int] = {}
@@ -160,7 +141,7 @@ class _Flattener:
                     continue
                 if states.get(field.group) == 1:
                     cycle = " -> ".join((*chain[chain.index(field.group) :], field.group))
-                    raise self.error(field.annotation, f"binding group cannot contain itself: {cycle}")
+                    raise self.error(field.annotation, f"params cannot contain itself: {cycle}")
                 if states.get(field.group, 0) == 0:
                     visit(field.group, (*chain, field.group))
             states[name] = 2
@@ -189,9 +170,9 @@ class _Flattener:
                     if not nested:
                         continue
                     if not _is_group_declaration(statement):
-                        raise self.error(nested[0], "binding group cannot be a Struct field")
+                        raise self.error(nested[0], "params cannot be a Struct field")
                     if not isinstance(member.annotation, ast.Name):
-                        raise self.error(nested[0], "binding group cannot be a Tensor, TensorView, or Tuple element")
+                        raise self.error(nested[0], "params cannot be a Tensor, TensorView, or Tuple element")
                 continue
             if not isinstance(statement, ast.FunctionDef):
                 continue
@@ -203,15 +184,15 @@ class _Flattener:
                 if self._parameter_group(argument.annotation) is None:
                     assert argument.annotation is not None
                     if _head(argument.annotation) in {"Annotated", "When"}:
-                        raise self.error(nested[0], "binding group cannot be annotated with interface metadata")
-                    raise self.error(nested[0], "binding group cannot be a Tensor, TensorView, or Tuple element")
+                        raise self.error(nested[0], "params parameter cannot declare interface metadata")
+                    raise self.error(nested[0], "params cannot be a Tensor, TensorView, or Tuple element")
                 if shared:
-                    raise self.error(argument, f"binding group cannot be passed to shared function '{statement.name}'")
+                    raise self.error(argument, f"params cannot be passed to shared function '{statement.name}'")
             if self._group_names(statement.returns):
-                raise self.error(statement.returns or statement, "binding group cannot be returned")
+                raise self.error(statement.returns or statement, "params cannot be returned")
             for node in ast.walk(statement):
                 if isinstance(node, ast.AnnAssign) and self._group_names(node.annotation):
-                    raise self.error(node, "binding group cannot be assigned to a local")
+                    raise self.error(node, "params cannot be assigned to a local")
 
     def _signature(self, function: ast.FunctionDef) -> _Signature:
         return _Signature(
@@ -237,12 +218,10 @@ class _Flattener:
             if group is None:
                 arguments.append(argument)
                 continue
-            if stage is not None and stage != "vertex" and self._has_attributes(group):
-                raise self.error(argument, "binding group with vertex attributes is only valid in a vertex stage")
             environment[argument.arg] = _GroupRef(group, argument.arg)
             for path, annotation in self.leaves(group, argument.arg):
                 leaf = copy_location(ast.arg(arg=path, annotation=self._leaf_annotation(annotation, stage)), argument)
-                leaf._vernon_binding_group = argument.arg
+                leaf._vernon_params_root = argument.arg
                 arguments.append(leaf)
         rewriter = _BodyRewriter(self, environment)
         if environment:
@@ -304,7 +283,7 @@ class _BodyRewriter(ast.NodeTransformer):
                 return _GroupRef(field.group, path) if field.group is not None else path
         if node.attr in self.owner.methods.get(base.group, {}):
             return _MethodRef(base.group)
-        raise self.owner.error(node, f"binding group '{base.group}' has no field '{node.attr}'")
+        raise self.owner.error(node, f"params '{base.group}' has no field '{node.attr}'")
 
     def _is_group(self, node: ast.AST | None) -> bool:
         return node is not None and isinstance(self._resolve(node), _GroupRef)
@@ -312,8 +291,8 @@ class _BodyRewriter(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.expr:
         if node.id in self.environment:
             if not isinstance(node.ctx, ast.Load):
-                raise self.owner.error(node, "binding group cannot be reassigned")
-            raise self.owner.error(node, "binding group cannot be used as a value")
+                raise self.owner.error(node, "params cannot be reassigned")
+            raise self.owner.error(node, "params cannot be used as a value")
         return node
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
@@ -321,41 +300,41 @@ class _BodyRewriter(ast.NodeTransformer):
         if resolved is None:
             return self.generic_visit(node)  # type: ignore[return-value]
         if not isinstance(node.ctx, ast.Load):
-            raise self.owner.error(node, "binding group cannot be reassigned through its fields")
+            raise self.owner.error(node, "params cannot be reassigned through its fields")
         if isinstance(resolved, str):
             return copy_location(ast.Name(id=resolved, ctx=ast.Load()), node)
         if isinstance(resolved, _MethodRef):
-            raise self.owner.error(node, "binding group methods cannot be used as first-class values")
-        raise self.owner.error(node, "binding group cannot be used as a value")
+            raise self.owner.error(node, "params methods cannot be used as first-class values")
+        raise self.owner.error(node, "params cannot be used as a value")
 
     def visit_Return(self, node: ast.Return) -> ast.stmt:
         if self._is_group(node.value):
-            raise self.owner.error(node, "binding group cannot be returned")
+            raise self.owner.error(node, "params cannot be returned")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_Assign(self, node: ast.Assign) -> ast.stmt:
         if self._is_group(node.value):
-            raise self.owner.error(node, "binding group cannot be assigned to a local")
+            raise self.owner.error(node, "params cannot be assigned to a local")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
         if self._is_group(node.value):
-            raise self.owner.error(node, "binding group cannot be assigned to a local")
+            raise self.owner.error(node, "params cannot be assigned to a local")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> ast.expr:
         if self._is_group(node.value):
-            raise self.owner.error(node, "binding group cannot be assigned to a local")
+            raise self.owner.error(node, "params cannot be assigned to a local")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_Compare(self, node: ast.Compare) -> ast.expr:
         if any(self._is_group(operand) for operand in (node.left, *node.comparators)):
-            raise self.owner.error(node, "binding group cannot be compared")
+            raise self.owner.error(node, "params cannot be compared")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
         if self._is_group(node.value):
-            raise self.owner.error(node, "binding group cannot be indexed")
+            raise self.owner.error(node, "params cannot be indexed")
         return self.generic_visit(node)  # type: ignore[return-value]
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
@@ -374,10 +353,10 @@ class _BodyRewriter(ast.NodeTransformer):
                     node,
                 )
         if isinstance(node.func, ast.Name) and node.func.id in self.owner.groups:
-            raise self.owner.error(node, "binding group cannot be constructed in shader code")
+            raise self.owner.error(node, "params cannot be constructed in shader code")
         for keyword in node.keywords:
             if self._is_group(keyword.value):
-                raise self.owner.error(keyword, "binding group cannot be passed by keyword")
+                raise self.owner.error(keyword, "params cannot be passed by keyword")
         groups = [(index, self._resolve(argument)) for index, argument in enumerate(node.args)]
         positions = [(index, value) for index, value in groups if isinstance(value, _GroupRef)]
         if not positions:
@@ -385,7 +364,7 @@ class _BodyRewriter(ast.NodeTransformer):
         callee = node.func.id if isinstance(node.func, ast.Name) else None
         signature = self.owner.signatures.get(callee or "")
         if callee is None or signature is None:
-            raise self.owner.error(node, f"binding group cannot be passed to '{dotted_name(node.func) or 'call'}'")
+            raise self.owner.error(node, f"params cannot be passed to '{dotted_name(node.func) or 'call'}'")
         if len(node.args) != len(signature.groups):
             raise self.owner.error(node, f"function '{callee}' expects {len(signature.groups)} arguments")
         generic: list[tuple[int, str]] = []
@@ -396,7 +375,7 @@ class _BodyRewriter(ast.NodeTransformer):
             elif signature.groups[index] != reference.group:
                 raise self.owner.error(
                     node.args[index],
-                    f"binding group cannot be passed as argument {index} of '{callee}', "
+                    f"params cannot be passed as argument {index} of '{callee}', "
                     f"which does not declare {reference.group}",
                 )
         if generic:
@@ -418,13 +397,13 @@ class _BodyRewriter(ast.NodeTransformer):
         return node
 
 
-def flatten_binding_groups(module: ast.Module, error: Error) -> ast.Module:
+def flatten_params(module: ast.Module, error: Error) -> ast.Module:
     return _Flattener(module, error).run()
 
 
-def binding_group_occurrence(argument: ast.arg) -> str | None:
+def params_root(argument: ast.arg) -> str | None:
     """The entry parameter path of the group occurrence a flattened leaf belongs to."""
-    return getattr(argument, "_vernon_binding_group", None)
+    return getattr(argument, "_vernon_params_root", None)
 
 
-__all__ = ["binding_group_occurrence", "flatten_binding_groups"]
+__all__ = ["flatten_params", "params_root"]

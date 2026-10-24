@@ -68,14 +68,17 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline, Verno
 #endif
 }
 
-VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                         GroupStore &transient, const PlannedComputeLaunch &launch,
                                          const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanCompute,
-                                    pipeline.bindingProjection, launch, owners,
+                                    pipeline.bindingProjection, commands, transient, launch, owners,
                                     runtimeBackendState<VulkanPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
+    (void)commands;
+    (void)transient;
     (void)launch;
     (void)owners;
     return VERNON_STATUS_UNSUPPORTED_TARGET;

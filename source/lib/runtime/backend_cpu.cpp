@@ -230,6 +230,8 @@ VernonStatus endCpuCommands(void *, VernonRuntimeProviderObject commands) {
     return VERNON_STATUS_OK;
 }
 
+VernonStatus resumeCpuCommands(void *, VernonRuntimeProviderObject) { return VERNON_STATUS_OK; }
+
 VernonStatus bindCpuPipeline(void *, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
     fromHandle<CpuCommands>(commands)->pipeline = fromHandle<CpuPreparedPipeline>(pipeline);
     return VERNON_STATUS_OK;
@@ -385,6 +387,7 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     state->provider.create_group = createCpuGroup;
     state->provider.begin_commands = beginCpuCommands;
     state->provider.end_commands = endCpuCommands;
+    state->provider.resume_commands = resumeCpuCommands;
     state->provider.encode_bind_pipeline = bindCpuPipeline;
     state->provider.encode_bind_group = bindCpuGroup;
     state->provider.encode_dispatch = encodeCpuDispatch;

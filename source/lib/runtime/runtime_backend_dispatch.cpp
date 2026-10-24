@@ -298,44 +298,99 @@ RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(Vernon
                                             err(runtimeErrorFromStatus(status, {"reference_command_encoder", 0, 0}))};
 }
 
-BackendCommands &BackendCommands::operator=(BackendCommands &&other) noexcept {
+namespace {
+
+const VernonRuntimeDeviceProvider *commandProvider(VernonRuntimeContext &context) {
+    if (context.backend == VERNON_RUNTIME_CPU)
+        return cpuProvider(context);
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    return adapter ? vernonRuntimeRhiAdapterGetProvider(adapter) : nullptr;
+}
+
+RuntimeResult<void> commandResult(VernonRuntimeContext &context, VernonStatus status, const char *operation,
+                                  std::string_view failure) {
+    if (VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context))
+        return renderingResult(context, *adapter, status, operation, failure);
+    return status == VERNON_STATUS_OK ? RuntimeResult<void>{ok()}
+                                      : RuntimeResult<void>{err(runtimeErrorFromStatus(status, {operation, 0, 0}))};
+}
+
+} // namespace
+
+CommandStream::CommandStream(CommandStream &&other) noexcept
+    : context_(other.context_), commands_(std::exchange(other.commands_, nullptr)), encoder_(other.encoder_),
+      transient_(std::move(other.transient_)) {}
+
+CommandStream &CommandStream::operator=(CommandStream &&other) noexcept {
     if (this != &other) {
         if (commands_)
             (void)vernonRuntimeCoreEndCommands(commands_);
         context_ = other.context_;
         commands_ = std::exchange(other.commands_, nullptr);
+        encoder_ = other.encoder_;
+        transient_ = std::move(other.transient_);
     }
     return *this;
 }
 
-BackendCommands::~BackendCommands() {
+CommandStream::~CommandStream() {
     if (commands_)
         (void)vernonRuntimeCoreEndCommands(commands_);
 }
 
-RuntimeResult<void> BackendCommands::end() {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(*context_);
-    const VernonStatus status = vernonRuntimeCoreEndCommands(std::exchange(commands_, nullptr));
-    if (!adapter)
-        return status == VERNON_STATUS_OK ? RuntimeResult<void>{ok()}
-                                          : runtimeFailure(RuntimeErrorCode::InvalidArgument, "end_backend_commands");
-    return renderingResult(*context_, *adapter, status, "end_backend_commands", "failed to end commands");
+RuntimeResult<void> CommandStream::resume() {
+    return commandResult(*context_, vernonRuntimeCoreResumeCommands(commands_), "resume_backend_commands",
+                         "failed to resume commands");
 }
 
-RuntimeResult<BackendCommands> beginBackendCommands(VernonRuntimeContext &context,
-                                                    VernonRuntimeProviderObject encoder) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    if (!adapter)
-        return RuntimeResult<BackendCommands>{
+RuntimeResult<void> CommandStream::end() {
+    const VernonStatus status = vernonRuntimeCoreEndCommands(std::exchange(commands_, nullptr));
+    transient_.reset();
+    return commandResult(*context_, status, "end_backend_commands", "failed to end commands");
+}
+
+RuntimeResult<CommandStream> beginCommandStream(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder) {
+    const VernonRuntimeDeviceProvider *provider = commandProvider(context);
+    if (!provider)
+        return RuntimeResult<CommandStream>{
             err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"begin_backend_commands", 0, 0}})};
-    VernonRuntimeCoreCommands *commands = nullptr;
-    auto begun =
-        renderingResult(context, *adapter,
-                        vernonRuntimeCoreBeginCommands(vernonRuntimeRhiAdapterGetProvider(adapter), encoder, &commands),
-                        "begin_backend_commands", "failed to begin commands");
+    CommandStream stream;
+    stream.context_ = &context;
+    stream.encoder_ = encoder;
+    stream.transient_ = std::make_unique<GroupStore>(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
+    auto begun = commandResult(context, vernonRuntimeCoreBeginCommands(provider, encoder, &stream.commands_),
+                               "begin_backend_commands", "failed to begin commands");
     if (begun.isErr())
-        return RuntimeResult<BackendCommands>{err(std::move(begun).error())};
-    return RuntimeResult<BackendCommands>{ok(BackendCommands(context, commands))};
+        return RuntimeResult<CommandStream>{err(std::move(begun).error())};
+    return RuntimeResult<CommandStream>{ok(std::move(stream))};
+}
+
+RuntimeResult<CommandStream *> EncoderCommandStream::acquire(VernonRhiCommandEncoder encoder) {
+    if (stream_) {
+        if (encoder.index != encoder_.index || encoder.generation != encoder_.generation)
+            return RuntimeResult<CommandStream *>{
+                err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"acquire_command_stream", 0, 0}})};
+        if (auto resumed = stream_.resume(); resumed.isErr())
+            return RuntimeResult<CommandStream *>{err(std::move(resumed).error())};
+        return RuntimeResult<CommandStream *>{ok(&stream_)};
+    }
+    auto provider = referenceBackendCommandEncoder(context_, encoder);
+    if (provider.isErr())
+        return RuntimeResult<CommandStream *>{err(std::move(provider).error())};
+    auto begun = beginCommandStream(context_, provider.value());
+    if (begun.isErr())
+        return RuntimeResult<CommandStream *>{err(std::move(begun).error())};
+    stream_ = std::move(begun).value();
+    encoder_ = encoder;
+    return RuntimeResult<CommandStream *>{ok(&stream_)};
+}
+
+VernonRhiStatus EncoderCommandStream::finish(void *opaque, VernonRhiCommandEncoder) {
+    CommandStream &stream = static_cast<EncoderCommandStream *>(opaque)->stream_;
+    if (!stream)
+        return VERNON_RHI_STATUS_OK;
+    auto ended = stream.end();
+    return ended.isOk() ? VERNON_RHI_STATUS_OK : toVernonRhiStatus(std::move(ended).error());
 }
 
 RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,

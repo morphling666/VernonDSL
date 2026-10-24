@@ -78,6 +78,8 @@ struct GraphicsStream {
     const VernonGraphicsState *graphicsState{};
     std::vector<uint32_t> vertexStrides;
     std::vector<uint32_t> nextVertexStrides;
+    // The vertex buffers of the command being encoded, by vertex binding.
+    std::vector<VernonRuntimeProviderResourceReference> vertexBuffers;
 };
 
 using DescribeImageResource = VernonStatus (*)(void *userData, VernonRuntimeProviderResourceReference resource,

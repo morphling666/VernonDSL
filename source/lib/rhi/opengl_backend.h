@@ -4,6 +4,8 @@
 #include "VernonRHI.h"
 #include "opengl_driver.h"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -41,6 +43,26 @@ struct Image {
 struct Sampler {
     Uint name{};
     bool imported{};
+};
+
+// The texture names a rendering scope attaches, by color location; `stencil` attaches `depth` at the depth-stencil
+// point.
+struct FramebufferAttachments {
+    std::array<Uint, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
+    Uint depth{};
+    bool stencil{};
+
+    bool operator==(const FramebufferAttachments &other) const {
+        return colors == other.colors && depth == other.depth && stencil == other.stencil;
+    }
+    bool attaches(Uint texture) const {
+        return depth == texture || std::find(colors.begin(), colors.end(), texture) != colors.end();
+    }
+};
+
+struct AttachmentFramebuffer {
+    FramebufferAttachments attachments;
+    Uint name{};
 };
 
 enum class DepthStencilAspect { Depth, Stencil };
@@ -90,6 +112,7 @@ struct VERNON_RHI_CAPI DeviceState {
     void destroyVertexArray(Uint vertexArray);
     bool createFramebuffer(Uint &framebuffer, std::string &error);
     void destroyFramebuffer(Uint framebuffer);
+    void destroyAttachmentFramebuffers();
 
     // No-ops without debug labels. A push beyond the context's group stack limit is skipped, and so is its pop, so
     // that labels never raise a GL error. Labels are cut to the context's message length.
@@ -101,7 +124,9 @@ struct VERNON_RHI_CAPI DeviceState {
     VernonOpenGLContextCallbacks callbacks{};
     bool embeddedProfile{};
     std::vector<std::string> extensions;
-    uint64_t framebufferGeneration{};
+    // A complete framebuffer per attachment set that a rendering scope used. Deleting a texture destroys the
+    // framebuffers attaching it: GL may reuse its name, and a framebuffer that is not bound keeps it alive.
+    std::vector<AttachmentFramebuffer> attachmentFramebuffers;
     // Advances whenever the RHI changes state that draws set (the bound framebuffer, write masks and scissor), so that
     // adapters caching draw state reapply it.
     uint64_t drawStateGeneration{};

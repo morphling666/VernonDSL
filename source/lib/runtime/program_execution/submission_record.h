@@ -15,7 +15,7 @@
 struct VernonRuntimeContext;
 
 namespace vernon::execution::detail {
-struct RhiCommandExecutionPlan;
+class ValidatedRhiCommandPlan;
 struct CommandScope;
 } // namespace vernon::execution::detail
 
@@ -39,7 +39,7 @@ public:
 
     bool asynchronous() const noexcept { return mode_ == CompletionMode::Asynchronous; }
 
-    VernonStatus submit(execution::detail::RhiCommandExecutionPlan plan);
+    VernonStatus submit(execution::detail::ValidatedRhiCommandPlan plan);
     // Takes ownership of a finished encoder, and destroys it when the device rejects it.
     VernonRhiStatus submit(VernonRhiCommandEncoder encoder);
     // Keeps `object` alive until every completion of the record has finished.
@@ -51,7 +51,7 @@ public:
     // Submits `plan`, and in WAIT mode waits for it. `step` reports how far the plan got: NotSubmitted when the device
     // never accepted it, Submitted when it was queued without a wait, Indeterminate when it was submitted but did not
     // complete successfully, Completed otherwise.
-    VernonStatus execute(execution::detail::RhiCommandExecutionPlan plan, SubmissionState &step);
+    VernonStatus execute(execution::detail::ValidatedRhiCommandPlan plan, SubmissionState &step);
     // PENDING until every submitted completion has finished.
     VernonStatus poll(VernonSubmissionState &output);
     // `output` is null while any completion is pending.

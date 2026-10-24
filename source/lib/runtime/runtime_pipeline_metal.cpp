@@ -232,14 +232,17 @@ VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline, Vernon
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                        GroupStore &transient, const PlannedComputeLaunch &launch,
                                         const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalCompute,
-                                    pipeline.bindingProjection, launch, owners,
+                                    pipeline.bindingProjection, commands, transient, launch, owners,
                                     runtimeBackendState<MetalPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
+    (void)commands;
+    (void)transient;
     (void)launch;
     (void)owners;
     return VERNON_STATUS_UNSUPPORTED_TARGET;

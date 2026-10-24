@@ -813,7 +813,7 @@ Result<uint64_t, RhiError> getImageNativeHandle(VernonRhiDevice handle, VernonRh
         return Result<uint64_t, RhiError>{err(std::move(anchor).error())};
     MetalDevice &device = anchor.value().device();
     auto pinned =
-        pinPayload(device, device.images, ImageHandle{image.index, image.generation},         "get_image_native_handle");
+        pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "get_image_native_handle");
     if (pinned.isErr())
         return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
     std::lock_guard<std::mutex> guard(device.mutex);
@@ -1283,7 +1283,8 @@ MTLClearColor metalClearColor(const VernonClearColor &color, VernonRhiFormat for
 
 // Passes are created with MTLStoreActionUnknown so that ending the scope, or restarting it for a clear, chooses the
 // store actions.
-id<MTLRenderCommandEncoder> beginMetalPass(uint64_t native, MTLRenderPassDescriptor *pass, const RenderingScope &scope) {
+id<MTLRenderCommandEncoder> beginMetalPass(uint64_t native, MTLRenderPassDescriptor *pass,
+                                           const RenderingScope &scope) {
     if (scope.layers > 1)
         pass.renderTargetArrayLength = scope.layers;
     id<MTLCommandBuffer> commandBuffer =
@@ -1295,9 +1296,9 @@ void endMetalPass(const vernon::rhi::metal::RenderingState &rendering, const Ren
     for (size_t index = 0; index < scope.colorCount; ++index) {
         const uint32_t location = scope.colors[index].location;
         const bool covers = renderAreaCoversMetalTexture(rendering.colorTextures[location], scope);
-        [rendering.encoder setColorStoreAction:final ? metalStoreAction(scope.colors[index].store, covers)
-                                                     : MTLStoreActionStore
-                                       atIndex:location];
+        [rendering.encoder
+            setColorStoreAction:final ? metalStoreAction(scope.colors[index].store, covers) : MTLStoreActionStore
+                        atIndex:location];
     }
     if (scope.hasDepth) {
         const bool covers = renderAreaCoversMetalTexture(rendering.depthStencilTexture, scope);
@@ -1316,8 +1317,7 @@ void endMetalPass(const vernon::rhi::metal::RenderingState &rendering, const Ren
 // the render area to cover it.
 bool restartMetalRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, const RenderingScope &scope,
                            int32_t colorLocation, const VernonClearColor *clearColor, float clearDepth,
-                           uint32_t clearStencil,
-                           uint32_t aspects) {
+                           uint32_t clearStencil, uint32_t aspects) {
     id<MTLTexture> target = colorLocation >= 0 ? rendering.colorTextures[colorLocation] : rendering.depthStencilTexture;
     if (!rendering.encoder || !target)
         return false;
@@ -1328,14 +1328,16 @@ bool restartMetalRendering(uint64_t native, vernon::rhi::metal::RenderingState &
         const uint32_t location = scope.colors[index].location;
         auto *attachment = pass.colorAttachments[location];
         attachment.texture = rendering.colorTextures[location];
-        attachment.loadAction = static_cast<int32_t>(location) == colorLocation ? MTLLoadActionClear : MTLLoadActionLoad;
+        attachment.loadAction =
+            static_cast<int32_t>(location) == colorLocation ? MTLLoadActionClear : MTLLoadActionLoad;
         attachment.storeAction = MTLStoreActionUnknown;
         if (static_cast<int32_t>(location) == colorLocation)
             attachment.clearColor = metalClearColor(*clearColor, scope.colors[index].format);
     }
     if (scope.hasDepth) {
         pass.depthAttachment.texture = rendering.depthStencilTexture;
-        pass.depthAttachment.loadAction = aspects & VERNON_RHI_ATTACHMENT_DEPTH ? MTLLoadActionClear : MTLLoadActionLoad;
+        pass.depthAttachment.loadAction =
+            aspects & VERNON_RHI_ATTACHMENT_DEPTH ? MTLLoadActionClear : MTLLoadActionLoad;
         pass.depthAttachment.storeAction = MTLStoreActionUnknown;
         pass.depthAttachment.clearDepth = clearDepth;
         if (scope.depth.stencil) {
@@ -1378,8 +1380,9 @@ Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_
                     const auto &attachment = scope.colors[index];
                     auto *target = pass.colorAttachments[attachment.location];
                     if (!metalLoadAction(attachment.load, covers, load))
-                        return Result<OpenedRendering, RhiError>{err(RhiError{
-                            RhiErrorCode::Unsupported, {"beginRendering_metal_partial_clear", attachment.location, 0}})};
+                        return Result<OpenedRendering, RhiError>{
+                            err(RhiError{RhiErrorCode::Unsupported,
+                                         {"beginRendering_metal_partial_clear", attachment.location, 0}})};
                     target.texture = texture;
                     target.loadAction = load;
                     target.storeAction = MTLStoreActionUnknown;
@@ -1454,9 +1457,9 @@ Result<void, RhiError> recordDebugCommand(VernonRhiDevice handle, uint64_t nativ
             auto anchor = lookupMetalDevice(handle);
             if (anchor.isErr())
                 return Result<void, RhiError>{err(std::move(anchor).error())};
-            auto *rendering = opened ? reinterpret_cast<vernon::rhi::metal::RenderingState *>(
-                                           static_cast<uintptr_t>(opened->object))
-                                     : nullptr;
+            auto *rendering =
+                opened ? reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(opened->object))
+                       : nullptr;
             if (!native || (opened && (opened->kind != vernon::rhi::CommandRenderingDynamic || !rendering)))
                 return Result<void, RhiError>{
                     err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command_metal", native, 0}})};
@@ -1514,9 +1517,9 @@ id<MTLCounterSet> metalTimestampCounterSet(id<MTLDevice> device) {
 uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
     constexpr uint32_t capabilities = BackendCommandIndependentRecording | BackendCommandConcurrentSubmission;
     auto anchor = lookupMetalDevice(handle);
-    return anchor.isOk() && metalTimestampCounterSet(anchor.value().device().state.device) ? capabilities |
-                                                                                                BackendCommandTimers
-                                                                                          : capabilities;
+    return anchor.isOk() && metalTimestampCounterSet(anchor.value().device().state.device)
+               ? capabilities | BackendCommandTimers
+               : capabilities;
 }
 
 // Metal samples counters only where an encoder starts or ends, so each timer edge records an empty blit encoder
@@ -1718,6 +1721,44 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Result<CommandTransient, RhiError>{ok(reserved.value().transient)};
 }
 
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Placed{err(std::move(anchor).error())};
+            MetalDevice &device = anchor.value().device();
+            std::lock_guard<std::mutex> guard(device.mutex);
+            id<MTLBuffer> buffer;
+            size_t offset{};
+            uint64_t key{};
+            if (!device.state.reservePersistent(static_cast<size_t>(size), static_cast<size_t>(alignment), buffer,
+                                                offset, key, device.error))
+                return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_metal_persistent", size, 0}})};
+            uint8_t *mapped = static_cast<uint8_t *>(buffer.contents) + offset;
+            if (data)
+                std::memcpy(mapped, data, static_cast<size_t>(size));
+            return Placed{ok(PersistentBlock{
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)buffer)), offset, mapped, key})};
+        } catch (const std::bad_alloc &) {
+            return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_metal_persistent", size, 0}})};
+        }
+    } @catch (NSException *) {
+        return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_metal_persistent_exception", size, 0}})};
+    }
+}
+
+void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return;
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.releasePersistent(key);
+}
+
 Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
     @try {
         auto anchor = lookupMetalDevice(handle);
@@ -1846,6 +1887,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.recordImageCopy.emplace(recordImageCopy);
         result.writeTransient.emplace(writeTransient);
         result.reserveTransient.emplace(reserveTransient);
+        result.placePersistent.emplace(placePersistent);
+        result.releasePersistent.emplace(releasePersistent);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

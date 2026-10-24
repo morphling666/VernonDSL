@@ -2261,6 +2261,37 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Result<CommandTransient, RhiError>{ok(CommandTransient{reinterpret_cast<uint64_t>(upload), offset})};
 }
 
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupDirectX12Device(handle);
+    if (!device || !size || !alignment || (alignment & (alignment - 1)) != 0 ||
+        size > (std::numeric_limits<size_t>::max)() || alignment > (std::numeric_limits<size_t>::max)())
+        return Placed{err(RhiError{RhiErrorCode::InvalidArgument, {"place_directx12_persistent", size, 0}})};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ID3D12Resource *resource{};
+    size_t offset{};
+    uint8_t *mapped{};
+    uint64_t key{};
+    try {
+        if (!device->state.placePersistent(static_cast<size_t>(size), static_cast<size_t>(alignment), resource, offset,
+                                           mapped, key, device->error))
+            return Placed{err(backendFailure("place_directx12_persistent", size))};
+    } catch (const std::bad_alloc &) {
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_directx12_persistent", size, 0}})};
+    }
+    if (data)
+        std::memcpy(mapped, data, static_cast<size_t>(size));
+    return Placed{ok(PersistentBlock{reinterpret_cast<uint64_t>(resource), offset, mapped, key})};
+}
+
+void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.releasePersistent(key);
+    }
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
                                        VernonRhiImage source, VernonRhiImage destination,
                                        const VernonRhiImageCopyRegion *regions, size_t regionCount) noexcept {
@@ -2954,6 +2985,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.writeTransient.emplace(writeTransient);
+        result.placePersistent.emplace(placePersistent);
+        result.releasePersistent.emplace(releasePersistent);
         result.recordImageCopy.emplace(recordImageCopy);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);

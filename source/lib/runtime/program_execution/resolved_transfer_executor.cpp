@@ -124,10 +124,10 @@ bool ResolvedTransferExecutor::prepareGraph(program::GraphDirection graph, std::
     return true;
 }
 
-VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
+VernonStatus ResolvedTransferExecutor::planBeforeConsumer(
     program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
-    vernon::execution::detail::RhiCommandExecutionPlan &commands, bool &commandsAppended, std::string &error) {
-    commandsAppended = false;
+    std::vector<vernon::execution::detail::RhiCommandExecutionPlan> &fragments) {
+    fragments.clear();
     if (!prepared_ || consumer.graph != preparedGraph_)
         return VERNON_STATUS_INVALID_ARGUMENT;
     const bool plannedConsumer = std::any_of(state_.plan_->transfers.edges.begin(), state_.plan_->transfers.edges.end(),
@@ -156,11 +156,8 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
         buildBufferTransferCommandPlan(context_, appendInitial ? initialCopies_ : physicalCopies, uploads, transfers);
     if (status != VERNON_STATUS_OK)
         return status;
-    if (!transfers.commands.nodes.empty()) {
-        if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(transfers), true, error))
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        commandsAppended = true;
-    }
+    if (!transfers.commands.nodes.empty())
+        fragments.push_back(std::move(transfers));
     if (appendInitial)
         initialCopiesPending_ = false;
     if (appendInitial && !physicalCopies.empty()) {
@@ -168,11 +165,8 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
         const VernonStatus physicalStatus = buildBufferTransferCommandPlan(context_, physicalCopies, {}, physical);
         if (physicalStatus != VERNON_STATUS_OK)
             return physicalStatus;
-        if (!physical.commands.nodes.empty()) {
-            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(physical), true, error))
-                return VERNON_STATUS_INVALID_ARGUMENT;
-            commandsAppended = true;
-        }
+        if (!physical.commands.nodes.empty())
+            fragments.push_back(std::move(physical));
     }
     return VERNON_STATUS_OK;
 }
@@ -216,14 +210,15 @@ bool ResolvedTransferExecutor::restoreForRetry(program::GraphDirection graph, Su
         }
         restored.push_back(destination.get());
     }
-    vernon::execution::detail::RhiCommandExecutionPlan plan;
-    const VernonStatus built = buildBufferTransferCommandPlan(context_, copies, uploads, plan);
+    vernon::execution::detail::RhiCommandExecutionPlan restoration;
+    const VernonStatus built = buildBufferTransferCommandPlan(context_, copies, uploads, restoration);
     if (built != VERNON_STATUS_OK)
         return error = "Program invocation cannot build retry restoration", false;
-    if (plan.commands.nodes.empty())
-        return true;
-    if (!vernon::execution::detail::validateRhiCommandExecutionPlan(plan, error))
+    vernon::execution::detail::ValidatedRhiCommandPlan plan;
+    if (!plan.append(std::move(restoration), error))
         return false;
+    if (plan.empty())
+        return true;
     SubmissionState step;
     return submission.execute(std::move(plan), step) == VERNON_STATUS_OK;
 }

@@ -31,9 +31,8 @@ the layout size times the command count, not to what changed.
 ## 2. Principles
 
 1. **Bind by update frequency.** Bindings are partitioned into groups that
-   change together: what the pass or invocation fixes, and each top-level
-   binding-group occurrence, which is how sources already express per-object
-   and per-material data.
+   change together. The source states the partition: each leaf's `set` is its
+   group (section 3).
 2. **Bindings are encoder state.** A command stream binds a pipeline, binds
    groups, and dispatches or draws. Bound state is sticky, as on every native
    API.
@@ -43,14 +42,89 @@ the layout size times the command count, not to what changed.
 4. **Per-command work is proportional to what changed.** A command that
    changes nothing binds nothing, validates nothing, and retains nothing.
 
-## 3. Groups (compiler)
+## 3. Parameters, placement and groups (language and compiler)
 
-- A Stage layout has group 0, holding the ungrouped endpoints and the
-  values the Runtime derives (resolution), and group `k + 1` for top-level
-  binding-group occurrence `k` in declaration order. Each group owns its own
-  TensorView metadata carrier per module, so no carrier mixes groups. This
-  replaces "all ranges are in descriptor set 0" in
-  [`../language/contract.md`](../language/contract.md) section 6.4.
+### 3.1 `@vd.params`
+
+`@vd.params` replaces `@vd.binding_group`. A params class has no physical
+meaning: an entry parameter of a params type is exactly its leaves, declared
+in field order under their dotted paths. Packing and partitioning never look
+at the class.
+
+```python
+@vd.params
+class Geometry:
+    position: Annotated[Vec3, vd.attribute(location=0)]
+    normal: Annotated[Vec3, vd.attribute(location=1)]
+    palette: Annotated[TensorView[Mat4, 1], vd.resource(set=2)]
+    model: Annotated[Mat4, vd.uniform(set=2)]
+```
+
+- A field takes every annotation an entry parameter of its type takes:
+  `attribute`, `builtin`, `varying`, `uniform` and `resource`, with their
+  locations and placement. Placement is written on fields, so a params
+  class places its leaves the same way wherever it is used.
+- A params parameter is valid in a stage when each of its leaves would be
+  valid there as a parameter: a class with an `attribute` leaf only in a
+  vertex stage, one with a `varying` leaf only in a fragment stage, one
+  with a `builtin` leaf where that builtin is an input.
+- A params-typed parameter takes no annotation at its use site except
+  `When[condition, T]`, which enables or disables all of its leaves; any
+  other fails with `params parameter cannot declare`.
+- Pinned leaves (section 3.2) of two occurrences of one class claim the same
+  bindings or locations and fail as two parameters would. Unpinned leaves
+  never conflict.
+- The rest of [`../language/contract.md`](../language/contract.md) section
+  6.4 is unchanged: a params value is not a Value, helpers and methods take
+  it, and autodiff treats it leaf by leaf.
+
+### 3.2 Placement
+
+Placement is per leaf, in every stage kind, Kernels included:
+
+| Annotation | Placement |
+|---|---|
+| `uniform(set=None, binding=None)` | a by-value leaf |
+| `resource(set=None, binding=None)` | a TensorView, Texture or Sampler leaf |
+
+`attribute(location=None, divisor=0)` is unchanged. A vertex attribute is a
+vertex-input location, as on every native API, and belongs to no group
+(section 3.3).
+
+- `set` is the leaf's group, its update-frequency partition. A leaf without
+  `set` is in group 0, as are the values the Runtime derives (resolution).
+- `binding` pins a leaf to that binding of its group. It exists for
+  interoperation with authored native layouts; the compiler assigns every
+  unpinned binding after reserving the pinned ones. A pinned by-value leaf
+  keeps a uniform block of its own and is not packed.
+- Only what the source states reaches MLIR: `vernon.set` when `set` is
+  written and `vernon.binding` when `binding` is written. The compiler maps
+  whatever is missing. Its current mapping puts a leaf without `set` in set 0
+  and assigns every unpinned binding at the pipeline link; a smarter
+  heuristic may replace it without a source change. A `vernon.binding`
+  without `vernon.set` is in set 0. No attribute names a group: the group is
+  the set.
+- A graphics TensorView cannot take `binding`: it spans one binding per
+  storage leaf plus the metadata carrier.
+- A Kernel Value parameter is by-value without `uniform()`; `uniform(set=...)`
+  only places it. This replaces "Kernel Resources bind in argument order"
+  in [`../language/contract.md`](../language/contract.md) section 6. Kernel
+  placement lands with packing (section 3.4), which rebuilds the Kernel
+  layout per group; until then a Kernel leaf with `set` or `binding` fails
+  with `kernel parameters bind in argument order`.
+- The same leaf in two stages of a pipeline has one placement; authored
+  placements that differ fail at the pipeline link.
+
+### 3.3 Groups
+
+- A Stage layout has one group per `set` index its leaves use, and empty
+  layouts for unused indices below the highest. No group is made or bound
+  at an empty index: no native API binds a set the shaders never read, and
+  a convention such as pass, object, geometry, material leaves holes for
+  the Stages that skip a frequency. Each group owns its
+  TensorView metadata carrier per module, so no carrier mixes groups. The
+  carrier split lands with packing; until then one carrier per module sits
+  in set 0.
 - Set-based targets place group `g` in descriptor set `g` (Vulkan), root
   descriptor table `g` (D3D12) and argument buffer `g` (Metal). OpenGL, CUDA
   and CPU keep flat bindings and record the group of every binding. A Stage
@@ -60,37 +134,50 @@ the layout size times the command count, not to what changed.
   stages, and value layout. Two Stages with equal group layouts at the same
   index are compatible at that index, which is what keeps a bound group
   valid across a pipeline switch.
-- Vertex buffers are group entries but bind as vertex inputs, with their
-  stride in the graphics variant key on every backend. An ungrouped
-  attribute is an entry of group 0; an attribute leaf of a vertex group
-  (`../language/contract.md` section 6.4) is an entry of that group, so a
-  set covering the group binds the draw's vertex buffers with the rest of
-  its geometry in one persistent group. Vertex-buffer slots (Vulkan and
-  D3D12 bindings, Metal buffer indices, OpenGL attribute bindings) are
-  numbered across the pipeline in entry order, so a group's slots are
-  fixed by its pipeline layout like its descriptor bindings. Vulkan 1.1 fixes
-  strides at pipeline creation and dynamic stride needs 1.3 or
-  `VK_EXT_extended_dynamic_state`; one rule on every backend keeps Vulkan 1.1
-  supported. A stride change selects another variant, made once; it never
-  rebinds the groups, whose layouts do not include strides.
+- Vertex inputs belong to no group. They are the pipeline's vertex-input
+  state, bound by slot as every native API binds them
+  (`vkCmdBindVertexBuffers`, `IASetVertexBuffers`, `setVertexBuffer`,
+  `glBindVertexBuffer`), with their stride in the graphics variant key on
+  every backend. Vertex-buffer bindings are numbered from 0 across the
+  pipeline, at most 16 (`VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS`), and
+  at most 15 on Metal, which maps binding `b` to buffer index `16 + b` so
+  that indices below 16 stay with the groups. Each binding carries its
+  instance divisor in the pipeline layout. Vulkan 1.1 fixes strides at
+  pipeline creation and dynamic stride needs 1.3 or
+  `VK_EXT_extended_dynamic_state`; one rule on every backend keeps Vulkan
+  1.1 supported. A stride change selects another variant, made once; it
+  never rebinds groups or vertex inputs. A base pipeline has no strides, and
+  RuntimeCore rejects a variant without a nonzero stride for every binding.
 - Implicit samplers belong to the group of the sampled image they pair with.
-  A group leaf stays an endpoint of every Stage that declares the group, so
-  a sampled Texture leaf a Stage never reads still binds there; pairing is
+  A params leaf stays an endpoint of every Stage that declares its
+  parameter, so a sampled Texture leaf a Stage never reads still binds
+  there; pairing is
   per Program ([`../program/integer_targets.md`](../program/integer_targets.md)
   section 4): the leaf gets an implicit sampler unless another Stage of the
   pipeline reads it, which pairs it in that Stage.
-- A binding group is only a combination of flattened leaves: each leaf is
-  the endpoint it would be ungrouped, placed in its group. A by-value leaf
-  therefore spills to its own uniform buffer in the group's set, as an
-  ungrouped value that cannot stay inline does; push constants and native
-  uniforms belong to the pipeline, so they stay group 0's. The group object
-  holds the spilled data: a persistent group uploads it when it is made, and
-  a transient group writes it to its encoder's transient memory. CUDA and CPU
-  pass the leaves as parameters of the group's fragment.
-- Packing several spilled values into one buffer is a separate, later design
-  that applies to every set, group 0 included. Until it lands, each spilled
-  leaf costs a binding: OpenGL and OpenGL ES guarantee 12 uniform blocks per
-  stage, and D3D12 sizes each constant buffer in 256-byte steps.
+
+### 3.4 Packing
+
+The compiler packs by-value leaves; the host never chooses where a value
+lives.
+
+- Push constants, root constants and native uniforms belong to the
+  pipeline, so only group 0 uses them: group 0's unpinned by-value leaves
+  stay there in flattened declaration order while they fit the target's
+  inline budget.
+- Every other unpinned by-value leaf of a group, in group 0 the ones that
+  did not fit, packs into one uniform block per group, shared by the
+  pipeline's stages like a binding (pipeline link,
+  [`../program/graphics_storage_reads.md`](../program/graphics_storage_reads.md)
+  section 3). Leaves are laid out in flattened declaration order under the
+  target's uniform-block rules; a leaf only one stage reads keeps its offset
+  in both.
+- Reflection reports each packed leaf's block and byte offset, and its
+  group's block size. A persistent group holds its block in one buffer, a
+  transient group in one range of its encoder's transient memory, so a group
+  costs at most one uniform binding and one dynamic offset for its values.
+- CUDA and CPU pass a group's by-value leaves as its parameter fragment,
+  laid out by the same rule.
 
 ## 4. Group objects (Runtime)
 
@@ -99,15 +186,19 @@ the layout size times the command count, not to what changed.
 | Sealed binding set covering one group | persistent | at its first match with a pipeline, per distinct group layout | the set |
 | Program instance values of a Node's group | persistent | when a binding token of one of the group's parameters changes | the instance |
 | Values fixed for one invocation (pass values, resolution after `set_viewport`) | transient | at invocation encode | the command encoder |
-| Sets that together cover one group in a recording | composite, transient | once per distinct combination in the invocation | the command encoder |
 
 - A persistent group retains its resources once, when it is made. Binding it
   retains the group object for the command encoder; the RHI deduplicates per
   encoder, so a group bound by many commands is retained once.
-- A set normally covers exactly one group, and one set serves every pipeline
-  whose group layout at that index is equal. A set that covers part of a
-  group or several groups stays valid (`recorded_draws.md` section 6) through
-  composite groups.
+- A set covers at most one group of each pipeline it matches, plus any
+  vertex inputs: it binds every per-draw leaf of that group and no leaf of
+  another group, and one set serves every pipeline whose group layout at
+  that index is equal. A match that covers part of a group or several
+  groups fails with `PROGRAM_BINDING_SET_MISMATCH`. A set's vertex inputs
+  are lowered with it (buffers, offsets, strides) and bound as vertex-input
+  state, not through its group. A group that holds both per-draw and fixed
+  endpoints fails pipeline conformance (`PROGRAM_PIPELINE_CONFORMANCE`),
+  because no set could cover it; fixed endpoints belong in group 0.
 - Standalone invocations that rebind nothing reuse every persistent group,
   so a post-processing Node invoked each frame with unchanged arguments makes
   no group at all after its first frame.
@@ -120,6 +211,7 @@ Every Node lowers to a stream on its command encoder:
 |---|---|
 | `bind pipeline` | compute pipeline or graphics variant |
 | `bind group` | group index and group object |
+| `bind vertex buffers` | first binding and buffer references, each with its offset |
 | `set dynamic state` | viewport, scissor, stencil reference, index buffer |
 | `dispatch` / `draw` | counts only |
 
@@ -128,15 +220,29 @@ Every Node lowers to a stream on its command encoder:
   one-command stream.
 - Group `g` stays bound across a pipeline switch when the two layouts are
   equal at `g`; otherwise the Runtime binds the object made for the new
-  layout. Per-parameter stickiness of recordings follows from groups: a set
-  whose group layouts correspond stays bound, as section 7 of
-  `recorded_draws.md` requires.
+  layout. A vertex input stays bound at its slot when the new pipeline's
+  input there has the same format. Stickiness of recordings follows: a
+  set whose group layouts and vertex formats correspond stays bound.
 - Each command validates only what it changes: `bind group` checks layout
-  compatibility at that index; `dispatch` or `draw` checks that every group of
-  the bound pipeline is bound.
+  compatibility at that index; `dispatch` or `draw` checks that every group
+  and vertex input of the bound pipeline is bound.
 - The stream is built at invocation entry by the existing recording
-  validation walk; draw counts of 0 are inferred from the vertex-input leading
-  dimensions recorded on the bound groups.
+  validation walk; draw counts of 0 are inferred from the leading
+  dimensions of the bound vertex inputs.
+- An encoder carries one stream, shared by every Node of the submitted plan
+  that encodes on it: graphics batches, compute and derivative Nodes. Its
+  transient groups live as long as the stream, so Nodes sharing an owner
+  identity share one group, and a pipeline or group the previous Node left
+  bound is not bound again.
+- The plan records barriers, copies, timers and debug groups on the native
+  encoder between Nodes. The stream is therefore a sequence of segments: the
+  first Node to encode begins it, and every later Node resumes it, so the
+  provider reapplies only the native state those commands may have changed
+  (section 8). A segment boundary never falls inside a rendering scope.
+- The plan ends the stream with a finisher that runs once after its last Node
+  and before the encoder finishes, also when a Node failed, so no stream
+  outlives its encoder. A standalone Stage invocation and a CPU Node, which
+  have no plan, begin and end their own stream.
 
 ## 6. Work by frequency
 
@@ -185,9 +291,10 @@ of its slots' owners, never by its values:
 
 **Lowering an owner** happens when its group is made. It validates the
 owner's arguments against the parameters, describes its images, fills and
-packs its slots, and records on the group what later commands read: the
-leading dimensions and strides of its vertex inputs, the buffer accesses
-it adds to the Node, and the images it samples. A sealed set's matched
+packs its slots, and records what later commands read: on the owner, the
+buffers, offsets, leading dimensions and strides of its vertex inputs; on
+the group, the buffer accesses it adds to the Node and the images it
+samples. A sealed set's matched
 argument frame is lowered once per match and reused by every invocation; a
 match whose arguments need a Runtime carrier is materialized per invocation
 instead.
@@ -196,11 +303,11 @@ instead.
 recording validation: a set's hazard check and frame run once per distinct
 set in the invocation, and render targets, attachment formats and the
 default viewport once per scope. A command holds its pipeline or variant,
-its group objects per index, its dynamic state and its counts. The encoder
-binds a pipeline, variant or group only when it differs from the bound one;
-the variant is chosen from the pipeline and the vertex strides recorded on
-the bound groups, and draw counts of 0 are inferred from their vertex
-leading dimensions.
+its group objects per index, its vertex inputs, its dynamic state and its
+counts. The encoder binds a pipeline, variant, group or vertex input only
+when it differs from the bound one; the variant is chosen from the pipeline
+and the strides of the bound vertex inputs, and draw counts of 0 are
+inferred from their leading dimensions.
 
 ## 7. RuntimeCore
 
@@ -213,12 +320,20 @@ vernonRuntimeCoreCreateGroup(group_layout, values, value_count, lifetime, &group
 vernonRuntimeCoreBeginCommands(provider, command_encoder, &commands);
 vernonRuntimeCoreBindPipeline(commands, pipeline_or_variant);
 vernonRuntimeCoreBindGroup(commands, index, group);
+vernonRuntimeCoreBindVertexBuffers(commands, first_binding, buffers, count);
 vernonRuntimeCoreDispatch(commands, groups);
 vernonRuntimeCoreBeginRendering(commands, rendering);
 vernonRuntimeCoreDraw(commands, draw);
 vernonRuntimeCoreEndRendering(commands);
+vernonRuntimeCoreResumeCommands(commands);
 vernonRuntimeCoreEndCommands(commands);
 ```
+
+`ResumeCommands` starts a segment outside a rendering scope after other
+commands were recorded on the native encoder. The bound pipeline, groups
+and vertex inputs stay bound in RuntimeCore, which therefore still skips binding them again.
+Vertex buffers stay bound across pipeline binds; `BindVertexBuffers`
+forwards only the run of bindings whose buffer changed.
 
 Group objects keep the immutable-revision lifetime of today's binding sets
 ([`design.md`](design.md) section 13): an encoded command pins the group it
@@ -234,13 +349,25 @@ create_group(user_data, group_layout, values, count, lifetime, encoder, &group);
 destroy_group(user_data, group);
 encode_bind_pipeline(user_data, encoder, pipeline);
 encode_bind_group(user_data, encoder, index, group);
+encode_bind_vertex_buffers(user_data, encoder, first_binding, buffers, count);
 encode_dispatch(user_data, encoder, groups[3]);
 encode_draw(user_data, encoder, draw);
+resume_commands(user_data, encoder);
 ```
 
 `lifetime` is persistent or transient; a transient group belongs to
 `encoder`, may use encoder-scoped memory, and is released with it. The
 provider skips native calls whose state is already current.
+
+`resume_commands` reapplies only what the RHI's own commands can change:
+
+| Backend | Reapplied at resume | Why |
+|---|---|---|
+| OpenGL/ES | all cached context state is invalidated | copies, clears and mipmap generation rebind buffers, textures and framebuffers |
+| D3D12 | root signatures, root tables, descriptor heaps and the bound pipeline state | mipmap generation and clears set heaps, a compute root signature and a pipeline state; barriers change the resource states that decide when root tables are rewritten |
+| Vulkan | nothing | the RHI records barriers, copies and debug labels, which change no bound state |
+| Metal | nothing | compute encoders are made per dispatch, and a render encoder change is already tracked |
+| CUDA, CPU | nothing | no native binding state |
 
 Encoder-scoped memory belongs to the RHI recording, not to the adapter. The
 RHI already owns the memory that lives exactly as long as a recording, such
@@ -265,9 +392,7 @@ command frame (`vulkan::allocateCommandDescriptorSet`), made without
 groups neither free sets one by one nor grow the device's pool chain.
 D3D12 serves it from the command frame's upload staging, which stays in
 `GENERIC_READ`; a transient group's constant-buffer and raw-SRV views point
-into it, so the group owns no default-heap buffer and records no copy, while
-a persistent group copies its inline values into its own default-heap
-buffers once per encoder.
+into it, so the group owns no default-heap buffer and records no copy.
 CUDA keeps one device-memory arena for the open recording, since a device
 records one encoder at a time; writes go through the stream's pinned
 staging, and submitting or abandoning the recording retires its chunks
@@ -280,12 +405,33 @@ buffers there; its argument encoders encode into the reserved range, which
 `MTLArgumentEncoder` requires to be an `MTLBuffer`, so a copy-only call
 could not serve them.
 
+A persistent group's memory (its inline values, CUDA host storage, Metal
+argument buffers) comes from blocks of the device's persistent memory,
+which the RHI also owns: `placePersistentBlock(device, bytes, size,
+alignment)` copies the bytes in, or, with null bytes on host-visible
+backends, returns the block's mapped address for the adapter to fill. A
+block takes the power-of-two size class of its size and alignment, at least
+256 bytes, from a 64 KiB chunk (or one block, when larger) that serves only
+that class (`rhi/block_pool.h`). The group holds its blocks and returns them
+when it is destroyed. Binding a group retains it until its encoder
+completes, so no command still reads a returned block, and the next group of
+that class reuses it at once. Remaking a group on every rebind therefore
+copies its bytes and writes its descriptors but makes no native buffer, on
+every backend. The memory is the kind transient memory already uses: D3D12
+upload-heap chunks in `GENERIC_READ`, whose views need no copy or
+transition; Vulkan host-visible, coherent chunks with the uniform and
+storage buffer usages; OpenGL buffers written with `glBufferSubData`, which
+GL orders after the commands that read a reused block; CUDA device memory
+uploaded on the stream that its kernels read on; Metal shared-storage
+buffers. Chunks are kept until the device is destroyed, so the pool holds
+the peak number of live blocks of each class.
+
 | Backend | Group object | `bind group` | Transient memory |
 |---|---|---|---|
-| Vulkan | descriptor set from a pool per group layout | `vkCmdBindDescriptorSets` at set `g`; vertex buffers with `vkCmdBindVertexBuffers` | descriptor pools of the encoder's command frame; RHI transient memory of the encoder |
+| Vulkan | descriptor set from a pool per group layout | `vkCmdBindDescriptorSets` at set `g` | descriptor pools of the encoder's command frame; RHI transient memory of the encoder |
 | D3D12 | descriptor range in a shader-visible heap | `SetGraphicsRootDescriptorTable`/`SetComputeRootDescriptorTable` at table `g` | descriptor rings of the encoder's command frame; RHI transient memory of the encoder |
 | Metal | argument buffer (tier 2) | `setVertexBuffer`/`setFragmentBuffer`/`setBuffer` at index `g`; `useResource` for its resources | RHI transient memory of the encoder, reserved in place |
-| OpenGL/ES | resolved bindings; inline uniform-buffer data in a buffer made with the group | `glBindBufferRange`, texture units, samplers, `glUniform*`, attribute pointers, each only when it differs | RHI transient memory of the encoder |
+| OpenGL/ES | resolved bindings; inline uniform-buffer data in persistent blocks of the device | `glBindBufferRange`, texture units, samplers, `glUniform*`, attribute pointers, each only when it differs | RHI transient memory of the encoder |
 | CUDA | packed parameter fragment | records the fragment | RHI transient memory of the encoder |
 | CPU | packed call-frame fragment | records the fragment | none |
 
@@ -305,8 +451,7 @@ remain behind the adapter's debug option.
   recorded passes, and Node accesses still decide barriers.
 - Autodiff is unchanged: derivative Programs are ordinary Programs and
   lower the same way.
-- Push constants keep their current use; per-draw scalars beyond them are
-  outside this design.
+- Push constants serve group 0 only (section 3.4).
 
 ## 10. Rollout
 
@@ -318,9 +463,11 @@ merges. The executor's per-draw contexts, `RhiGraphicsPipeline::bindings`,
 
 ## 11. Acceptance
 
-1. Groups: a Kernel and a Pipeline with two binding-group parameters report
-   three groups with their own carriers and spilled values on every target, and
-   too many groups fail with `PROGRAM_GRAPHICS_GROUP_SET_LIMIT`.
+1. Groups: a Kernel and a Pipeline whose leaves use sets 0, 1 and 2 report
+   three groups with their own carriers and one packed block each on every
+   target; a params parameter is reflected identically to its leaves
+   declared one by one; too many groups fail with
+   `PROGRAM_GRAPHICS_GROUP_SET_LIMIT`.
 2. A recorded pass with N draws that bind K distinct sets makes K group
    objects once across frames and issues K group binds and N draws; a mock
    driver shows no rebinding of unchanged state on OpenGL and Vulkan.
@@ -334,14 +481,34 @@ merges. The executor's per-draw contexts, `RhiGraphicsPipeline::bindings`,
 
 ## 12. Contract changes
 
-- [`../language/contract.md`](../language/contract.md) section 6.4: group
-  occurrences take their own partition instead of descriptor set 0.
+Status: the specs below describe phases 1 and 2 as implemented. Their parts
+that depend on uniform packing (section 3.4), namely per-set carriers, packed
+by-value leaves and Kernel placement by `set`, and the per-group command
+state of phases 3 to 5, are amended as those phases land. `When[...]` on a
+params parameter's use site is still rejected, unlike section 3.1.
+
+- [`../language/contract.md`](../language/contract.md): section 6 takes
+  `set` and `binding` on every stage kind and drops "Kernel Resources bind
+  in argument order"; section 6.4 becomes `@vd.params` (section 3.1), whose
+  fields take placement and whose leaves follow their own `set` instead of
+  descriptor set 0, and whose fields take every entry annotation, so
+  `binding group field cannot declare` is removed; the
+  vertex group's "one bound group object serves a draw" rationale is
+  dropped, since vertex inputs bind outside groups; section 6.6 and every
+  other spec rename binding groups to params.
+- [`../language/static_specialization.md`](../language/static_specialization.md)
+  section 4: a params class no longer implies its own descriptor set.
 - [`../program/recorded_draws.md`](../program/recorded_draws.md): section 6
-  is implemented by section 3 here; section 8 lowers through section 5;
-  section 13 drops the pending group partitions and the per-parameter native
-  state.
+  is replaced by section 3 here, and a set covers exactly one group
+  (section 4); section 7's per-parameter stickiness becomes per-group;
+  section 8 lowers through section 5; section 13 drops the pending group
+  partitions and the per-parameter native state.
 - [`../program/graphics_storage_reads.md`](../program/graphics_storage_reads.md)
-  sections 2 to 4: carriers per group.
+  sections 2 to 4: carriers per group; the link allocates per group from
+  `set` instead of per occurrence in set 0, and packs by-value leaves
+  (section 3.4).
+- [`../compiler/design.md`](../compiler/design.md): Kernel bindings follow
+  section 3.2 instead of argument order in set 0.
 - [`design.md`](design.md): sections 10 and 13 describe groups and command
   state instead of per-command binding sets.
 - [`reflection_binding_architecture.md`](reflection_binding_architecture.md)
@@ -366,17 +533,55 @@ merges. The executor's per-draw contexts, `RhiGraphicsPipeline::bindings`,
 - **Finding groups by their values**: every command fills, packs and hashes
   all its values to find groups that did not change, which kept per-draw
   work proportional to the layout (39 ms at 1000 boxes).
-- **Push-constant ranges per group** for binding-group values: every group
+- **Push-constant ranges per group** for its by-value leaves: every group
   bind pushes its bytes again, so per-command work grows with the group, and
   all groups share the 128-byte minimum push budget of Vulkan.
-- **A uniform block per binding group** for its by-value leaves: it ties
-  packing to groups, although group 0 spills the same way, and it needs
-  per-leaf block offsets in reflection and multi-parameter packing in the
-  Runtime for groups only. Packing spilled values is a separate design that
-  serves every set alike (section 3).
-- **Binding-group values in group 0**: a set holding material values would
-  make a composite transient group per invocation instead of a persistent
-  one.
+- **A group per top-level binding-group occurrence**: it gives a
+  convenience class physical meaning, so moving a field into or out of a
+  class changes the layout, a class cannot mix frequencies, and packing
+  served groups only, not group 0.
+- **Vertex buffers as group entries** (an earlier form of this design): no
+  native API binds vertex buffers through descriptor sets, tables or
+  argument buffers, so every group bind also issued a vertex-buffer bind
+  outside its object, and attributes would need a `set` that means nothing
+  to their location.
+- **A layout declared on the Pipeline or Kernel, or as a specialization
+  variant**: the partition decides packing and must be known when the
+  module compiles, and a variant multiplies compiled forms for what is a
+  property of each leaf.
+- **Placement at the use site of a params parameter**: it would be a second
+  way to place leaves, beside field annotations, with precedence rules
+  between them.
+- **One spilled uniform buffer per by-value leaf**: each costs a binding;
+  OpenGL and OpenGL ES guarantee 12 uniform blocks per stage, and D3D12
+  sizes each constant buffer in 256-byte steps.
+- **Composite groups** for sets that cover part of a group or several
+  groups: every such recording makes a transient group per invocation, and
+  it keeps a second binding path beside the one-object group.
+- **A stream per Node or per graphics batch**: every Node began and ended its
+  own stream, so it rebound its pipeline and groups, remade transient groups
+  that an earlier Node had made for the same owners, and drained `glGetError`
+  at each begin and end.
+- **Ending the stream at every RHI command instead of resuming it**: correct
+  without a provider callback, but it costs the same as a stream per Node,
+  since the plan records a barrier or debug group between almost every pair
+  of Nodes.
+- **A native buffer per persistent group**: a uniform rebound every frame
+  remakes its group, so every frame created a buffer on every backend, and
+  D3D12 also copied the group's default-heap buffer once per encoder.
+- **Persistent blocks bumped out of staging-pool arenas**
+  (`rhi/staging_pool.h`): an arena retires whole chunks at once, so one
+  long-lived group pins its chunk, and the blocks of short-lived groups
+  around it are never reused.
+- **Treating host values as invocation-owned**, so that groups holding only
+  host values are transient: it loses "a Node invoked with unchanged
+  arguments makes no group" and re-uploads unchanged uniforms on every
+  invocation.
+
+Future: [`stored_plans.md`](stored_plans.md) keeps a plan whose structure is
+unchanged between Executes and replays its commands with patched payload,
+without retained command buffers. It changes the group identity of instance
+bindings (section 6) from the payload to the binding's structure.
 
 Outside this design: Vernon's scene synchronization (about 13% of host time
 in the benchmark).

@@ -46,25 +46,25 @@ class BoundarySelection:
     def canonical_key(self) -> tuple[str, ...]:
         return tuple(sorted(self.ordered_paths))
 
-    def expand_binding_groups(self, annotations: Mapping[str, Any], *, role: str) -> BoundarySelection:
-        """Replaces each path that names a binding group with that group's leaves for `role`, in field order.
+    def expand_params(self, annotations: Mapping[str, Any], *, role: str) -> BoundarySelection:
+        """Replaces each path that names a params class with its leaves for `role`, in field order.
 
         `wrt` selects every differentiable leaf, `outputs` every writable floating TensorView. Expansion runs before
         the paths become the transform identity, so cotangents and cooked manifests see only leaf paths. Paths that
         do not name a group are kept for the compiler to validate.
         """
-        from .binding_groups import binding_group_at
+        from ._params import params_at
 
         expanded: dict[str, None] = {}
         for path in self.ordered_paths:
-            group = binding_group_at(annotations, path)
+            group = params_at(annotations, path)
             if group is None:
                 expanded[path] = None
                 continue
             leaves = tuple(_group_vjp_leaves(path, group, role))
             if not leaves:
                 kind = "differentiable" if role == "wrt" else "writable floating TensorView"
-                raise ValueError(f"VJP {role} path {path!r} names a binding group with no {kind} leaves")
+                raise ValueError(f"VJP {role} path {path!r} names params with no {kind} leaves")
             expanded.update(dict.fromkeys(leaves))
         return BoundarySelection(tuple(expanded))
 
@@ -82,12 +82,12 @@ def _tangent_leaf_paths(path: str, schema: Any) -> Iterator[str]:
 
 
 def _group_vjp_leaves(path: str, group: type[Any], role: str) -> Iterator[str]:
-    from .binding_groups import binding_group_leaf_annotations
+    from ._params import params_leaf_annotations
     from .frontend.model import SemanticCategory
     from .frontend.runtime_types import runtime_parameter_category, storage_parameter_constraint
     from .host_values import TangentZero, tangent_schema
 
-    for leaf, annotation in binding_group_leaf_annotations(path, group):
+    for leaf, annotation in params_leaf_annotations(path, group):
         storage = storage_parameter_constraint(annotation)
         if storage is not None:
             writable = storage.access in {"write", "read_write"}
@@ -152,7 +152,7 @@ class ProgramTransformSpec:
 class ProgramExpression:
     """A VJP over one Kernel or Pipeline, keeping `wrt` and `outputs` as written.
 
-    A path that names a binding group expands per specialization key, because a type specialization decides which
+    A path that names params expands per specialization key, because a type specialization decides which
     group, and therefore which leaves, a parameter has. Construction expands against the empty key so a selection
     that no key could satisfy fails at declaration.
     """
@@ -181,9 +181,9 @@ class ProgramExpression:
         )
         return ProgramTransformSpec(
             "vjp",
-            self.wrt.expand_binding_groups(annotations, role="wrt").canonical_key,
+            self.wrt.expand_params(annotations, role="wrt").canonical_key,
             output_cotangents=(
-                self.outputs.expand_binding_groups(annotations, role="outputs").canonical_key
+                self.outputs.expand_params(annotations, role="outputs").canonical_key
                 if self.outputs is not None
                 else ()
             ),
@@ -218,7 +218,7 @@ def vjp(
         annotations = type(program)._module_definition.resolved_annotations
         return ModuleVjpExpression(
             program,
-            wrt=BoundarySelection.create(wrt, label="wrt").expand_binding_groups(annotations, role="wrt").ordered_paths,
+            wrt=BoundarySelection.create(wrt, label="wrt").expand_params(annotations, role="wrt").ordered_paths,
             outputs=(BoundarySelection.create(outputs, label="outputs").ordered_paths if outputs is not None else None),
             planning_policy=planning_policy,
         )

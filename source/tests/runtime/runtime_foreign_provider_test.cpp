@@ -26,12 +26,15 @@ struct MockProvider {
     uint32_t dispatches{};
     uint32_t commandBegins{};
     uint32_t commandEnds{};
+    uint32_t commandResumes{};
     VernonRuntimeProviderObject lastEncoder{};
     VernonRuntimeProviderGroupLifetime lastGroupLifetime{};
     VernonRuntimeProviderDispatchDescriptor lastDispatch{};
     VernonRuntimeProviderDrawDescriptor lastDraw{};
     // The index and group of every encode_bind_group, in order.
     std::vector<std::pair<uint32_t, uint64_t>> groupBinds;
+    // The first binding and the buffer objects of every encode_bind_vertex_buffers, in order.
+    std::vector<std::pair<uint32_t, std::vector<uint64_t>>> vertexBufferBinds;
     uint32_t renderingBegins{};
     uint32_t renderingEnds{};
     size_t lastRenderingColorCount{};
@@ -146,6 +149,10 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
         ++state(data).commandEnds;
         return VERNON_STATUS_OK;
     };
+    provider.resume_commands = [](void *data, VernonRuntimeProviderObject) {
+        ++state(data).commandResumes;
+        return VERNON_STATUS_OK;
+    };
     provider.encode_bind_pipeline = [](void *data, VernonRuntimeProviderObject, VernonRuntimeProviderObject) {
         ++state(data).pipelineBinds;
         return VERNON_STATUS_OK;
@@ -153,6 +160,14 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     provider.encode_bind_group = [](void *data, VernonRuntimeProviderObject, uint32_t index,
                                     VernonRuntimeProviderObject group) {
         state(data).groupBinds.emplace_back(index, group.value);
+        return VERNON_STATUS_OK;
+    };
+    provider.encode_bind_vertex_buffers = [](void *data, VernonRuntimeProviderObject, uint32_t firstBinding,
+                                             const VernonRuntimeProviderResourceReference *buffers, size_t count) {
+        std::vector<uint64_t> objects;
+        for (size_t index = 0; index < count; ++index)
+            objects.push_back(buffers[index].resource.value);
+        state(data).vertexBufferBinds.emplace_back(firstBinding, std::move(objects));
         return VERNON_STATUS_OK;
     };
     provider.encode_dispatch = [](void *data, VernonRuntimeProviderObject,
@@ -341,6 +356,9 @@ TEST(RuntimeForeignProvider, RejectsProvidersWithoutLifecycleCallbacks) {
     provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
     provider.end_commands = nullptr;
     EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.resume_commands = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(layout, nullptr);
     EXPECT_EQ(pipeline, nullptr);
     EXPECT_EQ(mock.groupLayoutPreparations, 0u);
@@ -494,6 +512,52 @@ TEST(RuntimeForeignProvider, PreparesBindsAndDispatchesThroughCommandState) {
     vernonRuntimeCoreGroupLayoutDestroy(layout);
     EXPECT_EQ(mock.destroyedGroups, 1u);
     EXPECT_EQ(mock.destroyedGroupLayouts, 1u);
+}
+
+TEST(RuntimeForeignProvider, ResumedCommandsKeepTheirBindingsOutsideRendering) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider =
+        makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE | VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    VernonRuntimeCoreGroupLayout *layout = storageLayout(provider);
+    ASSERT_NE(layout, nullptr);
+    const VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor(&layout, 1);
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    VernonRuntimeCoreGroup *group = persistentGroup(layout, storageValue(99));
+    ASSERT_NE(group, nullptr);
+
+    EXPECT_EQ(vernonRuntimeCoreResumeCommands(nullptr), VERNON_STATUS_INVALID_ARGUMENT);
+    VernonRuntimeCoreCommands *commands = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreBeginCommands(&provider, {200}, &commands), VERNON_STATUS_OK);
+    const uint32_t groups[3]{4, 2, 1};
+    ASSERT_EQ(vernonRuntimeCoreBindPipeline(commands, pipeline), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreBindGroup(commands, 0, group), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreDispatch(commands, groups, nullptr, 0), VERNON_STATUS_OK);
+    for (int segment = 0; segment < 2; ++segment) {
+        ASSERT_EQ(vernonRuntimeCoreResumeCommands(commands), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeCoreBindPipeline(commands, pipeline), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeCoreBindGroup(commands, 0, group), VERNON_STATUS_OK);
+        EXPECT_EQ(vernonRuntimeCoreDispatch(commands, groups, nullptr, 0), VERNON_STATUS_OK);
+    }
+    EXPECT_EQ(mock.commandResumes, 2u);
+    EXPECT_EQ(mock.pipelineBinds, 1u);
+    EXPECT_EQ(mock.groupBinds.size(), 1u);
+    EXPECT_EQ(mock.dispatches, 3u);
+
+    VernonRuntimeProviderColorAttachment color{};
+    color.view = {104, {1}, 0, 0};
+    const VernonRuntimeProviderRenderingDescriptor rendering = colorRendering(color);
+    ASSERT_EQ(vernonRuntimeCoreBeginRendering(commands, &rendering), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreResumeCommands(commands), VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRuntimeCoreEndRendering(commands), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.commandResumes, 2u);
+    EXPECT_EQ(vernonRuntimeCoreEndCommands(commands), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.commandBegins, 1u);
+    EXPECT_EQ(mock.commandEnds, 1u);
+
+    vernonRuntimeCorePipelineDestroy(pipeline);
+    vernonRuntimeCoreGroupDestroy(group);
+    vernonRuntimeCoreGroupLayoutDestroy(layout);
 }
 
 TEST(RuntimeForeignProvider, EqualEntriesShareOneGroupLayout) {
@@ -808,6 +872,78 @@ TEST(RuntimeForeignProvider, DrawsRequireAGroupAtEveryIndexWithEntries) {
     vernonRuntimeCorePipelineDestroy(pipeline);
     vernonRuntimeCoreGroupLayoutDestroy(empty);
     vernonRuntimeCoreGroupLayoutDestroy(layout);
+}
+
+TEST(RuntimeForeignProvider, ForwardsChangedVertexBuffersAndDrawsRequireEveryVertexBinding) {
+    static const VernonRuntimeProviderVertexBinding bindings[]{{0, 0}, {1, 1}};
+    static const VernonRuntimeProviderVertexAttribute attributes[]{{0, 0, VERNON_RUNTIME_PROVIDER_F32, 3, 0},
+                                                                   {1, 1, VERNON_RUNTIME_PROVIDER_F32, 4, 0}};
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    VernonRuntimeCorePipelineDescriptor descriptor = graphicsPipelineDescriptor();
+    descriptor.vertex_attributes = attributes;
+    descriptor.vertex_attribute_count = std::size(attributes);
+    descriptor.vertex_bindings = bindings;
+    descriptor.vertex_binding_count = std::size(bindings);
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    const uint32_t strides[]{12, 16};
+    VernonRuntimeCoreGraphicsCompatibility compatibility = singleColorCompatibility();
+    compatibility.vertex_strides = strides;
+    compatibility.vertex_stride_count = 1;
+    VernonRuntimeCoreGraphicsVariant *variant = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &variant),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    compatibility.vertex_stride_count = std::size(strides);
+    ASSERT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &variant), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderColorAttachment color{};
+    color.view = {104, {1}, 0, 0};
+    const VernonRuntimeProviderRenderingDescriptor rendering = colorRendering(color);
+    VernonRuntimeCoreDrawInvocation draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    const VernonRuntimeProviderResourceReference positions{201, {11}, 0, 36};
+    const VernonRuntimeProviderResourceReference colors{202, {12}, 0, 16};
+    const VernonRuntimeProviderResourceReference otherColors{203, {13}, 0, 16};
+    VernonRuntimeCoreCommands *commands = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreBeginCommands(&provider, {7}, &commands), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreBeginRendering(commands, &rendering), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreBindGraphicsVariant(commands, variant), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreBindVertexBuffers(commands, 0, &positions, 1), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreDraw(commands, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+    const VernonRuntimeProviderResourceReference both[]{positions, colors};
+    ASSERT_EQ(vernonRuntimeCoreBindVertexBuffers(commands, 0, both, std::size(both)), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreDraw(commands, &draw), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreBindVertexBuffers(commands, 0, both, std::size(both)), VERNON_STATUS_OK);
+    const VernonRuntimeProviderResourceReference changed[]{positions, otherColors};
+    ASSERT_EQ(vernonRuntimeCoreBindVertexBuffers(commands, 0, changed, std::size(changed)), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreBindVertexBuffers(commands, VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS, both, 1),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRuntimeCoreEndRendering(commands), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreEndCommands(commands), VERNON_STATUS_OK);
+
+    const std::vector<std::pair<uint32_t, std::vector<uint64_t>>> expected{{0, {11}}, {1, {12}}, {1, {13}}};
+    EXPECT_EQ(mock.vertexBufferBinds, expected);
+    vernonRuntimeCoreGraphicsVariantDestroy(variant);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+}
+
+TEST(RuntimeForeignProvider, RejectsVertexAttributesWithoutTheirBinding) {
+    static const VernonRuntimeProviderVertexBinding binding{0, 0};
+    static const VernonRuntimeProviderVertexAttribute attribute{1, 0, VERNON_RUNTIME_PROVIDER_F32, 3, 0};
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    VernonRuntimeCorePipelineDescriptor descriptor = graphicsPipelineDescriptor();
+    descriptor.vertex_attributes = &attribute;
+    descriptor.vertex_attribute_count = 1;
+    descriptor.vertex_bindings = &binding;
+    descriptor.vertex_binding_count = 1;
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(pipeline, nullptr);
+    EXPECT_EQ(mock.pipelinePreparations, 0u);
 }
 
 TEST(RuntimeForeignProvider, ValidatesRenderingAttachmentsBeforeBeginning) {

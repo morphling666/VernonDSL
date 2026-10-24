@@ -70,18 +70,18 @@ def _is_self_attribute(node: ast.AST) -> bool:
 def _class_kind(node: ast.ClassDef) -> str | None:
     for decorator in node.decorator_list:
         name = (_name(decorator.func if isinstance(decorator, ast.Call) else decorator) or "").split(".")[-1]
-        if name in {"struct", "binding_group"}:
+        if name in {"struct", "params"}:
             return name
     return None
 
 
 def _validate_method(method: ast.FunctionDef, kind: str, shared_owner: bool, filename: str) -> bool:
-    owner = "struct" if kind == "struct" else "binding group"
+    owner = "struct" if kind == "struct" else "params"
     if len(method.decorator_list) != 1:
         _error(filename, method, f"{owner} methods require exactly one @func decorator")
     shared = _decorator(method.decorator_list[0], "func", filename)
-    if shared and kind == "binding_group":
-        _error(filename, method, "binding group cannot be shared; put host/device code on its Value Structs")
+    if shared and kind == "params":
+        _error(filename, method, "params cannot be shared; put host/device code on its Value Structs")
     if shared and not shared_owner:
         _error(filename, method, "a shared method requires @struct(shared=True)")
     if not method.args.args or method.args.args[0].arg != "self":
@@ -96,8 +96,8 @@ def _validate_method(method: ast.FunctionDef, kind: str, shared_owner: bool, fil
             else:
                 targets.append(node.target)
         if any(_is_self_attribute(target) for target in targets):
-            if kind == "binding_group":
-                _error(filename, node, "binding group cannot be reassigned through its fields")
+            if kind == "params":
+                _error(filename, node, "params cannot be reassigned through its fields")
             _error(filename, node, "struct methods cannot mutate self fields")
     return shared
 
@@ -165,7 +165,7 @@ class _MethodCallRewriter(ast.NodeTransformer):
             struct_name = self._expression_struct(node.value)
             info = self.structs[struct_name] if struct_name is not None else None
             if info is not None and node.attr in info.methods:
-                owner = "struct" if info.kind == "struct" else "binding group"
+                owner = "struct" if info.kind == "struct" else "params"
                 _error(self.filename, node, f"{owner} methods cannot be used as first-class values")
         return self.generic_visit(node)
 
@@ -188,12 +188,12 @@ class _MethodCallRewriter(ast.NodeTransformer):
 
 
 def method_tables(module: ast.Module) -> dict[str, dict[str, str]]:
-    """Maps each Struct or binding group to its method helpers; set by `normalize_struct_methods`."""
+    """Maps each Struct or params class to its method helpers; set by `normalize_struct_methods`."""
     return getattr(module, "_vernon_methods", {})
 
 
 def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
-    """Hoists Struct and binding-group methods into `Class__method` helpers and rewrites calls on typed receivers."""
+    """Hoists Struct and params methods into `Class__method` helpers and rewrites calls on typed receivers."""
     structs: dict[str, _StructInfo] = {}
     extracted: list[ast.FunctionDef] = []
     for node in module.body:
@@ -206,9 +206,9 @@ def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
             _error(filename, node, f"@{kind} classes do not support inheritance")
         if len(node.decorator_list) != 1:
             _error(filename, node, f"DSL classes require exactly one @{kind} decorator")
-        if kind == "binding_group":
+        if kind == "params":
             if isinstance(node.decorator_list[0], ast.Call):
-                _error(filename, node, "binding group cannot be shared; put host/device code on its Value Structs")
+                _error(filename, node, "params cannot be shared; put host/device code on its Value Structs")
             shared_struct = False
         else:
             shared_struct = _decorator(node.decorator_list[0], "struct", filename)

@@ -66,6 +66,8 @@ typedef struct VernonRuntimeCorePipelineDescriptor {
     size_t group_layout_count;
     const VernonRuntimeProviderVertexAttribute *vertex_attributes;
     size_t vertex_attribute_count;
+    const VernonRuntimeProviderVertexBinding *vertex_bindings;
+    size_t vertex_binding_count;
     uint32_t push_constant_size;
     uint32_t topology;
     const uint32_t *color_formats;
@@ -119,22 +121,32 @@ VERNON_RUNTIME_CORE_CAPI void vernonRuntimeCoreGraphicsVariantDestroy(VernonRunt
 
 /*
  * The command state of one command encoder; see VernonRuntimeDeviceProvider.
- * A bind of the pipeline or group already bound is free, and binding a
- * pipeline keeps the groups bound at the indices whose group layouts it
- * shares. A dispatch or draw requires a group at every index of the bound
- * pipeline whose group layout has entries.
+ * A bind of the pipeline, group or vertex buffer already bound is free, and
+ * binding a pipeline keeps the groups bound at the indices whose group
+ * layouts it shares and every bound vertex buffer. A dispatch or draw
+ * requires a group at every index of the bound pipeline whose group layout
+ * has entries, and a draw a vertex buffer at every vertex binding.
  */
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBeginCommands(const VernonRuntimeDeviceProvider *provider,
                                                                      VernonRuntimeProviderObject command_encoder,
                                                                      VernonRuntimeCoreCommands **commands);
 /* Ends and destroys the command state, even when it reports a failure. */
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEndCommands(VernonRuntimeCoreCommands *commands);
+/*
+ * Called outside a rendering scope after other commands were recorded on the
+ * native encoder. The bound pipeline and groups stay bound.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreResumeCommands(VernonRuntimeCoreCommands *commands);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindPipeline(VernonRuntimeCoreCommands *commands,
                                                                     VernonRuntimeCorePipeline *pipeline);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindGraphicsVariant(VernonRuntimeCoreCommands *commands,
                                                                            VernonRuntimeCoreGraphicsVariant *variant);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreBindGroup(VernonRuntimeCoreCommands *commands, uint32_t index,
                                                                  VernonRuntimeCoreGroup *group);
+/* Binds buffers[i] at vertex binding first_binding + i. */
+VERNON_RUNTIME_CORE_CAPI VernonStatus
+vernonRuntimeCoreBindVertexBuffers(VernonRuntimeCoreCommands *commands, uint32_t first_binding,
+                                   const VernonRuntimeProviderResourceReference *buffers, size_t buffer_count);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreDispatch(VernonRuntimeCoreCommands *commands,
                                                                 const uint32_t group_count[3],
                                                                 const void *push_constants, size_t push_constant_size);

@@ -469,10 +469,20 @@ a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
 Value even if a backend uses a buffer physically. Direct shader addressing,
 stores, and atomics require `TensorView[..., resource()]`.
 
-Kernel Resources bind in argument order: set 0, at the flattened binding of
-their argument. `resource(set, binding)` therefore applies only to graphics
-stages, and on a kernel parameter fails with
-`kernel Resources bind in argument order; resource(set, binding) applies only to graphics stages`.
+Graphics leaves are placed per leaf: `uniform(set=None, binding=None)` on a
+by-value leaf and `resource(set=None, binding=None)` on a TensorView, Texture
+or Sampler leaf. `set` is the leaf's group, its update-frequency partition,
+and a leaf without it is in set 0; `binding` pins the leaf to that binding of
+its set, and the compiler assigns every unpinned binding at the pipeline link
+after reserving the pinned ones. The Runtime's group model is
+[`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3.
+
+Kernel parameters bind in argument order: set 0, at the flattened binding of
+their argument, until Kernel placement lands with uniform packing
+([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3.4).
+A Kernel parameter or params leaf annotated with `resource(...)`, or with
+`uniform(...)` that gives a set or binding, fails with
+`kernel parameters bind in argument order; set and binding apply only to graphics stages`.
 
 A fragment output's element type follows its color target's component class:
 `f32` for `float` and `unorm` formats, `u32` for `uint`, and `i32` for `sint`,
@@ -567,7 +577,7 @@ semantics:
 - `and`, `or`, `not`.
 
 A type specialization compares only with `==` and `!=` against a type
-reference: a declared Struct or binding group, a scalar type, or another type
+reference: a declared Struct or params class, a scalar type, or another type
 specialization. Any other use in a compile-time expression fails with
 `a type specialization compares only with == and != against a type reference`.
 
@@ -602,70 +612,60 @@ ordering, and arithmetic, so on Python 3.11 through 3.13 a module whose
 annotations contain conditions other than `==` and `!=` needs
 `from __future__ import annotations`.
 
-### 6.4 Binding groups
+### 6.4 Params
 
-A `@vd.binding_group` class declares a named group of entry interface items.
-Its fields are `TensorView`, `Texture`, and `Sampler` resources; Values,
-including Structs, which bind as immutable uniforms in graphics stages and as
-ordinary Value parameters in Kernels; vertex attributes; and nested binding
-groups. A vertex attribute field is `Annotated[T, attribute()]` or
-`Annotated[T, attribute(divisor=n)]` with a Value type `T`; it binds as a
-vertex buffer, as an ungrouped attribute parameter does. Fields carry no
-other metadata (`varying`, `builtin`, `uniform`, `resource`, `set`,
-`binding`), and an attribute field takes no explicit location
-(`binding group attribute cannot declare a location`), so a group's
-locations follow from where it is used. Graphics TensorView fields follow
-the read-only rule of
+A `@vd.params` class declares named entry parameters with no physical
+meaning: an entry parameter of a params type is exactly its leaves, declared
+in field order under their dotted paths, and placement and packing never look
+at the class. Its fields are `TensorView`, `Texture`, and `Sampler`
+resources; Values, including Structs, which bind as immutable uniforms in
+graphics stages and as ordinary Value parameters in Kernels; vertex
+attributes; and nested params. A field takes every annotation an entry
+parameter of its type takes (`attribute`, `builtin`, `varying`, `uniform`,
+`resource`), with its location and placement (section 6), so a params class
+places its leaves the same way wherever it is used. A field cannot declare a
+`When` condition (`params field cannot declare a When condition`), and a
+params parameter takes no annotation at its use site (`params parameter
+cannot declare interface metadata`). Graphics TensorView fields follow the
+read-only rule of
 [`../program/graphics_storage_reads.md`](../program/graphics_storage_reads.md).
 
-A group whose leaves include a vertex attribute is a *vertex group*. It is
-valid only as a vertex-stage parameter, and helpers that take it are
-reachable only from vertex stages (`binding group with vertex attributes is
-only valid in a vertex stage`). Every other group stays valid in every stage.
-A vertex group is how a geometry source keeps its per-vertex buffers and
-the data that goes with them (a bone palette, an index range) in one group,
-so one bound group object serves a draw, rather than every draw binding its
-vertex buffers next to the pass-wide values of group 0.
-
-A binding group is not a Value. It appears only as an entry parameter, a
+A params value is not a Value. It appears only as an entry parameter, a
 helper parameter, a forwarded argument, or the receiver of a field access or
 method call. It cannot be constructed in device code, assigned to a local,
 returned, compared, used as a Struct field or a Tensor or TensorView element,
-or passed to `@func(shared=True)` code (`binding group cannot be`). Fields
-cannot declare interface metadata (`binding group field cannot declare`).
-Methods are `@vd.func`, cannot reassign fields, and a group has no `shared`
+or passed to `@func(shared=True)` code (`params cannot be`). Methods are
+`@vd.func`, cannot reassign fields, and a params class has no `shared`
 option.
 
 Each leaf is an entry interface item named by its dotted path, for example
 `material.noise`, in reflection, Program parameters, host keyword binding, and
-derivative paths. On the host the class is a plain container:
-`Hologram(params=HologramParams(...), noise=texture)` binds leaf by leaf. One
-group occurrence takes one consecutive binding range in field order, including
-spilled uniforms, storage leaves, and nested groups, and the same group under
-the same name in both stages of a pipeline reuses that range. All ranges are in
-descriptor set 0. Attribute leaves take vertex-input locations instead of
-bindings: after the entry's explicit locations and its ungrouped attributes
-are placed, group attribute leaves take the first free ranges in flattened
-declaration order.
+derivative paths. On the host the class is a plain immutable container that
+binds its fields by keyword: `Hologram(params=HologramParams(...),
+noise=texture)` binds leaf by leaf. Each leaf is placed like a parameter of
+its own (section 6), and its `set` is its group. Attribute
+leaves take vertex-input locations and belong to no group: after the entry's
+explicit locations are placed, unlocated attribute leaves take the first
+free ranges in flattened declaration order.
 
-Every backend accepts every group leaf kind, including Struct and Tuple Value
+Every backend accepts every params leaf kind, including Struct and Tuple Value
 leaves in GPU Kernels; leaf scalar types still follow target capabilities.
-Kernels, Pipelines, and `Module.forward()` accept groups. `Module.forward()`
-group parameters must be annotated, and `forward` may pass a group to the
-Kernels and Pipelines it calls or construct one from leaves it holds.
+Kernels, Pipelines, and `Module.forward()` accept params. `Module.forward()`
+params parameters must be annotated, and `forward` may pass a params value to
+the Kernels and Pipelines it calls or construct one from leaves it holds.
 
-Differentiation treats a group leaf by leaf under
+Differentiation treats a params value leaf by leaf under
 [`../autodiff/contract.md`](../autodiff/contract.md) section 3. A VJP `wrt` or
-`outputs` path naming a group root, or a nested group, is shorthand for its
+`outputs` path naming a params root, or a nested params, is shorthand for its
 leaves in field order: for `wrt` every floating Value leaf (Struct and Tuple
 Values expanded to floating fields) and whole floating TensorView leaf, for
 `outputs` the writable floating TensorView leaves. A root with no such leaf
-fails with `names a binding group with no ... leaves`. Expansion happens per
+fails with `names params with no ... leaves`. Expansion happens per
 specialization key, before the paths become the transform identity.
 
 ### 6.5 Typed method resolution
 
-`x.m(...)` resolves on the inferred Struct or binding-group type of `x` during
+`x.m(...)` resolves on the inferred Struct or params type of `x` during
 typed helper specialization, not by syntactic lookup of the receiver. Generic
 helpers may call methods on unannotated parameters, and each helper
 specialization resolves its calls independently. Methods are reachable only
@@ -676,10 +676,10 @@ helper specialization chain. Methods are not first-class values.
 ### 6.6 Type-valued specializations
 
 `vd.specialization(name, vd.type)` declares a specialization whose value is a
-`@vd.binding_group` class, a `@vd.struct` class, or a scalar type.
+`@vd.params` class, a `@vd.struct` class, or a scalar type.
 
 - The name is a type wherever a type is allowed: `material: MATERIAL` for a
-  binding group, `Annotated[MATERIAL, uniform()]` for a Struct in a graphics
+  params class, `Annotated[MATERIAL, uniform()]` for a Struct in a graphics
   stage, a `TensorView[ELEMENT, ...]` element, or a constructor call
   `ELEMENT(x)`.
 - At key binding, the module that defines the value joins the source module
@@ -742,7 +742,7 @@ Project processing order is:
 3. normalize generated builtins;
 4. prune to selected entries and validate the call graph;
 5. infer, specialize, and validate typed semantic nodes and effects,
-   resolving method calls and flattening binding groups;
+   resolving method calls and flattening params;
 6. lower typed nodes;
 7. validate target capabilities and materialize artifacts.
 
@@ -930,11 +930,11 @@ The current `COMPILER_CONTRACT_VERSION` may be declared implemented only when:
   callees and type errors of discarded branches, and a `When` resource
   disappears from the interface when disabled, for Kernels and graphics
   stages; graphics Pipeline assets cook and render with integer and type
-  variants; binding groups with every leaf kind work in Kernels and both
-  graphics stages on every backend, reject every misuse with its diagnostic,
-  take one consecutive binding range, and yield dotted-leaf VJP cotangents; one
-  generic helper calls the same method on two binding groups; a template that
-  does not import its material cooks against two binding-group values whose
+  variants; params with every leaf kind work in Kernels and both graphics
+  stages on every backend, reject every misuse with its diagnostic, place
+  each leaf by its own annotation, and yield dotted-leaf VJP cotangents; one
+  generic helper calls the same method on two params classes; a template that
+  does not import its material cooks against two params values whose
   frontend results never alias and whose source edits invalidate only their
   own keys; manifest keys carry checkout-independent type identities;
 - fluid simulation, PBR/SSR, and first-order autodiff examples compile within

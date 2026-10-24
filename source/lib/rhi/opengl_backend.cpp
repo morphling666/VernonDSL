@@ -298,13 +298,18 @@ void DeviceState::importImage(Image &image, Uint name) {
 }
 
 void DeviceState::destroyImage(Image &image) {
-    if (image.imported || !image.name)
+    if (!image.name)
         return;
     makeCurrent();
+    const auto attaching = std::partition(
+        attachmentFramebuffers.begin(), attachmentFramebuffers.end(),
+        [&](const AttachmentFramebuffer &framebuffer) { return !framebuffer.attachments.attaches(image.name); });
+    for (auto framebuffer = attaching; framebuffer != attachmentFramebuffers.end(); ++framebuffer)
+        driver.deleteFramebuffers(1, &framebuffer->name);
+    attachmentFramebuffers.erase(attaching, attachmentFramebuffers.end());
+    if (image.imported)
+        return;
     driver.deleteTextures(1, &image.name);
-    // GL may immediately reuse the numeric texture name. Cached framebuffer
-    // signatures must not treat the replacement as the deleted attachment.
-    ++framebufferGeneration;
     image.name = 0;
 }
 
@@ -332,7 +337,6 @@ bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel,
         return false;
     }
     driver.bindFramebuffer(kFramebuffer, framebuffer);
-    ++framebufferGeneration;
     // Stencil is only ever read from a packed depth-stencil image, which must attach at the depth-stencil point.
     const bool depthStencil = externalFormat == 0x84F9 || externalFormat == 0x1901;
     const bool depthOnly = externalFormat == 0x1902;
@@ -371,7 +375,6 @@ bool DeviceState::downloadImage3D(const Image &image, Int mipLevel, Int x, Int y
         return false;
     }
     driver.bindFramebuffer(kFramebuffer, framebuffer);
-    ++framebufferGeneration;
     constexpr Enum packAlignment = 0x0D05;
     driver.pixelStorei(packAlignment, 1);
     auto *output = static_cast<unsigned char *>(destination);
@@ -587,6 +590,12 @@ void DeviceState::destroyFramebuffer(Uint framebuffer) {
     makeCurrent();
     if (framebuffer)
         driver.deleteFramebuffers(1, &framebuffer);
+}
+
+void DeviceState::destroyAttachmentFramebuffers() {
+    for (const AttachmentFramebuffer &framebuffer : attachmentFramebuffers)
+        destroyFramebuffer(framebuffer.name);
+    attachmentFramebuffers.clear();
 }
 
 } // namespace vernon::rhi::opengl

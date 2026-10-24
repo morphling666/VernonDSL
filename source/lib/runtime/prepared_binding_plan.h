@@ -60,7 +60,6 @@ struct PreparedComputeBindingPlan {
 
 enum class PreparedGraphicsBindingSourceKind : uint8_t {
     ExternalUniform,
-    ExternalVertex,
     ExternalImage,
     ExternalSampler,
     ImplicitSampler,
@@ -119,6 +118,9 @@ struct PreparedGraphicsBindingPlan {
     VernonRuntimeBackend backend{VERNON_RUNTIME_OPENGL};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> layouts;
     std::vector<PreparedGraphicsBindingSource> sources;
+    // Vertex inputs belong to no group. Binding b is vertexBindings[b], read from Stage parameter vertexInputs[b].
+    std::vector<VernonRuntimeProviderVertexBinding> vertexBindings;
+    std::vector<uint32_t> vertexInputs;
     std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
     std::vector<PreparedGraphicsMetadataCarrier> metadataCarriers;
 
@@ -151,6 +153,10 @@ bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepare
                                       std::vector<uint8_t> &storage, std::string &error);
 std::vector<PipelineGroups::SlotDependencies>
 preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared);
+// The buffer and stride of vertex binding `binding`.
+bool preparedGraphicsVertexBuffer(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
+                                  size_t binding, VernonRuntimeProviderResourceReference &buffer, uint32_t &stride,
+                                  std::string &error);
 
 } // namespace vernon::runtime
 

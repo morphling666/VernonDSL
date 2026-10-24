@@ -68,6 +68,7 @@ void DeviceState::shutdown() {
     retiringTransients.clear();
     transientPool.retire(recordingTransients);
     transientPool.clear(freeChunk);
+    persistentBlocks.clear(freeChunk);
     for (PinnedBlock &block : stagingPool) {
         if (block.retirement)
             api.eventDestroy(block.retirement);
@@ -376,6 +377,34 @@ Result DeviceState::writeTransient(const void *data, size_t size, size_t alignme
     }
     return upload(chunk + offset, data, size);
 }
+
+Result DeviceState::placePersistent(const void *data, size_t size, size_t alignment, DevicePointer &chunk,
+                                    size_t &offset, uint64_t &key) {
+    if (!data)
+        return kInvalidValue;
+    Result status = makeCurrent();
+    if (status != kSuccess)
+        return status;
+    try {
+        TransientChunk *acquired =
+            persistentBlocks.acquire(size, alignment, offset, key, [&](size_t capacity, TransientChunk &created) {
+                status = allocate(created.pointer, capacity);
+                created.capacity = capacity;
+                return status == kSuccess;
+            });
+        if (!acquired)
+            return status == kSuccess ? kInvalidValue : status;
+        chunk = acquired->pointer;
+    } catch (const std::bad_alloc &) {
+        return kInvalidValue;
+    }
+    status = upload(chunk + offset, data, size);
+    if (status != kSuccess)
+        persistentBlocks.release(key);
+    return status;
+}
+
+void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
 
 Result DeviceState::retireTransients() {
     if (recordingTransients.chunks.empty())

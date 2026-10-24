@@ -525,6 +525,36 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Result<CommandTransient, RhiError>{ok(CommandTransient{static_cast<uint64_t>(chunk), offset})};
 }
 
+// Device memory is not host-visible, so every block is placed with its bytes.
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return Result<PersistentBlock, RhiError>{err(std::move(anchored).error())};
+    if (!data)
+        return Result<PersistentBlock, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"place_cuda_persistent", size, handle.index}})};
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    vernon::rhi::cuda::DevicePointer chunk{};
+    size_t offset{};
+    uint64_t key{};
+    const auto status = device.state.placePersistent(data, static_cast<size_t>(size), static_cast<size_t>(alignment),
+                                                     chunk, offset, key);
+    if (status != vernon::rhi::cuda::kSuccess)
+        return Result<PersistentBlock, RhiError>{err(backendFailure(device, status, "place_cuda_persistent"))};
+    return Result<PersistentBlock, RhiError>{ok(PersistentBlock{static_cast<uint64_t>(chunk), offset, nullptr, key})};
+}
+
+void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return;
+    CudaDevice &device = anchored.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.releasePersistent(key);
+}
+
 nvtxDomainHandle_t debugDomain() noexcept {
     static const nvtxDomainHandle_t domain = nvtxDomainCreateA("Vernon");
     return domain;
@@ -738,6 +768,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         result.recordBarriers.emplace(recordBarriers);
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.writeTransient.emplace(writeTransient);
+        result.placePersistent.emplace(placePersistent);
+        result.releasePersistent.emplace(releasePersistent);
         result.recordDebugCommand.emplace(recordDebugCommand);
         result.recordTimer.emplace(recordTimer);
         result.readTimers.emplace(readTimers);

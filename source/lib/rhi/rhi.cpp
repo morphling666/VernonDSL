@@ -884,6 +884,24 @@ vernon::rhi::reserveRecordingTransient(VernonRhiDevice device, uint64_t key, uin
     return backend->reserveTransient.value()(device, key, native, size, alignment);
 }
 
+vernon::Result<vernon::rhi::PersistentBlock, vernon::RhiError>
+vernon::rhi::placePersistentBlock(VernonRhiDevice device, const void *data, uint64_t size,
+                                  uint64_t alignment) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<PersistentBlock, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"place_persistent_block", size, 0}})};
+    if (!backend->placePersistent)
+        return Result<PersistentBlock, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"place_persistent_block", size, 0}})};
+    return backend->placePersistent.value()(device, data, size, alignment);
+}
+
+void vernon::rhi::releasePersistentBlock(VernonRhiDevice device, uint64_t key) noexcept {
+    if (const BackendDispatch *backend = dispatch(device); backend && backend->releasePersistent)
+        backend->releasePersistent.value()(device, key);
+}
+
 vernon::Result<void, vernon::RhiError> vernon::rhi::recordImageCopy(VernonRhiDevice device, uint64_t encoderKey,
                                                                     uint64_t native, VernonRhiImage source,
                                                                     VernonRhiImage destination,

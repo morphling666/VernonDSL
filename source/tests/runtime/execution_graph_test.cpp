@@ -749,10 +749,13 @@ TEST(CommandGraph, SplitsRenderScopesForNonAttachmentHazards) {
     auto plan = graph.compile(error);
     ASSERT_TRUE(plan) << error;
     ASSERT_EQ(plan->scopes().size(), 2u);
-    ASSERT_EQ(plan->scopes()[1].barriers.size(), 2u);
-    EXPECT_EQ(plan->scopes()[1].barriers[0].source_stage_mask, 0u);
-    EXPECT_EQ(plan->scopes()[1].barriers[0].source_access,
-              VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE);
+    const std::vector<VernonRhiBarrier> &barriers = plan->scopes()[1].barriers;
+    ASSERT_EQ(barriers.size(), 2u);
+    const auto image = std::find_if(barriers.begin(), barriers.end(),
+                                    [](const VernonRhiBarrier &barrier) { return barrier.is_image; });
+    ASSERT_NE(image, barriers.end());
+    EXPECT_EQ(image->source_stage_mask, 0u);
+    EXPECT_EQ(image->source_access, VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE);
 }
 
 TEST(CommandGraph, ValidatesParameterSchemasAndInitialBindings) {

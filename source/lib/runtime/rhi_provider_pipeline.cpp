@@ -4,7 +4,6 @@
 #include "pipeline_metadata.h"
 #include "prepared_graphics_draw.h"
 #include "runtime_state.h"
-
 #include <algorithm>
 #include <utility>
 
@@ -62,21 +61,21 @@ bool fillGraphicsGroupValue(const void *userData, size_t slot, VernonRuntimeProv
     return fillPreparedGraphicsBindingValue(values.plan, values.inputs, slot, value, storage, error);
 }
 
-// Chooses and binds the variant of `command` when the pipeline, its state or the vertex strides differ from the
-// bound variant of `stream`.
+// Resolves the vertex buffers of `command` into `stream`, then chooses and binds its variant when the pipeline, its
+// state or the vertex strides differ from the bound variant of `stream`.
 VernonStatus bindGraphicsVariant(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                  const RhiGraphicsTarget &target, VernonRuntimeCoreCommands *commands,
                                  const GraphicsCommand &command, GraphicsStream &stream,
                                  RhiGraphicsPipeline &pipeline) {
-    stream.nextVertexStrides.clear();
-    for (size_t index = 0; index < pipeline.bindingPlan.size(); ++index) {
-        const VernonRuntimeProviderBindingLayoutEntry &layout = pipeline.bindingPlan.layouts[index];
-        if (layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-            continue;
-        if (stream.nextVertexStrides.size() <= layout.binding)
-            stream.nextVertexStrides.resize(layout.binding + 1);
-        stream.nextVertexStrides[layout.binding] = static_cast<uint32_t>(
-            command.arguments[pipeline.bindingPlan.sources[index].parameter]->tensor.byte_strides[0]);
+    const size_t vertexBindings = pipeline.bindingPlan.vertexInputs.size();
+    stream.nextVertexStrides.resize(vertexBindings);
+    stream.vertexBuffers.resize(vertexBindings);
+    const GraphicsSlotInputs inputs{command.arguments, command.draw.resolution};
+    for (size_t binding = 0; binding < vertexBindings; ++binding) {
+        std::string error;
+        if (!preparedGraphicsVertexBuffer(pipeline.bindingPlan, inputs, binding, stream.vertexBuffers[binding],
+                                          stream.nextVertexStrides[binding], error))
+            return fail(context, std::move(error), VERNON_STATUS_INVALID_ARGUMENT);
     }
     if (stream.pipeline == &pipeline && stream.graphicsState == command.graphicsState &&
         stream.vertexStrides == stream.nextVertexStrides)
@@ -156,26 +155,18 @@ bool prepareRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAd
 
 VernonStatus invokeRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                       const RhiComputeTarget &target, const StageBindingPlan &projection,
+                                      VernonRuntimeCoreCommands *commands, GroupStore &transient,
                                       const PlannedComputeLaunch &launch, const ArgumentOwner *owners,
                                       RhiComputePipeline &pipeline) {
-    GroupStore transient(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
     const ComputeGroupValues values{target, pipeline.bindingPlan, projection, launch};
     const GroupSources sources{owners, &launch, &transient, {fillComputeGroupValue, &values}};
-    VernonRuntimeCoreCommands *commands = nullptr;
-    VernonStatus status =
-        vernonRuntimeCoreBeginCommands(vernonRuntimeRhiAdapterGetProvider(adapter), launch.commandEncoder, &commands);
-    if (status != VERNON_STATUS_OK)
-        return fail(context, providerFailure(adapter, target.name, "begin", "compute commands"), status);
-    status = vernonRuntimeCoreBindPipeline(commands, pipeline.pipeline);
+    VernonStatus status = vernonRuntimeCoreBindPipeline(commands, pipeline.pipeline);
     std::string error;
     if (status == VERNON_STATUS_OK)
         status = pipeline.groups.bind(commands, launch.commandEncoder, sources, error);
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     if (status == VERNON_STATUS_OK)
         status = vernonRuntimeCoreDispatch(commands, groups, nullptr, 0);
-    const VernonStatus ended = vernonRuntimeCoreEndCommands(commands);
-    if (status == VERNON_STATUS_OK)
-        status = ended;
     if (!error.empty())
         return fail(context, std::string(target.name) + " " + error, VERNON_STATUS_INVALID_ARGUMENT);
     if (status != VERNON_STATUS_OK)
@@ -209,6 +200,8 @@ bool prepareRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiA
     descriptor.group_layout_count = output.groups.size();
     descriptor.vertex_attributes = output.bindingPlan.vertexAttributes.data();
     descriptor.vertex_attribute_count = output.bindingPlan.vertexAttributes.size();
+    descriptor.vertex_bindings = output.bindingPlan.vertexBindings.data();
+    descriptor.vertex_binding_count = output.bindingPlan.vertexBindings.size();
     descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     descriptor.sample_count = 1;
     if (vernonRuntimeCorePreparePipeline(provider, &descriptor, &output.pipeline) == VERNON_STATUS_OK)
@@ -235,6 +228,9 @@ VernonStatus invokeRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRunt
         return fail(context, std::move(error), VERNON_STATUS_INVALID_ARGUMENT);
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "bind", "graphics groups"), status);
+    status = vernonRuntimeCoreBindVertexBuffers(commands, 0, stream.vertexBuffers.data(), stream.vertexBuffers.size());
+    if (status != VERNON_STATUS_OK)
+        return fail(context, providerFailure(adapter, target.name, "bind", "vertex buffers"), status);
     VernonRuntimeCoreDrawInvocation draw;
     if (!prepareGraphicsDrawInvocation(command.draw, command.graphicsState->topology, draw,
                                        invocationDiagnostic(context)))

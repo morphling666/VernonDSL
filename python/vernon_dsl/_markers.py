@@ -1,6 +1,6 @@
 """The declaration marker every Vernon decorator attaches: `__vernon_dsl__ = (kind, options)`.
 
-`kind` names what the object declares (`struct`, `binding_group`, `compute`, `vertex`, `fragment`, `func`, ...);
+`kind` names what the object declares (`struct`, `params`, `compute`, `vertex`, `fragment`, `func`, ...);
 `options` holds the decorator's keyword options. Read and write the marker only through this module.
 """
 
@@ -37,8 +37,8 @@ def is_struct_class(value: Any) -> bool:
     return isinstance(value, type) and dsl_kind(value) == "struct"
 
 
-def is_binding_group(value: Any) -> bool:
-    return isinstance(value, type) and dsl_kind(value) == "binding_group"
+def is_params(value: Any) -> bool:
+    return isinstance(value, type) and dsl_kind(value) == "params"
 
 
 def record_declaration_source(cls: type[Any]) -> None:
@@ -62,7 +62,7 @@ __all__ = [
     "declaration_source",
     "dsl_kind",
     "dsl_options",
-    "is_binding_group",
+    "is_params",
     "is_struct_class",
     "mark",
     "record_declaration_source",

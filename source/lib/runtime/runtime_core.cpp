@@ -67,6 +67,7 @@ template <typename Callback> void providerVoidBoundary(Callback &&callback) noex
 }
 
 constexpr size_t kMaxGroups = VERNON_RUNTIME_PROVIDER_MAX_GROUPS;
+constexpr size_t kMaxVertexBindings = VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS;
 
 } // namespace
 
@@ -92,6 +93,8 @@ struct VernonRuntimeCorePipeline {
     size_t groupCount{};
     // Bit g is set when group layout g has entries, so a dispatch or draw needs a group bound at g.
     uint32_t requiredGroups{};
+    // Bit b is set for vertex binding b, so a draw needs a vertex buffer bound at b.
+    uint32_t vertexBindings{};
     uint32_t pushConstantSize{};
     std::unordered_map<vernon::runtime::GraphicsVariantKey, VernonRuntimeProviderObject,
                        vernon::runtime::GraphicsVariantKeyHash, vernon::runtime::GraphicsVariantKeyEqual>
@@ -123,6 +126,8 @@ struct VernonRuntimeCoreCommands {
     // Referenced while bound.
     std::array<VernonRuntimeCoreGroup *, kMaxGroups> groups{};
     uint32_t boundGroups{};
+    std::array<VernonRuntimeProviderResourceReference, kMaxVertexBindings> vertexBuffers{};
+    uint32_t boundVertexBuffers{};
     bool rendering{};
 };
 
@@ -140,7 +145,6 @@ bool packedUniformBytes(const VernonRuntimeProviderBindingLayoutEntry &layout) {
 const VernonRuntimeProviderResourceReference *bindingResource(const VernonRuntimeProviderBindingValue &value) {
     switch (value.kind) {
     case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
-    case VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER:
         return &value.payload.buffer.resource;
     case VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE:
     case VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE:
@@ -159,9 +163,10 @@ bool providerIsValid(const VernonRuntimeDeviceProvider &provider) {
            provider.abi_version == VERNON_PROGRAM_VERSION && provider.get_capabilities &&
            provider.get_device_identity && provider.prepare_shader && provider.prepare_group_layout &&
            provider.prepare_pipeline_layout && provider.prepare_pipeline && provider.create_group &&
-           provider.begin_commands && provider.end_commands && provider.encode_bind_pipeline &&
-           provider.encode_bind_group && provider.destroy_shader && provider.destroy_group_layout &&
-           provider.destroy_pipeline_layout && provider.destroy_pipeline && provider.destroy_group;
+           provider.begin_commands && provider.end_commands && provider.resume_commands &&
+           provider.encode_bind_pipeline && provider.encode_bind_group && provider.destroy_shader &&
+           provider.destroy_group_layout && provider.destroy_pipeline_layout && provider.destroy_pipeline &&
+           provider.destroy_group;
 }
 
 bool providerSupports(const VernonRuntimeDeviceProvider &provider, VernonRuntimeProviderPipelineKind kind) {
@@ -169,7 +174,30 @@ bool providerSupports(const VernonRuntimeDeviceProvider &provider, VernonRuntime
         return false;
     return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE
                ? provider.encode_dispatch != nullptr
-               : provider.encode_draw && provider.begin_rendering && provider.end_rendering && provider.describe_image;
+               : provider.encode_draw && provider.encode_bind_vertex_buffers && provider.begin_rendering &&
+                     provider.end_rendering && provider.describe_image;
+}
+
+// Bindings are distinct and below the limit, and every attribute reads one of them; compute pipelines have none.
+bool vertexInputsAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor, uint32_t &bindings) {
+    bindings = 0;
+    if ((descriptor.vertex_binding_count != 0 && !descriptor.vertex_bindings) ||
+        (descriptor.vertex_attribute_count != 0 && !descriptor.vertex_attributes) ||
+        (descriptor.kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE &&
+         (descriptor.vertex_binding_count != 0 || descriptor.vertex_attribute_count != 0)))
+        return false;
+    for (size_t index = 0; index < descriptor.vertex_binding_count; ++index) {
+        const uint32_t binding = descriptor.vertex_bindings[index].binding;
+        if (binding >= kMaxVertexBindings || (bindings & (1u << binding)) != 0)
+            return false;
+        bindings |= 1u << binding;
+    }
+    for (size_t index = 0; index < descriptor.vertex_attribute_count; ++index) {
+        const uint32_t binding = descriptor.vertex_attributes[index].binding;
+        if (binding >= kMaxVertexBindings || (bindings & (1u << binding)) == 0)
+            return false;
+    }
+    return true;
 }
 
 // Group layouts are shared per provider, so that equal layouts are one object.
@@ -196,9 +224,8 @@ bool sameEntry(const VernonRuntimeProviderBindingLayoutEntry &left,
            std::string_view(left.name.data ? left.name.data : "", left.name.size) ==
                std::string_view(right.name.data ? right.name.data : "", right.name.size) &&
            left.element_count == right.element_count && left.vector_count == right.vector_count &&
-           left.divisor == right.divisor && left.element_alignment == right.element_alignment &&
-           left.numeric_type == right.numeric_type && left.image_dimension == right.image_dimension &&
-           left.storage_image_format == right.storage_image_format &&
+           left.element_alignment == right.element_alignment && left.numeric_type == right.numeric_type &&
+           left.image_dimension == right.image_dimension && left.storage_image_format == right.storage_image_format &&
            left.sample_result_class == right.sample_result_class;
 }
 
@@ -556,9 +583,10 @@ VernonStatus preparePipelineImpl(const VernonRuntimeDeviceProvider *provider,
                                  VernonRuntimeCorePipeline **output) {
     if (output)
         *output = nullptr;
+    uint32_t vertexBindings = 0;
     if (!provider || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         !providerSupports(*provider, descriptor->kind) || !groupLayoutsAreValid(*descriptor, *provider) ||
-        !shaderStagesAreValid(*descriptor))
+        !shaderStagesAreValid(*descriptor) || !vertexInputsAreValid(*descriptor, vertexBindings))
         return VERNON_STATUS_INVALID_ARGUMENT;
 
     const uint32_t requiredFacet = descriptor->kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE
@@ -581,6 +609,7 @@ VernonStatus preparePipelineImpl(const VernonRuntimeDeviceProvider *provider,
         VERNON_STATUS_OK)
         return VERNON_STATUS_INTERNAL_ERROR;
     pipeline->kind = descriptor->kind;
+    pipeline->vertexBindings = vertexBindings;
     pipeline->pushConstantSize = descriptor->push_constant_size;
     std::array<VernonRuntimeProviderObject, kMaxGroups> groupLayouts{};
     for (size_t index = 0; index < descriptor->group_layout_count; ++index) {
@@ -609,6 +638,8 @@ VernonStatus preparePipelineImpl(const VernonRuntimeDeviceProvider *provider,
         descriptor->group_layout_count,
         descriptor->vertex_attributes,
         descriptor->vertex_attribute_count,
+        descriptor->vertex_bindings,
+        descriptor->vertex_binding_count,
         descriptor->push_constant_size,
         {0, 0, 0, 0}};
     VernonStatus status = providerStatusBoundary(
@@ -693,6 +724,10 @@ VernonStatus prepareGraphicsVariantImpl(VernonRuntimeCorePipeline *pipeline,
         (compatibility->color_blend_count != 0 && !compatibility->color_blends) ||
         compatibility->color_blend_count != compatibility->color_format_count)
         return VERNON_STATUS_INVALID_ARGUMENT;
+    for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
+        if ((pipeline->vertexBindings & (1u << binding)) != 0 &&
+            (binding >= compatibility->vertex_stride_count || compatibility->vertex_strides[binding] == 0))
+            return VERNON_STATUS_INVALID_ARGUMENT;
 
     auto variant =
         std::unique_ptr<VernonRuntimeCoreGraphicsVariant>(new (std::nothrow) VernonRuntimeCoreGraphicsVariant());
@@ -812,6 +847,13 @@ VernonStatus endCommandsImpl(VernonRuntimeCoreCommands *commands) {
     return status != VERNON_STATUS_OK ? status : ended;
 }
 
+VernonStatus resumeCommandsImpl(VernonRuntimeCoreCommands *commands) {
+    if (!commands || commands->rendering)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return providerStatusBoundary(
+        [&] { return commands->provider.resume_commands(commands->provider.user_data, commands->native); });
+}
+
 VernonStatus bindNativePipeline(VernonRuntimeCoreCommands &commands, VernonRuntimeCorePipeline &pipeline,
                                 VernonRuntimeProviderObject handle) {
     if (commands.bound.value == handle.value && commands.pipeline == &pipeline)
@@ -864,6 +906,45 @@ VernonStatus bindGroupImpl(VernonRuntimeCoreCommands *commands, uint32_t index, 
     return VERNON_STATUS_OK;
 }
 
+bool sameReference(const VernonRuntimeProviderResourceReference &left,
+                   const VernonRuntimeProviderResourceReference &right) {
+    return left.identity == right.identity && left.resource.value == right.resource.value &&
+           left.offset == right.offset && left.size == right.size;
+}
+
+// Forwards only the run between the first and the last binding that changes.
+VernonStatus bindVertexBuffersImpl(VernonRuntimeCoreCommands *commands, uint32_t first,
+                                   const VernonRuntimeProviderResourceReference *buffers, size_t count) {
+    if (!commands || (count != 0 && !buffers) || first > kMaxVertexBindings || count > kMaxVertexBindings - first)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    size_t begin = count;
+    size_t end = 0;
+    for (size_t index = 0; index < count; ++index) {
+        if (!present(buffers[index].resource))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        const size_t binding = first + index;
+        if ((commands->boundVertexBuffers & (1u << binding)) == 0 ||
+            !sameReference(commands->vertexBuffers[binding], buffers[index])) {
+            begin = std::min(begin, index);
+            end = index + 1;
+        }
+    }
+    if (begin >= end)
+        return VERNON_STATUS_OK;
+    const VernonStatus status = providerStatusBoundary([&] {
+        return commands->provider.encode_bind_vertex_buffers(commands->provider.user_data, commands->native,
+                                                             static_cast<uint32_t>(first + begin), buffers + begin,
+                                                             end - begin);
+    });
+    if (status != VERNON_STATUS_OK)
+        return status;
+    for (size_t index = begin; index < end; ++index) {
+        commands->vertexBuffers[first + index] = buffers[index];
+        commands->boundVertexBuffers |= 1u << (first + index);
+    }
+    return VERNON_STATUS_OK;
+}
+
 bool groupsAreComplete(const VernonRuntimeCoreCommands &commands) {
     return (commands.boundGroups & commands.pipeline->requiredGroups) == commands.pipeline->requiredGroups;
 }
@@ -911,7 +992,8 @@ VernonStatus endRenderingImpl(VernonRuntimeCoreCommands *commands) {
 VernonStatus drawImpl(VernonRuntimeCoreCommands *commands, const VernonRuntimeCoreDrawInvocation *invocation) {
     if (!commands || !commands->rendering || !commands->pipeline ||
         commands->pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !drawInvocationIsValid(invocation) ||
-        !groupsAreComplete(*commands))
+        !groupsAreComplete(*commands) ||
+        (commands->boundVertexBuffers & commands->pipeline->vertexBindings) != commands->pipeline->vertexBindings)
         return VERNON_STATUS_INVALID_ARGUMENT;
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
@@ -998,6 +1080,10 @@ extern "C" VernonStatus vernonRuntimeCoreEndCommands(VernonRuntimeCoreCommands *
     return runtimeCoreBoundary([&] { return endCommandsImpl(commands); });
 }
 
+extern "C" VernonStatus vernonRuntimeCoreResumeCommands(VernonRuntimeCoreCommands *commands) {
+    return runtimeCoreBoundary([&] { return resumeCommandsImpl(commands); });
+}
+
 extern "C" VernonStatus vernonRuntimeCoreBindPipeline(VernonRuntimeCoreCommands *commands,
                                                       VernonRuntimeCorePipeline *pipeline) {
     return runtimeCoreBoundary([&] { return bindPipelineImpl(commands, pipeline); });
@@ -1011,6 +1097,12 @@ extern "C" VernonStatus vernonRuntimeCoreBindGraphicsVariant(VernonRuntimeCoreCo
 extern "C" VernonStatus vernonRuntimeCoreBindGroup(VernonRuntimeCoreCommands *commands, uint32_t index,
                                                    VernonRuntimeCoreGroup *group) {
     return runtimeCoreBoundary([&] { return bindGroupImpl(commands, index, group); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreBindVertexBuffers(VernonRuntimeCoreCommands *commands, uint32_t firstBinding,
+                                                           const VernonRuntimeProviderResourceReference *buffers,
+                                                           size_t bufferCount) {
+    return runtimeCoreBoundary([&] { return bindVertexBuffersImpl(commands, firstBinding, buffers, bufferCount); });
 }
 
 extern "C" VernonStatus vernonRuntimeCoreDispatch(VernonRuntimeCoreCommands *commands, const uint32_t groupCount[3],

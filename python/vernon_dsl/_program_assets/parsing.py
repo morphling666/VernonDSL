@@ -168,7 +168,7 @@ def _linted_assignment(source_path: Path, parameter: Specialization, value: ast.
         if reference is None:
             raise ProgramCompileError(
                 f"type specialization requires a declared type or scalar type; variant value for "
-                f"'{parameter.name}' must name a @vd.struct or @vd.binding_group class or a scalar type"
+                f"'{parameter.name}' must name a @vd.struct or @vd.params class or a scalar type"
             )
         identity, declared_in = reference
         return SpecializationAssignment(parameter.name, "type", identity, type_source=declared_in)

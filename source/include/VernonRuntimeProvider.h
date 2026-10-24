@@ -17,7 +17,7 @@ typedef enum VernonRuntimeProviderCapabilityBits {
     VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP = 1u << 2
 } VernonRuntimeProviderCapabilityBits;
 
-enum { VERNON_RUNTIME_PROVIDER_MAX_GROUPS = 8 };
+enum { VERNON_RUNTIME_PROVIDER_MAX_GROUPS = 8, VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS = 16 };
 
 typedef struct VernonRuntimeProviderObject {
     uint64_t value;
@@ -46,14 +46,12 @@ typedef enum VernonRuntimeProviderBindingKind {
     VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE = 2,
     VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE = 3,
     VERNON_RUNTIME_PROVIDER_SAMPLER = 4,
-    VERNON_RUNTIME_PROVIDER_INLINE_VALUE = 5,
-    VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER = 6
+    VERNON_RUNTIME_PROVIDER_INLINE_VALUE = 5
 } VernonRuntimeProviderBindingKind;
 
 typedef enum VernonRuntimeProviderBindingInterface {
     VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE = 0,
-    VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM = 1,
-    VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT = 2
+    VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM = 1
 } VernonRuntimeProviderBindingInterface;
 
 typedef enum VernonRuntimeProviderNumericType {
@@ -107,7 +105,6 @@ typedef struct VernonRuntimeProviderBindingLayoutEntry {
     uint32_t element_count;
     /* OpenGL native-uniform column count; zero for buffered/non-OpenGL bindings. */
     uint32_t vector_count;
-    uint32_t divisor;
     uint32_t element_alignment;
     uint32_t numeric_type;
     VernonTextureDimension image_dimension;
@@ -122,6 +119,17 @@ typedef struct VernonRuntimeProviderVertexAttribute {
     uint32_t component_count;
     uint32_t relative_offset;
 } VernonRuntimeProviderVertexAttribute;
+
+/*
+ * One vertex buffer binding of a graphics pipeline. Vertex buffers belong to
+ * no group: encode_bind_vertex_buffers binds them, and the graphics variant
+ * gives each binding its stride.
+ */
+typedef struct VernonRuntimeProviderVertexBinding {
+    uint32_t binding;
+    /* 0 advances per vertex; n advances once every n instances. */
+    uint32_t divisor;
+} VernonRuntimeProviderVertexBinding;
 
 /*
  * The bindings of one group. Entry `slot` is the entry's index; `set` is
@@ -146,6 +154,8 @@ typedef struct VernonRuntimeProviderPipelineLayoutDescriptor {
     size_t group_layout_count;
     const VernonRuntimeProviderVertexAttribute *vertex_attributes;
     size_t vertex_attribute_count;
+    const VernonRuntimeProviderVertexBinding *vertex_bindings;
+    size_t vertex_binding_count;
     uint32_t push_constant_size;
     uint32_t reserved[4];
 } VernonRuntimeProviderPipelineLayoutDescriptor;
@@ -313,11 +323,17 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
 /*
  * Commands are encoded between begin_commands and end_commands, which open
  * and close the provider's command state for one command encoder; an encoder
- * has at most one open command state. Bound pipelines and groups are state:
- * a dispatch or draw uses the last bound pipeline and the groups bound at
- * each of its group indices. Binding a pipeline keeps the group bound at an
- * index whose group layout the new pipeline layout shares and unbinds the
- * others; providers reissue native binds where their API requires it. A
+ * has at most one open command state. Its owner may record other commands on
+ * the native encoder, such as barriers, copies and debug groups, only outside
+ * a rendering scope and only before calling resume_commands, after which the
+ * provider reapplies the native state those commands may have changed before
+ * its next command. Bound pipelines, groups and vertex buffers are state:
+ * a dispatch or draw uses the last bound pipeline, the groups bound at each
+ * of its group indices and the vertex buffers bound at each of its vertex
+ * bindings. Binding a pipeline keeps the group bound at an index whose group
+ * layout the new pipeline layout shares and unbinds the others; vertex
+ * buffers stay bound across pipelines, with the stride of the bound variant.
+ * Providers reissue native binds where their API requires it. A
  * provider skips native calls whose state is already current and must not
  * assume that native state outside its commands, such as an OpenGL context
  * shared with other renderers, is unchanged between them.
@@ -355,10 +371,16 @@ typedef struct VernonRuntimeDeviceProvider {
     VernonStatus (*begin_commands)(void *user_data, VernonRuntimeProviderObject command_encoder,
                                    VernonRuntimeProviderObject *commands);
     VernonStatus (*end_commands)(void *user_data, VernonRuntimeProviderObject commands);
+    VernonStatus (*resume_commands)(void *user_data, VernonRuntimeProviderObject commands);
     VernonStatus (*encode_bind_pipeline)(void *user_data, VernonRuntimeProviderObject commands,
                                          VernonRuntimeProviderObject pipeline);
     VernonStatus (*encode_bind_group)(void *user_data, VernonRuntimeProviderObject commands, uint32_t index,
                                       VernonRuntimeProviderObject group);
+    /* Binds buffers[i] at vertex binding first_binding + i; the provider keeps them alive for the commands. */
+    VernonStatus (*encode_bind_vertex_buffers)(void *user_data, VernonRuntimeProviderObject commands,
+                                               uint32_t first_binding,
+                                               const VernonRuntimeProviderResourceReference *buffers,
+                                               size_t buffer_count);
     VernonStatus (*encode_dispatch)(void *user_data, VernonRuntimeProviderObject commands,
                                     const VernonRuntimeProviderDispatchDescriptor *descriptor);
     VernonStatus (*encode_draw)(void *user_data, VernonRuntimeProviderObject commands,

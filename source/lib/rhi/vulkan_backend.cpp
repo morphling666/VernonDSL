@@ -351,6 +351,7 @@ void DeviceState::shutdown() {
     if (device) {
         for (StagingPool<StagingChunk> *pool : {&uploadStaging, &readbackStaging})
             pool->clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
+        persistentBlocks.clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
         for (const std::vector<VkDescriptorPool> *pools : {&descriptorPools, &freeFrameDescriptorPools})
             for (VkDescriptorPool pool : *pools)
                 api.destroyDescriptorPool(device, pool, nullptr);
@@ -896,6 +897,21 @@ bool DeviceState::acquireStaging(VkCommandBuffer command, bool upload, VkDeviceS
     mapped = chunk->buffer.mapped + offset;
     return true;
 }
+
+bool DeviceState::placePersistent(VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
+                                  uint8_t *&mapped, uint64_t &key, std::string &error) {
+    StagingChunk *chunk =
+        persistentBlocks.acquire(size, alignment, offset, key, [&](VkDeviceSize capacity, StagingChunk &created) {
+            return createStagingChunk(true, capacity, created, error);
+        });
+    if (!chunk)
+        return false;
+    buffer = chunk->buffer.buffer;
+    mapped = chunk->buffer.mapped + offset;
+    return true;
+}
+
+void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
 
 bool DeviceState::createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error) {
     chunk.capacity = capacity;

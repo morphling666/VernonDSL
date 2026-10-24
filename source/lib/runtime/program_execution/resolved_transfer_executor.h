@@ -3,6 +3,8 @@
 
 #include "materialized_node_frame.h"
 
+#include <vector>
+
 namespace vernon::execution::detail {
 struct RhiCommandExecutionPlan;
 }
@@ -17,9 +19,9 @@ public:
         : context_(context), state_(state) {}
 
     bool prepareGraph(program::GraphDirection graph, std::string &error);
-    VernonStatus appendBeforeConsumer(program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
-                                      vernon::execution::detail::RhiCommandExecutionPlan &commands,
-                                      bool &commandsAppended, std::string &error);
+    // The transfer fragments that must run before `consumer`, in order; none when it needs no transfer.
+    VernonStatus planBeforeConsumer(program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
+                                    std::vector<vernon::execution::detail::RhiCommandExecutionPlan> &fragments);
     bool restoreForRetry(program::GraphDirection graph, SubmissionRecord &submission, std::string &error);
     bool readbackBoundaryValues(const std::vector<char> &values, std::string &error) const;
 

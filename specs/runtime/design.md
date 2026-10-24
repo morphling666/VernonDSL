@@ -367,6 +367,25 @@ through the native calls a fake OpenGL driver receives, not through an RHI trace
 because a trace inside the RHI would cost every shipping draw a lock; the
 real backends are only checked to render the same pixels with labels.
 
+A plan is composed, never revalidated. Producers build fragments (nodes,
+encoders, bindings, initial accesses) freely, but only a validated plan is
+submitted, and it grows only by appending a fragment. An append checks the
+fragment against indices the plan keeps, then commits it or leaves the plan
+unchanged:
+
+- bindings and initial accesses are indexed by alias domain and kind;
+- node accesses are indexed by the same key, and each node has a bit set of
+  its ancestors.
+
+Accesses of different domains or kinds never overlap, so validation and the
+barrier pass compare only accesses within one domain. Composing and
+submitting therefore cost time linear in the plan's accesses, times the
+accesses of one domain. Revalidating the whole plan at every append, plus
+twice more at submission, took 1.4 ms of a 3.4 ms Execute (20 Nodes, 255
+draws). An appended fragment's roots follow the plan's last node, because
+Nodes are recorded in order. Compiled graphs and Program plans submit through
+the same validated plan and share one barrier pass.
+
 Every GPU step of one Execute, pullback apply, or Stage submission goes
 through one submission record: publication initialization and commit copies,
 graph flushes, tape-retry restores, and the immediate Stage encoder. The record
@@ -519,9 +538,10 @@ value fill for compute. Whether the provider receives the artifact's binary or
 source follows from which one the Stage loader filled. Metal also supplies
 native binding resolvers that remap layouts to argument-buffer locations, and
 CUDA supplies its own value fill, since packed host values become host-storage
-buffers there. The binding set is created at the first invocation and updated
-in place afterwards; resolve never creates placeholder bindings, because every
-invocation rewrites all values. The shared pipeline objects own their provider
+buffers there. Each invocation binds one group per set under the owner rule
+of `binding_groups.md` section 6: a persistent group kept by its owner while
+its payload is unchanged, or a transient group of the encoder; resolve
+creates no groups. The shared pipeline objects own their provider
 handles and release them on destruction, so a resolve that fails halfway leaks
 nothing and backends need no teardown hook. Sharing keeps the backends from
 drifting: they report identical diagnostics, each including the provider's
@@ -692,9 +712,9 @@ on the window, set the swap interval, blit the texture into framebuffer 0 with
 its rows reversed, swap, and make the device's own target current again. The
 rows are reversed because the negated vertex y above puts image row 0 at the
 top while framebuffer 0 counts rows from the bottom. The blit goes through a
-framebuffer object created and deleted per present, because the device's own
-framebuffer is reserved for rendering scopes and per-present names cost
-nothing next to the blit.
+framebuffer object created and deleted per present, because the cached
+framebuffers belong to rendering scopes and per-present names cost nothing
+next to the blit.
 
 On every backend the command layer keeps the keys of acquired images whose
 contents are still undefined in a per-device list. Each surface reserves one
@@ -722,10 +742,10 @@ concurrent submission instead. A submission inserts a fence sync, which
 completion polls and waits on; GL itself orders later commands after it and
 defers deleting objects that pending commands use.
 
-The spilled uniform bytes of a transient binding group go to its encoder's
+The spilled uniform bytes of a transient group go to its encoder's
 transient memory (`binding_groups.md` section 8) rather than a buffer per
-group. A persistent group still uploads into a buffer of its own, made once
-with the group. Every draw uses one vertex array per adapter, made
+group, and those of a persistent group to a block of the device's persistent
+block pool, written once with the group. Every draw uses one vertex array per adapter, made
 when the first graphics pipeline is prepared, so invocations create no GL
 objects of their own.
 
@@ -859,11 +879,17 @@ Render scopes:
   buffer on the borrowed queue was rejected: the host owns that queue and
   would have to promise never to use it concurrently.
 - Scope objects do not depend on a pipeline. Vulkan without dynamic rendering
-  caches render passes and framebuffers in the RHI device. OpenGL keeps one
-  scope framebuffer per device, re-attached only when the attachments change;
-  the device's `drawStateGeneration` advances whenever the RHI rebinds it or
-  changes write masks or the scissor, so the adapter's cached draw state is
-  reapplied.
+  caches render passes and framebuffers in the RHI device. OpenGL caches one
+  complete framebuffer per attachment set (texture names plus the stencil
+  flag), attached and completeness-checked when the set is first rendered, so
+  a scope opening only binds it. Re-attaching one shared framebuffer whenever
+  the set changed cost about 6 µs per scope, mostly in
+  `glCheckFramebufferStatus`, because frames alternate their targets.
+  Destroying an image deletes the framebuffers that attach it, imported
+  images included: GL may reuse the texture name, and an unbound framebuffer
+  keeps the texture storage alive. The device's `drawStateGeneration` advances
+  whenever the RHI binds a scope framebuffer or changes write masks or the
+  scissor, so the adapter's cached draw state is reapplied.
 - `GraphicsScopeMaterializer` owns the fused scope: it takes the first Node's
   load operations, updates the stores from each fused Node, and collects the
   reads of every draw of every fused Node; the managed batch begins exactly

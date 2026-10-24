@@ -591,7 +591,7 @@ FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp p
         if (!path.empty() && !boundary &&
             llvm::any_of(boundaries.keys(), [&](StringRef name) { return isDottedPathPrefix(path, name); })) {
             primal.emitError() << "Program VJP wrt path '" << path
-                               << "' names a binding group; select its leaves by dotted name";
+                               << "' names params; select its leaves by dotted name";
             return failure();
         }
         if (path.empty() || !boundary ||

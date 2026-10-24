@@ -4,6 +4,7 @@
 #include "VernonError.hpp"
 #include "VernonRHI.h"
 #include "VernonResult.hpp"
+#include "block_pool.h"
 #include "staging_pool.h"
 
 #if defined(_WIN32)
@@ -127,6 +128,11 @@ struct VERNON_RHI_CAPI DeviceState {
     bool acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE type, bool shaderVisible, uint32_t count,
                             ID3D12DescriptorHeap *&heap, D3D12_CPU_DESCRIPTOR_HANDLE &cpu,
                             D3D12_GPU_DESCRIPTOR_HANDLE &gpu, std::string &error);
+    // Persistent blocks live in upload-heap chunks, which stay in GENERIC_READ, so they serve constant-buffer and
+    // raw-SRV reads without a copy or a transition.
+    bool placePersistent(size_t size, size_t alignment, ID3D12Resource *&resource, size_t &offset, uint8_t *&mapped,
+                         uint64_t &key, std::string &error);
+    void releasePersistent(uint64_t key);
 
     IDXGIFactory6 *factory{};
     IDXGIAdapter1 *adapter{};
@@ -149,6 +155,7 @@ struct VERNON_RHI_CAPI DeviceState {
     std::vector<DeferredRelease> deferredReleases;
     StagingPool<StagingChunk> uploadStaging;
     StagingPool<StagingChunk> readbackStaging;
+    BlockPool<StagingChunk> persistentBlocks;
     uint64_t submittedValue{};
     uint64_t completedValue{};
     size_t bufferCreations{};

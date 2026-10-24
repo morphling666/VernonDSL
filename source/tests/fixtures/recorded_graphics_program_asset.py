@@ -26,9 +26,9 @@ def packed_tint_fragment(
     return vd.Vector([vd.f32(tint.x), vd.f32(tint.y), vd.f32(tint.z), vd.f32(tint.w)]) / 255.0
 
 
-@vd.binding_group
+@vd.params
 class Tint:
-    color: vd.Vector[vd.f32, 4]
+    color: Annotated[vd.Vector[vd.f32, 4], vd.uniform(set=2)]
 
 
 @vd.fragment
@@ -36,10 +36,10 @@ def grouped_tint_fragment(tint: Tint) -> vd.Vector[vd.f32, 4]:
     return tint.color
 
 
-@vd.binding_group
+@vd.params
 class Shape:
     vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()]
-    offset: vd.Vector[vd.f32, 2]
+    offset: Annotated[vd.Vector[vd.f32, 2], vd.uniform(set=1)]
 
     @vd.func
     def position(self) -> vd.Vector[vd.f32, 4]:
@@ -51,6 +51,17 @@ def shape_vertex(shape: Shape) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("po
     return shape.position()
 
 
+@vd.params
+class SharedShape:
+    vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()]
+    offset: Annotated[vd.Vector[vd.f32, 2], vd.uniform()]
+
+
+@vd.vertex
+def shared_shape_vertex(shape: SharedShape) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([shape.vertices + shape.offset, 0.0, 1.0])
+
+
 _targets = vd.target_formats(colors={0: vd.rgba8_unorm})
 
 opaque_pipeline = vd.pipeline(surface_vertex, tinted_fragment, targets=_targets)
@@ -58,6 +69,8 @@ opaque_pipeline = vd.pipeline(surface_vertex, tinted_fragment, targets=_targets)
 grouped_tint_pipeline = vd.pipeline(surface_vertex, grouped_tint_fragment, targets=_targets)
 
 shape_pipeline = vd.pipeline(shape_vertex, tinted_fragment, targets=_targets)
+
+shared_shape_pipeline = vd.pipeline(shared_shape_vertex, tinted_fragment, targets=_targets)
 
 blended_pipeline = vd.pipeline(
     surface_vertex,
@@ -86,7 +99,29 @@ def sampled_fragment(
     return vd.texture_sample(source, source_sampler, vd.Vector([coordinate.x / 32.0, coordinate.y / 32.0]))
 
 
+@vd.fragment
+def set_one_sampled_fragment(
+    coordinate: Annotated[vd.Vector[vd.f32, 4], vd.builtin("frag_coord")],
+    source: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=1)],  # noqa: F722
+    source_sampler: Annotated[vd.Sampler, vd.resource(set=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(source, source_sampler, vd.Vector([coordinate.x / 32.0, coordinate.y / 32.0]))
+
+
+@vd.fragment
+def set_two_sampled_fragment(
+    coordinate: Annotated[vd.Vector[vd.f32, 4], vd.builtin("frag_coord")],
+    source: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=2)],  # noqa: F722
+    source_sampler: Annotated[vd.Sampler, vd.resource(set=2)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(source, source_sampler, vd.Vector([coordinate.x / 32.0, coordinate.y / 32.0]))
+
+
 packed_tint_pipeline = vd.pipeline(surface_vertex, packed_tint_fragment, targets=_targets)
+
+set_one_sampled_pipeline = vd.pipeline(surface_vertex, set_one_sampled_fragment, targets=_targets)
+
+set_two_sampled_pipeline = vd.pipeline(surface_vertex, set_two_sampled_fragment, targets=_targets)
 
 sampled_pipeline = vd.pipeline(surface_vertex, sampled_fragment, targets=_targets)
 
@@ -128,7 +163,10 @@ class OpaquePass(vd.Module):
 
 
 class GroupedTintPass(vd.Module):
-    """`vertices` alone fills group 0 and `tint` fills group 1, so a set binding either one covers a whole group."""
+    """`vertices` belongs to no group and `tint` alone fills set 2, so a set binding `tint` covers a whole group.
+
+    Sets 0 and 1 stay empty: a pipeline binds no group at an index its leaves skip.
+    """
 
     def forward(
         self,
@@ -145,7 +183,7 @@ class GroupedTintPass(vd.Module):
 
 
 class VertexGroupPass(vd.Module):
-    """`shape` fills group 1 with its vertex buffer and offset, and `tint` alone fills group 0."""
+    """`shape` binds its vertex buffer and fills set 1 with its offset, and `tint` alone fills group 0."""
 
     def forward(
         self,
@@ -156,6 +194,21 @@ class VertexGroupPass(vd.Module):
         dynamic_state: vd.DynamicState,
     ) -> Any:
         shape_pipeline(shape=shape, tint=tint, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
+        return vd.color_output(render_pass)
+
+
+class SharedGroupPass(vd.Module):
+    """`shape.offset` and `tint` share group 0, so sets that bind `shape` and `tint` separately split one group."""
+
+    def forward(
+        self,
+        shape: SharedShape,
+        tint: vd.Vector[vd.f32, 4],
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> Any:
+        shared_shape_pipeline(shape=shape, tint=tint, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
         return vd.color_output(render_pass)
 
 
@@ -225,6 +278,50 @@ class SampledPass(vd.Module):
         return vd.color_output(render_pass)
 
 
+class SetOneSampledPass(vd.Module):
+    """Samples `source` from set 1, at the binding a set 2 texture of `SetTwoSampledSurface` takes in its pipeline."""
+
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        source: vd.Texture["2d", vd.f32],  # noqa: F722
+        source_sampler: vd.Sampler,
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> Any:
+        set_one_sampled_pipeline(
+            vertices=vertices,
+            source=source,
+            source_sampler=source_sampler,
+            render_pass=render_pass,
+            draw=draw,
+            dynamic_state=dynamic_state,
+        )
+        return vd.color_output(render_pass)
+
+
+class SetTwoSampledSurface(vd.Module):
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        source: vd.Texture["2d", vd.f32],  # noqa: F722
+        source_sampler: vd.Sampler,
+        render_pass: vd.RenderPass,
+        draw: vd.DrawCommand,
+        dynamic_state: vd.DynamicState,
+    ) -> Any:
+        set_two_sampled_pipeline(
+            vertices=vertices,
+            source=source,
+            source_sampler=source_sampler,
+            render_pass=render_pass,
+            draw=draw,
+            dynamic_state=dynamic_state,
+        )
+        return vd.color_output(render_pass)
+
+
 class MirroredVerticesPass(vd.Module):
     """A compute Node rewrites the caller's `vertices`, so the pass reads them as a fixed endpoint."""
 
@@ -264,6 +361,8 @@ grouped_tint_pass_asset = vd.program_asset(id="runtime/recorded-graphics-grouped
 
 vertex_group_pass_asset = vd.program_asset(id="runtime/recorded-graphics-vertex-group-pass", program=VertexGroupPass())
 
+shared_group_pass_asset = vd.program_asset(id="runtime/recorded-graphics-shared-group-pass", program=SharedGroupPass())
+
 blended_surface_asset = vd.program_asset(id="runtime/recorded-graphics-blended-surface", program=BlendedSurface())
 
 packed_tint_surface_asset = vd.program_asset(
@@ -275,6 +374,14 @@ float_target_surface_asset = vd.program_asset(
 )
 
 sampled_pass_asset = vd.program_asset(id="runtime/recorded-graphics-sampled-pass", program=SampledPass())
+
+set_one_sampled_pass_asset = vd.program_asset(
+    id="runtime/recorded-graphics-set-one-sampled-pass", program=SetOneSampledPass()
+)
+
+set_two_sampled_surface_asset = vd.program_asset(
+    id="runtime/recorded-graphics-set-two-sampled-surface", program=SetTwoSampledSurface()
+)
 
 mirrored_vertices_pass_asset = vd.program_asset(
     id="runtime/recorded-graphics-mirrored-vertices-pass", program=MirroredVerticesPass()

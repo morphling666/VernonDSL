@@ -15,7 +15,6 @@ from ..shader_contracts import (
 )
 from .abi import attribute_layout, value_leaves
 from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
-from .binding_groups import binding_group_occurrence
 from .control_flow_lowering import (
     emit_source_block,
     lower_bool_op,
@@ -38,6 +37,7 @@ from .model import (
     TypedStatement,
 )
 from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower_unary
+from .params import params_root
 from .resource_lowering import lower_texture_sample, lower_texture_size
 from .storage_lowering import (
     lower_buffer_index,
@@ -56,6 +56,14 @@ def _dsl_type_from_contract(contract: TypeContract) -> DslType:
         element = DslType("scalar", contract.name)
         return DslType("tensor", "Tensor", (element, *contract.shape))
     return DslType(contract.kind, contract.name)
+
+
+def _placement_attributes(set_index: int, binding: int) -> tuple[str, ...]:
+    """Only the authored placement; the compiler maps whatever is missing."""
+    attributes = [f"vernon.set = {set_index} : i64"] if set_index >= 0 else []
+    if binding >= 0:
+        attributes.append(f"vernon.binding = {binding} : i64")
+    return tuple(attributes)
 
 
 class _FunctionEmitter:
@@ -185,7 +193,7 @@ class _FunctionEmitter:
         emit_value_abi_metadata = self.stage is not None or self.node.name in self.context.shared_functions
         argument_locations: dict[int, int] = {}
         # Every entry stage's Value parameters carry locations. The module graph assigns them to source parameters,
-        # but binding-group leaves exist only after flattening, so unlocated leaves take the free locations here.
+        # but params leaves exist only after flattening, so unlocated leaves take the free locations here.
         if self.stage is not None:
             candidates: list[tuple[int, AnnotatedType, int, int | None]] = []
 
@@ -230,12 +238,10 @@ class _FunctionEmitter:
                 argument_locations[index] = explicit
 
             next_location = 0
-            # Group leaves follow every ungrouped attribute, matching the module graph, which places ungrouped
-            # parameters before the entry is flattened.
+            # Params leaves follow every other attribute, matching the module graph, which places plain parameters
+            # before the entry is flattened.
             automatic = [candidate for candidate in candidates if candidate[3] is None]
-            automatic.sort(
-                key=lambda candidate: binding_group_occurrence(self.node.args.args[candidate[0]]) is not None
-            )
+            automatic.sort(key=lambda candidate: params_root(self.node.args.args[candidate[0]]) is not None)
             for index, _, span, _ in automatic:
                 while occupied & set(range(next_location, next_location + span)):
                     next_location += 1
@@ -257,10 +263,14 @@ class _FunctionEmitter:
                 access=access,
             )
             self.environment[argument.arg] = value
-            if self.stage == "compute" and any(item.kind == "resource" for item in annotation.metadata):
+            if self.stage == "compute" and any(
+                item.kind == "resource" or (item.kind == "uniform" and any(int(value) >= 0 for value in item.arguments))
+                for item in annotation.metadata
+            ):
                 raise self.context.error(
                     argument,
-                    "kernel Resources bind in argument order; resource(set, binding) applies only to graphics stages",
+                    f"kernel parameters bind in argument order; set and binding apply only to graphics stages: "
+                    f"'{argument.arg}'",
                 )
             attributes = self._metadata_attributes(annotation.metadata, stage=self.stage, is_result=False)
             if index in argument_locations and not any(
@@ -268,9 +278,6 @@ class _FunctionEmitter:
             ):
                 attributes.append(f"vernon.location = {argument_locations[index]} : i64")
             attributes.append(f'vernon.source_name = "{argument.arg}"')
-            group = binding_group_occurrence(argument)
-            if group is not None and self.stage in GRAPHICS_STAGES:
-                attributes.append(f'vernon.binding_group = "{group}"')
             attributes.extend(self._dtype_attributes(annotation.type))
             if annotation.type.kind == "tensor_view":
                 element_type = annotation.type.arguments[0]
@@ -408,14 +415,23 @@ class _FunctionEmitter:
             value = Value(f"%arg{index}", DslType("sampler", "Sampler"))
             self.implicit_samplers[self.environment[texture_name].name] = value
             source_name = f"__vernon_implicit_sampler_{texture_name}"
-            texture_argument = next(argument for argument in self.node.args.args if argument.arg == texture_name)
-            group = binding_group_occurrence(texture_argument)
-            group_attribute = f', vernon.binding_group = "{group}"' if group is not None else ""
+            texture_index = next(
+                index for index, argument in enumerate(self.node.args.args) if argument.arg == texture_name
+            )
+            texture_set = next(
+                (
+                    int(item.arguments[0])
+                    for item in self.argument_annotations[texture_index].metadata
+                    if item.kind == "resource"
+                ),
+                -1,
+            )
+            set_attribute = f", vernon.set = {texture_set} : i64" if texture_set >= 0 else ""
             arguments.append(
                 f'{value.name}: !vernon.sampler {{vernon.interface = "resource", '
                 f'vernon.source_name = "{source_name}", '
                 f'vernon.implicit = "sampler", '
-                f'vernon.implicit_texture = "{texture_name}"{group_attribute}}}'
+                f'vernon.implicit_texture = "{texture_name}"{set_attribute}}}'
             )
 
         for api in self.interface_plan.generated_apis:
@@ -455,25 +471,22 @@ class _FunctionEmitter:
         default_location: int | None = None,
     ) -> list[str]:
         attributes: list[str] = []
+        if stage is None:
+            return attributes
         items = tuple(metadata)
-        interface: str | None = None
+        interface = "output" if is_result else "input"
         if any(item.kind == "resource" for item in items):
             interface = "resource"
         elif any(item.kind == "uniform" for item in items):
             interface = "uniform"
-        elif stage and (is_result or items):
-            interface = "output" if is_result else "input"
-        elif stage:
-            interface = "output" if is_result else "input"
 
         has_slot = any(item.kind in {"attribute", "builtin"} for item in items)
-        if interface:
-            attributes.append(f'vernon.interface = "{interface}"')
-            if interface in {"input", "output"} and not has_slot:
-                if is_result and stage == "vertex":
-                    attributes.append('vernon.builtin = "position"')
-                elif default_location is not None:
-                    attributes.append(f"vernon.location = {default_location} : i64")
+        attributes.append(f'vernon.interface = "{interface}"')
+        if interface in {"input", "output"} and not has_slot:
+            if is_result and stage == "vertex":
+                attributes.append('vernon.builtin = "position"')
+            elif default_location is not None:
+                attributes.append(f"vernon.location = {default_location} : i64")
 
         for item in items:
             if item.kind == "attribute":
@@ -482,21 +495,8 @@ class _FunctionEmitter:
                     attributes.append(f"vernon.location = {location} : i64")
                 if divisor:
                     attributes.append(f"vernon.instance_divisor = {divisor} : i64")
-            elif item.kind == "resource":
-                attributes.extend(
-                    (
-                        f"vernon.set = {item.arguments[0]} : i64",
-                        f"vernon.binding = {item.arguments[1]} : i64",
-                    )
-                )
-            elif item.kind == "uniform":
-                if item.arguments:
-                    attributes.extend(
-                        (
-                            f"vernon.set = {item.arguments[0]} : i64",
-                            f"vernon.binding = {item.arguments[1]} : i64",
-                        )
-                    )
+            elif item.kind in {"resource", "uniform"}:
+                attributes.extend(_placement_attributes(*(int(value) for value in item.arguments)))
             elif item.kind == "varying":
                 attributes.append("vernon.varying = true")
                 if item.arguments:

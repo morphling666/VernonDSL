@@ -28,26 +28,26 @@ class Vertex:
     position: Tensor[f32, (3,)]
     weights: Tensor[f32, (4,)]
 
-@func
+@vertex
 def resources(
-    a: Vector[f32, 3],
-    b: Matrix[f32, 2, 3],
-    data: Annotated[TensorView[Vertex, (dyn,), read], resource(set=1, binding=2)],
+    a: Annotated[Vector[f32, 3], uniform()],
+    b: Annotated[Matrix[f32, 2, 3], uniform()],
+    data: Annotated[TensorView[Vertex, (dyn,), read], resource(set=1)],
     image: Texture["2d", f32],
     sampler: Sampler,
-    flag: bool,
-    signed: i32,
-    unsigned: u32,
-    half: f16,
-    double: f64,
+    flag: Annotated[bool, uniform()],
+    signed: Annotated[i32, uniform()],
+    unsigned: Annotated[u32, uniform()],
+    half: Annotated[f16, uniform()],
+    double: Annotated[f64, uniform()],
     rate: Annotated[f32, attribute(location=5, divisor=2)],
-) -> None:
-    pass
+) -> Annotated[Vector[f32, 4], builtin("position")]:
+    return Vector([rate, 0.0, 0.0, 1.0])
 """
         output = compile_source(source, "types.py")
         self.assertIn("tensor<3xf32>", output)
         self.assertIn("tensor<2x3xf32>", output)
-        self.assertEqual(output.count("tensor<4xf32>"), 1)
+        self.assertIn('"weights:tensor<4xf32>"', output)
         self.assertIn(
             '!vernon.tensor_view<!vernon.struct<"Vertex">, [-1], "read", "device">',
             output,
@@ -248,8 +248,9 @@ def main(
         output = compile_source(source, "sampler_binding_collision.py")
         sampler = output[output.index('vernon.source_name = "__vernon_implicit_sampler_image"') :]
         sampler = sampler[: sampler.index("}")]
-        # The compiler's graphics binding planner owns the sampler binding (test_graphics_storage_reads.py).
-        self.assertNotIn("vernon.set", sampler)
+        # The sampler joins its texture's set; the graphics binding planner owns its binding.
+        self.assertIn("vernon.set = 1 : i64", sampler)
+        self.assertNotIn("vernon.binding", sampler)
         self.assertNotIn("vernon.binding", sampler)
 
     def test_every_unpaired_sampled_texture_gets_an_implicit_sampler(self) -> None:

@@ -151,9 +151,15 @@ VernonStatus executeCpuProgramNode(VernonRuntimeContext &context, const program:
         return fail(&context, std::move(error));
 
     submission = vernon::runtime::program_execution::SubmissionState::Indeterminate;
-    auto invoked = invokeBackendComputePipeline(pipeline, plan, nullptr);
-    if (invoked.isErr()) {
-        const VernonStatus status = vernon::toVernonStatus(std::move(invoked).error());
+    auto stream = beginCommandStream(context, plan.commandEncoder);
+    if (stream.isErr())
+        return fail(&context, programNodeName(node) + ": cannot begin CPU commands",
+                    vernon::toVernonStatus(std::move(stream).error()));
+    auto invoked = invokeBackendComputePipeline(pipeline, stream.value(), plan, nullptr);
+    auto ended = stream.value().end();
+    if (invoked.isErr() || ended.isErr()) {
+        const VernonStatus status =
+            vernon::toVernonStatus(invoked.isErr() ? std::move(invoked).error() : std::move(ended).error());
         std::string &detail = invocationDiagnostic(context);
         if (detail.empty())
             detail = "pipeline compute failed";
@@ -202,6 +208,8 @@ public:
     }
     void append(vernon::execution::detail::CommandNode &command,
                 std::vector<vernon::execution::detail::RhiCommandResourceBinding> &bindings) const {
+        // Keys are ordered by buffer, so both kinds of read of one buffer are adjacent and bind it once.
+        const uint64_t *previous = nullptr;
         for (const auto &[key, range] : ranges_) {
             VernonRhiBuffer buffer{};
             decodeRhiResourceKey(key.first, buffer);
@@ -209,7 +217,10 @@ public:
                 buffer, range.begin, range.end - range.begin, vernon::execution::AccessMode::Read,
                 VERNON_RHI_STATE_SHADER_READ, VERNON_RHI_STAGE_VERTEX,
                 key.second ? VERNON_RHI_ACCESS_INDEX_READ : VERNON_RHI_ACCESS_VERTEX_READ));
-            vernon::execution::detail::appendRhiBufferBinding(bindings, buffer);
+            if (!previous || *previous != key.first)
+                bindings.push_back(
+                    {vernon::rhi::encodeResourceKey(buffer), vernon::execution::ResourceKind::Buffer, buffer, {}});
+            previous = &key.first;
         }
     }
 
@@ -320,6 +331,8 @@ struct ManagedGraphicsBatchMember {
 // Recorded draws point into the invocation's recordings, which the submission keeps until the batch is encoded.
 struct ManagedGraphicsCommandBatch {
     VernonRuntimeContext *context{};
+    // The plan's stream, which the plan retains with the batch.
+    EncoderCommandStream *stream{};
     GraphicsRenderScope scope;
     std::vector<ManagedGraphicsDraw> draws;
     std::vector<const VernonProgramArgument *> arguments;
@@ -354,16 +367,15 @@ void appendManagedGraphicsNode(ManagedGraphicsCommandBatch &batch, ManagedGraphi
                           std::make_move_iterator(node.retained.end()));
 }
 
-VernonRhiStatus encodeManagedGraphicsDraw(VernonRuntimeCoreCommands *commands, VernonRuntimeProviderObject encoder,
-                                          GroupStore &transient, GraphicsStream &stream,
+VernonRhiStatus encodeManagedGraphicsDraw(CommandStream &commands, GraphicsStream &stream,
                                           const ManagedGraphicsCommandBatch &batch, const ManagedGraphicsDraw &draw) {
     const GraphicsCommand command{batch.arguments.data() + draw.firstArgument,
                                   draw.targets,
                                   draw.graphicsState,
                                   draw.draw,
-                                  {batch.owners.data() + draw.firstArgument, draw.command, &transient, {}},
-                                  encoder};
-    auto invoked = invokeBackendPipeline(*draw.stage, commands, command, stream);
+                                  {batch.owners.data() + draw.firstArgument, draw.command, &commands.transient(), {}},
+                                  commands.encoder()};
+    auto invoked = invokeBackendPipeline(*draw.stage, commands.commands(), command, stream);
     if (invoked.isOk())
         return VERNON_RHI_STATUS_OK;
     const vernon::RuntimeError error = std::move(invoked).error();
@@ -387,9 +399,8 @@ VernonRhiStatus encodeRecordedDebugCommand(VernonRhiDevice device, VernonRhiComm
 }
 
 VernonRhiStatus encodeManagedGraphicsMember(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                            VernonRuntimeCoreCommands *commands,
-                                            VernonRuntimeProviderObject providerEncoder, GroupStore &transient,
-                                            GraphicsStream &stream, const ManagedGraphicsCommandBatch &batch,
+                                            CommandStream &commands, GraphicsStream &stream,
+                                            const ManagedGraphicsCommandBatch &batch,
                                             const ManagedGraphicsBatchMember &member, size_t firstDraw) {
     size_t command = 0;
     for (size_t draw = firstDraw;; ++draw) {
@@ -401,8 +412,7 @@ VernonRhiStatus encodeManagedGraphicsMember(VernonRhiDevice device, VernonRhiCom
                 return status;
         if (draw == member.drawEnd)
             return VERNON_RHI_STATUS_OK;
-        if (const VernonRhiStatus status =
-                encodeManagedGraphicsDraw(commands, providerEncoder, transient, stream, batch, batch.draws[draw]);
+        if (const VernonRhiStatus status = encodeManagedGraphicsDraw(commands, stream, batch, batch.draws[draw]);
             status != VERNON_RHI_STATUS_OK)
             return status;
     }
@@ -411,18 +421,16 @@ VernonRhiStatus encodeManagedGraphicsMember(VernonRhiDevice device, VernonRhiCom
 VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder encoder) {
     auto &batch = *static_cast<ManagedGraphicsCommandBatch *>(opaque);
     const VernonRhiDevice device = batch.context->rhiDevice;
-    auto providerEncoder = referenceBackendCommandEncoder(*batch.context, encoder);
-    if (providerEncoder.isErr()) {
-        invocationDiagnostic(*batch.context) = "failed to reference the managed graphics command encoder";
-        return vernon::toVernonRhiStatus(std::move(providerEncoder).error());
+    auto acquired = batch.stream->acquire(encoder);
+    if (acquired.isErr()) {
+        if (invocationDiagnostic(*batch.context).empty())
+            invocationDiagnostic(*batch.context) = "failed to acquire the managed graphics command stream";
+        return vernon::toVernonRhiStatus(std::move(acquired).error());
     }
-    GroupStore transient(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
+    CommandStream &commands = *acquired.value();
     GraphicsStream stream;
-    auto commands = beginBackendCommands(*batch.context, providerEncoder.value());
-    if (commands.isErr())
-        return vernon::toVernonRhiStatus(std::move(commands).error());
     if (auto begun =
-            beginBackendRendering(*batch.context, commands.value().get(), graphicsRenderingDescriptor(batch.scope));
+            beginBackendRendering(*batch.context, commands.commands(), graphicsRenderingDescriptor(batch.scope));
         begun.isErr())
         return vernon::toVernonRhiStatus(std::move(begun).error());
     VernonRhiStatus status = VERNON_RHI_STATUS_OK;
@@ -433,21 +441,17 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
         if (memberGroups)
             status = vernonRhiCommandEncoderPushDebugGroup(device, encoder, {member.label.data(), member.label.size()});
         if (status == VERNON_RHI_STATUS_OK)
-            status = encodeManagedGraphicsMember(device, encoder, commands.value().get(), providerEncoder.value(),
-                                                 transient, stream, batch, member, firstDraw);
+            status = encodeManagedGraphicsMember(device, encoder, commands, stream, batch, member, firstDraw);
         if (memberGroups && status == VERNON_RHI_STATUS_OK)
             status = vernonRhiCommandEncoderPopDebugGroup(device, encoder);
         if (status != VERNON_RHI_STATUS_OK)
             break;
         firstDraw = member.drawEnd;
     }
-    auto ended = endBackendRendering(*batch.context, commands.value().get());
-    auto finished = commands.value().end();
+    auto ended = endBackendRendering(*batch.context, commands.commands());
     if (status != VERNON_RHI_STATUS_OK)
         return status;
-    if (ended.isErr())
-        return vernon::toVernonRhiStatus(std::move(ended).error());
-    return finished.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(std::move(finished).error());
+    return ended.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(std::move(ended).error());
 }
 
 // The owner of each argument of `frame`, the frame of the Node that `node` keys: the Program instance binding that the
@@ -657,7 +661,7 @@ VernonStatus executePipelineProgramGraphImpl(
         return VERNON_STATUS_OK;
     }
     {
-        vernon::execution::detail::RhiCommandExecutionPlan commandPlan;
+        vernon::execution::detail::ValidatedRhiCommandPlan commandPlan;
         vernon::runtime::program_execution::ResolvedTransferExecutor transfers(context, arena);
         const std::optional<program::GraphDirection> graphDirection = program::graphDirection(graph.direction);
         std::string transferError;
@@ -667,35 +671,48 @@ VernonStatus executePipelineProgramGraphImpl(
         GraphicsScopeMaterializer graphicsScopeMaterializer;
         vernon::execution::detail::RhiCommandExecutionPlan graphicsNodePlan;
         GraphicsBufferReads graphicsBufferReads;
+        // The submitted plan's producers share one command stream on its encoder.
+        std::shared_ptr<EncoderCommandStream> commandStream;
+        const auto sharedCommandStream = [&]() -> EncoderCommandStream & {
+            if (!commandStream)
+                commandStream = std::make_shared<EncoderCommandStream>(context);
+            return *commandStream;
+        };
+        const auto retainCommandStream = [&](vernon::execution::detail::RhiCommandExecutionPlan &fragment) {
+            fragment.finishers.push_back({EncoderCommandStream::finish, commandStream.get()});
+            fragment.retainedContexts.push_back(commandStream);
+        };
         const auto appendGraphicsBatch = [&]() {
             if (!graphicsBatch)
                 return VERNON_STATUS_OK;
             graphicsBufferReads.append(graphicsNodePlan.commands.nodes.back(), graphicsNodePlan.bindings);
             graphicsBufferReads = {};
             std::string compositionError;
-            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(graphicsNodePlan),
-                                                                          true, compositionError))
+            if (!commandPlan.append(std::move(graphicsNodePlan), compositionError))
                 return fail(&context, std::move(compositionError));
             graphicsNodePlan = {};
             graphicsBatch.reset();
             return VERNON_STATUS_OK;
         };
         // A Node's transfers are planned apart so that a graphics Node can end the open render batch before them.
-        const auto appendNodeTransfers = [&](vernon::execution::detail::RhiCommandExecutionPlan &&nodeTransfers,
-                                             const std::shared_ptr<const CommandScope> &scope) {
-            setScope(nodeTransfers.encoders, scope);
-            std::string compositionError;
-            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(nodeTransfers), true,
-                                                                          compositionError))
-                return fail(&context, std::move(compositionError));
-            return VERNON_STATUS_OK;
-        };
+        const auto appendNodeTransfers =
+            [&](std::vector<vernon::execution::detail::RhiCommandExecutionPlan> &&nodeTransfers,
+                const std::shared_ptr<const CommandScope> &scope) {
+                for (vernon::execution::detail::RhiCommandExecutionPlan &fragment : nodeTransfers) {
+                    setScope(fragment.encoders, scope);
+                    std::string compositionError;
+                    if (!commandPlan.append(std::move(fragment), compositionError))
+                        return fail(&context, std::move(compositionError));
+                }
+                return VERNON_STATUS_OK;
+            };
         const auto flushCommands = [&]() {
             if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
                 return pending;
-            if (commandPlan.commands.nodes.empty())
+            if (commandPlan.empty())
                 return VERNON_STATUS_OK;
             graphicsScopeMaterializer.reset();
+            commandStream.reset();
             return submission.execute(std::exchange(commandPlan, {}), step);
         };
         // Per Value, the boundary slot whose instance binding supplies it.
@@ -776,15 +793,14 @@ VernonStatus executePipelineProgramGraphImpl(
                         copiesBefore.insert(copiesBefore.end(), setCopies.begin(), setCopies.end());
                     }
                 }
-                vernon::execution::detail::RhiCommandExecutionPlan nodeTransfers;
-                bool transferCommandsAppended = false;
-                if (const VernonStatus status = transfers.appendBeforeConsumer(
-                        {*direction, node.id}, copiesBefore, nodeTransfers, transferCommandsAppended, transferError);
+                std::vector<vernon::execution::detail::RhiCommandExecutionPlan> nodeTransfers;
+                if (const VernonStatus status =
+                        transfers.planBeforeConsumer({*direction, node.id}, copiesBefore, nodeTransfers);
                     status != VERNON_STATUS_OK)
                     return status;
                 const std::shared_ptr<CommandScope> scope = nodeScope(node);
                 // Transfers run before this Node's draws, so they end the open scope and this Node opens its own.
-                if (transferCommandsAppended) {
+                if (!nodeTransfers.empty()) {
                     if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
                         return pending;
                     if (const VernonStatus appended = appendNodeTransfers(std::move(nodeTransfers), scope);
@@ -825,6 +841,8 @@ VernonStatus executePipelineProgramGraphImpl(
                 if (!graphicsBatch) {
                     graphicsBatch = std::make_shared<ManagedGraphicsCommandBatch>();
                     graphicsBatch->context = &context;
+                    graphicsBatch->stream = &sharedCommandStream();
+                    retainCommandStream(graphicsNodePlan);
                     graphicsBatch->commandScope = scope;
                     vernon::execution::detail::CommandNode drawCommand;
                     drawCommand.kind = vernon::execution::detail::CommandNodeKind::Derivative;
@@ -859,17 +877,14 @@ VernonStatus executePipelineProgramGraphImpl(
                     materializationError))
                 return fail(&context, std::move(materializationError));
             const std::shared_ptr<const CommandScope> scope = nodeScope(node);
-            vernon::execution::detail::RhiCommandExecutionPlan nodeTransfers;
-            bool transferCommandsAppended = false;
-            if (const VernonStatus status =
-                    transfers.appendBeforeConsumer({*direction, node.id}, materializedNodes.back().deviceCopiesBefore,
-                                                   nodeTransfers, transferCommandsAppended, transferError);
+            std::vector<vernon::execution::detail::RhiCommandExecutionPlan> nodeTransfers;
+            if (const VernonStatus status = transfers.planBeforeConsumer(
+                    {*direction, node.id}, materializedNodes.back().deviceCopiesBefore, nodeTransfers);
                 status != VERNON_STATUS_OK)
                 return status;
-            if (transferCommandsAppended)
-                if (const VernonStatus appended = appendNodeTransfers(std::move(nodeTransfers), scope);
-                    appended != VERNON_STATUS_OK)
-                    return appended;
+            if (const VernonStatus appended = appendNodeTransfers(std::move(nodeTransfers), scope);
+                appended != VERNON_STATUS_OK)
+                return appended;
             vernon::execution::detail::RhiCommandExecutionPlan nodePlan;
             VernonLaunchSize grid{};
             std::string gridError;
@@ -888,16 +903,16 @@ VernonStatus executePipelineProgramGraphImpl(
             if (!grid.x || !grid.y || !grid.z)
                 continue;
             const VernonStatus planned = vernon::runtime::program_execution::buildPipelineCommandPlan(
-                context, {}, {}, *resolvedNode->stage, materializedNodes.back().arguments,
+                context, sharedCommandStream(), {}, {}, *resolvedNode->stage, materializedNodes.back().arguments,
                 frameOwners(invocationContext, valueSlots, nodeKey, *resolvedNode, materializedNodes.back()), grid,
                 materializedNodes.back().deviceCopiesAfter, vernon::execution::detail::CommandNodeKind::Derivative,
                 nodePlan);
             if (planned != VERNON_STATUS_OK)
                 return planned;
+            retainCommandStream(nodePlan);
             setScope(nodePlan.encoders, scope);
             std::string compositionError;
-            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(nodePlan), true,
-                                                                          compositionError))
+            if (!commandPlan.append(std::move(nodePlan), compositionError))
                 return fail(&context, std::move(compositionError));
         }
         return flushCommands();
@@ -906,23 +921,22 @@ VernonStatus executePipelineProgramGraphImpl(
 }
 
 // Encodes the planned `invocation`, alone, on `commands` inside their rendering scope.
-VernonStatus encodePlannedGraphics(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus encodePlannedGraphics(VernonStageExecutable &pipeline, CommandStream &commands,
                                    const VernonStageInvocationDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan) {
-    GroupStore transient(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
     GraphicsStream stream;
     const GraphicsCommand command{plan.arguments.data(),
                                   &plan.targets,
                                   invocation.graphics_state,
                                   plan.draw,
-                                  {nullptr, &plan, &transient, {}},
-                                  invocation.command_encoder};
-    auto invoked = invokeBackendPipeline(pipeline, commands, command, stream);
+                                  {nullptr, &plan, &commands.transient(), {}},
+                                  commands.encoder()};
+    auto invoked = invokeBackendPipeline(pipeline, commands.commands(), command, stream);
     return invoked.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(invoked).error());
 }
 
-VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation,
-                                   const ArgumentOwner *owners) {
+VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, CommandStream &commands,
+                                   const VernonStageInvocationDescriptor &invocation, const ArgumentOwner *owners) {
     if (!pipeline.bindingProjection.compute.empty()) {
         const uint32_t grid[3]{invocation.compute_grid.x, invocation.compute_grid.y, invocation.compute_grid.z};
         const uint32_t workgroup[3]{pipeline.workgroupSize.x, pipeline.workgroupSize.y, pipeline.workgroupSize.z};
@@ -933,7 +947,7 @@ VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const Vernon
         std::string planningError;
         if (!planComputeInvocation(pipeline.bindingProjection, invocation, plan, planningError))
             return fail(pipeline.context, planningError);
-        auto invoked = invokeBackendComputePipeline(pipeline, plan, owners);
+        auto invoked = invokeBackendComputePipeline(pipeline, commands, plan, owners);
         return invoked.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(invoked).error());
     }
     PlannedGraphicsInvocation plan;
@@ -941,7 +955,7 @@ VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const Vernon
     if (!planGraphicsInvocation(pipeline.bindingProjection, pipeline.drawLayout, invocation, describeRuntimeImage,
                                 pipeline.context, plan, planningError))
         return fail(pipeline.context, std::move(planningError));
-    return encodePlannedGraphics(pipeline, nullptr, invocation, plan);
+    return encodePlannedGraphics(pipeline, commands, invocation, plan);
 }
 
 } // namespace
@@ -977,7 +991,12 @@ VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipelin
         *pipeline->context, std::make_shared<program_execution::SubmissionRecord>(*pipeline->context));
     submission->lifecycle.emplace(std::move(child).value());
     if (pipeline->context->rhiDevice.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
-        const VernonStatus status = encodeStageInvocation(*pipeline, *invocation, nullptr);
+        auto commands = beginCommandStream(*pipeline->context, invocation->command_encoder);
+        if (commands.isErr())
+            return vernon::toVernonStatus(std::move(commands).error());
+        VernonStatus status = encodeStageInvocation(*pipeline, commands.value(), *invocation, nullptr);
+        if (auto ended = commands.value().end(); status == VERNON_STATUS_OK && ended.isErr())
+            status = vernon::toVernonStatus(std::move(ended).error());
         if (status != VERNON_STATUS_OK)
             return status;
         submission->record->setOutcome({program_execution::SubmissionState::Completed, {}});
@@ -996,21 +1015,14 @@ VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipelin
     if (vernonRhiDeviceCreateCommandEncoder(pipeline->context->rhiDevice, &descriptor, &native) != VERNON_RHI_STATUS_OK)
         return fail(pipeline->context, "failed to create the immediate command encoder");
     VernonStageInvocationDescriptor encoded = *invocation;
-    auto referencedEncoder = referenceBackendCommandEncoder(*pipeline->context, native);
-    VernonStatus status =
-        referencedEncoder.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(referencedEncoder).error());
-    if (status == VERNON_STATUS_OK)
-        encoded.command_encoder = referencedEncoder.value();
+    EncoderCommandStream stream(*pipeline->context);
+    auto acquired = stream.acquire(native);
+    VernonStatus status = acquired.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(acquired).error());
+    CommandStream *commands = status == VERNON_STATUS_OK ? acquired.value() : nullptr;
+    if (commands)
+        encoded.command_encoder = commands->encoder();
     bool rendering = false;
     PlannedGraphicsInvocation plan;
-    BackendCommands commands;
-    if (status == VERNON_STATUS_OK && graphics) {
-        auto begun = beginBackendCommands(*pipeline->context, encoded.command_encoder);
-        if (begun.isErr())
-            status = vernon::toVernonStatus(std::move(begun).error());
-        else
-            commands = std::move(begun).value();
-    }
     if (status == VERNON_STATUS_OK && graphics) {
         std::string planningError;
         if (!planGraphicsInvocation(pipeline->bindingProjection, pipeline->drawLayout, encoded, describeRuntimeImage,
@@ -1025,7 +1037,8 @@ VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipelin
         }
         if (status == VERNON_STATUS_OK) {
             const GraphicsRenderScope scope = graphicsRenderScope(plan.targets, std::move(reads));
-            auto begun = beginBackendRendering(*pipeline->context, commands.get(), graphicsRenderingDescriptor(scope));
+            auto begun =
+                beginBackendRendering(*pipeline->context, commands->commands(), graphicsRenderingDescriptor(scope));
             if (begun.isErr())
                 status = vernon::toVernonStatus(std::move(begun).error());
             else
@@ -1033,17 +1046,17 @@ VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipelin
         }
     }
     if (status == VERNON_STATUS_OK && graphics) {
-        status = encodePlannedGraphics(*pipeline, commands.get(), encoded, plan);
+        status = encodePlannedGraphics(*pipeline, *commands, encoded, plan);
     } else if (status == VERNON_STATUS_OK) {
-        status = encodeStageInvocation(*pipeline, encoded, nullptr);
+        status = encodeStageInvocation(*pipeline, *commands, encoded, nullptr);
     }
     if (rendering) {
-        auto ended = endBackendRendering(*pipeline->context, commands.get());
+        auto ended = endBackendRendering(*pipeline->context, commands->commands());
         if (status == VERNON_STATUS_OK && ended.isErr())
             status = vernon::toVernonStatus(std::move(ended).error());
     }
-    if (commands.get()) {
-        auto ended = commands.end();
+    if (commands) {
+        auto ended = commands->end();
         if (status == VERNON_STATUS_OK && ended.isErr())
             status = vernon::toVernonStatus(std::move(ended).error());
     }
@@ -1069,7 +1082,7 @@ VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipelin
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernon::runtime::encodeResolvedStage(VernonRuntimeProviderObject encoder, VernonStageExecutable *pipeline,
+VernonStatus vernon::runtime::encodeResolvedStage(CommandStream &stream, VernonStageExecutable *pipeline,
                                                   const VernonStageInvocationDescriptor *invocation,
                                                   const ArgumentOwner *owners) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
@@ -1082,8 +1095,8 @@ VernonStatus vernon::runtime::encodeResolvedStage(VernonRuntimeProviderObject en
     if (pipelinePin.isErr())
         return fail(pipeline->context, "resolved Stage is closing");
     VernonStageInvocationDescriptor encoded = *invocation;
-    encoded.command_encoder = encoder;
-    return encodeStageInvocation(*pipeline, encoded, owners);
+    encoded.command_encoder = stream.encoder();
+    return encodeStageInvocation(*pipeline, stream, encoded, owners);
 }
 
 VernonStageExecutable::~VernonStageExecutable() {

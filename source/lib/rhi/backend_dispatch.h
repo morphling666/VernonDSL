@@ -156,6 +156,15 @@ struct CommandTransientReservation {
     void *mapped{};
 };
 
+// A block of a device's persistent memory: the native buffer and byte offset as in CommandTransient, the block's
+// address when the memory is host-visible, and the key that releases it.
+struct PersistentBlock {
+    uint64_t buffer{};
+    uint64_t offset{};
+    void *mapped{};
+    uint64_t key{};
+};
+
 struct ImageResourceDescription {
     VernonRhiImageDescriptor image{};
 };
@@ -204,6 +213,14 @@ using WriteTransientCallback = Result<CommandTransient, RhiError> (*)(VernonRhiD
 using ReserveTransientCallback = Result<CommandTransientReservation, RhiError> (*)(VernonRhiDevice, uint64_t encoderKey,
                                                                                    uint64_t native, uint64_t size,
                                                                                    uint64_t alignment) noexcept;
+// Places `size` bytes in device memory that backs uniform and storage buffer bindings until the block is released, at
+// an offset that is a multiple of `alignment`, a power of two. It copies `data` in, or, when `data` is null, leaves the
+// block for the host to fill at `mapped`, which only backends with host-visible memory allow. The device pools the
+// memory, so steady-state placement makes no native buffers.
+using PlacePersistentCallback = Result<PersistentBlock, RhiError> (*)(VernonRhiDevice, const void *data, uint64_t size,
+                                                                      uint64_t alignment) noexcept;
+// Returns the block of `key` for reuse at once, so it is released only after every command that reads it completed.
+using ReleasePersistentCallback = void (*)(VernonRhiDevice, uint64_t key) noexcept;
 // Opens the native scope of `scope` on the encoder, applying its load operations, after making `reads` readable by
 // shaders. Attachments and reads are retained and transitioned through the encoder, so a failure leaves rollbacks that
 // restore their state.
@@ -318,6 +335,8 @@ struct BackendDispatch {
     Option<RecordImageCopyCallback> recordImageCopy;
     Option<WriteTransientCallback> writeTransient;
     Option<ReserveTransientCallback> reserveTransient;
+    Option<PlacePersistentCallback> placePersistent;
+    Option<ReleasePersistentCallback> releasePersistent;
     Option<BeginRenderingCallback> beginRendering;
     Option<EndRenderingCallback> endRendering;
     Option<ClearColorCallback> clearColor;

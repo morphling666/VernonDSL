@@ -11,12 +11,12 @@ class SurfaceParams:
     gain: vd.f32
 
 
-@vd.binding_group
+@vd.params
 class Lookup:
     weights: vd.TensorView[vd.f32, (vd.dyn,), vd.read]
 
 
-@vd.binding_group
+@vd.params
 class Surface:
     params: SurfaceParams
     albedo: vd.Texture["2d", vd.f32]  # noqa: F722
@@ -29,7 +29,7 @@ class Surface:
         return texel * self.params.tint * self.lookup.weights[0]
 
 
-@vd.binding_group
+@vd.params
 class Flat:
     params: SurfaceParams
 
@@ -57,7 +57,7 @@ def surface_fragment(surface: Surface, flat: Flat) -> vd.Vector[vd.f32, 4]:
     return apply(surface, uv) + apply(flat, uv)
 
 
-@vd.binding_group
+@vd.params
 class Layered:
     params: SurfaceParams
     weights: vd.Texture["2d", vd.f32]  # noqa: F722
@@ -68,7 +68,7 @@ def layered_fragment(layered: Layered) -> vd.Vector[vd.f32, 4]:
     return layered.params.tint
 
 
-@vd.binding_group
+@vd.params
 class Accumulator:
     params: SurfaceParams
     lookup: Lookup
@@ -85,7 +85,7 @@ def accumulate(
     output[x] = terms.lookup.weights[x] * terms.params.gain + terms.bias[x] + terms.params.tint[0]
 
 
-@vd.binding_group
+@vd.params
 class Affine:
     gain: vd.f32
     offset: vd.f32
@@ -112,7 +112,7 @@ def apply_term(terms, x):
     return terms.term(x)
 
 
-@vd.binding_group
+@vd.params
 class Volume:
     image: vd.Texture["3d", vd.rgba32_float, vd.read_write]  # noqa: F722
     gain: vd.f32

@@ -479,7 +479,10 @@ spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location loc
     };
     IntegerAttr locationAttr = toI32(interface.location);
     IntegerAttr bindingAttr = toI32(interface.binding);
-    IntegerAttr setAttr = toI32(interface.descriptorSet);
+    // A set without a binding names a group whose bindings are planned elsewhere; only a bound variable is decorated.
+    IntegerAttr setAttr = !bindingAttr              ? IntegerAttr{}
+                          : interface.descriptorSet ? toI32(interface.descriptorSet)
+                                                    : builder.getI32IntegerAttr(0);
     StringAttr builtInAttr;
     std::optional<spirv::BuiltIn> builtIn;
     if (auto spelling = dyn_cast_if_present<StringAttr>(interface.builtin)) {

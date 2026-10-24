@@ -21,40 +21,47 @@ inline BackendPipelineResult backendPipelineResolutionFailure(BackendStageBuildI
 BackendPipelineResult resolveCpuPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                          VernonStageExecutable &pipeline);
 void destroyCpuPipeline(VernonStageExecutable &pipeline);
-VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+// Compute invocations dispatch on `commands`, whose transient groups `transient` keeps.
+VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                      GroupStore &transient, const PlannedComputeLaunch &plan,
                                       const ArgumentOwner *owners);
 
 BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                           VernonStageExecutable &pipeline);
-VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                       GroupStore &transient, const PlannedComputeLaunch &plan,
                                        const ArgumentOwner *owners);
 
 BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
 VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
                                           const GraphicsCommand &command, GraphicsStream &stream);
-VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                         GroupStore &transient, const PlannedComputeLaunch &plan,
                                          const ArgumentOwner *owners);
 
 BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                                VernonStageExecutable &pipeline);
 VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
                                              const GraphicsCommand &command, GraphicsStream &stream);
-VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                            GroupStore &transient, const PlannedComputeLaunch &plan,
                                             const ArgumentOwner *owners);
 
 BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                            VernonStageExecutable &pipeline);
 VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
                                          const GraphicsCommand &command, GraphicsStream &stream);
-VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                        GroupStore &transient, const PlannedComputeLaunch &plan,
                                         const ArgumentOwner *owners);
 
 BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
 VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
                                           const GraphicsCommand &command, GraphicsStream &stream);
-VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
+VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                         GroupStore &transient, const PlannedComputeLaunch &plan,
                                          const ArgumentOwner *owners);
 
 } // namespace vernon::runtime

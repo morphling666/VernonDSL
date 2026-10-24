@@ -133,13 +133,14 @@ VernonStatus SubmissionRecord::fail(const char *fallback) {
     return VERNON_STATUS_INTERNAL_ERROR;
 }
 
-VernonStatus SubmissionRecord::submit(execution::detail::RhiCommandExecutionPlan plan) {
+VernonStatus SubmissionRecord::submit(execution::detail::ValidatedRhiCommandPlan plan) {
     if (injectFailure(FailureBoundary::Submission)) {
         invocationDiagnostic(*context_) = "injected GPU command DAG encoding failure";
         return VERNON_STATUS_INTERNAL_ERROR;
     }
+    const std::vector<execution::detail::CommandNode> &nodes = plan.plan().commands.nodes;
     const uint32_t requiredCapabilities =
-        std::any_of(plan.commands.nodes.begin(), plan.commands.nodes.end(),
+        std::any_of(nodes.begin(), nodes.end(),
                     [](const auto &node) { return node.queue == execution::detail::CommandQueueClass::Graphics; })
             ? VERNON_RHI_QUEUE_GRAPHICS
             : VERNON_RHI_QUEUE_COMPUTE;
@@ -149,7 +150,7 @@ VernonStatus SubmissionRecord::submit(execution::detail::RhiCommandExecutionPlan
     if (execution::detail::submitRhiCommandPlan(context_->rhiDevice, requiredCapabilities, plan, completion,
                                                 timings_ ? &timedScopes : nullptr) != VERNON_RHI_STATUS_OK)
         return fail("GPU command program failed");
-    pending_.push_back({completion, std::move(plan.retainedContexts), std::move(timedScopes), submitted_++});
+    pending_.push_back({completion, plan.takeRetainedContexts(), std::move(timedScopes), submitted_++});
     return VERNON_STATUS_OK;
 }
 
@@ -178,7 +179,7 @@ VernonStatus SubmissionRecord::wait() {
     return succeeded && status_ == VERNON_STATUS_OK ? VERNON_STATUS_OK : fail("GPU command program failed");
 }
 
-VernonStatus SubmissionRecord::execute(execution::detail::RhiCommandExecutionPlan plan, SubmissionState &step) {
+VernonStatus SubmissionRecord::execute(execution::detail::ValidatedRhiCommandPlan plan, SubmissionState &step) {
     step = SubmissionState::NotSubmitted;
     if (const VernonStatus status = submit(std::move(plan)); status != VERNON_STATUS_OK)
         return status;

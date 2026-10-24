@@ -11,7 +11,7 @@ from typing import Any, NoReturn, Self, TypeAlias
 import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
-from ._markers import declaration_source, is_binding_group, is_struct_class
+from ._markers import declaration_source, is_params, is_struct_class
 from ._texture_format import TextureFormat
 from .source_identity import project_module_name, project_root
 
@@ -260,7 +260,7 @@ Sampler = TypeExpr("Sampler")
 
 
 class _TypeKind:
-    """The kind of a specialization whose value is a `@struct` class, a `@binding_group` class, or a scalar type."""
+    """The kind of a specialization whose value is a `@struct` class, a `@params` class, or a scalar type."""
 
     name = "type"
 
@@ -391,7 +391,7 @@ def type_identity(value: object) -> str:
 
     if isinstance(value, _Scalar):
         return value.name
-    if not is_struct_class(value) and not is_binding_group(value):
+    if not is_struct_class(value) and not is_params(value):
         raise TypeError(f"type specialization requires a declared type or scalar type, not {value!r}")
     assert isinstance(value, builtins.type)
     source = declaration_source(value)
@@ -407,7 +407,7 @@ def type_identity(value: object) -> str:
 
 def specialization_assignment(parameter: Specialization, value: object) -> SpecializationAssignment:
     if parameter.type is type_kind:
-        source = declaration_source(value) if is_struct_class(value) or is_binding_group(value) else None
+        source = declaration_source(value) if is_struct_class(value) or is_params(value) else None
         return SpecializationAssignment(parameter.name, "type", type_identity(value), value, source)
     if parameter.type is format_kind:
         if not isinstance(value, TextureFormat) or "color" not in value.aspects:
@@ -474,9 +474,7 @@ def builtin(name: str) -> Annotation:
 
 
 def uniform(set: int | None = None, binding: int | None = None) -> Annotation:
-    if (set is None) != (binding is None):
-        raise ValueError("uniform set and binding must be provided together")
-    return _annotation("uniform", *((set, binding) if set is not None else ()))
+    return _annotation("uniform", -1 if set is None else set, -1 if binding is None else binding)
 
 
 class Interpolation(Enum):
@@ -500,5 +498,5 @@ def varying(interpolation: Interpolation | None = None) -> Annotation:
     return _annotation("varying", interpolation.value)
 
 
-def resource(set: int, binding: int) -> Annotation:
-    return _annotation("resource", set, binding)
+def resource(set: int | None = None, binding: int | None = None) -> Annotation:
+    return _annotation("resource", -1 if set is None else set, -1 if binding is None else binding)

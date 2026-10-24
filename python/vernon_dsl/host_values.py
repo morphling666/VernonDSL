@@ -341,7 +341,7 @@ def unpack_tangent_value(schema: TangentSchema, value: Any) -> Any:
 
 
 def declared_fields(cls: type[Any]) -> MappingProxyType[str, Any]:
-    """Field annotations of a `@struct` or `@binding_group` class, resolved once at its decoration.
+    """Field annotations of a `@struct` or `@params` class, resolved once at its decoration.
 
     Resolution must happen while the defining module is importable: a file-loaded Program Asset module leaves
     `sys.modules` once its source has been evaluated.

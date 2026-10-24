@@ -11,7 +11,7 @@ from . import _formats, ad
 from ._formats import *  # noqa: F403
 from ._texture_format import TextureFormat
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import binding_group, fragment, func, kernel, struct, vertex
+from .decorators import fragment, func, kernel, params, struct, vertex
 from .diagnostics import CompileError
 from .host_values import TangentLayout, TangentValue
 from .intrinsics import (
@@ -311,7 +311,6 @@ __all__ = [
     "Tuple",
     "When",
     "attribute",
-    "binding_group",
     "bool",
     "builtin",
     "clamp",
@@ -366,6 +365,7 @@ __all__ = [
     "normalize",
     "opengl",
     "opengles",
+    "params",
     "pow",
     "preserve",
     "pipeline",

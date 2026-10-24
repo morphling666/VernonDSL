@@ -20,11 +20,12 @@ VernonStatus executeCopies(VernonRuntimeContext &context, const std::vector<Devi
     step = SubmissionState::NotSubmitted;
     if (buffers.empty() && images.empty())
         return VERNON_STATUS_OK;
-    execution::detail::RhiCommandExecutionPlan plan;
-    VernonStatus status = buildDeviceTransferCommandPlan(context, buffers, images, {}, plan);
+    execution::detail::RhiCommandExecutionPlan copies;
+    VernonStatus status = buildDeviceTransferCommandPlan(context, buffers, images, {}, copies);
     if (status != VERNON_STATUS_OK)
         return status;
-    if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
+    execution::detail::ValidatedRhiCommandPlan plan;
+    if (!plan.append(std::move(copies), error))
         return fail(context, error, VERNON_STATUS_INVALID_ARGUMENT);
     return submission.execute(std::move(plan), step);
 }

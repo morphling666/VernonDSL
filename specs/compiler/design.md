@@ -118,10 +118,10 @@ frontend's row-major linearization; dynamic local value Tensors are rejected.
 annotation. A zero divisor advances per vertex; a positive divisor advances
 per that many instances. Explicit attribute ranges are reserved first, then
 automatic locations use declaration-order first-fit over the remaining
-contiguous ranges. Binding-group attribute fields are always automatic and
-take the ranges left free by the ungrouped parameters, in flattened
-declaration order, because a group's leaves exist only once the entry is
-flattened while the module graph places ungrouped parameters before it.
+contiguous ranges. Unlocated params attribute leaves take the ranges left
+free by the entry's other attributes, in flattened declaration order,
+because a params parameter's leaves exist only once the entry is flattened
+while the module graph places the other parameters before it.
 Uniforms, resources, and builtins never consume locations.
 Stage outputs and varyings use the same declaration-order location planning;
 the removed `location()` and `instance()` annotations have no compatibility
@@ -280,9 +280,9 @@ its class, and the prefixed name made every imported Struct unbindable from
 the host; the graph instead rejects two reachable Structs with one name.
 
 A VJP over a Kernel keeps its `wrt` and `outputs` selections unexpanded and
-expands binding-group roots per specialization key
+expands params roots per specialization key
 (`ProgramExpression.transform_for`), because a type specialization decides
-which group, and therefore which leaves, a parameter has.
+which params class, and therefore which leaves, a parameter has.
 Annotation-static shape-constraint and captured-constant substitution lives in
 `frontend.specialization`. It consumes only the immutable compile request and
 project source, before inference, and does not select operations or result
@@ -757,7 +757,7 @@ aggregate Tensors through the same `alloca`.
 
 The GLSL identifier of a non-varying interface is the source name with every
 character outside `[A-Za-z0-9_]` replaced by `_` and a leading `_` added when
-it does not start with a letter or `_`, so binding-group leaf
+it does not start with a letter or `_`, so params leaf
 `material.albedo` becomes `material_albedo`. The OpenGL-family Runtime binds
 named uniforms and textures by that identifier, and both sides call
 `runtime/interface_names.h` so the spelling has one definition.
@@ -792,10 +792,12 @@ in compute.
 Kernel Resources bind in argument order: the frontend emits set 0 and the
 argument index, validation rejects any other pair on a compute Resource, and
 `VernonToGPU` flattens each argument's storage leaves into consecutive
-interface ABI bindings. The frontend rejects `resource(set, binding)` on
-kernel parameters. Honouring declared sets was rejected: no compute caller
-needs them, and every backend's compute binding plan would have to carry a
-second numbering beside the flattened one.
+interface ABI bindings. The frontend rejects `resource(...)`, and
+`uniform(...)` with a set or binding, on Kernel parameters and params leaves.
+This numbering is interim: Kernel placement by `set` lands with uniform
+packing ([`../runtime/binding_groups.md`](../runtime/binding_groups.md)
+section 3.4), which gives each set's by-value leaves one carrier instead of
+the single argument-order carrier of set 0.
 
 ### Compute sampling
 
@@ -1092,7 +1094,7 @@ leaf never straddles a word and a 64-bit leaf starts on a word boundary;
 lowering rejects any other placement. The word buffer was chosen over
 per-leaf push constants or uniforms because it reuses the storage-binding
 path every compute backend already has. It needs no per-backend
-aggregate-uniform layout rules, and Struct leaves inside binding groups get
+aggregate-uniform layout rules, and Struct leaves inside params get
 the same transport.
 
 Autodiff is a deterministic VJP transform of specialized, validated typed

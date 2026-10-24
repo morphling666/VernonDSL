@@ -9,7 +9,7 @@ from typing import Any
 
 from .._formats import TEXTURE_FORMATS_BY_NAME
 from .._markers import is_struct_class
-from ..binding_groups import binding_group_leaf_annotations
+from .._params import params_leaf_annotations
 from ..host_values import pack_host_value
 from ..types import Specialization, SpecializationAssignment, TypeExpr, _DynamicExtent, _Scalar, dyn
 from ..types import bool as dsl_bool
@@ -358,12 +358,12 @@ def resolved_leaf_annotations(
     function: Any,
     specializations: tuple[SpecializationAssignment, ...] = (),
 ) -> dict[str, Any]:
-    """`resolved_annotations` with each binding-group parameter replaced by its dotted leaves, as the entry sees it."""
+    """`resolved_annotations` with each params parameter replaced by its dotted leaves, as the entry sees it."""
 
     return {
         leaf: leaf_annotation
         for name, annotation in resolved_annotations(function, specializations).items()
-        for leaf, leaf_annotation in binding_group_leaf_annotations(name, annotation)
+        for leaf, leaf_annotation in params_leaf_annotations(name, annotation)
     }
 
 

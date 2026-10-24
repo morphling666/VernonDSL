@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <unordered_set>
 
 namespace vernon::execution {
 
@@ -20,8 +21,22 @@ std::shared_ptr<CompiledCommandGraph> CommandGraph::compile(std::string &error) 
     detail::CommandDag commandDag;
     if (!detail::buildCommandDag(resourceRecords_, passes_, scopes_, commandDag, error))
         return {};
+    const auto recordTarget = [](const void *context, const detail::CommandResourceAccess &access,
+                                 VernonRhiBarrier &barrier, std::string &targetError) {
+        const auto &records = *static_cast<const std::vector<detail::ExecutionResourceRecord> *>(context);
+        if (access.resource >= records.size())
+            return targetError = "command barrier access refers to an invalid resource", false;
+        const detail::ExecutionResourceRecord &record = records[access.resource];
+        if (record.resource.kind != access.kind)
+            return targetError = "command barrier access kind does not match its resource", false;
+        if (barrier.is_image)
+            barrier.image = record.image;
+        else
+            barrier.buffer = record.buffer;
+        return true;
+    };
     std::vector<std::vector<VernonRhiBarrier>> commandBarriers;
-    if (!detail::buildCommandBarriers(resourceRecords_, commandDag, commandBarriers, error))
+    if (!detail::buildCommandBarriers(commandDag, {}, recordTarget, &resourceRecords_, commandBarriers, error))
         return {};
     for (uint32_t index = 0; index < scopes_.size(); ++index)
         scopes_[index].barriers = std::move(commandBarriers[index]);
@@ -190,115 +205,30 @@ VernonRhiStatus detail::executeCpuScheduleRange(VernonRhiDevice device, const st
     return VERNON_RHI_STATUS_OK;
 }
 
-static VernonRhiImageSubresourceRange commandImageIntersection(const VernonRhiImageSubresourceRange &left,
-                                                               const VernonRhiImageSubresourceRange &right) {
-    const auto interval = [](uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
-        const uint64_t begin = std::max(leftBase, rightBase);
-        const uint64_t leftEnd = leftCount == UINT32_MAX ? UINT64_MAX : uint64_t{leftBase} + leftCount;
-        const uint64_t rightEnd = rightCount == UINT32_MAX ? UINT64_MAX : uint64_t{rightBase} + rightCount;
-        const uint64_t end = std::min(leftEnd, rightEnd);
-        return std::pair{static_cast<uint32_t>(begin),
-                         end == UINT64_MAX ? UINT32_MAX : static_cast<uint32_t>(end - begin)};
+VernonRhiStatus detail::submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
+                                             const ValidatedRhiCommandPlan &validated,
+                                             VernonRhiCompletion &outputCompletion, TimedCommandScopes *timedScopes) {
+    const RhiCommandExecutionPlan &plan = validated.plan();
+    const std::vector<RhiCommandNodeEncoder> &encoders = plan.encoders;
+    if (plan.commands.nodes.empty())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const auto planBinding = [](const void *context, const CommandResourceAccess &access, VernonRhiBarrier &barrier,
+                                std::string &error) {
+        const RhiCommandResourceBinding *binding =
+            static_cast<const ValidatedRhiCommandPlan *>(context)->binding(commandAccessDomain(access));
+        if (!binding)
+            return error = "RHI command plan has an unbound resource access", false;
+        if (barrier.is_image)
+            barrier.image = binding->image;
+        else
+            barrier.buffer = binding->buffer;
+        return true;
     };
-    const auto [baseMip, mipCount] =
-        interval(left.base_mip_level, left.mip_level_count, right.base_mip_level, right.mip_level_count);
-    const auto [baseLayer, layerCount] =
-        interval(left.base_array_layer, left.array_layer_count, right.base_array_layer, right.array_layer_count);
-    return {baseMip, mipCount, baseLayer, layerCount, left.aspects & right.aspects};
-}
-
-static VernonRhiStatus
-buildRhiCommandBarriers(const detail::CommandDag &dag,
-                        const std::vector<detail::RhiCommandResourceBinding> &resourceBindings,
-                        std::vector<std::vector<VernonRhiBarrier>> &barriers,
-                        const std::vector<detail::CommandResourceAccess> *initialAccesses = nullptr) {
-    barriers.assign(dag.nodes.size(), {});
-    std::vector<detail::CommandResourceAccess> lastAccesses =
-        initialAccesses ? *initialAccesses : std::vector<detail::CommandResourceAccess>{};
-    for (uint32_t nodeIndex = 0; nodeIndex < dag.nodes.size(); ++nodeIndex) {
-        std::vector<detail::CommandResourceAccess> firstAccesses;
-        std::vector<detail::CommandResourceAccess> finalAccesses;
-        for (const detail::CommandResourceAccess &access : dag.nodes[nodeIndex].accesses) {
-            if (std::none_of(finalAccesses.begin(), finalAccesses.end(),
-                             [&](const detail::CommandResourceAccess &current) {
-                                 return detail::commandAccessesOverlap(current, access);
-                             }))
-                firstAccesses.push_back(access);
-            finalAccesses.erase(std::remove_if(finalAccesses.begin(), finalAccesses.end(),
-                                               [&](const detail::CommandResourceAccess &current) {
-                                                   return detail::commandAccessesOverlap(current, access);
-                                               }),
-                                finalAccesses.end());
-            finalAccesses.push_back(access);
-        }
-        for (const detail::CommandResourceAccess &access : firstAccesses) {
-            const auto binding =
-                std::find_if(resourceBindings.begin(), resourceBindings.end(),
-                             [&](const detail::RhiCommandResourceBinding &candidate) {
-                                 return candidate.aliasDomain == access.aliasDomain && candidate.kind == access.kind;
-                             });
-            if (binding == resourceBindings.end())
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-            for (const detail::CommandResourceAccess &previous : lastAccesses) {
-                if (!detail::commandAccessesOverlap(previous, access) ||
-                    (previous.state == access.state && previous.access == AccessMode::Read &&
-                     access.access == AccessMode::Read))
-                    continue;
-                VernonRhiBarrier barrier{};
-                barrier.struct_size = sizeof(barrier);
-                barrier.source_stage_mask = previous.stageMask;
-                barrier.destination_stage_mask = access.stageMask;
-                barrier.source_access = detail::commandAccessMask(previous);
-                barrier.destination_access = detail::commandAccessMask(access);
-                barrier.old_state = previous.state;
-                barrier.new_state = access.state;
-                barrier.is_image = access.kind == ResourceKind::Image;
-                if (barrier.is_image) {
-                    barrier.image = binding->image;
-                    barrier.image_subresources =
-                        commandImageIntersection(previous.imageSubresources, access.imageSubresources);
-                } else {
-                    barrier.buffer = binding->buffer;
-                }
-                barriers[nodeIndex].push_back(barrier);
-            }
-        }
-        for (const detail::CommandResourceAccess &access : finalAccesses) {
-            lastAccesses.erase(std::remove_if(lastAccesses.begin(), lastAccesses.end(),
-                                              [&](const detail::CommandResourceAccess &previous) {
-                                                  return detail::commandAccessesOverlap(previous, access);
-                                              }),
-                               lastAccesses.end());
-            lastAccesses.push_back(access);
-        }
-    }
-    return VERNON_RHI_STATUS_OK;
-}
-
-static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
-    VernonRhiDevice device, uint32_t requiredCapabilities, const detail::CommandDag &dag,
-    const std::vector<detail::RhiCommandNodeEncoder> &encoders, VernonRhiCompletion *outputCompletion,
-    const std::vector<detail::RhiCommandResourceBinding> *resourceBindings,
-    const std::vector<detail::CommandResourceAccess> *initialAccesses,
-    detail::TimedCommandScopes *timedScopes = nullptr) {
-    if (!outputCompletion || dag.nodes.empty() || encoders.size() != dag.nodes.size())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::string error;
-    if (!validateCommandDag(dag, error))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    for (const detail::RhiCommandNodeEncoder &encoder : encoders)
-        if (!encoder.encode)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::vector<std::vector<VernonRhiBarrier>> nodeBarriers;
-    if (resourceBindings) {
-        const VernonRhiStatus barrierStatus =
-            buildRhiCommandBarriers(dag, *resourceBindings, nodeBarriers, initialAccesses);
-        if (barrierStatus != VERNON_RHI_STATUS_OK)
-            return barrierStatus;
-    } else {
-        nodeBarriers.resize(dag.nodes.size());
-    }
-    *outputCompletion = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::string error;
+    if (!buildCommandBarriers(plan.commands, plan.initialAccesses, planBinding, &validated, nodeBarriers, error))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    outputCompletion = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     DeviceExecutionSession session(device);
     VernonRhiCommandEncoderDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
@@ -339,180 +269,17 @@ static VernonRhiStatus submitRhiCommandDagWithInitialAccesses(
         }
         if (status == VERNON_RHI_STATUS_OK && openScope)
             status = closeScope();
+        for (const RhiCommandFinisher &finisher : plan.finishers)
+            if (const VernonRhiStatus finished = finisher.finish(finisher.context, encoder);
+                status == VERNON_RHI_STATUS_OK)
+                status = finished;
     }
     if (status == VERNON_RHI_STATUS_OK)
         status = vernonRhiCommandEncoderFinish(device, encoder);
     if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiDeviceSubmit(device, encoder, outputCompletion);
+        status = vernonRhiDeviceSubmit(device, encoder, &outputCompletion);
     if (status != VERNON_RHI_STATUS_OK && encoder.index != VERNON_RHI_INVALID_HANDLE_INDEX)
         (void)vernonRhiDeviceDestroyCommandEncoder(device, encoder);
-    return status;
-}
-
-VernonRhiStatus detail::submitRhiCommandDag(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                            const CommandDag &dag, const std::vector<RhiCommandNodeEncoder> &encoders,
-                                            VernonRhiCompletion *outputCompletion,
-                                            const std::vector<RhiCommandResourceBinding> *resourceBindings) {
-    return submitRhiCommandDagWithInitialAccesses(device, requiredCapabilities, dag, encoders, outputCompletion,
-                                                  resourceBindings, nullptr);
-}
-
-VernonRhiStatus detail::submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                             const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion,
-                                             TimedCommandScopes *timedScopes) {
-    std::string error;
-    if (!validateRhiCommandExecutionPlan(plan, error))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return submitRhiCommandDagWithInitialAccesses(
-        device, requiredCapabilities, plan.commands, plan.encoders, &outputCompletion, &plan.bindings,
-        plan.initialAccesses.empty() ? nullptr : &plan.initialAccesses, timedScopes);
-}
-
-VernonRhiStatus detail::submitRhiComputeCommandRange(
-    VernonRhiDevice device, const std::vector<GraphResource> &resources,
-    const std::vector<ExecutionResourceRecord> &resourceRecords,
-    const std::vector<std::unique_ptr<ExecutionPass>> &passes, const std::vector<uint32_t> &schedule,
-    const std::vector<CompiledScope> &scopes, const CommandDag &commandDag,
-    std::shared_ptr<const ExecutionBindings> bindings, uint32_t beginOffset, uint32_t endOffset,
-    CpuPassExecutor executor, void *context, VernonRhiCompletion *outputCompletion, RhiCommandPlanExtension extension,
-    void *extensionContext, RhiPassCommandPlanner planner, void *plannerContext, RhiCommandExecutionPlan *outputPlan) {
-    if (beginOffset > endOffset || endOffset > schedule.size() || endOffset > scopes.size() ||
-        endOffset > commandDag.nodes.size() || resourceRecords.size() > resources.size())
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (beginOffset == endOffset)
-        return outputCompletion ? VERNON_RHI_STATUS_INVALID_ARGUMENT : VERNON_RHI_STATUS_OK;
-    std::vector<VernonRhiBuffer> buffers(resources.size(),
-                                         VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    for (size_t index = 0; index < resourceRecords.size(); ++index)
-        if (resourceRecords[index].resource.kind == ResourceKind::Buffer)
-            buffers[index] = resourceRecords[index].buffer;
-    struct ResourceContext {
-        ResourceContext(const std::vector<GraphResource> &graphResources, std::vector<VernonRhiBuffer> values,
-                        std::shared_ptr<const ExecutionBindings> bindings)
-            : buffers(std::move(values)), resources(graphResources, buffers, std::move(bindings)) {}
-        std::vector<VernonRhiBuffer> buffers;
-        ExecutionResources resources;
-    };
-    auto resourceContext = std::make_shared<ResourceContext>(resources, std::move(buffers), std::move(bindings));
-    const ExecutionResources &executionResources = resourceContext->resources;
-    struct EncodeContext {
-        VernonRhiDevice device;
-        const std::vector<std::unique_ptr<ExecutionPass>> &passes;
-        const std::vector<uint32_t> &schedule;
-        const std::vector<CompiledScope> &scopes;
-        const CommandDag &commandDag;
-        uint32_t offset;
-        CpuPassExecutor executor;
-        void *executorContext;
-        const ExecutionResources &resources;
-    };
-    const auto encode = [](void *opaque, VernonRhiCommandEncoder native) {
-        auto &state = *static_cast<EncodeContext *>(opaque);
-        ComputeEncoder encoder(state.device, native);
-        const CommandNode &node = state.commandDag.nodes[state.offset];
-        const CompiledScope &scope = state.scopes[state.offset];
-        auto *compute = dynamic_cast<ComputePass *>(state.passes[state.schedule[state.offset]].get());
-        if ((node.kind != CommandNodeKind::Compute && node.kind != CommandNodeKind::Derivative) ||
-            node.scopeIndices.size() != 1 || node.scopeIndices.front() != state.offset || scope.rendering ||
-            scope.passIndices.size() != 1 || scope.passIndices.front() != state.schedule[state.offset] || !compute)
-            return VERNON_RHI_STATUS_UNSUPPORTED;
-        return state.executor ? state.executor(state.executorContext, state.offset, *compute, encoder, state.resources)
-                              : compute->execute(encoder, state.resources);
-    };
-    RhiCommandExecutionPlan rangePlan;
-    std::vector<uint32_t> completionNodes;
-    rangePlan.commands.nodes.reserve(endOffset - beginOffset);
-    rangePlan.encoders.reserve(endOffset - beginOffset);
-    completionNodes.reserve(endOffset - beginOffset);
-    rangePlan.retainedContexts.push_back(resourceContext);
-    for (uint32_t offset = beginOffset; offset < endOffset; ++offset) {
-        auto *compute = dynamic_cast<ComputePass *>(passes[schedule[offset]].get());
-        if (!compute)
-            return VERNON_RHI_STATUS_UNSUPPORTED;
-        if (planner) {
-            RhiCommandExecutionPlan planned;
-            const VernonRhiStatus plannedStatus =
-                planner(plannerContext, offset, *compute, executionResources, planned);
-            if (plannedStatus == VERNON_RHI_STATUS_OK && !planned.commands.nodes.empty()) {
-                std::string error;
-                if (!appendRhiCommandExecutionPlan(rangePlan, std::move(planned), true, error))
-                    return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-                auto encodeContext = std::make_shared<EncodeContext>(EncodeContext{
-                    device, passes, schedule, scopes, commandDag, offset, executor, context, executionResources});
-                CommandNode finalize;
-                finalize.kind = CommandNodeKind::Derivative;
-                finalize.queue = CommandQueueClass::Ordered;
-                finalize.predecessors = {static_cast<uint32_t>(rangePlan.commands.nodes.size() - 1)};
-                rangePlan.commands.nodes.push_back(std::move(finalize));
-                rangePlan.encoders.push_back({encode, encodeContext.get()});
-                rangePlan.retainedContexts.push_back(std::move(encodeContext));
-                const uint32_t finalizer = static_cast<uint32_t>(rangePlan.commands.nodes.size() - 1);
-                if (extension && extension(extensionContext, offset, finalizer, rangePlan) != VERNON_RHI_STATUS_OK)
-                    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-                completionNodes.push_back(static_cast<uint32_t>(rangePlan.commands.nodes.size() - 1));
-                continue;
-            }
-            if (plannedStatus != VERNON_RHI_STATUS_UNSUPPORTED)
-                return plannedStatus;
-        }
-        CommandNode node = commandDag.nodes[offset];
-        std::vector<uint32_t> predecessors;
-        for (uint32_t predecessor : node.predecessors)
-            if (predecessor >= beginOffset) {
-                const uint32_t relative = predecessor - beginOffset;
-                if (relative >= completionNodes.size())
-                    return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-                predecessors.push_back(completionNodes[relative]);
-            }
-        node.predecessors = std::move(predecessors);
-        rangePlan.commands.nodes.push_back(std::move(node));
-        for (const CommandResourceAccess &access : rangePlan.commands.nodes.back().accesses) {
-            if (std::any_of(rangePlan.bindings.begin(), rangePlan.bindings.end(), [&](const auto &binding) {
-                    return binding.aliasDomain == access.aliasDomain && binding.kind == access.kind;
-                }))
-                continue;
-            if (access.resource >= resourceRecords.size())
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-            const ExecutionResourceRecord &record = resourceRecords[access.resource];
-            rangePlan.bindings.push_back({access.aliasDomain, access.kind, record.buffer, record.image});
-        }
-        auto encodeContext = std::make_shared<EncodeContext>(
-            EncodeContext{device, passes, schedule, scopes, commandDag, offset, executor, context, executionResources});
-        rangePlan.encoders.push_back({encode, encodeContext.get()});
-        rangePlan.retainedContexts.push_back(std::move(encodeContext));
-        const uint32_t computeNode = static_cast<uint32_t>(rangePlan.commands.nodes.size() - 1);
-        if (extension && extension(extensionContext, offset, computeNode, rangePlan) != VERNON_RHI_STATUS_OK)
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        completionNodes.push_back(static_cast<uint32_t>(rangePlan.commands.nodes.size() - 1));
-    }
-    for (const CommandNode &node : rangePlan.commands.nodes)
-        for (const CommandResourceAccess &access : node.accesses) {
-            if (std::any_of(rangePlan.bindings.begin(), rangePlan.bindings.end(), [&](const auto &binding) {
-                    return binding.aliasDomain == access.aliasDomain && binding.kind == access.kind;
-                }))
-                continue;
-            if (access.resource >= resourceRecords.size())
-                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-            const ExecutionResourceRecord &record = resourceRecords[access.resource];
-            rangePlan.bindings.push_back({access.aliasDomain, access.kind, record.buffer, record.image});
-        }
-    if (outputPlan) {
-        if (outputCompletion)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        *outputPlan = std::move(rangePlan);
-        return VERNON_RHI_STATUS_OK;
-    }
-    VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiStatus status = submitRhiCommandDag(device, VERNON_RHI_QUEUE_COMPUTE, rangePlan.commands,
-                                                 rangePlan.encoders, &completion, &rangePlan.bindings);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    if (outputCompletion) {
-        *outputCompletion = completion;
-        return VERNON_RHI_STATUS_OK;
-    }
-    status = vernonRhiCompletionWait(device, completion);
-    (void)vernonRhiDeviceDestroyCompletion(device, completion);
     return status;
 }
 
@@ -538,25 +305,6 @@ ExecutionSubmission CompiledCommandGraph::submit(std::shared_ptr<const Execution
         state_->commandDag.nodes.begin(), state_->commandDag.nodes.end(), [](const detail::CommandNode &node) {
             return node.kind == detail::CommandNodeKind::Compute || node.kind == detail::CommandNodeKind::Derivative;
         });
-    if (computeOnly) {
-        const VernonRhiStatus status = detail::submitRhiComputeCommandRange(
-            state_->device, state_->resources, state_->resourceRecords, state_->passes, state_->schedule,
-            state_->scopes, state_->commandDag, submission->bindings, 0, static_cast<uint32_t>(state_->schedule.size()),
-            nullptr, nullptr, &submission->completion);
-        submission->status = status;
-        submission->state =
-            status == VERNON_RHI_STATUS_OK ? ExecutionSubmission::State::Pending : ExecutionSubmission::State::Failed;
-        if (status == VERNON_RHI_STATUS_OK) {
-            VernonRhiCompletionState completionState{};
-            if (vernonRhiCompletionGetState(state_->device, submission->completion, &completionState) ==
-                    VERNON_RHI_STATUS_OK &&
-                completionState == VERNON_RHI_COMPLETION_SUCCEEDED)
-                submission->state = ExecutionSubmission::State::Succeeded;
-            (void)vernonRhiCompletionGetCommandStats(state_->device, submission->completion, &submission->stats);
-        }
-        return ExecutionSubmission(std::move(submission));
-    }
-
     std::vector<VernonRhiBuffer> buffers(state_->resources.size(),
                                          VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     for (size_t index = 0; index < state_->resourceRecords.size(); ++index)
@@ -666,27 +414,32 @@ ExecutionSubmission CompiledCommandGraph::submit(std::shared_ptr<const Execution
         return status;
     };
     std::vector<NodeContext> contexts;
-    std::vector<detail::RhiCommandNodeEncoder> encoders;
+    detail::RhiCommandExecutionPlan fragment;
+    fragment.commands = state_->commandDag;
     contexts.reserve(state_->commandDag.nodes.size());
-    encoders.reserve(state_->commandDag.nodes.size());
+    fragment.encoders.reserve(state_->commandDag.nodes.size());
     for (const detail::CommandNode &node : state_->commandDag.nodes) {
         contexts.push_back({*state_, node, resources});
-        encoders.push_back({encodeNode, &contexts.back()});
+        fragment.encoders.push_back({encodeNode, &contexts.back()});
     }
-    std::vector<detail::RhiCommandResourceBinding> resourceBindings;
+    std::unordered_set<detail::CommandAccessDomain, detail::CommandAccessDomainHash> bound;
     for (const detail::CommandNode &node : state_->commandDag.nodes)
         for (const detail::CommandResourceAccess &access : node.accesses) {
             if (access.resource >= state_->resourceRecords.size())
                 continue;
             const auto &record = state_->resourceRecords[access.resource];
-            if (std::none_of(resourceBindings.begin(), resourceBindings.end(), [&](const auto &binding) {
-                    return binding.aliasDomain == access.aliasDomain && binding.kind == access.kind;
-                }))
-                resourceBindings.push_back({access.aliasDomain, access.kind, record.buffer, record.image});
+            if (bound.insert(detail::commandAccessDomain(access)).second)
+                fragment.bindings.push_back({access.aliasDomain, access.kind, record.buffer, record.image});
         }
+    detail::ValidatedRhiCommandPlan plan;
+    std::string error;
     const VernonRhiStatus status =
-        detail::submitRhiCommandDag(state_->device, VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS,
-                                    state_->commandDag, encoders, &submission->completion, &resourceBindings);
+        plan.append(std::move(fragment), error)
+            ? detail::submitRhiCommandPlan(state_->device,
+                                           computeOnly ? VERNON_RHI_QUEUE_COMPUTE
+                                                       : VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS,
+                                           plan, submission->completion)
+            : VERNON_RHI_STATUS_INVALID_ARGUMENT;
     submission->status = status;
     submission->state =
         status == VERNON_RHI_STATUS_OK ? ExecutionSubmission::State::Pending : ExecutionSubmission::State::Failed;

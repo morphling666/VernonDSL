@@ -164,8 +164,30 @@ inline bool writesBinding(const VernonRuntimeProviderBindingLayoutEntry &entry) 
 }
 
 // A group keeps every resource its values name alive for as long as it exists.
+// A block of the device's persistent memory that a group holds. Destroying the group returns it, which happens only
+// after every encoder that bound the group has completed, since binding retains the group for its encoder.
+class PersistentBlockLease {
+public:
+    PersistentBlockLease(VernonRhiDevice device, uint64_t key) noexcept : device_(device), key_(key) {}
+    PersistentBlockLease(PersistentBlockLease &&other) noexcept
+        : device_(other.device_), key_(other.key_), active_(std::exchange(other.active_, false)) {}
+    PersistentBlockLease(const PersistentBlockLease &) = delete;
+    PersistentBlockLease &operator=(const PersistentBlockLease &) = delete;
+    PersistentBlockLease &operator=(PersistentBlockLease &&) = delete;
+    ~PersistentBlockLease() {
+        if (active_)
+            vernon::rhi::releasePersistentBlock(device_, key_);
+    }
+
+private:
+    VernonRhiDevice device_;
+    uint64_t key_;
+    bool active_{true};
+};
+
 struct RhiGroup : RhiRetainedObject {
     std::vector<vernon::rhi::RetainedRhiResourceLease> leases;
+    std::vector<PersistentBlockLease> blocks;
     // Resources the group's writable bindings name; every command that binds the group writes them.
     std::vector<VernonRuntimeProviderResourceReference> writes;
 };
@@ -174,6 +196,11 @@ struct RhiGroup : RhiRetainedObject {
 RhiAdapterResult<uint64_t> acquireGroupResource(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
                                                 VernonRuntimeProviderResourceReference resource,
                                                 RhiImageBinding *image = nullptr) noexcept;
+// Places bytes in the device's persistent memory for `group`, which holds the block until it is destroyed; see
+// PlacePersistentCallback.
+RhiAdapterResult<vernon::rhi::PersistentBlock> placePersistent(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
+                                                               const void *data, uint64_t size,
+                                                               uint64_t alignment) noexcept;
 // Records the group's written resources against the encoder of a command that bound it.
 RhiAdapterResult<void> recordGroupWrites(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                          const RhiGroup &group) noexcept;

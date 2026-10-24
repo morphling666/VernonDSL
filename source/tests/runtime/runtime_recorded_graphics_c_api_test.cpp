@@ -1180,12 +1180,13 @@ TEST_P(RuntimeRecordedSurfaceMatrix, SealedSetsCreateTheirGroupsOnce) {
         return vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime) - before;
     };
 
-    EXPECT_EQ(render(1), 4u);
+    // Only the tint sets make groups: vertex buffers belong to no group.
+    EXPECT_EQ(render(1), 2u);
     EXPECT_EQ(render(1), 0u);
     EXPECT_EQ(render(16), 0u);
 }
 
-TEST_P(RuntimeRecordedSurfaceMatrix, VertexGroupsBindTheirVertexBuffersInOnePersistentGroup) {
+TEST_P(RuntimeRecordedSurfaceMatrix, SetsBindTheirVertexBuffersBesideTheirPersistentGroups) {
     VernonProgramExecutable *pass = resolve("recorded_graphics_vertex_group_pass");
     ASSERT_NE(pass, nullptr);
     VernonProgramInstance *passInstance = instance(pass);
@@ -1230,23 +1231,31 @@ TEST_P(RuntimeRecordedSurfaceMatrix, VertexGroupsBindTheirVertexBuffersInOnePers
 }
 
 TEST_P(RuntimeRecordedSurfaceMatrix, SetsSharingAGroupMakeItOncePerCombinationAndInvocation) {
-    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    VernonProgramExecutable *pass = resolve("recorded_graphics_shared_group_pass");
     ASSERT_NE(pass, nullptr);
     VernonProgramInstance *passInstance = instance(pass);
     ASSERT_NE(passInstance, nullptr);
-    VernonGraphicsPipeline *opaque = pipeline(pass, nullptr);
-    ASSERT_NE(opaque, nullptr);
-    VernonBindingSet *left = set(opaque, {vertices(pass, left_)});
-    VernonBindingSet *right = set(opaque, {vertices(pass, right_)});
-    VernonBindingSet *red = set(opaque, {tint(pass, kRed)});
-    VernonBindingSet *blue = set(opaque, {tint(pass, kBlue)});
+    VernonGraphicsPipeline *shared = pipeline(pass, nullptr);
+    ASSERT_NE(shared, nullptr);
+    constexpr std::array<float, 2> kInPlace{0.0f, 0.0f};
+    constexpr std::array<float, 2> kToTheRight{1.0f, 0.0f};
+    const auto shape = [&](const RhiBuffer &resource, const std::array<float, 2> &offset) {
+        return set(shared, {vertices(pass, resource, "shape.vertices"),
+                            hostArgument(findParameter(pass, "shape.offset"), offset)});
+    };
+    VernonBindingSet *left = shape(left_, kInPlace);
+    VernonBindingSet *right = shape(left_, kToTheRight);
+    VernonBindingSet *red = set(shared, {tint(pass, kRed)});
+    VernonBindingSet *blue = set(shared, {tint(pass, kBlue)});
 
     const auto render = [&](size_t repeats) {
         const size_t before = vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime);
         Target target(runtime());
-        PassInvocation invocation(pass, passInstance, target, {vertices(pass, fullscreen_), tint(pass, kRed)},
+        PassInvocation invocation(pass, passInstance, target,
+                                  {vertices(pass, fullscreen_, "shape.vertices"),
+                                   hostArgument(findParameter(pass, "shape.offset"), kInPlace), tint(pass, kRed)},
                                   VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
-        std::vector<VernonGraphicsCommand> commands{bindPipeline(opaque)};
+        std::vector<VernonGraphicsCommand> commands{bindPipeline(shared)};
         for (size_t repeat = 0; repeat < repeats; ++repeat)
             commands.insert(commands.end(), {bindSet(left), bindSet(red), draw(3), bindSet(right), bindSet(blue),
                                              draw(3), bindSet(left), draw(3)});
@@ -1258,9 +1267,62 @@ TEST_P(RuntimeRecordedSurfaceMatrix, SetsSharingAGroupMakeItOncePerCombinationAn
         return vernon::runtime::getRhiAdapterGroupCreationCount(runtime().runtime) - before;
     };
 
-    // `vertices` and `tint` share group 0, which the draws bind in three combinations.
+    // `shape.offset` and `tint` share group 0, which the draws bind in three combinations.
     EXPECT_EQ(render(1), 3u);
     EXPECT_EQ(render(16), 3u);
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, GroupsAtOtherIndicesSharingBindingPointsBindAgainAfterEachOther) {
+    VernonProgramExecutable *opaque = resolve("recorded_graphics_opaque_pass");
+    VernonProgramExecutable *pass = resolve("recorded_graphics_set_one_sampled_pass");
+    VernonProgramExecutable *source = resolve("recorded_graphics_set_two_sampled_surface");
+    ASSERT_NE(opaque, nullptr);
+    ASSERT_NE(pass, nullptr);
+    ASSERT_NE(source, nullptr);
+    VernonProgramInstance *opaqueInstance = instance(opaque);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(opaqueInstance, nullptr);
+    ASSERT_NE(passInstance, nullptr);
+    const auto solid = [&](const std::array<float, 4> &color) {
+        auto rendered =
+            std::make_unique<Target>(runtime(), kExtent, VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_SAMPLED);
+        PassInvocation invocation(opaque, opaqueInstance, *rendered,
+                                  {vertices(opaque, fullscreen_), tint(opaque, color)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, false);
+        EXPECT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        return rendered;
+    };
+    const std::unique_ptr<Target> red = solid(kRed);
+    const std::unique_ptr<Target> blue = solid(kBlue);
+    const VernonRuntimeProviderResourceReference nearest = sampler();
+
+    VernonGraphicsPipeline *setOne = pipeline(pass, nullptr);
+    VernonGraphicsPipeline *setTwo = pipeline(pass, source);
+    ASSERT_NE(setOne, nullptr);
+    ASSERT_NE(setTwo, nullptr);
+    VernonBindingSet *sampledRed =
+        set(setOne, {image(pass, "source", red->view.reference), samplerArgument(pass, "source_sampler", nearest)});
+    VernonBindingSet *sampledBlue = set(
+        setTwo, {image(source, "source", blue->view.reference), samplerArgument(source, "source_sampler", nearest)});
+    VernonBindingSet *rightGeometry = set(setTwo, {vertices(source, right_)});
+    VernonBindingSet *leftGeometry = set(setOne, {vertices(pass, left_)});
+
+    // The set 2 texture takes the binding point of the set 1 texture where a context holds one value per point, so the
+    // last draw reads red only if its set 1 group binds again although it stayed bound.
+    Target target(runtime());
+    PassInvocation invocation(pass, passInstance, target,
+                              {vertices(pass, fullscreen_), image(pass, "source", red->view.reference),
+                               samplerArgument(pass, "source_sampler", nearest)},
+                              VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+    ASSERT_EQ(invocation.record({bindPipeline(setOne), bindSet(sampledRed), draw(3), bindPipeline(setTwo),
+                                 bindSet(sampledBlue), bindSet(rightGeometry), draw(3), bindPipeline(setOne),
+                                 bindSet(sampledRed), bindSet(leftGeometry), draw(3)}),
+              VERNON_STATUS_OK)
+        << lastError(runtime().runtime);
+    ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+    const std::vector<uint8_t> pixels = target.pixels();
+    EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), {255, 0, 0, 255}));
+    EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), {0, 0, 255, 255}));
 }
 
 TEST_P(RuntimeRecordedSurfaceMatrix, ComputeWriteIsOrderedBeforeRecordedDraws) {

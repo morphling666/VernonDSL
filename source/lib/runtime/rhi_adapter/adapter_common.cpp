@@ -304,7 +304,6 @@ VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderReso
 const VernonRuntimeProviderResourceReference *providerBindingResource(const VernonRuntimeProviderBindingValue &value) {
     switch (value.kind) {
     case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
-    case VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER:
         return &value.payload.buffer.resource;
     case VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE:
     case VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE:
@@ -479,6 +478,23 @@ RhiAdapterResult<vernon::rhi::CommandTransient> writeCommandTransient(VernonRunt
     if (!written)
         return RhiAdapterResult<vernon::rhi::CommandTransient>{vernon::err(providerError(std::move(written).error()))};
     return RhiAdapterResult<vernon::rhi::CommandTransient>{vernon::ok(written.value())};
+}
+
+RhiAdapterResult<vernon::rhi::PersistentBlock> placePersistent(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
+                                                               const void *data, uint64_t size,
+                                                               uint64_t alignment) noexcept {
+    using Placed = RhiAdapterResult<vernon::rhi::PersistentBlock>;
+    try {
+        group.blocks.reserve(group.blocks.size() + 1);
+    } catch (const std::bad_alloc &) {
+        return Placed{vernon::err(
+            providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "persistent_block_lease", size).error())};
+    }
+    auto placed = vernon::rhi::placePersistentBlock(adapter.rhiDevice, data, size, alignment);
+    if (!placed)
+        return Placed{vernon::err(providerError(std::move(placed).error()))};
+    group.blocks.emplace_back(adapter.rhiDevice, placed.value().key);
+    return Placed{vernon::ok(placed.value())};
 }
 
 RhiAdapterResult<vernon::rhi::CommandTransientReservation> reserveCommandTransient(VernonRuntimeRhiAdapter &adapter,

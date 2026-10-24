@@ -27,8 +27,8 @@ _REPOSITORY = Path(__file__).resolve().parents[2]
 _MATERIALS = "python.tests.type_specialization_materials"
 _FIXTURES = _REPOSITORY / "source" / "tests" / "fixtures"
 
-_MATTE = "from vernon_dsl import *\n@binding_group\nclass Matte:\n    gain: f32\n"
-_GLOSSY = "from vernon_dsl import *\n@binding_group\nclass Glossy:\n    gain: f32\n    offset: f32\n"
+_MATTE = "from vernon_dsl import *\n@params\nclass Matte:\n    gain: f32\n"
+_GLOSSY = "from vernon_dsl import *\n@params\nclass Glossy:\n    gain: f32\n    offset: f32\n"
 _TEMPLATE = """from vernon_dsl import *
 import glossy
 
@@ -111,7 +111,7 @@ class TypeSpecializationKernelTests(unittest.TestCase):
         vd.init(arch=vd.cpu)
         self.weights = vd.storage.from_numpy(np.array((1.0, 2.0, 3.0), dtype=np.float32))
 
-    def test_binding_group_type_selects_the_parameter_and_its_methods(self) -> None:
+    def test_params_type_selects_the_parameter_and_its_methods(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(3,))
         lookup = Lookup(weights=self.weights)
         shade(Matte(gain=np.float32(2.0), lookup=lookup), output, grid=(3, 1, 1), specializations={MATERIAL: Matte})
@@ -278,7 +278,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
             "from typing import Annotated\n"
             "import vernon_dsl as vd\n"
             'OPERATOR = vd.specialization("OPERATOR", vd.type)\n'
-            "@vd.binding_group\n"
+            "@vd.params\n"
             "class Gain:\n"
             "    gain: vd.f32\n"
             "    @vd.func\n"
@@ -325,7 +325,7 @@ class TypeSpecializationAssetTests(unittest.TestCase):
             "import vernon_dsl as vd\n"
             "from lib.ops import Scale\n"
             "from game.helpers import twice\n"
-            "@vd.binding_group\n"
+            "@vd.params\n"
             "class Boost:\n"
             "    scale: Scale\n"
             "    @vd.func\n"
@@ -442,7 +442,7 @@ class OpenGLTypeSpecializationTests(unittest.TestCase):
             probe_backend(backend_row(vd.opengl), BackendRequirements(graphics=True, minimum_api_version=(4, 3)))
         )
 
-    def test_type_specializations_select_the_fragment_binding_group(self) -> None:
+    def test_type_specializations_select_the_fragment_params(self) -> None:
         _assert_surface_pipeline_renders(self)
 
 
@@ -450,7 +450,7 @@ class VulkanTypeSpecializationTests(unittest.TestCase):
     def setUp(self) -> None:
         require_available(probe_backend(backend_row(vd.vulkan), BackendRequirements(graphics=True)))
 
-    def test_type_specializations_select_the_fragment_binding_group(self) -> None:
+    def test_type_specializations_select_the_fragment_params(self) -> None:
         _assert_surface_pipeline_renders(self)
 
 

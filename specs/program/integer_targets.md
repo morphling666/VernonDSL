@@ -74,7 +74,7 @@ attachment, with `PROGRAM_OPERATION_UNSUPPORTED`
 - Pairing is per Program, because the Runtime pairs a sampled image across
   all Stages by its native binding and rejects one paired both implicitly
   and explicitly. A sampled texture a Stage never reads, such as a
-  binding-group leaf only the other Stage uses, gets an implicit sampler
+  params leaf only the other Stage uses, gets an implicit sampler
   unless another Stage of the pipeline reads it. The pipeline compiles its
   Stages, then recompiles each Stage with the textures it leaves unread that
   others read (`FrontendCompileRequest.textures_read_elsewhere`), so the

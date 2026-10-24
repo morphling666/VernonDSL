@@ -195,8 +195,8 @@ class TypeParser:
         arities: dict[str, int | tuple[int, ...]] = {
             "attribute": (0, 1, 2),
             "builtin": 1,
-            "uniform": (0, 2),
-            "resource": 2,
+            "uniform": (0, 1, 2),
+            "resource": (0, 1, 2),
         }
         if kind not in arities:
             raise self.context.error(node, f"unknown annotation metadata '{kind}'")
@@ -211,8 +211,8 @@ class TypeParser:
                     values.get("location", ast.Constant(value=-1)),
                     values.get("divisor", ast.Constant(value=0)),
                 ]
-            elif kind in {"resource", "uniform"} and not node.args:
-                args = [values[key] for key in ("set", "binding") if key in values]
+            elif kind in {"resource", "uniform"} and not node.args and set(values) <= {"set", "binding"}:
+                args = [values.get(key, ast.Constant(value=-1)) for key in ("set", "binding")]
             else:
                 raise self.context.error(node, f"{kind} metadata does not accept keyword arguments here")
         else:
@@ -240,6 +240,10 @@ class TypeParser:
                 raise self.context.error(node, "attribute location must be non-negative")
             if not isinstance(divisor, int) or divisor < 0:
                 raise self.context.error(node, "attribute divisor must be non-negative")
+        if kind in {"resource", "uniform"}:
+            parsed.extend([-1] * (2 - len(parsed)))
+            if any(not isinstance(value, int) or value < -1 for value in parsed):
+                raise self.context.error(node, f"{kind} set and binding must be non-negative")
         return InterfaceMetadata(kind, tuple(parsed))
 
     def _varying(self, node: ast.Call) -> InterfaceMetadata:

@@ -7,15 +7,18 @@
 namespace vernon::runtime {
 
 struct ArgumentOwner;
+class CommandStream;
 
 extern "C" {
 void destroyResolvedStage(VernonStageExecutable *stage);
 VernonStatus submitResolvedStage(VernonStageExecutable *stage, const VernonStageInvocationDescriptor *invocation,
                                  VernonSubmission **output);
-// `owners`, when given, holds the owner of each argument; otherwise the invocation owns them all.
-VernonStatus encodeResolvedStage(VernonRuntimeProviderObject encoder, VernonStageExecutable *stage,
-                                 const VernonStageInvocationDescriptor *invocation, const ArgumentOwner *owners);
 }
+
+// Encodes on `stream`, outside a rendering scope. `owners`, when given, holds the owner of each argument; otherwise
+// the invocation owns them all.
+VernonStatus encodeResolvedStage(CommandStream &stream, VernonStageExecutable *stage,
+                                 const VernonStageInvocationDescriptor *invocation, const ArgumentOwner *owners);
 
 } // namespace vernon::runtime
 

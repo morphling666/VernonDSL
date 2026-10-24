@@ -520,7 +520,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
 
     uint32_t nextProviderSlot = 0;
     uint32_t maximumExternalSlot = 0;
-    uint32_t vertexBinding = 0;
     for (const Parameter &parameter : stagePlan.parameters)
         maximumExternalSlot = std::max(maximumExternalSlot, parameter.slot);
     uint32_t nextInternalSlot = maximumExternalSlot;
@@ -536,13 +535,11 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         slot = usesSequentialGraphicsSlots(options.backend) ? next++ : ++next;
         return true;
     };
-    const auto append = [&](VernonRuntimeProviderBindingLayoutEntry layout, PreparedGraphicsBindingSource source,
-                            std::vector<VernonRuntimeProviderVertexAttribute> attributes) {
+    const auto append = [&](VernonRuntimeProviderBindingLayoutEntry layout, PreparedGraphicsBindingSource source) {
         // D3D12 builds one root signature per pipeline, so a descriptor that both stages use is one range visible
         // to both. The link gives equal (kind, set, binding) only to the same Program Value. Inline root constants
         // are per-stage root parameters and stay separate.
-        if (directX12 && layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-            layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
+        if (directX12 && layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
             const auto shared = std::find_if(output.layouts.begin(), output.layouts.end(), [&](const auto &existing) {
                 return existing.kind == layout.kind && existing.set == layout.set && existing.binding == layout.binding;
             });
@@ -553,7 +550,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         }
         // OpenGL ignores the set, so a binding point names one descriptor across every set of the pipeline.
         if (openGL && layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-            layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
             std::any_of(output.layouts.begin(), output.layouts.end(), [&](const auto &existing) {
                 return existing.kind == layout.kind && existing.binding == layout.binding && existing.set != layout.set;
             })) {
@@ -566,7 +562,6 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
             return false;
         output.layouts.push_back(layout);
         output.sources.push_back(std::move(source));
-        output.vertexAttributes.insert(output.vertexAttributes.end(), attributes.begin(), attributes.end());
         return true;
     };
 
@@ -578,6 +573,31 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         if (!stageMask) {
             error = "graphics parameter references an unsupported stage";
             return false;
+        }
+        if (!internal && parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+            use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+            const auto binding = static_cast<uint32_t>(output.vertexBindings.size());
+            if (binding >= VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS) {
+                error = "graphics vertex binding limit is exceeded";
+                return false;
+            }
+            if (!parameter.elementLayout.byteSize) {
+                error = "graphics vertex element size is zero";
+                return false;
+            }
+            for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                const auto dtype = pipelineDataType(leaf.dtype);
+                if (!dtype) {
+                    error = "graphics vertex attribute dtype is unsupported";
+                    return false;
+                }
+                output.vertexAttributes.push_back({binding, use.location + leaf.locationOffset,
+                                                   static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                   leaf.byteOffset});
+            }
+            output.vertexBindings.push_back({binding, use.divisor});
+            output.vertexInputs.push_back(parameterIndex(stagePlan, parameter));
+            return true;
         }
         VernonRuntimeProviderBindingLayoutEntry layout{};
         if (usesSequentialGraphicsSlots(options.backend) || internal) {
@@ -621,7 +641,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                            sampledBinding.descriptorSet, sampledBinding.binding,
                                                            nullptr, samplerLayout, error))
                     return false;
-                if (!append(samplerLayout, std::move(samplerSource), {}))
+                if (!append(samplerLayout, std::move(samplerSource)))
                     return false;
             }
             return true;
@@ -663,7 +683,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 layout.set = use.descriptorSet;
                 layout.binding = use.binding;
             }
-            return append(layout, std::move(source), {});
+            return append(layout, std::move(source));
         }
 
         if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
@@ -727,42 +747,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                   layout, error))
                     return false;
             }
-            return append(layout, std::move(source), {});
-        }
-
-        if (!internal && parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
-            use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-            layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-            layout.element_size = parameter.elementLayout.byteSize;
-            layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-            layout.set = use.descriptorSet;
-            if (!layout.element_size) {
-                error = "graphics vertex element size is zero";
-                return false;
-            }
-            if (openGL)
-                layout.binding = parameter.slot;
-            else if (metal) {
-                if (vertexBinding >= 15) {
-                    error = "Metal graphics vertex binding limit is exceeded";
-                    return false;
-                }
-                layout.binding = 16 + vertexBinding++;
-            } else
-                layout.binding = vertexBinding++;
-            layout.divisor = use.divisor;
-            std::vector<VernonRuntimeProviderVertexAttribute> attributes;
-            for (const AttributeLeaf &leaf : use.attributeLeaves) {
-                const auto dtype = pipelineDataType(leaf.dtype);
-                if (!dtype) {
-                    error = "graphics vertex attribute dtype is unsupported";
-                    return false;
-                }
-                attributes.push_back({layout.binding, use.location + leaf.locationOffset, static_cast<uint32_t>(*dtype),
-                                      leaf.componentCount, leaf.byteOffset});
-            }
-            source.kind = PreparedGraphicsBindingSourceKind::ExternalVertex;
-            return append(layout, std::move(source), std::move(attributes));
+            return append(layout, std::move(source));
         }
 
         if (!internal && parameter.kind == "image" && use.interfaceKind == "resource" && use.binding != UINT32_MAX) {
@@ -786,7 +771,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                                                   use.binding, nullptr, layout, error))
                     return false;
             }
-            return append(layout, std::move(source), {});
+            return append(layout, std::move(source));
         }
 
         if (!internal && parameter.kind == "tensor" && use.interfaceKind == "resource" && !use.storageLeaves.empty()) {
@@ -808,7 +793,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
                 auto leafSource = source;
                 leafSource.kind = PreparedGraphicsBindingSourceKind::ExternalStorage;
                 leafSource.descriptorBinding = leaf.binding;
-                if (!append(leafLayout, std::move(leafSource), {}))
+                if (!append(leafLayout, std::move(leafSource)))
                     return false;
             }
             return true;
@@ -877,7 +862,7 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
         source.descriptorSet = carrier.descriptorSet;
         source.descriptorBinding = carrier.binding;
         output.metadataCarriers.push_back(std::move(prepared));
-        if (!append(layout, std::move(source), {}))
+        if (!append(layout, std::move(source)))
             return false;
     }
 
@@ -888,6 +873,8 @@ bool buildPreparedGraphicsBindingPlan(const StageBindingPlan &stagePlan, const P
               [&](size_t left, size_t right) { return output.layouts[left].slot < output.layouts[right].slot; });
     PreparedGraphicsBindingPlan sorted;
     sorted.backend = options.backend;
+    sorted.vertexBindings = std::move(output.vertexBindings);
+    sorted.vertexInputs = std::move(output.vertexInputs);
     sorted.vertexAttributes = std::move(output.vertexAttributes);
     sorted.metadataCarriers = std::move(output.metadataCarriers);
     sorted.layouts.reserve(order.size());
@@ -973,22 +960,6 @@ bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepare
         value.payload.inline_value.size = storage.size();
     };
     switch (source.kind) {
-    case PreparedGraphicsBindingSourceKind::ExternalVertex: {
-        if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
-            argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
-            !argument->tensor.byte_strides || argument->tensor.byte_strides[0] <= 0 ||
-            static_cast<uint64_t>(argument->tensor.byte_strides[0]) > UINT32_MAX ||
-            argument->tensor.byte_offset >= argument->tensor.resource.size) {
-            error = "graphics vertex argument is missing or invalid";
-            return false;
-        }
-        const VernonTensorView &tensor = argument->tensor;
-        value.payload.buffer.resource = tensor.resource;
-        value.payload.buffer.resource.offset += tensor.byte_offset;
-        value.payload.buffer.resource.size -= tensor.byte_offset;
-        value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
-        return true;
-    }
     case PreparedGraphicsBindingSourceKind::ExternalImage:
         if (!argument || argument->kind != VERNON_PROGRAM_IMAGE || !argument->image.view.resource.value) {
             error = "graphics image argument is missing";
@@ -1081,6 +1052,26 @@ preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared) {
         dependencies.command = source.kind == PreparedGraphicsBindingSourceKind::Resolution;
     }
     return result;
+}
+
+bool preparedGraphicsVertexBuffer(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
+                                  size_t binding, VernonRuntimeProviderResourceReference &buffer, uint32_t &stride,
+                                  std::string &error) {
+    const VernonProgramArgument *argument = inputs.arguments[prepared.vertexInputs[binding]];
+    if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
+        argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
+        !argument->tensor.byte_strides || argument->tensor.byte_strides[0] <= 0 ||
+        static_cast<uint64_t>(argument->tensor.byte_strides[0]) > UINT32_MAX ||
+        argument->tensor.byte_offset >= argument->tensor.resource.size) {
+        error = "graphics vertex argument is missing or invalid";
+        return false;
+    }
+    const VernonTensorView &tensor = argument->tensor;
+    buffer = tensor.resource;
+    buffer.offset += tensor.byte_offset;
+    buffer.size -= tensor.byte_offset;
+    stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+    return true;
 }
 
 } // namespace vernon::runtime

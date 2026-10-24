@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any, cast, get_args, get_origin
 
 from .._markers import dsl_kind, is_struct_class
-from ..binding_groups import expand_binding_group_arguments
+from .._params import expand_params_arguments
 from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest
 from ..frontend.interfaces import read_sampled_textures, unread_sampled_textures
@@ -426,7 +426,7 @@ class Pipeline:
         if dynamic_state is not None and not isinstance(dynamic_state, DynamicState):
             raise TypeError("dynamic_state must be a DynamicState or None")
         with _invocation_context():
-            self._invoke(expand_binding_group_arguments(arguments), render_pass, draw, dynamic_state)
+            self._invoke(expand_params_arguments(arguments), render_pass, draw, dynamic_state)
 
 
 def pipeline(

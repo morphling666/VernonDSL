@@ -32,8 +32,8 @@ and each invocation records the pass content.
   bound (section 3). A declaration would duplicate those facts and tie
   ordinary pipelines, such as material Programs that are also drawn
   standalone, to one use.
-- **Binding-group records in portable reflection.** Group leaves are ordinary
-  reflected parameters. Per-draw binding works on parameters, so a group
+- **Params records in portable reflection.** Params leaves are ordinary
+  reflected parameters. Per-draw binding works on parameters, so a params
   identity would be a second, redundant compatibility rule.
 - **Host callbacks that record native commands.** They are opaque to the
   Runtime, which owns command recording.
@@ -91,7 +91,7 @@ ProgramGraph call. Every fact a pass needs is already in the Program:
 
 Endpoints of different pipelines correspond when they have the same module
 role and `source_name`, the stage-local identity reflection already carries.
-A binding-group leaf's `source_name` is its dotted path, so `material.albedo`
+A params leaf's `source_name` is its dotted path, so `material.albedo`
 in two pipelines is one parameter name.
 
 ## 4. Graphics pipelines and conformance
@@ -162,20 +162,19 @@ the recording refers to. Nothing else about binding changes:
 
 ## 6. Physical layout
 
-Semantics never refer to binding groups. Groups are the unit the compiler uses
-to partition native bindings, so that the common per-draw switch touches only
-the switched native state:
+Semantics never refer to groups. A group is the set of leaves that declare
+one `set` ([`../runtime/binding_groups.md`](../runtime/binding_groups.md)
+section 3), the unit the compiler uses to partition native bindings, so that
+the common per-draw switch touches only the switched native state:
 
-- Each top-level binding-group occurrence owns its own TensorView metadata
-  carrier per module. Ungrouped TensorViews share the module's remaining
-  carrier. A carrier that mixed pass and per-draw fields would be rewritten on
-  every draw.
-- Set-based targets give ungrouped endpoints and their carriers descriptor
-  set 0 and top-level occurrence `k`, in declaration order, set `k + 1`.
-  D3D12 uses one descriptor table per occurrence and Metal one argument buffer
-  per occurrence. A Stage with more occurrences than the target's set limit
-  minus one fails compilation.
-- OpenGL keeps flat bindings.
+- Set-based targets give each set its own native object: a descriptor set on
+  Vulkan, a descriptor table on D3D12, an argument buffer on Metal. A set at
+  or above the target's set limit fails compilation.
+- Every TensorView metadata carrier is in set 0, one per module, until
+  per-set carriers land with uniform packing
+  ([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section
+  3.4).
+- OpenGL keeps flat bindings, unique across sets.
 
 Runtime reads these partitions from the target implementation records it
 already validates. A sealed set that covers exactly one partition binds as
@@ -295,8 +294,8 @@ Run on every backend with graphics support:
    render scope per recorded Node.
 7. A compute Node writes a fixed TensorView endpoint that the recorded draws
    read, and the write is ordered first.
-8. A set covering one binding group binds as one native object on set-based
-   backends; a set covering part of a group draws the same pixels.
+8. A binding set covering one group binds as one native object on set-based
+   backends; a binding set covering part of a group draws the same pixels.
 9. The same cooked pipeline draws standalone and as a recorded pass, with no
    recook.
 10. Every diagnostic in section 9 is produced with its code, phase, path, and

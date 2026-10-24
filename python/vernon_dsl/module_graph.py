@@ -53,7 +53,7 @@ _HOST_MODULES = {
 _SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type", "format"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
-_CLASS_DECORATORS = frozenset({"struct", "binding_group"})
+_CLASS_DECORATORS = frozenset({"struct", "params"})
 
 
 def _is_dsl_class(node: ast.AST | None) -> bool:
@@ -66,10 +66,8 @@ def _is_struct_declaration(node: ast.AST | None) -> bool:
     return isinstance(node, ast.ClassDef) and any(_decorator_name(item) == "struct" for item in node.decorator_list)
 
 
-def _is_binding_group(node: ast.AST | None) -> bool:
-    return isinstance(node, ast.ClassDef) and any(
-        _decorator_name(item) == "binding_group" for item in node.decorator_list
-    )
+def _is_params(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.ClassDef) and any(_decorator_name(item) == "params" for item in node.decorator_list)
 
 
 @dataclass(frozen=True)
@@ -109,7 +107,7 @@ class _Module:
 
 @dataclass(frozen=True)
 class _TypeValue:
-    """A bound type specialization: a scalar type (no declaration) or a declared `@struct`/`@binding_group` class."""
+    """A bound type specialization: a scalar type (no declaration) or a declared `@struct`/`@params` class."""
 
     identity: str
     declaration: tuple[_Module, ast.ClassDef] | None = None
@@ -401,7 +399,7 @@ class _Specializer(ast.NodeTransformer):
                 continue
             # Binding-group leaves are uniforms and resources, which never take interface locations.
             declared_class = self.graph._resolve_class(self.module, interface_type)
-            if declared_class is not None and _is_binding_group(declared_class[1]):
+            if declared_class is not None and _is_params(declared_class[1]):
                 continue
             candidates.append(
                 (

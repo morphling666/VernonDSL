@@ -2,6 +2,7 @@
 #define VERNON_RHI_METAL_BACKEND_H
 
 #include "VernonRHI.h"
+#include "block_pool.h"
 #include "staging_pool.h"
 
 #import <Metal/Metal.h>
@@ -87,6 +88,11 @@ struct VERNON_RHI_CAPI DeviceState {
     // `offset` in `buffer`, a multiple of `alignment`.
     bool reserveTransient(uint64_t native, size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset,
                           std::string &error);
+    // Reserves `size` bytes of shared memory at `offset` in `buffer`, a multiple of `alignment`, held until
+    // `releasePersistent(key)`.
+    bool reservePersistent(size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset, uint64_t &key,
+                           std::string &error);
+    void releasePersistent(uint64_t key);
 
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -107,6 +113,7 @@ private:
     StagingPool<TransientChunk> transientPool;
     // Keyed by the recording's command buffer; recordings of a device are open concurrently.
     std::unordered_map<uint64_t, StagingArena<TransientChunk>> recordingTransients;
+    BlockPool<TransientChunk> persistentBlocks;
 };
 
 } // namespace vernon::rhi::metal

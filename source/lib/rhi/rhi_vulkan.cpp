@@ -2455,6 +2455,35 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Result<CommandTransient, RhiError>{ok(CommandTransient{vulkanHandleBits(buffer), offset})};
 }
 
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !size || !alignment || (alignment & (alignment - 1)) != 0)
+        return Placed{err(invalidResource("place_vulkan_persistent", size))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkBuffer buffer{};
+    VkDeviceSize offset{};
+    uint8_t *mapped{};
+    uint64_t key{};
+    try {
+        if (!device->state.placePersistent(size, alignment, buffer, offset, mapped, key, device->error))
+            return Placed{err(backendFailure("place_vulkan_persistent", size))};
+    } catch (const std::bad_alloc &) {
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_vulkan_persistent", size, 0}})};
+    }
+    if (data)
+        std::memcpy(mapped, data, static_cast<size_t>(size));
+    return Placed{ok(PersistentBlock{vulkanHandleBits(buffer), offset, mapped, key})};
+}
+
+void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.releasePersistent(key);
+    }
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                                        VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
                                        size_t regionCount) noexcept {
@@ -3074,6 +3103,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
         result.writeTransient.emplace(writeTransient);
+        result.placePersistent.emplace(placePersistent);
+        result.releasePersistent.emplace(releasePersistent);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

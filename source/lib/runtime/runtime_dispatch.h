@@ -55,9 +55,11 @@ void destroyBackendPipeline(VernonStageExecutable &pipeline);
 // Encodes one draw of `stream` on `commands`, inside its rendering scope.
 RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
                                           const GraphicsCommand &command, GraphicsStream &stream);
-// `owners`, when given, holds the owner of each Stage parameter's argument; otherwise the launch owns them all.
-RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan,
-                                                 const ArgumentOwner *owners);
+class CommandStream;
+// Dispatches on `stream`, whose encoder is the launch's. `owners`, when given, holds the owner of each Stage
+// parameter's argument; otherwise the launch owns them all.
+RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, CommandStream &stream,
+                                                 const PlannedComputeLaunch &plan, const ArgumentOwner *owners);
 
 RuntimeResult<VernonRuntimeProviderResourceReference>
 referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size);
@@ -72,28 +74,53 @@ RuntimeResult<VernonRuntimeProviderImageDescription>
 describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
 RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
                                                                           VernonRhiCommandEncoder encoder);
-// The RuntimeCore command state of one command encoder, ended on destruction when end() was not called.
-class BackendCommands {
+// The command stream of one provider command encoder: its RuntimeCore commands and the transient groups they bind,
+// which live until the stream ends. Ended on destruction when end() was not called.
+class CommandStream {
 public:
-    BackendCommands() = default;
-    BackendCommands(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands) noexcept
-        : context_(&context), commands_(commands) {}
-    BackendCommands(BackendCommands &&other) noexcept
-        : context_(other.context_), commands_(std::exchange(other.commands_, nullptr)) {}
-    BackendCommands &operator=(BackendCommands &&other) noexcept;
-    BackendCommands(const BackendCommands &) = delete;
-    BackendCommands &operator=(const BackendCommands &) = delete;
-    ~BackendCommands();
+    CommandStream() = default;
+    CommandStream(CommandStream &&other) noexcept;
+    CommandStream &operator=(CommandStream &&other) noexcept;
+    CommandStream(const CommandStream &) = delete;
+    CommandStream &operator=(const CommandStream &) = delete;
+    ~CommandStream();
 
-    VernonRuntimeCoreCommands *get() const { return commands_; }
+    explicit operator bool() const { return commands_ != nullptr; }
+    VernonRuntimeCoreCommands *commands() const { return commands_; }
+    VernonRuntimeProviderObject encoder() const { return encoder_; }
+    GroupStore &transient() const { return *transient_; }
+    // Called before the next command once other commands were recorded on the encoder, outside a rendering scope.
+    RuntimeResult<void> resume();
     RuntimeResult<void> end();
 
 private:
+    friend RuntimeResult<CommandStream> beginCommandStream(VernonRuntimeContext &, VernonRuntimeProviderObject);
+
     VernonRuntimeContext *context_{};
     VernonRuntimeCoreCommands *commands_{};
+    VernonRuntimeProviderObject encoder_{};
+    std::unique_ptr<GroupStore> transient_;
 };
 
-RuntimeResult<BackendCommands> beginBackendCommands(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
+// On the provider of `context`: the CPU provider, or the RHI adapter's.
+RuntimeResult<CommandStream> beginCommandStream(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
+
+// The command stream that the nodes of one RHI command plan share on the plan's encoder. Each node acquires it: the
+// first begins it, and later ones resume it, because the plan records barriers, copies and scope commands between
+// nodes. The plan's finisher ends it.
+class EncoderCommandStream {
+public:
+    explicit EncoderCommandStream(VernonRuntimeContext &context) : context_(context) {}
+
+    RuntimeResult<CommandStream *> acquire(VernonRhiCommandEncoder encoder);
+    // An RhiCommandListEncoder for the plan's finishers.
+    static VernonRhiStatus finish(void *stream, VernonRhiCommandEncoder encoder);
+
+private:
+    VernonRuntimeContext &context_;
+    VernonRhiCommandEncoder encoder_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    CommandStream stream_;
+};
 RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,
                                           const VernonRuntimeProviderRenderingDescriptor &descriptor);
 RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands);

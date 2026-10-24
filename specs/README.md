@@ -111,7 +111,7 @@ Architecture and tutorials link to the contract instead of redefining fields.
   permanent Kernel/Module/Program/VJP regression gates.
 - [`language/static_specialization.md`](language/static_specialization.md)
   records the rationale for static specialization branches, `When`
-  predicates, binding groups, typed method resolution, and type-valued
+  predicates, params, typed method resolution, and type-valued
   specializations, whose rules are in `language/contract.md` section 6.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   lists remaining language-v4 gates.

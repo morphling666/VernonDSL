@@ -428,7 +428,7 @@ compile failure with the stated stable reason, never a runtime skip.
 - Valid: source imports without execution, deterministic captured constants,
   static branches over every scalar specialization kind, compile-time `When`
   predicates in Kernels and graphics Pipelines, type-valued specializations
-  bound to declared structs, binding groups, or scalar types (compared with
+  bound to declared structs, params classes, or scalar types (compared with
   `==`/`!=` only), format specializations selecting a graphics Pipeline's
   color target formats, and declared ProgramAsset variants.
 - Invalid: arbitrary Python capture/execution, undeclared or mistyped

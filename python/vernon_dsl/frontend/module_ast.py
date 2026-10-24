@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .._markers import dsl_kind
-from ..binding_groups import expand_binding_group_arguments, is_binding_group
+from .._params import expand_params_arguments, is_params
 from ..host_values import declared_fields
 from ..module import Module
 from ..operation_graph import (
@@ -121,7 +121,7 @@ def _contains_graph(value: Any) -> bool:
         return any(_contains_graph(member) for member in value.values())
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return any(_contains_graph(getattr(value, field.name)) for field in dataclasses.fields(value))
-    if is_binding_group(type(value)):
+    if is_params(type(value)):
         return any(_contains_graph(getattr(value, field)) for field in declared_fields(type(value)))
     return False
 
@@ -445,7 +445,7 @@ class _ForwardInterpreter:
                     raise TypeError("dynamic_state must be a DynamicState or None")
             self.capture.capture_graphics(
                 callee,
-                expand_binding_group_arguments(keywords),
+                expand_params_arguments(keywords),
                 render_pass,
                 draw,
                 dynamic_state,
@@ -464,7 +464,7 @@ class _ForwardInterpreter:
             if keywords:
                 raise TypeError("depth_output does not accept keyword arguments")
             return self.capture.attachment_output(args[0], "depth", None)
-        if (dataclasses.is_dataclass(callee) and isinstance(callee, type)) or is_binding_group(callee):
+        if (dataclasses.is_dataclass(callee) and isinstance(callee, type)) or is_params(callee):
             return callee(*args, **keywords)
         if any(_contains_graph(value) for value in (*args, *keywords.values())):
             raise TypeError(

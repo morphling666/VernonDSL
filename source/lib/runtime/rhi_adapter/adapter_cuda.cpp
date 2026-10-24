@@ -88,6 +88,8 @@ struct KernelParameter {
 struct PreparedLayout : RhiRetainedObject {
     std::array<GroupLayout *, kMaxGroups> groups{};
     uint32_t groupCount{};
+    // Bit g is set when the group layout at index g has entries; an index without entries is never bound.
+    uint32_t groupMask{};
     std::array<std::vector<KernelParameter>, kMaxGroups> parameters;
     size_t parameterCount{};
 
@@ -121,19 +123,13 @@ struct CudaGroup : RhiGroup {
     struct Value {
         MemRefDescriptor memref;
         std::vector<uint8_t> inlineStorage;
-        DevicePointer hostStorage{};
     };
     DeviceState *device{};
     GroupLayout *layout{};
     uint64_t serial{};
     std::vector<Value> values;
 
-    ~CudaGroup() override {
-        for (const Value &value : values)
-            if (value.hostStorage)
-                device->free(value.hostStorage);
-        releaseRetainedObject(layout);
-    }
+    ~CudaGroup() override { releaseRetainedObject(layout); }
 };
 
 // Applied state holds group serials rather than pointers, because addresses are reused.
@@ -221,6 +217,8 @@ RhiAdapterResult<void> prepareLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
         groupLayout->references.fetch_add(1, std::memory_order_relaxed);
         layout->groups[group] = groupLayout;
         layout->groupCount = static_cast<uint32_t>(group + 1);
+        if (!groupLayout->entries.empty())
+            layout->groupMask |= 1u << group;
         auto &parameters = layout->parameters[group];
         parameters.resize(groupLayout->entries.size());
         for (uint32_t entry = 0; entry < parameters.size(); ++entry) {
@@ -296,11 +294,10 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
 }
 
 // Host values bound as storage need device memory: a transient group's comes from its encoder's transient memory, and a
-// persistent group allocates its own.
+// persistent group's from a persistent block of the device.
 RhiAdapterResult<DevicePointer> placeHostStorage(VernonRuntimeRhiAdapter &adapter, CudaGroup &group,
                                                  const VernonRuntimeProviderGroupDescriptor &descriptor,
-                                                 const VernonRuntimeProviderInlineValue &host,
-                                                 CudaGroup::Value &value) {
+                                                 const VernonRuntimeProviderInlineValue &host) {
     if (descriptor.lifetime == VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT) {
         auto written = writeCommandTransient(adapter, descriptor.command_encoder, host.data, host.size,
                                              kDeviceAllocationAlignment);
@@ -309,15 +306,11 @@ RhiAdapterResult<DevicePointer> placeHostStorage(VernonRuntimeRhiAdapter &adapte
         return RhiAdapterResult<DevicePointer>{
             vernon::ok(static_cast<DevicePointer>(written.value().buffer + written.value().offset))};
     }
-    if (auto allocated =
-            cudaResult(group.device->allocate(value.hostStorage, host.size), "cuMemAlloc host storage binding");
-        !allocated)
-        return RhiAdapterResult<DevicePointer>{vernon::err(std::move(allocated).error())};
-    if (auto uploaded = cudaResult(group.device->upload(value.hostStorage, host.data, host.size),
-                                   "cuMemcpyHtoDAsync host storage binding");
-        !uploaded)
-        return RhiAdapterResult<DevicePointer>{vernon::err(std::move(uploaded).error())};
-    return RhiAdapterResult<DevicePointer>{vernon::ok(value.hostStorage)};
+    auto placed = placePersistent(adapter, group, host.data, host.size, kDeviceAllocationAlignment);
+    if (!placed)
+        return RhiAdapterResult<DevicePointer>{vernon::err(std::move(placed).error())};
+    return RhiAdapterResult<DevicePointer>{
+        vernon::ok(static_cast<DevicePointer>(placed.value().buffer + placed.value().offset))};
 }
 
 RhiAdapterResult<void> initializeGroupValue(VernonRuntimeRhiAdapter &adapter, CudaGroup &group,
@@ -346,7 +339,7 @@ RhiAdapterResult<void> initializeGroupValue(VernonRuntimeRhiAdapter &adapter, Cu
         if (!inlineValue.data || !inlineValue.size || inlineValue.size % entry.element_size != 0)
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_host_storage_binding_is_invalid",
                                    inlineValue.size, entry.element_size);
-        auto placed = placeHostStorage(adapter, group, descriptor, inlineValue, value);
+        auto placed = placeHostStorage(adapter, group, descriptor, inlineValue);
         if (!placed)
             return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
         pointer = placed.value();
@@ -435,6 +428,14 @@ RhiAdapterResult<void> endCommandsResult(void *, VernonRuntimeProviderObject han
                : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_end_commands_handle_is_invalid");
 }
 
+// Each launch carries its whole parameter frame, so no native state outlives a command.
+RhiAdapterResult<void> resumeCommandsResult(void *, VernonRuntimeProviderObject handle) {
+    const auto *commands = fromHandle<CudaCommands>(handle);
+    return commands && !commands->rendering
+               ? RhiAdapterResult<void>{vernon::ok()}
+               : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_resume_commands_is_invalid");
+}
+
 RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
                                           VernonRuntimeProviderObject pipelineHandle) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -476,6 +477,8 @@ RhiAdapterResult<void> fillParameters(CudaCommands &commands) {
         commands.parameterGroups.fill(0);
     }
     for (uint32_t index = 0; index < layout.groupCount; ++index) {
+        if ((layout.groupMask & (1u << index)) == 0)
+            continue;
         CudaGroup *group = commands.groups[index];
         if (!group)
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_command_group_is_unbound", index);
@@ -515,7 +518,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         !launched)
         return launched;
     for (uint32_t index = 0; index < pipeline.layout->groupCount; ++index)
-        if (!commands->groups[index]->writes.empty())
+        if ((pipeline.layout->groupMask & (1u << index)) != 0 && !commands->groups[index]->writes.empty())
             if (auto recorded = recordGroupWrites(adapter, commands->encoder, *commands->groups[index]); !recorded)
                 return recorded;
     if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
@@ -570,6 +573,10 @@ VernonStatus endCommands(void *data, VernonRuntimeProviderObject commands) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, endCommandsResult(data, commands), "CUDA commands failed");
 }
+VernonStatus resumeCommands(void *data, VernonRuntimeProviderObject commands) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, resumeCommandsResult(data, commands), "CUDA commands could not resume");
+}
 VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "CUDA pipeline binding failed");
@@ -600,6 +607,7 @@ void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.create_group = createGroup;
     adapter.provider.begin_commands = beginCommands;
     adapter.provider.end_commands = endCommands;
+    adapter.provider.resume_commands = resumeCommands;
     adapter.provider.encode_bind_pipeline = bindPipeline;
     adapter.provider.encode_bind_group = bindGroup;
     adapter.provider.encode_dispatch = encodeDispatch;

@@ -183,114 +183,145 @@ bool buildCommandDag(const std::vector<ExecutionResourceRecord> &resources,
     return validateCommandDag(dag, error);
 }
 
-bool buildCommandBarriers(const std::vector<ExecutionResourceRecord> &resources, const CommandDag &dag,
+namespace {
+
+// Makes `access` the last access of the region it covers in `accesses`, which hold accesses of its domain.
+void replaceOverlapping(std::vector<CommandResourceAccess> &accesses, const CommandResourceAccess &access) {
+    accesses.erase(
+        std::remove_if(accesses.begin(), accesses.end(),
+                       [&](const CommandResourceAccess &current) { return commandAccessesOverlap(current, access); }),
+        accesses.end());
+    accesses.push_back(access);
+}
+
+} // namespace
+
+bool buildCommandBarriers(const CommandDag &dag, const std::vector<CommandResourceAccess> &initialAccesses,
+                          CommandBarrierTarget target, const void *context,
                           std::vector<std::vector<VernonRhiBarrier>> &barriers, std::string &error) {
     barriers.assign(dag.nodes.size(), {});
-    std::vector<CommandResourceAccess> lastAccesses;
+    CommandAccessDomainMap<std::vector<CommandResourceAccess>> lastAccesses;
+    for (const CommandResourceAccess &access : initialAccesses)
+        lastAccesses[commandAccessDomain(access)].push_back(access);
+    CommandAccessDomainMap<std::vector<CommandResourceAccess>> finalAccesses;
+    std::vector<const CommandResourceAccess *> firstAccesses;
     for (uint32_t nodeIndex = 0; nodeIndex < dag.nodes.size(); ++nodeIndex) {
-        const CommandNode &node = dag.nodes[nodeIndex];
-        std::vector<CommandResourceAccess> firstAccesses;
-        std::vector<CommandResourceAccess> finalAccesses;
-        for (const CommandResourceAccess &access : node.accesses) {
-            if (std::none_of(finalAccesses.begin(), finalAccesses.end(), [&](const CommandResourceAccess &current) {
+        finalAccesses.clear();
+        firstAccesses.clear();
+        for (const CommandResourceAccess &access : dag.nodes[nodeIndex].accesses) {
+            std::vector<CommandResourceAccess> &domainFinal = finalAccesses[commandAccessDomain(access)];
+            if (std::none_of(domainFinal.begin(), domainFinal.end(), [&](const CommandResourceAccess &current) {
                     return commandAccessesOverlap(current, access);
                 }))
-                firstAccesses.push_back(access);
-            finalAccesses.erase(std::remove_if(finalAccesses.begin(), finalAccesses.end(),
-                                               [&](const CommandResourceAccess &current) {
-                                                   return commandAccessesOverlap(current, access);
-                                               }),
-                                finalAccesses.end());
-            finalAccesses.push_back(access);
+                firstAccesses.push_back(&access);
+            replaceOverlapping(domainFinal, access);
         }
-        std::vector<const CommandResourceAccess *> orderedAccesses;
-        orderedAccesses.reserve(firstAccesses.size());
-        for (const CommandResourceAccess &access : firstAccesses)
-            orderedAccesses.push_back(&access);
-        std::stable_sort(orderedAccesses.begin(), orderedAccesses.end(),
-                         [](const CommandResourceAccess *left, const CommandResourceAccess *right) {
-                             return left->resource < right->resource;
-                         });
-        for (const CommandResourceAccess *accessPointer : orderedAccesses) {
-            const CommandResourceAccess &access = *accessPointer;
-            if (access.resource >= resources.size()) {
-                error = "command barrier access refers to an invalid resource";
-                return false;
-            }
-            const ExecutionResourceRecord &record = resources[access.resource];
-            if (record.resource.kind != access.kind) {
-                error = "command barrier access kind does not match its resource";
-                return false;
-            }
-            for (const CommandResourceAccess &previous : lastAccesses) {
-                if (!commandAccessesOverlap(previous, access) ||
-                    (previous.state == access.state && !writes(previous.access) && !writes(access.access)))
+        for (const CommandResourceAccess *access : firstAccesses) {
+            const auto previousAccesses = lastAccesses.find(commandAccessDomain(*access));
+            if (previousAccesses == lastAccesses.end())
+                continue;
+            for (const CommandResourceAccess &previous : previousAccesses->second) {
+                if (!commandAccessesOverlap(previous, *access) ||
+                    (previous.state == access->state && !writes(previous.access) && !writes(access->access)))
                     continue;
                 VernonRhiBarrier barrier{};
                 barrier.struct_size = sizeof(barrier);
                 barrier.source_stage_mask = previous.stageMask;
-                barrier.destination_stage_mask = access.stageMask;
+                barrier.destination_stage_mask = access->stageMask;
                 barrier.source_access = commandAccessMask(previous);
-                barrier.destination_access = commandAccessMask(access);
+                barrier.destination_access = commandAccessMask(*access);
                 barrier.old_state = previous.state;
-                barrier.new_state = access.state;
-                barrier.is_image = access.kind == ResourceKind::Image;
-                if (barrier.is_image) {
-                    barrier.image = record.image;
-                    barrier.image_subresources = intersection(previous.imageSubresources, access.imageSubresources);
-                } else {
-                    barrier.buffer = record.buffer;
-                }
+                barrier.new_state = access->state;
+                barrier.is_image = access->kind == ResourceKind::Image;
+                if (barrier.is_image)
+                    barrier.image_subresources = intersection(previous.imageSubresources, access->imageSubresources);
+                if (!target(context, *access, barrier, error))
+                    return false;
                 barriers[nodeIndex].push_back(barrier);
             }
         }
-        for (const CommandResourceAccess &access : finalAccesses) {
-            lastAccesses.erase(std::remove_if(lastAccesses.begin(), lastAccesses.end(),
-                                              [&](const CommandResourceAccess &previous) {
-                                                  return commandAccessesOverlap(previous, access);
-                                              }),
-                               lastAccesses.end());
-            lastAccesses.push_back(access);
+        for (const auto &[domain, accesses] : finalAccesses) {
+            std::vector<CommandResourceAccess> &last = lastAccesses[domain];
+            for (const CommandResourceAccess &access : accesses)
+                replaceOverlapping(last, access);
         }
     }
     return true;
 }
 
-bool validateCommandDag(const CommandDag &dag, std::string &error) {
-    std::vector<std::vector<bool>> ancestors(dag.nodes.size(), std::vector<bool>(dag.nodes.size()));
-    for (uint32_t index = 0; index < dag.nodes.size(); ++index) {
-        const CommandNode &node = dag.nodes[index];
-        if ((node.kind == CommandNodeKind::Compute || node.kind == CommandNodeKind::Render) &&
-            node.scopeIndices.empty()) {
-            error = "command node has no compiled scope";
+bool CommandDagValidator::add(const CommandNode &node, std::string &error) {
+    const uint32_t index = size();
+    if ((node.kind == CommandNodeKind::Compute || node.kind == CommandNodeKind::Render) && node.scopeIndices.empty()) {
+        error = "command node has no compiled scope";
+        return false;
+    }
+    std::vector<uint64_t> ancestors((index + 63) / 64);
+    uint32_t previous = UINT32_MAX;
+    for (uint32_t predecessor : node.predecessors) {
+        if (predecessor >= index) {
+            error = "command DAG is not topologically ordered";
             return false;
         }
-        uint32_t previous = UINT32_MAX;
-        for (uint32_t predecessor : node.predecessors) {
-            if (predecessor >= index) {
-                error = "command DAG is not topologically ordered";
-                return false;
-            }
-            if (previous != UINT32_MAX && predecessor <= previous) {
-                error = "command node predecessors are not unique and ordered";
-                return false;
-            }
-            previous = predecessor;
-            ancestors[index][predecessor] = true;
-            for (uint32_t ancestor = 0; ancestor < index; ++ancestor)
-                ancestors[index][ancestor] = ancestors[index][ancestor] || ancestors[predecessor][ancestor];
+        if (previous != UINT32_MAX && predecessor <= previous) {
+            error = "command node predecessors are not unique and ordered";
+            return false;
         }
-        for (CommandResourceAccess access : node.accesses)
-            if (!normalizeCommandAccess(access, error))
-                return false;
-        for (uint32_t earlier = 0; earlier < index; ++earlier)
-            for (const CommandResourceAccess &left : dag.nodes[earlier].accesses)
-                for (const CommandResourceAccess &right : node.accesses)
-                    if (commandAccessesConflict(left, right) && !ancestors[index][earlier]) {
-                        error = "conflicting command resource accesses have no dependency";
-                        return false;
-                    }
+        previous = predecessor;
+        ancestors[predecessor / 64] |= uint64_t{1} << (predecessor % 64);
+        const std::vector<uint64_t> &inherited = ancestors_[predecessor];
+        for (size_t word = 0; word < inherited.size(); ++word)
+            ancestors[word] |= inherited[word];
     }
+    std::vector<CommandResourceAccess> accesses = node.accesses;
+    for (CommandResourceAccess &access : accesses)
+        if (!normalizeCommandAccess(access, error))
+            return false;
+    for (const CommandResourceAccess &access : accesses) {
+        const auto earlier = accesses_.find(commandAccessDomain(access));
+        if (earlier == accesses_.end())
+            continue;
+        for (const Added &added : earlier->second)
+            if (commandAccessesConflict(added.access, access) &&
+                !((ancestors[added.node / 64] >> (added.node % 64)) & 1)) {
+                error = "conflicting command resource accesses have no dependency";
+                return false;
+            }
+    }
+    for (CommandResourceAccess &access : accesses) {
+        const CommandAccessDomain domain = commandAccessDomain(access);
+        accesses_[domain].push_back({index, std::move(access)});
+        insertions_.push_back(domain);
+    }
+    ancestors_.push_back(std::move(ancestors));
+    return true;
+}
+
+void CommandDagValidator::truncate(uint32_t count) {
+    while (!insertions_.empty()) {
+        const auto domain = accesses_.find(insertions_.back());
+        if (domain->second.back().node < count)
+            break;
+        domain->second.pop_back();
+        if (domain->second.empty())
+            accesses_.erase(domain);
+        insertions_.pop_back();
+    }
+    if (count < ancestors_.size())
+        ancestors_.resize(count);
+}
+
+bool CommandDagValidator::overlapsAdded(const CommandResourceAccess &access) const {
+    const auto added = accesses_.find(commandAccessDomain(access));
+    return added != accesses_.end() &&
+           std::any_of(added->second.begin(), added->second.end(),
+                       [&](const Added &earlier) { return commandAccessesOverlap(earlier.access, access); });
+}
+
+bool validateCommandDag(const CommandDag &dag, std::string &error) {
+    CommandDagValidator validator;
+    for (const CommandNode &node : dag.nodes)
+        if (!validator.add(node, error))
+            return false;
     return true;
 }
 

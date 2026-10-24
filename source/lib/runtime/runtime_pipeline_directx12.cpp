@@ -68,14 +68,17 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline, Ve
 #endif
 }
 
-VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                            GroupStore &transient, const PlannedComputeLaunch &launch,
                                             const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, directX12State(*pipeline.context).adapter, kDirectX12Compute,
-                                    pipeline.bindingProjection, launch, owners,
+                                    pipeline.bindingProjection, commands, transient, launch, owners,
                                     runtimeBackendState<DirectX12PipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
+    (void)commands;
+    (void)transient;
     (void)launch;
     (void)owners;
     return VERNON_STATUS_UNSUPPORTED_TARGET;

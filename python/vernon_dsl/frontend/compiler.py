@@ -12,7 +12,6 @@ from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
 from ..types import SpecializationAssignment, enabled_features
 from .autodiff_profiles import AutodiffProfilePlan
-from .binding_groups import flatten_binding_groups
 from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
@@ -20,6 +19,7 @@ from .lowering_types import DslType, FunctionSignature, ModuleContext
 from .model import AccessMode, ConcreteType, StorageEffect, StorageOwnerKind, StorageRegionKind, is_abi_stable_value
 from .monomorphize import infer_and_monomorphize_helpers
 from .parameter_paths import split_parameter_path
+from .params import flatten_params
 from .request import FrontendCompileRequest, FrontendCompileResult
 from .specialization import specialize_frontend_module
 from .type_parser import AnnotatedType, TypeParser
@@ -79,7 +79,7 @@ class Compiler:
         strip_docstrings(module)
         module = normalize_struct_methods(module, filename)
         context = ModuleContext(filename, runtime_entry=runtime_entry)
-        module = flatten_binding_groups(module, context.error)
+        module = flatten_params(module, context.error)
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)

@@ -78,9 +78,11 @@ bool prepareRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAd
                                const RhiComputeTarget &target, const LoadedStageArtifact &stage,
                                const StageBindingPlan &plan, RhiComputePipeline &output,
                                RhiComputeNativeBindingResolver resolver = {});
-// `owners`, when given, holds the owner of each Stage parameter's argument; otherwise the launch owns them all.
+// Dispatches on `commands`, whose transient groups `transient` keeps. `owners`, when given, holds the owner of each
+// Stage parameter's argument; otherwise the launch owns them all.
 VernonStatus invokeRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                       const RhiComputeTarget &target, const StageBindingPlan &projection,
+                                      VernonRuntimeCoreCommands *commands, GroupStore &transient,
                                       const PlannedComputeLaunch &launch, const ArgumentOwner *owners,
                                       RhiComputePipeline &pipeline);
 

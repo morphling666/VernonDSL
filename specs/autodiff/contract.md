@@ -16,7 +16,7 @@ Status: normative compute Program VJP contract.
 > Graphics VJP, browser wasm32 Program VJP, custom compute VJPs, higher-order
 > AD, persistent `.grad`, and unrestricted temporal differentiation remain
 > deferred. Module and Kernel VJP reject every Texture or Sampler parameter,
-> including binding-group leaves, during Program VJP planning; compute
+> including params leaves, during Program VJP planning; compute
 > sampling through Sampler is unsupported, while graphics forward supports
 > Texture/Sampler. GPU `f16` remains unsupported on every backend in the
 > current contract and requires a future versioned capability change.
@@ -111,8 +111,8 @@ Values derive gradient structure recursively from floating leaves.
 - Integer and Boolean leaves are non-differentiable unless an explicit custom
   rule consumes them without requesting a gradient.
 - Resource handles and sampler state are non-differentiable.
-- A binding group is differentiated leaf by leaf; each cotangent is keyed by
-  the leaf's dotted path. A `wrt` or `outputs` path naming a group root is
+- A params value is differentiated leaf by leaf; each cotangent is keyed by
+  the leaf's dotted path. A `wrt` or `outputs` path naming a params root is
   shorthand for its differentiable (for `outputs`, writable floating
   TensorView) leaves, expanded before the paths become the transform
   identity ([`../language/contract.md`](../language/contract.md)

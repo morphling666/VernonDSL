@@ -1000,7 +1000,7 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
 
 
 def _module_parameter_types(module: Any) -> dict[str, Any]:
-    from .binding_groups import binding_group_leaf_annotations
+    from ._params import params_leaf_annotations
     from .frontend.model import SemanticCategory
     from .frontend.runtime_types import runtime_parameter_descriptor
     from .operation_graph import ProgramControlDescriptor
@@ -1034,7 +1034,7 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
             continue
         if parameter.default is not inspect.Parameter.empty:
             continue
-        for name, leaf_annotation in binding_group_leaf_annotations(parameter.name, annotation):
+        for name, leaf_annotation in params_leaf_annotations(parameter.name, annotation):
             types[name] = descriptor(name, leaf_annotation)
     return types
 
@@ -1351,7 +1351,7 @@ class _TreeRecipe:
             return tuple(member.resolve(inputs, allocations) for member in self.value)
         if self.kind == "list":
             return [member.resolve(inputs, allocations) for member in self.value]
-        if self.kind in {"dataclass", "binding_group"}:
+        if self.kind in {"dataclass", "params"}:
             cls, fields = self.value
             return cls(**{name: member.resolve(inputs, allocations) for name, member in fields})
         raise RuntimeError(f"unknown Program output recipe {self.kind!r}")
@@ -1390,7 +1390,7 @@ def _capture_recipes(
     tuple[_AllocationSpec, ...],
     _TreeRecipe,
 ]:
-    from .binding_groups import is_binding_group
+    from ._params import is_params
     from .host_values import declared_fields
 
     inputs = tuple(capture.inputs.items())
@@ -1445,9 +1445,9 @@ def _capture_recipes(
                     tuple((field.name, tree(getattr(value, field.name))) for field in dataclasses.fields(value)),
                 ),
             )
-        if is_binding_group(type(value)):
+        if is_params(type(value)):
             return _TreeRecipe(
-                "binding_group",
+                "params",
                 (type(value), tuple((name, tree(getattr(value, name))) for name in declared_fields(type(value)))),
             )
         if isinstance(value, Mapping):

@@ -7,12 +7,12 @@ import vernon_dsl as vd
 EXTENT = vd.specialization("extent", vd.u32)
 
 
-@vd.binding_group
+@vd.params
 class Lookup:
     weights: vd.TensorView[vd.f32, (vd.dyn,), vd.read]
 
 
-@vd.binding_group
+@vd.params
 class Terms:
     gain: vd.f32
     lookup: Lookup

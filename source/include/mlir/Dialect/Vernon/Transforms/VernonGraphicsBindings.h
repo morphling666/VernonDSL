@@ -25,17 +25,12 @@ inline constexpr llvm::StringLiteral kGraphicsBindingLayoutAttrName = "vernon.gr
 /// materializeGraphicsResourceBindings rather than authored.
 inline constexpr llvm::StringLiteral kGeneratedBindingAttrName = "vernon.generated_binding";
 
-/// Entry argument attribute naming the binding-group occurrence (its entry
-/// parameter path) that a flattened leaf or its implicit sampler belongs to.
-inline constexpr llvm::StringLiteral kBindingGroupAttrName = "vernon.binding_group";
-
-/// Descriptor sets a graphics pipeline may use: set 0 for ungrouped bindings
-/// and one set per binding-group occurrence. Metal argument buffers bound it.
+/// Descriptor sets a graphics pipeline may use. Metal argument buffers bound it.
 inline constexpr uint32_t kGraphicsDescriptorSetLimit = 8;
 
 /// One generated binding request of a graphics entry. `argument` is empty for
 /// the entry's TensorView metadata carrier, which exists only after target
-/// preparation. `group` is the binding-group occurrence, or empty.
+/// preparation. `group` is the request's `vernon.set`, 0 when it has none.
 struct GraphicsBindingRequest {
     std::string entry;
     std::optional<unsigned> argument;
@@ -43,7 +38,7 @@ struct GraphicsBindingRequest {
     std::string kind;
     std::string typeKey;
     uint32_t count{};
-    std::string group;
+    uint32_t group{};
 };
 
 struct GraphicsAuthoredBinding {
@@ -71,7 +66,7 @@ struct GraphicsBindingAssignment {
 /// lowering both read bindings from this plan; neither may assign its own.
 struct GraphicsBindingPlan {
     /// (entry symbol, argument index) -> generated bindings: one for a uniform
-    /// spilled to a buffer (every by-value binding-group leaf spills), a
+    /// spilled to a buffer (every by-value leaf outside set 0 spills), a
     /// texture, or a sampler without an authored binding; one per storage leaf
     /// for a TensorView; one for the TensorView metadata carrier.
     std::map<std::pair<std::string, unsigned>, GraphicsBindingAssignment> arguments;
@@ -91,11 +86,9 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
 /// Authored bindings stay fixed and may be shared across modules only by
 /// endpoints with the same pipeline parameter name. A generated request reuses
 /// the bindings of an earlier module's request with the same parameter name,
-/// kind, type, and count; every other request takes the lowest free bindings.
-/// Ungrouped requests are in set 0. Each binding-group occurrence takes set
-/// 1 + its first-appearance order across the modules, and one consecutive
-/// range covering the union of its requests in every module, so both stages
-/// share it.
+/// kind, type, and count; every other request of set 0 takes the lowest free
+/// bindings. Each other set takes one consecutive range covering the union of
+/// its requests in every module, so both stages share it.
 FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<GraphicsBindingRequests> modules,
                                                                    std::string &error);
 

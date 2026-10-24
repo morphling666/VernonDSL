@@ -1,4 +1,5 @@
 #include "backend_dispatch.h"
+#include "block_pool.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
 #include "opengl_backend.h"
@@ -105,16 +106,6 @@ struct SurfaceSlot {
     bool acquired{};
 };
 
-struct OpenGLScopeAttachments {
-    std::array<Uint, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
-    Uint depth{};
-    bool stencil{};
-
-    bool operator==(const OpenGLScopeAttachments &other) const {
-        return colors == other.colors && depth == other.depth && stencil == other.stencil;
-    }
-};
-
 struct TransientChunk {
     Buffer buffer;
     size_t capacity{};
@@ -143,16 +134,12 @@ struct OpenGLDevice {
     std::string error;
     std::mutex resourceAllocationMutex;
     std::mutex mutex;
-    // Every rendering scope renders into this framebuffer, created with the device so that encoding allocates no GL
-    // names. Texture names are reusable once `state.framebufferGeneration` moves past `scopeGeneration`, so
-    // `scopeAttachments` then no longer describes what is attached.
-    Uint scopeFramebuffer{};
-    OpenGLScopeAttachments scopeAttachments{};
-    uint64_t scopeGeneration{};
-    bool scopeAttachmentsValid{};
     // Guarded by `mutex`. An encoder's arena returns its chunks to the pool when the encoder completes or is abandoned.
     vernon::rhi::StagingPool<TransientChunk> transientPool;
     std::vector<TransientArena> transients;
+    // Guarded by `mutex`. GL orders the `glBufferSubData` that refills a released block after the commands that read
+    // it.
+    vernon::rhi::BlockPool<TransientChunk> persistentBlocks;
 };
 
 using OpenGLDeviceRegistry = vernon::rhi::DeviceRegistry<OpenGLDevice, kMaximumOpenGLDevices>;
@@ -324,14 +311,13 @@ vernon::Result<void, vernon::RhiError> teardownSurface(void *context, SurfaceLif
 vernon::Result<void, vernon::RhiError> teardownDevice(OpenGLDevice &device) noexcept {
     std::lock_guard<std::mutex> guard(device.mutex);
     device.state.makeCurrent();
-    device.state.destroyFramebuffer(device.scopeFramebuffer);
-    device.scopeFramebuffer = 0;
-    device.scopeAttachmentsValid = false;
+    device.state.destroyAttachmentFramebuffers();
     device.state.destroyDepthStencilCopyObjects();
     for (TransientArena &transient : device.transients)
         device.transientPool.retire(transient.arena);
     device.transients.clear();
     device.transientPool.clear([&](TransientChunk &chunk) { device.state.destroyBuffer(chunk.buffer); });
+    device.persistentBlocks.clear([&](TransientChunk &chunk) { device.state.destroyBuffer(chunk.buffer); });
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -433,6 +419,43 @@ void attachOpenGLView(gl::Driver &driver, Enum attachment, const ImageViewSlot *
         driver.framebufferTextureLayer(gl::kFramebuffer, attachment, imageViewName(*view), 0, 0);
 }
 
+// Binds the framebuffer of `attachments`, creating and completeness-checking it on first use.
+vernon::Result<Uint, vernon::RhiError>
+bindAttachmentFramebuffer(OpenGLDevice &device, const gl::FramebufferAttachments &attachments,
+                          const std::array<const ImageViewSlot *, VERNON_RHI_MAX_COLOR_ATTACHMENTS> &colorViews,
+                          uint32_t colorSlots, const ImageViewSlot *depthView) {
+    auto &driver = device.state.driver;
+    auto &framebuffers = device.state.attachmentFramebuffers;
+    const auto cached = std::find_if(framebuffers.begin(), framebuffers.end(),
+                                     [&](const auto &framebuffer) { return framebuffer.attachments == attachments; });
+    if (cached != framebuffers.end()) {
+        driver.bindFramebuffer(gl::kFramebuffer, cached->name);
+        return vernon::Result<Uint, vernon::RhiError>{vernon::ok(cached->name)};
+    }
+    Uint name = 0;
+    if (!device.state.createFramebuffer(name, device.error))
+        return vernon::Result<Uint, vernon::RhiError>{
+            vernon::err(fail(device, device.error, vernon::RhiErrorCode::BackendFailure))};
+    driver.bindFramebuffer(gl::kFramebuffer, name);
+    std::array<Enum, VERNON_RHI_MAX_COLOR_ATTACHMENTS> drawBuffers{};
+    for (uint32_t location = 0; location < VERNON_RHI_MAX_COLOR_ATTACHMENTS; ++location) {
+        if (colorViews[location])
+            attachOpenGLView(driver, gl::kColorAttachment0 + location, colorViews[location]);
+        drawBuffers[location] = colorViews[location] ? gl::kColorAttachment0 + location : gl::kNone;
+    }
+    if (depthView)
+        attachOpenGLView(driver, attachments.stencil ? gl::kDepthStencilAttachment : gl::kDepthAttachment, depthView);
+    driver.drawBuffers(static_cast<Size>(std::max(1u, colorSlots)), drawBuffers.data());
+    driver.readBuffer(colorSlots ? drawBuffers[0] : gl::kNone);
+    if (driver.checkFramebufferStatus(gl::kFramebuffer) != gl::kFramebufferComplete) {
+        device.state.destroyFramebuffer(name);
+        return vernon::Result<Uint, vernon::RhiError>{vernon::err(
+            fail(device, "OpenGL rendering framebuffer is incomplete", vernon::RhiErrorCode::BackendFailure))};
+    }
+    framebuffers.push_back({attachments, name});
+    return vernon::Result<Uint, vernon::RhiError>{vernon::ok(name)};
+}
+
 // glInvalidateFramebuffer discards whole attachments, so a store discard applies only when the render area covers
 // the attachment.
 bool renderAreaCoversOpenGLView(OpenGLDevice &device, uint64_t key, const vernon::rhi::RenderingScope &scope) {
@@ -509,8 +532,7 @@ vernon::Result<VernonRhiDevice, vernon::RhiError> createOpenGLDeviceImpl(const V
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(commandState).error())};
     OpenGLDevice &device = reservation.value().device();
     device.commandState = std::move(commandState).value();
-    if (!device.state.initialize(*callbacks, embeddedProfile, device.error) ||
-        !device.state.createFramebuffer(device.scopeFramebuffer, device.error))
+    if (!device.state.initialize(*callbacks, embeddedProfile, device.error))
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::BackendFailure, {"initialize_opengl_device", 0, 0}})};
     auto published = devices.publish(std::move(reservation).value());
@@ -1732,6 +1754,51 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Written{ok(CommandTransient{chunk->buffer.name, offset})};
 }
 
+// GL buffers are not mapped, so every block is placed with its bytes.
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Placed{err(std::move(device).error())};
+    if (!data)
+        return Placed{err(RhiError{RhiErrorCode::Unsupported, {"place_opengl_persistent", size, 0}})};
+    if (!size || !alignment || (alignment & (alignment - 1)) != 0 || size > (std::numeric_limits<size_t>::max)() ||
+        alignment > (std::numeric_limits<size_t>::max)())
+        return Placed{err(RhiError{RhiErrorCode::InvalidArgument, {"place_opengl_persistent", size, 0}})};
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    size_t offset{};
+    uint64_t key{};
+    TransientChunk *chunk{};
+    try {
+        chunk =
+            state.persistentBlocks.acquire(static_cast<size_t>(size), static_cast<size_t>(alignment), offset, key,
+                                           [&](size_t capacity, TransientChunk &created) {
+                                               created.capacity = capacity;
+                                               return state.state.createBuffer(created.buffer, capacity, state.error);
+                                           });
+    } catch (const std::bad_alloc &) {
+    }
+    if (!chunk)
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_opengl_persistent", size, 0}})};
+    if (!state.state.uploadBuffer(chunk->buffer, offset, data, static_cast<size_t>(size), state.error)) {
+        state.persistentBlocks.release(key);
+        return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_opengl_persistent", size, 0}})};
+    }
+    return Placed{ok(PersistentBlock{chunk->buffer.name, offset, nullptr, key})};
+}
+
+void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return;
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.persistentBlocks.release(key);
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                                        VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
                                        size_t regionCount) noexcept {
@@ -1877,8 +1944,8 @@ Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_
     if (auto scopeError = beginErrorScope(state, "begin rendering"))
         return Result<OpenedRendering, RhiError>{err(std::move(*scopeError))};
     std::array<const ImageViewSlot *, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorViews{};
-    OpenGLScopeAttachments attachments{};
-    OpenedRendering opened{CommandRenderingStateless, state.scopeFramebuffer};
+    gl::FramebufferAttachments attachments{};
+    OpenedRendering opened{CommandRenderingStateless, 0};
     uint32_t colorSlots = 0;
     for (size_t index = 0; index < scope.colorCount; ++index) {
         const uint32_t location = scope.colors[index].location;
@@ -1894,30 +1961,11 @@ Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_
         opened.depthTarget = attachments.depth;
     }
     auto &driver = state.state.driver;
-    driver.bindFramebuffer(gl::kFramebuffer, state.scopeFramebuffer);
     ++state.state.drawStateGeneration;
-    if (!state.scopeAttachmentsValid || state.scopeGeneration != state.state.framebufferGeneration ||
-        !(state.scopeAttachments == attachments)) {
-        state.scopeAttachmentsValid = false;
-        std::array<Enum, VERNON_RHI_MAX_COLOR_ATTACHMENTS> drawBuffers{};
-        for (uint32_t location = 0; location < VERNON_RHI_MAX_COLOR_ATTACHMENTS; ++location) {
-            attachOpenGLView(driver, gl::kColorAttachment0 + location, colorViews[location]);
-            drawBuffers[location] = colorViews[location] ? gl::kColorAttachment0 + location : gl::kNone;
-        }
-        attachOpenGLView(driver, gl::kDepthStencilAttachment, nullptr);
-        attachOpenGLView(driver, gl::kDepthAttachment, nullptr);
-        if (depthView)
-            attachOpenGLView(driver, attachments.stencil ? gl::kDepthStencilAttachment : gl::kDepthAttachment,
-                             depthView);
-        driver.drawBuffers(static_cast<Size>(std::max(1u, colorSlots)), drawBuffers.data());
-        driver.readBuffer(colorSlots ? drawBuffers[0] : gl::kNone);
-        if (driver.checkFramebufferStatus(gl::kFramebuffer) != gl::kFramebufferComplete)
-            return Result<OpenedRendering, RhiError>{
-                err(fail(state, "OpenGL rendering framebuffer is incomplete", RhiErrorCode::BackendFailure))};
-        state.scopeAttachments = attachments;
-        state.scopeGeneration = state.state.framebufferGeneration;
-        state.scopeAttachmentsValid = true;
-    }
+    auto framebuffer = bindAttachmentFramebuffer(state, attachments, colorViews, colorSlots, depthView);
+    if (framebuffer.isErr())
+        return Result<OpenedRendering, RhiError>{err(std::move(framebuffer).error())};
+    opened.object = framebuffer.value();
     // Desktop GL encodes sRGB attachment writes and clears only while GL_FRAMEBUFFER_SRGB is enabled (OpenGL ES always
     // encodes). Image copies blit through framebuffers and must stay raw, so the state is scoped to rendering and
     // every blit disables it again.
@@ -1972,7 +2020,7 @@ Result<void, RhiError> endRendering(VernonRhiDevice handle, uint64_t native, con
         return Result<void, RhiError>{ok()};
     if (auto scopeError = beginErrorScope(state, "end rendering"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
-    state.state.driver.bindFramebuffer(gl::kFramebuffer, state.scopeFramebuffer);
+    state.state.driver.bindFramebuffer(gl::kFramebuffer, static_cast<Uint>(opened.object));
     state.state.driver.invalidateFramebuffer(gl::kFramebuffer, static_cast<Size>(discardedCount), discarded.data());
     if (auto scopeError = endErrorScope(state, "end rendering"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
@@ -2103,7 +2151,7 @@ Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const
     state.state.makeCurrent();
     if (auto scopeError = beginErrorScope(state, "clear color"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
-    state.state.driver.bindFramebuffer(gl::kFramebuffer, state.scopeFramebuffer);
+    state.state.driver.bindFramebuffer(gl::kFramebuffer, static_cast<Uint>(opened.object));
     prepareOpenGLClears(state.state, scope);
     clearOpenGLColor(state.state.driver, location, attachment->format, color);
     if (auto scopeError = endErrorScope(state, "clear color"))
@@ -2126,7 +2174,7 @@ Result<void, RhiError> clearDepthStencil(VernonRhiDevice handle, uint64_t native
     state.state.makeCurrent();
     if (auto scopeError = beginErrorScope(state, "clear depth stencil"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
-    state.state.driver.bindFramebuffer(gl::kFramebuffer, state.scopeFramebuffer);
+    state.state.driver.bindFramebuffer(gl::kFramebuffer, static_cast<Uint>(opened.object));
     prepareOpenGLClears(state.state, scope);
     clearOpenGLDepthStencil(state.state.driver, (aspects & VERNON_RHI_ATTACHMENT_DEPTH) != 0,
                             (aspects & VERNON_RHI_ATTACHMENT_STENCIL) != 0, depth, stencil);
@@ -2568,6 +2616,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         result.recordBufferCopy.emplace(recordBufferCopy);
         result.recordImageCopy.emplace(recordImageCopy);
         result.writeTransient.emplace(writeTransient);
+        result.placePersistent.emplace(placePersistent);
+        result.releasePersistent.emplace(releasePersistent);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

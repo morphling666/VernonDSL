@@ -55,10 +55,11 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline, Verno
                                      runtimeBackendState<OpenGLPipelineState>(pipeline).rhiGraphics);
 }
 
-VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch,
+VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+                                         GroupStore &transient, const PlannedComputeLaunch &launch,
                                          const ArgumentOwner *owners) {
     return invokeRhiComputePipeline(*pipeline.context, openGLState(*pipeline.context).adapter, kOpenGLCompute,
-                                    pipeline.bindingProjection, launch, owners,
+                                    pipeline.bindingProjection, commands, transient, launch, owners,
                                     runtimeBackendState<OpenGLPipelineState>(pipeline).rhiCompute);
 }
 

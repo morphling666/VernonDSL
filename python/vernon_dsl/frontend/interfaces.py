@@ -65,8 +65,8 @@ def _unpaired_textures(
 ) -> set[str]:
     """Sampled textures that no explicit sampler pairs with. Those bind as combined image-samplers, so each needs an
     implicit sampler even when it is only fetched or measured. One the entry does not read needs one too, because a
-    binding-group leaf stays an endpoint of every Stage of its group, unless another Stage of the pipeline reads it
-    and so pairs it there."""
+    params leaf stays an endpoint of every Stage that declares its parameter, unless another Stage of the pipeline
+    reads it and so pairs it there."""
     read = _read_textures(argument_types, effects)
     unread = _sampled_textures(argument_types) - read - read_elsewhere
     return {name for name in read | unread if sampler_modes.get(name) != "explicit"}

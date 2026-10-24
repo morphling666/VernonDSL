@@ -15,6 +15,11 @@ bool sameBinding(const RhiCommandResourceBinding &left, const RhiCommandResource
     return left.image.index == right.image.index && left.image.generation == right.image.generation;
 }
 
+bool validHandle(const RhiCommandResourceBinding &binding) {
+    return binding.kind == ResourceKind::Buffer ? binding.buffer.index != VERNON_RHI_INVALID_HANDLE_INDEX
+                                                : binding.image.index != VERNON_RHI_INVALID_HANDLE_INDEX;
+}
+
 bool sameAccessRegion(const CommandResourceAccess &left, const CommandResourceAccess &right) {
     if (left.aliasDomain != right.aliasDomain || left.kind != right.kind)
         return false;
@@ -30,156 +35,133 @@ bool sameAccessRegion(const CommandResourceAccess &left, const CommandResourceAc
 
 } // namespace
 
-bool validateRhiCommandExecutionPlan(const RhiCommandExecutionPlan &plan, std::string &error) {
-    if (!validateCommandDag(plan.commands, error))
-        return false;
-    if (plan.encoders.size() != plan.commands.nodes.size()) {
+const RhiCommandResourceBinding *ValidatedRhiCommandPlan::binding(const CommandAccessDomain &domain) const {
+    const auto found = bindings_.find(domain);
+    return found == bindings_.end() ? nullptr : &plan_.bindings[found->second];
+}
+
+bool ValidatedRhiCommandPlan::append(RhiCommandExecutionPlan fragment, std::string &error) {
+    if (fragment.commands.nodes.empty())
+        return true;
+    if (fragment.encoders.size() != fragment.commands.nodes.size()) {
         error = "RHI command plan encoder count does not match its command DAG";
         return false;
     }
-    for (size_t index = 0; index < plan.commands.nodes.size(); ++index) {
-        if (!plan.encoders[index].encode) {
-            error = "RHI command plan has an invalid node encoder";
-            return false;
-        }
-        for (const CommandResourceAccess &access : plan.commands.nodes[index].accesses) {
-            const auto binding =
-                std::find_if(plan.bindings.begin(), plan.bindings.end(), [&](const RhiCommandResourceBinding &value) {
-                    return value.aliasDomain == access.aliasDomain && value.kind == access.kind;
-                });
-            if (binding == plan.bindings.end()) {
-                error = "RHI command plan has an unbound resource access";
-                return false;
-            }
-        }
+    if (std::any_of(fragment.encoders.begin(), fragment.encoders.end(),
+                    [](const RhiCommandNodeEncoder &encoder) { return !encoder.encode; })) {
+        error = "RHI command plan has an invalid node encoder";
+        return false;
     }
-    for (const CommandResourceAccess &initial : plan.initialAccesses) {
-        CommandResourceAccess normalized = initial;
-        if (!normalizeCommandAccess(normalized, error))
-            return false;
-        const auto binding =
-            std::find_if(plan.bindings.begin(), plan.bindings.end(), [&](const RhiCommandResourceBinding &value) {
-                return value.aliasDomain == initial.aliasDomain && value.kind == initial.kind;
-            });
-        if (binding == plan.bindings.end()) {
-            error = "RHI command plan has an unbound initial resource access";
-            return false;
-        }
+    if (std::any_of(fragment.finishers.begin(), fragment.finishers.end(),
+                    [](const RhiCommandFinisher &finisher) { return !finisher.finish; })) {
+        error = "RHI command plan has an invalid finisher";
+        return false;
     }
-    for (size_t index = 0; index < plan.bindings.size(); ++index) {
-        const RhiCommandResourceBinding &binding = plan.bindings[index];
-        if ((binding.kind == ResourceKind::Buffer && binding.buffer.index == VERNON_RHI_INVALID_HANDLE_INDEX) ||
-            (binding.kind == ResourceKind::Image && binding.image.index == VERNON_RHI_INVALID_HANDLE_INDEX)) {
+    // A fragment's accesses must name its own bindings, not only bindings the plan already holds.
+    CommandAccessDomainMap<uint32_t> fragmentBindings;
+    fragmentBindings.reserve(fragment.bindings.size());
+    for (uint32_t index = 0; index < fragment.bindings.size(); ++index) {
+        const RhiCommandResourceBinding &binding = fragment.bindings[index];
+        if (!validHandle(binding)) {
             error = "RHI command plan contains an invalid physical resource binding";
             return false;
         }
-        for (size_t other = index + 1; other < plan.bindings.size(); ++other)
-            if (plan.bindings[index].aliasDomain == plan.bindings[other].aliasDomain &&
-                plan.bindings[index].kind == plan.bindings[other].kind) {
-                error = sameBinding(plan.bindings[index], plan.bindings[other])
-                            ? "RHI command plan contains a duplicate resource binding"
-                            : "RHI command plan maps one alias domain to different physical resources";
-                return false;
-            }
-    }
-    return true;
-}
-
-bool appendRhiCommandExecutionPlan(RhiCommandExecutionPlan &destination, RhiCommandExecutionPlan source, bool serialize,
-                                   std::string &error) {
-    if (source.commands.nodes.empty())
-        return true;
-    if (!validateRhiCommandExecutionPlan(source, error))
-        return false;
-    if (!destination.commands.nodes.empty() && !validateRhiCommandExecutionPlan(destination, error))
-        return false;
-    std::vector<CommandResourceAccess> appendedInitialAccesses;
-    appendedInitialAccesses.reserve(source.initialAccesses.size());
-    for (const CommandResourceAccess &initial : source.initialAccesses) {
-        const bool alreadyUsed =
-            std::any_of(destination.commands.nodes.begin(), destination.commands.nodes.end(), [&](const auto &node) {
-                return std::any_of(node.accesses.begin(), node.accesses.end(),
-                                   [&](const auto &access) { return commandAccessesOverlap(access, initial); });
-            });
-        if (alreadyUsed)
-            continue;
-        bool duplicate = false;
-        for (const CommandResourceAccess &existing : destination.initialAccesses) {
-            if (!commandAccessesOverlap(existing, initial))
-                continue;
-            if (!sameAccessRegion(existing, initial) || existing.state != initial.state ||
-                existing.access != initial.access || existing.stageMask != initial.stageMask) {
-                error = "combined RHI command plan has overlapping initial resource states";
-                return false;
-            }
-            duplicate = true;
+        const CommandAccessDomain domain{binding.aliasDomain, binding.kind};
+        const auto [existing, inserted] = fragmentBindings.try_emplace(domain, index);
+        if (!inserted) {
+            error = sameBinding(fragment.bindings[existing->second], binding)
+                        ? "RHI command plan contains a duplicate resource binding"
+                        : "RHI command plan maps one alias domain to different physical resources";
+            return false;
         }
-        if (!duplicate)
-            appendedInitialAccesses.push_back(initial);
-    }
-    if (source.commands.nodes.size() > std::numeric_limits<uint32_t>::max() - destination.commands.nodes.size()) {
-        error = "combined RHI command plan exceeds the command index range";
-        return false;
-    }
-    const uint32_t nodeBase = static_cast<uint32_t>(destination.commands.nodes.size());
-    uint32_t resourceBase = 0;
-    for (const CommandNode &node : destination.commands.nodes)
-        for (const CommandResourceAccess &access : node.accesses) {
-            if (access.resource == std::numeric_limits<uint32_t>::max()) {
-                error = "RHI command plan resource index overflows";
-                return false;
-            }
-            resourceBase = std::max(resourceBase, access.resource + 1);
-        }
-    for (const RhiCommandResourceBinding &binding : source.bindings) {
-        const auto existing = std::find_if(
-            destination.bindings.begin(), destination.bindings.end(), [&](const RhiCommandResourceBinding &value) {
-                return value.aliasDomain == binding.aliasDomain && value.kind == binding.kind;
-            });
-        if (existing != destination.bindings.end() && !sameBinding(*existing, binding)) {
+        if (const RhiCommandResourceBinding *bound = this->binding(domain); bound && !sameBinding(*bound, binding)) {
             error = "combined RHI command plan maps one alias domain to different physical resources";
             return false;
         }
     }
-    for (CommandNode &node : source.commands.nodes) {
+    const auto bound = [&](const CommandResourceAccess &access) {
+        return fragmentBindings.count(commandAccessDomain(access)) != 0;
+    };
+    std::vector<CommandResourceAccess> initialAccesses;
+    initialAccesses.reserve(fragment.initialAccesses.size());
+    for (const CommandResourceAccess &initial : fragment.initialAccesses) {
+        CommandResourceAccess normalized = initial;
+        if (!normalizeCommandAccess(normalized, error))
+            return false;
+        if (!bound(initial)) {
+            error = "RHI command plan has an unbound initial resource access";
+            return false;
+        }
+        if (dag_.overlapsAdded(initial))
+            continue;
+        bool duplicate = false;
+        if (const auto existing = initialAccesses_.find(commandAccessDomain(initial));
+            existing != initialAccesses_.end())
+            for (uint32_t index : existing->second) {
+                const CommandResourceAccess &current = plan_.initialAccesses[index];
+                if (!commandAccessesOverlap(current, initial))
+                    continue;
+                if (!sameAccessRegion(current, initial) || current.state != initial.state ||
+                    current.access != initial.access || current.stageMask != initial.stageMask) {
+                    error = "combined RHI command plan has overlapping initial resource states";
+                    return false;
+                }
+                duplicate = true;
+            }
+        if (!duplicate)
+            initialAccesses.push_back(initial);
+    }
+    const uint32_t nodeBase = dag_.size();
+    if (fragment.commands.nodes.size() > std::numeric_limits<uint32_t>::max() - nodeBase) {
+        error = "combined RHI command plan exceeds the command index range";
+        return false;
+    }
+    uint32_t resourceBase = resourceBase_;
+    for (CommandNode &node : fragment.commands.nodes) {
         const bool root = node.predecessors.empty();
         for (uint32_t &predecessor : node.predecessors)
             predecessor += nodeBase;
-        if (serialize && nodeBase && root)
+        if (nodeBase && root)
             node.predecessors.push_back(nodeBase - 1);
         for (CommandResourceAccess &access : node.accesses) {
-            if (access.resource > std::numeric_limits<uint32_t>::max() - resourceBase) {
+            if (!bound(access))
+                error = "RHI command plan has an unbound resource access";
+            else if (access.resource >= std::numeric_limits<uint32_t>::max() - resourceBase_)
                 error = "combined RHI command plan resource index overflows";
-                return false;
+            else {
+                access.resource += resourceBase_;
+                resourceBase = std::max(resourceBase, access.resource + 1);
+                continue;
             }
-            access.resource += resourceBase;
+            dag_.truncate(nodeBase);
+            return false;
+        }
+        if (!dag_.add(node, error)) {
+            dag_.truncate(nodeBase);
+            return false;
         }
     }
-    destination.initialAccesses.reserve(destination.initialAccesses.size() + appendedInitialAccesses.size());
-    destination.commands.nodes.reserve(destination.commands.nodes.size() + source.commands.nodes.size());
-    destination.encoders.reserve(destination.encoders.size() + source.encoders.size());
-    destination.bindings.reserve(destination.bindings.size() + source.bindings.size());
-    destination.retainedContexts.reserve(destination.retainedContexts.size() + source.retainedContexts.size());
-    RhiCommandExecutionPlan result = std::move(destination);
-    result.initialAccesses.insert(result.initialAccesses.end(),
-                                  std::make_move_iterator(appendedInitialAccesses.begin()),
-                                  std::make_move_iterator(appendedInitialAccesses.end()));
-    result.commands.nodes.insert(result.commands.nodes.end(), std::make_move_iterator(source.commands.nodes.begin()),
-                                 std::make_move_iterator(source.commands.nodes.end()));
-    result.encoders.insert(result.encoders.end(), std::make_move_iterator(source.encoders.begin()),
-                           std::make_move_iterator(source.encoders.end()));
-    for (RhiCommandResourceBinding &binding : source.bindings) {
-        const auto existing =
-            std::find_if(result.bindings.begin(), result.bindings.end(), [&](const RhiCommandResourceBinding &value) {
-                return value.aliasDomain == binding.aliasDomain && value.kind == binding.kind;
-            });
-        if (existing == result.bindings.end())
-            result.bindings.push_back(std::move(binding));
+    resourceBase_ = resourceBase;
+    for (CommandResourceAccess &initial : initialAccesses) {
+        initialAccesses_[commandAccessDomain(initial)].push_back(static_cast<uint32_t>(plan_.initialAccesses.size()));
+        plan_.initialAccesses.push_back(std::move(initial));
     }
-    result.retainedContexts.insert(result.retainedContexts.end(),
-                                   std::make_move_iterator(source.retainedContexts.begin()),
-                                   std::make_move_iterator(source.retainedContexts.end()));
-    destination = std::move(result);
+    for (RhiCommandResourceBinding &binding : fragment.bindings)
+        if (bindings_.try_emplace({binding.aliasDomain, binding.kind}, static_cast<uint32_t>(plan_.bindings.size()))
+                .second)
+            plan_.bindings.push_back(std::move(binding));
+    plan_.commands.nodes.insert(plan_.commands.nodes.end(), std::make_move_iterator(fragment.commands.nodes.begin()),
+                                std::make_move_iterator(fragment.commands.nodes.end()));
+    plan_.encoders.insert(plan_.encoders.end(), std::make_move_iterator(fragment.encoders.begin()),
+                          std::make_move_iterator(fragment.encoders.end()));
+    plan_.retainedContexts.insert(plan_.retainedContexts.end(),
+                                  std::make_move_iterator(fragment.retainedContexts.begin()),
+                                  std::make_move_iterator(fragment.retainedContexts.end()));
+    for (const RhiCommandFinisher &finisher : fragment.finishers)
+        if (std::none_of(plan_.finishers.begin(), plan_.finishers.end(), [&](const RhiCommandFinisher &existing) {
+                return existing.finish == finisher.finish && existing.context == finisher.context;
+            }))
+            plan_.finishers.push_back(finisher);
     return true;
 }
 

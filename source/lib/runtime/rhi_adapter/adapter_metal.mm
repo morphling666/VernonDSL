@@ -26,8 +26,10 @@ constexpr uint32_t kNone = UINT32_MAX;
 // Stage indices of the argument buffers a group holds: compute, vertex and fragment.
 constexpr uint32_t kStageCount = 3;
 constexpr uint32_t kPushConstantBufferIndex = 15;
+// Vertex binding b is buffer index kFirstVertexBufferIndex + b, below kMaxBufferIndex.
 constexpr uint32_t kFirstVertexBufferIndex = 16;
 constexpr uint32_t kMaxBufferIndex = 31;
+constexpr uint32_t kMaxVertexBindings = kMaxBufferIndex - kFirstVertexBufferIndex;
 // The largest block setBytes accepts.
 constexpr uint32_t kMaxDirectBlockSize = 4096;
 // Offsets of constant buffers bound from one MTLBuffer must be 256-byte aligned on macOS GPUs.
@@ -92,16 +94,14 @@ constexpr uint32_t kComputeStage = 0;
 constexpr uint32_t kVertexStage = 1;
 constexpr uint32_t kFragmentStage = 2;
 
-// Graphics inline values bind as bytes at their buffer index; every other entry except a vertex buffer is a member
-// of the stage's argument buffer, compute inline values through a buffer the group owns.
+// Graphics inline values bind as bytes at their buffer index; every other entry is a member of the stage's argument
+// buffer, compute inline values through a buffer the group owns.
 bool directValue(const VernonRuntimeProviderBindingLayoutEntry &entry) {
     return entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
 }
 
-bool argumentMember(const VernonRuntimeProviderBindingLayoutEntry &entry) {
-    return entry.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && !directValue(entry);
-}
+bool argumentMember(const VernonRuntimeProviderBindingLayoutEntry &entry) { return !directValue(entry); }
 
 MTLResourceUsage resourceUsage(const VernonRuntimeProviderBindingLayoutEntry &entry) {
     MTLResourceUsage usage = MTLResourceUsageRead;
@@ -140,7 +140,6 @@ struct GroupLayout : RhiRetainedObject {
     uint32_t inlineSize{};
     // Bit s is set when stage s has argument members.
     uint32_t argumentStages{};
-    bool hasVertexBuffers{};
     // An argument encoder is not thread-safe, so groups encode their argument buffers under the mutex.
     std::mutex mutex;
     std::array<id<MTLArgumentEncoder>, kStageCount> encoders;
@@ -167,11 +166,13 @@ struct DirectBlock {
 struct PreparedLayout : RhiRetainedObject {
     std::array<GroupLayout *, kMaxGroups> groups{};
     uint32_t groupCount{};
+    // Bit g is set when the group layout at index g has entries; an index without entries is never bound.
+    uint32_t groupMask{};
     std::vector<DirectBlock> directBlocks;
     uint32_t directScratchSize{};
     uint32_t directGroupMask{};
-    uint32_t vertexGroupMask{};
     uint32_t pushConstantSize{};
+    std::vector<VernonRuntimeProviderVertexBinding> vertexBindings;
     std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
 
     ~PreparedLayout() override {
@@ -211,12 +212,7 @@ struct MetalGroup : RhiGroup {
         MTLResourceUsage usage{};
         uint32_t stage{};
     };
-    struct VertexBuffer {
-        uint32_t index{};
-        id<MTLBuffer> buffer;
-        uint64_t offset{};
-    };
-    // A range of the group's own buffer, or of its encoder's transient memory for a transient group.
+    // A persistent block of the device, or a range of its encoder's transient memory for a transient group.
     struct Memory {
         id<MTLBuffer> buffer;
         uint64_t offset{};
@@ -228,7 +224,6 @@ struct MetalGroup : RhiGroup {
     std::array<Memory, kStageCount> arguments;
     std::vector<uint8_t> directData;
     std::vector<ResourceUse> uses;
-    std::vector<VertexBuffer> vertexBuffers;
 
     ~MetalGroup() override { releaseRetainedObject(layout); }
 };
@@ -243,7 +238,13 @@ struct MetalCommands : RhiCommands {
     std::array<uint64_t, kMaxGroups> vertexArguments{};
     std::array<uint64_t, kMaxGroups> fragmentArguments{};
     std::array<uint64_t, kMaxGroups> usedGroups{};
-    std::array<uint64_t, kMaxGroups> vertexGroups{};
+    struct VertexBuffer {
+        id<MTLBuffer> buffer;
+        uint64_t offset{};
+    };
+    std::array<VertexBuffer, kMaxVertexBindings> vertexBuffers{};
+    // Bit b is set when the render encoder holds binding b's buffer.
+    uint32_t appliedVertexBuffers{};
     // The layout whose blocks `directScratch` follows, and the group serial each index copied in.
     const PreparedLayout *directLayout{};
     std::array<uint64_t, kMaxGroups> directGroups{};
@@ -317,16 +318,11 @@ bool supportedEntry(const VernonRuntimeProviderBindingLayoutEntry &entry) {
     const bool supportedKind =
         entry.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER || entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
         entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE || entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
-        entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLER || entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-        entry.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+        entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLER || entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
     if (!supportedKind || stageIndex(entry.stage_mask) == kNone || entry.array_count != 1)
         return false;
-    if ((packedUniformBytes(entry.kind, entry.interface_kind) || entry.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) &&
-        entry.element_size == 0)
+    if (packedUniformBytes(entry.kind, entry.interface_kind) && entry.element_size == 0)
         return false;
-    if (entry.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-        return entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX && entry.binding >= kFirstVertexBufferIndex &&
-               entry.binding < kMaxBufferIndex;
     if (directValue(entry))
         return entry.binding <= kPushConstantBufferIndex && entry.element_alignment != 0 &&
                (entry.element_alignment & (entry.element_alignment - 1)) == 0 &&
@@ -432,8 +428,6 @@ RhiAdapterResult<void> prepareGroupLayoutImplResult(VernonRuntimeRhiAdapter &ada
         if (directValue(source)) {
             layout->directValues.push_back({static_cast<uint32_t>(index), layout->directDataSize, source.element_size});
             layout->directDataSize += source.element_size;
-        } else if (source.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-            layout->hasVertexBuffers = true;
         } else {
             layout->argumentStages |= 1u << entry.stage;
             if (packedUniformBytes(source.kind, source.interface_kind)) {
@@ -545,8 +539,8 @@ RhiAdapterResult<void> prepareLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
         groupLayout->references.fetch_add(1, std::memory_order_relaxed);
         layout->groups[group] = groupLayout;
         layout->groupCount = static_cast<uint32_t>(group + 1);
-        if (groupLayout->hasVertexBuffers)
-            layout->vertexGroupMask |= 1u << group;
+        if (!groupLayout->entries.empty())
+            layout->groupMask |= 1u << group;
     }
     if (auto placed = placeDirectValues(*layout); !placed)
         return placed;
@@ -561,17 +555,17 @@ RhiAdapterResult<void> prepareLayoutImplResult(VernonRuntimeRhiAdapter &adapter,
     layout->pushConstantSize = descriptor.push_constant_size;
     if (auto valid = validateArgumentBufferUsage(adapter, *layout); !valid)
         return valid;
+    for (size_t index = 0; index < descriptor.vertex_binding_count; ++index) {
+        const VernonRuntimeProviderVertexBinding &binding = descriptor.vertex_bindings[index];
+        if (binding.binding >= kMaxVertexBindings)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported, "metal_vertex_binding_limit_is_exceeded",
+                                   binding.binding);
+        layout->vertexBindings.push_back(binding);
+    }
     for (size_t index = 0; index < descriptor.vertex_attribute_count; ++index) {
         const auto &attribute = descriptor.vertex_attributes[index];
-        bool bindingExists = false;
-        for (uint32_t group = 0; group < layout->groupCount; ++group)
-            for (const GroupLayout::Entry &entry : layout->groups[group]->entries)
-                bindingExists |= entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
-                                 entry.layout.binding == attribute.binding;
-        if (!bindingExists || attribute.location >= 31 || attribute.component_count == 0 ||
-            attribute.component_count > 4)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                                   "metal_vertex_attribute_is_invalid_or_references_an_unknown_binding",
+        if (attribute.location >= 31 || attribute.component_count == 0 || attribute.component_count > 4)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_vertex_attribute_is_invalid",
                                    attribute.binding, attribute.location);
         layout->vertexAttributes.push_back(attribute);
     }
@@ -815,19 +809,17 @@ RhiAdapterResult<void> prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
                                    "metal_graphics_pipeline_has_no_vertex_strides");
         MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
-        for (uint32_t group = 0; group < layout.groupCount; ++group)
-            for (const GroupLayout::Entry &entry : layout.groups[group]->entries) {
-                if (entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-                    continue;
-                const uint32_t binding = entry.layout.binding;
-                if (binding >= descriptor.vertex_stride_count || descriptor.vertex_strides[binding] == 0)
-                    return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                                           "metal_graphics_pipeline_has_an_invalid_vertex_stride", binding);
-                vertexDescriptor.layouts[binding].stride = descriptor.vertex_strides[binding];
-                vertexDescriptor.layouts[binding].stepFunction =
-                    entry.layout.divisor ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
-                vertexDescriptor.layouts[binding].stepRate = entry.layout.divisor ? entry.layout.divisor : 1;
-            }
+        for (const VernonRuntimeProviderVertexBinding &vertexBinding : layout.vertexBindings) {
+            const uint32_t binding = vertexBinding.binding;
+            if (binding >= descriptor.vertex_stride_count || descriptor.vertex_strides[binding] == 0)
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                       "metal_graphics_pipeline_has_an_invalid_vertex_stride", binding);
+            MTLVertexBufferLayoutDescriptor *bufferLayout = vertexDescriptor.layouts[kFirstVertexBufferIndex + binding];
+            bufferLayout.stride = descriptor.vertex_strides[binding];
+            bufferLayout.stepFunction =
+                vertexBinding.divisor ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
+            bufferLayout.stepRate = vertexBinding.divisor ? vertexBinding.divisor : 1;
+        }
         for (const auto &attribute : layout.vertexAttributes) {
             const MTLVertexFormat format = vertexFormat(attribute.dtype, attribute.component_count);
             if (format == MTLVertexFormatInvalid)
@@ -835,7 +827,7 @@ RhiAdapterResult<void> prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
                                        "metal_graphics_pipeline_has_an_unsupported_vertex_format", attribute.location);
             vertexDescriptor.attributes[attribute.location].format = format;
             vertexDescriptor.attributes[attribute.location].offset = attribute.relative_offset;
-            vertexDescriptor.attributes[attribute.location].bufferIndex = attribute.binding;
+            vertexDescriptor.attributes[attribute.location].bufferIndex = kFirstVertexBufferIndex + attribute.binding;
         }
         nativeDescriptor.vertexDescriptor = vertexDescriptor;
     }
@@ -927,13 +919,10 @@ RhiAdapterResult<void> validateGroupValue(const GroupLayout::Entry &entry,
         (!image && !sampler && resource->offset >= resource->size))
         return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_resource_binding_is_invalid",
                                layout.slot);
-    if (layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value.payload.buffer.stride == 0)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_vertex_binding_has_no_stride",
-                               layout.slot);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<MetalGroup::Memory> placeGroupMemory(VernonRuntimeRhiAdapter &adapter,
+RhiAdapterResult<MetalGroup::Memory> placeGroupMemory(VernonRuntimeRhiAdapter &adapter, MetalGroup &group,
                                                       const VernonRuntimeProviderGroupDescriptor &descriptor,
                                                       uint64_t size, uint64_t alignment) {
     using Placed = RhiAdapterResult<MetalGroup::Memory>;
@@ -946,12 +935,13 @@ RhiAdapterResult<MetalGroup::Memory> placeGroupMemory(VernonRuntimeRhiAdapter &a
             (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(reservation.transient.buffer))),
             reservation.transient.offset, static_cast<uint8_t *>(reservation.mapped)})};
     }
-    id<MTLBuffer> buffer = [metalDevice(adapter).device newBufferWithLength:size options:MTLResourceStorageModeShared];
-    if (!buffer)
-        return Placed{vernon::err(
-            providerFailure(vernon::ProviderErrorCode::BackendFailure, "metal_group_buffer_allocation_failed", size)
-                .error())};
-    return Placed{vernon::ok(MetalGroup::Memory{buffer, 0, static_cast<uint8_t *>(buffer.contents)})};
+    auto placed = placePersistent(adapter, group, nullptr, size, alignment);
+    if (!placed)
+        return Placed{vernon::err(std::move(placed).error())};
+    const vernon::rhi::PersistentBlock &block = placed.value();
+    return Placed{vernon::ok(
+        MetalGroup::Memory{(__bridge id<MTLBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(block.buffer))),
+                           block.offset, static_cast<uint8_t *>(block.mapped)})};
 }
 
 // Encodes the argument buffers of the group; the caller holds the group layout's mutex.
@@ -963,8 +953,8 @@ RhiAdapterResult<void> encodeArguments(VernonRuntimeRhiAdapter &adapter, MetalGr
         if ((layout.argumentStages & (1u << stage)) == 0)
             continue;
         id<MTLArgumentEncoder> encoder = layout.encoders[stage];
-        auto placed =
-            placeGroupMemory(adapter, descriptor, encoder.encodedLength, std::max<uint64_t>(encoder.alignment, 1));
+        auto placed = placeGroupMemory(adapter, group, descriptor, encoder.encodedLength,
+                                       std::max<uint64_t>(encoder.alignment, 1));
         if (!placed)
             return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
         const MetalGroup::Memory &memory = placed.value();
@@ -1012,7 +1002,7 @@ RhiAdapterResult<void> createGroupImplResult(VernonRuntimeRhiAdapter &adapter,
     layout->references.fetch_add(1, std::memory_order_relaxed);
     group->layout = layout;
     if (layout->inlineSize != 0) {
-        auto placed = placeGroupMemory(adapter, descriptor, layout->inlineSize, kInlineAlignment);
+        auto placed = placeGroupMemory(adapter, *group, descriptor, layout->inlineSize, kInlineAlignment);
         if (!placed)
             return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
         group->inlineValues = placed.value();
@@ -1043,10 +1033,6 @@ RhiAdapterResult<void> createGroupImplResult(VernonRuntimeRhiAdapter &adapter,
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_resource_binding_is_stale",
                                    entry.layout.slot);
         void *native = reinterpret_cast<void *>(static_cast<uintptr_t>(natives[index]));
-        if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-            group->vertexBuffers.push_back({entry.layout.binding, (__bridge id<MTLBuffer>)native, resource.offset});
-            continue;
-        }
         if (entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER)
             group->uses.push_back({(__bridge id<MTLResource>)native, resourceUsage(entry.layout), entry.stage});
         if (writesBinding(entry.layout))
@@ -1101,6 +1087,14 @@ RhiAdapterResult<void> endCommandsResult(void *, VernonRuntimeProviderObject han
                : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_end_commands_handle_is_invalid");
 }
 
+// Native state belongs to the render and compute encoders, which the commands open and track themselves.
+RhiAdapterResult<void> resumeCommandsResult(void *, VernonRuntimeProviderObject handle) {
+    const auto *commands = fromHandle<MetalCommands>(handle);
+    return commands && !commands->rendering
+               ? RhiAdapterResult<void>{vernon::ok()}
+               : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_resume_commands_is_invalid");
+}
+
 RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
                                           VernonRuntimeProviderObject pipelineHandle) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1133,16 +1127,46 @@ RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject h
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
+RhiAdapterResult<void> bindVertexBuffersResult(void *data, VernonRuntimeProviderObject handle, uint32_t firstBinding,
+                                               const VernonRuntimeProviderResourceReference *references, size_t count) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<MetalCommands>(handle);
+    if (!commands || !references || count == 0 || firstBinding > kMaxVertexBindings ||
+        count > kMaxVertexBindings - firstBinding)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_bind_vertex_buffers_is_invalid");
+    for (size_t index = 0; index < count; ++index) {
+        const VernonRuntimeProviderResourceReference &reference = references[index];
+        const size_t binding = firstBinding + index;
+        if ((reference.identity & kRhiResourceKindMask) != kRhiBufferResource || reference.offset >= reference.size)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_vertex_buffer_is_invalid",
+                                   binding);
+        if (auto retained = retainCommandResource(adapter, commands->encoder, reference); !retained)
+            return retained;
+        auto resolved = resolveCommandRhiResource(adapter, commands->encoder, reference);
+        if (!resolved)
+            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+        id<MTLBuffer> buffer =
+            (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(resolved.value())));
+        if (!buffer)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_vertex_buffer_is_stale", binding);
+        commands->vertexBuffers[binding] = {buffer, reference.offset};
+        commands->appliedVertexBuffers &= ~(1u << binding);
+    }
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
 RhiAdapterResult<void> requireBoundGroups(const MetalCommands &commands) {
-    for (uint32_t index = 0; index < commands.pipeline->layout->groupCount; ++index)
-        if (!commands.groups[index])
+    const PreparedLayout &layout = *commands.pipeline->layout;
+    for (uint32_t index = 0; index < layout.groupCount; ++index)
+        if ((layout.groupMask & (1u << index)) != 0 && !commands.groups[index])
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "metal_command_group_is_unbound", index);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> recordBoundGroupWrites(VernonRuntimeRhiAdapter &adapter, const MetalCommands &commands) {
-    for (uint32_t index = 0; index < commands.pipeline->layout->groupCount; ++index)
-        if (!commands.groups[index]->writes.empty())
+    const PreparedLayout &layout = *commands.pipeline->layout;
+    for (uint32_t index = 0; index < layout.groupCount; ++index)
+        if ((layout.groupMask & (1u << index)) != 0 && !commands.groups[index]->writes.empty())
             if (auto recorded = recordGroupWrites(adapter, commands.encoder, *commands.groups[index]); !recorded)
                 return recorded;
     return RhiAdapterResult<void>{vernon::ok()};
@@ -1171,6 +1195,8 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                                "metal_compute_command_encoder_creation_failed");
     [encoder setComputePipelineState:pipeline.compute];
     for (uint32_t index = 0; index < pipeline.layout->groupCount; ++index) {
+        if ((pipeline.layout->groupMask & (1u << index)) == 0)
+            continue;
         const MetalGroup &group = *commands->groups[index];
         if (const MetalGroup::Memory &arguments = group.arguments[kComputeStage]; arguments.buffer)
             [encoder setBuffer:arguments.buffer offset:arguments.offset atIndex:index];
@@ -1215,7 +1241,7 @@ void resetRenderState(MetalCommands &commands, id<MTLRenderCommandEncoder> encod
     commands.vertexArguments.fill(0);
     commands.fragmentArguments.fill(0);
     commands.usedGroups.fill(0);
-    commands.vertexGroups.fill(0);
+    commands.appliedVertexBuffers = 0;
     commands.directLayout = nullptr;
     commands.viewportValid = false;
     commands.scissorValid = false;
@@ -1262,6 +1288,8 @@ void applyRenderPipeline(MetalCommands &commands, id<MTLRenderCommandEncoder> en
 void applyRenderGroups(MetalCommands &commands, id<MTLRenderCommandEncoder> encoder) {
     const PreparedLayout &layout = *commands.pipeline->layout;
     for (uint32_t index = 0; index < layout.groupCount; ++index) {
+        if ((layout.groupMask & (1u << index)) == 0)
+            continue;
         const MetalGroup &group = *commands.groups[index];
         const MetalGroup::Memory &vertexArguments = group.arguments[kVertexStage];
         if (vertexArguments.buffer && commands.vertexArguments[index] != group.serial) {
@@ -1278,11 +1306,14 @@ void applyRenderGroups(MetalCommands &commands, id<MTLRenderCommandEncoder> enco
                 [encoder useResource:use.resource usage:use.usage stages:renderStages(use.stage)];
             commands.usedGroups[index] = group.serial;
         }
-        if ((layout.vertexGroupMask & (1u << index)) != 0 && commands.vertexGroups[index] != group.serial) {
-            for (const MetalGroup::VertexBuffer &buffer : group.vertexBuffers)
-                [encoder setVertexBuffer:buffer.buffer offset:buffer.offset atIndex:buffer.index];
-            commands.vertexGroups[index] = group.serial;
-        }
+    }
+    for (const VernonRuntimeProviderVertexBinding &vertexBinding : layout.vertexBindings) {
+        const uint32_t binding = vertexBinding.binding;
+        if ((commands.appliedVertexBuffers & (1u << binding)) != 0)
+            continue;
+        const MetalCommands::VertexBuffer &buffer = commands.vertexBuffers[binding];
+        [encoder setVertexBuffer:buffer.buffer offset:buffer.offset atIndex:kFirstVertexBufferIndex + binding];
+        commands.appliedVertexBuffers |= 1u << binding;
     }
     if (commands.directLayout != &layout) {
         commands.directLayout = &layout;
@@ -1473,6 +1504,10 @@ VernonStatus endCommands(void *data, VernonRuntimeProviderObject commands) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, endCommandsResult(data, commands), "Metal commands failed");
 }
+VernonStatus resumeCommands(void *data, VernonRuntimeProviderObject commands) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, resumeCommandsResult(data, commands), "Metal commands could not resume");
+}
 VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "Metal pipeline binding failed");
@@ -1481,6 +1516,12 @@ VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_
                        VernonRuntimeProviderObject group) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, bindGroupResult(data, commands, index, group), "Metal group binding failed");
+}
+VernonStatus bindVertexBuffers(void *data, VernonRuntimeProviderObject commands, uint32_t firstBinding,
+                               const VernonRuntimeProviderResourceReference *buffers, size_t count) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, bindVertexBuffersResult(data, commands, firstBinding, buffers, count),
+                          "Metal vertex buffer binding failed");
 }
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
@@ -1518,8 +1559,10 @@ void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.create_group = createGroup;
     adapter.provider.begin_commands = beginCommands;
     adapter.provider.end_commands = endCommands;
+    adapter.provider.resume_commands = resumeCommands;
     adapter.provider.encode_bind_pipeline = bindPipeline;
     adapter.provider.encode_bind_group = bindGroup;
+    adapter.provider.encode_bind_vertex_buffers = bindVertexBuffers;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
     adapter.provider.begin_rendering = beginRendering;

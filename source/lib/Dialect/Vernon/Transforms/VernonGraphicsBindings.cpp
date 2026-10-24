@@ -65,29 +65,32 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
             InterfaceAttrs attrs = parseInterfaceAttrs(dictionary);
             auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
             const bool generated = dictionary && dictionary.get(kGeneratedBindingAttrName);
-            auto group = dictionary ? dictionary.getAs<StringAttr>(kBindingGroupAttrName) : nullptr;
+            auto setAttr = dyn_cast_if_present<IntegerAttr>(attrs.descriptorSet);
+            if (setAttr && (setAttr.getInt() < 0 || setAttr.getInt() >= int64_t{kGraphicsDescriptorSetLimit}))
+                return function.emitError()
+                       << "PROGRAM_GRAPHICS_GROUP_SET_LIMIT: graphics argument #" << index << " uses set "
+                       << setAttr.getInt() << "; sets are 0 to " << kGraphicsDescriptorSetLimit - 1;
+            const uint32_t group = setAttr ? static_cast<uint32_t>(setAttr.getInt()) : 0;
             auto implicitTexture = dictionary ? dictionary.getAs<StringAttr>("vernon.implicit_texture") : nullptr;
             const auto request = [&](StringRef requestKind, uint32_t count) {
-                requests.push_back({symbol, argument, sourceName(function, argument), requestKind.str(), typeKey(type),
-                                    count, group ? group.getValue().str() : std::string()});
+                requests.push_back(
+                    {symbol, argument, sourceName(function, argument), requestKind.str(), typeKey(type), count, group});
                 implicitTextures.push_back(implicitTexture ? implicitTexture.getValue().str() : std::string());
             };
             if (function.getArgAttr(argument, kTensorMetadataCarrierAttrName))
                 continue;
-            if (attrs.binding && !generated) {
-                auto set = dyn_cast_if_present<IntegerAttr>(attrs.descriptorSet);
-                collected.authored.push_back({symbol, argument, sourceName(function, argument), set ? set.getInt() : 0,
+            if (attrs.binding && !generated)
+                collected.authored.push_back({symbol, argument, sourceName(function, argument), int64_t{group},
                                               cast<IntegerAttr>(attrs.binding).getInt()});
-            }
             if (auto view = dyn_cast<TensorViewType>(type)) {
                 if (view.getAddressSpace() != "device")
                     continue;
                 if (view.getAccess() != "read")
                     return function.emitError()
                            << "graphics TensorView argument #" << index << " must have read access";
-                if (attrs.binding || attrs.descriptorSet)
+                if (attrs.binding)
                     return function.emitError()
-                           << "graphics TensorView argument #" << index << " cannot declare an explicit set or binding";
+                           << "graphics TensorView argument #" << index << " cannot declare a binding";
                 FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
                 if (failed(layout) || layout->leaves.empty())
                     return function.emitError()
@@ -97,21 +100,15 @@ FailureOr<GraphicsBindingRequests> collectGraphicsBindingRequests(ModuleOp modul
                 continue;
             }
             if (isa<TextureType, SamplerType>(type)) {
-                if (generated || (!attrs.binding && !attrs.descriptorSet))
+                if (generated || !attrs.binding)
                     request(isa<TextureType>(type) ? "texture" : "sampler", 1);
-                continue;
-            }
-            // A vertex group's attribute takes no descriptor binding, but it belongs to the group's set, so the
-            // group object that binds it also binds the vertex buffer.
-            if (group && kind && kind.getValue() == "input") {
-                request("vertex_input", 0);
                 continue;
             }
             if (!kind || kind.getValue() != "uniform" || attrs.binding)
                 continue;
             // Aggregates are not native inline uniforms on OpenGL, OpenGL ES, or Metal, so they always spill. A
-            // binding-group leaf spills too: inline values belong to the pipeline, not to its group's set.
-            if (group || isa<TensorType, StructType, TupleType>(type)) {
+            // leaf outside set 0 spills too: inline values belong to the pipeline, not to its set.
+            if (group != 0 || isa<TensorType, StructType, TupleType>(type)) {
                 request("uniform_buffer", 1);
                 continue;
             }
@@ -176,22 +173,18 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
             used.insert(static_cast<uint32_t>(binding.binding));
         }
 
-    std::map<std::string, uint32_t> groupSets;
+    std::map<std::string, std::pair<std::string, uint32_t>> parameterSets;
     for (const GraphicsBindingRequests &module : modules)
-        for (const GraphicsBindingRequest &request : module.requests)
-            if (request.argument && !request.group.empty())
-                groupSets.try_emplace(request.group, static_cast<uint32_t>(groupSets.size() + 1));
-    if (groupSets.size() + 1 > kGraphicsDescriptorSetLimit) {
-        error = "PROGRAM_GRAPHICS_GROUP_SET_LIMIT: a graphics pipeline takes at most " +
-                std::to_string(kGraphicsDescriptorSetLimit - 1) + " binding-group occurrences, found " +
-                std::to_string(groupSets.size());
-        return failure();
-    }
-    for (const auto &[location, owner] : authored)
-        if (location.first != 0 && location.first <= static_cast<int64_t>(groupSets.size())) {
-            error = "graphics endpoint " + owner.stage + " '" + owner.sourceName + "' uses descriptor set " +
-                    std::to_string(location.first) + ", which belongs to a binding group";
-            return failure();
+        for (const GraphicsBindingRequest &request : module.requests) {
+            if (!request.argument || request.sourceName.empty())
+                continue;
+            auto [placed, inserted] = parameterSets.try_emplace(request.sourceName, module.stage, request.group);
+            if (!inserted && placed->second.second != request.group) {
+                error = "graphics parameter '" + request.sourceName + "' is in set " +
+                        std::to_string(placed->second.second) + " in the " + placed->second.first +
+                        " stage and in set " + std::to_string(request.group) + " in the " + module.stage + " stage";
+                return failure();
+            }
         }
 
     using ShareKey = std::tuple<std::string, std::string, std::string, uint32_t>;
@@ -200,11 +193,11 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
     };
     // A request seen only in a later module, such as an implicit sampler of one stage, joins the group's union
     // right after the request that precedes it there, which keeps the union in field order.
-    std::map<std::string, std::vector<ShareKey>> groupRequests;
+    std::map<uint32_t, std::vector<ShareKey>> groupRequests;
     for (const GraphicsBindingRequests &module : modules) {
-        std::map<std::string, size_t> cursors;
+        std::map<uint32_t, size_t> cursors;
         for (const GraphicsBindingRequest &request : module.requests) {
-            if (!request.argument || request.group.empty())
+            if (!request.argument || request.group == 0)
                 continue;
             std::vector<ShareKey> &keys = groupRequests[request.group];
             size_t &cursor = cursors[request.group];
@@ -218,8 +211,8 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
             ++cursor;
         }
     }
-    std::map<std::string, std::map<ShareKey, SmallVector<uint32_t>>> groupBindings;
-    const auto allocateGroup = [&](const std::string &group) {
+    std::map<uint32_t, std::map<ShareKey, SmallVector<uint32_t>>> groupBindings;
+    const auto allocateGroup = [&](uint32_t group) {
         const std::vector<ShareKey> &keys = groupRequests[group];
         uint32_t total = 0;
         for (const ShareKey &key : keys)
@@ -249,12 +242,12 @@ FailureOr<std::vector<GraphicsBindingLayout>> linkGraphicsBindings(ArrayRef<Grap
     for (const GraphicsBindingRequests &module : modules) {
         GraphicsBindingLayout &layout = layouts.emplace_back();
         for (const GraphicsBindingRequest &request : module.requests) {
-            if (request.argument && !request.group.empty()) {
+            if (request.argument && request.group != 0) {
                 if (!groupBindings.count(request.group))
                     allocateGroup(request.group);
                 layout.assignments.emplace_back(
-                    request, GraphicsBindingAssignment{groupSets.at(request.group),
-                                                       groupBindings[request.group].at(shareKey(request))});
+                    request,
+                    GraphicsBindingAssignment{request.group, groupBindings[request.group].at(shareKey(request))});
                 continue;
             }
             const bool shareable = request.argument && !request.sourceName.empty();

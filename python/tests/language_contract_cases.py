@@ -409,7 +409,9 @@ METADATA_VALID_CASES: Final = tuple(
             'Annotated[f32, builtin("position")]',
             ("builtin", ("position",)),
         ),
-        ("inferred-uniform", "Annotated[f32, uniform()]", ("uniform", ())),
+        ("inferred-uniform", "Annotated[f32, uniform()]", ("uniform", (-1, -1))),
+        ("set-only-resource", "Annotated[Sampler, resource(set=1)]", ("resource", (1, -1))),
+        ("binding-only-uniform", "Annotated[f32, uniform(binding=2)]", ("uniform", (-1, 2))),
         (
             "bound-uniform",
             "Annotated[f32, uniform(set=1, binding=2)]",
@@ -468,7 +470,7 @@ METADATA_INVALID_CASES: Final = tuple(
             "Annotated[f32, resource(**opts)]",
             r"\*\*kwargs",
         ),
-        ("partial-resource-binding", "Annotated[f32, resource(set=1)]", "wrong number"),
+        ("string-set", "Annotated[f32, uniform(set='a')]", "set and binding must be non-negative"),
         (
             "builtin-keyword",
             "Annotated[f32, builtin(value=0)]",
@@ -819,7 +821,7 @@ from vernon_dsl import *
 def main(image: Annotated[Texture["2d", rgba32_float, write], resource(set=1, binding=0)]) -> None:
     texture_store(image, Vector([0, 0]), Vector([1.0, 1.0, 1.0, 1.0]))
 """,
-        "kernel Resources bind in argument order",
+        "kernel parameters bind in argument order",
         capabilities=frozenset({"compute", "storage_texture"}),
     ),
 )

@@ -13,8 +13,8 @@ from typing import Any, ClassVar, Protocol, cast
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from .._markers import is_struct_class, mark
+from .._params import params_leaf_items
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
-from ..binding_groups import binding_group_leaf_items
 from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
@@ -199,7 +199,7 @@ class Kernel:
 
     @classmethod
     def _parameter_names(cls, lowered: _LoweredKernel) -> tuple[str, ...]:
-        """Launch parameters of the specialized entry, with each binding group expanded to its dotted leaves.
+        """Launch parameters of the specialized entry, with each params parameter expanded to its dotted leaves.
 
         `When` parameters disabled by the key are absent.
         """
@@ -210,7 +210,7 @@ class Kernel:
         )
 
     def _launch_leaves(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> list[tuple[str, Any]]:
-        """Pairs positional source arguments with the entry's launch parameters, expanding binding groups."""
+        """Pairs positional source arguments with the entry's launch parameters, expanding params."""
         source_parameters = [
             argument.arg for argument in lowered.function.args.args if argument.arg not in lowered.builtins
         ]
@@ -220,7 +220,7 @@ class Kernel:
         return [
             (leaf, leaf_value)
             for name, value in zip(source_parameters, arguments, strict=True)
-            for leaf, _, leaf_value in binding_group_leaf_items(name, annotations.get(name), value)
+            for leaf, _, leaf_value in params_leaf_items(name, annotations.get(name), value)
         ]
 
     def _normalize_arguments(

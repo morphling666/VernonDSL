@@ -569,9 +569,10 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 auto view = dyn_cast<TensorViewType>(type);
                 const bool graphicsStorage = kind == InterfaceKind::Resource && !isResult && view &&
                                              view.getAddressSpace() == "device" && *stage != ShaderStage::Compute;
-                if (graphicsStorage && (attrs.descriptorSet || attrs.binding)) {
-                    function.emitError() << "argument #" << index
-                                         << " graphics TensorView cannot declare an explicit set or binding";
+                // A graphics TensorView spans one binding per storage leaf plus the metadata carrier, so one authored
+                // binding cannot place it.
+                if (graphicsStorage && attrs.binding) {
+                    function.emitError() << "argument #" << index << " graphics TensorView cannot declare a binding";
                     invalid = true;
                 }
                 if (graphicsStorage && view.getAccess() != "read") {
@@ -586,9 +587,11 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                          << index;
                     invalid = true;
                 }
-                const bool graphicsPlannedResource =
-                    kind == InterfaceKind::Resource && !isResult && *stage != ShaderStage::Compute &&
-                    isa<TextureType, SamplerType>(type) && !attrs.descriptorSet && !attrs.binding;
+                // Graphics stages link into one pipeline whose planner assigns every binding left unauthored, and a
+                // missing set means set 0. Kernels have no planner, so their placements arrive complete.
+                const bool graphicsPlannedResource = kind == InterfaceKind::Resource && !isResult &&
+                                                     *stage != ShaderStage::Compute &&
+                                                     isa<TextureType, SamplerType>(type);
                 if (kind == InterfaceKind::Resource && !graphicsStorage && !graphicsPlannedResource &&
                     (!attrs.descriptorSet || !attrs.binding)) {
                     function.emitError() << (isResult ? "result #" : "argument #") << index << " "
@@ -596,11 +599,11 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                          << "' and '" << kBindingAttrName << "'";
                     invalid = true;
                 }
-                if (kind == InterfaceKind::Uniform &&
+                if (kind == InterfaceKind::Uniform && *stage == ShaderStage::Compute &&
                     static_cast<bool>(attrs.descriptorSet) != static_cast<bool>(attrs.binding)) {
                     function.emitError() << (isResult ? "result #" : "argument #") << index
-                                         << " uniform must provide both '" << kDescriptorSetAttrName << "' and '"
-                                         << kBindingAttrName << "', or neither";
+                                         << " compute uniform must provide both '" << kDescriptorSetAttrName
+                                         << "' and '" << kBindingAttrName << "', or neither";
                     invalid = true;
                 }
                 if (isIo && (attrs.descriptorSet || attrs.binding)) {
@@ -614,10 +617,10 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                     invalid = true;
                 }
 
-                if (descriptorSet && binding && !bindings.insert({*descriptorSet, *binding}).second) {
+                if (binding && !bindings.insert({descriptorSet.value_or(0), *binding}).second) {
                     function.emitError() << (isResult ? "result #" : "argument #") << index
-                                         << " conflicts with another interface at descriptor set " << *descriptorSet
-                                         << ", binding " << *binding;
+                                         << " conflicts with another interface at descriptor set "
+                                         << descriptorSet.value_or(0) << ", binding " << *binding;
                     invalid = true;
                 }
 

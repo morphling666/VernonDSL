@@ -2,6 +2,7 @@
 #define VERNON_RHI_CUDA_BACKEND_H
 
 #include "VernonRHI.h"
+#include "block_pool.h"
 #include "cuda_driver.h"
 #include "staging_pool.h"
 
@@ -58,6 +59,12 @@ struct VERNON_RHI_CAPI DeviceState {
     // Ends the open recording's hold on its transient memory, which is reused once the stream work enqueued so far
     // completes. A device records one encoder at a time, so this runs when it is submitted or abandoned.
     Result retireTransients();
+    // Uploads `size` bytes into a block of device memory, at `offset` in `chunk`, a multiple of `alignment`, which is
+    // held until `releasePersistent(key)`. Uploads and kernels share the stream, so a released block's next upload
+    // follows the kernels that read it.
+    Result placePersistent(const void *data, size_t size, size_t alignment, DevicePointer &chunk, size_t &offset,
+                           uint64_t &key);
+    void releasePersistent(uint64_t key);
 
     Device device{};
     Context context{};
@@ -84,6 +91,7 @@ private:
     StagingPool<TransientChunk> transientPool;
     StagingArena<TransientChunk> recordingTransients;
     std::deque<RetiringTransients> retiringTransients;
+    BlockPool<TransientChunk> persistentBlocks;
 };
 
 struct VERNON_RHI_CAPI PreparedFunction {

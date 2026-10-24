@@ -70,6 +70,10 @@ VERNON_RHI_CAPI Result<CommandTransientReservation, RhiError> reserveRecordingTr
                                                                                         uint64_t key, uint64_t native,
                                                                                         uint64_t size,
                                                                                         uint64_t alignment) noexcept;
+// Places bytes in the device's persistent memory until `releasePersistentBlock`; see PlacePersistentCallback.
+VERNON_RHI_CAPI Result<PersistentBlock, RhiError> placePersistentBlock(VernonRhiDevice device, const void *data,
+                                                                       uint64_t size, uint64_t alignment) noexcept;
+VERNON_RHI_CAPI void releasePersistentBlock(VernonRhiDevice device, uint64_t key) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderKey(VernonRhiDevice device,
                                                              VernonRhiCommandEncoder encoder) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderNative(VernonRhiDevice device, uint64_t key,

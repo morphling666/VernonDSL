@@ -3,12 +3,12 @@ from __future__ import annotations
 import vernon_dsl as vd
 
 
-@vd.binding_group
+@vd.params
 class Lookup:
     weights: vd.TensorView[vd.f32, (vd.dyn,), vd.read]
 
 
-@vd.binding_group
+@vd.params
 class Matte:
     gain: vd.f32
     lookup: Lookup
@@ -18,7 +18,7 @@ class Matte:
         return self.lookup.weights[x] * self.gain
 
 
-@vd.binding_group
+@vd.params
 class Glossy:
     gain: vd.f32
     offset: vd.f32
@@ -35,7 +35,7 @@ class SurfaceParams:
     gain: vd.f32
 
 
-@vd.binding_group
+@vd.params
 class Flat:
     params: SurfaceParams
 
@@ -44,7 +44,7 @@ class Flat:
         return self.params.tint
 
 
-@vd.binding_group
+@vd.params
 class Scaled:
     params: SurfaceParams
 

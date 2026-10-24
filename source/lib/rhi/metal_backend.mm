@@ -135,6 +135,7 @@ void DeviceState::shutdown() {
         transientPool.retire(arena);
     recordingTransients.clear();
     transientPool.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
+    persistentBlocks.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
     queue = nil;
     device = nil;
     maxComputeInvocations = 0;
@@ -177,8 +178,9 @@ bool DeviceState::uploadBuffer(const Buffer &buffer, uint64_t offset, const void
         std::memcpy(static_cast<unsigned char *>(buffer.buffer.contents) + offset, source, static_cast<size_t>(size));
         return true;
     }
-    id<MTLBuffer> staging =
-        [device newBufferWithBytes:source length:static_cast<NSUInteger>(size) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> staging = [device newBufferWithBytes:source
+                                                length:static_cast<NSUInteger>(size)
+                                               options:MTLResourceStorageModeShared];
     if (!staging) {
         error = "Metal upload staging buffer allocation failed";
         return false;
@@ -187,8 +189,8 @@ bool DeviceState::uploadBuffer(const Buffer &buffer, uint64_t offset, const void
                    error);
 }
 
-bool DeviceState::uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges,
-                                     size_t rangeCount, std::string &error) {
+bool DeviceState::uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges, size_t rangeCount,
+                                     std::string &error) {
     if (buffer.buffer.storageMode == MTLStorageModeShared) {
         auto *destination = static_cast<unsigned char *>(buffer.buffer.contents);
         for (size_t index = 0; index < rangeCount; ++index)
@@ -212,8 +214,7 @@ bool DeviceState::uploadBufferRanges(const Buffer &buffer, const VernonRhiBuffer
         }
         stagingSize += static_cast<NSUInteger>(ranges[index].size);
     }
-    id<MTLBuffer> staging =
-        [device newBufferWithLength:stagingSize options:MTLResourceStorageModeShared];
+    id<MTLBuffer> staging = [device newBufferWithLength:stagingSize options:MTLResourceStorageModeShared];
     if (!staging) {
         error = "Metal batched upload staging buffer allocation failed";
         return false;
@@ -249,8 +250,8 @@ bool DeviceState::downloadBuffer(const Buffer &buffer, uint64_t offset, void *de
                     static_cast<size_t>(size));
         return true;
     }
-    id<MTLBuffer> staging =
-        [device newBufferWithLength:static_cast<NSUInteger>(size) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> staging = [device newBufferWithLength:static_cast<NSUInteger>(size)
+                                                options:MTLResourceStorageModeShared];
     if (!staging) {
         error = "Metal readback staging buffer allocation failed";
         return false;
@@ -365,17 +366,16 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const size_t pixelSize = vernon::rhi::imageTransferPixelSize(descriptor.format, upload.aspect);
-        const bool validLayer =
-            descriptor.dimension == VERNON_RHI_IMAGE_3D ? upload.array_layer == 0
-                                                        : upload.array_layer < descriptor.array_layers;
+        const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                    ? upload.array_layer == 0
+                                    : upload.array_layer < descriptor.array_layers;
         const bool validMip = upload.mip_level < descriptor.mip_levels;
         const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
         const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;
-        const uint32_t mipDepth = !validMip
-                                      ? 0
-                                      : descriptor.dimension == VERNON_RHI_IMAGE_3D
-                                            ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
-                                            : 1u;
+        const uint32_t mipDepth = !validMip ? 0
+                                  : descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                      ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
+                                      : 1u;
         if (upload.struct_size < sizeof(upload) || !upload.data || !validMip || !validLayer || !upload.width ||
             !upload.height || !upload.depth || upload.offset_x >= mipWidth ||
             upload.width > mipWidth - upload.offset_x || upload.offset_y >= mipHeight ||
@@ -395,14 +395,12 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
             const size_t stencilRowPitch = alignedTextureRowSize(stencilRowSize);
             const size_t depthImagePitch = depthRowPitch * upload.height;
             const size_t stencilImagePitch = stencilRowPitch * upload.height;
-            id<MTLBuffer> depthStaging =
-                copyDepth
-                    ? [device newBufferWithLength:depthImagePitch * upload.depth options:MTLResourceStorageModeShared]
-                    : nil;
-            id<MTLBuffer> stencilStaging =
-                copyStencil
-                    ? [device newBufferWithLength:stencilImagePitch * upload.depth options:MTLResourceStorageModeShared]
-                    : nil;
+            id<MTLBuffer> depthStaging = copyDepth ? [device newBufferWithLength:depthImagePitch * upload.depth
+                                                                         options:MTLResourceStorageModeShared]
+                                                   : nil;
+            id<MTLBuffer> stencilStaging = copyStencil ? [device newBufferWithLength:stencilImagePitch * upload.depth
+                                                                             options:MTLResourceStorageModeShared]
+                                                       : nil;
             if ((copyDepth && !depthStaging) || (copyStencil && !stencilStaging)) {
                 error = "Metal depth/stencil upload staging allocation failed";
                 return false;
@@ -429,31 +427,31 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
                                             y * depthRowPitch + x * sizeof(float),
                                         &depth, sizeof(depth));
                         if (copyStencil)
-                            static_cast<uint8_t *>(stencilStaging.contents)
-                                [z * stencilImagePitch + y * stencilRowPitch + x] = stencil;
+                            static_cast<uint8_t *>(
+                                stencilStaging.contents)[z * stencilImagePitch + y * stencilRowPitch + x] = stencil;
                     }
             if (copyDepth)
                 [encoder copyFromBuffer:depthStaging
-                          sourceOffset:0
-                     sourceBytesPerRow:depthRowPitch
-                   sourceBytesPerImage:depthImagePitch
-                            sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
-                             toTexture:image.texture
-                      destinationSlice:upload.array_layer
-                      destinationLevel:upload.mip_level
-                     destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)
-                               options:MTLBlitOptionDepthFromDepthStencil];
+                           sourceOffset:0
+                      sourceBytesPerRow:depthRowPitch
+                    sourceBytesPerImage:depthImagePitch
+                             sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
+                              toTexture:image.texture
+                       destinationSlice:upload.array_layer
+                       destinationLevel:upload.mip_level
+                      destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)
+                                options:MTLBlitOptionDepthFromDepthStencil];
             if (copyStencil)
                 [encoder copyFromBuffer:stencilStaging
-                          sourceOffset:0
-                     sourceBytesPerRow:stencilRowPitch
-                   sourceBytesPerImage:stencilImagePitch
-                            sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
-                             toTexture:image.texture
-                      destinationSlice:upload.array_layer
-                      destinationLevel:upload.mip_level
-                     destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)
-                               options:MTLBlitOptionStencilFromDepthStencil];
+                           sourceOffset:0
+                      sourceBytesPerRow:stencilRowPitch
+                    sourceBytesPerImage:stencilImagePitch
+                             sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
+                              toTexture:image.texture
+                       destinationSlice:upload.array_layer
+                       destinationLevel:upload.mip_level
+                      destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)
+                                options:MTLBlitOptionStencilFromDepthStencil];
             continue;
         }
         const size_t rowSize = pixelSize * upload.width;
@@ -467,8 +465,8 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
             error = "Metal image upload staging size overflows the host address range";
             return false;
         }
-        id<MTLBuffer> staging =
-            [device newBufferWithLength:imagePitch * upload.depth options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = [device newBufferWithLength:imagePitch * upload.depth
+                                                    options:MTLResourceStorageModeShared];
         if (!staging) {
             error = "Metal image upload staging allocation failed";
             return false;
@@ -481,14 +479,14 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
                 std::memcpy(destination + z * imagePitch + y * rowPitch,
                             source + (static_cast<size_t>(z) * upload.height + y) * rowSize, rowSize);
         [encoder copyFromBuffer:staging
-                  sourceOffset:0
-             sourceBytesPerRow:rowPitch
-           sourceBytesPerImage:imagePitch
-                    sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
-                     toTexture:image.texture
-              destinationSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : upload.array_layer
-              destinationLevel:upload.mip_level
-             destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)];
+                   sourceOffset:0
+              sourceBytesPerRow:rowPitch
+            sourceBytesPerImage:imagePitch
+                     sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
+                      toTexture:image.texture
+               destinationSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : upload.array_layer
+               destinationLevel:upload.mip_level
+              destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)];
     }
     [encoder endEncoding];
     [commandBuffer commit];
@@ -539,25 +537,25 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         }
         if (copyDepth)
             [encoder copyFromTexture:image.texture
-                        sourceSlice:download.array_layer
-                        sourceLevel:download.mip_level
-                       sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
-                         sourceSize:MTLSizeMake(download.width, download.height, 1)
-                           toBuffer:depthStaging
-                  destinationOffset:0
-             destinationBytesPerRow:depthRowPitch
-           destinationBytesPerImage:depthLayerSize];
+                             sourceSlice:download.array_layer
+                             sourceLevel:download.mip_level
+                            sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                              sourceSize:MTLSizeMake(download.width, download.height, 1)
+                                toBuffer:depthStaging
+                       destinationOffset:0
+                  destinationBytesPerRow:depthRowPitch
+                destinationBytesPerImage:depthLayerSize];
         if (copyStencil)
             [encoder copyFromTexture:image.texture
-                        sourceSlice:download.array_layer
-                        sourceLevel:download.mip_level
-                       sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
-                         sourceSize:MTLSizeMake(download.width, download.height, 1)
-                           toBuffer:stencilStaging
-                  destinationOffset:0
-             destinationBytesPerRow:stencilRowPitch
-           destinationBytesPerImage:stencilLayerSize
-                          options:MTLBlitOptionStencilFromDepthStencil];
+                             sourceSlice:download.array_layer
+                             sourceLevel:download.mip_level
+                            sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                              sourceSize:MTLSizeMake(download.width, download.height, 1)
+                                toBuffer:stencilStaging
+                       destinationOffset:0
+                  destinationBytesPerRow:stencilRowPitch
+                destinationBytesPerImage:stencilLayerSize
+                                 options:MTLBlitOptionStencilFromDepthStencil];
         [encoder endEncoding];
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
@@ -582,13 +580,12 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         }
         for (uint32_t y = 0; y < download.height; ++y)
             for (uint32_t x = 0; x < download.width; ++x) {
-                    const size_t outputOffset =
-                        (static_cast<size_t>(y) * download.width + x) * packedDepthStencilPixelSize;
-                    const size_t depthOffset = y * depthRowPitch + x * sizeof(float);
-                    const size_t stencilOffset = y * stencilRowPitch + x;
-                    float depthValue{};
-                    std::memcpy(&depthValue, depthSource + depthOffset, sizeof(depthValue));
-                    storePackedDepthStencil(output + outputOffset, depthValue, stencilSource[stencilOffset]);
+                const size_t outputOffset = (static_cast<size_t>(y) * download.width + x) * packedDepthStencilPixelSize;
+                const size_t depthOffset = y * depthRowPitch + x * sizeof(float);
+                const size_t stencilOffset = y * stencilRowPitch + x;
+                float depthValue{};
+                std::memcpy(&depthValue, depthSource + depthOffset, sizeof(depthValue));
+                storePackedDepthStencil(output + outputOffset, depthValue, stencilSource[stencilOffset]);
             }
         return true;
     }
@@ -612,14 +609,14 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         return false;
     }
     [encoder copyFromTexture:image.texture
-                sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : download.array_layer
-                sourceLevel:download.mip_level
-               sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, download.offset_z)
-                 sourceSize:MTLSizeMake(download.width, download.height, download.depth)
-                   toBuffer:staging
-          destinationOffset:0
-     destinationBytesPerRow:rowPitch
-   destinationBytesPerImage:imagePitch];
+                     sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : download.array_layer
+                     sourceLevel:download.mip_level
+                    sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, download.offset_z)
+                      sourceSize:MTLSizeMake(download.width, download.height, download.depth)
+                        toBuffer:staging
+               destinationOffset:0
+          destinationBytesPerRow:rowPitch
+        destinationBytesPerImage:imagePitch];
     [encoder endEncoding];
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
@@ -668,48 +665,41 @@ bool DeviceState::downloadImageBatch(const Image &image, const VernonRhiImageDes
             const bool copyStencil = (download.aspect & VERNON_RHI_IMAGE_ASPECT_STENCIL) != 0;
             const size_t depthRowPitch = alignedTextureRowSize(sizeof(float) * download.width);
             const size_t stencilRowPitch = alignedTextureRowSize(download.width);
-            id<MTLBuffer> depthStaging =
-                copyDepth ? [device newBufferWithLength:depthRowPitch * download.height
-                                                options:MTLResourceStorageModeShared]
-                          : nil;
-            id<MTLBuffer> stencilStaging =
-                copyStencil ? [device newBufferWithLength:stencilRowPitch * download.height
-                                                  options:MTLResourceStorageModeShared]
-                            : nil;
+            id<MTLBuffer> depthStaging = copyDepth ? [device newBufferWithLength:depthRowPitch * download.height
+                                                                         options:MTLResourceStorageModeShared]
+                                                   : nil;
+            id<MTLBuffer> stencilStaging = copyStencil ? [device newBufferWithLength:stencilRowPitch * download.height
+                                                                             options:MTLResourceStorageModeShared]
+                                                       : nil;
             if ((copyDepth && !depthStaging) || (copyStencil && !stencilStaging)) {
                 error = "Metal batched depth/stencil readback staging allocation failed";
                 return false;
             }
             if (copyDepth)
                 [encoder copyFromTexture:image.texture
-                            sourceSlice:download.array_layer
-                            sourceLevel:download.mip_level
-                           sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
-                             sourceSize:MTLSizeMake(download.width, download.height, 1)
-                               toBuffer:depthStaging
-                      destinationOffset:0
-                 destinationBytesPerRow:depthRowPitch
-               destinationBytesPerImage:depthRowPitch * download.height];
+                                 sourceSlice:download.array_layer
+                                 sourceLevel:download.mip_level
+                                sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                                  sourceSize:MTLSizeMake(download.width, download.height, 1)
+                                    toBuffer:depthStaging
+                           destinationOffset:0
+                      destinationBytesPerRow:depthRowPitch
+                    destinationBytesPerImage:depthRowPitch * download.height];
             if (copyStencil)
                 [encoder copyFromTexture:image.texture
-                            sourceSlice:download.array_layer
-                            sourceLevel:download.mip_level
-                           sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
-                             sourceSize:MTLSizeMake(download.width, download.height, 1)
-                               toBuffer:stencilStaging
-                      destinationOffset:0
-                 destinationBytesPerRow:stencilRowPitch
-               destinationBytesPerImage:stencilRowPitch * download.height
-                              options:MTLBlitOptionStencilFromDepthStencil];
-            readbacks.push_back({depthStaging,
-                                 stencilStaging,
-                                 vernon::rhi::imageTransferPixelSize(descriptor.format, download.aspect) *
-                                     download.width,
-                                 depthRowPitch,
-                                 depthRowPitch * download.height,
-                                 stencilRowPitch,
-                                 copyDepth,
-                                 copyStencil});
+                                 sourceSlice:download.array_layer
+                                 sourceLevel:download.mip_level
+                                sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                                  sourceSize:MTLSizeMake(download.width, download.height, 1)
+                                    toBuffer:stencilStaging
+                           destinationOffset:0
+                      destinationBytesPerRow:stencilRowPitch
+                    destinationBytesPerImage:stencilRowPitch * download.height
+                                     options:MTLBlitOptionStencilFromDepthStencil];
+            readbacks.push_back(
+                {depthStaging, stencilStaging,
+                 vernon::rhi::imageTransferPixelSize(descriptor.format, download.aspect) * download.width,
+                 depthRowPitch, depthRowPitch * download.height, stencilRowPitch, copyDepth, copyStencil});
             continue;
         }
         const size_t pixelSize = vernon::rhi::imageTransferPixelSize(descriptor.format, download.aspect);
@@ -729,21 +719,21 @@ bool DeviceState::downloadImageBatch(const Image &image, const VernonRhiImageDes
             error = "Metal batched image readback destination is too small";
             return false;
         }
-        id<MTLBuffer> staging =
-            [device newBufferWithLength:imagePitch * download.depth options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = [device newBufferWithLength:imagePitch * download.depth
+                                                    options:MTLResourceStorageModeShared];
         if (!staging) {
             error = "Metal batched image readback staging allocation failed";
             return false;
         }
         [encoder copyFromTexture:image.texture
-                    sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : download.array_layer
-                    sourceLevel:download.mip_level
-                   sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, download.offset_z)
-                     sourceSize:MTLSizeMake(download.width, download.height, download.depth)
-                       toBuffer:staging
-              destinationOffset:0
-         destinationBytesPerRow:rowPitch
-       destinationBytesPerImage:imagePitch];
+                         sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : download.array_layer
+                         sourceLevel:download.mip_level
+                        sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, download.offset_z)
+                          sourceSize:MTLSizeMake(download.width, download.height, download.depth)
+                            toBuffer:staging
+                   destinationOffset:0
+              destinationBytesPerRow:rowPitch
+            destinationBytesPerImage:imagePitch];
         readbacks.push_back({staging, nil, rowSize, rowPitch, imagePitch, 0, false, false});
     }
     [encoder endEncoding];
@@ -765,9 +755,9 @@ bool DeviceState::downloadImageBatch(const Image &image, const VernonRhiImageDes
                     for (uint32_t x = 0; x < download.width; ++x) {
                         float depth{};
                         std::memcpy(&depth, source + y * readback.rowPitch + x * sizeof(float), sizeof(depth));
-                        storePackedDepthStencil(
-                            output + (static_cast<size_t>(y) * download.width + x) * packedDepthStencilPixelSize, depth,
-                            stencil[y * readback.stencilRowPitch + x]);
+                        storePackedDepthStencil(output + (static_cast<size_t>(y) * download.width + x) *
+                                                             packedDepthStencilPixelSize,
+                                                depth, stencil[y * readback.stencilRowPitch + x]);
                     }
             } else {
                 const size_t sourcePitch = readback.copyDepth ? readback.rowPitch : readback.stencilRowPitch;
@@ -805,15 +795,14 @@ bool DeviceState::generateImageMipmaps(const Image &image, uint32_t mipLevels, s
     return false;
 }
 
-bool DeviceState::createImageView(ImageView &view, const Image &image,
-                                  const VernonRhiImageViewDescriptor &descriptor, std::string &error) {
+bool DeviceState::createImageView(ImageView &view, const Image &image, const VernonRhiImageViewDescriptor &descriptor,
+                                  std::string &error) {
     const MTLPixelFormat format = static_cast<MTLPixelFormat>(pixelFormat(descriptor.format));
-    view.texture = [image.texture newTextureViewWithPixelFormat:format
-                                                   textureType:metalTextureType(descriptor.dimension)
-                                                        levels:NSMakeRange(descriptor.base_mip_level,
-                                                                           descriptor.mip_level_count)
-                                                        slices:NSMakeRange(descriptor.base_array_layer,
-                                                                           descriptor.array_layer_count)];
+    view.texture = [image.texture
+        newTextureViewWithPixelFormat:format
+                          textureType:metalTextureType(descriptor.dimension)
+                               levels:NSMakeRange(descriptor.base_mip_level, descriptor.mip_level_count)
+                               slices:NSMakeRange(descriptor.base_array_layer, descriptor.array_layer_count)];
     if (view.texture)
         return true;
     error = "Metal image view format or subresource range is unsupported";
@@ -866,9 +855,8 @@ bool DeviceState::beginCommands(uint64_t &native, std::string &error) {
     return true;
 }
 
-bool DeviceState::copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset,
-                             const Buffer &destination, uint64_t destinationOffset, uint64_t size,
-                             std::string &error) {
+bool DeviceState::copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset, const Buffer &destination,
+                             uint64_t destinationOffset, uint64_t size, std::string &error) {
     if (!native || !source.buffer || !destination.buffer || !size) {
         error = "Metal buffer copy arguments are invalid";
         return false;
@@ -880,10 +868,10 @@ bool DeviceState::copyBuffer(uint64_t native, const Buffer &source, uint64_t sou
         return false;
     }
     [blit copyFromBuffer:source.buffer
-            sourceOffset:sourceOffset
-                toBuffer:destination.buffer
-       destinationOffset:destinationOffset
-                    size:size];
+             sourceOffset:sourceOffset
+                 toBuffer:destination.buffer
+        destinationOffset:destinationOffset
+                     size:size];
     [blit endEncoding];
     return true;
 }
@@ -903,14 +891,14 @@ bool DeviceState::copyImage(uint64_t native, const Image &source, const Image &d
     for (size_t index = 0; index < regionCount; ++index) {
         const VernonRhiImageCopyRegion &region = regions[index];
         [blit copyFromTexture:source.texture
-                 sourceSlice:region.source_array_layer
-                 sourceLevel:region.source_mip_level
-                sourceOrigin:MTLOriginMake(region.source_x, region.source_y, region.source_z)
-                  sourceSize:MTLSizeMake(region.width, region.height, region.depth)
-                   toTexture:destination.texture
-            destinationSlice:region.destination_array_layer
-            destinationLevel:region.destination_mip_level
-           destinationOrigin:MTLOriginMake(region.destination_x, region.destination_y, region.destination_z)];
+                  sourceSlice:region.source_array_layer
+                  sourceLevel:region.source_mip_level
+                 sourceOrigin:MTLOriginMake(region.source_x, region.source_y, region.source_z)
+                   sourceSize:MTLSizeMake(region.width, region.height, region.depth)
+                    toTexture:destination.texture
+             destinationSlice:region.destination_array_layer
+             destinationLevel:region.destination_mip_level
+            destinationOrigin:MTLOriginMake(region.destination_x, region.destination_y, region.destination_z)];
     }
     [blit endEncoding];
     return true;
@@ -932,8 +920,8 @@ bool DeviceState::pollCommands(uint64_t native, bool &completed, bool &succeeded
         return false;
     }
     id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
-    completed = commandBuffer.status == MTLCommandBufferStatusCompleted ||
-                commandBuffer.status == MTLCommandBufferStatusError;
+    completed =
+        commandBuffer.status == MTLCommandBufferStatusCompleted || commandBuffer.status == MTLCommandBufferStatusError;
     succeeded = commandBuffer.status == MTLCommandBufferStatusCompleted;
     if (completed && !succeeded)
         setCommandError(error, commandBuffer, "Metal command buffer failed");
@@ -994,5 +982,23 @@ bool DeviceState::reserveTransient(uint64_t native, size_t size, size_t alignmen
     buffer = chunk->buffer;
     return true;
 }
+
+bool DeviceState::reservePersistent(size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset, uint64_t &key,
+                                    std::string &error) {
+    TransientChunk *chunk =
+        persistentBlocks.acquire(size, alignment, offset, key, [&](size_t capacity, TransientChunk &created) {
+            created.buffer = [device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+            created.capacity = capacity;
+            return created.buffer != nil;
+        });
+    if (!chunk) {
+        error = "Metal persistent block allocation failed";
+        return false;
+    }
+    buffer = chunk->buffer;
+    return true;
+}
+
+void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
 
 } // namespace vernon::rhi::metal

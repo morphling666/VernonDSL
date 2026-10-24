@@ -139,31 +139,48 @@ inline void appendRhiImageBinding(std::vector<RhiCommandResourceBinding> &bindin
     bindings.push_back({identity, ResourceKind::Image, {}, image});
 }
 
+// Ends what nodes of a plan share on its encoder, such as a command stream.
+struct RhiCommandFinisher {
+    RhiCommandListEncoder finish{};
+    void *context{};
+};
+
+// A fragment of commands that a producer builds freely; it is checked when appended to a validated plan.
 struct RhiCommandExecutionPlan {
     CommandDag commands;
     std::vector<RhiCommandNodeEncoder> encoders;
     std::vector<RhiCommandResourceBinding> bindings;
     std::vector<std::shared_ptr<void>> retainedContexts;
     std::vector<CommandResourceAccess> initialAccesses;
+    // Run once each, in order, after the last node and before the encoder finishes, also when a node failed.
+    std::vector<RhiCommandFinisher> finishers;
 };
 
-using RhiCommandPlanExtension = VernonRhiStatus (*)(void *context, uint32_t offset, uint32_t predecessor,
-                                                    RhiCommandExecutionPlan &plan);
-using RhiPassCommandPlanner = VernonRhiStatus (*)(void *context, uint32_t offset, ComputePass &pass,
-                                                  const ExecutionResources &resources, RhiCommandExecutionPlan &plan);
+// The only plan that is submitted. It grows only by appending fragments, each checked against the indices kept
+// here, so the plan is valid by construction and is never revalidated.
+class ValidatedRhiCommandPlan {
+public:
+    // Appends `fragment` after every node of the plan: its root nodes depend on the plan's last node. A rejected
+    // fragment leaves the plan unchanged.
+    bool append(RhiCommandExecutionPlan fragment, std::string &error);
+    bool empty() const { return plan_.commands.nodes.empty(); }
+    const RhiCommandExecutionPlan &plan() const { return plan_; }
+    const RhiCommandResourceBinding *binding(const CommandAccessDomain &domain) const;
+    std::vector<std::shared_ptr<void>> takeRetainedContexts() { return std::move(plan_.retainedContexts); }
 
-bool appendRhiCommandExecutionPlan(RhiCommandExecutionPlan &destination, RhiCommandExecutionPlan source, bool serialize,
-                                   std::string &error);
-bool validateRhiCommandExecutionPlan(const RhiCommandExecutionPlan &plan, std::string &error);
+private:
+    RhiCommandExecutionPlan plan_;
+    CommandDagValidator dag_;
+    CommandAccessDomainMap<uint32_t> bindings_;
+    // Per domain, the indices of its initial accesses in `plan_`.
+    CommandAccessDomainMap<std::vector<uint32_t>> initialAccesses_;
+    uint32_t resourceBase_{};
+};
 
-VernonRhiStatus submitRhiCommandDag(VernonRhiDevice device, uint32_t requiredCapabilities, const CommandDag &dag,
-                                    const std::vector<RhiCommandNodeEncoder> &encoders,
-                                    VernonRhiCompletion *outputCompletion,
-                                    const std::vector<RhiCommandResourceBinding> *resourceBindings = nullptr);
 // With `timedScopes`, each run of encoders sharing a scope records one timer, and the scopes are listed in timer
 // order.
 VernonRhiStatus submitRhiCommandPlan(VernonRhiDevice device, uint32_t requiredCapabilities,
-                                     const RhiCommandExecutionPlan &plan, VernonRhiCompletion &outputCompletion,
+                                     const ValidatedRhiCommandPlan &plan, VernonRhiCompletion &outputCompletion,
                                      TimedCommandScopes *timedScopes = nullptr);
 VernonRhiStatus executeCpuScheduleRange(VernonRhiDevice device, const std::vector<GraphResource> &resources,
                                         const std::vector<std::unique_ptr<ExecutionPass>> &passes,
@@ -171,19 +188,6 @@ VernonRhiStatus executeCpuScheduleRange(VernonRhiDevice device, const std::vecto
                                         std::shared_ptr<const ExecutionBindings> bindings, uint32_t beginOffset,
                                         uint32_t endOffset, CpuPassExecutor executor = nullptr, void *context = nullptr,
                                         const std::vector<VernonRhiBuffer> *resourceBuffers = nullptr);
-
-VernonRhiStatus submitRhiComputeCommandRange(VernonRhiDevice device, const std::vector<GraphResource> &resources,
-                                             const std::vector<ExecutionResourceRecord> &resourceRecords,
-                                             const std::vector<std::unique_ptr<ExecutionPass>> &passes,
-                                             const std::vector<uint32_t> &schedule,
-                                             const std::vector<CompiledScope> &scopes, const CommandDag &commandDag,
-                                             std::shared_ptr<const ExecutionBindings> bindings, uint32_t beginOffset,
-                                             uint32_t endOffset, CpuPassExecutor executor = nullptr,
-                                             void *context = nullptr, VernonRhiCompletion *outputCompletion = nullptr,
-                                             RhiCommandPlanExtension extension = nullptr,
-                                             void *extensionContext = nullptr, RhiPassCommandPlanner planner = nullptr,
-                                             void *plannerContext = nullptr,
-                                             RhiCommandExecutionPlan *outputPlan = nullptr);
 
 } // namespace detail
 

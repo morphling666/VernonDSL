@@ -10,7 +10,7 @@ design generalizes it instead of adding a composition feature:
 
 1. every specialization condition is static, and `When` takes any
    compile-time predicate;
-2. binding groups aggregate entry interface items the way Structs aggregate
+2. params classes aggregate entry interface items the way Structs aggregate
    Values, and methods resolve on inferred types;
 3. a specialization value may be a type.
 
@@ -44,7 +44,7 @@ Rejected alternatives:
   with constant expressions, so the fallback tier needs ordinary bindings.
 
 A type value fits the domain: a material is one unit of parameters,
-resources and code, which is a binding group with methods.
+resources and code, which is a params class with methods.
 
 ## 2. Static branches
 
@@ -68,26 +68,26 @@ specializations are mapping keys in `variants=` and `specializations=`. The
 other operators therefore raise on the host, and annotations that use them
 must be deferred.
 
-## 4. Binding groups
+## 4. Params
 
-A group carries no interface metadata so one declaration is valid in every
-stage and the binding planner, not the author, places its leaves.
+A params class has no physical meaning, so the source unit that aggregates
+parameters is independent of the unit the Runtime binds: a leaf's group is
+its update frequency, written as its `set`, not the class it is declared in
+([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3).
+Fields therefore carry their own interface metadata, and a class places its
+leaves the same way wherever it is used. With bindless resource tables
+(Engine extension E3), typed handles become ABI-stable Values that a Struct
+may hold, so a material's parameters and texture references can move into
+one Struct that serves as the GPU material-table row. Params remain the
+interface for directly bound resources.
 
-A group is one consecutive binding range so that a later contract can give
-each group its own descriptor set or Metal argument buffer, grouped by update
-frequency, without changing source. With bindless resource tables (Engine
-extension E3), typed handles become ABI-stable Values that a Struct may hold,
-so a material's parameters and texture references can move into one Struct
-that serves as the GPU material-table row. Binding groups remain the interface
-for directly bound resources.
-
-A group has no `shared` option because its purpose is device-only resources;
-host/device code belongs on its Value Structs.
+A params class has no `shared` option because its purpose is device-only
+resources; host/device code belongs on its Value Structs.
 
 ## 5. Typed method resolution
 
 Resolving methods on the inferred receiver type, rather than syntactically,
-lets one generic helper call the same method on different binding groups,
+lets one generic helper call the same method on different params classes,
 which is how a template calls whichever material a key binds. Keeping methods
 non-first-class preserves the no-function-values rule of section 1.
 
@@ -125,5 +125,5 @@ make every type-valued Struct unbindable from the host.
 
 Function values, closures, and lambdas; runtime dispatch; resources inside
 Structs; declared interface constraints on type specializations, which belong
-to the constrained-generics roadmap item; `When` on binding-group fields;
+to the constrained-generics roadmap item; `When` on params fields;
 type values other than declared types and scalar types.

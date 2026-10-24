@@ -160,6 +160,10 @@ if(TARGET VernonRuntime)
     target_include_directories(VernonRhiStagingPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib/rhi")
     target_link_libraries(VernonRhiStagingPoolTests PRIVATE GTest::gtest_main)
     vernon_discover_gtests(VernonRhiStagingPoolTests)
+    add_executable(VernonRhiBlockPoolTests rhi/block_pool_test.cpp)
+    target_include_directories(VernonRhiBlockPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib/rhi")
+    target_link_libraries(VernonRhiBlockPoolTests PRIVATE GTest::gtest_main)
+    vernon_discover_gtests(VernonRhiBlockPoolTests)
     add_executable(VernonRhiDeferredActionTests rhi/rhi_deferred_action_test.cpp)
     target_include_directories(VernonRhiDeferredActionTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
                                                                     "${VERNON_REPOSITORY_ROOT}/source/lib")
@@ -347,10 +351,13 @@ if(TARGET VernonRuntime)
             "module_graphics|recorded_graphics_opaque_pass|${recorded_graphics_asset}:opaque_pass_asset|graphics"
             "module_graphics|recorded_graphics_grouped_tint_pass|${recorded_graphics_asset}:grouped_tint_pass_asset|graphics"
             "module_graphics|recorded_graphics_vertex_group_pass|${recorded_graphics_asset}:vertex_group_pass_asset|graphics"
+            "module_graphics|recorded_graphics_shared_group_pass|${recorded_graphics_asset}:shared_group_pass_asset|graphics"
             "module_graphics|recorded_graphics_blended_surface|${recorded_graphics_asset}:blended_surface_asset|graphics"
             "module_graphics|recorded_graphics_packed_tint_surface|${recorded_graphics_asset}:packed_tint_surface_asset|graphics"
             "module_graphics|recorded_graphics_float_target_surface|${recorded_graphics_asset}:float_target_surface_asset|graphics"
             "module_graphics|recorded_graphics_sampled_pass|${recorded_graphics_asset}:sampled_pass_asset|graphics"
+            "module_graphics|recorded_graphics_set_one_sampled_pass|${recorded_graphics_asset}:set_one_sampled_pass_asset|graphics"
+            "module_graphics|recorded_graphics_set_two_sampled_surface|${recorded_graphics_asset}:set_two_sampled_surface_asset|graphics"
             "module_graphics|recorded_graphics_mirrored_vertices_pass|${recorded_graphics_asset}:mirrored_vertices_pass_asset|compute,graphics"
             "module_graphics|recorded_graphics_scratch_writing_pass|${recorded_graphics_asset}:scratch_writing_pass_asset|compute,graphics"
         )
@@ -514,10 +521,10 @@ if(TARGET VernonRuntime)
             typed_specialization_fixture_target)
         vernon_add_cpu_program_fixture(
             binding-group
-            binding_group_fixture
-            "${VERNON_TEST_ROOT}/fixtures/binding_group_program_asset.py:asset"
-            binding_group_manifest
-            binding_group_fixture_target)
+            params_fixture
+            "${VERNON_TEST_ROOT}/fixtures/params_program_asset.py:asset"
+            params_manifest
+            params_fixture_target)
         vernon_add_cpu_program_fixture(
             type-specialization
             type_specialization_fixture
@@ -641,7 +648,7 @@ if(TARGET VernonRuntime)
                     nlohmann_json::nlohmann_json
                     ${module_program_cpu_fixture_targets}
                     ${typed_specialization_fixture_target}
-                    ${binding_group_fixture_target}
+                    ${params_fixture_target}
                     ${type_specialization_fixture_target})
         target_include_directories(
             VernonModuleProgramRuntimeTests
@@ -652,7 +659,7 @@ if(TARGET VernonRuntime)
             PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cpu_manifest}"
                     VERNON_MODULE_PROGRAM_CPU_FIXTURES_AVAILABLE=1
                     VERNON_TYPED_SPECIALIZATION_MANIFEST="${typed_specialization_manifest}"
-                    VERNON_BINDING_GROUP_MANIFEST="${binding_group_manifest}"
+                    VERNON_PARAMS_MANIFEST="${params_manifest}"
                     VERNON_TYPE_SPECIALIZATION_MANIFEST="${type_specialization_manifest}")
         set_target_properties(VernonModuleProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                          "${CMAKE_BINARY_DIR}/source")

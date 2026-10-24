@@ -100,11 +100,11 @@ def struct(value: _T | None = None, *, shared: bool = False) -> _T | Callable[[_
     return decorate(value) if value is not None else decorate
 
 
-def binding_group(cls: _T) -> _T:
-    """Declare a named group of entry interface items; on the host it is a keyword-only container."""
+def params(cls: _T) -> _T:
+    """Declare a bundle of entry parameters with no physical meaning; on the host it is a keyword-only container."""
 
-    from .binding_groups import make_binding_group
+    from ._params import make_params
 
-    mark(cls, "binding_group")
+    mark(cls, "params")
     record_declaration_source(cls)
-    return make_binding_group(cls)  # type: ignore[arg-type,return-value]
+    return make_params(cls)  # type: ignore[arg-type,return-value]

@@ -22,6 +22,7 @@ release-artifacts/
 *.o
 *.obj
 *.lib
+*.pdb
 *.exp
 *.exe
 *.npy

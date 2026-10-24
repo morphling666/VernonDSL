@@ -1133,8 +1133,8 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeModuleProgramCppApi, BindingGroupLeavesBindAcrossTypedVariants) {
-    std::ifstream input(VERNON_BINDING_GROUP_MANIFEST, std::ios::binary);
+TEST(RuntimeModuleProgramCppApi, ParamsLeavesBindAcrossTypedVariants) {
+    std::ifstream input(VERNON_PARAMS_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -1206,7 +1206,7 @@ TEST(RuntimeModuleProgramCppApi, BindingGroupLeavesBindAcrossTypedVariants) {
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeModuleProgramCppApi, TypeVariantsSelectBindingGroupValuesByIdentity) {
+TEST(RuntimeModuleProgramCppApi, TypeVariantsSelectParamsValuesByIdentity) {
     std::ifstream input(VERNON_TYPE_SPECIALIZATION_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};

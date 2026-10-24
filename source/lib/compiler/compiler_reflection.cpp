@@ -1191,6 +1191,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     if (attr.getName().strref() == "vernon.instance_divisor")
                         requiredFeatures.insert("instancing");
                 }
+                if (argument.get("vernon.binding") && !argument.get("vernon.set"))
+                    argument["vernon.set"] = int64_t{0};
             }
             if (stage.getValue() == "fragment" &&
                 !reflectVaryingInterpolation(argument, argumentAttrs, argumentType, module)) {
@@ -1227,10 +1229,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["vernon.set"] = static_cast<int64_t>(generated->second.first);
                 argument["vernon.binding"] = static_cast<int64_t>(generated->second.second);
             }
-            if (stage.getValue() == "vertex" && argumentAttrs && argumentAttrs.get("vernon.location"))
-                if (const mlir::vernon::GraphicsBindingAssignment *grouped =
-                        graphicsBindings->find(function.getSymName(), index))
-                    argument["vernon.set"] = static_cast<int64_t>(grouped->set);
             if (computeBindings[index]) {
                 argument["vernon.set"] = int64_t{0};
                 argument["vernon.binding"] = static_cast<int64_t>(*computeBindings[index]);

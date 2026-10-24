@@ -5,6 +5,7 @@
 #include "VernonFormats.hpp"
 #include "VernonRHI.h"
 #include "VernonResult.hpp"
+#include "block_pool.h"
 #include "staging_pool.h"
 #include "vulkan_driver.h"
 
@@ -167,6 +168,10 @@ struct VERNON_RHI_CAPI DeviceState {
     // uniform and storage buffer descriptors.
     bool acquireStaging(VkCommandBuffer command, bool upload, VkDeviceSize size, VkDeviceSize alignment,
                         VkBuffer &buffer, VkDeviceSize &offset, uint8_t *&mapped, std::string &error);
+    // Persistent blocks live in upload staging chunks, which carry the uniform and storage buffer usages.
+    bool placePersistent(VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
+                         uint8_t *&mapped, uint64_t &key, std::string &error);
+    void releasePersistent(uint64_t key);
     // A descriptor set owned by the frame recording `command`, valid until that frame retires.
     bool allocateFrameDescriptorSet(VkCommandBuffer command, VkDescriptorSetLayout layout, VkDescriptorSet &set,
                                     std::string &error);
@@ -224,6 +229,7 @@ struct VERNON_RHI_CAPI DeviceState {
     std::vector<DeferredDestruction> deferredDestructions;
     StagingPool<StagingChunk> uploadStaging;
     StagingPool<StagingChunk> readbackStaging;
+    BlockPool<StagingChunk> persistentBlocks;
     uint64_t submittedSerial{};
     uint64_t completedSerial{};
     bool deviceLost{};

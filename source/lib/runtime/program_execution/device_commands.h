@@ -17,6 +17,10 @@ namespace vernon::execution::detail {
 struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
+namespace vernon::runtime {
+class EncoderCommandStream;
+} // namespace vernon::runtime
+
 namespace vernon::runtime::program_execution {
 
 struct DeviceBufferCopy {
@@ -64,10 +68,13 @@ VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const
                                             execution::detail::RhiCommandExecutionPlan &plan);
 // `owners`, when not empty, holds the owner of each argument; otherwise the command owns them all.
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
-                                   VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
+                                   EncoderCommandStream &stream, VernonStageExecutable &pipeline,
+                                   std::vector<VernonProgramArgument> &arguments,
                                    const std::vector<ArgumentOwner> &owners, VernonLaunchSize grid);
+// The pipeline dispatches on `stream`, which the caller retains with `plan` and ends with its finisher.
 VernonStatus
-buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
+buildPipelineCommandPlan(VernonRuntimeContext &context, EncoderCommandStream &stream,
+                         const std::vector<DeviceBufferCopy> &copiesBefore,
                          const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
                          const std::vector<VernonProgramArgument> &arguments, std::vector<ArgumentOwner> owners,
                          VernonLaunchSize grid, const std::vector<DeviceBufferCopy> &copiesAfter,

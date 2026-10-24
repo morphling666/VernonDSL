@@ -185,6 +185,9 @@ std::vector<GlEnum> invalidatedAttachments;
 std::vector<unsigned char> bufferStorage;
 std::vector<unsigned char> textureStorage;
 std::vector<GlInt> framebufferTextureLayers;
+std::vector<GlUint> framebufferTextures;
+std::vector<GlUint> generatedFramebuffers;
+std::vector<GlUint> deletedFramebuffers;
 std::array<GlInt, 4> signedUniformUpload{};
 std::array<GlUint, 4> unsignedUniformUpload{};
 GlEnum pendingError = 0;
@@ -211,7 +214,10 @@ void GL_CALL infoLogNoop(GlUint, GlSize, GlSize *length, char *) {
 void GL_CALL enumNoop(GlEnum) {}
 void GL_CALL enumIntNoop(GlEnum, GlInt) {}
 void GL_CALL deleteNamesNoop(GlSize, const GlUint *) {}
-void GL_CALL framebufferTexture2DNoop(GlEnum, GlEnum, GlEnum, GlUint, GlInt) {}
+void GL_CALL framebufferTexture2D(GlEnum, GlEnum, GlEnum, GlUint texture, GlInt) {
+    if (texture)
+        framebufferTextures.push_back(texture);
+}
 void GL_CALL framebufferTextureLayer(GlEnum, GlEnum, GlUint, GlInt, GlInt layer) {
     framebufferTextureLayers.push_back(layer);
 }
@@ -293,6 +299,13 @@ void GL_CALL pushDebugGroupKhr(GlEnum source, GlUint id, GlSize length, const ch
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
         *names++ = nextName++;
+}
+void GL_CALL genFramebuffers(GlSize count, GlUint *names) {
+    genNames(count, names);
+    generatedFramebuffers.insert(generatedFramebuffers.end(), names, names + count);
+}
+void GL_CALL deleteFramebuffers(GlSize count, const GlUint *names) {
+    std::copy_if(names, names + count, std::back_inserter(deletedFramebuffers), [](GlUint name) { return name != 0; });
 }
 void GL_CALL deleteQueries(GlSize count, const GlUint *names) {
     std::copy_if(names, names + count, std::back_inserter(deletedQueries), [](GlUint name) { return name != 0; });
@@ -509,8 +522,8 @@ void *getProcAddress(void *, const char *name) {
     PROC("glEnableVertexAttribArray", objectNoop);
     PROC("glDisableVertexAttribArray", objectNoop);
     PROC("glUseProgram", useProgram);
-    PROC("glGenFramebuffers", genNames);
-    PROC("glDeleteFramebuffers", deleteNamesNoop);
+    PROC("glGenFramebuffers", genFramebuffers);
+    PROC("glDeleteFramebuffers", deleteFramebuffers);
     PROC("glGenBuffers", genNames);
     PROC("glBindBuffer", bindBuffer);
     PROC("glBindBufferBase", bindBufferBase);
@@ -542,7 +555,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glSamplerParameteri", enumIntNoop);
     PROC("glCheckFramebufferStatus", framebufferStatus);
     PROC("glBindFramebuffer", bindFramebuffer);
-    PROC("glFramebufferTexture2D", framebufferTexture2DNoop);
+    PROC("glFramebufferTexture2D", framebufferTexture2D);
     PROC("glFramebufferTextureLayer", framebufferTextureLayer);
     PROC("glBlitFramebuffer", blitFramebufferNoop);
     PROC("glDrawBuffers", drawBuffersNoop);
@@ -702,9 +715,10 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *manifest, uint
         const GlUint nextNameAfterPreparation = nextName;
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
             << lastError(gl);
+        EXPECT_EQ(nextName, nextNameAfterPreparation + 1) << "only the target's framebuffer is created";
         ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
             << lastError(gl);
-        EXPECT_EQ(nextName, nextNameAfterPreparation);
+        EXPECT_EQ(nextName, nextNameAfterPreparation + 1);
         EXPECT_EQ(matrixTranspose, expectedTranspose);
         EXPECT_EQ(matrixUpload, expectedUpload);
         EXPECT_EQ(clearCount, 2U);
@@ -811,6 +825,58 @@ VernonRhiCommandEncoder createGraphicsEncoder(VernonRhiDevice device) {
     VernonRhiCommandEncoder encoder{};
     EXPECT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
     return encoder;
+}
+
+TEST(RuntimeExternalGl, CachesOneFramebufferPerAttachmentSetUntilAnAttachedImageIsDestroyed) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    const VernonRhiDevice device = rhiRuntime(gl).device;
+    const RhiImage first = createTexture2D(gl, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+    const RhiImage second = createTexture2D(gl, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto firstView =
+        vernon::tests::createImageView(rhiRuntime(gl), first, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto secondView =
+        vernon::tests::createImageView(rhiRuntime(gl), second, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto render = [&](VernonRhiImageView view) {
+        const VernonRhiCommandEncoder encoder = createGraphicsEncoder(device);
+        VernonRhiColorAttachment color{};
+        color.view = view;
+        color.initial_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
+        color.final_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
+        color.load_operation = VERNON_RHI_LOAD_CLEAR;
+        color.store_operation = VERNON_RHI_STORE_PRESERVE;
+        VernonRhiRenderingDescriptor rendering{};
+        rendering.struct_size = sizeof(rendering);
+        rendering.color_attachments = &color;
+        rendering.color_attachment_count = 1;
+        rendering.width = 4;
+        rendering.height = 4;
+        rendering.layers = 1;
+        ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, encoder, &rendering), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiCommandEncoderEndRendering(device, encoder), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
+    };
+    framebufferTextures.clear();
+    generatedFramebuffers.clear();
+    deletedFramebuffers.clear();
+
+    render(firstView.handle);
+    render(secondView.handle);
+    render(firstView.handle);
+    ASSERT_EQ(generatedFramebuffers.size(), 2U);
+    EXPECT_EQ(framebufferTextures.size(), 2U) << "each attachment set is attached once";
+
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, firstView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(device, first.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(deletedFramebuffers, (std::vector<GlUint>{generatedFramebuffers[0]}));
+    render(secondView.handle);
+    EXPECT_EQ(generatedFramebuffers.size(), 2U);
+
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, secondView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(device, second.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(deletedFramebuffers, generatedFramebuffers);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
 // Submits the finished `encoder`, waits for it and reads its timers into `spans`.
