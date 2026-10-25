@@ -3,11 +3,15 @@
 
 #include "VernonRHI.h"
 #include "opengl_driver.h"
+#include "rhi_test_hooks.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -68,7 +72,17 @@ struct AttachmentFramebuffer {
 enum class DepthStencilAspect { Depth, Stencil };
 
 struct VERNON_RHI_CAPI DeviceState {
-    bool initialize(const VernonOpenGLContextCallbacks &callbacks, bool embeddedProfile, std::string &error);
+    DeviceState() = default;
+    // Removes the debug callback of a device destroyed without shutdown.
+    ~DeviceState();
+    DeviceState(const DeviceState &) = delete;
+    DeviceState &operator=(const DeviceState &) = delete;
+
+    // `flags` are the device's effective VernonRhiDeviceFlagBits.
+    bool initialize(const VernonOpenGLContextCallbacks &callbacks, bool embeddedProfile, uint32_t flags,
+                    std::string &error);
+    // Removes the debug callback and deletes pooled queries; the context must be current.
+    void shutdown();
     bool makeCurrent() const noexcept;
     bool supportsCompute() const;
     bool apiVersionAtLeast(uint32_t major, uint32_t minor) const;
@@ -121,8 +135,30 @@ struct VERNON_RHI_CAPI DeviceState {
     void popDebugGroups();
     void insertDebugMarker(std::string_view label);
 
+    // Reads and clears the context's error flag. On a threaded driver every read waits until the driver thread has
+    // run the calls queued before it, so only validation mode and synchronous operations read it per operation.
+    Enum readError();
+    // Outside validation mode, a synchronous operation checks its own errors between these calls. Earlier errors stay
+    // queued for takeErrors; endSynchronous returns the operation's first error and drops its errors from the queue,
+    // since the operation reports them itself.
+    void beginSynchronous();
+    Enum endSynchronous();
+    // Takes the errors raised on the context since the last call. Call when a completion is checked after its fence
+    // signalled.
+    std::optional<std::string> takeErrors();
+
+    // Timer queries are pooled: released queries are reused instead of deleted. releaseQueries pools all of them or,
+    // when it throws, none.
+    Uint acquireQuery();
+    void releaseQueries(const std::vector<Uint> &queries);
+
     VernonOpenGLContextCallbacks callbacks{};
     bool embeddedProfile{};
+    // VERNON_RHI_DEVICE_VALIDATION: error scopes around every operation.
+    bool validation{};
+    // GL_GPU_DISJOINT_EXT can be read; without it, timers cannot tell that a disjoint event invalidated them.
+    bool disjointQueryable{};
+    OpenGLCallStats stats;
     std::vector<std::string> extensions;
     // A complete framebuffer per attachment set that a rendering scope used. Deleting a texture destroys the
     // framebuffers attaching it: GL may reuse its name, and a framebuffer that is not bound keeps it alive.
@@ -139,10 +175,27 @@ private:
     Uint depthStencilCopyProgram(Enum target, DepthStencilAspect aspect, std::string &error);
     Size debugLabelLength(std::string_view label) const;
 
+    // Errors not yet reported by a completion. The debug callback may add to it on any thread. The first message is
+    // kept with the number of errors.
+    struct ErrorQueue {
+        std::mutex mutex;
+        std::string first;
+        size_t count{};
+        void push(std::string message);
+    };
+    // Clears the context's error flag, queueing what it held unless the debug callback already received it.
+    void deferErrors();
+    void removeDebugOutput();
+
     Int maxDebugMessageLength{};
     Int maxDebugGroupDepth{};
     // One entry per open group, telling whether its push reached the context.
     std::vector<bool> debugGroupsPushed;
+    std::unique_ptr<ErrorQueue> errors = std::make_unique<ErrorQueue>();
+    bool debugOutput{};
+    // The queued error count when the running synchronous operation began.
+    size_t synchronousMark{};
+    std::vector<Uint> freeQueries;
 };
 
 } // namespace vernon::rhi::opengl

@@ -214,6 +214,7 @@ void DeviceState::shutdown() {
     uploadStaging.clear(destroyStagingChunk);
     readbackStaging.clear(destroyStagingChunk);
     persistentBlocks.clear(destroyStagingChunk);
+    updatableBlocks.clear(destroyStagingChunk);
     availableFrames.clear();
     inFlightFrames.clear();
     recording = false;
@@ -537,6 +538,22 @@ bool DeviceState::placePersistent(size_t size, size_t alignment, ID3D12Resource 
 }
 
 void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
+
+bool DeviceState::placeUpdatable(size_t size, size_t alignment, ID3D12Resource *&resource, size_t &offset,
+                                 uint64_t &key, std::string &error) {
+    StagingChunk *chunk =
+        updatableBlocks.acquire(size, alignment, offset, key, [&](size_t capacity, StagingChunk &created) {
+            created.capacity = capacity;
+            return createBuffer(created.buffer, capacity, false, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                error);
+        });
+    if (!chunk)
+        return false;
+    resource = chunk->buffer.resource;
+    return true;
+}
+
+void DeviceState::releaseUpdatable(uint64_t key) { updatableBlocks.release(key); }
 
 bool DeviceState::createStagingChunk(bool upload, size_t capacity, StagingChunk &chunk, std::string &error) {
     chunk.capacity = capacity;

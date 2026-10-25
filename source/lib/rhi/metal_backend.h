@@ -93,6 +93,11 @@ struct VERNON_RHI_CAPI DeviceState {
     bool reservePersistent(size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset, uint64_t &key,
                            std::string &error);
     void releasePersistent(uint64_t key);
+    // Reserves `size` bytes of private memory at `offset` in `buffer`, a multiple of `alignment`, which only blits
+    // write; held until `releaseUpdatable(key)`.
+    bool reserveUpdatable(size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset, uint64_t &key,
+                          std::string &error);
+    void releaseUpdatable(uint64_t key);
 
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -114,6 +119,7 @@ private:
     // Keyed by the recording's command buffer; recordings of a device are open concurrently.
     std::unordered_map<uint64_t, StagingArena<TransientChunk>> recordingTransients;
     BlockPool<TransientChunk> persistentBlocks;
+    BlockPool<TransientChunk> updatableBlocks;
 };
 
 } // namespace vernon::rhi::metal

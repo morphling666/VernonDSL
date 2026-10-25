@@ -290,7 +290,12 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return encodeResolvedStage(*acquired.value(), &pipeline, &invocation, owners.empty() ? nullptr : owners.data());
+    const VernonStatus status =
+        encodeResolvedStage(*acquired.value(), &pipeline, &invocation, owners.empty() ? nullptr : owners.data());
+    if (status != VERNON_STATUS_OK)
+        return status;
+    auto flushed = acquired.value()->flush();
+    return flushed.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(flushed).error());
 }
 
 VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,

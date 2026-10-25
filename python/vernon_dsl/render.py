@@ -525,12 +525,8 @@ class DrawCommand:
             not isinstance(self.vertex_count, int) or isinstance(self.vertex_count, bool) or self.vertex_count <= 0
         ):
             raise ValueError("vertex_count must be a positive integer")
-        if (
-            not isinstance(self.instance_count, int)
-            or isinstance(self.instance_count, bool)
-            or self.instance_count <= 0
-        ):
-            raise ValueError("instance_count must be a positive integer")
+        if not isinstance(self.instance_count, int) or isinstance(self.instance_count, bool) or self.instance_count < 0:
+            raise ValueError("instance_count must be a non-negative integer; a draw of no instances draws nothing")
         if self.index_buffer is not None and self.vertex_count is not None:
             raise ValueError("indexed draw cannot also specify vertex_count")
 

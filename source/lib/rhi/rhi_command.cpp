@@ -6,6 +6,7 @@
 #include "rhi_deferred_action.h"
 #include "rhi_internal.h"
 #include "rhi_pending_write.h"
+#include "rhi_test_hooks.h"
 
 #include <algorithm>
 #include <array>
@@ -72,6 +73,7 @@ struct EncoderSlot {
     VernonRhiBackend backend{VERNON_RHI_BACKEND_CUDA};
     uint64_t native{};
     VernonRhiCommandEncoderStats stats{};
+    vernon::rhi::EncoderCallStats calls{};
     // The rendering scope of `BeginRendering`; clears recorded before the native scope opens become its loads.
     vernon::rhi::RenderingScope scope;
     std::vector<vernon::rhi::RenderingRead> renderingReads;
@@ -155,7 +157,8 @@ namespace vernon::rhi {
 
 class CommandDeviceStateControl final : public CheckedIntrusiveControl<CommandDeviceStateControl> {
 public:
-    explicit CommandDeviceStateControl(OwnerRef value) noexcept : owner(std::move(value)) {}
+    CommandDeviceStateControl(OwnerRef value, uint32_t deviceFlags) noexcept
+        : owner(std::move(value)), flags(effectiveDeviceFlags(deviceFlags)) {}
     ~CommandDeviceStateControl() noexcept {
         if (owner.childCount() || activeEncoderCount || inFlightSubmissionCount || liveCompletionCount ||
             admittedUploadBytes)
@@ -169,6 +172,8 @@ public:
     }
 
     OwnerRef owner;
+    // VernonRhiDeviceFlagBits of the device, fixed at creation.
+    const uint32_t flags;
     std::mutex encoderCreationMutex;
     std::mutex completionCreationMutex;
     std::mutex quotaMutex;
@@ -239,8 +244,8 @@ Result<ChildLease, RhiError> CommandDeviceStateRef::retainDeviceLease() const no
     return Result<ChildLease, RhiError>{ok(std::move(committed).value())};
 }
 
-Result<CommandDeviceStateRef, RhiError> createCommandDeviceState(OwnerRef owner) noexcept {
-    auto *control = new (std::nothrow) CommandDeviceStateControl(std::move(owner));
+Result<CommandDeviceStateRef, RhiError> createCommandDeviceState(OwnerRef owner, uint32_t flags) noexcept {
+    auto *control = new (std::nothrow) CommandDeviceStateControl(std::move(owner), flags);
     if (!control)
         return Result<CommandDeviceStateRef, RhiError>{
             err(RhiError{RhiErrorCode::ResourceExhausted, {"allocate_command_state", 0, 0}})};
@@ -296,6 +301,14 @@ void forgetUndefinedImage(VernonRhiDevice device, uint64_t imageKey) noexcept {
         return;
     auto stateRef = std::move(retained).value();
     commandDeviceState(stateRef).defineImage(imageKey);
+}
+
+Result<bool, RhiError> deviceEmitsLabels(VernonRhiDevice device) noexcept {
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return Result<bool, RhiError>{err(std::move(retained).error())};
+    auto stateRef = std::move(retained).value();
+    return Result<bool, RhiError>{ok((commandDeviceState(stateRef).flags & VERNON_RHI_DEVICE_LABELS) != 0)};
 }
 
 bool imageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept {
@@ -1693,6 +1706,56 @@ static bool debugCommandUsable(const EncoderSlot &slot, vernon::rhi::DebugComman
     return command != vernon::rhi::DebugCommand::PopGroup || slot.debugGroupDepth > floor;
 }
 
+static void trackDebugGroupDepth(EncoderSlot &slot, vernon::rhi::DebugCommand command) {
+    if (command == vernon::rhi::DebugCommand::PushGroup)
+        ++slot.debugGroupDepth;
+    else if (command == vernon::rhi::DebugCommand::PopGroup)
+        --slot.debugGroupDepth;
+}
+
+static vernon::Result<void, vernon::RhiError> recordKeyDebugCommand(VernonRhiDevice device, uint64_t key,
+                                                                    vernon::rhi::DebugCommand command,
+                                                                    std::string_view label) noexcept {
+    using vernon::err;
+    using vernon::ok;
+    using vernon::RhiError;
+    using vernon::RhiErrorCode;
+    using Result = vernon::Result<void, RhiError>;
+    auto slot = lookupKey(device, key);
+    if (!slot)
+        return Result{err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command", key, 0}})};
+    bool openScope = false;
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        ++slot->calls.debugCommands;
+        if (!debugCommandUsable(*slot.slot, command))
+            return Result{err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command", key, 0}})};
+        if (!(slot->commandState->flags & VERNON_RHI_DEVICE_LABELS)) {
+            trackDebugGroupDepth(*slot.slot, command);
+            return Result{ok()};
+        }
+        openScope = slot->rendering && !slot->opened.kind;
+    }
+    // A command inside a rendering scope belongs to its native scope, which therefore opens first, as for a draw;
+    // otherwise Metal would push on the command buffer and pop on the render encoder.
+    if (openScope) {
+        auto opened = openSlotRendering(device, key, *slot.slot);
+        if (opened.isErr())
+            return Result{err(opened.error())};
+    }
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!debugCommandUsable(*slot.slot, command) || (slot->rendering && !slot->opened.kind))
+        return Result{err(RhiError{RhiErrorCode::InvalidArgument, {"record_debug_command", key, 0}})};
+    auto recorded = vernon::rhi::recordDebugCommand(device, slot->native, slot->rendering ? &slot->opened : nullptr,
+                                                    command, label);
+    if (recorded.isErr()) {
+        slot->failed = true;
+        return recorded;
+    }
+    trackDebugGroupDepth(*slot.slot, command);
+    return Result{ok()};
+}
+
 static VernonRhiStatus recordDebugCommandBusiness(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
                                                   vernon::rhi::DebugCommand command, VernonStringView label) {
     if (label.size && !label.data)
@@ -1700,40 +1763,10 @@ static VernonRhiStatus recordDebugCommandBusiness(VernonRhiDevice device, Vernon
     auto key = vernon::rhi::commandEncoderKey(device, encoder);
     if (key.isErr())
         return vernon::toVernonRhiStatus(key.error());
-    auto slot = lookupKey(device, key.value());
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    bool openScope = false;
-    {
-        std::lock_guard<std::mutex> guard(slot->mutex);
-        if (!debugCommandUsable(*slot.slot, command))
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        openScope = slot->rendering && !slot->opened.kind;
-    }
-    // A command inside a rendering scope belongs to its native scope, which therefore opens first, as for a draw;
-    // otherwise Metal would push on the command buffer and pop on the render encoder.
-    if (openScope) {
-        auto opened = openSlotRendering(device, key.value(), *slot.slot);
-        if (opened.isErr())
-            return vernon::toVernonRhiStatus(opened.error());
-    }
-    std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!debugCommandUsable(*slot.slot, command) || (slot->rendering && !slot->opened.kind))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto recorded =
-        vernon::rhi::recordDebugCommand(device, slot->native, slot->rendering ? &slot->opened : nullptr, command,
-                                        std::string_view(label.size ? label.data : "", label.size));
-    if (recorded.isErr()) {
-        slot->failed = true;
-        return vernon::toVernonRhiStatus(recorded.error());
-    }
-    if (command == vernon::rhi::DebugCommand::PushGroup)
-        ++slot->debugGroupDepth;
-    else if (command == vernon::rhi::DebugCommand::PopGroup)
-        --slot->debugGroupDepth;
-    return VERNON_RHI_STATUS_OK;
+        recordKeyDebugCommand(device, key.value(), command, std::string_view(label.size ? label.data : "", label.size));
+    return recorded.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(recorded.error());
 }
-
 static VernonRhiStatus vernonRhiCommandEncoderPushDebugGroupBusiness(VernonRhiDevice device,
                                                                      VernonRhiCommandEncoder encoder,
                                                                      VernonStringView label) {
@@ -2202,6 +2235,29 @@ vernon::rhi::reserveCommandTransient(VernonRhiDevice device, uint64_t key, uint6
         [&](uint64_t native) { return reserveRecordingTransient(device, key, native, size, alignment); });
 }
 
+vernon::Result<void, vernon::RhiError> vernon::rhi::writeUpdatableBlock(VernonRhiDevice device, uint64_t key,
+                                                                        const PersistentBlock &block, const void *data,
+                                                                        uint64_t size) noexcept {
+    auto slot = lookupKey(device, key);
+    if (!slot || !data || !size)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"write_updatable_block", key, 0}})};
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->finished || slot->failed || slot->rendering)
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::LifecycleFailure, {"write_updatable_block", key, 0}})};
+        slot->busy = true;
+        native = slot->native;
+    }
+    Result<void, RhiError> written = writeRecordingUpdatable(device, key, native, block, data, size);
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    slot->busy = false;
+    if (written.isErr())
+        slot->failed = true;
+    return written;
+}
+
 vernon::Result<bool, vernon::RhiError> vernon::rhi::commandEncoderRendering(VernonRhiDevice device,
                                                                             uint64_t key) noexcept {
     auto slot = lookupKey(device, key);
@@ -2223,38 +2279,44 @@ vernon::rhi::openCommandRendering(VernonRhiDevice device, uint64_t key) noexcept
             err(RhiError{RhiErrorCode::InvalidArgument, {"open_command_rendering", key, 0}})};
     return openSlotRendering(device, key, *slot.slot);
 }
-vernon::Result<void, vernon::RhiError> vernon::rhi::recordProviderCommand(VernonRhiDevice device, uint64_t key,
-                                                                          bool draw) noexcept {
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordProviderCommands(VernonRhiDevice device, uint64_t key,
+                                                                           uint32_t draws, uint32_t dispatches,
+                                                                           const CommandWrite *writes,
+                                                                           size_t writeCount) noexcept {
     auto slot = lookupKey(device, key);
+    if (!slot || (writeCount && !writes))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"record_provider_commands", key, 0}})};
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!slot->alive || slot->busy || slot->finished || slot->rendering)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"record_provider_commands", key, 0}})};
+    ++slot->calls.providerRecords;
+    slot->stats.draw_count += draws;
+    slot->stats.dispatch_count += dispatches;
+    for (size_t index = 0; index < writeCount; ++index)
+        recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites, writes[index].kind,
+                           writes[index].key);
+    return Result<void, RhiError>{ok()};
+}
+
+vernon::rhi::EncoderCallStats vernon::rhi::getEncoderCallStats(VernonRhiDevice device,
+                                                               VernonRhiCommandEncoder encoder) {
+    auto key = commandEncoderKey(device, encoder);
+    if (key.isErr())
+        return {};
+    auto slot = lookupKey(device, key.value());
     if (!slot)
-        return Result<void, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"record_provider_command", key, uint32_t(draw)}})};
+        return {};
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || slot->finished || (draw != slot->rendering))
-        return Result<void, RhiError>{
-            err(RhiError{RhiErrorCode::LifecycleFailure, {"record_provider_command", key, uint32_t(draw)}})};
-    if (draw)
-        ++slot->stats.draw_count;
-    else
-        ++slot->stats.dispatch_count;
-    return Result<void, RhiError>{ok()};
+    return slot->calls;
 }
 
-vernon::Result<void, vernon::RhiError> vernon::rhi::recordCommandWriteResource(VernonRhiDevice device, uint64_t key,
-                                                                               ResourceKind kind,
-                                                                               uint64_t resourceKey) noexcept {
-    auto slot = lookupKey(device, key);
-    if (!slot || !resourceKey)
-        return Result<void, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"record_command_write", resourceKey, uint32_t(kind)}})};
-    std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || slot->finished)
-        return Result<void, RhiError>{
-            err(RhiError{RhiErrorCode::LifecycleFailure, {"record_command_write", resourceKey, uint32_t(kind)}})};
-    recordPendingWrite(slot->pendingWriteResources, slot->unknownPendingWrites, kind, resourceKey);
-    return Result<void, RhiError>{ok()};
+vernon::Result<void, vernon::RhiError> vernon::rhi::recordEncoderDebugCommand(VernonRhiDevice device, uint64_t key,
+                                                                              DebugCommand command,
+                                                                              std::string_view label) noexcept {
+    return recordKeyDebugCommand(device, key, command, label);
 }
-
 static vernon::Result<void, vernon::RhiError> retainCommandResourceImpl(VernonRhiDevice device, uint64_t key,
                                                                         vernon::rhi::ResourceKind kind,
                                                                         uint64_t resourceKey,

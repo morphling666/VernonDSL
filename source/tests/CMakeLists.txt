@@ -132,6 +132,7 @@ if(TARGET VernonRuntime)
 
     add_executable(VernonRuntimeCoreProviderTests runtime/runtime_foreign_provider_test.cpp)
     target_link_libraries(VernonRuntimeCoreProviderTests PRIVATE GTest::gtest_main Vernon::RuntimeCore)
+    target_include_directories(VernonRuntimeCoreProviderTests PRIVATE "${VERNON_TEST_ROOT}/support")
     add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
     vernon_discover_gtests(VernonRuntimeCoreProviderTests)
 

@@ -120,6 +120,10 @@ constexpr Enum kDebugSeverityNotification = 0x826B;
 constexpr Enum kMaxDebugGroupStackDepth = 0x826C;
 constexpr Enum kDebugGroupStackDepth = 0x826D;
 constexpr Enum kMaxDebugMessageLength = 0x9143;
+constexpr Enum kDebugOutput = 0x92E0;
+constexpr Enum kDebugOutputSynchronous = 0x8242;
+constexpr Enum kDebugTypeError = 0x824C;
+constexpr Enum kDontCare = 0x1100;
 constexpr Enum kTimestamp = 0x8E28;
 constexpr Enum kQueryResult = 0x8866;
 constexpr Enum kGpuDisjoint = 0x8FBB;
@@ -129,6 +133,9 @@ constexpr Enum kGpuDisjoint = 0x8FBB;
 #else
 #define VERNON_GL_CALL
 #endif
+
+using DebugCallback = void(VERNON_GL_CALL *)(Enum source, Enum type, Uint id, Enum severity, Size length,
+                                             const char *message, const void *user);
 
 struct Driver {
     Enum(VERNON_GL_CALL *getError)() {};
@@ -263,6 +270,9 @@ struct Driver {
     void(VERNON_GL_CALL *pushDebugGroup)(Enum, Uint, Size, const char *){};
     void(VERNON_GL_CALL *popDebugGroup)(){};
     void(VERNON_GL_CALL *debugMessageInsert)(Enum, Enum, Uint, Enum, Size, const char *){};
+    // Null unless loadDebugLabelDriver also found both.
+    void(VERNON_GL_CALL *debugMessageCallback)(DebugCallback, const void *){};
+    void(VERNON_GL_CALL *debugMessageControl)(Enum, Enum, Enum, Size, const Uint *, Boolean){};
     // Null unless loadTimerQueryDriver found all four.
     void(VERNON_GL_CALL *genQueries)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteQueries)(Size, const Uint *){};

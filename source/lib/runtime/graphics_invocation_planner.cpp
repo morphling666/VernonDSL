@@ -385,15 +385,17 @@ bool planGraphicsArgument(const StageBindingPlan &stagePlan, const GraphicsDrawL
     return true;
 }
 
-bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgument *const *arguments,
-                      const PlannedRenderTargets &targets, const VernonRenderPass &renderPass,
-                      const VernonDynamicState *dynamicState, const VernonDrawCommand &draw, PlannedGraphicsDraw &plan,
-                      std::string &error) {
-    plan = {};
-    if (draw.struct_size < sizeof(VernonDrawCommand))
-        return fail(error, "DrawCommand control is missing or incomplete");
-    if (dynamicState && dynamicState->struct_size < sizeof(VernonDynamicState))
-        return fail(error, "DynamicState control metadata is incomplete");
+GraphicsVertexRecords graphicsVertexRecords(const GraphicsDrawLayout &layout,
+                                            const VernonProgramArgument *const *arguments) {
+    GraphicsVertexRecords records;
+    records.reserve(layout.vertexInputs.size());
+    for (const GraphicsDrawLayout::VertexInput &input : layout.vertexInputs)
+        records.emplace_back(static_cast<uint32_t>(arguments[input.parameter]->tensor.shape[0]), input.divisor);
+    return records;
+}
+
+bool checkGraphicsSharedDescriptors(const GraphicsDrawLayout &layout, const VernonProgramArgument *const *arguments,
+                                    std::string &error) {
     for (const auto &[first, second] : layout.sharedDescriptors) {
         const VernonProgramArgument &left = *arguments[first];
         const VernonProgramArgument &right = *arguments[second];
@@ -402,6 +404,26 @@ bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgum
             (image ? right.image.view.resource.value : right.resource.resource.value))
             return fail(error, image ? "sampled image binding is ambiguous" : "sampler pairing is ambiguous");
     }
+    return true;
+}
+
+bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgument *const *arguments,
+                      const PlannedRenderTargets &targets, const VernonRenderPass &renderPass,
+                      const VernonDynamicState *dynamicState, const VernonDrawCommand &draw, PlannedGraphicsDraw &plan,
+                      std::string &error) {
+    return checkGraphicsSharedDescriptors(layout, arguments, error) &&
+           planGraphicsDrawValues(graphicsVertexRecords(layout, arguments), targets, renderPass, dynamicState, draw,
+                                  plan, error);
+}
+
+bool planGraphicsDrawValues(const GraphicsVertexRecords &records, const PlannedRenderTargets &targets,
+                            const VernonRenderPass &renderPass, const VernonDynamicState *dynamicState,
+                            const VernonDrawCommand &draw, PlannedGraphicsDraw &plan, std::string &error) {
+    plan = {};
+    if (draw.struct_size < sizeof(VernonDrawCommand))
+        return fail(error, "DrawCommand control is missing or incomplete");
+    if (dynamicState && dynamicState->struct_size < sizeof(VernonDynamicState))
+        return fail(error, "DynamicState control metadata is incomplete");
     const uint32_t *dynamicViewport = dynamicState ? dynamicState->viewport : nullptr;
     const uint32_t *dynamicScissor = dynamicState ? dynamicState->scissor : nullptr;
     const bool hasViewport = dynamicViewport && dynamicViewport[2] && dynamicViewport[3];
@@ -420,25 +442,21 @@ bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgum
     plan.vertexCount = draw.vertex_count;
     plan.instanceCount = draw.instance_count;
     plan.firstInstance = draw.first_instance;
-    for (const GraphicsDrawLayout::VertexInput &input : layout.vertexInputs) {
-        const uint32_t leading = static_cast<uint32_t>(arguments[input.parameter]->tensor.shape[0]);
-        const bool instanced = input.divisor != 0;
-        uint32_t &inferred = instanced ? plan.instanceCount : plan.vertexCount;
-        const uint32_t divisor = instanced ? input.divisor : 1u;
-        const uint64_t base = instanced ? plan.firstInstance : 0;
-        if (inferred) {
-            const uint64_t requiredRecords = (base + inferred - 1) / divisor + 1;
-            if (base ? requiredRecords > leading : requiredRecords != leading)
+    for (const auto &[leading, divisor] : records) {
+        if (!divisor) {
+            if (!plan.vertexCount)
+                plan.vertexCount = leading;
+            else if (plan.vertexCount != leading)
                 return fail(error, "graphics Tensor leading dimensions conflict");
-        } else {
-            const uint64_t records = static_cast<uint64_t>(leading) * divisor;
-            if (records < base || records - base > std::numeric_limits<uint32_t>::max())
-                return fail(error, "graphics inferred draw count is out of range");
-            inferred = static_cast<uint32_t>(records - base);
+            continue;
         }
+        // A draw of no instances reads no instance records.
+        if (!plan.instanceCount)
+            continue;
+        const uint64_t requiredRecords = (uint64_t{plan.firstInstance} + plan.instanceCount - 1) / divisor + 1;
+        if (plan.firstInstance ? requiredRecords > leading : requiredRecords != leading)
+            return fail(error, "graphics Tensor leading dimensions conflict");
     }
-    if (!plan.instanceCount)
-        plan.instanceCount = 1;
     if (!plan.vertexCount && !draw.index_binding)
         return fail(error, "graphics draw counts cannot be inferred");
     if (draw.index_binding) {
@@ -449,39 +467,6 @@ bool planGraphicsDraw(const GraphicsDrawLayout &layout, const VernonProgramArgum
         plan.indexBinding = &index;
     }
     return true;
-}
-
-bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const GraphicsDrawLayout &layout,
-                            const VernonStageInvocationDescriptor &source, DescribeImageResource describeImage,
-                            void *describeImageUserData, PlannedGraphicsInvocation &plan, std::string &error) {
-    plan = {};
-    if (source.argument_count != stagePlan.parameters.size())
-        return fail(error, "pipeline argument count does not match layout");
-    plan.arguments.assign(stagePlan.parameters.size(), nullptr);
-    plan.planned.resize(stagePlan.parameters.size());
-    for (size_t index = 0; index < source.argument_count; ++index) {
-        const VernonProgramArgument &argument = source.arguments[index];
-        const auto parameter =
-            std::find_if(stagePlan.parameters.begin(), stagePlan.parameters.end(),
-                         [&](const Parameter &candidate) { return candidate.slot == argument.slot; });
-        if (parameter == stagePlan.parameters.end())
-            return fail(error, "pipeline argument count does not match layout");
-        const VernonProgramArgument *&bound = plan.arguments[parameter - stagePlan.parameters.begin()];
-        if (bound)
-            return fail(error, "duplicate pipeline argument slot");
-        bound = &argument;
-    }
-    for (uint32_t index = 0; index < stagePlan.parameters.size(); ++index)
-        if (!planGraphicsArgument(stagePlan, layout, index, *plan.arguments[index], describeImage,
-                                  describeImageUserData, plan.planned[index], error))
-            return false;
-    if (!source.graphics_state || source.graphics_state->struct_size < sizeof(VernonGraphicsState))
-        return fail(error, "graphics pipeline state is missing or incomplete");
-    if (!source.draw_command)
-        return fail(error, "DrawCommand control is missing or incomplete");
-    return planRenderTargets(source.render_pass, describeImage, describeImageUserData, plan.targets, error) &&
-           planGraphicsDraw(layout, plan.arguments.data(), plan.targets, *source.render_pass, source.dynamic_state,
-                            *source.draw_command, plan.draw, error);
 }
 
 } // namespace vernon::runtime

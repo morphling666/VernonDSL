@@ -212,19 +212,6 @@ RhiAdapterResult<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiA
         vernon::ProviderErrorCode::InvalidArgument, {"rhi_adapter_resource_kind", resource.resource.value, 0}})};
 }
 
-RhiAdapterResult<uint64_t> resolveCommandRhiResource(VernonRuntimeRhiAdapter &adapter,
-                                                     VernonRuntimeProviderObject encoder,
-                                                     VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kind = resourceKind(adapter, resource);
-    if (!kind)
-        return RhiAdapterResult<uint64_t>{vernon::err(std::move(kind).error())};
-    auto resolved = vernon::rhi::resolveCommandResource(adapter.rhiDevice, encoder.value, std::move(kind).value(),
-                                                        resource.resource.value);
-    if (!resolved)
-        return RhiAdapterResult<uint64_t>{vernon::err(providerError(std::move(resolved).error()))};
-    return RhiAdapterResult<uint64_t>{vernon::ok(std::move(resolved).value())};
-}
-
 RhiAdapterResult<void> describeProviderImage(VernonRuntimeRhiAdapter &adapter,
                                              VernonRuntimeProviderResourceReference resource,
                                              VernonRuntimeProviderImageDescription &description) noexcept {
@@ -438,38 +425,6 @@ RhiAdapterResult<void> endEncoderRendering(VernonRuntimeRhiAdapter &adapter,
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                             bool draw) noexcept {
-    auto recorded = vernon::rhi::recordProviderCommand(adapter.rhiDevice, encoder.value, draw);
-    if (!recorded)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                                  VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kind = resourceKind(adapter, resource);
-    if (!kind)
-        return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
-    auto recorded = vernon::rhi::recordCommandWriteResource(adapter.rhiDevice, encoder.value, std::move(kind).value(),
-                                                            resource.resource.value);
-    if (!recorded)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                             VernonRuntimeProviderResourceReference resource) noexcept {
-    auto kind = resourceKind(adapter, resource);
-    if (!kind)
-        return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
-    auto retained = vernon::rhi::retainCommandResource(adapter.rhiDevice, encoder.value, std::move(kind).value(),
-                                                       resource.resource.value);
-    if (!retained)
-        return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
 RhiAdapterResult<vernon::rhi::CommandTransient> writeCommandTransient(VernonRuntimeRhiAdapter &adapter,
                                                                       VernonRuntimeProviderObject encoder,
                                                                       const void *data, uint64_t size,
@@ -493,8 +448,33 @@ RhiAdapterResult<vernon::rhi::PersistentBlock> placePersistent(VernonRuntimeRhiA
     auto placed = vernon::rhi::placePersistentBlock(adapter.rhiDevice, data, size, alignment);
     if (!placed)
         return Placed{vernon::err(providerError(std::move(placed).error()))};
-    group.blocks.emplace_back(adapter.rhiDevice, placed.value().key);
+    group.blocks.emplace_back(adapter.rhiDevice, placed.value().key, false);
     return Placed{vernon::ok(placed.value())};
+}
+
+RhiAdapterResult<vernon::rhi::PersistentBlock> placeUpdatable(VernonRuntimeRhiAdapter &adapter, RhiGroup &group,
+                                                              uint64_t size, uint64_t alignment) noexcept {
+    using Placed = RhiAdapterResult<vernon::rhi::PersistentBlock>;
+    try {
+        group.blocks.reserve(group.blocks.size() + 1);
+    } catch (const std::bad_alloc &) {
+        return Placed{vernon::err(
+            providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "updatable_block_lease", size).error())};
+    }
+    auto placed = vernon::rhi::placeUpdatableBlock(adapter.rhiDevice, size, alignment);
+    if (!placed)
+        return Placed{vernon::err(providerError(std::move(placed).error()))};
+    group.blocks.emplace_back(adapter.rhiDevice, placed.value().key, true);
+    return Placed{vernon::ok(placed.value())};
+}
+
+RhiAdapterResult<void> writeUpdatable(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                      const vernon::rhi::PersistentBlock &block, const void *data,
+                                      uint64_t size) noexcept {
+    auto written = vernon::rhi::writeUpdatableBlock(adapter.rhiDevice, encoder.value, block, data, size);
+    if (!written)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(written).error()))};
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<vernon::rhi::CommandTransientReservation> reserveCommandTransient(VernonRuntimeRhiAdapter &adapter,
@@ -586,14 +566,6 @@ RhiAdapterResult<uint64_t> acquireGroupResource(VernonRuntimeRhiAdapter &adapter
     return Acquired{vernon::ok(resolved.value())};
 }
 
-RhiAdapterResult<void> recordGroupWrites(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                         const RhiGroup &group) noexcept {
-    for (const VernonRuntimeProviderResourceReference &resource : group.writes)
-        if (auto recorded = recordCommandWriteResource(adapter, encoder, resource); !recorded)
-            return recorded;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
 RhiAdapterResult<void> beginRhiCommands(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                         RhiCommands &commands) noexcept {
     auto native = nativeCommandEncoder(adapter, encoder);
@@ -607,6 +579,263 @@ RhiAdapterResult<void> beginRhiCommands(VernonRuntimeRhiAdapter &adapter, Vernon
     commands.encoder = encoder;
     commands.native = native.value();
     commands.rendering = false;
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiPacketBatch::~RhiPacketBatch() {
+    for (RhiRetainedObject *object : objects)
+        releaseRetainedObject(object);
+}
+
+namespace {
+
+enum class PacketObjectKind : uint8_t { Unused, Pipeline, Group };
+constexpr uint8_t kVertexBufferUse = 1;
+constexpr uint8_t kIndexBufferUse = 2;
+
+RhiAdapterResult<void> invalidPackets(uint64_t value = 0) noexcept {
+    return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "rhi_packet_batch_is_invalid", value);
+}
+
+// Checks the packet's operands against the descriptor and records which kind of object each object operand names.
+RhiAdapterResult<void> scanPacket(const VernonRuntimeProviderPacketBatchDescriptor &descriptor, uint32_t opcode,
+                                  const uint32_t *operands, uint32_t operandCount,
+                                  std::vector<PacketObjectKind> &objects, std::vector<uint8_t> &resources) {
+    const auto object = [&](uint32_t index, PacketObjectKind kind) {
+        if (index >= objects.size() || (objects[index] != PacketObjectKind::Unused && objects[index] != kind))
+            return false;
+        objects[index] = kind;
+        return true;
+    };
+    const auto resource = [&](uint32_t index, uint8_t use) {
+        if (index >= resources.size())
+            return false;
+        resources[index] |= use;
+        return true;
+    };
+    const auto vertexBuffer = [&](uint32_t index) { return resource(index, kVertexBufferUse); };
+    const auto payload = [&](uint32_t index, size_t words) {
+        return index <= descriptor.payload_word_count && words <= descriptor.payload_word_count - index;
+    };
+    constexpr size_t kDrawWords = sizeof(VernonRuntimeProviderDrawPayload) / sizeof(uint32_t);
+    bool valid = false;
+    switch (opcode) {
+    case VERNON_RUNTIME_PROVIDER_PACKET_BEGIN_RENDERING:
+        valid = operandCount == 2 && operands[0] < descriptor.rendering_count &&
+                payload(operands[1], descriptor.renderings[operands[0]].color_attachment_count * 4 + 2);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_END_RENDERING:
+    case VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP:
+        valid = operandCount == 0;
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_BIND_PIPELINE:
+        valid = operandCount == 1 && object(operands[0], PacketObjectKind::Pipeline);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_BIND_GROUP:
+        valid = operandCount == 2 && operands[0] < VERNON_RUNTIME_PROVIDER_MAX_GROUPS &&
+                object(operands[1], PacketObjectKind::Group);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_BIND_VERTEX_BUFFERS:
+        valid = operandCount >= 2 && operands[0] < VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS &&
+                operandCount - 1 <= VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS - operands[0] &&
+                std::all_of(operands + 1, operands + operandCount, vertexBuffer);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_DRAW:
+        valid = operandCount == 2 && payload(operands[1], kDrawWords);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED:
+        valid = operandCount == 3 && resource(operands[1], kIndexBufferUse) && payload(operands[2], kDrawWords);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH:
+        valid = operandCount == 1 && payload(operands[0], 3);
+        break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP:
+    case VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER:
+        valid = operandCount >= 1 && operands[0] <= (operandCount - 1) * sizeof(uint32_t);
+        break;
+    default:
+        break;
+    }
+    return valid ? RhiAdapterResult<void>{vernon::ok()} : invalidPackets(opcode);
+}
+
+bool isDebugPacket(uint32_t opcode) {
+    return opcode == VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP ||
+           opcode == VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP ||
+           opcode == VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER;
+}
+
+RhiAdapterResult<void> buildPacketBatch(VernonRuntimeRhiAdapter &adapter,
+                                        const VernonRuntimeProviderPacketBatchDescriptor &descriptor,
+                                        RhiPacketObjects resolve, RhiPacketBatch &batch) {
+    auto labels = vernon::rhi::deviceEmitsLabels(adapter.rhiDevice);
+    if (!labels)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(labels).error()))};
+    std::vector<PacketObjectKind> kinds(descriptor.object_count, PacketObjectKind::Unused);
+    std::vector<uint8_t> used(descriptor.resource_count, 0);
+    batch.payloadWords = descriptor.payload_word_count;
+    batch.packets.reserve(descriptor.packet_word_count);
+    for (size_t word = 0; word < descriptor.packet_word_count;) {
+        const uint32_t header = descriptor.packets[word];
+        const uint32_t opcode = header & 0xffffu;
+        const uint32_t count = header >> 16;
+        if (count == 0 || count > descriptor.packet_word_count - word)
+            return invalidPackets(word);
+        if (auto scanned = scanPacket(descriptor, opcode, descriptor.packets + word + 1, count - 1, kinds, used);
+            !scanned)
+            return scanned;
+        batch.draws +=
+            opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW || opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED;
+        batch.dispatches += opcode == VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH;
+        if (labels.value() || !isDebugPacket(opcode))
+            batch.packets.insert(batch.packets.end(), descriptor.packets + word, descriptor.packets + word + count);
+        word += count;
+    }
+    batch.objects.reserve(descriptor.object_count);
+    for (size_t index = 0; index < descriptor.object_count; ++index) {
+        RhiRetainedObject *object = nullptr;
+        if (kinds[index] == PacketObjectKind::Pipeline) {
+            object = resolve.pipeline(descriptor.objects[index]);
+        } else if (kinds[index] == PacketObjectKind::Group) {
+            RhiGroup *group = resolve.group(descriptor.objects[index]);
+            if (group)
+                for (const VernonRuntimeProviderResourceReference &write : group->writes) {
+                    auto kind = resourceKind(adapter, write);
+                    if (!kind)
+                        return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
+                    batch.writes.push_back({kind.value(), write.resource.value});
+                }
+            object = group;
+        }
+        if (kinds[index] != PacketObjectKind::Unused && !object)
+            return invalidPackets(index);
+        if (object)
+            object->references.fetch_add(1, std::memory_order_relaxed);
+        batch.objects.push_back(object);
+    }
+    std::sort(batch.writes.begin(), batch.writes.end(), [](const auto &left, const auto &right) {
+        return left.kind != right.kind ? left.kind < right.kind : left.key < right.key;
+    });
+    batch.writes.erase(std::unique(batch.writes.begin(), batch.writes.end(),
+                                   [](const auto &left, const auto &right) {
+                                       return left.kind == right.kind && left.key == right.key;
+                                   }),
+                       batch.writes.end());
+    batch.resources.assign(descriptor.resources, descriptor.resources + descriptor.resource_count);
+    batch.natives.assign(descriptor.resource_count, 0);
+    batch.leases.reserve(descriptor.resource_count);
+    for (size_t index = 0; index < descriptor.resource_count; ++index) {
+        const VernonRuntimeProviderResourceReference &resource = descriptor.resources[index];
+        if (!used[index] || (resource.identity & kRhiResourceKindMask) != kRhiBufferResource ||
+            ((used[index] & kVertexBufferUse) != 0 && resource.offset >= resource.size))
+            return invalidPackets(index);
+        auto kind = resourceKind(adapter, resource);
+        if (!kind)
+            return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
+        auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind.value(), resource.resource.value);
+        if (!retained)
+            return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
+        batch.leases.push_back(std::move(retained).value());
+        auto resolved =
+            vernon::rhi::resolveResource(adapter.rhiDevice, kind.value(), resource.resource.value, batch.leases.back());
+        if (!resolved)
+            return RhiAdapterResult<void>{vernon::err(providerError(std::move(resolved).error()))};
+        batch.natives[index] = resolved.value();
+    }
+    batch.renderings.resize(descriptor.rendering_count);
+    for (size_t index = 0; index < descriptor.rendering_count; ++index) {
+        const VernonRuntimeProviderRenderingDescriptor &source = descriptor.renderings[index];
+        RhiPacketBatch::Rendering &rendering = batch.renderings[index];
+        if (source.color_attachment_count > rendering.colors.size() ||
+            (source.color_attachment_count != 0 && !source.color_attachments) ||
+            (source.sampled_image_count != 0 && !source.sampled_images))
+            return invalidPackets(index);
+        rendering.descriptor = source;
+        std::copy_n(source.color_attachments, source.color_attachment_count, rendering.colors.begin());
+        if (source.depth_stencil_attachment)
+            rendering.depth = *source.depth_stencil_attachment;
+        rendering.sampledImages.assign(source.sampled_images, source.sampled_images + source.sampled_image_count);
+    }
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+} // namespace
+
+RhiAdapterResult<void> createRhiPacketBatch(VernonRuntimeRhiAdapter &adapter,
+                                            const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                                            RhiPacketObjects objects, VernonRuntimeProviderObject *output) noexcept {
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
+        (descriptor->packet_word_count != 0 && !descriptor->packets) ||
+        (descriptor->object_count != 0 && !descriptor->objects) ||
+        (descriptor->resource_count != 0 && !descriptor->resources) ||
+        (descriptor->rendering_count != 0 && !descriptor->renderings))
+        return invalidPackets();
+    try {
+        std::unique_ptr<RhiPacketBatch, void (*)(RhiRetainedObject *)> batch(new RhiPacketBatch(),
+                                                                             releaseRetainedObject);
+        if (auto built = buildPacketBatch(adapter, *descriptor, objects, *batch); !built)
+            return built;
+        *output = toHandle(batch.release());
+        return RhiAdapterResult<void>{vernon::ok()};
+    } catch (const std::bad_alloc &) {
+        return providerFailure(vernon::ProviderErrorCode::ResourceExhausted, "rhi_packet_batch_allocation");
+    }
+}
+
+void destroyRhiPacketBatch(void *, VernonRuntimeProviderObject batch) {
+    releaseRetainedObject(fromHandle<RhiPacketBatch>(batch));
+}
+
+VernonRuntimeProviderRenderingDescriptor
+packetRendering(const RhiPacketBatch::Rendering &rendering, const uint32_t *clears,
+                std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> &colors,
+                VernonRuntimeProviderDepthStencilAttachment &depth) noexcept {
+    VernonRuntimeProviderRenderingDescriptor descriptor = rendering.descriptor;
+    const size_t colorCount = descriptor.color_attachment_count;
+    for (size_t index = 0; index < colorCount; ++index) {
+        colors[index] = rendering.colors[index];
+        std::memcpy(colors[index].clear_color.u32, clears + index * 4, sizeof(colors[index].clear_color.u32));
+    }
+    descriptor.color_attachments = colors.data();
+    if (descriptor.depth_stencil_attachment) {
+        depth = rendering.depth;
+        std::memcpy(&depth.clear_depth, clears + colorCount * 4, sizeof(float));
+        depth.clear_stencil = clears[colorCount * 4 + 1];
+        descriptor.depth_stencil_attachment = &depth;
+    }
+    descriptor.sampled_images = rendering.sampledImages.data();
+    return descriptor;
+}
+
+RhiAdapterResult<void> recordPacketDebugCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                                uint32_t opcode, const uint32_t *operands) noexcept {
+    using vernon::rhi::DebugCommand;
+    const DebugCommand command = opcode == VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP ? DebugCommand::PushGroup
+                                 : opcode == VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP
+                                     ? DebugCommand::PopGroup
+                                     : DebugCommand::InsertMarker;
+    const std::string_view label =
+        command == DebugCommand::PopGroup
+            ? std::string_view{}
+            : std::string_view{reinterpret_cast<const char *>(operands + 1), static_cast<size_t>(operands[0])};
+    auto recorded = vernon::rhi::recordEncoderDebugCommand(adapter.rhiDevice, encoder.value, command, label);
+    if (!recorded)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> finishRhiPacketBatch(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                            const RhiPacketBatch &batch, bool drew, uint32_t lastStencilReference,
+                                            bool lastDrawIndexed) noexcept {
+    auto recorded = vernon::rhi::recordProviderCommands(adapter.rhiDevice, encoder.value, batch.draws, batch.dispatches,
+                                                        batch.writes.data(), batch.writes.size());
+    if (!recorded)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(recorded).error()))};
+    if (drew) {
+        adapter.lastStencilReference.store(lastStencilReference, std::memory_order_relaxed);
+        adapter.lastDrawIndexed.store(lastDrawIndexed, std::memory_order_relaxed);
+    }
+    adapter.dispatches.fetch_add(batch.draws + batch.dispatches, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 

@@ -8,6 +8,8 @@
 #include "runtime/compute_launch_planner.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/graphics_scope_materializer.h"
+#include "runtime/prepared_binding_plan.h"
+#include "runtime/prepared_graphics_draw.h"
 #include "runtime/program_execution/device_commands.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/materialized_node_frame.h"
@@ -26,6 +28,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -307,6 +310,8 @@ struct ManagedGraphicsDraw {
     // Identifies the draw inputs no parameter decides.
     const void *command{};
     PlannedGraphicsDraw draw;
+    // What planning a recorded draw's values reads of its arguments; null for a draw without a recording.
+    std::shared_ptr<const GraphicsVertexRecords> records;
 };
 
 // What one graphics Node adds to a batch; its draws count arguments from its own first argument.
@@ -318,6 +323,14 @@ struct ManagedGraphicsNode {
     GraphicsScopeReads reads;
     GraphicsBufferReads bufferReads;
     std::vector<std::shared_ptr<const void>> retained;
+    // The control that `targets` point into.
+    std::shared_ptr<const RuntimeProgramControl> renderPass;
+    // What the Node's key names; see GraphicsNodeKey.
+    std::vector<std::weak_ptr<const void>> identities;
+    // False when an input of the Node lives only as long as the invocation, so that its commands cannot be stored.
+    bool storable{true};
+    // The draw values of a recorded Node.
+    std::shared_ptr<const RecordedDrawPayload> payload;
 };
 
 struct ManagedGraphicsBatchMember {
@@ -326,9 +339,149 @@ struct ManagedGraphicsBatchMember {
     size_t drawEnd{};
     // Positions count from the member's first draw.
     std::vector<RecordedDebugCommand> debugCommands;
+    // The frame of the Node, and whether the Node is keyed, so that its groups belong to the stored scope.
+    const vernon::runtime::program_execution::MaterializedNodeFrame *frame{};
+    bool keyed{};
 };
 
-// Recorded draws point into the invocation's recordings, which the submission keeps until the batch is encoded.
+// What decides the commands of one graphics Node: Nodes with equal keys plan and encode equal commands. The pointers
+// name immutable inputs; a stored scope replays only while each is alive, since an input made after one died may take
+// its address.
+struct GraphicsNodeKey {
+    // The validated recording, or the draw and dynamic-state controls of a Node without one.
+    const void *pass{};
+    const void *draw{};
+    const void *dynamic{};
+    const void *renderPass{};
+    // The Node, its staged attachments and the arguments of its frame.
+    std::vector<uint64_t> words;
+
+    bool operator==(const GraphicsNodeKey &other) const {
+        return pass == other.pass && draw == other.draw && dynamic == other.dynamic && renderPass == other.renderPass &&
+               words == other.words;
+    }
+};
+
+constexpr uint32_t kFixedArgument = UINT32_MAX;
+
+// An updatable group of a stored scope, and what fills it again when the scope replays.
+struct StoredGroupSite {
+    VernonRuntimeCoreGroup *group{};
+    const PreparedGraphicsBindingPlan *plan{};
+    std::vector<uint32_t> slots;
+    std::array<float, 2> resolution{};
+    // The scope member whose frame supplies the arguments that `frameArguments` index.
+    size_t member{};
+    // Per Stage parameter: the index of its argument in the member's frame, or kFixedArgument for the argument in
+    // `arguments`, which a binding set lowered once and keeps while the scope can replay.
+    std::vector<uint32_t> frameArguments;
+    std::vector<const VernonProgramArgument *> arguments;
+    // The inline bytes of the group's values, as last written.
+    std::vector<uint8_t> bytes;
+};
+
+constexpr size_t kDrawPayloadWords = sizeof(VernonRuntimeProviderDrawPayload) / sizeof(uint32_t);
+
+// A recorded draw of a stored Node: what planning other values for it reads, and where its payload is in the batch's.
+struct StoredGraphicsDraw {
+    std::shared_ptr<const GraphicsVertexRecords> records;
+    VernonPrimitiveTopology topology{};
+    // Other values replay the draw only with an equal resolution, which the stored groups were filled for.
+    std::array<float, 2> resolution{};
+    size_t payloadWord{SIZE_MAX};
+};
+
+// What a stored Node shows the Nodes after it: what fusing decides on, and the buffers its draws read.
+struct StoredGraphicsMember {
+    // A copy of the Node's render pass without its leases, which `targets` point into.
+    std::shared_ptr<const RuntimeProgramControl> renderPass;
+    PlannedRenderTargets targets;
+    GraphicsScopeReads reads;
+    GraphicsBufferReads bufferReads;
+    // The draw values of a recorded Node as stored, and its draws.
+    std::shared_ptr<const RecordedDrawPayload> payload;
+    std::vector<StoredGraphicsDraw> draws;
+};
+
+} // namespace
+
+struct vernon::runtime::StoredGraphicsScope {
+    explicit StoredGraphicsScope(VernonRuntimeProviderGroupLifetime lifetime) : groups(lifetime) {}
+
+    std::vector<GraphicsNodeKey> keys;
+    std::vector<StoredGraphicsMember> members;
+    StoredPacketBatch batch;
+    std::vector<std::weak_ptr<const void>> identities;
+    // The groups of the arguments that no binding set owns: updatable when the provider writes updatable groups, else
+    // persistent, holding only arguments that a Program instance binding does not own.
+    GroupStore groups;
+    // The updatable groups of `groups`. A replay writes those whose bytes changed before it encodes `batch`, and
+    // `replays` keeps concurrent replays from interleaving their writes.
+    mutable std::vector<StoredGroupSite> sites;
+    mutable std::mutex replays;
+
+    bool alive() const {
+        return std::none_of(identities.begin(), identities.end(),
+                            [](const std::weak_ptr<const void> &identity) { return identity.expired(); });
+    }
+};
+
+namespace {
+
+// What planning a graphics Node reads, kept for a Node of a replayed scope until the scope either completes or has to
+// plan its Nodes after all.
+struct GraphicsMemberInputs {
+    const program::Node *node{};
+    const program::ResolvedNodePlan *resolved{};
+    RecordedGraphicsNode *recorded{};
+    std::shared_ptr<vernon::runtime::program_execution::MaterializedNodeFrame> frame;
+    std::vector<ArgumentOwner> owners;
+    // The bound control, and the control with the staged attachments the Node renders to.
+    std::shared_ptr<const RuntimeProgramControl> boundRenderPass;
+    std::shared_ptr<const RuntimeProgramControl> renderPass;
+    std::shared_ptr<const RuntimeProgramControl> draw;
+    std::shared_ptr<const RuntimeProgramControl> dynamic;
+    // Empty when the Node's commands cannot be stored.
+    std::optional<GraphicsNodeKey> key;
+    // The payload words, by position in the replayed batch's, of the draws whose values differ from the stored ones.
+    std::vector<std::pair<size_t, VernonRuntimeProviderDrawPayload>> payload;
+};
+
+// Whether the draw values of `member` replay `stored`: each draw whose values differ from the stored ones, planned
+// with them, keeps what the stored commands depend on, its payload then going to `payload`.
+bool replaysDrawValues(const StoredGraphicsMember &stored, const GraphicsMemberInputs &member,
+                       std::vector<std::pair<size_t, VernonRuntimeProviderDrawPayload>> &payload) {
+    payload.clear();
+    const RecordedDrawPayload *values = member.recorded ? member.recorded->payload.get() : nullptr;
+    if (!values || values == stored.payload.get())
+        return true;
+    if (values->draws.size() != stored.draws.size())
+        return false;
+    std::string error;
+    for (size_t index = 0; index < stored.draws.size(); ++index) {
+        if (values->draws[index] == stored.payload->draws[index] &&
+            sameDynamicState(values->dynamics[index]->dynamic, stored.payload->dynamics[index]->dynamic))
+            continue;
+        const StoredGraphicsDraw &draw = stored.draws[index];
+        PlannedGraphicsDraw planned;
+        VernonRuntimeCoreDrawInvocation invocation;
+        VernonRuntimeProviderDrawPayload words{};
+        if (draw.payloadWord == SIZE_MAX ||
+            !planGraphicsDrawValues(*draw.records, stored.targets, stored.renderPass->renderPass,
+                                    &values->dynamics[index]->dynamic, values->draws[index]->draw, planned, error) ||
+            planned.resolution != draw.resolution ||
+            !prepareGraphicsDrawInvocation(planned, draw.topology, invocation, error) ||
+            vernonRuntimeCoreDrawPayload(&invocation, &words) != VERNON_STATUS_OK) {
+            payload.clear();
+            return false;
+        }
+        payload.emplace_back(draw.payloadWord, words);
+    }
+    return true;
+}
+
+// The draws of one rendering scope, which either plans and encodes its members, storing them in `built`, or replays a
+// stored scope. Recorded draws point into validated recordings, which the submission keeps until the batch is encoded.
 struct ManagedGraphicsCommandBatch {
     VernonRuntimeContext *context{};
     // The plan's stream, which the plan retains with the batch.
@@ -343,6 +496,16 @@ struct ManagedGraphicsCommandBatch {
     // The distinct resolutions of the draws, which identify their command inputs.
     std::deque<std::array<float, 2>> resolutions;
     std::vector<std::shared_ptr<const void>> retained;
+    // Published to `scopes` under `opener` once encoded, when every member can be stored; keyed members' groups.
+    std::shared_ptr<StoredGraphicsScope> built;
+    // The groups of the members that are not keyed.
+    GroupStore groups{VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT};
+    bool storable{true};
+    StoredGraphicsScopes *scopes{};
+    uint64_t opener{};
+    // The stored scope replayed instead, whose first `inputs.size()` members matched.
+    std::shared_ptr<const StoredGraphicsScope> replay;
+    std::vector<GraphicsMemberInputs> inputs;
 };
 
 const void *resolutionIdentity(ManagedGraphicsCommandBatch &batch, const std::array<float, 2> &resolution) {
@@ -352,7 +515,8 @@ const void *resolutionIdentity(ManagedGraphicsCommandBatch &batch, const std::ar
     return &batch.resolutions.emplace_back(resolution);
 }
 
-void appendManagedGraphicsNode(ManagedGraphicsCommandBatch &batch, ManagedGraphicsNode &&node) {
+void appendManagedGraphicsNode(ManagedGraphicsCommandBatch &batch, ManagedGraphicsNode &&node,
+                               const std::optional<GraphicsNodeKey> &key) {
     const size_t offset = batch.arguments.size();
     batch.arguments.insert(batch.arguments.end(), node.arguments.begin(), node.arguments.end());
     batch.owners.insert(batch.owners.end(), node.owners.begin(), node.owners.end());
@@ -362,22 +526,125 @@ void appendManagedGraphicsNode(ManagedGraphicsCommandBatch &batch, ManagedGraphi
         draw.command = resolutionIdentity(batch, draw.draw.resolution);
         batch.draws.push_back(draw);
     }
+    batch.storable = batch.storable && node.storable && key;
+    if (batch.storable) {
+        auto renderPass = std::make_shared<RuntimeProgramControl>(*node.renderPass);
+        renderPass->leases.clear();
+        renderPass->refresh();
+        StoredGraphicsMember &stored = batch.built->members.emplace_back(
+            StoredGraphicsMember{renderPass, *node.targets, node.reads, node.bufferReads, node.payload, {}});
+        if (node.payload)
+            for (const ManagedGraphicsDraw &draw : node.draws)
+                stored.draws.push_back({draw.records, draw.graphicsState->topology, draw.draw.resolution});
+        for (const VernonColorAttachment *&attachment : stored.targets.attachments)
+            attachment = &renderPass->colors[attachment - node.renderPass->colors.data()];
+        if (stored.targets.depthAttachment)
+            stored.targets.depthAttachment = &*renderPass->depth;
+        batch.built->keys.push_back(*key);
+        batch.built->identities.insert(batch.built->identities.end(), node.identities.begin(), node.identities.end());
+    }
     batch.retained.push_back(std::move(node.targets));
     batch.retained.insert(batch.retained.end(), std::make_move_iterator(node.retained.begin()),
                           std::make_move_iterator(node.retained.end()));
 }
+// The draw of a keyed member whose groups a stored scope makes.
+struct GroupSiteDraw {
+    CommandStream &commands;
+    ManagedGraphicsCommandBatch &batch;
+    const ManagedGraphicsDraw &draw;
+    size_t member{};
+};
 
+// Writes a group's first values before the draw binds it, and keeps what fills it on replay.
+VernonStatus recordGroupSite(void *userData, VernonRuntimeCoreGroup *group, const PreparedGraphicsBindingPlan &plan,
+                             const std::vector<uint32_t> &slots, const VernonRuntimeProviderBindingValue *values,
+                             size_t valueCount) {
+    const auto &made = *static_cast<const GroupSiteDraw *>(userData);
+    const std::vector<VernonProgramArgument> &frame = made.batch.members[made.member].frame->arguments;
+    const size_t parameters = made.draw.stage->bindingProjection.parameters.size();
+    StoredGroupSite site{group, &plan, slots, made.draw.draw.resolution, made.member};
+    site.arguments.assign(made.batch.arguments.begin() + static_cast<std::ptrdiff_t>(made.draw.firstArgument),
+                          made.batch.arguments.begin() +
+                              static_cast<std::ptrdiff_t>(made.draw.firstArgument + parameters));
+    site.frameArguments.assign(parameters, kFixedArgument);
+    for (size_t parameter = 0; parameter < parameters; ++parameter)
+        if (const VernonProgramArgument *argument = site.arguments[parameter];
+            argument >= frame.data() && argument < frame.data() + frame.size())
+            site.frameArguments[parameter] = static_cast<uint32_t>(argument - frame.data());
+    for (size_t value = 0; value < valueCount; ++value)
+        if (inlineGroupValue(values[value])) {
+            const auto *bytes = static_cast<const uint8_t *>(values[value].payload.inline_value.data);
+            site.bytes.insert(site.bytes.end(), bytes, bytes + values[value].payload.inline_value.size);
+        }
+    if (auto updated = made.commands.updateGroup(group, values, valueCount); updated.isErr())
+        return vernon::toVernonStatus(std::move(updated).error());
+    made.batch.built->sites.push_back(std::move(site));
+    return VERNON_STATUS_OK;
+}
+
+// Fills the updatable groups of the replayed scope from the frames of the Nodes it replays, and writes those whose
+// bytes changed. Called outside a rendering scope, with the scope's replays serialized.
+RuntimeResult<void> updateStoredGroups(CommandStream &commands, const ManagedGraphicsCommandBatch &batch) {
+    std::vector<const VernonProgramArgument *> arguments;
+    std::vector<VernonRuntimeProviderBindingValue> values;
+    std::vector<std::vector<uint8_t>> storage;
+    std::vector<uint8_t> bytes;
+    for (StoredGroupSite &site : batch.replay->sites) {
+        const std::vector<VernonProgramArgument> &frame = batch.inputs[site.member].frame->arguments;
+        arguments = site.arguments;
+        for (size_t parameter = 0; parameter < arguments.size(); ++parameter)
+            if (site.frameArguments[parameter] != kFixedArgument)
+                arguments[parameter] = &frame[site.frameArguments[parameter]];
+        values.assign(site.slots.size(), {});
+        storage.resize(site.slots.size());
+        bytes.clear();
+        std::string error;
+        for (size_t value = 0; value < site.slots.size(); ++value) {
+            if (!fillPreparedGraphicsBindingValue(*site.plan, {arguments.data(), site.resolution}, site.slots[value],
+                                                  values[value], storage[value], error)) {
+                if (invocationDiagnostic(*batch.context).empty())
+                    invocationDiagnostic(*batch.context) = error;
+                return RuntimeResult<void>{vernon::err(vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument,
+                                                                            {"refill_stored_graphics_group", 0, 0}})};
+            }
+            values[value].slot = static_cast<uint32_t>(value);
+            if (inlineGroupValue(values[value])) {
+                const auto *data = static_cast<const uint8_t *>(values[value].payload.inline_value.data);
+                bytes.insert(bytes.end(), data, data + values[value].payload.inline_value.size);
+            }
+        }
+        if (bytes == site.bytes)
+            continue;
+        if (auto updated = commands.updateGroup(site.group, values.data(), values.size()); updated.isErr())
+            return updated;
+        site.bytes.swap(bytes);
+    }
+    return RuntimeResult<void>{vernon::ok()};
+}
+
+// `stored`, the draw as the scope being built stores it, learns where the draw's payload is.
 VernonRhiStatus encodeManagedGraphicsDraw(CommandStream &commands, GraphicsStream &stream,
-                                          const ManagedGraphicsCommandBatch &batch, const ManagedGraphicsDraw &draw) {
-    const GraphicsCommand command{batch.arguments.data() + draw.firstArgument,
-                                  draw.targets,
-                                  draw.graphicsState,
-                                  draw.draw,
-                                  {batch.owners.data() + draw.firstArgument, draw.command, &commands.transient(), {}},
-                                  commands.encoder()};
-    auto invoked = invokeBackendPipeline(*draw.stage, commands.commands(), command, stream);
-    if (invoked.isOk())
+                                          ManagedGraphicsCommandBatch &batch, const ManagedGraphicsDraw &draw,
+                                          size_t member, StoredGraphicsDraw *stored) {
+    const bool keyed = batch.members[member].keyed;
+    GroupSiteDraw made{commands, batch, draw, member};
+    const GraphicsCommand command{
+        batch.arguments.data() + draw.firstArgument,
+        draw.targets,
+        draw.graphicsState,
+        draw.draw,
+        {batch.owners.data() + draw.firstArgument, draw.command, keyed ? &batch.built->groups : &batch.groups, {}},
+        commands.encoder(),
+        keyed ? GraphicsGroupSink{recordGroupSite, &made} : GraphicsGroupSink{}};
+    auto invoked = invokeBackendPipeline(*draw.stage, commands.packets(), command, stream);
+    if (invoked.isOk()) {
+        if (stored) {
+            size_t words = 0;
+            vernonRuntimeCorePacketsGetPayload(commands.packets(), &words);
+            stored->payloadWord = words - kDrawPayloadWords;
+        }
         return VERNON_RHI_STATUS_OK;
+    }
     const vernon::RuntimeError error = std::move(invoked).error();
     if (invocationDiagnostic(*draw.stage->context).empty())
         invocationDiagnostic(*draw.stage->context) =
@@ -385,34 +652,45 @@ VernonRhiStatus encodeManagedGraphicsDraw(CommandStream &commands, GraphicsStrea
     return vernon::toVernonRhiStatus(error);
 }
 
-VernonRhiStatus encodeRecordedDebugCommand(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                           const RecordedDebugCommand &command) {
+VernonRhiStatus recordedCommandStatus(VernonRuntimeContext &context, VernonStatus status, const char *operation) {
+    if (status == VERNON_STATUS_OK)
+        return VERNON_RHI_STATUS_OK;
+    if (invocationDiagnostic(context).empty())
+        invocationDiagnostic(context) = operation;
+    return vernon::toVernonRhiStatus(vernon::runtimeErrorFromStatus(status, {operation, 0, 0}));
+}
+
+VernonStatus encodeRecordedDebugCommand(VernonRuntimeCorePackets *packets, const RecordedDebugCommand &command) {
     const VernonStringView label{command.label.data(), command.label.size()};
     switch (command.kind) {
     case VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP:
-        return vernonRhiCommandEncoderPushDebugGroup(device, encoder, label);
+        return vernonRuntimeCorePacketsPushDebugGroup(packets, label);
     case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
-        return vernonRhiCommandEncoderPopDebugGroup(device, encoder);
+        return vernonRuntimeCorePacketsPopDebugGroup(packets);
     default:
-        return vernonRhiCommandEncoderInsertDebugMarker(device, encoder, label);
+        return vernonRuntimeCorePacketsInsertDebugMarker(packets, label);
     }
 }
 
-VernonRhiStatus encodeManagedGraphicsMember(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                            CommandStream &commands, GraphicsStream &stream,
-                                            const ManagedGraphicsCommandBatch &batch,
-                                            const ManagedGraphicsBatchMember &member, size_t firstDraw) {
+VernonRhiStatus encodeManagedGraphicsMember(CommandStream &commands, GraphicsStream &stream,
+                                            ManagedGraphicsCommandBatch &batch, size_t memberIndex, size_t firstDraw) {
+    const ManagedGraphicsBatchMember &member = batch.members[memberIndex];
+    std::vector<StoredGraphicsDraw> *stored =
+        batch.storable && batch.scopes ? &batch.built->members[memberIndex].draws : nullptr;
     size_t command = 0;
     for (size_t draw = firstDraw;; ++draw) {
         for (; command < member.debugCommands.size() && member.debugCommands[command].draw <= draw - firstDraw;
              ++command)
-            if (const VernonRhiStatus status =
-                    encodeRecordedDebugCommand(device, encoder, member.debugCommands[command]);
+            if (const VernonRhiStatus status = recordedCommandStatus(
+                    *batch.context, encodeRecordedDebugCommand(commands.packets(), member.debugCommands[command]),
+                    "managed graphics debug command failed");
                 status != VERNON_RHI_STATUS_OK)
                 return status;
         if (draw == member.drawEnd)
             return VERNON_RHI_STATUS_OK;
-        if (const VernonRhiStatus status = encodeManagedGraphicsDraw(commands, stream, batch, batch.draws[draw]);
+        if (const VernonRhiStatus status =
+                encodeManagedGraphicsDraw(commands, stream, batch, batch.draws[draw], memberIndex,
+                                          stored && !stored->empty() ? &(*stored)[draw - firstDraw] : nullptr);
             status != VERNON_RHI_STATUS_OK)
             return status;
     }
@@ -420,7 +698,6 @@ VernonRhiStatus encodeManagedGraphicsMember(VernonRhiDevice device, VernonRhiCom
 
 VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder encoder) {
     auto &batch = *static_cast<ManagedGraphicsCommandBatch *>(opaque);
-    const VernonRhiDevice device = batch.context->rhiDevice;
     auto acquired = batch.stream->acquire(encoder);
     if (acquired.isErr()) {
         if (invocationDiagnostic(*batch.context).empty())
@@ -428,32 +705,147 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
         return vernon::toVernonRhiStatus(std::move(acquired).error());
     }
     CommandStream &commands = *acquired.value();
+    if (batch.replay) {
+        const std::lock_guard lock(batch.replay->replays);
+        if (auto flushed = commands.flush(); flushed.isErr())
+            return vernon::toVernonRhiStatus(std::move(flushed).error());
+        if (auto updated = updateStoredGroups(commands, batch); updated.isErr())
+            return vernon::toVernonRhiStatus(std::move(updated).error());
+        std::vector<uint32_t> patched;
+        for (const GraphicsMemberInputs &member : batch.inputs)
+            for (const auto &[word, payload] : member.payload) {
+                if (patched.empty())
+                    patched = batch.replay->batch.payload();
+                std::memcpy(patched.data() + word, &payload, sizeof(payload));
+            }
+        auto encoded = commands.encode(batch.replay->batch, patched.empty() ? batch.replay->batch.payload() : patched);
+        return encoded.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(std::move(encoded).error());
+    }
+    // A stored batch's payload starts with its own draws, where they are patched on replay.
+    if (auto flushed = commands.flush(); flushed.isErr())
+        return vernon::toVernonRhiStatus(std::move(flushed).error());
     GraphicsStream stream;
-    if (auto begun =
-            beginBackendRendering(*batch.context, commands.commands(), graphicsRenderingDescriptor(batch.scope));
-        begun.isErr())
+    if (auto begun = commands.beginRendering(graphicsRenderingDescriptor(batch.scope)); begun.isErr())
         return vernon::toVernonRhiStatus(std::move(begun).error());
     VernonRhiStatus status = VERNON_RHI_STATUS_OK;
     // Members get their own groups only inside a fused scope; an unfused scope's group already carries the label.
     const bool memberGroups = batch.members.size() > 1;
     size_t firstDraw = 0;
-    for (const ManagedGraphicsBatchMember &member : batch.members) {
+    for (size_t memberIndex = 0; memberIndex < batch.members.size(); ++memberIndex) {
+        const ManagedGraphicsBatchMember &member = batch.members[memberIndex];
         if (memberGroups)
-            status = vernonRhiCommandEncoderPushDebugGroup(device, encoder, {member.label.data(), member.label.size()});
+            status = recordedCommandStatus(
+                *batch.context,
+                vernonRuntimeCorePacketsPushDebugGroup(commands.packets(), {member.label.data(), member.label.size()}),
+                "managed graphics debug group failed");
         if (status == VERNON_RHI_STATUS_OK)
-            status = encodeManagedGraphicsMember(device, encoder, commands, stream, batch, member, firstDraw);
+            status = encodeManagedGraphicsMember(commands, stream, batch, memberIndex, firstDraw);
         if (memberGroups && status == VERNON_RHI_STATUS_OK)
-            status = vernonRhiCommandEncoderPopDebugGroup(device, encoder);
+            status = recordedCommandStatus(*batch.context, vernonRuntimeCorePacketsPopDebugGroup(commands.packets()),
+                                           "managed graphics debug group failed");
         if (status != VERNON_RHI_STATUS_OK)
-            break;
+            return status;
         firstDraw = member.drawEnd;
     }
-    auto ended = endBackendRendering(*batch.context, commands.commands());
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    return ended.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(std::move(ended).error());
+    if (auto ended = commands.endRendering(); ended.isErr())
+        return vernon::toVernonRhiStatus(std::move(ended).error());
+    if (!batch.storable || !batch.scopes) {
+        auto flushed = commands.flush();
+        return flushed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(std::move(flushed).error());
+    }
+    if (auto flushed = commands.flush(batch.built->batch); flushed.isErr())
+        return vernon::toVernonRhiStatus(std::move(flushed).error());
+    batch.scopes->publish(batch.opener, batch.built,
+                          [](const StoredGraphicsScope &left, const StoredGraphicsScope &right) {
+                              return left.keys == right.keys || !left.alive();
+                          });
+    return VERNON_RHI_STATUS_OK;
 }
 
+bool frameIsStorable(const vernon::runtime::program_execution::MaterializedNodeFrame &frame) {
+    return frame.copiesBefore.empty() && frame.copiesAfter.empty() && frame.deviceCopiesBefore.empty() &&
+           frame.deviceCopiesAfter.empty() && frame.deviceEndpointCarriers.empty();
+}
+
+void addReferenceKey(std::vector<uint64_t> &words, const VernonRuntimeProviderResourceReference &reference) {
+    words.insert(words.end(), {reference.identity, reference.resource.value, reference.offset, reference.size});
+}
+
+void addBytesKey(std::vector<uint64_t> &words, const void *data, size_t size) {
+    words.push_back(size);
+    const size_t first = words.size();
+    words.resize(first + (size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    if (size)
+        std::memcpy(words.data() + first, data, size);
+}
+
+// False for an argument whose commands cannot be stored. Host bytes are keyed only with `hostBytes`.
+bool addArgumentKey(std::vector<uint64_t> &words, const VernonProgramArgument &argument, bool hostBytes) {
+    words.push_back((static_cast<uint64_t>(argument.kind) << 32) | argument.slot);
+    switch (argument.kind) {
+    case VERNON_PROGRAM_IMAGE:
+        addReferenceKey(words, argument.image.view);
+        return true;
+    case VERNON_PROGRAM_SAMPLER:
+        addReferenceKey(words, argument.resource);
+        return true;
+    case VERNON_PROGRAM_TENSOR:
+        break;
+    default:
+        return false;
+    }
+    const VernonTensorView &tensor = argument.tensor;
+    const VernonValueLayoutView &layout = tensor.element_layout;
+    words.insert(words.end(), {static_cast<uint64_t>(tensor.storage), static_cast<uint64_t>(tensor.access), tensor.rank,
+                               tensor.byte_offset, tensor.byte_size, layout.byte_size, layout.alignment});
+    addBytesKey(words, layout.layout_hash.data, layout.layout_hash.size);
+    if (tensor.rank && (!tensor.shape || !tensor.byte_strides))
+        return false;
+    for (uint32_t axis = 0; axis < tensor.rank; ++axis)
+        words.insert(words.end(), {tensor.shape[axis], static_cast<uint64_t>(tensor.byte_strides[axis])});
+    if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+        addReferenceKey(words, tensor.resource);
+        return true;
+    }
+    if (tensor.storage != VERNON_TENSOR_HOST || (tensor.byte_size && !tensor.host_data))
+        return false;
+    if (hostBytes)
+        addBytesKey(words, static_cast<const uint8_t *>(tensor.host_data) + tensor.byte_offset, tensor.byte_size);
+    return true;
+}
+
+// Empty when the commands of the Node cannot be stored. Arguments are keyed by their structure and resources. Their
+// host bytes only reach group values, so with `updatable` groups a replay writes them and they are not keyed; without,
+// an argument that a Program instance binding owns is keyed by the binding, which never changes, and any other by its
+// host bytes as well.
+std::optional<GraphicsNodeKey> graphicsNodeKey(uint64_t node, const GraphicsMemberInputs &member, bool updatable) {
+    const vernon::runtime::program_execution::MaterializedNodeFrame &frame = *member.frame;
+    if (!frameIsStorable(frame))
+        return std::nullopt;
+    GraphicsNodeKey key;
+    key.pass = member.recorded ? member.recorded->pass.get() : nullptr;
+    if (!key.pass) {
+        key.draw = member.draw.get();
+        key.dynamic = member.dynamic.get();
+    }
+    key.renderPass = member.boundRenderPass.get();
+    key.words.push_back(node);
+    for (const VernonColorAttachment &color : member.renderPass->colors)
+        addReferenceKey(key.words, color.view);
+    if (member.renderPass->depth)
+        addReferenceKey(key.words, member.renderPass->depth->view);
+    for (size_t parameter = 0; parameter < frame.arguments.size(); ++parameter) {
+        const ArgumentOwner &owner = member.owners[parameter];
+        if (!updatable && owner.groups) {
+            key.words.insert(key.words.end(), {1, reinterpret_cast<uintptr_t>(owner.identity)});
+            continue;
+        }
+        key.words.push_back(2);
+        if (!addArgumentKey(key.words, frame.arguments[parameter], !updatable))
+            return std::nullopt;
+    }
+    return key;
+}
 // The owner of each argument of `frame`, the frame of the Node that `node` keys: the Program instance binding that the
 // argument borrows unchanged, whose groups the instance keeps for the Node, otherwise the frame itself.
 std::vector<ArgumentOwner> frameOwners(const ProgramInvocationContext *invocation,
@@ -520,16 +912,22 @@ bool planUnrecordedGraphicsNode(VernonRuntimeContext &context, VernonStageExecut
 }
 
 // Plans the recorded draws of a Node. A draw whose argument sources equal the previous draw's shares its arguments.
+// A draw's index read is its whole index view, so that the reads of a Node depend only on its recording's structure.
 bool planRecordedGraphicsNode(VernonRuntimeContext &context, const RecordedGraphicsPass &pass,
+                              const std::shared_ptr<const RecordedDrawPayload> &payload,
                               const vernon::runtime::program_execution::MaterializedNodeFrame &frame,
                               const std::vector<ArgumentOwner> &owners, const std::vector<InvocationSetFrame> &sets,
                               const RuntimeProgramControl &renderPass, ManagedGraphicsNode &node, std::string &error) {
+    if (payload->draws.size() != pass.draws.size() || payload->dynamics.size() != pass.draws.size())
+        return error = "recording payload does not match its draws", false;
+    std::shared_ptr<const GraphicsVertexRecords> records;
     // Per pipeline and Stage parameter: whether the pass frame's argument was validated.
     std::unordered_map<const RuntimeGraphicsPipelineState *, std::vector<char>> passChecked;
     std::vector<char> setRead(sets.size());
     const std::vector<RecordedArgumentSource> *sources = nullptr;
     size_t firstArgument = 0;
-    for (const RecordedDraw &recorded : pass.draws) {
+    for (size_t index = 0; index < pass.draws.size(); ++index) {
+        const RecordedDraw &recorded = pass.draws[index];
         const RuntimeGraphicsPipelineState &pipeline = *recorded.pipeline;
         VernonStageExecutable &stage = *pipeline.sourcePlan->stage;
         if (recorded.arguments.get() != sources) {
@@ -563,20 +961,26 @@ bool planRecordedGraphicsNode(VernonRuntimeContext &context, const RecordedGraph
             }
             if (!addVertexReads(stage.drawLayout, node.arguments.data() + firstArgument, node.bufferReads))
                 return error = "contains an invalid vertex resource", false;
+            if (!checkGraphicsSharedDescriptors(stage.drawLayout, node.arguments.data() + firstArgument, error))
+                return false;
+            records = std::make_shared<const GraphicsVertexRecords>(
+                graphicsVertexRecords(stage.drawLayout, node.arguments.data() + firstArgument));
         }
         ManagedGraphicsDraw &draw = node.draws.emplace_back();
         draw.stage = &stage;
         draw.graphicsState = &pipeline.graphicsState.state;
         draw.targets = node.targets.get();
         draw.firstArgument = firstArgument;
-        if (!planGraphicsDraw(stage.drawLayout, node.arguments.data() + firstArgument, *node.targets,
-                              renderPass.renderPass, &recorded.dynamic->dynamic, recorded.draw->draw, draw.draw, error))
+        draw.records = records;
+        if (!planGraphicsDrawValues(*records, *node.targets, renderPass.renderPass, &payload->dynamics[index]->dynamic,
+                                    payload->draws[index]->draw, draw.draw, error))
             return false;
         if (draw.draw.indexBinding &&
-            !node.bufferReads.add(draw.draw.indexBinding->resource, draw.draw.indexBinding->offset,
-                                  static_cast<uint64_t>(draw.draw.indexBinding->index_count) * sizeof(uint32_t), true))
+            !node.bufferReads.add(draw.draw.indexBinding->resource, 0, draw.draw.indexBinding->resource.size, true))
             return error = "contains an invalid index resource", false;
     }
+    node.payload = payload;
+    node.retained.push_back(payload);
     return true;
 }
 
@@ -682,9 +1086,96 @@ VernonStatus executePipelineProgramGraphImpl(
             fragment.finishers.push_back({EncoderCommandStream::finish, commandStream.get()});
             fragment.retainedContexts.push_back(commandStream);
         };
+        // Lowers the binding sets a recorded Node draws with. Without `copies`, the sets must need no copies: they were
+        // lowered once and kept by a stored scope that planned no transfers for them.
+        const auto lowerSets = [&](const GraphicsMemberInputs &member, std::vector<InvocationSetFrame> &sets,
+                                   std::vector<vernon::runtime::program_execution::DeviceBufferCopy> *copies) {
+            const RecordedGraphicsPass *pass = member.recorded ? member.recorded->pass.get() : nullptr;
+            if (!pass)
+                return VERNON_STATUS_OK;
+            sets.resize(pass->frames.size());
+            std::string error;
+            for (size_t index = 0; index < sets.size(); ++index) {
+                if (!lowerSetFrame(context, pass->frames[index], sets[index], error))
+                    return fail(&context, programNodeName(*member.node) + ": binding set: " + error);
+                const auto &setCopies = sets[index].lowered->frame.deviceCopiesBefore;
+                if (copies)
+                    copies->insert(copies->end(), setCopies.begin(), setCopies.end());
+                else if (!setCopies.empty())
+                    return fail(&context, programNodeName(*member.node) + ": binding set needs unplanned copies",
+                                VERNON_STATUS_INTERNAL_ERROR);
+            }
+            return VERNON_STATUS_OK;
+        };
+        const auto planMember = [&](const GraphicsMemberInputs &member, std::vector<InvocationSetFrame> &sets,
+                                    ManagedGraphicsNode &graphicsNode) {
+            const program::Node &node = *member.node;
+            const program::GraphicsOperation &graphics = program::graphicsOperation(node);
+            const RecordedGraphicsPass *pass = member.recorded ? member.recorded->pass.get() : nullptr;
+            std::string error;
+            if (!planRenderTargets(&member.renderPass->renderPass, describeRuntimeImage, &context,
+                                   *graphicsNode.targets, error) ||
+                !checkProgramGraphicsAttachmentSignature(graphics, *graphicsNode.targets, error))
+                return fail(&context, programNodeName(node) + ": " + error);
+            const bool planned =
+                pass ? planRecordedGraphicsNode(context, *pass, member.recorded->payload, *member.frame, member.owners,
+                                                sets, *member.renderPass, graphicsNode, error)
+                     : planUnrecordedGraphicsNode(context, *member.resolved->stage, graphics, *member.frame,
+                                                  member.owners, *member.renderPass, member.draw, member.dynamic,
+                                                  graphicsNode, error);
+            if (!planned)
+                return fail(&context, programNodeName(node) + ": " + error);
+            if (graphicsScopeReadsOverlap(graphicsNode.reads, *graphicsNode.targets))
+                return fail(&context, programNodeName(node) + ": samples an image it renders to");
+            graphicsNode.storable = frameIsStorable(*member.frame);
+            for (InvocationSetFrame &set : sets) {
+                graphicsNode.storable = graphicsNode.storable && set.owner.groups;
+                graphicsNode.retained.push_back(std::move(set.lowered));
+            }
+            graphicsNode.renderPass = member.renderPass;
+            graphicsNode.retained.insert(graphicsNode.retained.end(), {member.frame, member.renderPass});
+            for (const ArgumentOwner &owner : member.owners)
+                if (owner.groups && owner.lifetime)
+                    graphicsNode.identities.emplace_back(*owner.lifetime);
+            for (const std::shared_ptr<const void> &identity :
+                 {std::shared_ptr<const void>(member.boundRenderPass), std::shared_ptr<const void>(member.draw),
+                  std::shared_ptr<const void>(member.dynamic),
+                  member.recorded ? std::shared_ptr<const void>(member.recorded->pass) : nullptr})
+                if (identity)
+                    graphicsNode.identities.emplace_back(identity);
+            return VERNON_STATUS_OK;
+        };
+        const auto appendPlanned = [&](const GraphicsMemberInputs &member, ManagedGraphicsNode &&graphicsNode) {
+            graphicsBufferReads.merge(graphicsNode.bufferReads);
+            const RecordedGraphicsPass *pass = member.recorded ? member.recorded->pass.get() : nullptr;
+            appendManagedGraphicsNode(*graphicsBatch, std::move(graphicsNode), member.key);
+            graphicsBatch->members.push_back({programNodeLabel(*member.node), graphicsBatch->draws.size(),
+                                              pass ? pass->debugCommands : std::vector<RecordedDebugCommand>{},
+                                              member.frame.get(), member.key.has_value()});
+        };
+        const auto planMembers = [&](std::vector<GraphicsMemberInputs> &&members) {
+            for (GraphicsMemberInputs &member : members) {
+                std::vector<InvocationSetFrame> sets;
+                if (const VernonStatus status = lowerSets(member, sets, nullptr); status != VERNON_STATUS_OK)
+                    return status;
+                ManagedGraphicsNode graphicsNode;
+                if (const VernonStatus status = planMember(member, sets, graphicsNode); status != VERNON_STATUS_OK)
+                    return status;
+                appendPlanned(member, std::move(graphicsNode));
+            }
+            return VERNON_STATUS_OK;
+        };
+        // A replayed scope whose Nodes stop matching its stored members plans the Nodes it already matched.
+        const auto stopReplay = [&]() {
+            graphicsBatch->replay.reset();
+            return planMembers(std::exchange(graphicsBatch->inputs, {}));
+        };
         const auto appendGraphicsBatch = [&]() {
             if (!graphicsBatch)
                 return VERNON_STATUS_OK;
+            if (graphicsBatch->replay && graphicsBatch->inputs.size() != graphicsBatch->replay->keys.size())
+                if (const VernonStatus status = stopReplay(); status != VERNON_STATUS_OK)
+                    return status;
             graphicsBufferReads.append(graphicsNodePlan.commands.nodes.back(), graphicsNodePlan.bindings);
             graphicsBufferReads = {};
             std::string compositionError;
@@ -716,6 +1207,8 @@ VernonStatus executePipelineProgramGraphImpl(
             return submission.execute(std::exchange(commandPlan, {}), step);
         };
         // Per Value, the boundary slot whose instance binding supplies it.
+        StoredGraphicsScopes *storedScopes = invocationContext ? invocationContext->storedGraphics : nullptr;
+        const bool updatesGroups = storedScopes && backendUpdatesGroups(context);
         std::vector<uint32_t> valueSlots;
         if (invocationContext && invocationContext->groups) {
             valueSlots.assign(canonicalProgram.values.size(), UINT32_MAX);
@@ -736,8 +1229,12 @@ VernonStatus executePipelineProgramGraphImpl(
                 auto renderPass = control(graphics.renderPassControl, RuntimeProgramControl::RenderPass);
                 if (!renderPass)
                     return fail(&context, "managed graphics node has no bound RenderPass control");
-                auto draw = control(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand);
-                auto dynamic = control(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState);
+                GraphicsMemberInputs member;
+                member.node = &node;
+                member.resolved = resolvedNode;
+                member.boundRenderPass = renderPass;
+                member.draw = control(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand);
+                member.dynamic = control(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState);
                 const auto *graphicsControls = std::get_if<program::ResolvedGraphicsControls>(&resolvedNode->controls);
                 if (!graphicsControls)
                     return fail(&context, "managed graphics node has no resolved attachment controls");
@@ -770,29 +1267,58 @@ VernonStatus executePipelineProgramGraphImpl(
                 if (graphics.depthStencilAttachment.has_value() !=
                     static_cast<bool>(renderPass->renderPass.depth_attachment))
                     return fail(&context, "managed graphics depth attachment does not match the canonical render pass");
-                RecordedGraphicsPass *recordedPass = nullptr;
+                member.renderPass = renderPass;
                 if (invocationContext && invocationContext->recordedGraphics) {
                     auto &recordedNodes = invocationContext->recordedGraphics->nodes;
                     const auto found = recordedNodes.find(node.id);
-                    recordedPass = found == recordedNodes.end() ? nullptr : &found->second;
+                    member.recorded = found == recordedNodes.end() ? nullptr : &found->second;
                 }
-                auto frame = std::make_shared<vernon::runtime::program_execution::MaterializedNodeFrame>();
+                member.frame = std::make_shared<vernon::runtime::program_execution::MaterializedNodeFrame>();
                 std::string graphicsError;
-                if (!vernon::runtime::program_execution::materializeNodeFrame(
-                        arena, canonicalProgram, node, *resolvedNode, resolvePhysicalEndpoint, *frame, graphicsError))
+                if (!vernon::runtime::program_execution::materializeNodeFrame(arena, canonicalProgram, node,
+                                                                              *resolvedNode, resolvePhysicalEndpoint,
+                                                                              *member.frame, graphicsError))
                     return fail(&context, std::move(graphicsError));
-                std::vector<vernon::runtime::program_execution::DeviceBufferCopy> copiesBefore =
-                    frame->deviceCopiesBefore;
-                std::vector<InvocationSetFrame> sets;
-                if (recordedPass) {
-                    sets.resize(recordedPass->frames.size());
-                    for (size_t index = 0; index < sets.size(); ++index) {
-                        if (!lowerSetFrame(context, recordedPass->frames[index], sets[index], graphicsError))
-                            return fail(&context, programNodeName(node) + ": binding set: " + graphicsError);
-                        const auto &setCopies = sets[index].lowered->frame.deviceCopiesBefore;
-                        copiesBefore.insert(copiesBefore.end(), setCopies.begin(), setCopies.end());
+                member.owners = frameOwners(invocationContext, valueSlots, nodeKey, *resolvedNode, *member.frame);
+                if (storedScopes)
+                    member.key = graphicsNodeKey(nodeKey, member, updatesGroups);
+                // The groups of a keyed Node belong to its scope, which finds each by the arguments it holds.
+                if (member.key && updatesGroups)
+                    for (size_t parameter = 0; parameter < member.owners.size(); ++parameter)
+                        member.owners[parameter] = {&member.frame->arguments[parameter], nullptr, nullptr};
+                if (member.recorded)
+                    member.recorded->telemetry.render_scopes = 1;
+
+                // A stored Node with an equal key renders to the same targets and reads the same resources, so the
+                // Node is planned only once it is known that no stored scope replays it.
+                const StoredGraphicsMember *stored = nullptr;
+                bool continues = false;
+                std::shared_ptr<const StoredGraphicsScope> opening;
+                std::vector<std::pair<size_t, VernonRuntimeProviderDrawPayload>> openingPayload;
+                if (member.key) {
+                    if (graphicsBatch && graphicsBatch->replay) {
+                        const size_t next = graphicsBatch->inputs.size();
+                        continues = next < graphicsBatch->replay->keys.size() &&
+                                    graphicsBatch->replay->keys[next] == *member.key &&
+                                    replaysDrawValues(graphicsBatch->replay->members[next], member, member.payload);
+                        if (continues)
+                            stored = &graphicsBatch->replay->members[next];
                     }
+                    for (const std::shared_ptr<const StoredGraphicsScope> &scope : storedScopes->find(nodeKey))
+                        if (scope->keys.front() == *member.key && scope->alive() &&
+                            replaysDrawValues(scope->members.front(), member, openingPayload)) {
+                            opening = scope;
+                            if (!stored)
+                                stored = &scope->members.front();
+                            break;
+                        }
                 }
+                std::vector<vernon::runtime::program_execution::DeviceBufferCopy> copiesBefore =
+                    member.frame->deviceCopiesBefore;
+                std::vector<InvocationSetFrame> sets;
+                if (!stored)
+                    if (const VernonStatus status = lowerSets(member, sets, &copiesBefore); status != VERNON_STATUS_OK)
+                        return status;
                 std::vector<vernon::execution::detail::RhiCommandExecutionPlan> nodeTransfers;
                 if (const VernonStatus status =
                         transfers.planBeforeConsumer({*direction, node.id}, copiesBefore, nodeTransfers);
@@ -808,23 +1334,9 @@ VernonStatus executePipelineProgramGraphImpl(
                         return appended;
                 }
                 ManagedGraphicsNode graphicsNode;
-                if (!planRenderTargets(&renderPass->renderPass, describeRuntimeImage, &context, *graphicsNode.targets,
-                                       graphicsError) ||
-                    !checkProgramGraphicsAttachmentSignature(graphics, *graphicsNode.targets, graphicsError))
-                    return fail(&context, programNodeName(node) + ": " + graphicsError);
-                const std::vector<ArgumentOwner> owners =
-                    frameOwners(invocationContext, valueSlots, nodeKey, *resolvedNode, *frame);
-                const bool planned =
-                    recordedPass ? planRecordedGraphicsNode(context, *recordedPass, *frame, owners, sets, *renderPass,
-                                                            graphicsNode, graphicsError)
-                                 : planUnrecordedGraphicsNode(context, *resolvedNode->stage, graphics, *frame, owners,
-                                                              *renderPass, draw, dynamic, graphicsNode, graphicsError);
-                if (!planned)
-                    return fail(&context, programNodeName(node) + ": " + graphicsError);
-                if (recordedPass)
-                    recordedPass->telemetry.render_scopes = 1;
-                if (graphicsScopeReadsOverlap(graphicsNode.reads, *graphicsNode.targets))
-                    return fail(&context, programNodeName(node) + ": samples an image it renders to");
+                if (!stored)
+                    if (const VernonStatus status = planMember(member, sets, graphicsNode); status != VERNON_STATUS_OK)
+                        return status;
                 const auto candidate =
                     std::find_if(execution.graphicsScopeCandidates.begin(), execution.graphicsScopeCandidates.end(),
                                  [&](const program::ResolvedGraphicsScopeCandidate &entry) {
@@ -834,14 +1346,28 @@ VernonStatus executePipelineProgramGraphImpl(
                     return fail(&context, "managed graphics node has no resolved scope candidate");
                 // Only a node following an open batch's scope can fuse into it.
                 const GraphicsScopeMaterialization materialization = graphicsScopeMaterializer.materialize(
-                    candidate->region, *graphicsNode.targets, graphicsNode.reads, !graphicsBatch);
-                if (materialization != GraphicsScopeMaterialization::Fuse)
+                    candidate->region, stored ? stored->targets : *graphicsNode.targets,
+                    stored ? stored->reads : graphicsNode.reads, !graphicsBatch);
+                const bool fuses = graphicsBatch && materialization == GraphicsScopeMaterialization::Fuse;
+                if (!fuses) {
                     if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
                         return pending;
+                } else if (graphicsBatch->replay && !continues) {
+                    if (const VernonStatus status = stopReplay(); status != VERNON_STATUS_OK)
+                        return status;
+                }
                 if (!graphicsBatch) {
                     graphicsBatch = std::make_shared<ManagedGraphicsCommandBatch>();
                     graphicsBatch->context = &context;
                     graphicsBatch->stream = &sharedCommandStream();
+                    graphicsBatch->scopes = storedScopes;
+                    graphicsBatch->opener = nodeKey;
+                    if (opening)
+                        member.payload = std::move(openingPayload);
+                    graphicsBatch->replay = std::move(opening);
+                    graphicsBatch->built =
+                        std::make_shared<StoredGraphicsScope>(updatesGroups ? VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE
+                                                                            : VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT);
                     retainCommandStream(graphicsNodePlan);
                     graphicsBatch->commandScope = scope;
                     vernon::execution::detail::CommandNode drawCommand;
@@ -856,15 +1382,19 @@ VernonStatus executePipelineProgramGraphImpl(
                     ++graphicsBatch->commandScope->nodeCount;
                 }
                 graphicsBatch->scope = graphicsScopeMaterializer.scope();
-                graphicsBufferReads.merge(graphicsNode.bufferReads);
-                graphicsNode.retained.push_back(std::move(frame));
-                graphicsNode.retained.push_back(std::move(renderPass));
-                for (InvocationSetFrame &set : sets)
-                    graphicsNode.retained.push_back(std::move(set.lowered));
-                appendManagedGraphicsNode(*graphicsBatch, std::move(graphicsNode));
-                graphicsBatch->members.push_back(
-                    {programNodeLabel(node), graphicsBatch->draws.size(),
-                     recordedPass ? recordedPass->debugCommands : std::vector<RecordedDebugCommand>{}});
+                if (graphicsBatch->replay) {
+                    graphicsBufferReads.merge(stored->bufferReads);
+                    graphicsBatch->inputs.push_back(std::move(member));
+                    continue;
+                }
+                if (stored) {
+                    std::vector<GraphicsMemberInputs> members;
+                    members.push_back(std::move(member));
+                    if (const VernonStatus status = planMembers(std::move(members)); status != VERNON_STATUS_OK)
+                        return status;
+                    continue;
+                }
+                appendPlanned(member, std::move(graphicsNode));
                 continue;
             }
             if (const VernonStatus pending = appendGraphicsBatch(); pending != VERNON_STATUS_OK)
@@ -920,42 +1450,20 @@ VernonStatus executePipelineProgramGraphImpl(
     return VERNON_STATUS_INTERNAL_ERROR;
 }
 
-// Encodes the planned `invocation`, alone, on `commands` inside their rendering scope.
-VernonStatus encodePlannedGraphics(VernonStageExecutable &pipeline, CommandStream &commands,
-                                   const VernonStageInvocationDescriptor &invocation,
-                                   const PlannedGraphicsInvocation &plan) {
-    GraphicsStream stream;
-    const GraphicsCommand command{plan.arguments.data(),
-                                  &plan.targets,
-                                  invocation.graphics_state,
-                                  plan.draw,
-                                  {nullptr, &plan, &commands.transient(), {}},
-                                  commands.encoder()};
-    auto invoked = invokeBackendPipeline(pipeline, commands.commands(), command, stream);
-    return invoked.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(invoked).error());
-}
-
 VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, CommandStream &commands,
                                    const VernonStageInvocationDescriptor &invocation, const ArgumentOwner *owners) {
-    if (!pipeline.bindingProjection.compute.empty()) {
-        const uint32_t grid[3]{invocation.compute_grid.x, invocation.compute_grid.y, invocation.compute_grid.z};
-        const uint32_t workgroup[3]{pipeline.workgroupSize.x, pipeline.workgroupSize.y, pipeline.workgroupSize.z};
-        if (!validateDispatchContract(pipeline.dispatchContract, grid, workgroup,
-                                      invocationDiagnostic(*pipeline.context)))
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        PlannedComputeLaunch plan;
-        std::string planningError;
-        if (!planComputeInvocation(pipeline.bindingProjection, invocation, plan, planningError))
-            return fail(pipeline.context, planningError);
-        auto invoked = invokeBackendComputePipeline(pipeline, commands, plan, owners);
-        return invoked.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(invoked).error());
-    }
-    PlannedGraphicsInvocation plan;
+    if (pipeline.bindingProjection.compute.empty())
+        return fail(pipeline.context, "only a compute Stage is invoked alone");
+    const uint32_t grid[3]{invocation.compute_grid.x, invocation.compute_grid.y, invocation.compute_grid.z};
+    const uint32_t workgroup[3]{pipeline.workgroupSize.x, pipeline.workgroupSize.y, pipeline.workgroupSize.z};
+    if (!validateDispatchContract(pipeline.dispatchContract, grid, workgroup, invocationDiagnostic(*pipeline.context)))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    PlannedComputeLaunch plan;
     std::string planningError;
-    if (!planGraphicsInvocation(pipeline.bindingProjection, pipeline.drawLayout, invocation, describeRuntimeImage,
-                                pipeline.context, plan, planningError))
-        return fail(pipeline.context, std::move(planningError));
-    return encodePlannedGraphics(pipeline, commands, invocation, plan);
+    if (!planComputeInvocation(pipeline.bindingProjection, invocation, plan, planningError))
+        return fail(pipeline.context, planningError);
+    auto invoked = invokeBackendComputePipeline(pipeline, commands, plan, owners);
+    return invoked.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(invoked).error());
 }
 
 } // namespace
@@ -966,120 +1474,6 @@ VernonStatus vernon::runtime::executePipelineProgramGraph(
     const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
     program_execution::SubmissionRecord &submission, program_execution::SubmissionState &step) {
     return executePipelineProgramGraphImpl(context, execution, graph, frame, resolvePhysicalEndpoint, submission, step);
-}
-
-VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipeline,
-                                                  const VernonStageInvocationDescriptor *invocation,
-                                                  VernonSubmission **output) {
-    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (output)
-        *output = nullptr;
-    if (!pipeline || !invocation || !output || invocation->struct_size < sizeof(VernonStageInvocationDescriptor) ||
-        invocation->abi_version != VERNON_PROGRAM_VERSION || (invocation->argument_count && !invocation->arguments) ||
-        invocation->command_encoder.value != 0)
-        return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline submission");
-    if (!pipeline->lifecycle)
-        vernon::resultContractViolation();
-    auto pipelinePin = pipeline->lifecycle.value().pin();
-    if (pipelinePin.isErr())
-        return fail(pipeline->context, "resolved Stage is closing");
-    auto child = RuntimeChildLifecycle::reserve(pipeline->context->owner);
-    if (child.isErr())
-        return fail(pipeline->context, "runtime context cannot admit a submission",
-                    vernon::toVernonStatus(child.error()));
-    auto submission = std::make_unique<VernonSubmission>(
-        *pipeline->context, std::make_shared<program_execution::SubmissionRecord>(*pipeline->context));
-    submission->lifecycle.emplace(std::move(child).value());
-    if (pipeline->context->rhiDevice.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
-        auto commands = beginCommandStream(*pipeline->context, invocation->command_encoder);
-        if (commands.isErr())
-            return vernon::toVernonStatus(std::move(commands).error());
-        VernonStatus status = encodeStageInvocation(*pipeline, commands.value(), *invocation, nullptr);
-        if (auto ended = commands.value().end(); status == VERNON_STATUS_OK && ended.isErr())
-            status = vernon::toVernonStatus(std::move(ended).error());
-        if (status != VERNON_STATUS_OK)
-            return status;
-        submission->record->setOutcome({program_execution::SubmissionState::Completed, {}});
-        if (submission->lifecycle.value().publish().isErr())
-            return fail(pipeline->context, "cannot publish pipeline submission", VERNON_STATUS_INTERNAL_ERROR);
-        *output = submission.release();
-        return VERNON_STATUS_OK;
-    }
-
-    pipeline->context->submissions.admit({0, 1});
-    const bool graphics = pipeline->bindingProjection.compute.empty();
-    VernonRhiCommandEncoderDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.required_capabilities = graphics ? VERNON_RHI_QUEUE_GRAPHICS : VERNON_RHI_QUEUE_COMPUTE;
-    VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    if (vernonRhiDeviceCreateCommandEncoder(pipeline->context->rhiDevice, &descriptor, &native) != VERNON_RHI_STATUS_OK)
-        return fail(pipeline->context, "failed to create the immediate command encoder");
-    VernonStageInvocationDescriptor encoded = *invocation;
-    EncoderCommandStream stream(*pipeline->context);
-    auto acquired = stream.acquire(native);
-    VernonStatus status = acquired.isOk() ? VERNON_STATUS_OK : vernon::toVernonStatus(std::move(acquired).error());
-    CommandStream *commands = status == VERNON_STATUS_OK ? acquired.value() : nullptr;
-    if (commands)
-        encoded.command_encoder = commands->encoder();
-    bool rendering = false;
-    PlannedGraphicsInvocation plan;
-    if (status == VERNON_STATUS_OK && graphics) {
-        std::string planningError;
-        if (!planGraphicsInvocation(pipeline->bindingProjection, pipeline->drawLayout, encoded, describeRuntimeImage,
-                                    pipeline->context, plan, planningError))
-            status = fail(pipeline->context, std::move(planningError));
-        GraphicsScopeReads reads;
-        if (status == VERNON_STATUS_OK) {
-            for (uint32_t image : pipeline->drawLayout.sampledImages)
-                addGraphicsScopeRead(reads, plan.arguments[image]->image.view, plan.planned[image].subresources);
-            if (graphicsScopeReadsOverlap(reads, plan.targets))
-                status = fail(pipeline->context, "graphics invocation samples an image it renders to");
-        }
-        if (status == VERNON_STATUS_OK) {
-            const GraphicsRenderScope scope = graphicsRenderScope(plan.targets, std::move(reads));
-            auto begun =
-                beginBackendRendering(*pipeline->context, commands->commands(), graphicsRenderingDescriptor(scope));
-            if (begun.isErr())
-                status = vernon::toVernonStatus(std::move(begun).error());
-            else
-                rendering = true;
-        }
-    }
-    if (status == VERNON_STATUS_OK && graphics) {
-        status = encodePlannedGraphics(*pipeline, *commands, encoded, plan);
-    } else if (status == VERNON_STATUS_OK) {
-        status = encodeStageInvocation(*pipeline, *commands, encoded, nullptr);
-    }
-    if (rendering) {
-        auto ended = endBackendRendering(*pipeline->context, commands->commands());
-        if (status == VERNON_STATUS_OK && ended.isErr())
-            status = vernon::toVernonStatus(std::move(ended).error());
-    }
-    if (commands) {
-        auto ended = commands->end();
-        if (status == VERNON_STATUS_OK && ended.isErr())
-            status = vernon::toVernonStatus(std::move(ended).error());
-    }
-    if (status == VERNON_STATUS_OK &&
-        vernonRhiCommandEncoderFinish(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
-        status = fail(pipeline->context, "failed to finish the immediate command encoder");
-    if (status != VERNON_STATUS_OK) {
-        (void)vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
-        return status;
-    }
-    if (submission->record->submit(native) != VERNON_RHI_STATUS_OK) {
-        const VernonStringView detail = vernonRhiDeviceGetLastError(pipeline->context->rhiDevice);
-        std::string error = "failed to submit the immediate command encoder";
-        if (detail.data && detail.size)
-            error.append(": ").append(detail.data, detail.size);
-        return fail(pipeline->context, std::move(error));
-    }
-    submission->record->setOutcome({program_execution::SubmissionState::Submitted, {}});
-    pipeline->context->submissions.push(submission->record, 0);
-    if (submission->lifecycle.value().publish().isErr())
-        return fail(pipeline->context, "cannot publish pipeline submission", VERNON_STATUS_INTERNAL_ERROR);
-    *output = submission.release();
-    return VERNON_STATUS_OK;
 }
 
 VernonStatus vernon::runtime::encodeResolvedStage(CommandStream &stream, VernonStageExecutable *pipeline,

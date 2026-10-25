@@ -45,14 +45,16 @@ bool prepareGraphicsDrawInvocation(const PlannedGraphicsDraw &plan, VernonPrimit
     if (plan.indexBinding) {
         const VernonIndexBinding &index = *plan.indexBinding;
         const uint64_t indexBytes = static_cast<uint64_t>(index.index_count) * sizeof(uint32_t);
-        if (index.offset > index.resource.size || indexBytes > index.resource.size - index.offset ||
-            index.resource.offset > UINT64_MAX - index.offset) {
+        if (index.offset > index.resource.size || indexBytes > index.resource.size - index.offset) {
             error = "index binding exceeds its index buffer";
             return false;
         }
+        if (index.offset % sizeof(uint32_t) != 0 || index.offset / sizeof(uint32_t) > UINT32_MAX) {
+            error = "index binding offset is not a 32-bit index position";
+            return false;
+        }
         draw.index_buffer = index.resource;
-        draw.index_buffer.offset += index.offset;
-        draw.index_buffer.size -= index.offset;
+        draw.first_index = static_cast<uint32_t>(index.offset / sizeof(uint32_t));
         draw.index_count = index.index_count;
         draw.index_type = index.type;
         draw.base_vertex = index.base_vertex;

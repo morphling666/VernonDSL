@@ -347,7 +347,7 @@ void destroyCpuPipeline(VernonStageExecutable &pipeline) {
     vernonRuntimeCorePipelineDestroy(state.pipeline);
 }
 
-VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                       GroupStore &transient, const PlannedComputeLaunch &launch,
                                       const ArgumentOwner *) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
@@ -427,12 +427,12 @@ VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, VernonRun
         return true;
     };
     const GroupSources sources{nullptr, &launch, &transient, {filled, &state.values}};
-    VernonStatus status = vernonRuntimeCoreBindPipeline(commands, state.pipeline);
+    VernonStatus status = vernonRuntimeCorePacketsBindPipeline(packets, state.pipeline);
     std::string groupError;
     if (status == VERNON_STATUS_OK)
-        status = state.groups.bind(commands, launch.commandEncoder, sources, groupError);
+        status = state.groups.bind(packets, launch.commandEncoder, sources, groupError);
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeCoreDispatch(commands, groups, nullptr, 0);
+        status = vernonRuntimeCorePacketsDispatch(packets, groups);
     if (status != VERNON_STATUS_OK) {
         return fail(
             *pipeline.context,

@@ -221,6 +221,18 @@ using PlacePersistentCallback = Result<PersistentBlock, RhiError> (*)(VernonRhiD
                                                                       uint64_t alignment) noexcept;
 // Returns the block of `key` for reuse at once, so it is released only after every command that reads it completed.
 using ReleasePersistentCallback = void (*)(VernonRhiDevice, uint64_t key) noexcept;
+// Places `size` bytes in device memory that backs uniform and storage buffer bindings and that only
+// WriteUpdatableCallback writes, at an offset that is a multiple of `alignment`, a power of two. Its bytes are
+// undefined until the first write. Pooled and released like persistent memory, with ReleaseUpdatableCallback.
+using PlaceUpdatableCallback = Result<PersistentBlock, RhiError> (*)(VernonRhiDevice, uint64_t size,
+                                                                     uint64_t alignment) noexcept;
+// Records a write of `size` bytes from `data` at the start of `block` on the encoder, outside rendering scopes:
+// commands recorded before it read the block's previous bytes and commands recorded after it the new ones. It runs
+// outside the encoder's lock, so it may call encoder services.
+using WriteUpdatableCallback = Result<void, RhiError> (*)(VernonRhiDevice, uint64_t encoderKey, uint64_t native,
+                                                          const PersistentBlock &block, const void *data,
+                                                          uint64_t size) noexcept;
+using ReleaseUpdatableCallback = void (*)(VernonRhiDevice, uint64_t key) noexcept;
 // Opens the native scope of `scope` on the encoder, applying its load operations, after making `reads` readable by
 // shaders. Attachments and reads are retained and transitioned through the encoder, so a failure leaves rollbacks that
 // restore their state.
@@ -337,6 +349,9 @@ struct BackendDispatch {
     Option<ReserveTransientCallback> reserveTransient;
     Option<PlacePersistentCallback> placePersistent;
     Option<ReleasePersistentCallback> releasePersistent;
+    Option<PlaceUpdatableCallback> placeUpdatable;
+    Option<WriteUpdatableCallback> writeUpdatable;
+    Option<ReleaseUpdatableCallback> releaseUpdatable;
     Option<BeginRenderingCallback> beginRendering;
     Option<EndRenderingCallback> endRendering;
     Option<ClearColorCallback> clearColor;

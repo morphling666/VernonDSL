@@ -56,10 +56,17 @@ const vernon::rhi::BackendDispatch *dispatch(VernonRhiBackend backend) {
 vernon::Result<VernonRhiDevice, vernon::RhiError>
 vernon::rhi::createDeviceImpl(const VernonRhiOwnedDeviceDescriptor *descriptor) {
     creationErrorSize = 0;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) ||
-        (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)) ||
-        (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags))
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
         return Result<VernonRhiDevice, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"create_device", 0, 0}})};
+    const bool opengl =
+        descriptor->backend == VERNON_RHI_BACKEND_OPENGL || descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES;
+    const uint32_t allowed = (opengl ? openGLDeviceFlagMask : deviceFlagMask) |
+                             (descriptor->backend == VERNON_RHI_BACKEND_DIRECTX12
+                                  ? static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)
+                                  : 0u);
+    if (descriptor->flags & ~allowed)
+        return Result<VernonRhiDevice, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"create_device", descriptor->flags, 0}})};
     const BackendDispatch *backend = dispatch(descriptor->backend);
     if (!backend) {
         setDeviceCreationError("requested RHI backend is unavailable in this build");
@@ -900,6 +907,35 @@ vernon::rhi::placePersistentBlock(VernonRhiDevice device, const void *data, uint
 void vernon::rhi::releasePersistentBlock(VernonRhiDevice device, uint64_t key) noexcept {
     if (const BackendDispatch *backend = dispatch(device); backend && backend->releasePersistent)
         backend->releasePersistent.value()(device, key);
+}
+
+vernon::Result<vernon::rhi::PersistentBlock, vernon::RhiError>
+vernon::rhi::placeUpdatableBlock(VernonRhiDevice device, uint64_t size, uint64_t alignment) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<PersistentBlock, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"place_updatable_block", size, 0}})};
+    if (!backend->placeUpdatable || !backend->writeUpdatable || !backend->releaseUpdatable)
+        return Result<PersistentBlock, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"place_updatable_block", size, 0}})};
+    return backend->placeUpdatable.value()(device, size, alignment);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::writeRecordingUpdatable(VernonRhiDevice device, uint64_t key,
+                                                                            uint64_t native,
+                                                                            const PersistentBlock &block,
+                                                                            const void *data, uint64_t size) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"write_updatable_block", key, 0}})};
+    if (!backend->writeUpdatable)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"write_updatable_block", key, 0}})};
+    return backend->writeUpdatable.value()(device, key, native, block, data, size);
+}
+
+void vernon::rhi::releaseUpdatableBlock(VernonRhiDevice device, uint64_t key) noexcept {
+    if (const BackendDispatch *backend = dispatch(device); backend && backend->releaseUpdatable)
+        backend->releaseUpdatable.value()(device, key);
 }
 
 vernon::Result<void, vernon::RhiError> vernon::rhi::recordImageCopy(VernonRhiDevice device, uint64_t encoderKey,

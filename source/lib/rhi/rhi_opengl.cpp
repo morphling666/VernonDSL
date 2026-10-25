@@ -318,6 +318,7 @@ vernon::Result<void, vernon::RhiError> teardownDevice(OpenGLDevice &device) noex
     device.transients.clear();
     device.transientPool.clear([&](TransientChunk &chunk) { device.state.destroyBuffer(chunk.buffer); });
     device.persistentBlocks.clear([&](TransientChunk &chunk) { device.state.destroyBuffer(chunk.buffer); });
+    device.state.shutdown();
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -377,10 +378,18 @@ vernon::RhiError fail(OpenGLDevice &device, std::string message,
     return {code, {"opengl_backend", 0, 0}};
 }
 
-std::optional<vernon::RhiError> beginErrorScope(OpenGLDevice &device, const char *operation) {
-    if (!device.state.driver.getError)
+// Outside validation mode an operation's errors surface when its completion is checked. A synchronous operation
+// already waits for the driver, so it checks its own errors in every mode.
+enum class ErrorScope { Validation, Always };
+
+std::optional<vernon::RhiError> beginErrorScope(OpenGLDevice &device, const char *operation,
+                                                ErrorScope scope = ErrorScope::Validation) {
+    if (!device.state.validation) {
+        if (scope == ErrorScope::Always)
+            device.state.beginSynchronous();
         return std::nullopt;
-    const Enum error = device.state.driver.getError();
+    }
+    const Enum error = device.state.readError();
     if (error == 0)
         return std::nullopt;
     return fail(device,
@@ -389,11 +398,17 @@ std::optional<vernon::RhiError> beginErrorScope(OpenGLDevice &device, const char
                 vernon::RhiErrorCode::BackendFailure);
 }
 
+// The first error the scope's operation raised, or zero when the mode leaves its errors to the completion.
+Enum scopeError(OpenGLDevice &device, ErrorScope scope) {
+    if (device.state.validation)
+        return device.state.readError();
+    return scope == ErrorScope::Always ? device.state.endSynchronous() : 0;
+}
+
 std::optional<vernon::RhiError> endErrorScope(OpenGLDevice &device, const char *operation,
-                                              vernon::RhiErrorCode code = vernon::RhiErrorCode::BackendFailure) {
-    if (!device.state.driver.getError)
-        return std::nullopt;
-    const Enum error = device.state.driver.getError();
+                                              vernon::RhiErrorCode code = vernon::RhiErrorCode::BackendFailure,
+                                              ErrorScope scope = ErrorScope::Validation) {
+    const Enum error = scopeError(device, scope);
     if (error == 0)
         return std::nullopt;
     return fail(device, std::string("OpenGL operation '") + operation + "' failed with error " + std::to_string(error),
@@ -517,22 +532,22 @@ void clearOpenGLColor(gl::Driver &driver, uint32_t location, VernonRhiFormat for
 }
 
 vernon::Result<VernonRhiDevice, vernon::RhiError> createOpenGLDeviceImpl(const VernonOpenGLContextCallbacks *callbacks,
-                                                                         bool embeddedProfile) {
-    if (!callbacks)
+                                                                         bool embeddedProfile, uint32_t flags) {
+    if (!callbacks || (flags & ~vernon::rhi::openGLDeviceFlagMask))
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{
-            vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"create_opengl_device", 0, 0}})};
+            vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"create_opengl_device", flags, 0}})};
     auto reservation = devices.reserve();
     if (reservation.isErr())
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(reservation).error())};
     auto owner = reservation.value().retainOwner();
     if (owner.isErr())
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(owner).error())};
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), flags);
     if (commandState.isErr())
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(commandState).error())};
     OpenGLDevice &device = reservation.value().device();
     device.commandState = std::move(commandState).value();
-    if (!device.state.initialize(*callbacks, embeddedProfile, device.error))
+    if (!device.state.initialize(*callbacks, embeddedProfile, vernon::rhi::effectiveDeviceFlags(flags), device.error))
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{
             vernon::err(vernon::RhiError{vernon::RhiErrorCode::BackendFailure, {"initialize_opengl_device", 0, 0}})};
     auto published = devices.publish(std::move(reservation).value());
@@ -546,8 +561,8 @@ vernon::Result<VernonRhiDevice, vernon::RhiError> createOpenGLDeviceImpl(const V
 namespace vernon::rhi::opengl_api {
 
 extern "C" VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
-                                                                       uint32_t embeddedProfile) {
-    return publicHandleBoundary([&] { return createOpenGLDeviceImpl(callbacks, embeddedProfile != 0); },
+                                                                       uint32_t embeddedProfile, uint32_t flags) {
+    return publicHandleBoundary([&] { return createOpenGLDeviceImpl(callbacks, embeddedProfile != 0, flags); },
                                 invalidDevice());
 }
 
@@ -555,15 +570,9 @@ Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDe
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
         return Result<VernonRhiDevice, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", 0, 0}})};
-    if (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE))
-        return Result<VernonRhiDevice, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", descriptor->flags, 0}})};
-    if (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags)
-        return Result<VernonRhiDevice, RhiError>{
-            err(RhiError{RhiErrorCode::InvalidArgument, {"create_owned_opengl_device", descriptor->flags, 0}})};
     if (descriptor->backend == VERNON_RHI_BACKEND_OPENGL || descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES)
-        return createOpenGLDeviceImpl(descriptor->opengl_callbacks,
-                                      descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES);
+        return createOpenGLDeviceImpl(descriptor->opengl_callbacks, descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES,
+                                      descriptor->flags);
     return Result<VernonRhiDevice, RhiError>{err(RhiError{
         RhiErrorCode::Unsupported, {"create_owned_opengl_device", static_cast<uint64_t>(descriptor->backend), 0}})};
 }
@@ -1070,12 +1079,12 @@ Result<void, RhiError> readImageLocked(OpenGLDevice &state, const ImageSlot &slo
 // glReadPixels reports an unsupported format or type only through glGetError and leaves the destination untouched.
 Result<void, RhiError> downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
                                            const VernonRhiImageDownloadDescriptor &download, void *destination) {
-    if (auto scopeError = beginErrorScope(state, "download image"))
+    if (auto scopeError = beginErrorScope(state, "download image", ErrorScope::Always))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     auto read = readImageLocked(state, slot, download, destination);
     if (read.isErr())
         return read;
-    if (auto scopeError = endErrorScope(state, "download image"))
+    if (auto scopeError = endErrorScope(state, "download image", RhiErrorCode::BackendFailure, ErrorScope::Always))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     return read;
 }
@@ -1148,22 +1157,21 @@ Result<void, RhiError> generateImageMipmaps(VernonRhiDevice handle, VernonRhiIma
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"generate_opengl_mipmaps", image.generation, image.index}})};
     state.state.makeCurrent();
-    if (auto scopeError = beginErrorScope(state, "generate image mipmaps"))
+    // glGenerateMipmap reports an unsupported format only through glGetError, so the check runs in every mode.
+    if (auto scopeError = beginErrorScope(state, "generate image mipmaps", ErrorScope::Always))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     state.state.driver.bindTexture(slot->target, slot->image.name);
     state.state.driver.generateMipmap(slot->target);
     state.state.driver.bindTexture(slot->target, 0);
     constexpr Enum invalidOperation = 0x0502;
-    if (state.state.driver.getError) {
-        const Enum error = state.state.driver.getError();
-        if (error != 0)
-            return Result<void, RhiError>{err(fail(
-                state,
-                error == invalidOperation
-                    ? "OpenGL image format does not support mipmap generation (error " + std::to_string(error) + ")"
-                    : "OpenGL mipmap generation failed with error " + std::to_string(error),
-                error == invalidOperation ? RhiErrorCode::Unsupported : RhiErrorCode::BackendFailure))};
-    }
+    const Enum error = scopeError(state, ErrorScope::Always);
+    if (error != 0)
+        return Result<void, RhiError>{err(
+            fail(state,
+                 error == invalidOperation
+                     ? "OpenGL image format does not support mipmap generation (error " + std::to_string(error) + ")"
+                     : "OpenGL mipmap generation failed with error " + std::to_string(error),
+                 error == invalidOperation ? RhiErrorCode::Unsupported : RhiErrorCode::BackendFailure))};
     return Result<void, RhiError>{ok()};
 }
 
@@ -1555,8 +1563,11 @@ Result<bool, RhiError> waitFence(VernonRhiDevice handle, uint64_t retirement, ve
         state.state.driver.clientWaitSync(fence, vernon::rhi::opengl::kSyncFlushCommandsBit, timeout);
     if (release)
         state.state.driver.deleteSync(fence);
-    if (status == vernon::rhi::opengl::kAlreadySignaled || status == vernon::rhi::opengl::kConditionSatisfied)
+    if (status == vernon::rhi::opengl::kAlreadySignaled || status == vernon::rhi::opengl::kConditionSatisfied) {
+        if (auto errors = state.state.takeErrors())
+            return Result<bool, RhiError>{err(fail(state, std::move(*errors), RhiErrorCode::BackendFailure))};
         return Result<bool, RhiError>{ok(true)};
+    }
     if (status == vernon::rhi::opengl::kTimeoutExpired)
         return Result<bool, RhiError>{ok(false)};
     return Result<bool, RhiError>{err(RhiError{RhiErrorCode::BackendFailure, {"wait_opengl_fence", retirement, 0}})};
@@ -1754,21 +1765,14 @@ Result<CommandTransient, RhiError> writeTransient(VernonRhiDevice handle, uint64
     return Written{ok(CommandTransient{chunk->buffer.name, offset})};
 }
 
-// GL buffers are not mapped, so every block is placed with its bytes.
-Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
-                                                  uint64_t alignment) noexcept {
+// Takes a block of the persistent pool, with the device mutex held and its context current, and uploads `data` into it
+// unless it is null.
+Result<PersistentBlock, RhiError> acquirePersistentBlock(OpenGLDevice &state, const void *data, uint64_t size,
+                                                         uint64_t alignment, const char *operation) noexcept {
     using Placed = Result<PersistentBlock, RhiError>;
-    auto device = lookupDevice(handle);
-    if (device.isErr())
-        return Placed{err(std::move(device).error())};
-    if (!data)
-        return Placed{err(RhiError{RhiErrorCode::Unsupported, {"place_opengl_persistent", size, 0}})};
     if (!size || !alignment || (alignment & (alignment - 1)) != 0 || size > (std::numeric_limits<size_t>::max)() ||
         alignment > (std::numeric_limits<size_t>::max)())
-        return Placed{err(RhiError{RhiErrorCode::InvalidArgument, {"place_opengl_persistent", size, 0}})};
-    OpenGLDevice &state = device.value().device();
-    std::lock_guard<std::mutex> guard(state.mutex);
-    state.state.makeCurrent();
+        return Placed{err(RhiError{RhiErrorCode::InvalidArgument, {operation, size, 0}})};
     size_t offset{};
     uint64_t key{};
     TransientChunk *chunk{};
@@ -1782,12 +1786,60 @@ Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const 
     } catch (const std::bad_alloc &) {
     }
     if (!chunk)
-        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_opengl_persistent", size, 0}})};
-    if (!state.state.uploadBuffer(chunk->buffer, offset, data, static_cast<size_t>(size), state.error)) {
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {operation, size, 0}})};
+    if (data && !state.state.uploadBuffer(chunk->buffer, offset, data, static_cast<size_t>(size), state.error)) {
         state.persistentBlocks.release(key);
-        return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_opengl_persistent", size, 0}})};
+        return Placed{err(RhiError{RhiErrorCode::BackendFailure, {operation, size, 0}})};
     }
     return Placed{ok(PersistentBlock{chunk->buffer.name, offset, nullptr, key})};
+}
+
+// GL buffers are not mapped, so every block is placed with its bytes.
+Result<PersistentBlock, RhiError> placePersistent(VernonRhiDevice handle, const void *data, uint64_t size,
+                                                  uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Placed{err(std::move(device).error())};
+    if (!data)
+        return Placed{err(RhiError{RhiErrorCode::Unsupported, {"place_opengl_persistent", size, 0}})};
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    return acquirePersistentBlock(state, data, size, alignment, "place_opengl_persistent");
+}
+
+// GL orders `glBufferSubData` after the commands that read the buffer before it, so updatable blocks share the
+// persistent pool and a write is an upload.
+Result<PersistentBlock, RhiError> placeUpdatable(VernonRhiDevice handle, uint64_t size, uint64_t alignment) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<PersistentBlock, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    return acquirePersistentBlock(state, nullptr, size, alignment, "place_opengl_updatable");
+}
+
+Result<void, RhiError> writeUpdatable(VernonRhiDevice handle, uint64_t, uint64_t native, const PersistentBlock &block,
+                                      const void *data, uint64_t size) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return Result<void, RhiError>{err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    if (native != reinterpret_cast<uintptr_t>(&state.state) || !block.buffer || !data ||
+        size > (std::numeric_limits<size_t>::max)())
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_opengl_updatable", native, 0}})};
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    Buffer buffer;
+    buffer.name = static_cast<Uint>(block.buffer);
+    if (!state.state.uploadBuffer(buffer, static_cast<size_t>(block.offset), data, static_cast<size_t>(size),
+                                  state.error))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"write_opengl_updatable", native, 0}})};
+    return Result<void, RhiError>{ok()};
 }
 
 void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
@@ -2081,7 +2133,7 @@ Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint
         if (!storage) {
             storage = reinterpret_cast<uintptr_t>(new OpenGLTimers{});
             // Reading the disjoint flag clears it, so that only disjoint events during these timers invalidate them.
-            if (state.state.embeddedProfile) {
+            if (state.state.disjointQueryable) {
                 Int disjoint = 0;
                 state.state.driver.getIntegerv(gl::kGpuDisjoint, &disjoint);
             }
@@ -2090,7 +2142,8 @@ Result<void, RhiError> recordTimer(VernonRhiDevice handle, uint64_t native, uint
         const size_t query = size_t{timer} * 2 + (edge == TimerEdge::End ? 1 : 0);
         if (timers.queries.size() <= query)
             timers.queries.resize(size_t{timer} * 2 + 2);
-        state.state.driver.genQueries(1, &timers.queries[query]);
+        if (!timers.queries[query])
+            timers.queries[query] = state.state.acquireQuery();
         state.state.driver.queryCounter(timers.queries[query], gl::kTimestamp);
     } catch (const std::bad_alloc &) {
         return Result<void, RhiError>{
@@ -2117,7 +2170,7 @@ Result<void, RhiError> readTimers(VernonRhiDevice handle, uint64_t storage, uint
                                                &spans[timer].end_nanoseconds);
     }
     Int disjoint = 0;
-    if (state.state.embeddedProfile)
+    if (state.state.disjointQueryable)
         state.state.driver.getIntegerv(gl::kGpuDisjoint, &disjoint);
     if (disjoint)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"read_opengl_timers_disjoint", 0, 0}})};
@@ -2131,8 +2184,12 @@ void releaseTimers(VernonRhiDevice handle, uint64_t storage) noexcept {
         return;
     OpenGLDevice &state = device.value().device();
     std::lock_guard<std::mutex> guard(state.mutex);
-    state.state.makeCurrent();
-    state.state.driver.deleteQueries(static_cast<Size>(timers->queries.size()), timers->queries.data());
+    try {
+        state.state.releaseQueries(timers->queries);
+    } catch (const std::bad_alloc &) {
+        state.state.makeCurrent();
+        state.state.driver.deleteQueries(static_cast<Size>(timers->queries.size()), timers->queries.data());
+    }
 }
 
 Result<void, RhiError> clearColor(VernonRhiDevice handle, uint64_t native, const RenderingScope &scope,
@@ -2618,6 +2675,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         result.writeTransient.emplace(writeTransient);
         result.placePersistent.emplace(placePersistent);
         result.releasePersistent.emplace(releasePersistent);
+        result.placeUpdatable.emplace(placeUpdatable);
+        result.writeUpdatable.emplace(writeUpdatable);
+        result.releaseUpdatable.emplace(releasePersistent);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);
@@ -2641,4 +2701,23 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         return result;
     }();
     return dispatch;
+}
+
+vernon::rhi::OpenGLCallStats vernon::rhi::getOpenGLCallStats(VernonRhiDevice handle) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return {};
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    return state.state.stats;
+}
+
+void vernon::rhi::raiseOpenGLError(VernonRhiDevice handle) {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return;
+    OpenGLDevice &state = device.value().device();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.state.makeCurrent();
+    state.state.driver.enable(0);
 }

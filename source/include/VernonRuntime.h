@@ -197,6 +197,7 @@ typedef struct VernonDrawCommand {
     uint32_t struct_size;
     const VernonIndexBinding *index_binding;
     uint32_t vertex_count;
+    /* A draw of no instances draws nothing and reads no instance records. */
     uint32_t instance_count;
     /* `instance_index` equals first_instance plus the instance ordinal on every backend. */
     uint32_t first_instance;
@@ -750,17 +751,44 @@ typedef struct VernonGraphicsCommand {
     };
 } VernonGraphicsCommand;
 
-/* Appends to the recording of graphics Node `node`, whose draw control must be an invocation control. Validation runs
- * at Execute; `leases` keep index buffers alive until the invocation completes. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationRecordGraphics(
-    VernonProgramInvocation *invocation, VernonProgramNodeId node, const VernonGraphicsCommand *commands,
-    size_t command_count, const VernonProgramResourceLease *leases, size_t lease_count);
+/*
+ * A recording (specs/runtime/stored_plans.md section 4) holds the commands of graphics Node `node`, whose draw control
+ * must be an invocation control, for Program instance `instance`. It persists across invocations: an invocation that
+ * binds it draws its current commands. Validation runs at the first Execute after an edit and is kept until the next
+ * edit. A recording is externally synchronized: it is not edited while an Execute of an invocation bound to it runs.
+ * Executes already submitted keep what they drew, so editing or destroying a recording never waits for them.
+ */
+typedef struct VernonGraphicsRecording VernonGraphicsRecording;
+
+VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeGraphicsRecordingCreate(VernonProgramInstance *instance,
+                                                                                      VernonProgramNodeId node,
+                                                                                      VernonGraphicsRecording **output);
+VERNON_RUNTIME_CAPI void vernonRuntimeGraphicsRecordingDestroy(VernonGraphicsRecording *recording);
+/* Removes every command and lease. */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingReset(VernonGraphicsRecording *recording);
+/* Appends commands; `leases` keep index buffers alive until the recording is reset or destroyed and every Execute
+ * that drew them completes. Nothing is appended when any command is invalid. */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingAppend(VernonGraphicsRecording *recording,
+                                                                      const VernonGraphicsCommand *commands,
+                                                                      size_t command_count,
+                                                                      const VernonProgramResourceLease *leases,
+                                                                      size_t lease_count);
+/* Replaces command `index` with `command` of the same kind, which must be a viewport, scissor, stencil reference or
+ * draw. A draw keeps whether it is indexed and its index buffer; only its counts, offsets and first elements change. */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingSetCommand(VernonGraphicsRecording *recording,
+                                                                          size_t index,
+                                                                          const VernonGraphicsCommand *command);
+/* Makes the invocation's Execute draw the recording in its graphics Node. The recording must belong to the
+ * invocation's instance; binding another recording of the same Node replaces it. */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRecording(VernonProgramInvocation *invocation,
+                                                                             VernonGraphicsRecording *recording);
 
 typedef struct VernonProgramGraphicsNodeTelemetry {
     uint32_t struct_size;
     uint64_t render_scopes;
     uint64_t pipeline_binds;
     uint64_t set_binds;
+    /* The draws of at least one instance. */
     uint64_t draws;
 } VernonProgramGraphicsNodeTelemetry;
 

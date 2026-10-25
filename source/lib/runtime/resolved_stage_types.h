@@ -14,10 +14,6 @@ struct VernonStageInvocationDescriptor {
     size_t argument_count;
     VernonLaunchSize compute_grid;
     VernonRuntimeProviderObject command_encoder;
-    const VernonGraphicsState *graphics_state;
-    const VernonRenderPass *render_pass;
-    const VernonDrawCommand *draw_command;
-    const VernonDynamicState *dynamic_state;
 };
 
 #endif

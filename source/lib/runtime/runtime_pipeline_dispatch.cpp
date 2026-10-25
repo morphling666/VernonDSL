@@ -92,46 +92,45 @@ void destroyBackendPipeline(VernonStageExecutable &pipeline) {
     destroyRuntimeBackendState(pipeline);
 }
 
-RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                           const GraphicsCommand &command, GraphicsStream &stream) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA)
         return RuntimeResult<void>{vernon::ok()};
     if (pipeline.context->backend == VERNON_RUNTIME_VULKAN)
-        return invocationResult(invokeVulkanGraphicsPipeline(pipeline, commands, command, stream),
+        return invocationResult(invokeVulkanGraphicsPipeline(pipeline, packets, command, stream),
                                 "invoke_vulkan_graphics");
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return invocationResult(invokeDirectX12GraphicsPipeline(pipeline, commands, command, stream),
+        return invocationResult(invokeDirectX12GraphicsPipeline(pipeline, packets, command, stream),
                                 "invoke_directx12_graphics");
     if (pipeline.context->backend == VERNON_RUNTIME_METAL)
-        return invocationResult(invokeMetalGraphicsPipeline(pipeline, commands, command, stream),
+        return invocationResult(invokeMetalGraphicsPipeline(pipeline, packets, command, stream),
                                 "invoke_metal_graphics");
-    return invocationResult(invokeOpenGLGraphicsPipeline(pipeline, commands, command, stream),
-                            "invoke_opengl_graphics");
+    return invocationResult(invokeOpenGLGraphicsPipeline(pipeline, packets, command, stream), "invoke_opengl_graphics");
 }
 
 RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, CommandStream &stream,
                                                  const PlannedComputeLaunch &plan, const ArgumentOwner *owners) {
-    VernonRuntimeCoreCommands *commands = stream.commands();
+    VernonRuntimeCorePackets *packets = stream.packets();
     GroupStore &transient = stream.transient();
     if (pipeline.context->backend == VERNON_RUNTIME_CPU)
-        return invocationResult(invokeCpuComputePipeline(pipeline, commands, transient, plan, owners),
+        return invocationResult(invokeCpuComputePipeline(pipeline, packets, transient, plan, owners),
                                 "invoke_cpu_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_CUDA)
-        return invocationResult(invokeCudaComputePipeline(pipeline, commands, transient, plan, owners),
+        return invocationResult(invokeCudaComputePipeline(pipeline, packets, transient, plan, owners),
                                 "invoke_cuda_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_VULKAN)
-        return invocationResult(invokeVulkanComputePipeline(pipeline, commands, transient, plan, owners),
+        return invocationResult(invokeVulkanComputePipeline(pipeline, packets, transient, plan, owners),
                                 "invoke_vulkan_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return invocationResult(invokeDirectX12ComputePipeline(pipeline, commands, transient, plan, owners),
+        return invocationResult(invokeDirectX12ComputePipeline(pipeline, packets, transient, plan, owners),
                                 "invoke_directx12_compute");
     if (pipeline.context->backend == VERNON_RUNTIME_METAL)
-        return invocationResult(invokeMetalComputePipeline(pipeline, commands, transient, plan, owners),
+        return invocationResult(invokeMetalComputePipeline(pipeline, packets, transient, plan, owners),
                                 "invoke_metal_compute");
     if (!isOpenGLBackend(pipeline.context->backend))
         return RuntimeResult<void>{
             vernon::err(vernon::RuntimeError{vernon::RuntimeErrorCode::Unsupported, {"invoke_compute", 0, 0}})};
-    return invocationResult(invokeOpenGLComputePipeline(pipeline, commands, transient, plan, owners),
+    return invocationResult(invokeOpenGLComputePipeline(pipeline, packets, transient, plan, owners),
                             "invoke_opengl_compute");
 }
 

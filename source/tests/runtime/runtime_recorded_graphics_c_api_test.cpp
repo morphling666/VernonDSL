@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -178,7 +179,7 @@ public:
     PassInvocation(VernonProgramExecutable *executable, VernonProgramInstance *instance, const DrawTarget &target,
                    std::initializer_list<VernonProgramArgument> arguments, VernonRuntimeProviderLoadOperation load,
                    bool recorded, uint32_t instances = 1)
-        : invocation_(vernonRuntimeProgramInstanceBeginInvocation(instance)) {
+        : instance_(instance), invocation_(vernonRuntimeProgramInstanceBeginInvocation(instance)) {
         EXPECT_NE(invocation_, nullptr);
         EXPECT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls_),
                   VERNON_STATUS_OK);
@@ -227,15 +228,27 @@ public:
     }
     PassInvocation(const PassInvocation &) = delete;
     PassInvocation &operator=(const PassInvocation &) = delete;
-    ~PassInvocation() { vernonRuntimeProgramInvocationDestroy(invocation_); }
+    ~PassInvocation() {
+        vernonRuntimeProgramInvocationDestroy(invocation_);
+        vernonRuntimeGraphicsRecordingDestroy(recording_);
+    }
 
     VernonProgramInvocation *handle() const { return invocation_; }
     VernonProgramNodeId node() const { return controls_.node; }
     uint32_t renderPassControl() const { return controls_.render_pass_control; }
 
+    // Appends to the invocation's recording, which the first call creates and binds.
     VernonStatus record(const std::vector<VernonGraphicsCommand> &commands) {
-        return vernonRuntimeProgramInvocationRecordGraphics(invocation_, controls_.node, commands.data(),
-                                                            commands.size(), nullptr, 0);
+        if (!recording_) {
+            EXPECT_EQ(vernonRuntimeGraphicsRecordingCreate(instance_, controls_.node, &recording_),
+                      VERNON_RUNTIME_OPERATION_OK);
+            EXPECT_EQ(vernonRuntimeProgramInvocationBindRecording(invocation_, recording_), VERNON_STATUS_OK);
+        }
+        return vernonRuntimeGraphicsRecordingAppend(recording_, commands.data(), commands.size(), nullptr, 0);
+    }
+
+    VernonStatus bind(VernonGraphicsRecording *recording) {
+        return vernonRuntimeProgramInvocationBindRecording(invocation_, recording);
     }
 
     VernonStatus setCompletionMode(VernonCompletionMode mode) {
@@ -262,7 +275,9 @@ public:
     }
 
 private:
+    VernonProgramInstance *instance_;
     VernonProgramInvocation *invocation_;
+    VernonGraphicsRecording *recording_{};
     VernonProgramGraphicsControlsView controls_{};
     VernonColorAttachment attachment_{};
 };
@@ -315,6 +330,13 @@ VernonGraphicsCommand draw(uint32_t vertexCount, uint32_t firstInstance = 0) {
     VernonGraphicsCommand command{};
     command.kind = VERNON_GRAPHICS_COMMAND_DRAW;
     command.draw = {sizeof(VernonDrawCommand), nullptr, vertexCount, 1, firstInstance};
+    return command;
+}
+
+VernonGraphicsCommand scissor(const std::array<uint32_t, 4> &rect) {
+    VernonGraphicsCommand command{};
+    command.kind = VERNON_GRAPHICS_COMMAND_SET_SCISSOR;
+    std::copy(rect.begin(), rect.end(), command.rect);
     return command;
 }
 
@@ -913,6 +935,8 @@ protected:
     }
 
     void TearDown() override {
+        for (VernonGraphicsRecording *owned : recordings_)
+            vernonRuntimeGraphicsRecordingDestroy(owned);
         for (const vernon::tests::RhiSampler &owned : samplers_)
             EXPECT_EQ(vernonRhiDeviceDestroySampler(runtime().device, owned.handle), VERNON_RHI_STATUS_OK);
         for (VernonBindingSet *set : sets_)
@@ -976,6 +1000,21 @@ protected:
             << lastError(runtime().runtime);
         if (result)
             pipelines_.push_back(result);
+        return result;
+    }
+
+    VernonGraphicsRecording *recording(VernonProgramExecutable *pass, VernonProgramInstance *passInstance,
+                                       const std::vector<VernonGraphicsCommand> &commands) {
+        VernonGraphicsRecording *result = nullptr;
+        EXPECT_EQ(vernonRuntimeGraphicsRecordingCreate(passInstance, graphicsNode(pass), &result),
+                  VERNON_RUNTIME_OPERATION_OK)
+            << lastError(runtime().runtime);
+        if (!result)
+            return nullptr;
+        recordings_.push_back(result);
+        EXPECT_EQ(vernonRuntimeGraphicsRecordingAppend(result, commands.data(), commands.size(), nullptr, 0),
+                  VERNON_STATUS_OK)
+            << lastError(runtime().runtime);
         return result;
     }
 
@@ -1043,6 +1082,7 @@ protected:
     std::vector<VernonProgramInstance *> instances_;
     std::vector<VernonGraphicsPipeline *> pipelines_;
     std::vector<VernonBindingSet *> sets_;
+    std::vector<VernonGraphicsRecording *> recordings_;
     std::vector<RhiBuffer> buffers_;
     std::vector<vernon::tests::RhiSampler> samplers_;
     RhiBuffer left_;
@@ -1432,6 +1472,234 @@ TEST_P(RuntimeRecordedSurfaceMatrix, ResourcesWrittenByTheInvocationAreHazards) 
         ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
         EXPECT_TRUE(nearPixel(pixelAt(target.pixels(), kLeftX, kMiddleY), {255, 0, 0, 255}));
     }
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, StoredScopesDrawTheHostValuesOfEachInvocation) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsRecording *recorded = recording(pass, passInstance, {bindPipeline(nullptr), draw(3)});
+    ASSERT_NE(recorded, nullptr);
+    Target target(runtime());
+    for (const bool record : {false, true})
+        for (const bool blue : {false, true, false, true}) {
+            PassInvocation invocation(pass, passInstance, target,
+                                      {vertices(pass, left_), tint(pass, blue ? kBlue : kRed)},
+                                      VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, record);
+            if (record)
+                ASSERT_EQ(invocation.bind(recorded), VERNON_STATUS_OK) << lastError(runtime().runtime);
+            ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+            EXPECT_TRUE(nearPixel(pixelAt(target.pixels(), kLeftX, kMiddleY),
+                                  blue ? Pixel{0, 0, 255, 255} : Pixel{255, 0, 0, 255}))
+                << (record ? "recorded" : "unrecorded") << (blue ? " blue" : " red");
+        }
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, PersistentRecordingDrawsItsCurrentCommandsInEveryInvocation) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *passPipeline = pipeline(pass, nullptr);
+    ASSERT_NE(passPipeline, nullptr);
+    VernonBindingSet *red = set(passPipeline, {vertices(pass, left_), tint(pass, kRed)});
+    VernonBindingSet *blue = set(passPipeline, {vertices(pass, right_), tint(pass, kBlue)});
+    VernonGraphicsRecording *recorded = recording(
+        pass, passInstance,
+        {bindPipeline(passPipeline), bindSet(red), draw(3), bindSet(blue), scissor({0, 0, kExtent, kExtent}), draw(3)});
+    ASSERT_NE(recorded, nullptr);
+
+    Target target(runtime());
+    const auto drawRecording = [&](uint32_t draws, const Pixel &left, const Pixel &right) {
+        PassInvocation invocation(pass, passInstance, target, {vertices(pass, left_), tint(pass, kRed)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        ASSERT_EQ(invocation.bind(recorded), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.telemetry().draws, draws);
+        const std::vector<uint8_t> pixels = target.pixels();
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), left));
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), right));
+    };
+    drawRecording(2, {255, 0, 0, 255}, {0, 0, 255, 255});
+    drawRecording(2, {255, 0, 0, 255}, {0, 0, 255, 255});
+
+    const VernonGraphicsCommand leftHalf = scissor({0, 0, kExtent / 2, kExtent});
+    ASSERT_EQ(vernonRuntimeGraphicsRecordingSetCommand(recorded, 4, &leftHalf), VERNON_STATUS_OK)
+        << lastError(runtime().runtime);
+    drawRecording(2, {255, 0, 0, 255}, {0, 0, 0, 255});
+
+    ASSERT_EQ(vernonRuntimeGraphicsRecordingReset(recorded), VERNON_STATUS_OK);
+    const std::vector<VernonGraphicsCommand> blueOnly{bindPipeline(passPipeline), bindSet(blue), draw(3)};
+    ASSERT_EQ(vernonRuntimeGraphicsRecordingAppend(recorded, blueOnly.data(), blueOnly.size(), nullptr, 0),
+              VERNON_STATUS_OK);
+    drawRecording(1, {0, 0, 0, 255}, {0, 0, 255, 255});
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, StoredScopesDrawTheEditedValuesOfTheirRecording) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *passPipeline = pipeline(pass, nullptr);
+    ASSERT_NE(passPipeline, nullptr);
+    VernonBindingSet *red = set(passPipeline, {vertices(pass, left_), tint(pass, kRed)});
+    VernonBindingSet *blue = set(passPipeline, {vertices(pass, right_), tint(pass, kBlue)});
+    VernonGraphicsRecording *recorded = recording(
+        pass, passInstance,
+        {bindPipeline(passPipeline), bindSet(red), draw(3), bindSet(blue), scissor({0, 0, kExtent, kExtent}), draw(3)});
+    ASSERT_NE(recorded, nullptr);
+
+    Target target(runtime());
+    const auto drawRecording = [&](uint64_t draws, const Pixel &left, const Pixel &right) {
+        PassInvocation invocation(pass, passInstance, target, {vertices(pass, left_), tint(pass, kRed)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        ASSERT_EQ(invocation.bind(recorded), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(invocation.telemetry().draws, draws);
+        const std::vector<uint8_t> pixels = target.pixels();
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), left));
+        EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), right));
+    };
+    const Pixel black{0, 0, 0, 255};
+    const Pixel redPixel{255, 0, 0, 255};
+    const Pixel bluePixel{0, 0, 255, 255};
+    VernonGraphicsCommand none = draw(3);
+    none.draw.instance_count = 0;
+    const VernonGraphicsCommand some = draw(3);
+    const VernonGraphicsCommand leftHalf = scissor({0, 0, kExtent / 2, kExtent});
+    const VernonGraphicsCommand whole = scissor({0, 0, kExtent, kExtent});
+    drawRecording(2, redPixel, bluePixel);
+    for (const auto &[at, command, draws, left, right] :
+         std::vector<std::tuple<size_t, const VernonGraphicsCommand *, uint64_t, Pixel, Pixel>>{
+             {5, &none, 1, redPixel, black},
+             {5, &some, 2, redPixel, bluePixel},
+             {2, &none, 1, black, bluePixel},
+             {4, &leftHalf, 1, black, black},
+             {2, &some, 2, redPixel, black},
+             {4, &whole, 2, redPixel, bluePixel}}) {
+        ASSERT_EQ(vernonRuntimeGraphicsRecordingSetCommand(recorded, at, command), VERNON_STATUS_OK)
+            << lastError(runtime().runtime);
+        drawRecording(draws, left, right);
+        drawRecording(draws, left, right);
+    }
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, SetCommandOnlyReplacesPayload) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    VernonGraphicsPipeline *passPipeline = pipeline(pass, nullptr);
+    ASSERT_NE(passPipeline, nullptr);
+    VernonBindingSet *red = set(passPipeline, {vertices(pass, left_), tint(pass, kRed)});
+    VernonBindingSet *blue = set(passPipeline, {vertices(pass, right_), tint(pass, kBlue)});
+    // The first triangle is degenerate.
+    const RhiBuffer indices = buffer(std::array<uint32_t, 6>{0, 0, 0, 0, 1, 2}, VERNON_RHI_BUFFER_INDEX);
+    const RhiBuffer otherIndices = buffer(std::array<uint32_t, 3>{0, 1, 2}, VERNON_RHI_BUFFER_INDEX);
+    const VernonIndexBinding degenerate = indexBinding(indices.reference, 0, 0);
+    VernonGraphicsRecording *recorded =
+        recording(pass, passInstance,
+                  {bindPipeline(passPipeline), bindSet(red), draw(1), bindSet(blue), drawIndexed(degenerate)});
+    ASSERT_NE(recorded, nullptr);
+
+    VernonGraphicsCommand viewport{};
+    viewport.kind = VERNON_GRAPHICS_COMMAND_SET_VIEWPORT;
+    const VernonIndexBinding otherIndex = indexBinding(otherIndices.reference, 0, 0);
+    const VernonGraphicsCommand pipelineBind = bindPipeline(passPipeline);
+    const VernonGraphicsCommand indexedDraw = drawIndexed(degenerate);
+    const VernonGraphicsCommand otherIndexedDraw = drawIndexed(otherIndex);
+    const VernonGraphicsCommand triangle = draw(3);
+    for (const auto &[command, at, failure] :
+         std::vector<std::tuple<const VernonGraphicsCommand *, size_t, std::string>>{
+             {&triangle, 5, "invalid graphics recording command update"},
+             {&pipelineBind, 0,
+              "graphics recording command 0 can only be replaced by a viewport, scissor, stencil reference or draw"},
+             {&viewport, 2, "graphics recording command 2 cannot change its kind"},
+             {&indexedDraw, 2, "graphics recording command 2 cannot change whether it is indexed or its index buffer"},
+             {&otherIndexedDraw, 4,
+              "graphics recording command 4 cannot change whether it is indexed or its index buffer"},
+             {&triangle, 4, "graphics recording command 4 cannot change whether it is indexed or its index buffer"}}) {
+        EXPECT_EQ(vernonRuntimeGraphicsRecordingSetCommand(recorded, at, command), VERNON_STATUS_INVALID_ARGUMENT);
+        EXPECT_EQ(lastError(runtime().runtime), failure);
+    }
+    ASSERT_EQ(vernonRuntimeGraphicsRecordingSetCommand(recorded, 2, &triangle), VERNON_STATUS_OK);
+    const VernonIndexBinding shifted = indexBinding(indices.reference, 3 * sizeof(uint32_t), 0);
+    const VernonGraphicsCommand shiftedDraw = drawIndexed(shifted);
+    ASSERT_EQ(vernonRuntimeGraphicsRecordingSetCommand(recorded, 4, &shiftedDraw), VERNON_STATUS_OK);
+
+    Target target(runtime());
+    PassInvocation invocation(pass, passInstance, target, {vertices(pass, right_), tint(pass, kBlue)},
+                              VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+    ASSERT_EQ(invocation.bind(recorded), VERNON_STATUS_OK);
+    ASSERT_EQ(invocation.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+    EXPECT_EQ(invocation.telemetry().draws, 2u);
+    const std::vector<uint8_t> pixels = target.pixels();
+    EXPECT_TRUE(nearPixel(pixelAt(pixels, kLeftX, kMiddleY), {255, 0, 0, 255}));
+    EXPECT_TRUE(nearPixel(pixelAt(pixels, kRightX, kMiddleY), {0, 0, 255, 255}));
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, RecordingsBelongToOneInstanceAndGraphicsNode) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_opaque_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *owner = instance(pass);
+    VernonProgramInstance *other = instance(pass);
+    ASSERT_NE(owner, nullptr);
+    ASSERT_NE(other, nullptr);
+    VernonGraphicsRecording *invalid = nullptr;
+    const VernonProgramNodeId node = graphicsNode(pass);
+    EXPECT_EQ(vernonRuntimeGraphicsRecordingCreate(owner, node + 1000, &invalid),
+              VERNON_RUNTIME_OPERATION_INVALID_ARGUMENT);
+    EXPECT_EQ(invalid, nullptr);
+    EXPECT_EQ(lastError(runtime().runtime), "graphics recording Node " + std::to_string(node + 1000) +
+                                                " is not a resolved graphics Node of the executable");
+
+    VernonGraphicsRecording *recorded = recording(pass, owner, {bindPipeline(nullptr), draw(3)});
+    ASSERT_NE(recorded, nullptr);
+    Target target(runtime());
+    PassInvocation foreign(pass, other, target, {vertices(pass, left_), tint(pass, kRed)},
+                           VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+    EXPECT_EQ(foreign.bind(recorded), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(lastError(runtime().runtime), "graphics recording belongs to another Program instance");
+    PassInvocation owned(pass, owner, target, {vertices(pass, left_), tint(pass, kRed)},
+                         VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+    ASSERT_EQ(owned.bind(recorded), VERNON_STATUS_OK) << lastError(runtime().runtime);
+    ASSERT_EQ(owned.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+    EXPECT_TRUE(nearPixel(pixelAt(target.pixels(), kLeftX, kMiddleY), {255, 0, 0, 255}));
+}
+
+TEST_P(RuntimeRecordedSurfaceMatrix, ValidatedRecordingsAreCheckedForHazardsByEveryExecute) {
+    VernonProgramExecutable *pass = resolve("recorded_graphics_scratch_writing_pass");
+    ASSERT_NE(pass, nullptr);
+    VernonProgramInstance *passInstance = instance(pass);
+    ASSERT_NE(passInstance, nullptr);
+    const RhiBuffer scratch = buffer(kLeftTriangle, VERNON_RHI_BUFFER_VERTEX | VERNON_RHI_BUFFER_STORAGE);
+    const RhiBuffer elsewhere = buffer(kLeftTriangle, VERNON_RHI_BUFFER_VERTEX | VERNON_RHI_BUFFER_STORAGE);
+    VernonGraphicsPipeline *passPipeline = pipeline(pass, nullptr);
+    ASSERT_NE(passPipeline, nullptr);
+    VernonBindingSet *aliased = set(passPipeline, {vertices(pass, scratch)});
+    VernonGraphicsRecording *recorded =
+        recording(pass, passInstance, {bindPipeline(passPipeline), bindSet(aliased), draw(3)});
+    ASSERT_NE(recorded, nullptr);
+
+    Target target(runtime());
+    const auto execute = [&](const RhiBuffer &written, VernonStatus status, const std::string &error) {
+        PassInvocation invocation(pass, passInstance, target,
+                                  {vertices(pass, left_),
+                                   verticesArgument(findParameter(pass, "scratch"), written.reference),
+                                   tint(pass, kRed)},
+                                  VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, true);
+        EXPECT_EQ(invocation.bind(recorded), VERNON_STATUS_OK);
+        EXPECT_EQ(invocation.run(), status) << lastError(runtime().runtime);
+        if (status != VERNON_STATUS_OK)
+            EXPECT_EQ(lastError(runtime().runtime), error);
+    };
+    execute(elsewhere, VERNON_STATUS_OK, {});
+    execute(scratch, VERNON_STATUS_INVALID_ARGUMENT,
+            "PROGRAM_BINDING_SET_HAZARD at node " + std::to_string(graphicsNode(pass)) +
+                ".commands[1].vertices: resource is written by a Node of the same "
+                "invocation");
+    execute(elsewhere, VERNON_STATUS_OK, {});
 }
 
 VernonSubmission *submitAsynchronously(PassInvocation &invocation, VernonRuntimeContext *context) {

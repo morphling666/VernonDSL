@@ -53,31 +53,31 @@ BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, con
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                           const GraphicsCommand &command, GraphicsStream &stream) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     return invokeRhiGraphicsPipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanGraphics,
-                                     commands, command, stream,
+                                     packets, command, stream,
                                      runtimeBackendState<VulkanPipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
     (void)command;
     (void)stream;
-    (void)commands;
+    (void)packets;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }
 
-VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                          GroupStore &transient, const PlannedComputeLaunch &launch,
                                          const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanCompute,
-                                    pipeline.bindingProjection, commands, transient, launch, owners,
+                                    pipeline.bindingProjection, packets, transient, launch, owners,
                                     runtimeBackendState<VulkanPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
-    (void)commands;
+    (void)packets;
     (void)transient;
     (void)launch;
     (void)owners;

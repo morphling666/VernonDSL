@@ -172,6 +172,10 @@ struct VERNON_RHI_CAPI DeviceState {
     bool placePersistent(VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
                          uint8_t *&mapped, uint64_t &key, std::string &error);
     void releasePersistent(uint64_t key);
+    // Updatable blocks live in device-local chunks that transfers write.
+    bool placeUpdatable(VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
+                        uint64_t &key, std::string &error);
+    void releaseUpdatable(uint64_t key);
     // A descriptor set owned by the frame recording `command`, valid until that frame retires.
     bool allocateFrameDescriptorSet(VkCommandBuffer command, VkDescriptorSetLayout layout, VkDescriptorSet &set,
                                     std::string &error);
@@ -230,6 +234,7 @@ struct VERNON_RHI_CAPI DeviceState {
     StagingPool<StagingChunk> uploadStaging;
     StagingPool<StagingChunk> readbackStaging;
     BlockPool<StagingChunk> persistentBlocks;
+    BlockPool<StagingChunk> updatableBlocks;
     uint64_t submittedSerial{};
     uint64_t completedSerial{};
     bool deviceLost{};

@@ -185,10 +185,17 @@ higher cost.
 ## 7. Recording
 
 ```c
-vernonRuntimeProgramInvocationRecordGraphics(invocation, node, commands, count, leases, lease_count);
+vernonRuntimeGraphicsRecordingCreate(instance, node, &recording);
+vernonRuntimeGraphicsRecordingAppend(recording, commands, count, leases, lease_count);
+vernonRuntimeGraphicsRecordingSetCommand(recording, index, &command);
+vernonRuntimeGraphicsRecordingReset(recording);
+vernonRuntimeProgramInvocationBindRecording(invocation, recording);
+vernonRuntimeGraphicsRecordingDestroy(recording);
 ```
 
-`commands` is an array of tagged records appended to the Node's recording:
+A recording belongs to one Program instance and one graphics Node and
+outlives invocations ([`../runtime/stored_plans.md`](../runtime/stored_plans.md)
+section 4). `commands` is an array of tagged records appended to it:
 
 | Command | Members |
 |---|---|
@@ -200,8 +207,11 @@ vernonRuntimeProgramInvocationRecordGraphics(invocation, node, commands, count, 
 | `pop_debug_group` | none |
 
 A recorded draw is the same `VernonDrawCommand` the draw control binds, with
-the same validation and the same meaning of 0 counts (inferred from vertex
-inputs), so one draw description serves both forms.
+the same validation and the same meaning of 0 counts, so one draw description
+serves both forms: a `vertex_count` of 0 is inferred from the per-vertex
+inputs, and an `instance_count` of 0 draws nothing and reads no instance
+records. A renderer culls a draw by setting its instance count to 0 with
+`SetCommand`, which keeps the recording's structure.
 
 Blend constants are absent because no blend factor reads one; they join the
 dynamic state together with constant blend factors.
@@ -231,12 +241,29 @@ Rules:
   be written by any Node of the same invocation. Anything a Node writes is a
   fixed endpoint bound through ordinary accesses, which keeps the hazard plan
   static.
-- Validation runs once at invocation entry, linear in the command count,
-  before any native command is recorded. Recording belongs to the invocation
-  transaction; failure follows the ordinary rollback rules, and recorded
-  leases are retained until completion.
-- Recordings are invocation-local. A new invocation starts with an empty
-  recording.
+- An invocation draws the recordings bound to it, at most one per Node.
+  Validation runs at invocation entry, linear in the command count, before
+  any native command is recorded, and only for a recording edited since its
+  last validation or validated against a different initial dynamic state.
+  The hazard rule above depends on what each invocation writes, so every
+  Execute checks it, once per distinct set and index buffer, against the
+  whole index view a draw names. Failure follows the ordinary rollback rules.
+- `SetCommand` replaces a viewport, scissor, stencil reference or draw with
+  one of the same kind; a draw keeps whether it is indexed and its index
+  buffer. Structure changes go through `Reset` and `Append`.
+- A recording is its structure (pipelines, sets, index buffers, debug
+  commands) and its draw values (each draw's counts, offsets and dynamic
+  state). `SetCommand` replaces only draw values: the recording keeps its
+  validation, and the native commands Runtime stored for it replay with the
+  new values patched into their payload
+  ([`../runtime/stored_plans.md`](../runtime/stored_plans.md) section 12,
+  draw values).
+  Per-frame culling and dynamic state therefore cost no revalidation and no
+  re-recording of native commands.
+- Editing a recording never waits for submissions that drew it: each
+  submission keeps the validated commands and leases it drew until it
+  completes. Edits are externally synchronized with Executes of invocations
+  bound to the recording.
 - Debug groups and markers name the draws between them in capture tools and
   have no effect on rendering. Groups nest inside the Node's own group
   ([`../runtime/gpu_profiling.md`](../runtime/gpu_profiling.md) section 2),
@@ -254,8 +281,8 @@ Rules:
 - D3D12: one render-target scope; one descriptor table per partition.
 - Metal: one render encoder; one argument buffer per partition.
 - Runtime telemetry reports per Node: native render scopes, pipeline binds,
-  set binds, and draws (`vernonRuntimeProgramInvocationGetGraphicsTelemetry`,
-  valid after execute).
+  set binds, and draws of at least one instance
+  (`vernonRuntimeProgramInvocationGetGraphicsTelemetry`, valid after execute).
 
 ## 9. Diagnostics
 
@@ -269,9 +296,11 @@ Rules:
 
 ## 10. Outside this design
 
-- **GPU-produced draws.** A later extension adds indirect draw commands whose
+- **GPU-produced draws** are specified in
+  [`indirect_draws.md`](indirect_draws.md): indirect draw commands whose
   argument and count buffers are static Node accesses. Indirect draws switch
-  no binding sets; per-object resources come from resource tables.
+  no binding sets; per-object data comes from tables indexed by
+  `draw_index`.
 - **GPU pipeline switching** is not planned: GPU-driven passes issue one
   indirect draw per pipeline.
 - **Graph-level gradient fan-in** is independent of this design.
@@ -300,6 +329,9 @@ Run on every backend with graphics support:
    recook.
 10. Every diagnostic in section 9 is produced with its code, phase, path, and
     context.
+11. Draws edited by `SetCommand` (an instance count of 0, a different
+    scissor) draw their new values in every following invocation, through
+    the stored commands.
 
 ## 12. Contract changes on acceptance
 
@@ -315,7 +347,7 @@ Run on every backend with graphics support:
 - [`graphics_execution.md`](graphics_execution.md): section 5 lists recorded
   draws as a DrawCommand form.
 - [`../runtime/design.md`](../runtime/design.md): graphics pipelines and
-  binding sets join the owner model; recordings are invocation-local; binding
+  binding sets and recordings join the owner model; binding
   sets share the validation path of `vernonRuntimeProgramInvocationBind`.
 
 ## 13. Implementation status and decisions

@@ -318,15 +318,18 @@ RuntimeResult<void> commandResult(VernonRuntimeContext &context, VernonStatus st
 } // namespace
 
 CommandStream::CommandStream(CommandStream &&other) noexcept
-    : context_(other.context_), commands_(std::exchange(other.commands_, nullptr)), encoder_(other.encoder_),
+    : context_(other.context_), commands_(std::exchange(other.commands_, nullptr)),
+      packets_(std::exchange(other.packets_, nullptr)), encoder_(other.encoder_),
       transient_(std::move(other.transient_)) {}
 
 CommandStream &CommandStream::operator=(CommandStream &&other) noexcept {
     if (this != &other) {
         if (commands_)
             (void)vernonRuntimeCoreEndCommands(commands_);
+        vernonRuntimeCorePacketsDestroy(packets_);
         context_ = other.context_;
         commands_ = std::exchange(other.commands_, nullptr);
+        packets_ = std::exchange(other.packets_, nullptr);
         encoder_ = other.encoder_;
         transient_ = std::move(other.transient_);
     }
@@ -336,6 +339,58 @@ CommandStream &CommandStream::operator=(CommandStream &&other) noexcept {
 CommandStream::~CommandStream() {
     if (commands_)
         (void)vernonRuntimeCoreEndCommands(commands_);
+    vernonRuntimeCorePacketsDestroy(packets_);
+}
+
+RuntimeResult<void> CommandStream::beginRendering(const VernonRuntimeProviderRenderingDescriptor &descriptor) {
+    return commandResult(*context_, vernonRuntimeCorePacketsBeginRendering(packets_, &descriptor),
+                         "begin_backend_rendering", "failed to begin rendering");
+}
+
+RuntimeResult<void> CommandStream::endRendering() {
+    return commandResult(*context_, vernonRuntimeCorePacketsEndRendering(packets_), "end_backend_rendering",
+                         "failed to end rendering");
+}
+
+RuntimeResult<void> CommandStream::flush() {
+    if (vernonRuntimeCorePacketsIsEmpty(packets_))
+        return RuntimeResult<void>{ok()};
+    VernonRuntimeCorePacketBatch *batch = nullptr;
+    VernonStatus status = vernonRuntimeCorePacketBatchCreate(packets_, &batch);
+    if (status == VERNON_STATUS_OK) {
+        size_t payloadWords = 0;
+        const uint32_t *payload = vernonRuntimeCorePacketsGetPayload(packets_, &payloadWords);
+        status = vernonRuntimeCoreEncodePackets(commands_, batch, payload, payloadWords);
+        vernonRuntimeCorePacketBatchDestroy(batch);
+    }
+    vernonRuntimeCorePacketsReset(packets_);
+    return commandResult(*context_, status, "encode_backend_commands", "failed to encode commands");
+}
+
+RuntimeResult<void> CommandStream::flush(StoredPacketBatch &stored) {
+    if (stored.batch_)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "store_backend_commands");
+    if (vernonRuntimeCorePacketsIsEmpty(packets_))
+        return RuntimeResult<void>{ok()};
+    VernonStatus status = vernonRuntimeCorePacketBatchCreate(packets_, &stored.batch_);
+    if (status == VERNON_STATUS_OK) {
+        size_t payloadWords = 0;
+        const uint32_t *payload = vernonRuntimeCorePacketsGetPayload(packets_, &payloadWords);
+        stored.payload_.assign(payload, payload + payloadWords);
+        status = vernonRuntimeCoreEncodePackets(commands_, stored.batch_, stored.payload_.data(), payloadWords);
+    }
+    vernonRuntimeCorePacketsReset(packets_);
+    return commandResult(*context_, status, "encode_backend_commands", "failed to encode commands");
+}
+
+RuntimeResult<void> CommandStream::encode(const StoredPacketBatch &stored, const std::vector<uint32_t> &payload) {
+    if (payload.size() != stored.payload_.size())
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "encode_backend_commands");
+    if (auto flushed = flush(); flushed.isErr())
+        return flushed;
+    return commandResult(*context_,
+                         vernonRuntimeCoreEncodePackets(commands_, stored.batch_, payload.data(), payload.size()),
+                         "encode_backend_commands", "failed to encode commands");
 }
 
 RuntimeResult<void> CommandStream::resume() {
@@ -343,9 +398,19 @@ RuntimeResult<void> CommandStream::resume() {
                          "failed to resume commands");
 }
 
+RuntimeResult<void> CommandStream::updateGroup(VernonRuntimeCoreGroup *group,
+                                               const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    return commandResult(*context_, vernonRuntimeCoreUpdateGroup(commands_, group, values, valueCount),
+                         "update_backend_group", "failed to update a group");
+}
+
 RuntimeResult<void> CommandStream::end() {
+    auto flushed = flush();
     const VernonStatus status = vernonRuntimeCoreEndCommands(std::exchange(commands_, nullptr));
+    vernonRuntimeCorePacketsDestroy(std::exchange(packets_, nullptr));
     transient_.reset();
+    if (flushed.isErr())
+        return flushed;
     return commandResult(*context_, status, "end_backend_commands", "failed to end commands");
 }
 
@@ -358,11 +423,20 @@ RuntimeResult<CommandStream> beginCommandStream(VernonRuntimeContext &context, V
     stream.context_ = &context;
     stream.encoder_ = encoder;
     stream.transient_ = std::make_unique<GroupStore>(VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT);
+    auto recording = commandResult(context, vernonRuntimeCorePacketsCreate(provider, &stream.packets_),
+                                   "begin_backend_commands", "failed to begin commands");
+    if (recording.isErr())
+        return RuntimeResult<CommandStream>{err(std::move(recording).error())};
     auto begun = commandResult(context, vernonRuntimeCoreBeginCommands(provider, encoder, &stream.commands_),
                                "begin_backend_commands", "failed to begin commands");
     if (begun.isErr())
         return RuntimeResult<CommandStream>{err(std::move(begun).error())};
     return RuntimeResult<CommandStream>{ok(std::move(stream))};
+}
+
+bool backendUpdatesGroups(VernonRuntimeContext &context) {
+    const VernonRuntimeDeviceProvider *provider = commandProvider(context);
+    return provider && provider->update_group;
 }
 
 RuntimeResult<CommandStream *> EncoderCommandStream::acquire(VernonRhiCommandEncoder encoder) {
@@ -391,23 +465,6 @@ VernonRhiStatus EncoderCommandStream::finish(void *opaque, VernonRhiCommandEncod
         return VERNON_RHI_STATUS_OK;
     auto ended = stream.end();
     return ended.isOk() ? VERNON_RHI_STATUS_OK : toVernonRhiStatus(std::move(ended).error());
-}
-
-RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,
-                                          const VernonRuntimeProviderRenderingDescriptor &descriptor) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    if (!adapter)
-        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "begin_backend_rendering");
-    return renderingResult(context, *adapter, vernonRuntimeCoreBeginRendering(commands, &descriptor),
-                           "begin_backend_rendering", "failed to begin rendering");
-}
-
-RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    if (!adapter)
-        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "end_backend_rendering");
-    return renderingResult(context, *adapter, vernonRuntimeCoreEndRendering(commands), "end_backend_rendering",
-                           "failed to end rendering");
 }
 
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {

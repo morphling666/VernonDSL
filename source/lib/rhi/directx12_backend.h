@@ -133,6 +133,11 @@ struct VERNON_RHI_CAPI DeviceState {
     bool placePersistent(size_t size, size_t alignment, ID3D12Resource *&resource, size_t &offset, uint8_t *&mapped,
                          uint64_t &key, std::string &error);
     void releasePersistent(uint64_t key);
+    // Updatable blocks live in default-heap chunks, which are in a shader-read state except while a copy writes them.
+    bool placeUpdatable(size_t size, size_t alignment, ID3D12Resource *&resource, size_t &offset, uint64_t &key,
+                        std::string &error);
+    Buffer &updatableBuffer(uint64_t key) { return updatableBlocks.chunk(key).buffer; }
+    void releaseUpdatable(uint64_t key);
 
     IDXGIFactory6 *factory{};
     IDXGIAdapter1 *adapter{};
@@ -156,6 +161,7 @@ struct VERNON_RHI_CAPI DeviceState {
     StagingPool<StagingChunk> uploadStaging;
     StagingPool<StagingChunk> readbackStaging;
     BlockPool<StagingChunk> persistentBlocks;
+    BlockPool<StagingChunk> updatableBlocks;
     uint64_t submittedValue{};
     uint64_t completedValue{};
     size_t bufferCreations{};

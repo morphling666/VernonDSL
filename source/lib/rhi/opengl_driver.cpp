@@ -189,14 +189,23 @@ void loadDebugLabelDriver(const VernonOpenGLContextCallbacks &callbacks, Driver 
         load(driver.pushDebugGroup, "glPushDebugGroup", "glPushDebugGroupKHR");
         load(driver.popDebugGroup, "glPopDebugGroup", "glPopDebugGroupKHR");
         load(driver.debugMessageInsert, "glDebugMessageInsert", "glDebugMessageInsertKHR");
+        load(driver.debugMessageCallback, "glDebugMessageCallback", "glDebugMessageCallbackKHR");
+        load(driver.debugMessageControl, "glDebugMessageControl", "glDebugMessageControlKHR");
     } catch (...) {
         driver.pushDebugGroup = nullptr;
     }
-    if (driver.pushDebugGroup && driver.popDebugGroup && driver.debugMessageInsert)
+    if (driver.pushDebugGroup && driver.popDebugGroup && driver.debugMessageInsert) {
+        if (!driver.debugMessageCallback || !driver.debugMessageControl) {
+            driver.debugMessageCallback = nullptr;
+            driver.debugMessageControl = nullptr;
+        }
         return;
+    }
     driver.pushDebugGroup = nullptr;
     driver.popDebugGroup = nullptr;
     driver.debugMessageInsert = nullptr;
+    driver.debugMessageCallback = nullptr;
+    driver.debugMessageControl = nullptr;
 }
 
 void loadTimerQueryDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, bool extSuffix) {

@@ -61,10 +61,21 @@ bool fillGraphicsGroupValue(const void *userData, size_t slot, VernonRuntimeProv
     return fillPreparedGraphicsBindingValue(values.plan, values.inputs, slot, value, storage, error);
 }
 
+struct GraphicsGroupsMade {
+    const GraphicsGroupSink &sink;
+    const PreparedGraphicsBindingPlan &plan;
+};
+
+VernonStatus forwardGraphicsGroup(void *userData, VernonRuntimeCoreGroup *group, const std::vector<uint32_t> &slots,
+                                  const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    const auto &made = *static_cast<const GraphicsGroupsMade *>(userData);
+    return made.sink.made(made.sink.userData, group, made.plan, slots, values, valueCount);
+}
+
 // Resolves the vertex buffers of `command` into `stream`, then chooses and binds its variant when the pipeline, its
 // state or the vertex strides differ from the bound variant of `stream`.
 VernonStatus bindGraphicsVariant(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
-                                 const RhiGraphicsTarget &target, VernonRuntimeCoreCommands *commands,
+                                 const RhiGraphicsTarget &target, VernonRuntimeCorePackets *packets,
                                  const GraphicsCommand &command, GraphicsStream &stream,
                                  RhiGraphicsPipeline &pipeline) {
     const size_t vertexBindings = pipeline.bindingPlan.vertexInputs.size();
@@ -106,7 +117,7 @@ VernonStatus bindGraphicsVariant(VernonRuntimeContext &context, VernonRuntimeRhi
     VernonStatus status = ensureGraphicsVariant(pipeline.pipeline, key, pipeline.variant);
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "prepare", "graphics variant"), status);
-    status = vernonRuntimeCoreBindGraphicsVariant(commands, pipeline.variant.handle);
+    status = vernonRuntimeCorePacketsBindGraphicsVariant(packets, pipeline.variant.handle);
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "bind", "graphics variant"), status);
     stream.pipeline = &pipeline;
@@ -155,18 +166,18 @@ bool prepareRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAd
 
 VernonStatus invokeRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                       const RhiComputeTarget &target, const StageBindingPlan &projection,
-                                      VernonRuntimeCoreCommands *commands, GroupStore &transient,
+                                      VernonRuntimeCorePackets *packets, GroupStore &transient,
                                       const PlannedComputeLaunch &launch, const ArgumentOwner *owners,
                                       RhiComputePipeline &pipeline) {
     const ComputeGroupValues values{target, pipeline.bindingPlan, projection, launch};
     const GroupSources sources{owners, &launch, &transient, {fillComputeGroupValue, &values}};
-    VernonStatus status = vernonRuntimeCoreBindPipeline(commands, pipeline.pipeline);
+    VernonStatus status = vernonRuntimeCorePacketsBindPipeline(packets, pipeline.pipeline);
     std::string error;
     if (status == VERNON_STATUS_OK)
-        status = pipeline.groups.bind(commands, launch.commandEncoder, sources, error);
+        status = pipeline.groups.bind(packets, launch.commandEncoder, sources, error);
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeCoreDispatch(commands, groups, nullptr, 0);
+        status = vernonRuntimeCorePacketsDispatch(packets, groups);
     if (!error.empty())
         return fail(context, std::string(target.name) + " " + error, VERNON_STATUS_INVALID_ARGUMENT);
     if (status != VERNON_STATUS_OK)
@@ -211,31 +222,35 @@ bool prepareRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiA
 }
 
 VernonStatus invokeRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
-                                       const RhiGraphicsTarget &target, VernonRuntimeCoreCommands *commands,
+                                       const RhiGraphicsTarget &target, VernonRuntimeCorePackets *packets,
                                        const GraphicsCommand &command, GraphicsStream &stream,
                                        RhiGraphicsPipeline &pipeline) {
     if (!pipeline.pipeline)
         return VERNON_STATUS_OK;
-    VernonStatus status = bindGraphicsVariant(context, adapter, target, commands, command, stream, pipeline);
+    VernonStatus status = bindGraphicsVariant(context, adapter, target, packets, command, stream, pipeline);
     if (status != VERNON_STATUS_OK)
         return status;
     const GraphicsGroupValues values{pipeline.bindingPlan, {command.arguments, command.draw.resolution}};
+    GraphicsGroupsMade made{command.made, pipeline.bindingPlan};
     GroupSources sources = command.groups;
     sources.values = {fillGraphicsGroupValue, &values};
+    if (command.made.made)
+        sources.made = {forwardGraphicsGroup, &made};
     std::string error;
-    status = pipeline.groups.bind(commands, command.encoder, sources, error);
+    status = pipeline.groups.bind(packets, command.encoder, sources, error);
     if (!error.empty())
         return fail(context, std::move(error), VERNON_STATUS_INVALID_ARGUMENT);
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "bind", "graphics groups"), status);
-    status = vernonRuntimeCoreBindVertexBuffers(commands, 0, stream.vertexBuffers.data(), stream.vertexBuffers.size());
+    status =
+        vernonRuntimeCorePacketsBindVertexBuffers(packets, 0, stream.vertexBuffers.data(), stream.vertexBuffers.size());
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "bind", "vertex buffers"), status);
     VernonRuntimeCoreDrawInvocation draw;
     if (!prepareGraphicsDrawInvocation(command.draw, command.graphicsState->topology, draw,
                                        invocationDiagnostic(context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    status = vernonRuntimeCoreDraw(commands, &draw);
+    status = vernonRuntimeCorePacketsDraw(packets, &draw);
     if (status != VERNON_STATUS_OK)
         return fail(context, providerFailure(adapter, target.name, "encode", "draw"), status);
     return VERNON_STATUS_OK;

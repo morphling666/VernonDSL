@@ -16,6 +16,7 @@ protected:
         VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
         deviceDescriptor.struct_size = sizeof(deviceDescriptor);
         deviceDescriptor.backend = VERNON_RHI_BACKEND_CUDA;
+        deviceDescriptor.flags = VERNON_RHI_DEVICE_LABELS;
         device = vernonRhiCreateDevice(&deviceDescriptor);
         if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
             GTEST_SKIP() << "CUDA RHI device is unavailable";

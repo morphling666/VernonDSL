@@ -197,10 +197,13 @@ struct DirectX12Group : RhiGroup {
     GroupLayout *layout{};
     uint64_t serial{};
     std::vector<Value> values;
-    // Views read the inline values at `inlineOffset` in `inlineResource`, upload memory that stays in GENERIC_READ: a
-    // persistent block of the device, or the transient memory of a transient group's encoder.
+    // Views read the inline values at `inlineOffset` in `inlineResource`: upload memory that stays in GENERIC_READ (a
+    // persistent block of the device, or the transient memory of a transient group's encoder), or the updatable block
+    // of an updatable group, whose writes leave it readable by shaders.
     ID3D12Resource *inlineResource{};
     uint64_t inlineOffset{};
+    vernon::rhi::PersistentBlock updatable{};
+    std::vector<uint8_t> updatableBytes;
     std::vector<uint8_t> rootData;
     std::vector<BufferUse> buffers;
     std::vector<ImageUse> images;
@@ -253,7 +256,6 @@ struct DirectX12Commands : RhiCommands {
     std::array<uint32_t, 4> scissor{};
     uint32_t stencilReference{};
     D3D_PRIMITIVE_TOPOLOGY topology{D3D_PRIMITIVE_TOPOLOGY_UNDEFINED};
-    uint64_t indexBufferKey{};
     uint64_t indexBufferOffset{UINT64_MAX};
     uint64_t indexBufferEpoch{};
     rhi::directx12::Buffer *indexBuffer{};
@@ -1028,6 +1030,15 @@ RhiAdapterResult<void> createGroupImplResult(VernonRuntimeRhiAdapter &adapter,
                 return RhiAdapterResult<void>{vernon::err(std::move(written).error())};
             group->inlineResource = reinterpret_cast<ID3D12Resource *>(static_cast<uintptr_t>(written.value().buffer));
             group->inlineOffset = written.value().offset;
+        } else if (descriptor.lifetime == VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE) {
+            auto placed =
+                placeUpdatable(adapter, *group, inlineData.size(), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            if (!placed)
+                return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
+            group->updatable = placed.value();
+            group->inlineResource = reinterpret_cast<ID3D12Resource *>(static_cast<uintptr_t>(placed.value().buffer));
+            group->inlineOffset = placed.value().offset;
+            group->updatableBytes = std::move(inlineData);
         } else {
             auto placed = placePersistent(adapter, *group, inlineData.data(), inlineData.size(),
                                           D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -1053,6 +1064,42 @@ RhiAdapterResult<void> createGroupResult(void *data, const VernonRuntimeProvider
     } catch (const std::bad_alloc &) {
         return providerFailure(vernon::ProviderErrorCode::BackendFailure, "d3d12_group_creation_ran_out_of_memory");
     }
+}
+
+RhiAdapterResult<void> updateGroupResult(void *data, VernonRuntimeProviderObject commandsHandle,
+                                         VernonRuntimeProviderObject groupHandle,
+                                         const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<DirectX12Commands>(commandsHandle);
+    auto *group = fromHandle<DirectX12Group>(groupHandle);
+    if (!commands || !group || commands->rendering || valueCount != group->layout->entries.size() ||
+        (valueCount && !values))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_group_update_is_invalid");
+    bool rooted = false;
+    for (size_t index = 0; index < valueCount; ++index) {
+        const GroupLayout::Entry &entry = group->layout->entries[index];
+        if (!packedUniformBytes(entry.layout.kind, entry.layout.interface_kind))
+            continue;
+        const auto &bytes = values[index].payload.inline_value;
+        if (!bytes.data || bytes.size != entry.layout.element_size)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_inline_binding_is_invalid",
+                                   entry.layout.slot);
+        if (entry.rootOffset != kNone) {
+            std::memcpy(group->rootData.data() + entry.rootOffset, bytes.data, bytes.size);
+            rooted = true;
+        } else if (entry.inlineOffset != kNone) {
+            std::memcpy(group->updatableBytes.data() + entry.inlineOffset, bytes.data, bytes.size);
+        }
+    }
+    if (!group->updatableBytes.empty())
+        if (auto written = writeUpdatable(adapter, commands->encoder, group->updatable, group->updatableBytes.data(),
+                                          group->updatableBytes.size());
+            !written)
+            return written;
+    // Commands set a group's root constants again only for a serial they have not set.
+    if (rooted)
+        group->serial = directX12State(adapter).nextSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObject encoder,
@@ -1090,39 +1137,6 @@ RhiAdapterResult<void> resumeCommandsResult(void *, VernonRuntimeProviderObject 
     ++commands->epoch;
     if (commands->pipeline)
         commands->list->SetPipelineState(commands->pipeline->pipeline);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
-                                          VernonRuntimeProviderObject pipelineHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    auto *pipeline = fromHandle<PreparedPipeline>(pipelineHandle);
-    if (!commands || !pipeline || !pipeline->pipeline)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_bind_pipeline_is_invalid");
-    if (auto retained = retainForCommands(adapter, commands->encoder, *pipeline); !retained)
-        return retained;
-    const PreparedLayout &layout = *pipeline->layout;
-    for (uint32_t group = 0; group < kMaxGroups; ++group)
-        if (commands->groups[group] &&
-            (group >= layout.groupCount || commands->groups[group]->layout != layout.groups[group]))
-            commands->groups[group] = nullptr;
-    commands->list->SetPipelineState(pipeline->pipeline);
-    commands->pipeline = pipeline;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject handle, uint32_t index,
-                                       VernonRuntimeProviderObject groupHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    auto *group = fromHandle<DirectX12Group>(groupHandle);
-    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->layout->groupCount ||
-        group->layout != commands->pipeline->layout->groups[index])
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_bind_group_is_invalid", index);
-    if (auto retained = retainForCommands(adapter, commands->encoder, *group); !retained)
-        return retained;
-    commands->groups[index] = group;
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -1325,69 +1339,6 @@ RhiAdapterResult<void> transitionGroups(VernonRuntimeRhiAdapter &adapter, Direct
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> recordBoundGroupWrites(VernonRuntimeRhiAdapter &adapter, const DirectX12Commands &commands) {
-    const PreparedLayout &layout = *commands.pipeline->layout;
-    for (uint32_t index = 0; index < layout.groupCount; ++index)
-        if ((layout.groupMask & (1u << index)) != 0 && !commands.groups[index]->writes.empty())
-            if (auto recorded = recordGroupWrites(adapter, commands.encoder, *commands.groups[index]); !recorded)
-                return recorded;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
-        commands->pipeline->graphics || commands->rendering || descriptor->push_constant_size != 0)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                               "d3d12_adapter_received_an_invalid_dispatch");
-    if (auto prepared = prepareGroups(adapter, *commands); !prepared)
-        return prepared;
-    flushBindPoint(*commands, commands->computeState, false);
-    if (auto transitioned = transitionGroups(adapter, *commands); !transitioned)
-        return transitioned;
-    commands->list->Dispatch(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
-    // The dispatch may write what a later command reads in another state.
-    ++commands->epoch;
-    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
-        return recorded;
-    if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
-        return recorded;
-    adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindVertexBuffersResult(void *data, VernonRuntimeProviderObject handle, uint32_t firstBinding,
-                                               const VernonRuntimeProviderResourceReference *references, size_t count) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    if (!commands || !references || count == 0 || firstBinding > kMaxVertexBindings ||
-        count > kMaxVertexBindings - firstBinding)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_bind_vertex_buffers_is_invalid");
-    for (size_t index = 0; index < count; ++index) {
-        const VernonRuntimeProviderResourceReference &reference = references[index];
-        const size_t binding = firstBinding + index;
-        if ((reference.identity & kRhiResourceKindMask) != kRhiBufferResource || reference.offset >= reference.size ||
-            reference.size - reference.offset > UINT32_MAX)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_vertex_buffer_is_invalid",
-                                   binding);
-        if (auto retained = retainCommandResource(adapter, commands->encoder, reference); !retained)
-            return retained;
-        auto resolved = resolveCommandRhiResource(adapter, commands->encoder, reference);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(static_cast<uintptr_t>(resolved.value()));
-        if (!buffer || !buffer->resource)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_vertex_buffer_is_invalid",
-                                   binding);
-        commands->vertexBuffers[binding] = {buffer, reference.offset, reference.size - reference.offset};
-        commands->vertexEpochs[binding] = 0;
-        commands->vertexViews &= ~(1u << binding);
-    }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
 // Sets the views of the bound pipeline's vertex bindings that the list lacks; a view carries the variant's stride.
 RhiAdapterResult<void> applyVertexBuffers(VernonRuntimeRhiAdapter &adapter, DirectX12Commands &commands) {
     const PreparedPipeline &pipeline = *commands.pipeline;
@@ -1414,42 +1365,35 @@ RhiAdapterResult<void> applyVertexBuffers(VernonRuntimeRhiAdapter &adapter, Dire
 }
 
 RhiAdapterResult<void> bindIndexBuffer(VernonRuntimeRhiAdapter &adapter, DirectX12Commands &commands,
-                                       const VernonRuntimeProviderResourceReference &indexBuffer) {
-    if (commands.indexBufferKey != indexBuffer.resource.value) {
-        if (auto retained = retainCommandResource(adapter, commands.encoder, indexBuffer); !retained)
-            return retained;
-        auto resolved = resolveCommandRhiResource(adapter, commands.encoder, indexBuffer);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(static_cast<uintptr_t>(resolved.value()));
-        if (!buffer || !buffer->resource || indexBuffer.size == 0)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                                   "d3d12_draw_contains_an_invalid_index_buffer");
+                                       rhi::directx12::Buffer *buffer,
+                                       const VernonRuntimeProviderResourceReference &reference) {
+    if (!buffer || !buffer->resource || reference.size == 0 || reference.size > UINT32_MAX)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                               "d3d12_draw_contains_an_invalid_index_buffer");
+    if (commands.indexBuffer != buffer) {
         commands.indexBuffer = buffer;
-        commands.indexBufferKey = indexBuffer.resource.value;
         commands.indexBufferOffset = UINT64_MAX;
         commands.indexBufferEpoch = 0;
     }
     if (commands.indexBufferEpoch != commands.epoch) {
-        if (auto transitioned =
-                transitionBuffer(adapter, commands, *commands.indexBuffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        if (auto transitioned = transitionBuffer(adapter, commands, *buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
             !transitioned)
             return transitioned;
         commands.indexBufferEpoch = commands.epoch;
     }
-    if (commands.indexBufferOffset != indexBuffer.offset) {
-        const D3D12_INDEX_BUFFER_VIEW view{commands.indexBuffer->resource->GetGPUVirtualAddress() + indexBuffer.offset,
-                                           static_cast<UINT>(indexBuffer.size), DXGI_FORMAT_R32_UINT};
+    if (commands.indexBufferOffset != reference.offset) {
+        const D3D12_INDEX_BUFFER_VIEW view{buffer->resource->GetGPUVirtualAddress() + reference.offset,
+                                           static_cast<UINT>(reference.size), DXGI_FORMAT_R32_UINT};
         commands.list->IASetIndexBuffer(&view);
-        commands.indexBufferOffset = indexBuffer.offset;
+        commands.indexBufferOffset = reference.offset;
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-void setDynamicState(DirectX12Commands &commands, const VernonRuntimeProviderDrawDescriptor &descriptor) {
+void setDynamicState(DirectX12Commands &commands, uint32_t topologyIndex,
+                     const VernonRuntimeProviderDrawPayload &draw) {
     ID3D12GraphicsCommandList *list = commands.list;
-    const std::array<uint32_t, 4> viewport{descriptor.viewport[0], descriptor.viewport[1], descriptor.viewport[2],
-                                           descriptor.viewport[3]};
+    const std::array<uint32_t, 4> viewport{draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3]};
     if (!commands.viewportValid || commands.viewport != viewport) {
         const D3D12_VIEWPORT native{static_cast<float>(viewport[0]),
                                     static_cast<float>(viewport[1]),
@@ -1461,8 +1405,7 @@ void setDynamicState(DirectX12Commands &commands, const VernonRuntimeProviderDra
         commands.viewport = viewport;
         commands.viewportValid = true;
     }
-    const std::array<uint32_t, 4> scissor{descriptor.scissor[0], descriptor.scissor[1], descriptor.scissor[2],
-                                          descriptor.scissor[3]};
+    const std::array<uint32_t, 4> scissor{draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]};
     if (!commands.scissorValid || commands.scissor != scissor) {
         const D3D12_RECT native{static_cast<LONG>(scissor[0]), static_cast<LONG>(scissor[1]),
                                 static_cast<LONG>(scissor[0] + scissor[2]), static_cast<LONG>(scissor[1] + scissor[3])};
@@ -1470,91 +1413,151 @@ void setDynamicState(DirectX12Commands &commands, const VernonRuntimeProviderDra
         commands.scissor = scissor;
         commands.scissorValid = true;
     }
-    if (!commands.stencilValid || commands.stencilReference != descriptor.stencil_reference) {
-        list->OMSetStencilRef(descriptor.stencil_reference);
-        commands.stencilReference = descriptor.stencil_reference;
+    if (!commands.stencilValid || commands.stencilReference != draw.stencil_reference) {
+        list->OMSetStencilRef(draw.stencil_reference);
+        commands.stencilReference = draw.stencil_reference;
         commands.stencilValid = true;
     }
-    const D3D_PRIMITIVE_TOPOLOGY topology = descriptor.topology == 1   ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
-                                            : descriptor.topology == 2 ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
-                                                                       : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    const D3D_PRIMITIVE_TOPOLOGY topology = topologyIndex == 1   ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                                            : topologyIndex == 2 ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
+                                                                 : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     if (commands.topology != topology) {
         list->IASetPrimitiveTopology(topology);
         commands.topology = topology;
     }
 }
 
-RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject handle,
-                                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
-        !commands->pipeline->graphics || !commands->rendering)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                               "d3d12_adapter_received_an_invalid_draw_descriptor");
-    // SV_InstanceID and SV_VertexID exclude the draw offsets, so nonzero offsets would change `instance_index` and
-    // `vertex_index`.
-    if (descriptor->first_instance != 0 || descriptor->base_vertex != 0)
-        return providerFailure(vernon::ProviderErrorCode::Unsupported,
-                               "d3d12_draw_base_instance_or_base_vertex_is_unsupported");
-    if (auto opened = openCommandRendering(adapter, commands->encoder); !opened)
-        return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
-    // Opening the native scope clears its attachments, which may set descriptor heaps, and transitions its images.
-    if (!commands->scopeOpened) {
-        commands->scopeOpened = true;
-        commands->setResourceHeap = nullptr;
-        commands->setSamplerHeap = nullptr;
-        ++commands->epoch;
-    }
-    if (auto prepared = prepareGroups(adapter, *commands); !prepared)
-        return prepared;
-    flushBindPoint(*commands, commands->graphicsState, true);
-    if (auto transitioned = transitionGroups(adapter, *commands); !transitioned)
-        return transitioned;
-    if (auto applied = applyVertexBuffers(adapter, *commands); !applied)
-        return applied;
-    setDynamicState(*commands, *descriptor);
-    if (descriptor->index_count != 0) {
-        if (auto bound = bindIndexBuffer(adapter, *commands, descriptor->index_buffer); !bound)
-            return bound;
-        commands->list->DrawIndexedInstanced(descriptor->index_count, descriptor->instance_count, 0, 0, 0);
-    } else {
-        commands->list->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, 0, 0);
-    }
-    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
-        return recorded;
-    if (auto recorded = recordProviderCommand(adapter, commands->encoder, true); !recorded)
-        return recorded;
-    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
-    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
-    adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
+struct DirectX12PacketDecoder {
+    VernonRuntimeRhiAdapter &adapter;
+    DirectX12Commands &commands;
+    const RhiPacketBatch &batch;
 
-RhiAdapterResult<void> beginRenderingResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    if (!commands || !descriptor || commands->rendering)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_begin_rendering_is_invalid");
-    if (auto begun = beginEncoderRendering(adapter, commands->encoder, *descriptor); !begun)
-        return begun;
-    commands->rendering = true;
-    commands->scopeOpened = false;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
+    RhiAdapterResult<void> beginRendering() {
+        commands.rendering = true;
+        commands.scopeOpened = false;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
 
-RhiAdapterResult<void> endRenderingResult(void *data, VernonRuntimeProviderObject handle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<DirectX12Commands>(handle);
-    if (!commands || !commands->rendering)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_end_rendering_is_invalid");
-    commands->rendering = false;
     // A scope no draw opened clears its attachments as it ends, which may set descriptor heaps.
-    commands->setResourceHeap = nullptr;
-    commands->setSamplerHeap = nullptr;
-    ++commands->epoch;
-    return endEncoderRendering(adapter, commands->encoder);
+    RhiAdapterResult<void> endRendering() {
+        commands.rendering = false;
+        commands.setResourceHeap = nullptr;
+        commands.setSamplerHeap = nullptr;
+        ++commands.epoch;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindPipeline(RhiRetainedObject &object) {
+        auto &pipeline = static_cast<PreparedPipeline &>(object);
+        if (!pipeline.pipeline)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_bind_pipeline_is_invalid");
+        const PreparedLayout &layout = *pipeline.layout;
+        for (uint32_t group = 0; group < kMaxGroups; ++group)
+            if (commands.groups[group] &&
+                (group >= layout.groupCount || commands.groups[group]->layout != layout.groups[group]))
+                commands.groups[group] = nullptr;
+        commands.list->SetPipelineState(pipeline.pipeline);
+        commands.pipeline = &pipeline;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindGroup(uint32_t index, RhiGroup &object) {
+        auto &group = static_cast<DirectX12Group &>(object);
+        if (!commands.pipeline || index >= commands.pipeline->layout->groupCount ||
+            group.layout != commands.pipeline->layout->groups[index])
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_bind_group_is_invalid", index);
+        commands.groups[index] = &group;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindVertexBuffers(uint32_t first, const uint32_t *resources, size_t count) {
+        for (size_t index = 0; index < count; ++index) {
+            const VernonRuntimeProviderResourceReference &reference = batch.resources[resources[index]];
+            const size_t binding = first + index;
+            auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(batch.natives[resources[index]]);
+            if (!buffer || !buffer->resource || reference.size - reference.offset > UINT32_MAX)
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_vertex_buffer_is_invalid",
+                                       binding);
+            commands.vertexBuffers[binding] = {buffer, reference.offset, reference.size - reference.offset};
+            commands.vertexEpochs[binding] = 0;
+            commands.vertexViews &= ~(1u << binding);
+        }
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> dispatch(const uint32_t *groupCount) {
+        if (!commands.pipeline || commands.pipeline->graphics || commands.rendering)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "d3d12_adapter_received_an_invalid_dispatch");
+        if (auto prepared = prepareGroups(adapter, commands); !prepared)
+            return prepared;
+        flushBindPoint(commands, commands.computeState, false);
+        if (auto transitioned = transitionGroups(adapter, commands); !transitioned)
+            return transitioned;
+        commands.list->Dispatch(groupCount[0], groupCount[1], groupCount[2]);
+        // The dispatch may write what a later command reads in another state.
+        ++commands.epoch;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> draw(uint32_t topology, uint32_t indexResource, const VernonRuntimeProviderDrawPayload &draw,
+                                const vernon::rhi::OpenedRendering &) {
+        if (!commands.pipeline || !commands.pipeline->graphics || !commands.rendering)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "d3d12_adapter_received_an_invalid_draw_descriptor");
+        // SV_InstanceID and SV_VertexID exclude the draw offsets, so nonzero offsets would change `instance_index`
+        // and `vertex_index`.
+        if (draw.first_instance != 0 || draw.base_vertex != 0)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "d3d12_draw_base_instance_or_base_vertex_is_unsupported");
+        // Opening the native scope clears its attachments, which may set descriptor heaps, and transitions its images.
+        if (!commands.scopeOpened) {
+            commands.scopeOpened = true;
+            commands.setResourceHeap = nullptr;
+            commands.setSamplerHeap = nullptr;
+            ++commands.epoch;
+        }
+        if (auto prepared = prepareGroups(adapter, commands); !prepared)
+            return prepared;
+        flushBindPoint(commands, commands.graphicsState, true);
+        if (auto transitioned = transitionGroups(adapter, commands); !transitioned)
+            return transitioned;
+        if (auto applied = applyVertexBuffers(adapter, commands); !applied)
+            return applied;
+        setDynamicState(commands, topology, draw);
+        if (indexResource == UINT32_MAX) {
+            commands.list->DrawInstanced(draw.vertex_count, draw.instance_count, 0, 0);
+            return RhiAdapterResult<void>{vernon::ok()};
+        }
+        if (auto bound = bindIndexBuffer(adapter, commands,
+                                         reinterpret_cast<rhi::directx12::Buffer *>(batch.natives[indexResource]),
+                                         batch.resources[indexResource]);
+            !bound)
+            return bound;
+        commands.list->DrawIndexedInstanced(draw.vertex_count, draw.instance_count, draw.first_index, 0, 0);
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+};
+
+RhiRetainedObject *packetPipeline(VernonRuntimeProviderObject handle) noexcept {
+    return fromHandle<PreparedPipeline>(handle);
+}
+RhiGroup *packetGroup(VernonRuntimeProviderObject handle) noexcept { return fromHandle<DirectX12Group>(handle); }
+
+// A batch starts with nothing bound; the native binding state carries over, since the encoder keeps every object an
+// earlier batch bound alive.
+RhiAdapterResult<void> encodePacketsResult(void *data, VernonRuntimeProviderObject handle,
+                                           VernonRuntimeProviderObject batchHandle, const uint32_t *payload,
+                                           size_t payloadWords) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<DirectX12Commands>(handle);
+    auto *batch = fromHandle<RhiPacketBatch>(batchHandle);
+    if (!commands || !batch || commands->rendering)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_encode_packets_is_invalid");
+    commands->pipeline = nullptr;
+    commands->groups.fill(nullptr);
+    DirectX12PacketDecoder decoder{adapter, *commands, *batch};
+    return decodeRhiPackets(adapter, commands->encoder, *batch, payload, payloadWords, decoder);
 }
 
 void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
@@ -1610,39 +1613,23 @@ VernonStatus resumeCommands(void *data, VernonRuntimeProviderObject commands) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, resumeCommandsResult(data, commands), "D3D12 commands could not resume");
 }
-VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+VernonStatus encodePackets(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject batch,
+                           const uint32_t *payload, size_t payloadWords) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "D3D12 pipeline binding failed");
+    return providerStatus(adapter, encodePacketsResult(data, commands, batch, payload, payloadWords),
+                          "D3D12 packet encoding failed");
 }
-VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_t index,
-                       VernonRuntimeProviderObject group) {
+VernonStatus updateGroup(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject group,
+                         const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindGroupResult(data, commands, index, group), "D3D12 group binding failed");
+    return providerStatus(adapter, updateGroupResult(data, commands, group, values, valueCount),
+                          "D3D12 group update failed");
 }
-VernonStatus bindVertexBuffers(void *data, VernonRuntimeProviderObject commands, uint32_t firstBinding,
-                               const VernonRuntimeProviderResourceReference *buffers, size_t count) {
+VernonStatus createPacketBatch(void *data, const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                               VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindVertexBuffersResult(data, commands, firstBinding, buffers, count),
-                          "D3D12 vertex buffer binding failed");
-}
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
-                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDispatchResult(data, commands, descriptor), "D3D12 dispatch encoding failed");
-}
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commands,
-                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDrawResult(data, commands, descriptor), "D3D12 draw encoding failed");
-}
-VernonStatus beginRendering(void *data, VernonRuntimeProviderObject commands,
-                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, beginRenderingResult(data, commands, descriptor), "D3D12 rendering could not begin");
-}
-VernonStatus endRendering(void *data, VernonRuntimeProviderObject commands) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, endRenderingResult(data, commands), "D3D12 rendering could not end");
+    return providerStatus(adapter, createRhiPacketBatch(adapter, descriptor, {packetPipeline, packetGroup}, output),
+                          "D3D12 packet batch creation failed");
 }
 
 } // namespace
@@ -1662,18 +1649,15 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.begin_commands = beginCommands;
     adapter.provider.end_commands = endCommands;
     adapter.provider.resume_commands = resumeCommands;
-    adapter.provider.encode_bind_pipeline = bindPipeline;
-    adapter.provider.encode_bind_group = bindGroup;
-    adapter.provider.encode_bind_vertex_buffers = bindVertexBuffers;
-    adapter.provider.encode_dispatch = encodeDispatch;
-    adapter.provider.encode_draw = encodeDraw;
-    adapter.provider.begin_rendering = beginRendering;
-    adapter.provider.end_rendering = endRendering;
+    adapter.provider.create_packet_batch = createPacketBatch;
+    adapter.provider.encode_packets = encodePackets;
+    adapter.provider.update_group = updateGroup;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_group_layout = destroyGroupLayout;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;
     adapter.provider.destroy_group = destroyGroup;
+    adapter.provider.destroy_packet_batch = destroyRhiPacketBatch;
 }
 
 } // namespace vernon::runtime::rhi_adapter

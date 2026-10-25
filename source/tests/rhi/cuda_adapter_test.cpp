@@ -2,6 +2,7 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "rhi/rhi_test_hooks.h"
 #include "runtime/rhi_adapter/adapter_test_hooks.h"
+#include "runtime_core_packets.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
@@ -122,13 +123,24 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, encoder, &providerEncoder), VERNON_STATUS_OK);
     VernonRuntimeCoreCommands *commands = nullptr;
     ASSERT_EQ(vernonRuntimeCoreBeginCommands(provider, providerEncoder, &commands), VERNON_STATUS_OK);
+    VernonRuntimeCorePackets *packets = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePacketsCreate(provider, &packets), VERNON_STATUS_OK);
     const uint32_t groups[3]{1, 1, 1};
-    EXPECT_EQ(vernonRuntimeCoreBindPipeline(commands, pipeline), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimeCoreBindGroup(commands, 0, first), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimeCoreDispatch(commands, groups, nullptr, 0), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimeCoreBindGroup(commands, 0, second), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimeCoreDispatch(commands, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsPushDebugGroup(packets, {"scale", 5}), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsBindPipeline(packets, pipeline), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsBindGroup(packets, 0, first), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsDispatch(packets, groups), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsInsertDebugMarker(packets, {"second", 6}), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsBindGroup(packets, 0, second), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsDispatch(packets, groups), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCorePacketsPopDebugGroup(packets), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::tests::encodeRecordedPackets(commands, packets), VERNON_STATUS_OK);
+    vernonRuntimeCorePacketsDestroy(packets);
     EXPECT_EQ(vernonRuntimeCoreEndCommands(commands), VERNON_STATUS_OK);
+    // The device has no labels, so the batch dropped its debug packets when it was created.
+    const vernon::rhi::EncoderCallStats calls = vernon::rhi::getEncoderCallStats(device, encoder);
+    EXPECT_EQ(calls.providerRecords, 1u);
+    EXPECT_EQ(calls.debugCommands, 0u);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRuntimeRhiAdapterSynchronize(adapter), VERNON_STATUS_OK);
@@ -242,10 +254,14 @@ TEST(CudaRhiAdapter, HostStorageOfTransientGroupsReusesTheTransientMemoryOfRetir
                   VERNON_STATUS_OK);
         VernonRuntimeCoreCommands *commands = nullptr;
         ASSERT_EQ(vernonRuntimeCoreBeginCommands(provider, providerEncoder, &commands), VERNON_STATUS_OK);
+        VernonRuntimeCorePackets *packets = nullptr;
+        ASSERT_EQ(vernonRuntimeCorePacketsCreate(provider, &packets), VERNON_STATUS_OK);
         const uint32_t groups[3]{1, 1, 1};
-        EXPECT_EQ(vernonRuntimeCoreBindPipeline(commands, pipeline), VERNON_STATUS_OK);
-        EXPECT_EQ(vernonRuntimeCoreBindGroup(commands, 0, group), VERNON_STATUS_OK);
-        EXPECT_EQ(vernonRuntimeCoreDispatch(commands, groups, nullptr, 0), VERNON_STATUS_OK);
+        EXPECT_EQ(vernonRuntimeCorePacketsBindPipeline(packets, pipeline), VERNON_STATUS_OK);
+        EXPECT_EQ(vernonRuntimeCorePacketsBindGroup(packets, 0, group), VERNON_STATUS_OK);
+        EXPECT_EQ(vernonRuntimeCorePacketsDispatch(packets, groups), VERNON_STATUS_OK);
+        EXPECT_EQ(vernon::tests::encodeRecordedPackets(commands, packets), VERNON_STATUS_OK);
+        vernonRuntimeCorePacketsDestroy(packets);
         EXPECT_EQ(vernonRuntimeCoreEndCommands(commands), VERNON_STATUS_OK);
         vernonRuntimeCoreGroupDestroy(group);
         EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);

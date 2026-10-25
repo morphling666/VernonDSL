@@ -436,38 +436,6 @@ RhiAdapterResult<void> resumeCommandsResult(void *, VernonRuntimeProviderObject 
                : providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_resume_commands_is_invalid");
 }
 
-RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
-                                          VernonRuntimeProviderObject pipelineHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<CudaCommands>(handle);
-    auto *pipeline = fromHandle<PreparedPipeline>(pipelineHandle);
-    if (!commands || !pipeline)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_bind_pipeline_is_invalid");
-    if (auto retained = retainForCommands(adapter, commands->encoder, *pipeline); !retained)
-        return retained;
-    const PreparedLayout &layout = *pipeline->layout;
-    for (uint32_t group = 0; group < kMaxGroups; ++group)
-        if (commands->groups[group] &&
-            (group >= layout.groupCount || commands->groups[group]->layout != layout.groups[group]))
-            commands->groups[group] = nullptr;
-    commands->pipeline = pipeline;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject handle, uint32_t index,
-                                       VernonRuntimeProviderObject groupHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<CudaCommands>(handle);
-    auto *group = fromHandle<CudaGroup>(groupHandle);
-    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->layout->groupCount ||
-        group->layout != commands->pipeline->layout->groups[index])
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_bind_group_is_invalid", index);
-    if (auto retained = retainForCommands(adapter, commands->encoder, *group); !retained)
-        return retained;
-    commands->groups[index] = group;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
 // Points the kernel parameters at the values of the bound groups whose parameters the array lacks.
 RhiAdapterResult<void> fillParameters(CudaCommands &commands) {
     const PreparedLayout &layout = *commands.pipeline->layout;
@@ -502,29 +470,71 @@ RhiAdapterResult<void> fillParameters(CudaCommands &commands) {
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
+struct CudaPacketDecoder {
+    CudaCommands &commands;
+
+    static RhiAdapterResult<void> graphics() {
+        return providerFailure(vernon::ProviderErrorCode::Unsupported, "cuda_graphics_commands_are_unsupported");
+    }
+    RhiAdapterResult<void> beginRendering() { return graphics(); }
+    RhiAdapterResult<void> endRendering() { return graphics(); }
+    RhiAdapterResult<void> bindVertexBuffers(uint32_t, const uint32_t *, size_t) { return graphics(); }
+    RhiAdapterResult<void> draw(uint32_t, uint32_t, const VernonRuntimeProviderDrawPayload &,
+                                const vernon::rhi::OpenedRendering &) {
+        return graphics();
+    }
+
+    RhiAdapterResult<void> bindPipeline(RhiRetainedObject &object) {
+        auto &pipeline = static_cast<PreparedPipeline &>(object);
+        const PreparedLayout &layout = *pipeline.layout;
+        for (uint32_t group = 0; group < kMaxGroups; ++group)
+            if (commands.groups[group] &&
+                (group >= layout.groupCount || commands.groups[group]->layout != layout.groups[group]))
+                commands.groups[group] = nullptr;
+        commands.pipeline = &pipeline;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindGroup(uint32_t index, RhiGroup &object) {
+        auto &group = static_cast<CudaGroup &>(object);
+        if (!commands.pipeline || index >= commands.pipeline->layout->groupCount ||
+            group.layout != commands.pipeline->layout->groups[index])
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_bind_group_is_invalid", index);
+        commands.groups[index] = &group;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> dispatch(const uint32_t *groupCount) {
+        if (!commands.pipeline)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "cuda_adapter_received_an_invalid_dispatch");
+        if (auto filled = fillParameters(commands); !filled)
+            return filled;
+        PreparedPipeline &pipeline = *commands.pipeline;
+        return cudaResult(
+            pipeline.function.launch(*pipeline.device, groupCount, pipeline.workgroup, commands.parameters.data()),
+            "cuLaunchKernel");
+    }
+};
+
+RhiRetainedObject *packetPipeline(VernonRuntimeProviderObject handle) noexcept {
+    return fromHandle<PreparedPipeline>(handle);
+}
+RhiGroup *packetGroup(VernonRuntimeProviderObject handle) noexcept { return fromHandle<CudaGroup>(handle); }
+
+// A batch starts with nothing bound, so the bindings of earlier batches are dropped.
+RhiAdapterResult<void> encodePacketsResult(void *data, VernonRuntimeProviderObject handle,
+                                           VernonRuntimeProviderObject batchHandle, const uint32_t *payload,
+                                           size_t payloadWords) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *commands = fromHandle<CudaCommands>(handle);
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
-        commands->rendering || descriptor->push_constant_size != 0)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_adapter_received_an_invalid_dispatch");
-    if (auto filled = fillParameters(*commands); !filled)
-        return filled;
-    PreparedPipeline &pipeline = *commands->pipeline;
-    if (auto launched = cudaResult(pipeline.function.launch(*pipeline.device, descriptor->group_count,
-                                                            pipeline.workgroup, commands->parameters.data()),
-                                   "cuLaunchKernel");
-        !launched)
-        return launched;
-    for (uint32_t index = 0; index < pipeline.layout->groupCount; ++index)
-        if ((pipeline.layout->groupMask & (1u << index)) != 0 && !commands->groups[index]->writes.empty())
-            if (auto recorded = recordGroupWrites(adapter, commands->encoder, *commands->groups[index]); !recorded)
-                return recorded;
-    if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
-        return recorded;
-    adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    return RhiAdapterResult<void>{vernon::ok()};
+    auto *batch = fromHandle<RhiPacketBatch>(batchHandle);
+    if (!commands || !batch)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "cuda_encode_packets_is_invalid");
+    commands->pipeline = nullptr;
+    commands->groups.fill(nullptr);
+    CudaPacketDecoder decoder{*commands};
+    return decodeRhiPackets(adapter, commands->encoder, *batch, payload, payloadWords, decoder);
 }
 
 void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
@@ -577,19 +587,17 @@ VernonStatus resumeCommands(void *data, VernonRuntimeProviderObject commands) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, resumeCommandsResult(data, commands), "CUDA commands could not resume");
 }
-VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+VernonStatus encodePackets(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject batch,
+                           const uint32_t *payload, size_t payloadWords) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "CUDA pipeline binding failed");
+    return providerStatus(adapter, encodePacketsResult(data, commands, batch, payload, payloadWords),
+                          "CUDA packet encoding failed");
 }
-VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_t index,
-                       VernonRuntimeProviderObject group) {
+VernonStatus createPacketBatch(void *data, const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                               VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindGroupResult(data, commands, index, group), "CUDA group binding failed");
-}
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
-                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDispatchResult(data, commands, descriptor), "CUDA dispatch encoding failed");
+    return providerStatus(adapter, createRhiPacketBatch(adapter, descriptor, {packetPipeline, packetGroup}, output),
+                          "CUDA packet batch creation failed");
 }
 
 } // namespace
@@ -608,14 +616,14 @@ void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.begin_commands = beginCommands;
     adapter.provider.end_commands = endCommands;
     adapter.provider.resume_commands = resumeCommands;
-    adapter.provider.encode_bind_pipeline = bindPipeline;
-    adapter.provider.encode_bind_group = bindGroup;
-    adapter.provider.encode_dispatch = encodeDispatch;
+    adapter.provider.create_packet_batch = createPacketBatch;
+    adapter.provider.encode_packets = encodePackets;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_group_layout = destroyGroupLayout;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;
     adapter.provider.destroy_group = destroyGroup;
+    adapter.provider.destroy_packet_batch = destroyRhiPacketBatch;
 }
 
 } // namespace vernon::runtime::rhi_adapter

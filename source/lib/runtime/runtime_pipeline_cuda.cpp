@@ -98,16 +98,16 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeCudaComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                        GroupStore &transient, const PlannedComputeLaunch &launch,
                                        const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, cudaState(*pipeline.context).adapter, kCudaCompute,
-                                    pipeline.bindingProjection, commands, transient, launch, owners,
+                                    pipeline.bindingProjection, packets, transient, launch, owners,
                                     runtimeBackendState<CudaPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
-    (void)commands;
+    (void)packets;
     (void)transient;
     (void)launch;
     (void)owners;

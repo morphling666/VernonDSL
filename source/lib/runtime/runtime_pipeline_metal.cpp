@@ -218,30 +218,30 @@ BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, cons
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                          const GraphicsCommand &command, GraphicsStream &stream) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    return invokeRhiGraphicsPipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalGraphics, commands,
+    return invokeRhiGraphicsPipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalGraphics, packets,
                                      command, stream, runtimeBackendState<MetalPipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
     (void)command;
     (void)stream;
-    (void)commands;
+    (void)packets;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                         GroupStore &transient, const PlannedComputeLaunch &launch,
                                         const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, metalState(*pipeline.context).adapter, kMetalCompute,
-                                    pipeline.bindingProjection, commands, transient, launch, owners,
+                                    pipeline.bindingProjection, packets, transient, launch, owners,
                                     runtimeBackendState<MetalPipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
-    (void)commands;
+    (void)packets;
     (void)transient;
     (void)launch;
     (void)owners;

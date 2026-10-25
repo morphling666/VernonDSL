@@ -183,6 +183,8 @@ struct GroupSlot {
     uint32_t columnCount{};
     uint32_t numericType{};
     size_t valueOffset{};
+    // The inline buffer of an updatable group's slot.
+    vernon::rhi::PersistentBlock updatable{};
 };
 
 struct OpenGLGroup : RhiGroup {
@@ -215,9 +217,6 @@ struct OpenGLCommands : RhiCommands {
     uint32_t stencilReference{};
     std::array<uint32_t, 4> viewport{};
     std::array<uint32_t, 4> scissor{};
-    // The index buffer the commands retained and resolved last.
-    uint64_t indexBufferKey{};
-    gl::Uint indexBuffer{};
 
     void invalidate(const OpenGLAdapterState &state) {
         epoch = state.epoch;
@@ -709,6 +708,13 @@ RhiAdapterResult<void> writeInlineUniform(VernonRuntimeRhiAdapter &adapter, Open
             return RhiAdapterResult<void>{vernon::err(std::move(written).error())};
         slot.name = static_cast<gl::Uint>(written.value().buffer);
         slot.offset = static_cast<size_t>(written.value().offset);
+    } else if (descriptor.lifetime == VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE) {
+        auto placed = placeUpdatable(adapter, group, size, aligned);
+        if (!placed)
+            return RhiAdapterResult<void>{vernon::err(std::move(placed).error())};
+        slot.updatable = placed.value();
+        slot.name = static_cast<gl::Uint>(placed.value().buffer);
+        slot.offset = static_cast<size_t>(placed.value().offset);
     } else {
         auto placed = placePersistent(adapter, group, bytes, size, aligned);
         if (!placed)
@@ -846,6 +852,43 @@ RhiAdapterResult<void> createGroupResult(void *data, const VernonRuntimeProvider
     }
 }
 
+RhiAdapterResult<void> updateGroupResult(void *data, VernonRuntimeProviderObject commandsHandle,
+                                         VernonRuntimeProviderObject groupHandle,
+                                         const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    auto *commands = fromHandle<OpenGLCommands>(commandsHandle);
+    auto *group = fromHandle<OpenGLGroup>(groupHandle);
+    if (!commands || !group || commands->rendering || valueCount != group->slots.size() || (valueCount && !values))
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_group_update_is_invalid");
+    bool named = false;
+    bool written = false;
+    for (size_t index = 0; index < valueCount; ++index) {
+        const GroupLayout::Entry &entry = group->layout->entries[index];
+        if (!packedUniformBytes(entry.layout.kind, entry.layout.interface_kind))
+            continue;
+        const auto &bytes = values[index].payload.inline_value;
+        if (!bytes.data || bytes.size != entry.layout.element_size)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_inline_binding_is_invalid",
+                                   entry.layout.slot);
+        const GroupSlot &slot = group->slots[index];
+        if (entry.inlineBuffer) {
+            if (auto write = writeUpdatable(adapter, commands->encoder, slot.updatable, bytes.data, bytes.size); !write)
+                return write;
+            written = true;
+        } else {
+            std::memcpy(group->values.data() + slot.valueOffset, bytes.data, bytes.size);
+            named = true;
+        }
+    }
+    // Commands and programs re-apply named uniforms only for a group serial they have not applied.
+    if (named)
+        group->serial = ++openGLState(adapter).nextSerial;
+    // A buffer write rebinds the array buffer.
+    if (written)
+        commands->invalidate(openGLState(adapter));
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
 RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObject encoder,
                                            VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -862,8 +905,8 @@ RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObje
     if (!state.device->makeCurrent())
         return providerFailure(vernon::ProviderErrorCode::BackendFailure, "opengl_make_context_current_for_commands");
     // Errors that other OpenGL code left pending would otherwise be reported by end_commands.
-    if (state.device->driver.getError)
-        for (int drained = 0; drained < 16 && state.device->driver.getError() != 0; ++drained) {
+    if (state.device->validation)
+        for (int drained = 0; drained < 16 && state.device->readError() != 0; ++drained) {
         }
     ++state.epoch;
     commands->invalidate(state);
@@ -871,15 +914,16 @@ RhiAdapterResult<void> beginCommandsResult(void *data, VernonRuntimeProviderObje
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-// Reports the OpenGL errors raised since the last check, which the commands just encoded raised.
+// Reports the OpenGL errors raised since the last check, which the commands just encoded raised. Outside validation
+// mode they fail the submission's completion instead.
 RhiAdapterResult<void> pendingErrors(VernonRuntimeRhiAdapter &adapter, const char *operation) {
-    const gl::Driver &driver = openGLState(adapter).device->driver;
-    if (!driver.getError)
+    gl::DeviceState &device = *openGLState(adapter).device;
+    if (!device.validation)
         return RhiAdapterResult<void>{vernon::ok()};
-    const gl::Enum error = driver.getError();
+    const gl::Enum error = device.readError();
     if (error == 0)
         return RhiAdapterResult<void>{vernon::ok()};
-    for (int drained = 0; drained < 16 && driver.getError() != 0; ++drained) {
+    for (int drained = 0; drained < 16 && device.readError() != 0; ++drained) {
     }
     return providerFailure(vernon::ProviderErrorCode::BackendFailure, operation, error);
 }
@@ -899,37 +943,6 @@ RhiAdapterResult<void> resumeCommandsResult(void *data, VernonRuntimeProviderObj
     if (!commands || commands->rendering)
         return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_resume_commands_is_invalid");
     commands->invalidate(openGLState(adapter));
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindPipelineResult(void *data, VernonRuntimeProviderObject handle,
-                                          VernonRuntimeProviderObject pipelineHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    auto *pipeline = fromHandle<PreparedPipeline>(pipelineHandle);
-    if (!commands || !pipeline)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_bind_pipeline_is_invalid");
-    if (auto retained = retainForCommands(adapter, commands->encoder, *pipeline); !retained)
-        return retained;
-    for (uint32_t group = 0; group < kMaxGroups; ++group)
-        if (commands->groups[group] && (group >= pipeline->layout->groupCount ||
-                                        commands->groups[group]->layout != pipeline->layout->groups[group]))
-            commands->groups[group] = nullptr;
-    commands->pipeline = pipeline;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> bindGroupResult(void *data, VernonRuntimeProviderObject handle, uint32_t index,
-                                       VernonRuntimeProviderObject groupHandle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    auto *group = fromHandle<OpenGLGroup>(groupHandle);
-    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->layout->groupCount ||
-        group->layout != commands->pipeline->layout->groups[index])
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_bind_group_is_invalid", index);
-    if (auto retained = retainForCommands(adapter, commands->encoder, *group); !retained)
-        return retained;
-    commands->groups[index] = group;
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -1050,36 +1063,6 @@ RhiAdapterResult<void> applyProgramAndGroups(OpenGLAdapterState &state, OpenGLCo
                                    group->values.data() + group->slots[entry].valueOffset);
         native.uniformGroups[index] = group->serial;
     }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> recordBoundGroupWrites(VernonRuntimeRhiAdapter &adapter, const OpenGLCommands &commands) {
-    const PreparedLayout &layout = *commands.pipeline->layout;
-    for (uint32_t index = 0; index < layout.groupCount; ++index)
-        if ((layout.groupMask & (1u << index)) != 0 && !commands.groups[index]->writes.empty())
-            if (auto recorded = recordGroupWrites(adapter, commands.encoder, *commands.groups[index]); !recorded)
-                return recorded;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto &state = openGLState(adapter);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
-        !commands->pipeline->compute || commands->rendering || descriptor->push_constant_size != 0)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
-                               "opengl_adapter_received_an_invalid_compute_dispatch");
-    if (auto applied = applyProgramAndGroups(state, *commands); !applied)
-        return applied;
-    state.device->driver.dispatchCompute(descriptor->group_count[0], descriptor->group_count[1],
-                                         descriptor->group_count[2]);
-    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
-        return recorded;
-    if (auto recorded = recordProviderCommand(adapter, commands->encoder, false); !recorded)
-        return recorded;
-    adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -1217,150 +1200,151 @@ void applyVertexAttributes(OpenGLAdapterState &state, const OpenGLCommands &comm
         }
 }
 
-RhiAdapterResult<void> bindVertexBuffersResult(void *data, VernonRuntimeProviderObject handle, uint32_t firstBinding,
-                                               const VernonRuntimeProviderResourceReference *references, size_t count) {
+struct OpenGLPacketDecoder {
+    VernonRuntimeRhiAdapter &adapter;
+    OpenGLAdapterState &state;
+    OpenGLCommands &commands;
+    const RhiPacketBatch &batch;
+
+    RhiAdapterResult<void> beginRendering() {
+        commands.rendering = true;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> endRendering() {
+        commands.rendering = false;
+        return pendingErrors(adapter, "opengl_rendering");
+    }
+
+    RhiAdapterResult<void> bindPipeline(RhiRetainedObject &object) {
+        auto &pipeline = static_cast<PreparedPipeline &>(object);
+        for (uint32_t group = 0; group < kMaxGroups; ++group)
+            if (commands.groups[group] && (group >= pipeline.layout->groupCount ||
+                                           commands.groups[group]->layout != pipeline.layout->groups[group]))
+                commands.groups[group] = nullptr;
+        commands.pipeline = &pipeline;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindGroup(uint32_t index, RhiGroup &object) {
+        auto &group = static_cast<OpenGLGroup &>(object);
+        if (!commands.pipeline || index >= commands.pipeline->layout->groupCount ||
+            group.layout != commands.pipeline->layout->groups[index])
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_bind_group_is_invalid", index);
+        commands.groups[index] = &group;
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> bindVertexBuffers(uint32_t first, const uint32_t *resources, size_t count) {
+        for (size_t index = 0; index < count; ++index) {
+            const VernonRuntimeProviderResourceReference &reference = batch.resources[resources[index]];
+            const auto name = static_cast<gl::Uint>(batch.natives[resources[index]]);
+            if (!name)
+                return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_vertex_buffer_is_stale",
+                                       first + index);
+            commands.vertexBuffers[first + index] = {reference.resource.value, name, reference.offset, 0};
+        }
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> dispatch(const uint32_t *groupCount) {
+        if (!commands.pipeline || !commands.pipeline->compute || commands.rendering)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "opengl_adapter_received_an_invalid_compute_dispatch");
+        if (auto applied = applyProgramAndGroups(state, commands); !applied)
+            return applied;
+        state.device->driver.dispatchCompute(groupCount[0], groupCount[1], groupCount[2]);
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    RhiAdapterResult<void> draw(uint32_t topologyIndex, uint32_t indexResource,
+                                const VernonRuntimeProviderDrawPayload &draw, const vernon::rhi::OpenedRendering &) {
+        if (!commands.pipeline || commands.pipeline->compute || !commands.rendering || topologyIndex > 2)
+            return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
+                                   "opengl_adapter_received_an_invalid_draw");
+        // gl_InstanceID excludes the base instance, so a nonzero first instance would change `instance_index`.
+        if (draw.first_instance != 0)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_first_instance_is_unsupported");
+        auto &driver = state.device->driver;
+        const bool indexed = indexResource != UINT32_MAX;
+        if (indexed && draw.base_vertex != 0 && !driver.drawElementsInstancedBaseVertex)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_base_vertex_is_unsupported");
+        if (auto applied = applyProgramAndGroups(state, commands); !applied)
+            return applied;
+        PreparedPipeline &pipeline = *commands.pipeline;
+        if (commands.appliedPipeline != pipeline.serial) {
+            applyFixedFunctionState(driver, pipeline, draw.stencil_reference);
+            commands.appliedPipeline = pipeline.serial;
+            commands.stencilReference = draw.stencil_reference;
+        } else if (pipeline.depthStencil.stencil_test && commands.stencilReference != draw.stencil_reference) {
+            applyStencilFunction(driver, pipeline, draw.stencil_reference);
+            commands.stencilReference = draw.stencil_reference;
+        }
+        if (!commands.vertexArrayBound) {
+            driver.bindVertexArray(state.vertexArray);
+            commands.vertexArrayBound = true;
+        }
+        applyVertexAttributes(state, commands);
+        const std::array<uint32_t, 4> viewport{draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3]};
+        if (!commands.viewportValid || commands.viewport != viewport) {
+            driver.viewport(static_cast<gl::Int>(viewport[0]), static_cast<gl::Int>(viewport[1]),
+                            static_cast<gl::Size>(viewport[2]), static_cast<gl::Size>(viewport[3]));
+            commands.viewport = viewport;
+            commands.viewportValid = true;
+        }
+        const std::array<uint32_t, 4> scissor{draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]};
+        if (!commands.scissorValid || commands.scissor != scissor) {
+            driver.enable(gl::kScissorTest);
+            driver.scissor(static_cast<gl::Int>(scissor[0]), static_cast<gl::Int>(scissor[1]),
+                           static_cast<gl::Size>(scissor[2]), static_cast<gl::Size>(scissor[3]));
+            commands.scissor = scissor;
+            commands.scissorValid = true;
+        }
+        constexpr gl::Enum topologies[]{gl::kTriangles, gl::kLines, gl::kPoints};
+        const gl::Enum topology = topologies[topologyIndex];
+        const auto instances = static_cast<gl::Size>(draw.instance_count);
+        if (indexed) {
+            const VernonRuntimeProviderResourceReference &indexBuffer = batch.resources[indexResource];
+            if (state.indexBufferKey != indexBuffer.resource.value) {
+                driver.bindBuffer(gl::kElementArrayBuffer, static_cast<gl::Uint>(batch.natives[indexResource]));
+                state.indexBufferKey = indexBuffer.resource.value;
+            }
+            const auto *indices = reinterpret_cast<const void *>(
+                static_cast<uintptr_t>(indexBuffer.offset + uint64_t{draw.first_index} * sizeof(uint32_t)));
+            const auto count = static_cast<gl::Size>(draw.vertex_count);
+            if (draw.base_vertex != 0)
+                driver.drawElementsInstancedBaseVertex(topology, count, gl::kUnsignedInt, indices, instances,
+                                                       static_cast<gl::Int>(draw.base_vertex));
+            else
+                driver.drawElementsInstanced(topology, count, gl::kUnsignedInt, indices, instances);
+        } else if (draw.instance_count == 1) {
+            driver.drawArrays(topology, 0, static_cast<gl::Size>(draw.vertex_count));
+        } else {
+            driver.drawArraysInstanced(topology, 0, static_cast<gl::Size>(draw.vertex_count), instances);
+        }
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+};
+
+RhiRetainedObject *packetPipeline(VernonRuntimeProviderObject handle) noexcept {
+    return fromHandle<PreparedPipeline>(handle);
+}
+RhiGroup *packetGroup(VernonRuntimeProviderObject handle) noexcept { return fromHandle<OpenGLGroup>(handle); }
+
+// A batch starts with nothing bound, so the bindings of earlier batches, whose objects may be gone, are dropped.
+RhiAdapterResult<void> encodePacketsResult(void *data, VernonRuntimeProviderObject handle,
+                                           VernonRuntimeProviderObject batchHandle, const uint32_t *payload,
+                                           size_t payloadWords) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *commands = fromHandle<OpenGLCommands>(handle);
-    if (!commands || !references || count == 0 || firstBinding > kMaxVertexBindings ||
-        count > kMaxVertexBindings - firstBinding)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_bind_vertex_buffers_is_invalid");
-    for (size_t index = 0; index < count; ++index) {
-        const VernonRuntimeProviderResourceReference &reference = references[index];
-        const size_t binding = firstBinding + index;
-        if ((reference.identity & kRhiResourceKindMask) != kRhiBufferResource || reference.offset >= reference.size)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_vertex_buffer_is_invalid",
-                                   binding);
-        if (auto retained = retainCommandResource(adapter, commands->encoder, reference); !retained)
-            return retained;
-        auto resolved = resolveCommandRhiResource(adapter, commands->encoder, reference);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        const auto name = static_cast<gl::Uint>(resolved.value());
-        if (!name)
-            return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_vertex_buffer_is_stale",
-                                   binding);
-        commands->vertexBuffers[binding] = {reference.resource.value, name, reference.offset, 0};
-    }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> applyIndexBuffer(VernonRuntimeRhiAdapter &adapter, OpenGLAdapterState &state,
-                                        OpenGLCommands &commands, VernonRuntimeProviderResourceReference indexBuffer) {
-    if (commands.indexBufferKey != indexBuffer.resource.value) {
-        if (auto retained = retainCommandResource(adapter, commands.encoder, indexBuffer); !retained)
-            return retained;
-        auto resolved = resolveCommandRhiResource(adapter, commands.encoder, indexBuffer);
-        if (!resolved)
-            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
-        commands.indexBufferKey = indexBuffer.resource.value;
-        commands.indexBuffer = static_cast<gl::Uint>(resolved.value());
-    }
-    if (state.indexBufferKey != indexBuffer.resource.value) {
-        state.device->driver.bindBuffer(gl::kElementArrayBuffer, commands.indexBuffer);
-        state.indexBufferKey = indexBuffer.resource.value;
-    }
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject handle,
-                                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto &state = openGLState(adapter);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !commands || !commands->pipeline ||
-        commands->pipeline->compute || !commands->rendering || descriptor->topology > 2 ||
-        (descriptor->index_count != 0 && descriptor->index_type != 0))
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_adapter_received_an_invalid_draw");
-    // gl_InstanceID excludes the base instance, so a nonzero first instance would change `instance_index`.
-    if (descriptor->first_instance != 0)
-        return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_first_instance_is_unsupported");
-    auto &driver = state.device->driver;
-    if (descriptor->index_count != 0 && descriptor->base_vertex != 0 && !driver.drawElementsInstancedBaseVertex)
-        return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_base_vertex_is_unsupported");
-    if (auto opened = openCommandRendering(adapter, commands->encoder); !opened)
-        return RhiAdapterResult<void>{vernon::err(std::move(opened).error())};
-    if (auto applied = applyProgramAndGroups(state, *commands); !applied)
-        return applied;
-    PreparedPipeline &pipeline = *commands->pipeline;
-    if (commands->appliedPipeline != pipeline.serial) {
-        applyFixedFunctionState(driver, pipeline, descriptor->stencil_reference);
-        commands->appliedPipeline = pipeline.serial;
-        commands->stencilReference = descriptor->stencil_reference;
-    } else if (pipeline.depthStencil.stencil_test && commands->stencilReference != descriptor->stencil_reference) {
-        applyStencilFunction(driver, pipeline, descriptor->stencil_reference);
-        commands->stencilReference = descriptor->stencil_reference;
-    }
-    if (!commands->vertexArrayBound) {
-        driver.bindVertexArray(state.vertexArray);
-        commands->vertexArrayBound = true;
-    }
-    applyVertexAttributes(state, *commands);
-    const std::array<uint32_t, 4> viewport{descriptor->viewport[0], descriptor->viewport[1], descriptor->viewport[2],
-                                           descriptor->viewport[3]};
-    if (!commands->viewportValid || commands->viewport != viewport) {
-        driver.viewport(static_cast<gl::Int>(viewport[0]), static_cast<gl::Int>(viewport[1]),
-                        static_cast<gl::Size>(viewport[2]), static_cast<gl::Size>(viewport[3]));
-        commands->viewport = viewport;
-        commands->viewportValid = true;
-    }
-    const std::array<uint32_t, 4> scissor{descriptor->scissor[0], descriptor->scissor[1], descriptor->scissor[2],
-                                          descriptor->scissor[3]};
-    if (!commands->scissorValid || commands->scissor != scissor) {
-        driver.enable(gl::kScissorTest);
-        driver.scissor(static_cast<gl::Int>(scissor[0]), static_cast<gl::Int>(scissor[1]),
-                       static_cast<gl::Size>(scissor[2]), static_cast<gl::Size>(scissor[3]));
-        commands->scissor = scissor;
-        commands->scissorValid = true;
-    }
-    constexpr gl::Enum topologies[]{gl::kTriangles, gl::kLines, gl::kPoints};
-    const gl::Enum topology = topologies[descriptor->topology];
-    const auto instances = static_cast<gl::Size>(descriptor->instance_count);
-    if (descriptor->index_count != 0) {
-        if (auto bound = applyIndexBuffer(adapter, state, *commands, descriptor->index_buffer); !bound)
-            return bound;
-        const auto *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(descriptor->index_buffer.offset));
-        const auto count = static_cast<gl::Size>(descriptor->index_count);
-        if (descriptor->base_vertex != 0)
-            driver.drawElementsInstancedBaseVertex(topology, count, gl::kUnsignedInt, indices, instances,
-                                                   static_cast<gl::Int>(descriptor->base_vertex));
-        else
-            driver.drawElementsInstanced(topology, count, gl::kUnsignedInt, indices, instances);
-    } else if (descriptor->instance_count == 1) {
-        driver.drawArrays(topology, 0, static_cast<gl::Size>(descriptor->vertex_count));
-    } else {
-        driver.drawArraysInstanced(topology, 0, static_cast<gl::Size>(descriptor->vertex_count), instances);
-    }
-    if (auto recorded = recordBoundGroupWrites(adapter, *commands); !recorded)
-        return recorded;
-    if (auto recorded = recordProviderCommand(adapter, commands->encoder, true); !recorded)
-        return recorded;
-    adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
-    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> beginRenderingResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    if (!commands || !descriptor || commands->rendering)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_begin_rendering_is_invalid");
-    if (auto begun = beginEncoderRendering(adapter, commands->encoder, *descriptor); !begun)
-        return begun;
-    commands->rendering = true;
-    return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> endRenderingResult(void *data, VernonRuntimeProviderObject handle) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *commands = fromHandle<OpenGLCommands>(handle);
-    if (!commands || !commands->rendering)
-        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_end_rendering_is_invalid");
-    commands->rendering = false;
-    if (auto ended = endEncoderRendering(adapter, commands->encoder); !ended)
-        return ended;
-    return pendingErrors(adapter, "opengl_rendering");
+    auto *batch = fromHandle<RhiPacketBatch>(batchHandle);
+    if (!commands || !batch || commands->rendering)
+        return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_encode_packets_is_invalid");
+    commands->pipeline = nullptr;
+    commands->groups.fill(nullptr);
+    commands->vertexBuffers.fill({});
+    OpenGLPacketDecoder decoder{adapter, openGLState(adapter), *commands, *batch};
+    return decodeRhiPackets(adapter, commands->encoder, *batch, payload, payloadWords, decoder);
 }
 
 void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
@@ -1400,6 +1384,12 @@ VernonStatus createGroup(void *data, const VernonRuntimeProviderGroupDescriptor 
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, createGroupResult(data, descriptor, output), "OpenGL group creation failed");
 }
+VernonStatus updateGroup(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject group,
+                         const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, updateGroupResult(data, commands, group, values, valueCount),
+                          "OpenGL group update failed");
+}
 VernonStatus beginCommands(void *data, VernonRuntimeProviderObject encoder, VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, beginCommandsResult(data, encoder, output), "OpenGL commands could not begin");
@@ -1412,40 +1402,17 @@ VernonStatus resumeCommands(void *data, VernonRuntimeProviderObject commands) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, resumeCommandsResult(data, commands), "OpenGL commands could not resume");
 }
-VernonStatus bindPipeline(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
+VernonStatus encodePackets(void *data, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject batch,
+                           const uint32_t *payload, size_t payloadWords) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindPipelineResult(data, commands, pipeline), "OpenGL pipeline binding failed");
+    return providerStatus(adapter, encodePacketsResult(data, commands, batch, payload, payloadWords),
+                          "OpenGL packet encoding failed");
 }
-VernonStatus bindGroup(void *data, VernonRuntimeProviderObject commands, uint32_t index,
-                       VernonRuntimeProviderObject group) {
+VernonStatus createPacketBatch(void *data, const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                               VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindGroupResult(data, commands, index, group), "OpenGL group binding failed");
-}
-VernonStatus bindVertexBuffers(void *data, VernonRuntimeProviderObject commands, uint32_t firstBinding,
-                               const VernonRuntimeProviderResourceReference *buffers, size_t count) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, bindVertexBuffersResult(data, commands, firstBinding, buffers, count),
-                          "OpenGL vertex buffer binding failed");
-}
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commands,
-                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDispatchResult(data, commands, descriptor), "OpenGL dispatch encoding failed");
-}
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commands,
-                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, encodeDrawResult(data, commands, descriptor), "OpenGL draw encoding failed");
-}
-VernonStatus beginRendering(void *data, VernonRuntimeProviderObject commands,
-                            const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, beginRenderingResult(data, commands, descriptor),
-                          "OpenGL rendering could not begin");
-}
-VernonStatus endRendering(void *data, VernonRuntimeProviderObject commands) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, endRenderingResult(data, commands), "OpenGL rendering could not end");
+    return providerStatus(adapter, createRhiPacketBatch(adapter, descriptor, {packetPipeline, packetGroup}, output),
+                          "OpenGL packet batch creation failed");
 }
 
 } // namespace
@@ -1465,18 +1432,15 @@ void initializeOpenGLProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.begin_commands = beginCommands;
     adapter.provider.end_commands = endCommands;
     adapter.provider.resume_commands = resumeCommands;
-    adapter.provider.encode_bind_pipeline = bindPipeline;
-    adapter.provider.encode_bind_group = bindGroup;
-    adapter.provider.encode_bind_vertex_buffers = bindVertexBuffers;
-    adapter.provider.encode_dispatch = encodeDispatch;
-    adapter.provider.encode_draw = encodeDraw;
-    adapter.provider.begin_rendering = beginRendering;
-    adapter.provider.end_rendering = endRendering;
+    adapter.provider.create_packet_batch = createPacketBatch;
+    adapter.provider.encode_packets = encodePackets;
+    adapter.provider.update_group = updateGroup;
     adapter.provider.destroy_shader = destroyShader;
     adapter.provider.destroy_group_layout = destroyGroupLayout;
     adapter.provider.destroy_pipeline_layout = destroyLayout;
     adapter.provider.destroy_pipeline = destroyPipeline;
     adapter.provider.destroy_group = destroyGroup;
+    adapter.provider.destroy_packet_batch = destroyRhiPacketBatch;
 }
 
 } // namespace vernon::runtime::rhi_adapter

@@ -136,6 +136,7 @@ void DeviceState::shutdown() {
     recordingTransients.clear();
     transientPool.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
     persistentBlocks.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
+    updatableBlocks.clear([](TransientChunk &chunk) { chunk.buffer = nil; });
     queue = nil;
     device = nil;
     maxComputeInvocations = 0;
@@ -1000,5 +1001,23 @@ bool DeviceState::reservePersistent(size_t size, size_t alignment, id<MTLBuffer>
 }
 
 void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
+
+bool DeviceState::reserveUpdatable(size_t size, size_t alignment, id<MTLBuffer> &buffer, size_t &offset, uint64_t &key,
+                                   std::string &error) {
+    TransientChunk *chunk =
+        updatableBlocks.acquire(size, alignment, offset, key, [&](size_t capacity, TransientChunk &created) {
+            created.buffer = [device newBufferWithLength:capacity options:MTLResourceStorageModePrivate];
+            created.capacity = capacity;
+            return created.buffer != nil;
+        });
+    if (!chunk) {
+        error = "Metal updatable block allocation failed";
+        return false;
+    }
+    buffer = chunk->buffer;
+    return true;
+}
+
+void DeviceState::releaseUpdatable(uint64_t key) { updatableBlocks.release(key); }
 
 } // namespace vernon::rhi::metal

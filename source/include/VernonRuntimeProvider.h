@@ -237,7 +237,9 @@ typedef struct VernonRuntimeProviderImageDescription {
 typedef enum VernonRuntimeProviderGroupLifetime {
     VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT = 0,
     /* Bound only by commands of `command_encoder`, which may own its memory. */
-    VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT = 1
+    VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT = 1,
+    /* Persistent; its inline values are undefined until update_group writes them. Made without a command encoder. */
+    VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE = 2
 } VernonRuntimeProviderGroupLifetime;
 
 /*
@@ -254,14 +256,6 @@ typedef struct VernonRuntimeProviderGroupDescriptor {
     VernonRuntimeProviderObject command_encoder;
     uint32_t reserved[4];
 } VernonRuntimeProviderGroupDescriptor;
-
-typedef struct VernonRuntimeProviderDispatchDescriptor {
-    uint32_t struct_size;
-    uint32_t group_count[3];
-    const void *push_constants;
-    size_t push_constant_size;
-    uint32_t reserved[4];
-} VernonRuntimeProviderDispatchDescriptor;
 
 typedef struct VernonRuntimeProviderColorAttachment {
     uint32_t location;
@@ -304,46 +298,97 @@ typedef struct VernonRuntimeProviderRenderingDescriptor {
     uint32_t reserved[4];
 } VernonRuntimeProviderRenderingDescriptor;
 
-typedef struct VernonRuntimeProviderDrawDescriptor {
-    uint32_t struct_size;
+/*
+ * A packet is a uint32_t header, the opcode in the low 16 bits and the
+ * packet's word count including the header in the high 16 bits, followed by
+ * its operands. Object operands index the batch's objects, resource operands
+ * its resources and rendering operands its renderings; payload operands index
+ * the payload words passed to encode_packets.
+ */
+typedef enum VernonRuntimeProviderPacketOpcode {
+    /* rendering, payload of one VernonClearColor per color attachment, then the depth clear value as a float and
+     * the stencil clear value */
+    VERNON_RUNTIME_PROVIDER_PACKET_BEGIN_RENDERING = 1,
+    VERNON_RUNTIME_PROVIDER_PACKET_END_RENDERING = 2,
+    /* pipeline object */
+    VERNON_RUNTIME_PROVIDER_PACKET_BIND_PIPELINE = 3,
+    /* group index, group object */
+    VERNON_RUNTIME_PROVIDER_PACKET_BIND_GROUP = 4,
+    /* first binding, then one buffer resource per binding */
+    VERNON_RUNTIME_PROVIDER_PACKET_BIND_VERTEX_BUFFERS = 5,
+    /* topology, payload of a VernonRuntimeProviderDrawPayload */
+    VERNON_RUNTIME_PROVIDER_PACKET_DRAW = 6,
+    /* topology, resource of the 32-bit index buffer, payload of a VernonRuntimeProviderDrawPayload */
+    VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED = 7,
+    /* payload of the three group counts */
+    VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH = 8,
+    /* label byte count, then the label bytes in whole words */
+    VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP = 9,
+    VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP = 10,
+    /* label byte count, then the label bytes in whole words */
+    VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER = 11
+} VernonRuntimeProviderPacketOpcode;
+
+/* The payload words of a draw; every member is one word. */
+typedef struct VernonRuntimeProviderDrawPayload {
+    /* The index count of an indexed draw. */
     uint32_t vertex_count;
+    /* A draw of no instances draws nothing; providers skip it. */
     uint32_t instance_count;
     uint32_t first_instance;
     /* Indexed draws only: added to each index before vertex fetch. */
     int32_t base_vertex;
+    /* Indexed draws only: the first index read from the index buffer. */
+    uint32_t first_index;
     uint32_t viewport[4];
     uint32_t scissor[4];
-    uint32_t topology;
-    VernonRuntimeProviderResourceReference index_buffer;
-    uint32_t index_count;
-    uint32_t index_type;
     uint32_t stencil_reference;
-} VernonRuntimeProviderDrawDescriptor;
+} VernonRuntimeProviderDrawPayload;
+
+/*
+ * A recorded command stream; see stored_plans.md section 11. The packets are
+ * valid: each draw and dispatch has a compatible pipeline, a group at every
+ * group index it requires and, for a draw, a vertex buffer at every vertex
+ * binding and an open rendering scope. The batch starts with nothing bound and
+ * ends outside a rendering scope with balanced debug groups.
+ */
+typedef struct VernonRuntimeProviderPacketBatchDescriptor {
+    uint32_t struct_size;
+    const uint32_t *packets;
+    size_t packet_word_count;
+    /* Pipelines and groups. */
+    const VernonRuntimeProviderObject *objects;
+    size_t object_count;
+    /* Vertex and index buffers. */
+    const VernonRuntimeProviderResourceReference *resources;
+    size_t resource_count;
+    /* Their clear values are ignored; BEGIN_RENDERING reads them from the payload. */
+    const VernonRuntimeProviderRenderingDescriptor *renderings;
+    size_t rendering_count;
+    /* encode_packets receives at least this many payload words. */
+    size_t payload_word_count;
+    uint32_t reserved[4];
+} VernonRuntimeProviderPacketBatchDescriptor;
 
 /*
  * Commands are encoded between begin_commands and end_commands, which open
  * and close the provider's command state for one command encoder; an encoder
- * has at most one open command state. Its owner may record other commands on
- * the native encoder, such as barriers, copies and debug groups, only outside
- * a rendering scope and only before calling resume_commands, after which the
- * provider reapplies the native state those commands may have changed before
- * its next command. Bound pipelines, groups and vertex buffers are state:
- * a dispatch or draw uses the last bound pipeline, the groups bound at each
- * of its group indices and the vertex buffers bound at each of its vertex
- * bindings. Binding a pipeline keeps the group bound at an index whose group
- * layout the new pipeline layout shares and unbinds the others; vertex
- * buffers stay bound across pipelines, with the stride of the bound variant.
- * Providers reissue native binds where their API requires it. A
+ * has at most one open command state. Commands are encoded as packet batches.
+ * The owner of the commands may record other commands on the native encoder,
+ * such as barriers, copies and debug groups, only between batches and only
+ * before calling resume_commands, after which the provider reapplies the
+ * native state those commands may have changed before its next batch. A
  * provider skips native calls whose state is already current and must not
  * assume that native state outside its commands, such as an OpenGL context
  * shared with other renderers, is unchanged between them.
  *
- * Preparation callbacks and create_group may allocate. The encode callbacks
- * and the rendering callbacks are the invocation hot path and must not
- * parse, perform name lookup, create stable objects, or make unbounded heap
- * allocations. encode_draw is called only inside a rendering scope, and a
- * scope may contain no draws. end_commands reports failures the provider
- * detects only after encoding, such as OpenGL errors.
+ * Preparation callbacks, create_group and create_packet_batch may allocate
+ * and look objects up. A batch keeps the objects and resources it names alive
+ * until it is destroyed and no command that encoded it is pending. The other
+ * command callbacks are the invocation hot path and must not parse, perform
+ * name lookup, create stable objects, or make unbounded heap allocations.
+ * end_commands reports failures the provider detects only after encoding,
+ * such as OpenGL errors.
  */
 typedef struct VernonRuntimeDeviceProvider {
     uint32_t struct_size;
@@ -367,33 +412,32 @@ typedef struct VernonRuntimeDeviceProvider {
                                    VernonRuntimeProviderImageDescription *description);
     VernonStatus (*create_group)(void *user_data, const VernonRuntimeProviderGroupDescriptor *descriptor,
                                  VernonRuntimeProviderObject *group);
+    VernonStatus (*create_packet_batch)(void *user_data, const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                                        VernonRuntimeProviderObject *batch);
 
     VernonStatus (*begin_commands)(void *user_data, VernonRuntimeProviderObject command_encoder,
                                    VernonRuntimeProviderObject *commands);
     VernonStatus (*end_commands)(void *user_data, VernonRuntimeProviderObject commands);
     VernonStatus (*resume_commands)(void *user_data, VernonRuntimeProviderObject commands);
-    VernonStatus (*encode_bind_pipeline)(void *user_data, VernonRuntimeProviderObject commands,
-                                         VernonRuntimeProviderObject pipeline);
-    VernonStatus (*encode_bind_group)(void *user_data, VernonRuntimeProviderObject commands, uint32_t index,
-                                      VernonRuntimeProviderObject group);
-    /* Binds buffers[i] at vertex binding first_binding + i; the provider keeps them alive for the commands. */
-    VernonStatus (*encode_bind_vertex_buffers)(void *user_data, VernonRuntimeProviderObject commands,
-                                               uint32_t first_binding,
-                                               const VernonRuntimeProviderResourceReference *buffers,
-                                               size_t buffer_count);
-    VernonStatus (*encode_dispatch)(void *user_data, VernonRuntimeProviderObject commands,
-                                    const VernonRuntimeProviderDispatchDescriptor *descriptor);
-    VernonStatus (*encode_draw)(void *user_data, VernonRuntimeProviderObject commands,
-                                const VernonRuntimeProviderDrawDescriptor *descriptor);
-    VernonStatus (*begin_rendering)(void *user_data, VernonRuntimeProviderObject commands,
-                                    const VernonRuntimeProviderRenderingDescriptor *descriptor);
-    VernonStatus (*end_rendering)(void *user_data, VernonRuntimeProviderObject commands);
+    VernonStatus (*encode_packets)(void *user_data, VernonRuntimeProviderObject commands,
+                                   VernonRuntimeProviderObject batch, const uint32_t *payload,
+                                   size_t payload_word_count);
+    /*
+     * Optional. Writes the inline values of an UPDATABLE group between batches of `commands`, outside rendering
+     * scopes: batches encoded before the call read the previous values and batches encoded after it the new ones, on
+     * every encoder. `values` are index-aligned with the group layout's entries and name the group's resources; only
+     * inline values are read. The provider leaves `commands` ready for their next batch.
+     */
+    VernonStatus (*update_group)(void *user_data, VernonRuntimeProviderObject commands,
+                                 VernonRuntimeProviderObject group, const VernonRuntimeProviderBindingValue *values,
+                                 size_t value_count);
 
     void (*destroy_shader)(void *user_data, VernonRuntimeProviderObject shader);
     void (*destroy_group_layout)(void *user_data, VernonRuntimeProviderObject group_layout);
     void (*destroy_pipeline_layout)(void *user_data, VernonRuntimeProviderObject layout);
     void (*destroy_pipeline)(void *user_data, VernonRuntimeProviderObject pipeline);
     void (*destroy_group)(void *user_data, VernonRuntimeProviderObject group);
+    void (*destroy_packet_batch)(void *user_data, VernonRuntimeProviderObject batch);
     uint32_t reserved[8];
 } VernonRuntimeDeviceProvider;
 

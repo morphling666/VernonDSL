@@ -166,7 +166,7 @@ createOwnedDeviceResult(const VernonRhiOwnedDeviceDescriptor *descriptor) noexce
     auto owner = reserved.value().retainOwner();
     if (owner.isErr())
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(owner).error())};
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), descriptor->flags);
     if (commandState.isErr())
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(commandState).error())};
     device.commandState = std::move(commandState).value();

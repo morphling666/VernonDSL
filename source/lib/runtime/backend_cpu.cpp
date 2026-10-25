@@ -232,17 +232,6 @@ VernonStatus endCpuCommands(void *, VernonRuntimeProviderObject commands) {
 
 VernonStatus resumeCpuCommands(void *, VernonRuntimeProviderObject) { return VERNON_STATUS_OK; }
 
-VernonStatus bindCpuPipeline(void *, VernonRuntimeProviderObject commands, VernonRuntimeProviderObject pipeline) {
-    fromHandle<CpuCommands>(commands)->pipeline = fromHandle<CpuPreparedPipeline>(pipeline);
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus bindCpuGroup(void *, VernonRuntimeProviderObject commands, uint32_t index,
-                          VernonRuntimeProviderObject group) {
-    fromHandle<CpuCommands>(commands)->groups[index] = fromHandle<CpuGroup>(group);
-    return VERNON_STATUS_OK;
-}
-
 // Values of the bound groups, in group order, follow the reflected arguments and then the metadata carrier.
 VernonStatus packCpuFrame(CpuContextState &context, CpuCommands &commands) {
     const CpuPreparedPipeline &pipeline = *commands.pipeline;
@@ -323,17 +312,14 @@ VernonStatus packCpuFrame(CpuContextState &context, CpuCommands &commands) {
                                           : fail(context.error, "CPU provider binding layout exceeds reflection");
 }
 
-VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject handle,
-                               const VernonRuntimeProviderDispatchDescriptor *descriptor) {
-    auto &context = *static_cast<CpuContextState *>(data);
-    CpuCommands &commands = *fromHandle<CpuCommands>(handle);
-    if (!descriptor || !commands.pipeline)
+VernonStatus dispatchCpu(CpuContextState &context, CpuCommands &commands, const uint32_t groupCount[3]) {
+    if (!commands.pipeline)
         return fail(context.error, "invalid CPU provider dispatch");
     VernonStatus status = packCpuFrame(context, commands);
     if (status != VERNON_STATUS_OK)
         return status;
     const CpuPreparedPipeline &pipeline = *commands.pipeline;
-    status = context.scheduler->dispatch(descriptor->group_count, pipeline.workgroup, [&](VernonCpuRange &range) {
+    status = context.scheduler->dispatch(groupCount, pipeline.workgroup, [&](VernonCpuRange &range) {
         range.arguments = commands.packed.data();
         range.arguments_size = commands.packed.size();
         range.results = commands.results.empty() ? nullptr : commands.results.data();
@@ -354,9 +340,85 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject handle,
     return status;
 }
 
-VernonStatus unsupportedCpuDraw(void *, VernonRuntimeProviderObject, const VernonRuntimeProviderDrawDescriptor *) {
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
+// The Runtime keeps the batch's pipelines and groups alive for as long as the batch exists.
+struct CpuPacketBatch {
+    std::vector<uint32_t> packets;
+    std::vector<VernonRuntimeProviderObject> objects;
+    size_t payloadWords{};
+};
+
+bool cpuPacketIsValid(const VernonRuntimeProviderPacketBatchDescriptor &descriptor, uint32_t opcode,
+                      const uint32_t *operands, uint32_t operandCount) {
+    switch (opcode) {
+    case VERNON_RUNTIME_PROVIDER_PACKET_BIND_PIPELINE:
+        return operandCount == 1 && operands[0] < descriptor.object_count;
+    case VERNON_RUNTIME_PROVIDER_PACKET_BIND_GROUP:
+        return operandCount == 2 && operands[0] < VERNON_RUNTIME_PROVIDER_MAX_GROUPS &&
+               operands[1] < descriptor.object_count;
+    case VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH:
+        return operandCount == 1 && operands[0] <= descriptor.payload_word_count &&
+               descriptor.payload_word_count - operands[0] >= 3;
+    case VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP:
+    case VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER:
+    case VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP:
+        return true;
+    default:
+        return false;
+    }
 }
+
+VernonStatus createCpuPacketBatch(void *data, const VernonRuntimeProviderPacketBatchDescriptor *descriptor,
+                                  VernonRuntimeProviderObject *output) {
+    auto &context = *static_cast<CpuContextState *>(data);
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
+        (descriptor->packet_word_count != 0 && !descriptor->packets) ||
+        (descriptor->object_count != 0 && !descriptor->objects))
+        return fail(context.error, "invalid CPU provider packet batch");
+    if (descriptor->resource_count != 0 || descriptor->rendering_count != 0)
+        return fail(context.error, "CPU provider does not encode graphics commands", VERNON_STATUS_UNSUPPORTED_TARGET);
+    for (size_t word = 0; word < descriptor->packet_word_count;) {
+        const uint32_t count = descriptor->packets[word] >> 16;
+        if (count == 0 || count > descriptor->packet_word_count - word ||
+            !cpuPacketIsValid(*descriptor, descriptor->packets[word] & 0xffffu, descriptor->packets + word + 1,
+                              count - 1))
+            return fail(context.error, "invalid CPU provider packet");
+        word += count;
+    }
+    auto batch = std::make_unique<CpuPacketBatch>();
+    batch->packets.assign(descriptor->packets, descriptor->packets + descriptor->packet_word_count);
+    batch->objects.assign(descriptor->objects, descriptor->objects + descriptor->object_count);
+    batch->payloadWords = descriptor->payload_word_count;
+    *output = toHandle(batch.release());
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus encodeCpuPackets(void *data, VernonRuntimeProviderObject handle, VernonRuntimeProviderObject batchHandle,
+                              const uint32_t *payload, size_t payloadWords) {
+    auto &context = *static_cast<CpuContextState *>(data);
+    CpuCommands &commands = *fromHandle<CpuCommands>(handle);
+    const auto *batch = fromHandle<CpuPacketBatch>(batchHandle);
+    if (!batch || payloadWords < batch->payloadWords || (batch->payloadWords != 0 && !payload))
+        return fail(context.error, "invalid CPU provider packet encoding");
+    commands.pipeline = nullptr;
+    commands.groups.fill(nullptr);
+    for (size_t word = 0; word < batch->packets.size();) {
+        const uint32_t opcode = batch->packets[word] & 0xffffu;
+        const uint32_t *operands = batch->packets.data() + word + 1;
+        word += batch->packets[word] >> 16;
+        if (opcode == VERNON_RUNTIME_PROVIDER_PACKET_BIND_PIPELINE) {
+            commands.pipeline = fromHandle<CpuPreparedPipeline>(batch->objects[operands[0]]);
+        } else if (opcode == VERNON_RUNTIME_PROVIDER_PACKET_BIND_GROUP) {
+            commands.groups[operands[0]] = fromHandle<CpuGroup>(batch->objects[operands[1]]);
+        } else if (opcode == VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH) {
+            const VernonStatus status = dispatchCpu(context, commands, payload + operands[0]);
+            if (status != VERNON_STATUS_OK)
+                return status;
+        }
+    }
+    return VERNON_STATUS_OK;
+}
+
+void destroyCpuPacketBatch(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPacketBatch>(handle); }
 
 void destroyCpuShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuPreparedShader>(handle); }
 void destroyCpuGroupLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<CpuGroupLayout>(handle); }
@@ -388,15 +450,14 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     state->provider.begin_commands = beginCpuCommands;
     state->provider.end_commands = endCpuCommands;
     state->provider.resume_commands = resumeCpuCommands;
-    state->provider.encode_bind_pipeline = bindCpuPipeline;
-    state->provider.encode_bind_group = bindCpuGroup;
-    state->provider.encode_dispatch = encodeCpuDispatch;
-    state->provider.encode_draw = unsupportedCpuDraw;
+    state->provider.create_packet_batch = createCpuPacketBatch;
+    state->provider.encode_packets = encodeCpuPackets;
     state->provider.destroy_shader = destroyCpuShader;
     state->provider.destroy_group_layout = destroyCpuGroupLayout;
     state->provider.destroy_pipeline_layout = destroyCpuLayout;
     state->provider.destroy_pipeline = destroyCpuPipeline;
     state->provider.destroy_group = destroyCpuGroup;
+    state->provider.destroy_packet_batch = destroyCpuPacketBatch;
     installRuntimeBackendState(context, state.release());
     return true;
 }

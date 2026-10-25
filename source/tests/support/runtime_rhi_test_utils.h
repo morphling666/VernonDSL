@@ -466,17 +466,18 @@ inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
 
 inline RhiRuntime createRhiRuntime(VernonRuntimeBackend backend,
                                    const VernonOpenGLContextCallbacks *openglCallbacks = nullptr,
-                                   RhiTestDevicePreference devicePreference = RhiTestDevicePreference::Hardware) {
+                                   RhiTestDevicePreference devicePreference = RhiTestDevicePreference::Hardware,
+                                   uint32_t deviceFlags = 0) {
     RhiRuntime result;
     if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES)
-        result.device = vernonRhiCreateOpenGLDevice(openglCallbacks, backend == VERNON_RUNTIME_OPENGL_ES);
+        result.device = vernonRhiCreateOpenGLDevice(openglCallbacks, backend == VERNON_RUNTIME_OPENGL_ES, deviceFlags);
     else {
         VernonRhiOwnedDeviceDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.backend = rhiBackend(backend);
-        descriptor.flags = devicePreference == RhiTestDevicePreference::Software
-                               ? static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)
-                               : 0;
+        descriptor.flags = deviceFlags | (devicePreference == RhiTestDevicePreference::Software
+                                              ? static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)
+                                              : 0);
         result.device = vernonRhiCreateDevice(&descriptor);
     }
     if (result.device.index != VERNON_RHI_INVALID_HANDLE_INDEX)

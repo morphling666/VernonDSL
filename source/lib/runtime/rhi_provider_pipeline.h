@@ -78,11 +78,11 @@ bool prepareRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAd
                                const RhiComputeTarget &target, const LoadedStageArtifact &stage,
                                const StageBindingPlan &plan, RhiComputePipeline &output,
                                RhiComputeNativeBindingResolver resolver = {});
-// Dispatches on `commands`, whose transient groups `transient` keeps. `owners`, when given, holds the owner of each
-// Stage parameter's argument; otherwise the launch owns them all.
+// Records a dispatch on `packets`, whose transient groups `transient` keeps. `owners`, when given, holds the owner of
+// each Stage parameter's argument; otherwise the launch owns them all.
 VernonStatus invokeRhiComputePipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
                                       const RhiComputeTarget &target, const StageBindingPlan &projection,
-                                      VernonRuntimeCoreCommands *commands, GroupStore &transient,
+                                      VernonRuntimeCorePackets *packets, GroupStore &transient,
                                       const PlannedComputeLaunch &launch, const ArgumentOwner *owners,
                                       RhiComputePipeline &pipeline);
 
@@ -90,9 +90,9 @@ bool prepareRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiA
                                 const RhiGraphicsTarget &target, const LoadedStageArtifact &vertex,
                                 const LoadedStageArtifact &fragment, const StageBindingPlan &plan,
                                 const PreparedGraphicsBindingOptions &options, RhiGraphicsPipeline &output);
-// Encodes one draw of `stream` on `commands`, inside its rendering scope.
+// Records one draw of `stream` on `packets`, inside its rendering scope.
 VernonStatus invokeRhiGraphicsPipeline(VernonRuntimeContext &context, VernonRuntimeRhiAdapter *adapter,
-                                       const RhiGraphicsTarget &target, VernonRuntimeCoreCommands *commands,
+                                       const RhiGraphicsTarget &target, VernonRuntimeCorePackets *packets,
                                        const GraphicsCommand &command, GraphicsStream &stream,
                                        RhiGraphicsPipeline &pipeline);
 

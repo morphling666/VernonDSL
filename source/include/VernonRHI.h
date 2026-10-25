@@ -83,6 +83,21 @@ typedef enum VernonRhiOwnedDeviceFlagBits {
     VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE = 1u << 0
 } VernonRhiOwnedDeviceFlagBits;
 
+/*
+ * Flags of every device creation: the owned descriptor's `flags`, the borrowed descriptors' `flags` and
+ * vernonRhiCreateOpenGLDevice.
+ * VALIDATION: checks native errors around every operation that can raise one and fails that operation, at the cost
+ * of a driver round trip per check; implies LABELS. Without it, native errors fail the next completion checked.
+ * LABELS: debug groups and markers reach the native API; without it they are validated and dropped.
+ * OPENGL_OWNS_DEBUG_OUTPUT: the device may install the context's KHR_debug callback, which then receives every error
+ * of the context, including the host's.
+ */
+typedef enum VernonRhiDeviceFlagBits {
+    VERNON_RHI_DEVICE_VALIDATION = 1u << 1,
+    VERNON_RHI_DEVICE_LABELS = 1u << 2,
+    VERNON_RHI_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT = 1u << 3
+} VernonRhiDeviceFlagBits;
+
 typedef enum VernonRhiQueueCapabilityBits {
     VERNON_RHI_QUEUE_TRANSFER = 1u << 0,
     VERNON_RHI_QUEUE_COMPUTE = 1u << 1,
@@ -257,6 +272,7 @@ typedef struct VernonRhiOwnedDeviceDescriptor {
     VernonRhiBackend backend;
     uint32_t device_index;
     const VernonOpenGLContextCallbacks *opengl_callbacks;
+    /* VernonRhiOwnedDeviceFlagBits and VernonRhiDeviceFlagBits */
     uint32_t flags;
     uint32_t reserved[3];
 } VernonRhiOwnedDeviceDescriptor;
@@ -572,7 +588,9 @@ typedef struct VernonRhiDirectX12BorrowedDeviceDescriptor {
     void *queue;
     void *command_list;
     uint32_t queue_capabilities;
-    uint32_t reserved[4];
+    /* VernonRhiDeviceFlagBits */
+    uint32_t flags;
+    uint32_t reserved[3];
 } VernonRhiDirectX12BorrowedDeviceDescriptor;
 
 typedef struct VernonRhiDirectX12BorrowedBufferDescriptor {
@@ -612,7 +630,9 @@ typedef struct VernonRhiVulkanBorrowedDeviceDescriptor {
     void *command_buffer;
     uint32_t queue_family_index;
     uint32_t queue_capabilities;
-    uint32_t reserved[4];
+    /* VernonRhiDeviceFlagBits */
+    uint32_t flags;
+    uint32_t reserved[3];
 } VernonRhiVulkanBorrowedDeviceDescriptor;
 
 typedef struct VernonRhiVulkanBorrowedBufferDescriptor {
@@ -703,8 +723,9 @@ typedef struct VernonRhiSurfaceImage {
 
 VERNON_RHI_CAPI uint32_t vernonRhiGetApiVersion(void);
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateDevice(const VernonRhiOwnedDeviceDescriptor *descriptor);
+/* `flags` are VernonRhiDeviceFlagBits. */
 VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
-                                                            uint32_t embedded_profile);
+                                                            uint32_t embedded_profile, uint32_t flags);
 // Returns VERNON_RHI_STATUS_INVALID_ARGUMENT, leaving the device valid, while
 // the device still owns child resources or is retained by a Runtime context.
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDestroyDevice(VernonRhiDevice device);

@@ -521,9 +521,13 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
                 return status;
         }
         const ProgramInvocationContext programContext{
-            *invocation->snapshot,        invocation->checkpointMemoryBudget,
-            invocation->checkpointPolicy, invocation->executionWorkspace.get(),
-            recordedGraphics.get(),       &invocation->instance->groups,
+            *invocation->snapshot,
+            invocation->checkpointMemoryBudget,
+            invocation->checkpointPolicy,
+            invocation->executionWorkspace.get(),
+            recordedGraphics.get(),
+            &invocation->instance->groups,
+            &invocation->instance->storedGraphics,
         };
         VernonPullback *pullback = nullptr;
         vernon::runtime::program_execution::InvocationMutationOutcome outcome;
@@ -538,17 +542,14 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
         invocation->instance->submissionRhiSubmissions.store(record.submittedCount());
         vernon::runtime::program_execution::publishPublicOutcome(outcome, publicOutcome);
         if (recordedGraphics)
-            for (const auto &[node, pass] : recordedGraphics->nodes)
-                invocation->graphicsTelemetry[node] = pass.telemetry;
+            for (const auto &[node, recorded] : recordedGraphics->nodes)
+                invocation->graphicsTelemetry[node] = recorded.telemetry;
         if (outcome.submission != vernon::runtime::program_execution::SubmissionState::NotSubmitted) {
             const bool pending = outcome.submission == vernon::runtime::program_execution::SubmissionState::Submitted;
             record.retain(invocation->snapshot);
             record.retain(invocation->executionWorkspace);
-            if (recordedGraphics) {
+            if (recordedGraphics)
                 record.retain(std::move(recordedGraphics));
-                record.retain(std::make_shared<std::map<VernonProgramNodeId, RuntimeGraphicsRecording>>(
-                    std::exchange(invocation->recordings, {})));
-            }
             record.setOutcome(std::move(outcome));
             if (pending)
                 pipeline->context->submissions.push(submission->record, meter.bytes());

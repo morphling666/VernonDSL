@@ -107,6 +107,7 @@ struct VernonRuntimeCoreGroup {
     VernonRuntimeCoreGroupLayout *layout{};
     VernonRuntimeProviderObject handle{};
     bool transient{};
+    bool updatable{};
     VernonRuntimeProviderObject encoder{};
     std::atomic<uint32_t> references{1};
 };
@@ -120,15 +121,135 @@ struct VernonRuntimeCoreCommands {
     VernonRuntimeDeviceProvider provider{};
     VernonRuntimeProviderObject encoder{};
     VernonRuntimeProviderObject native{};
-    // The bound pipeline's owner, referenced while bound, and the bound native pipeline or variant.
+};
+
+namespace {
+
+// Finds or inserts a table index by a non-zero 64-bit hash, with `equal(index)` telling whether the entry at an index
+// with that hash is the one sought. Clearing keeps the slots' storage.
+class IndexTable {
+public:
+    template <typename Equal> std::pair<uint32_t, bool> insert(uint64_t hash, uint32_t next, Equal &&equal) {
+        if ((count_ + 1) * 2 > slots_.size())
+            grow();
+        const size_t mask = slots_.size() - 1;
+        for (size_t probe = mix(hash) & mask;; probe = (probe + 1) & mask) {
+            Slot &slot = slots_[probe];
+            if (!slot.hash) {
+                slot = {hash, next};
+                ++count_;
+                return {next, true};
+            }
+            if (slot.hash == hash && equal(slot.index))
+                return {slot.index, false};
+        }
+    }
+
+    void clear() {
+        if (count_)
+            std::fill(slots_.begin(), slots_.end(), Slot{});
+        count_ = 0;
+    }
+
+private:
+    struct Slot {
+        uint64_t hash{};
+        uint32_t index{};
+    };
+
+    static size_t mix(uint64_t hash) {
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdull;
+        return static_cast<size_t>(hash ^ (hash >> 33));
+    }
+
+    void grow() {
+        std::vector<Slot> previous(std::max<size_t>(slots_.size() * 2, 64));
+        previous.swap(slots_);
+        const size_t mask = slots_.size() - 1;
+        for (const Slot &slot : previous) {
+            if (!slot.hash)
+                continue;
+            size_t probe = mix(slot.hash) & mask;
+            while (slots_[probe].hash)
+                probe = (probe + 1) & mask;
+            slots_[probe] = slot;
+        }
+    }
+
+    std::vector<Slot> slots_;
+    size_t count_{};
+};
+
+// A rendering scope of a recording; the descriptor's pointers are filled when a batch is created.
+struct PacketRendering {
+    VernonRuntimeProviderRenderingDescriptor descriptor{};
+    std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colors{};
+    VernonRuntimeProviderDepthStencilAttachment depth{};
+    bool hasDepth{};
+    // The scope's sampled images in VernonRuntimeCorePackets::sampledImages.
+    size_t firstSampledImage{};
+};
+
+enum class PayloadSiteKind : uint8_t { Draw, DrawIndexed, Dispatch, Clear };
+
+// Payload words a command wrote, with the limits EncodePackets checks them against.
+struct PayloadSite {
+    PayloadSiteKind kind{};
+    uint32_t payload{};
+    // DrawIndexed: the index buffer's capacity in indices. Clear: the color attachment count.
+    uint32_t limit{};
+    // Clear: bit c is set when color attachment c has an integer format, whose clear values are raw bits.
+    uint32_t integerColors{};
+};
+
+constexpr uint32_t packetHeader(VernonRuntimeProviderPacketOpcode opcode, size_t words) {
+    return static_cast<uint32_t>(opcode) | static_cast<uint32_t>(words << 16);
+}
+
+constexpr size_t kDrawPayloadWords = sizeof(VernonRuntimeProviderDrawPayload) / sizeof(uint32_t);
+constexpr size_t kMaxPacketWords = 0xffff;
+
+} // namespace
+
+struct VernonRuntimeCorePackets {
+    VernonRuntimeDeviceProvider provider{};
+    std::vector<uint32_t> words;
+    std::vector<uint32_t> payload;
+    std::vector<VernonRuntimeProviderObject> objects;
+    IndexTable objectIndices;
+    // Referenced by the recording: the owner of each pipeline object and each group object.
+    std::vector<VernonRuntimeCorePipeline *> pipelines;
+    std::vector<VernonRuntimeCoreGroup *> groups;
+    std::vector<VernonRuntimeProviderResourceReference> resources;
+    IndexTable resourceIndices;
+    std::vector<PacketRendering> renderings;
+    std::vector<VernonRuntimeProviderResourceReference> sampledImages;
+    std::vector<PayloadSite> sites;
+    // The command encoder of the transient groups the recording binds, which is the only one it is encodable on.
+    VernonRuntimeProviderObject transientEncoder{};
+    // The binding state after the last recorded command.
     VernonRuntimeCorePipeline *pipeline{};
     VernonRuntimeProviderObject bound{};
-    // Referenced while bound.
-    std::array<VernonRuntimeCoreGroup *, kMaxGroups> groups{};
-    uint32_t boundGroups{};
+    std::array<VernonRuntimeCoreGroup *, kMaxGroups> boundGroups{};
+    uint32_t boundGroupMask{};
     std::array<VernonRuntimeProviderResourceReference, kMaxVertexBindings> vertexBuffers{};
     uint32_t boundVertexBuffers{};
     bool rendering{};
+    uint32_t debugDepth{};
+    // The depth when the rendering scope began; groups above it close before the scope ends.
+    uint32_t renderingDebugDepth{};
+};
+
+struct VernonRuntimeCorePacketBatch {
+    VernonRuntimeDeviceProvider provider{};
+    VernonRuntimeProviderObject handle{};
+    // Referenced by the batch, whose provider objects belong to them.
+    std::vector<VernonRuntimeCorePipeline *> pipelines;
+    std::vector<VernonRuntimeCoreGroup *> groups;
+    std::vector<PayloadSite> sites;
+    size_t payloadWords{};
+    VernonRuntimeProviderObject transientEncoder{};
 };
 
 namespace {
@@ -163,19 +284,16 @@ bool providerIsValid(const VernonRuntimeDeviceProvider &provider) {
            provider.abi_version == VERNON_PROGRAM_VERSION && provider.get_capabilities &&
            provider.get_device_identity && provider.prepare_shader && provider.prepare_group_layout &&
            provider.prepare_pipeline_layout && provider.prepare_pipeline && provider.create_group &&
-           provider.begin_commands && provider.end_commands && provider.resume_commands &&
-           provider.encode_bind_pipeline && provider.encode_bind_group && provider.destroy_shader &&
+           provider.create_packet_batch && provider.begin_commands && provider.end_commands &&
+           provider.resume_commands && provider.encode_packets && provider.destroy_shader &&
            provider.destroy_group_layout && provider.destroy_pipeline_layout && provider.destroy_pipeline &&
-           provider.destroy_group;
+           provider.destroy_group && provider.destroy_packet_batch;
 }
 
 bool providerSupports(const VernonRuntimeDeviceProvider &provider, VernonRuntimeProviderPipelineKind kind) {
     if (!providerIsValid(provider))
         return false;
-    return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE
-               ? provider.encode_dispatch != nullptr
-               : provider.encode_draw && provider.encode_bind_vertex_buffers && provider.begin_rendering &&
-                     provider.end_rendering && provider.describe_image;
+    return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE || provider.describe_image != nullptr;
 }
 
 // Bindings are distinct and below the limit, and every attribute reads one of them; compute pipelines have none.
@@ -455,13 +573,6 @@ VernonStatus validateImageValues(const VernonRuntimeCoreGroupLayout &layout,
     return VERNON_STATUS_OK;
 }
 
-bool drawInvocationIsValid(const VernonRuntimeCoreDrawInvocation *invocation) {
-    return invocation && invocation->struct_size >= sizeof(VernonRuntimeCoreDrawInvocation) &&
-           (invocation->vertex_count != 0 || invocation->index_count != 0) && invocation->instance_count != 0 &&
-           (invocation->index_count != 0) == (invocation->index_buffer.resource.value != 0) &&
-           invocation->stencil_reference <= 0xff;
-}
-
 bool renderingDescriptorIsValid(const VernonRuntimeProviderRenderingDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(VernonRuntimeProviderRenderingDescriptor) ||
         (descriptor->color_attachment_count != 0 && !descriptor->color_attachments) ||
@@ -486,9 +597,12 @@ bool renderingDescriptorIsValid(const VernonRuntimeProviderRenderingDescriptor *
 }
 
 // Attachments are distinct single-mip views that share their extent, layer count and sample count and contain the
-// render area; sampled images have sampled usage and overlap no attachment.
+// render area; sampled images have sampled usage and overlap no attachment. Bit c of integerColors receives whether
+// color attachment c has an integer format.
 VernonStatus validateRenderingAttachments(const VernonRuntimeDeviceProvider &provider,
-                                          const VernonRuntimeProviderRenderingDescriptor &rendering) {
+                                          const VernonRuntimeProviderRenderingDescriptor &rendering,
+                                          uint32_t &integerColors) {
+    integerColors = 0;
     struct Attachment {
         VernonRuntimeProviderImageDescription description{};
         uint32_t width{};
@@ -539,9 +653,10 @@ VernonStatus validateRenderingAttachments(const VernonRuntimeDeviceProvider &pro
         if (status != VERNON_STATUS_OK)
             return status;
         // The view's format selects the clear member: integer formats read raw bits, the others finite floats.
-        if (!vernon::formats::isInteger(attachments[attachmentCount - 1].description.view.format) &&
-            !std::all_of(std::begin(color.clear_color.f32), std::end(color.clear_color.f32),
-                         [](float value) { return std::isfinite(value); }))
+        if (vernon::formats::isInteger(attachments[attachmentCount - 1].description.view.format))
+            integerColors |= 1u << index;
+        else if (!std::all_of(std::begin(color.clear_color.f32), std::end(color.clear_color.f32),
+                              [](float value) { return std::isfinite(value); }))
             return VERNON_STATUS_INVALID_ARGUMENT;
     }
     const VernonRuntimeProviderDepthStencilAttachment *depth = rendering.depth_stencil_attachment;
@@ -686,9 +801,12 @@ VernonStatus createGroupImpl(VernonRuntimeCoreGroupLayout *layout, const VernonR
     if (output)
         *output = nullptr;
     if (!layout || !output || !groupValuesMatchLayout(*layout, values, valueCount) ||
-        (lifetime != VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT && lifetime != VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT) ||
-        (lifetime == VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT && present(encoder)))
+        (lifetime != VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT && lifetime != VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT &&
+         lifetime != VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE) ||
+        (lifetime != VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT && present(encoder)))
         return VERNON_STATUS_INVALID_ARGUMENT;
+    if (lifetime == VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE && !layout->provider.update_group)
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
     const VernonStatus validated = validateImageValues(*layout, values);
     if (validated != VERNON_STATUS_OK)
         return validated;
@@ -707,7 +825,9 @@ VernonStatus createGroupImpl(VernonRuntimeCoreGroupLayout *layout, const VernonR
     retainGroupLayout(layout);
     group->layout = layout;
     group->transient = lifetime == VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT;
-    group->encoder = encoder;
+    group->updatable = lifetime == VERNON_RUNTIME_PROVIDER_GROUP_UPDATABLE;
+    if (group->transient)
+        group->encoder = encoder;
     *output = group.release();
     return VERNON_STATUS_OK;
 }
@@ -823,87 +943,85 @@ VernonStatus beginCommandsImpl(const VernonRuntimeDeviceProvider *provider, Vern
     return VERNON_STATUS_OK;
 }
 
-void unbindGroup(VernonRuntimeCoreCommands &commands, size_t index) noexcept {
-    releaseGroup(std::exchange(commands.groups[index], nullptr));
-    commands.boundGroups &= ~(1u << index);
-}
-
 VernonStatus endCommandsImpl(VernonRuntimeCoreCommands *commands) {
     if (!commands)
         return VERNON_STATUS_INVALID_ARGUMENT;
     std::unique_ptr<VernonRuntimeCoreCommands> owned(commands);
-    VernonStatus status = VERNON_STATUS_OK;
-    if (owned->rendering) {
-        status = providerStatusBoundary(
-            [&] { return owned->provider.end_rendering(owned->provider.user_data, owned->native); });
-        if (status == VERNON_STATUS_OK)
-            status = VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    const VernonStatus ended =
-        providerStatusBoundary([&] { return owned->provider.end_commands(owned->provider.user_data, owned->native); });
-    for (size_t index = 0; index < kMaxGroups; ++index)
-        unbindGroup(*owned, index);
-    releasePipeline(owned->pipeline);
-    return status != VERNON_STATUS_OK ? status : ended;
+    return providerStatusBoundary(
+        [&] { return owned->provider.end_commands(owned->provider.user_data, owned->native); });
 }
 
 VernonStatus resumeCommandsImpl(VernonRuntimeCoreCommands *commands) {
-    if (!commands || commands->rendering)
+    if (!commands)
         return VERNON_STATUS_INVALID_ARGUMENT;
     return providerStatusBoundary(
         [&] { return commands->provider.resume_commands(commands->provider.user_data, commands->native); });
 }
 
-VernonStatus bindNativePipeline(VernonRuntimeCoreCommands &commands, VernonRuntimeCorePipeline &pipeline,
-                                VernonRuntimeProviderObject handle) {
-    if (commands.bound.value == handle.value && commands.pipeline == &pipeline)
-        return VERNON_STATUS_OK;
-    const VernonStatus status = providerStatusBoundary(
-        [&] { return commands.provider.encode_bind_pipeline(commands.provider.user_data, commands.native, handle); });
-    if (status != VERNON_STATUS_OK)
-        return status;
-    for (size_t index = 0; index < kMaxGroups; ++index)
-        if (commands.groups[index] &&
-            (index >= pipeline.groupCount || commands.groups[index]->layout != pipeline.groupLayouts[index]))
-            unbindGroup(commands, index);
-    if (commands.pipeline != &pipeline) {
-        retainPipeline(&pipeline);
-        releasePipeline(std::exchange(commands.pipeline, &pipeline));
-    }
-    commands.bound = handle;
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus bindPipelineImpl(VernonRuntimeCoreCommands *commands, VernonRuntimeCorePipeline *pipeline) {
-    if (!commands || !pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ||
-        !sameProvider(commands->provider, pipeline->provider) || commands->rendering)
+VernonStatus updateGroupImpl(VernonRuntimeCoreCommands *commands, VernonRuntimeCoreGroup *group,
+                             const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    if (!commands || !group || !group->updatable || !sameProvider(commands->provider, group->layout->provider) ||
+        !groupValuesMatchLayout(*group->layout, values, valueCount))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return bindNativePipeline(*commands, *pipeline, pipeline->pipeline);
-}
-
-VernonStatus bindGraphicsVariantImpl(VernonRuntimeCoreCommands *commands, VernonRuntimeCoreGraphicsVariant *variant) {
-    if (!commands || !variant || !sameProvider(commands->provider, variant->pipeline->provider))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    return bindNativePipeline(*commands, *variant->pipeline, variant->handle);
-}
-
-VernonStatus bindGroupImpl(VernonRuntimeCoreCommands *commands, uint32_t index, VernonRuntimeCoreGroup *group) {
-    if (!commands || !group || !commands->pipeline || index >= commands->pipeline->groupCount ||
-        group->layout != commands->pipeline->groupLayouts[index] ||
-        (group->transient && group->encoder.value != commands->encoder.value))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    if (commands->groups[index] == group)
-        return VERNON_STATUS_OK;
-    const VernonStatus status = providerStatusBoundary([&] {
-        return commands->provider.encode_bind_group(commands->provider.user_data, commands->native, index,
-                                                    group->handle);
+    return providerStatusBoundary([&] {
+        return commands->provider.update_group(commands->provider.user_data, commands->native, group->handle, values,
+                                               valueCount);
     });
-    if (status != VERNON_STATUS_OK)
-        return status;
-    retainGroup(group);
-    releaseGroup(std::exchange(commands->groups[index], group));
-    commands->boundGroups |= 1u << index;
+}
+
+VernonStatus createPacketsImpl(const VernonRuntimeDeviceProvider *provider, VernonRuntimeCorePackets **output) {
+    if (output)
+        *output = nullptr;
+    if (!provider || !output || !providerIsValid(*provider))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    auto packets = std::unique_ptr<VernonRuntimeCorePackets>(new (std::nothrow) VernonRuntimeCorePackets());
+    if (!packets)
+        return VERNON_STATUS_INTERNAL_ERROR;
+    packets->provider = *provider;
+    *output = packets.release();
     return VERNON_STATUS_OK;
+}
+
+void resetPackets(VernonRuntimeCorePackets &packets) noexcept {
+    for (VernonRuntimeCorePipeline *pipeline : packets.pipelines)
+        releasePipeline(pipeline);
+    for (VernonRuntimeCoreGroup *group : packets.groups)
+        releaseGroup(group);
+    packets.pipelines.clear();
+    packets.groups.clear();
+    packets.words.clear();
+    packets.payload.clear();
+    packets.objects.clear();
+    packets.objectIndices.clear();
+    packets.resources.clear();
+    packets.resourceIndices.clear();
+    packets.renderings.clear();
+    packets.sampledImages.clear();
+    packets.sites.clear();
+    packets.transientEncoder = {};
+    packets.pipeline = nullptr;
+    packets.bound = {};
+    packets.boundGroups = {};
+    packets.boundGroupMask = 0;
+    packets.boundVertexBuffers = 0;
+    packets.rendering = false;
+    packets.debugDepth = 0;
+    packets.renderingDebugDepth = 0;
+}
+
+// The object table index of `handle`, whose owner the recording references from its first entry on.
+template <typename Owner>
+uint32_t packetObject(VernonRuntimeCorePackets &packets, VernonRuntimeProviderObject handle, Owner *owner,
+                      std::vector<Owner *> &owners, void (*retain)(Owner *) noexcept) {
+    const auto next = static_cast<uint32_t>(packets.objects.size());
+    const auto [index, inserted] = packets.objectIndices.insert(
+        handle.value, next, [&](uint32_t candidate) { return packets.objects[candidate].value == handle.value; });
+    if (inserted) {
+        packets.objects.push_back(handle);
+        owners.push_back(owner);
+        retain(owner);
+    }
+    return index;
 }
 
 bool sameReference(const VernonRuntimeProviderResourceReference &left,
@@ -912,10 +1030,75 @@ bool sameReference(const VernonRuntimeProviderResourceReference &left,
            left.offset == right.offset && left.size == right.size;
 }
 
-// Forwards only the run between the first and the last binding that changes.
-VernonStatus bindVertexBuffersImpl(VernonRuntimeCoreCommands *commands, uint32_t first,
-                                   const VernonRuntimeProviderResourceReference *buffers, size_t count) {
-    if (!commands || (count != 0 && !buffers) || first > kMaxVertexBindings || count > kMaxVertexBindings - first)
+uint32_t packetResource(VernonRuntimeCorePackets &packets, const VernonRuntimeProviderResourceReference &resource) {
+    uint64_t hash = resource.resource.value * 0x9e3779b97f4a7c15ull;
+    hash = (hash ^ resource.identity) * 0x100000001b3ull;
+    hash = (hash ^ resource.offset) * 0x100000001b3ull;
+    hash = ((hash ^ resource.size) * 0x100000001b3ull) | 1;
+    const auto next = static_cast<uint32_t>(packets.resources.size());
+    const auto [index, inserted] = packets.resourceIndices.insert(
+        hash, next, [&](uint32_t candidate) { return sameReference(packets.resources[candidate], resource); });
+    if (inserted)
+        packets.resources.push_back(resource);
+    return index;
+}
+
+void unbindGroup(VernonRuntimeCorePackets &packets, size_t index) noexcept {
+    packets.boundGroups[index] = nullptr;
+    packets.boundGroupMask &= ~(1u << index);
+}
+
+VernonStatus bindPacketPipeline(VernonRuntimeCorePackets &packets, VernonRuntimeCorePipeline &pipeline,
+                                VernonRuntimeProviderObject handle) {
+    if (packets.bound.value == handle.value && packets.pipeline == &pipeline)
+        return VERNON_STATUS_OK;
+    const uint32_t object = packetObject(packets, handle, &pipeline, packets.pipelines, retainPipeline);
+    packets.words.insert(packets.words.end(), {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_BIND_PIPELINE, 2), object});
+    for (size_t index = 0; index < kMaxGroups; ++index)
+        if (packets.boundGroups[index] &&
+            (index >= pipeline.groupCount || packets.boundGroups[index]->layout != pipeline.groupLayouts[index]))
+            unbindGroup(packets, index);
+    packets.pipeline = &pipeline;
+    packets.bound = handle;
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus bindPacketsPipelineImpl(VernonRuntimeCorePackets *packets, VernonRuntimeCorePipeline *pipeline) {
+    if (!packets || !pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ||
+        !sameProvider(packets->provider, pipeline->provider) || packets->rendering)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return bindPacketPipeline(*packets, *pipeline, pipeline->pipeline);
+}
+
+VernonStatus bindPacketsGraphicsVariantImpl(VernonRuntimeCorePackets *packets,
+                                            VernonRuntimeCoreGraphicsVariant *variant) {
+    if (!packets || !variant || !sameProvider(packets->provider, variant->pipeline->provider))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return bindPacketPipeline(*packets, *variant->pipeline, variant->handle);
+}
+
+VernonStatus bindPacketsGroupImpl(VernonRuntimeCorePackets *packets, uint32_t index, VernonRuntimeCoreGroup *group) {
+    if (!packets || !group || !packets->pipeline || index >= packets->pipeline->groupCount ||
+        group->layout != packets->pipeline->groupLayouts[index] ||
+        (group->transient && present(packets->transientEncoder) &&
+         packets->transientEncoder.value != group->encoder.value))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    if (packets->boundGroups[index] == group)
+        return VERNON_STATUS_OK;
+    const uint32_t object = packetObject(*packets, group->handle, group, packets->groups, retainGroup);
+    packets->words.insert(packets->words.end(),
+                          {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_BIND_GROUP, 3), index, object});
+    if (group->transient)
+        packets->transientEncoder = group->encoder;
+    packets->boundGroups[index] = group;
+    packets->boundGroupMask |= 1u << index;
+    return VERNON_STATUS_OK;
+}
+
+// Records only the run between the first and the last binding that changes.
+VernonStatus bindPacketsVertexBuffersImpl(VernonRuntimeCorePackets *packets, uint32_t first,
+                                          const VernonRuntimeProviderResourceReference *buffers, size_t count) {
+    if (!packets || (count != 0 && !buffers) || first > kMaxVertexBindings || count > kMaxVertexBindings - first)
         return VERNON_STATUS_INVALID_ARGUMENT;
     size_t begin = count;
     size_t end = 0;
@@ -923,93 +1106,290 @@ VernonStatus bindVertexBuffersImpl(VernonRuntimeCoreCommands *commands, uint32_t
         if (!present(buffers[index].resource))
             return VERNON_STATUS_INVALID_ARGUMENT;
         const size_t binding = first + index;
-        if ((commands->boundVertexBuffers & (1u << binding)) == 0 ||
-            !sameReference(commands->vertexBuffers[binding], buffers[index])) {
+        if ((packets->boundVertexBuffers & (1u << binding)) == 0 ||
+            !sameReference(packets->vertexBuffers[binding], buffers[index])) {
             begin = std::min(begin, index);
             end = index + 1;
         }
     }
     if (begin >= end)
         return VERNON_STATUS_OK;
-    const VernonStatus status = providerStatusBoundary([&] {
-        return commands->provider.encode_bind_vertex_buffers(commands->provider.user_data, commands->native,
-                                                             static_cast<uint32_t>(first + begin), buffers + begin,
-                                                             end - begin);
-    });
-    if (status != VERNON_STATUS_OK)
-        return status;
+    packets->words.push_back(packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_BIND_VERTEX_BUFFERS, 2 + end - begin));
+    packets->words.push_back(static_cast<uint32_t>(first + begin));
     for (size_t index = begin; index < end; ++index) {
-        commands->vertexBuffers[first + index] = buffers[index];
-        commands->boundVertexBuffers |= 1u << (first + index);
+        packets->words.push_back(packetResource(*packets, buffers[index]));
+        packets->vertexBuffers[first + index] = buffers[index];
+        packets->boundVertexBuffers |= 1u << (first + index);
     }
     return VERNON_STATUS_OK;
 }
 
-bool groupsAreComplete(const VernonRuntimeCoreCommands &commands) {
-    return (commands.boundGroups & commands.pipeline->requiredGroups) == commands.pipeline->requiredGroups;
+bool groupsAreComplete(const VernonRuntimeCorePackets &packets) {
+    return (packets.boundGroupMask & packets.pipeline->requiredGroups) == packets.pipeline->requiredGroups;
 }
 
-VernonStatus dispatchImpl(VernonRuntimeCoreCommands *commands, const uint32_t groupCount[3], const void *pushConstants,
-                          size_t pushConstantSize) {
-    if (!commands || !commands->pipeline || commands->pipeline->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ||
-        !groupCount || groupCount[0] == 0 || groupCount[1] == 0 || groupCount[2] == 0 ||
-        pushConstantSize > commands->pipeline->pushConstantSize || (pushConstantSize != 0 && !pushConstants) ||
-        !groupsAreComplete(*commands))
+uint32_t appendPayload(VernonRuntimeCorePackets &packets, const uint32_t *words, size_t count) {
+    const auto index = static_cast<uint32_t>(packets.payload.size());
+    packets.payload.insert(packets.payload.end(), words, words + count);
+    return index;
+}
+
+VernonStatus packetsDispatchImpl(VernonRuntimeCorePackets *packets, const uint32_t groupCount[3]) {
+    if (!packets || !packets->pipeline || packets->pipeline->kind != VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ||
+        packets->rendering || !groupCount || groupCount[0] == 0 || groupCount[1] == 0 || groupCount[2] == 0 ||
+        !groupsAreComplete(*packets))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const VernonRuntimeProviderDispatchDescriptor descriptor{sizeof(VernonRuntimeProviderDispatchDescriptor),
-                                                             {groupCount[0], groupCount[1], groupCount[2]},
-                                                             pushConstants,
-                                                             pushConstantSize,
-                                                             {0, 0, 0, 0}};
-    return providerStatusBoundary([&] {
-        return commands->provider.encode_dispatch(commands->provider.user_data, commands->native, &descriptor);
-    });
+    const uint32_t payload = appendPayload(*packets, groupCount, 3);
+    packets->sites.push_back({PayloadSiteKind::Dispatch, payload, 0, 0});
+    packets->words.insert(packets->words.end(), {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH, 2), payload});
+    return VERNON_STATUS_OK;
 }
 
-VernonStatus beginRenderingImpl(VernonRuntimeCoreCommands *commands,
-                                const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    if (!commands || commands->rendering ||
-        !providerSupports(commands->provider, VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE) ||
+uint32_t bitsOf(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float floatOf(uint32_t bits) {
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+VernonStatus packetsBeginRenderingImpl(VernonRuntimeCorePackets *packets,
+                                       const VernonRuntimeProviderRenderingDescriptor *descriptor) {
+    if (!packets || packets->rendering ||
+        !providerSupports(packets->provider, VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE) ||
         !renderingDescriptorIsValid(descriptor))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const VernonStatus attachmentStatus = validateRenderingAttachments(commands->provider, *descriptor);
+    uint32_t integerColors = 0;
+    const VernonStatus attachmentStatus = validateRenderingAttachments(packets->provider, *descriptor, integerColors);
     if (attachmentStatus != VERNON_STATUS_OK)
         return attachmentStatus;
-    const VernonStatus status = providerStatusBoundary(
-        [&] { return commands->provider.begin_rendering(commands->provider.user_data, commands->native, descriptor); });
-    commands->rendering = status == VERNON_STATUS_OK;
-    return status;
+    PacketRendering rendering;
+    rendering.descriptor = *descriptor;
+    std::copy_n(descriptor->color_attachments, descriptor->color_attachment_count, rendering.colors.begin());
+    if (descriptor->depth_stencil_attachment) {
+        rendering.depth = *descriptor->depth_stencil_attachment;
+        rendering.hasDepth = true;
+    }
+    rendering.firstSampledImage = packets->sampledImages.size();
+    packets->sampledImages.insert(packets->sampledImages.end(), descriptor->sampled_images,
+                                  descriptor->sampled_images + descriptor->sampled_image_count);
+    const auto renderingIndex = static_cast<uint32_t>(packets->renderings.size());
+    packets->renderings.push_back(rendering);
+    const auto payload = static_cast<uint32_t>(packets->payload.size());
+    for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+        appendPayload(*packets, descriptor->color_attachments[index].clear_color.u32, 4);
+    const VernonRuntimeProviderDepthStencilAttachment *depth = descriptor->depth_stencil_attachment;
+    const uint32_t depthStencil[2]{bitsOf(depth ? depth->clear_depth : 0.0f), depth ? depth->clear_stencil : 0};
+    appendPayload(*packets, depthStencil, 2);
+    packets->sites.push_back(
+        {PayloadSiteKind::Clear, payload, static_cast<uint32_t>(descriptor->color_attachment_count), integerColors});
+    packets->words.insert(packets->words.end(),
+                          {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_BEGIN_RENDERING, 3), renderingIndex, payload});
+    packets->rendering = true;
+    packets->renderingDebugDepth = packets->debugDepth;
+    return VERNON_STATUS_OK;
 }
 
-VernonStatus endRenderingImpl(VernonRuntimeCoreCommands *commands) {
-    if (!commands || !commands->rendering)
+VernonStatus packetsEndRenderingImpl(VernonRuntimeCorePackets *packets) {
+    if (!packets || !packets->rendering || packets->debugDepth != packets->renderingDebugDepth)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    commands->rendering = false;
-    return providerStatusBoundary(
-        [&] { return commands->provider.end_rendering(commands->provider.user_data, commands->native); });
+    packets->words.push_back(packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_END_RENDERING, 1));
+    packets->rendering = false;
+    return VERNON_STATUS_OK;
 }
 
-VernonStatus drawImpl(VernonRuntimeCoreCommands *commands, const VernonRuntimeCoreDrawInvocation *invocation) {
-    if (!commands || !commands->rendering || !commands->pipeline ||
-        commands->pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !drawInvocationIsValid(invocation) ||
-        !groupsAreComplete(*commands) ||
-        (commands->boundVertexBuffers & commands->pipeline->vertexBindings) != commands->pipeline->vertexBindings)
+// The checks that EncodePackets repeats on payload words, against the index buffer's capacity of an indexed draw.
+bool drawPayloadIsValid(const VernonRuntimeProviderDrawPayload &draw, bool indexed, uint64_t indexCapacity) {
+    if (draw.vertex_count == 0 || draw.stencil_reference > 0xff)
+        return false;
+    return indexed ? uint64_t{draw.first_index} + draw.vertex_count <= indexCapacity
+                   : draw.first_index == 0 && draw.base_vertex == 0;
+}
+
+VernonStatus drawPayloadImpl(const VernonRuntimeCoreDrawInvocation *invocation,
+                             VernonRuntimeProviderDrawPayload *payload) {
+    if (!invocation || !payload || invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) ||
+        invocation->topology > 2)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const VernonRuntimeProviderDrawDescriptor descriptor{
-        sizeof(VernonRuntimeProviderDrawDescriptor),
-        invocation->vertex_count,
-        invocation->instance_count,
-        invocation->first_instance,
-        invocation->base_vertex,
-        {invocation->viewport[0], invocation->viewport[1], invocation->viewport[2], invocation->viewport[3]},
-        {invocation->scissor[0], invocation->scissor[1], invocation->scissor[2], invocation->scissor[3]},
-        invocation->topology,
-        invocation->index_buffer,
-        invocation->index_count,
-        invocation->index_type,
-        invocation->stencil_reference};
-    return providerStatusBoundary(
-        [&] { return commands->provider.encode_draw(commands->provider.user_data, commands->native, &descriptor); });
+    const bool indexed = invocation->index_count != 0;
+    if (indexed != present(invocation->index_buffer.resource) || (indexed && invocation->index_type != 0))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonRuntimeProviderDrawPayload draw{};
+    draw.vertex_count = indexed ? invocation->index_count : invocation->vertex_count;
+    draw.instance_count = invocation->instance_count;
+    draw.first_instance = invocation->first_instance;
+    draw.base_vertex = indexed ? invocation->base_vertex : 0;
+    draw.first_index = indexed ? invocation->first_index : 0;
+    std::copy_n(invocation->viewport, 4, draw.viewport);
+    std::copy_n(invocation->scissor, 4, draw.scissor);
+    draw.stencil_reference = invocation->stencil_reference;
+    if (!drawPayloadIsValid(draw, indexed, invocation->index_buffer.size / sizeof(uint32_t)) ||
+        (!indexed && (invocation->base_vertex != 0 || invocation->first_index != 0)))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    *payload = draw;
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus packetsDrawImpl(VernonRuntimeCorePackets *packets, const VernonRuntimeCoreDrawInvocation *invocation) {
+    if (!packets || !packets->rendering || !packets->pipeline ||
+        packets->pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !groupsAreComplete(*packets) ||
+        (packets->boundVertexBuffers & packets->pipeline->vertexBindings) != packets->pipeline->vertexBindings)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonRuntimeProviderDrawPayload draw{};
+    if (const VernonStatus status = drawPayloadImpl(invocation, &draw); status != VERNON_STATUS_OK)
+        return status;
+    const bool indexed = invocation->index_count != 0;
+    const uint64_t indexCapacity = invocation->index_buffer.size / sizeof(uint32_t);
+    uint32_t words[kDrawPayloadWords];
+    std::memcpy(words, &draw, sizeof(words));
+    const uint32_t payload = appendPayload(*packets, words, kDrawPayloadWords);
+    if (indexed) {
+        const uint32_t index = packetResource(*packets, invocation->index_buffer);
+        packets->sites.push_back({PayloadSiteKind::DrawIndexed, payload,
+                                  static_cast<uint32_t>(std::min<uint64_t>(indexCapacity, UINT32_MAX)), 0});
+        packets->words.insert(packets->words.end(), {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED, 4),
+                                                     invocation->topology, index, payload});
+    } else {
+        packets->sites.push_back({PayloadSiteKind::Draw, payload, 0, 0});
+        packets->words.insert(packets->words.end(),
+                              {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_DRAW, 3), invocation->topology, payload});
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus packetsDebugImpl(VernonRuntimeCorePackets *packets, VernonRuntimeProviderPacketOpcode opcode,
+                              VernonStringView label) {
+    if (!packets || (label.size != 0 && !label.data))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    if (opcode == VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP) {
+        if (packets->debugDepth <= (packets->rendering ? packets->renderingDebugDepth : 0))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        packets->words.push_back(packetHeader(opcode, 1));
+        --packets->debugDepth;
+        return VERNON_STATUS_OK;
+    }
+    const size_t labelWords = (label.size + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+    if (2 + labelWords > kMaxPacketWords)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const size_t start = packets->words.size();
+    packets->words.resize(start + 2 + labelWords, 0);
+    packets->words[start] = packetHeader(opcode, 2 + labelWords);
+    packets->words[start + 1] = static_cast<uint32_t>(label.size);
+    if (label.size)
+        std::memcpy(packets->words.data() + start + 2, label.data, label.size);
+    if (opcode == VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP)
+        ++packets->debugDepth;
+    return VERNON_STATUS_OK;
+}
+
+void releasePacketBatch(VernonRuntimeCorePacketBatch *batch) noexcept {
+    if (!batch)
+        return;
+    if (present(batch->handle))
+        providerVoidBoundary([&] { batch->provider.destroy_packet_batch(batch->provider.user_data, batch->handle); });
+    for (VernonRuntimeCorePipeline *pipeline : batch->pipelines)
+        releasePipeline(pipeline);
+    for (VernonRuntimeCoreGroup *group : batch->groups)
+        releaseGroup(group);
+    delete batch;
+}
+
+VernonStatus createPacketBatchImpl(const VernonRuntimeCorePackets *packets, VernonRuntimeCorePacketBatch **output) {
+    if (output)
+        *output = nullptr;
+    if (!packets || !output || packets->rendering || packets->debugDepth != 0)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    std::vector<VernonRuntimeProviderRenderingDescriptor> renderings;
+    renderings.reserve(packets->renderings.size());
+    for (const PacketRendering &rendering : packets->renderings) {
+        VernonRuntimeProviderRenderingDescriptor descriptor = rendering.descriptor;
+        descriptor.color_attachments = descriptor.color_attachment_count ? rendering.colors.data() : nullptr;
+        descriptor.depth_stencil_attachment = rendering.hasDepth ? &rendering.depth : nullptr;
+        descriptor.sampled_images =
+            descriptor.sampled_image_count ? packets->sampledImages.data() + rendering.firstSampledImage : nullptr;
+        renderings.push_back(descriptor);
+    }
+    auto batch = std::unique_ptr<VernonRuntimeCorePacketBatch, void (*)(VernonRuntimeCorePacketBatch *)>(
+        new (std::nothrow) VernonRuntimeCorePacketBatch(), releasePacketBatch);
+    if (!batch)
+        return VERNON_STATUS_INTERNAL_ERROR;
+    batch->provider = packets->provider;
+    batch->sites = packets->sites;
+    batch->payloadWords = packets->payload.size();
+    batch->transientEncoder = packets->transientEncoder;
+    batch->pipelines.reserve(packets->pipelines.size());
+    batch->groups.reserve(packets->groups.size());
+    for (VernonRuntimeCorePipeline *pipeline : packets->pipelines) {
+        retainPipeline(pipeline);
+        batch->pipelines.push_back(pipeline);
+    }
+    for (VernonRuntimeCoreGroup *group : packets->groups) {
+        retainGroup(group);
+        batch->groups.push_back(group);
+    }
+    const VernonRuntimeProviderPacketBatchDescriptor descriptor{sizeof(descriptor),
+                                                                packets->words.data(),
+                                                                packets->words.size(),
+                                                                packets->objects.data(),
+                                                                packets->objects.size(),
+                                                                packets->resources.data(),
+                                                                packets->resources.size(),
+                                                                renderings.data(),
+                                                                renderings.size(),
+                                                                packets->payload.size(),
+                                                                {0, 0, 0, 0}};
+    const VernonStatus status = providerStatusBoundary([&] {
+        return packets->provider.create_packet_batch(packets->provider.user_data, &descriptor, &batch->handle);
+    });
+    if (status != VERNON_STATUS_OK)
+        return status;
+    if (!present(batch->handle))
+        return VERNON_STATUS_INTERNAL_ERROR;
+    *output = batch.release();
+    return VERNON_STATUS_OK;
+}
+
+bool payloadSiteIsValid(const PayloadSite &site, const uint32_t *payload) {
+    const uint32_t *words = payload + site.payload;
+    switch (site.kind) {
+    case PayloadSiteKind::Draw:
+    case PayloadSiteKind::DrawIndexed: {
+        VernonRuntimeProviderDrawPayload draw;
+        std::memcpy(&draw, words, sizeof(draw));
+        return drawPayloadIsValid(draw, site.kind == PayloadSiteKind::DrawIndexed, site.limit);
+    }
+    case PayloadSiteKind::Dispatch:
+        return words[0] != 0 && words[1] != 0 && words[2] != 0;
+    case PayloadSiteKind::Clear: {
+        for (uint32_t color = 0; color < site.limit; ++color)
+            if ((site.integerColors & (1u << color)) == 0)
+                for (uint32_t component = 0; component < 4; ++component)
+                    if (!std::isfinite(floatOf(words[color * 4 + component])))
+                        return false;
+        const float depth = floatOf(words[site.limit * 4]);
+        return std::isfinite(depth) && depth >= 0.0f && depth <= 1.0f && words[site.limit * 4 + 1] <= 0xff;
+    }
+    }
+    return false;
+}
+
+VernonStatus encodePacketsImpl(VernonRuntimeCoreCommands *commands, const VernonRuntimeCorePacketBatch *batch,
+                               const uint32_t *payload, size_t payloadWordCount) {
+    if (!commands || !batch || !sameProvider(commands->provider, batch->provider) ||
+        payloadWordCount < batch->payloadWords || (payloadWordCount != 0 && !payload) ||
+        (present(batch->transientEncoder) && batch->transientEncoder.value != commands->encoder.value))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    for (const PayloadSite &site : batch->sites)
+        if (!payloadSiteIsValid(site, payload))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+    return providerStatusBoundary([&] {
+        return commands->provider.encode_packets(commands->provider.user_data, commands->native, batch->handle, payload,
+                                                 payloadWordCount);
+    });
 }
 
 } // namespace
@@ -1070,6 +1450,112 @@ extern "C" void vernonRuntimeCoreGraphicsVariantDestroy(VernonRuntimeCoreGraphic
     });
 }
 
+extern "C" VernonStatus vernonRuntimeCorePacketsCreate(const VernonRuntimeDeviceProvider *provider,
+                                                       VernonRuntimeCorePackets **output) {
+    return runtimeCoreBoundary([&] { return createPacketsImpl(provider, output); });
+}
+
+extern "C" void vernonRuntimeCorePacketsDestroy(VernonRuntimeCorePackets *packets) {
+    runtimeCoreVoidBoundary([&] {
+        if (!packets)
+            return;
+        resetPackets(*packets);
+        delete packets;
+    });
+}
+
+extern "C" void vernonRuntimeCorePacketsReset(VernonRuntimeCorePackets *packets) {
+    runtimeCoreVoidBoundary([&] {
+        if (packets)
+            resetPackets(*packets);
+    });
+}
+
+extern "C" int vernonRuntimeCorePacketsIsEmpty(const VernonRuntimeCorePackets *packets) {
+    return !packets || packets->words.empty();
+}
+
+extern "C" const uint32_t *vernonRuntimeCorePacketsGetPayload(const VernonRuntimeCorePackets *packets,
+                                                              size_t *wordCount) {
+    if (wordCount)
+        *wordCount = packets ? packets->payload.size() : 0;
+    return packets ? packets->payload.data() : nullptr;
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsBindPipeline(VernonRuntimeCorePackets *packets,
+                                                             VernonRuntimeCorePipeline *pipeline) {
+    return runtimeCoreBoundary([&] { return bindPacketsPipelineImpl(packets, pipeline); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsBindGraphicsVariant(VernonRuntimeCorePackets *packets,
+                                                                    VernonRuntimeCoreGraphicsVariant *variant) {
+    return runtimeCoreBoundary([&] { return bindPacketsGraphicsVariantImpl(packets, variant); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsBindGroup(VernonRuntimeCorePackets *packets, uint32_t index,
+                                                          VernonRuntimeCoreGroup *group) {
+    return runtimeCoreBoundary([&] { return bindPacketsGroupImpl(packets, index, group); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsBindVertexBuffers(VernonRuntimeCorePackets *packets,
+                                                                  uint32_t firstBinding,
+                                                                  const VernonRuntimeProviderResourceReference *buffers,
+                                                                  size_t bufferCount) {
+    return runtimeCoreBoundary(
+        [&] { return bindPacketsVertexBuffersImpl(packets, firstBinding, buffers, bufferCount); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsDispatch(VernonRuntimeCorePackets *packets,
+                                                         const uint32_t groupCount[3]) {
+    return runtimeCoreBoundary([&] { return packetsDispatchImpl(packets, groupCount); });
+}
+
+extern "C" VernonStatus
+vernonRuntimeCorePacketsBeginRendering(VernonRuntimeCorePackets *packets,
+                                       const VernonRuntimeProviderRenderingDescriptor *descriptor) {
+    return runtimeCoreBoundary([&] { return packetsBeginRenderingImpl(packets, descriptor); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsEndRendering(VernonRuntimeCorePackets *packets) {
+    return runtimeCoreBoundary([&] { return packetsEndRenderingImpl(packets); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsDraw(VernonRuntimeCorePackets *packets,
+                                                     const VernonRuntimeCoreDrawInvocation *invocation) {
+    return runtimeCoreBoundary([&] { return packetsDrawImpl(packets, invocation); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreDrawPayload(const VernonRuntimeCoreDrawInvocation *invocation,
+                                                     VernonRuntimeProviderDrawPayload *payload) {
+    return runtimeCoreBoundary([&] { return drawPayloadImpl(invocation, payload); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsPushDebugGroup(VernonRuntimeCorePackets *packets,
+                                                               VernonStringView label) {
+    return runtimeCoreBoundary(
+        [&] { return packetsDebugImpl(packets, VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP, label); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsPopDebugGroup(VernonRuntimeCorePackets *packets) {
+    return runtimeCoreBoundary(
+        [&] { return packetsDebugImpl(packets, VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP, {}); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsInsertDebugMarker(VernonRuntimeCorePackets *packets,
+                                                                  VernonStringView label) {
+    return runtimeCoreBoundary(
+        [&] { return packetsDebugImpl(packets, VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER, label); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketBatchCreate(const VernonRuntimeCorePackets *packets,
+                                                           VernonRuntimeCorePacketBatch **output) {
+    return runtimeCoreBoundary([&] { return createPacketBatchImpl(packets, output); });
+}
+
+extern "C" void vernonRuntimeCorePacketBatchDestroy(VernonRuntimeCorePacketBatch *batch) {
+    runtimeCoreVoidBoundary([&] { releasePacketBatch(batch); });
+}
+
 extern "C" VernonStatus vernonRuntimeCoreBeginCommands(const VernonRuntimeDeviceProvider *provider,
                                                        VernonRuntimeProviderObject encoder,
                                                        VernonRuntimeCoreCommands **output) {
@@ -1084,42 +1570,14 @@ extern "C" VernonStatus vernonRuntimeCoreResumeCommands(VernonRuntimeCoreCommand
     return runtimeCoreBoundary([&] { return resumeCommandsImpl(commands); });
 }
 
-extern "C" VernonStatus vernonRuntimeCoreBindPipeline(VernonRuntimeCoreCommands *commands,
-                                                      VernonRuntimeCorePipeline *pipeline) {
-    return runtimeCoreBoundary([&] { return bindPipelineImpl(commands, pipeline); });
+extern "C" VernonStatus vernonRuntimeCoreUpdateGroup(VernonRuntimeCoreCommands *commands, VernonRuntimeCoreGroup *group,
+                                                     const VernonRuntimeProviderBindingValue *values,
+                                                     size_t valueCount) {
+    return runtimeCoreBoundary([&] { return updateGroupImpl(commands, group, values, valueCount); });
 }
 
-extern "C" VernonStatus vernonRuntimeCoreBindGraphicsVariant(VernonRuntimeCoreCommands *commands,
-                                                             VernonRuntimeCoreGraphicsVariant *variant) {
-    return runtimeCoreBoundary([&] { return bindGraphicsVariantImpl(commands, variant); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreBindGroup(VernonRuntimeCoreCommands *commands, uint32_t index,
-                                                   VernonRuntimeCoreGroup *group) {
-    return runtimeCoreBoundary([&] { return bindGroupImpl(commands, index, group); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreBindVertexBuffers(VernonRuntimeCoreCommands *commands, uint32_t firstBinding,
-                                                           const VernonRuntimeProviderResourceReference *buffers,
-                                                           size_t bufferCount) {
-    return runtimeCoreBoundary([&] { return bindVertexBuffersImpl(commands, firstBinding, buffers, bufferCount); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreDispatch(VernonRuntimeCoreCommands *commands, const uint32_t groupCount[3],
-                                                  const void *pushConstants, size_t pushConstantSize) {
-    return runtimeCoreBoundary([&] { return dispatchImpl(commands, groupCount, pushConstants, pushConstantSize); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreBeginRendering(VernonRuntimeCoreCommands *commands,
-                                                        const VernonRuntimeProviderRenderingDescriptor *descriptor) {
-    return runtimeCoreBoundary([&] { return beginRenderingImpl(commands, descriptor); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreEndRendering(VernonRuntimeCoreCommands *commands) {
-    return runtimeCoreBoundary([&] { return endRenderingImpl(commands); });
-}
-
-extern "C" VernonStatus vernonRuntimeCoreDraw(VernonRuntimeCoreCommands *commands,
-                                              const VernonRuntimeCoreDrawInvocation *invocation) {
-    return runtimeCoreBoundary([&] { return drawImpl(commands, invocation); });
+extern "C" VernonStatus vernonRuntimeCoreEncodePackets(VernonRuntimeCoreCommands *commands,
+                                                       const VernonRuntimeCorePacketBatch *batch,
+                                                       const uint32_t *payload, size_t payloadWordCount) {
+    return runtimeCoreBoundary([&] { return encodePacketsImpl(commands, batch, payload, payloadWordCount); });
 }

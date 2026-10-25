@@ -65,6 +65,9 @@ public:
     // The block of `key` serves later blocks of its class at once.
     void release(uint64_t key) noexcept { classes_[chunks_[key >> kIndexShift].sizeClass].free.push_back(key); }
 
+    // The chunk holding the block of `key`; acquiring later blocks may move it.
+    Chunk &chunk(uint64_t key) noexcept { return chunks_[key >> kIndexShift].chunk; }
+
     template <typename Destroy> void clear(Destroy &&destroy) {
         for (Entry &entry : chunks_)
             destroy(entry.chunk);

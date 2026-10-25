@@ -74,6 +74,17 @@ VERNON_RHI_CAPI Result<CommandTransientReservation, RhiError> reserveRecordingTr
 VERNON_RHI_CAPI Result<PersistentBlock, RhiError> placePersistentBlock(VernonRhiDevice device, const void *data,
                                                                        uint64_t size, uint64_t alignment) noexcept;
 VERNON_RHI_CAPI void releasePersistentBlock(VernonRhiDevice device, uint64_t key) noexcept;
+// Device memory that encoder-ordered writes update; see PlaceUpdatableCallback and WriteUpdatableCallback.
+VERNON_RHI_CAPI Result<PersistentBlock, RhiError> placeUpdatableBlock(VernonRhiDevice device, uint64_t size,
+                                                                      uint64_t alignment) noexcept;
+// A failure fails encoder `key`.
+VERNON_RHI_CAPI Result<void, RhiError> writeUpdatableBlock(VernonRhiDevice device, uint64_t key,
+                                                           const PersistentBlock &block, const void *data,
+                                                           uint64_t size) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> writeRecordingUpdatable(VernonRhiDevice device, uint64_t key, uint64_t native,
+                                                               const PersistentBlock &block, const void *data,
+                                                               uint64_t size) noexcept;
+VERNON_RHI_CAPI void releaseUpdatableBlock(VernonRhiDevice device, uint64_t key) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderKey(VernonRhiDevice device,
                                                              VernonRhiCommandEncoder encoder) noexcept;
 VERNON_RHI_CAPI Result<uint64_t, RhiError> commandEncoderNative(VernonRhiDevice device, uint64_t key,
@@ -98,9 +109,21 @@ VERNON_RHI_CAPI bool imageContentsUndefined(VernonRhiDevice device, uint64_t ima
 // Opens the native scope of the encoder's rendering scope unless it is open, and returns it. Draws open it before
 // recording; `EndRendering` opens a scope that no draw opened so that its load operations apply.
 VERNON_RHI_CAPI Result<OpenedRendering, RhiError> openCommandRendering(VernonRhiDevice device, uint64_t key) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> recordProviderCommand(VernonRhiDevice device, uint64_t key, bool draw) noexcept;
-VERNON_RHI_CAPI Result<void, RhiError> recordCommandWriteResource(VernonRhiDevice device, uint64_t key,
-                                                                  ResourceKind kind, uint64_t resource_key) noexcept;
+// A resource that commands write, by kind and resource key.
+struct CommandWrite {
+    ResourceKind kind{};
+    uint64_t key{};
+};
+// Records the draws, dispatches and written resources of a provider packet batch that encoder `key` encoded outside a
+// rendering scope.
+VERNON_RHI_CAPI Result<void, RhiError> recordProviderCommands(VernonRhiDevice device, uint64_t key, uint32_t draws,
+                                                              uint32_t dispatches, const CommandWrite *writes,
+                                                              size_t write_count) noexcept;
+// Whether the device emits debug groups and markers to the native API.
+VERNON_RHI_CAPI Result<bool, RhiError> deviceEmitsLabels(VernonRhiDevice device) noexcept;
+// `vernonRhiCommandEncoderPushDebugGroup`, `PopDebugGroup` and `InsertDebugMarker` for an encoder key.
+VERNON_RHI_CAPI Result<void, RhiError> recordEncoderDebugCommand(VernonRhiDevice device, uint64_t key,
+                                                                 DebugCommand command, std::string_view label) noexcept;
 VERNON_RHI_CAPI Result<OpenedRendering, RhiError> beginCommandRendering(VernonRhiDevice device, uint64_t key,
                                                                         uint64_t native, const RenderingScope &scope,
                                                                         const RenderingRead *reads,

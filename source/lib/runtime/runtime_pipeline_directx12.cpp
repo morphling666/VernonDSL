@@ -53,31 +53,31 @@ BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, 
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
 }
 
-VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                              const GraphicsCommand &command, GraphicsStream &stream) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     return invokeRhiGraphicsPipeline(*pipeline.context, directX12State(*pipeline.context).adapter, kDirectX12Graphics,
-                                     commands, command, stream,
+                                     packets, command, stream,
                                      runtimeBackendState<DirectX12PipelineState>(pipeline).rhiGraphics);
 #else
     (void)pipeline;
     (void)command;
     (void)stream;
-    (void)commands;
+    (void)packets;
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
 }
 
-VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                             GroupStore &transient, const PlannedComputeLaunch &launch,
                                             const ArgumentOwner *owners) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     return invokeRhiComputePipeline(*pipeline.context, directX12State(*pipeline.context).adapter, kDirectX12Compute,
-                                    pipeline.bindingProjection, commands, transient, launch, owners,
+                                    pipeline.bindingProjection, packets, transient, launch, owners,
                                     runtimeBackendState<DirectX12PipelineState>(pipeline).rhiCompute);
 #else
     (void)pipeline;
-    (void)commands;
+    (void)packets;
     (void)transient;
     (void)launch;
     (void)owners;

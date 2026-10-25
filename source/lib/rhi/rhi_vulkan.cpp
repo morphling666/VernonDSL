@@ -807,7 +807,8 @@ vernonRhiCreateBorrowedVulkanDeviceBusiness(const VernonRhiVulkanBorrowedDeviceD
         VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->instance ||
         !descriptor->physical_device || !descriptor->device || !descriptor->queue || !descriptor->command_buffer ||
-        (descriptor->queue_capabilities & ~allQueueCapabilities) != 0)
+        (descriptor->queue_capabilities & ~allQueueCapabilities) != 0 ||
+        (descriptor->flags & ~vernon::rhi::deviceFlagMask) != 0)
         return invalidDevice();
     auto reserved = vulkanDevices().reserve();
     if (reserved.isErr())
@@ -819,7 +820,7 @@ vernonRhiCreateBorrowedVulkanDeviceBusiness(const VernonRhiVulkanBorrowedDeviceD
         vernon::rhi::setDeviceCreationError("cannot retain Vulkan RHI device owner");
         return invalidDevice();
     }
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), descriptor->flags);
     if (commandState.isErr()) {
         vernon::rhi::setDeviceCreationError("cannot allocate Vulkan command state");
         return invalidDevice();
@@ -1209,7 +1210,7 @@ vernon::Result<VernonRhiDevice, vernon::RhiError> createOwnedDevice(const Vernon
         vernon::rhi::setDeviceCreationError("cannot retain Vulkan RHI device owner");
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(owner).error())};
     }
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), descriptor->flags);
     if (commandState.isErr()) {
         vernon::rhi::setDeviceCreationError("cannot allocate Vulkan command state");
         return vernon::Result<VernonRhiDevice, vernon::RhiError>{vernon::err(std::move(commandState).error())};
@@ -2484,6 +2485,68 @@ void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
     }
 }
 
+Result<PersistentBlock, RhiError> placeUpdatable(VernonRhiDevice handle, uint64_t size, uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !size || !alignment || (alignment & (alignment - 1)) != 0)
+        return Placed{err(invalidResource("place_vulkan_updatable", size))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkBuffer buffer{};
+    VkDeviceSize offset{};
+    uint64_t key{};
+    try {
+        if (!device->state.placeUpdatable(size, alignment, buffer, offset, key, device->error))
+            return Placed{err(backendFailure("place_vulkan_updatable", size))};
+    } catch (const std::bad_alloc &) {
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_vulkan_updatable", size, 0}})};
+    }
+    return Placed{ok(PersistentBlock{vulkanHandleBits(buffer), offset, nullptr, key})};
+}
+
+// Copies from the recording's upload staging. The barriers order the copy after earlier shader reads of the range and
+// before later ones.
+Result<void, RhiError> writeUpdatable(VernonRhiDevice handle, uint64_t, uint64_t native, const PersistentBlock &block,
+                                      const void *data, uint64_t size) noexcept {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || !block.buffer || !data || !size)
+        return Result<void, RhiError>{err(invalidResource("write_vulkan_updatable", native))};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkBuffer staging{};
+    VkDeviceSize stagingOffset{};
+    uint8_t *mapped{};
+    if (!device->state.acquireStaging(command, true, size, 4, staging, stagingOffset, mapped, device->error))
+        return Result<void, RhiError>{err(backendFailure("write_vulkan_updatable", native))};
+    std::memcpy(mapped, data, static_cast<size_t>(size));
+    const auto &api = vernon::rhi::vulkan::driver();
+    constexpr VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    constexpr VkAccessFlags reads = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = reads;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = vulkanHandle<VkBuffer>(block.buffer);
+    barrier.offset = block.offset;
+    barrier.size = size;
+    api.cmdPipelineBarrier(command, shaders, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+    const VkBufferCopy copy{stagingOffset, block.offset, size};
+    api.cmdCopyBuffer(command, staging, barrier.buffer, 1, &copy);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = reads;
+    api.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, shaders, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseUpdatable(VernonRhiDevice handle, uint64_t key) noexcept {
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.releaseUpdatable(key);
+    }
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                                        VernonRhiImage destination, const VernonRhiImageCopyRegion *regions,
                                        size_t regionCount) noexcept {
@@ -3105,6 +3168,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         result.writeTransient.emplace(writeTransient);
         result.placePersistent.emplace(placePersistent);
         result.releasePersistent.emplace(releasePersistent);
+        result.placeUpdatable.emplace(placeUpdatable);
+        result.writeUpdatable.emplace(writeUpdatable);
+        result.releaseUpdatable.emplace(releaseUpdatable);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

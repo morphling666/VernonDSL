@@ -273,7 +273,7 @@ ProgramBindingValueResult makeProgramBinding(const VernonProgramArgument &argume
 }
 
 std::shared_ptr<RuntimeProgramControl> makeDrawCommandControl(const VernonDrawCommand *draw) {
-    if (!draw || draw->struct_size < sizeof(*draw) || !draw->instance_count ||
+    if (!draw || draw->struct_size < sizeof(*draw) ||
         (draw->index_binding && (draw->vertex_count || draw->index_binding->type != VERNON_INDEX_U32)))
         return nullptr;
     auto control = std::make_shared<RuntimeProgramControl>();

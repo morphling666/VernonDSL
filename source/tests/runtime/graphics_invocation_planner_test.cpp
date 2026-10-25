@@ -33,14 +33,44 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
     return VERNON_STATUS_OK;
 }
 
-bool planForTest(const StageBindingPlan &variant, const VernonStageInvocationDescriptor &invocation,
-                 PlannedGraphicsInvocation &plan, std::string &error, GraphicsDrawLayout *planned = nullptr) {
+// One draw of a graphics Stage, as a graphics Node supplies it.
+struct GraphicsInvocation {
+    const VernonProgramArgument *arguments{};
+    size_t argument_count{};
+    const VernonRenderPass *render_pass{};
+    const VernonDrawCommand *draw_command{};
+    const VernonDynamicState *dynamic_state{};
+};
+
+struct PlannedGraphicsInvocation {
+    PlannedRenderTargets targets;
+    std::vector<const VernonProgramArgument *> arguments;
+    std::vector<PlannedGraphicsArgument> planned;
+    PlannedGraphicsDraw draw;
+};
+
+// Plans the arguments by slot, the targets and the draw, as the Runtime plans each draw of a graphics Node.
+bool planForTest(const StageBindingPlan &variant, const GraphicsInvocation &invocation, PlannedGraphicsInvocation &plan,
+                 std::string &error, GraphicsDrawLayout *planned = nullptr) {
     GraphicsDrawLayout layout;
     if (!buildGraphicsDrawLayout(variant, layout, error))
         return false;
     if (planned)
         *planned = layout;
-    return planGraphicsInvocation(variant, layout, invocation, describeTestImage, nullptr, plan, error);
+    plan = {};
+    plan.arguments.assign(variant.parameters.size(), nullptr);
+    plan.planned.resize(variant.parameters.size());
+    for (size_t index = 0; index < invocation.argument_count; ++index)
+        for (size_t parameter = 0; parameter < variant.parameters.size(); ++parameter)
+            if (variant.parameters[parameter].slot == invocation.arguments[index].slot)
+                plan.arguments[parameter] = &invocation.arguments[index];
+    for (uint32_t index = 0; index < variant.parameters.size(); ++index)
+        if (!plan.arguments[index] || !planGraphicsArgument(variant, layout, index, *plan.arguments[index],
+                                                            describeTestImage, nullptr, plan.planned[index], error))
+            return false;
+    return planRenderTargets(invocation.render_pass, describeTestImage, nullptr, plan.targets, error) &&
+           planGraphicsDraw(layout, plan.arguments.data(), plan.targets, *invocation.render_pass,
+                            invocation.dynamic_state, *invocation.draw_command, plan.draw, error);
 }
 
 bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vector<uint64_t> &valueShape,
@@ -97,15 +127,9 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     draw.struct_size = sizeof(draw);
     draw.vertex_count = divisor ? 3 : 0;
     draw.instance_count = instanceCount;
-    VernonGraphicsState state{};
-    state.struct_size = sizeof(state);
-    state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
+    GraphicsInvocation invocation{};
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.graphics_state = &state;
     invocation.render_pass = &renderPass;
     invocation.draw_command = &draw;
     return planForTest(variant, invocation, plan, error);
@@ -185,15 +209,9 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     dynamic.struct_size = sizeof(dynamic);
     dynamic.viewport[2] = 20;
     dynamic.viewport[3] = 10;
-    VernonGraphicsState state{};
-    state.struct_size = sizeof(state);
-    state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
+    GraphicsInvocation invocation{};
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.graphics_state = &state;
     invocation.render_pass = &renderPass;
     invocation.draw_command = &draw;
     invocation.dynamic_state = &dynamic;
@@ -274,12 +292,15 @@ TEST(GraphicsInvocationPlanner, PlansNonSquareAttributesWithInterleavedRecordPad
     EXPECT_EQ(plan.draw.vertexCount, 5u);
 }
 
-TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsToInferredAndExplicitCounts) {
+TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsAndReadsNoInstanceRecordsForNoInstances) {
     PlannedGraphicsInvocation plan;
     std::string error;
     const std::vector<uint64_t> shape{2, 4};
     const std::vector<int64_t> strides{24, 4};
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 0, plan, error))
+        << error;
+    EXPECT_EQ(plan.draw.instanceCount, 0u);
+    ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 6, plan, error))
         << error;
     EXPECT_EQ(plan.draw.instanceCount, 6u);
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 5, plan, error))
@@ -492,17 +513,11 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     dynamic.viewport[2] = 12;
     dynamic.viewport[3] = 13;
     dynamic.stencil_reference = 3;
-    VernonGraphicsState state{};
-    state.struct_size = sizeof(state);
-    state.topology = VERNON_TOPOLOGY_LINE_LIST;
 
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
+    GraphicsInvocation invocation{};
     invocation.render_pass = &renderPass;
     invocation.draw_command = &draw;
     invocation.dynamic_state = &dynamic;
-    invocation.graphics_state = &state;
     PlannedGraphicsInvocation planned;
     std::string error;
     ASSERT_TRUE(planForTest(variant, invocation, planned, error)) << error;

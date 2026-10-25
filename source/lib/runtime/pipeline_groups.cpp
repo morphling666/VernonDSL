@@ -5,12 +5,12 @@
 
 namespace vernon::runtime {
 
-namespace {
-
-bool inlinePayload(const VernonRuntimeProviderBindingValue &value) {
+bool inlineGroupValue(const VernonRuntimeProviderBindingValue &value) {
     return value.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || value.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
            (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE) != 0;
 }
+
+namespace {
 
 void mix(uint64_t &hash, uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; }
 
@@ -42,11 +42,11 @@ void GroupStore::collect() {
     }
 }
 
-VernonStatus GroupStore::bind(VernonRuntimeCoreCommands *commands, uint32_t index, VernonRuntimeCoreGroupLayout *layout,
+VernonStatus GroupStore::bind(VernonRuntimeCorePackets *packets, uint32_t index, VernonRuntimeCoreGroupLayout *layout,
                               const Key &key, const std::vector<uint32_t> &slots, const GroupValues &values,
-                              VernonRuntimeProviderObject encoder, std::string &error) {
+                              const GroupSink &made, VernonRuntimeProviderObject encoder, std::string &error) {
     const uint64_t hash = keyHash(layout, key);
-    // Binding under the lock keeps a concurrent collection from destroying the group before the commands retain it.
+    // Binding under the lock keeps a concurrent collection from destroying the group before the recording retains it.
     const std::lock_guard lock(mutex_);
     const auto [first, last] = entries_.equal_range(hash);
     for (auto candidate = first; candidate != last; ++candidate) {
@@ -57,52 +57,57 @@ VernonStatus GroupStore::bind(VernonRuntimeCoreCommands *commands, uint32_t inde
         while (matched < key.size() && entry.identities[matched] == key[matched])
             ++matched;
         if (matched == key.size())
-            return vernonRuntimeCoreBindGroup(commands, index, entry.group);
+            return vernonRuntimeCorePacketsBindGroup(packets, index, entry.group);
     }
 
     const bool persistent = lifetime_ == VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT;
+    const bool transient = lifetime_ == VERNON_RUNTIME_PROVIDER_GROUP_TRANSIENT;
+    if (!transient && !persistent && !made.made)
+        return VERNON_STATUS_INVALID_ARGUMENT;
     if (persistent)
         collect();
-    auto made = std::make_unique<Entry>();
-    made->layout = layout;
-    made->identities.reserve(key.size());
+    auto entry = std::make_unique<Entry>();
+    entry->layout = layout;
+    entry->identities.reserve(key.size());
     for (size_t identity = 0; identity < key.size(); ++identity)
-        made->identities.push_back(key[identity]);
+        entry->identities.push_back(key[identity]);
     if (persistent)
         for (size_t parameter = 0; parameter < key.parameterCount; ++parameter)
             if (const std::shared_ptr<void> *lifetime = key.owners[key.parameters[parameter]].lifetime)
-                made->lifetimes.push_back(*lifetime);
-    made->values.resize(slots.size());
+                entry->lifetimes.push_back(*lifetime);
+    entry->values.resize(slots.size());
     std::vector<std::vector<uint8_t>> storage(slots.size());
     size_t inlineSize = 0;
-    for (size_t entry = 0; entry < slots.size(); ++entry) {
-        VernonRuntimeProviderBindingValue &value = made->values[entry];
-        if (!values.fill(values.userData, slots[entry], value, storage[entry], error))
+    for (size_t slot = 0; slot < slots.size(); ++slot) {
+        VernonRuntimeProviderBindingValue &value = entry->values[slot];
+        if (!values.fill(values.userData, slots[slot], value, storage[slot], error))
             return VERNON_STATUS_INVALID_ARGUMENT;
-        value.slot = static_cast<uint32_t>(entry);
-        if (inlinePayload(value))
+        value.slot = static_cast<uint32_t>(slot);
+        if (inlineGroupValue(value))
             inlineSize += value.payload.inline_value.size;
     }
-    made->inlineBytes.resize(inlineSize);
+    entry->inlineBytes.resize(inlineSize);
     size_t offset = 0;
-    for (VernonRuntimeProviderBindingValue &value : made->values) {
-        if (!inlinePayload(value) || value.payload.inline_value.size == 0)
+    for (VernonRuntimeProviderBindingValue &value : entry->values) {
+        if (!inlineGroupValue(value) || value.payload.inline_value.size == 0)
             continue;
-        std::memcpy(made->inlineBytes.data() + offset, value.payload.inline_value.data,
+        std::memcpy(entry->inlineBytes.data() + offset, value.payload.inline_value.data,
                     value.payload.inline_value.size);
-        value.payload.inline_value.data = made->inlineBytes.data() + offset;
+        value.payload.inline_value.data = entry->inlineBytes.data() + offset;
         offset += value.payload.inline_value.size;
     }
     VernonStatus status =
-        vernonRuntimeCoreCreateGroup(layout, made->values.data(), made->values.size(), lifetime_,
-                                     persistent ? VernonRuntimeProviderObject{} : encoder, &made->group);
+        vernonRuntimeCoreCreateGroup(layout, entry->values.data(), entry->values.size(), lifetime_,
+                                     transient ? encoder : VernonRuntimeProviderObject{}, &entry->group);
+    if (status == VERNON_STATUS_OK && !transient && !persistent)
+        status = made.made(made.userData, entry->group, slots, entry->values.data(), entry->values.size());
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeCoreBindGroup(commands, index, made->group);
+        status = vernonRuntimeCorePacketsBindGroup(packets, index, entry->group);
     if (status != VERNON_STATUS_OK) {
-        vernonRuntimeCoreGroupDestroy(made->group);
+        vernonRuntimeCoreGroupDestroy(entry->group);
         return status;
     }
-    entries_.emplace(hash, std::move(made));
+    entries_.emplace(hash, std::move(entry));
     return VERNON_STATUS_OK;
 }
 
@@ -155,7 +160,7 @@ bool PipelineGroups::prepare(const VernonRuntimeDeviceProvider &provider,
     return true;
 }
 
-VernonStatus PipelineGroups::bind(VernonRuntimeCoreCommands *commands, VernonRuntimeProviderObject encoder,
+VernonStatus PipelineGroups::bind(VernonRuntimeCorePackets *packets, VernonRuntimeProviderObject encoder,
                                   const GroupSources &sources, std::string &error) const {
     for (uint32_t index = 0; index < groups_.size(); ++index) {
         const Group &group = groups_[index];
@@ -175,8 +180,8 @@ VernonStatus PipelineGroups::bind(VernonRuntimeCoreCommands *commands, VernonRun
             if (owner && !group.command)
                 store = owner;
         }
-        if (const VernonStatus status =
-                store->bind(commands, index, layouts_[index], key, group.slots, sources.values, encoder, error);
+        if (const VernonStatus status = store->bind(packets, index, layouts_[index], key, group.slots, sources.values,
+                                                    sources.made, encoder, error);
             status != VERNON_STATUS_OK)
             return status;
     }

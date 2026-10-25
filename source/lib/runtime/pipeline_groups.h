@@ -33,6 +33,17 @@ struct GroupValues {
     const void *userData{};
 };
 
+// Told of each group an updatable store makes, before a command binds it; its inline values are undefined until
+// written.
+struct GroupSink {
+    VernonStatus (*made)(void *userData, VernonRuntimeCoreGroup *group, const std::vector<uint32_t> &slots,
+                         const VernonRuntimeProviderBindingValue *values, size_t valueCount){};
+    void *userData{};
+};
+
+// Whether a group value's bytes are inline in it rather than in a resource.
+bool inlineGroupValue(const VernonRuntimeProviderBindingValue &value);
+
 // What decides the groups of one command.
 struct GroupSources {
     // Per Stage parameter, the owner of its argument; null when the command alone owns every argument.
@@ -40,13 +51,14 @@ struct GroupSources {
     // Identity of the inputs that no parameter decides, such as the viewport resolution; with null `parameters` it
     // identifies every argument as well.
     const void *command{};
-    // Required: the transient groups of the command stream.
+    // Required: the groups of the command alone. An updatable store requires `made`.
     GroupStore *transient{};
     GroupValues values;
+    GroupSink made;
 };
 
-// The provider groups one owner made. A persistent store outlives command streams; a transient store belongs to one
-// command stream.
+// The provider groups one owner made. A persistent or updatable store outlives command streams and keeps its groups
+// until it dies, a persistent one only while their owners live; a transient store belongs to one command stream.
 class GroupStore {
 public:
     explicit GroupStore(VernonRuntimeProviderGroupLifetime lifetime) : lifetime_(lifetime) {}
@@ -68,11 +80,11 @@ public:
         }
     };
 
-    // Binds at `index` of `commands` the group of `layout` that `key` finds, made from the values of `slots` (one per
+    // Binds at `index` of `packets` the group of `layout` that `key` finds, made from the values of `slots` (one per
     // group entry, in entry order) on first use. `error` is set only when filling a value fails.
-    VernonStatus bind(VernonRuntimeCoreCommands *commands, uint32_t index, VernonRuntimeCoreGroupLayout *layout,
+    VernonStatus bind(VernonRuntimeCorePackets *packets, uint32_t index, VernonRuntimeCoreGroupLayout *layout,
                       const Key &key, const std::vector<uint32_t> &slots, const GroupValues &values,
-                      VernonRuntimeProviderObject encoder, std::string &error);
+                      const GroupSink &made, VernonRuntimeProviderObject encoder, std::string &error);
 
 private:
     struct Entry {
@@ -115,7 +127,7 @@ public:
     VernonRuntimeCoreGroupLayout *const *layouts() const { return layouts_.data(); }
     size_t size() const { return layouts_.size(); }
     // Binds the groups of one command of `encoder`, each kept by the owner of what decides it.
-    VernonStatus bind(VernonRuntimeCoreCommands *commands, VernonRuntimeProviderObject encoder,
+    VernonStatus bind(VernonRuntimeCorePackets *packets, VernonRuntimeProviderObject encoder,
                       const GroupSources &sources, std::string &error) const;
 
 private:

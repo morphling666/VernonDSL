@@ -99,9 +99,10 @@ std::string depthStencilCopySource(Enum target, DepthStencilAspect aspect, const
 } // namespace
 
 bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallbacks, bool isEmbeddedProfile,
-                             std::string &error) {
+                             uint32_t flags, std::string &error) {
     callbacks = contextCallbacks;
     embeddedProfile = isEmbeddedProfile;
+    validation = (flags & VERNON_RHI_DEVICE_VALIDATION) != 0;
     if (!loadDriver(callbacks, driver, error))
         return false;
     makeCurrent();
@@ -125,10 +126,47 @@ bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallback
     if (embeddedProfile ? hasExtension("GL_EXT_disjoint_timer_query")
                         : apiVersionAtLeast(3, 3) || hasExtension("GL_ARB_timer_query"))
         loadTimerQueryDriver(callbacks, driver, embeddedProfile);
-    if (!supportsCompute() || (driver.dispatchCompute && driver.memoryBarrier))
-        return true;
-    error = "OpenGL context reports compute support but required compute functions are missing";
-    return false;
+    // NVIDIA's ES contexts list GL_EXT_disjoint_timer_query but reject GL_GPU_DISJOINT_EXT. Errors already pending
+    // are queued so that the probe reads only its own.
+    if (embeddedProfile && driver.queryCounter) {
+        for (int read = 0; read < 16; ++read) {
+            const Enum pending = readError();
+            if (pending == 0)
+                break;
+            errors->push("OpenGL error " + std::to_string(pending));
+        }
+        Int disjoint = 0;
+        driver.getIntegerv(kGpuDisjoint, &disjoint);
+        disjointQueryable = readError() == 0;
+    }
+    if (supportsCompute() && !(driver.dispatchCompute && driver.memoryBarrier)) {
+        error = "OpenGL context reports compute support but required compute functions are missing";
+        return false;
+    }
+    // Last, because only shutdown removes the callback. Validation reads errors per operation instead; asynchronous
+    // output keeps the driver threaded.
+    if (!validation && (flags & VERNON_RHI_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT) && driver.debugMessageCallback) {
+        debugOutput = true;
+        driver.debugMessageControl(kDontCare, kDontCare, kDontCare, 0, nullptr, 0);
+        driver.debugMessageControl(kDontCare, kDebugTypeError, kDontCare, 0, nullptr, 1);
+        // A captureless lambda converts to the callback's calling convention.
+        const DebugCallback receive = [](Enum, Enum type, Uint id, Enum, Size length, const char *message,
+                                         const void *user) {
+            if (type != kDebugTypeError || !user || !message)
+                return;
+            try {
+                static_cast<ErrorQueue *>(const_cast<void *>(user))
+                    ->push("OpenGL error " + std::to_string(id) + ": " +
+                           std::string(message, length < 0 ? std::strlen(message) : static_cast<size_t>(length)));
+            } catch (...) {
+                // An exception must not unwind into the driver.
+            }
+        };
+        driver.debugMessageCallback(receive, errors.get());
+        driver.disable(kDebugOutputSynchronous);
+        driver.enable(kDebugOutput);
+    }
+    return true;
 }
 
 bool DeviceState::makeCurrent() const noexcept {
@@ -162,9 +200,108 @@ Size DeviceState::debugLabelLength(std::string_view label) const {
     return static_cast<Size>(length);
 }
 
+DeviceState::~DeviceState() {
+    if (debugOutput && makeCurrent())
+        removeDebugOutput();
+}
+
+void DeviceState::removeDebugOutput() {
+    driver.disable(kDebugOutput);
+    driver.debugMessageCallback(nullptr, nullptr);
+    // The driver may deliver messages of earlier calls until it has run them, and the queue dies with the device.
+    driver.finish();
+    debugOutput = false;
+}
+
+void DeviceState::shutdown() {
+    if (debugOutput)
+        removeDebugOutput();
+    if (!freeQueries.empty())
+        driver.deleteQueries(static_cast<Size>(freeQueries.size()), freeQueries.data());
+    freeQueries.clear();
+}
+
+void DeviceState::ErrorQueue::push(std::string message) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (count++ == 0)
+        first = std::move(message);
+}
+
+Enum DeviceState::readError() {
+    ++stats.errorReads;
+    return driver.getError ? driver.getError() : 0;
+}
+
+void DeviceState::deferErrors() {
+    if (validation)
+        return;
+    // glGetError returns one recorded error per call; the bound keeps a context that keeps raising from spinning.
+    for (int read = 0; read < 16; ++read) {
+        const Enum error = readError();
+        if (error == 0)
+            return;
+        if (!debugOutput)
+            errors->push("OpenGL error " + std::to_string(error));
+    }
+}
+
+void DeviceState::beginSynchronous() {
+    deferErrors();
+    std::lock_guard<std::mutex> guard(errors->mutex);
+    synchronousMark = errors->count;
+}
+
+Enum DeviceState::endSynchronous() {
+    const Enum error = readError();
+    if (error == 0)
+        return 0;
+    for (int read = 0; read < 16; ++read)
+        if (readError() == 0)
+            break;
+    std::lock_guard<std::mutex> guard(errors->mutex);
+    if (synchronousMark == 0)
+        errors->first.clear();
+    errors->count = std::min(errors->count, synchronousMark);
+    return error;
+}
+
+std::optional<std::string> DeviceState::takeErrors() {
+    if (!debugOutput)
+        deferErrors();
+    std::lock_guard<std::mutex> guard(errors->mutex);
+    if (!errors->count)
+        return std::nullopt;
+    std::string message = errors->first;
+    if (errors->count > 1)
+        message += " (and " + std::to_string(errors->count - 1) + " more)";
+    errors->first.clear();
+    errors->count = 0;
+    return message;
+}
+
+Uint DeviceState::acquireQuery() {
+    if (freeQueries.empty()) {
+        Uint query = 0;
+        driver.genQueries(1, &query);
+        ++stats.queryCreations;
+        return query;
+    }
+    const Uint query = freeQueries.back();
+    freeQueries.pop_back();
+    return query;
+}
+
+void DeviceState::releaseQueries(const std::vector<Uint> &queries) {
+    freeQueries.reserve(freeQueries.size() + queries.size());
+    for (const Uint query : queries)
+        if (query)
+            freeQueries.push_back(query);
+}
+
 void DeviceState::pushDebugGroup(std::string_view label) {
     if (!driver.pushDebugGroup)
         return;
+    ++stats.debugGroupPushes;
     Int depth = 0;
     driver.getIntegerv(kDebugGroupStackDepth, &depth);
     const bool pushed = depth < maxDebugGroupDepth;

@@ -351,7 +351,8 @@ void DeviceState::shutdown() {
     if (device) {
         for (StagingPool<StagingChunk> *pool : {&uploadStaging, &readbackStaging})
             pool->clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
-        persistentBlocks.clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
+        for (BlockPool<StagingChunk> *pool : {&persistentBlocks, &updatableBlocks})
+            pool->clear([this](StagingChunk &chunk) { destroyBuffer(chunk.buffer); });
         for (const std::vector<VkDescriptorPool> *pools : {&descriptorPools, &freeFrameDescriptorPools})
             for (VkDescriptorPool pool : *pools)
                 api.destroyDescriptorPool(device, pool, nullptr);
@@ -912,6 +913,24 @@ bool DeviceState::placePersistent(VkDeviceSize size, VkDeviceSize alignment, VkB
 }
 
 void DeviceState::releasePersistent(uint64_t key) { persistentBlocks.release(key); }
+
+bool DeviceState::placeUpdatable(VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
+                                 uint64_t &key, std::string &error) {
+    StagingChunk *chunk =
+        updatableBlocks.acquire(size, alignment, offset, key, [&](VkDeviceSize capacity, StagingChunk &created) {
+            created.capacity = capacity;
+            return createBuffer(created.buffer, capacity,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, error);
+        });
+    if (!chunk)
+        return false;
+    buffer = chunk->buffer.buffer;
+    return true;
+}
+
+void DeviceState::releaseUpdatable(uint64_t key) { updatableBlocks.release(key); }
 
 bool DeviceState::createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error) {
     chunk.capacity = capacity;

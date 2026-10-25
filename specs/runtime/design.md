@@ -404,8 +404,8 @@ reports it for every path that waits.
 
 An invocation in `VERNON_COMPLETION_ASYNCHRONOUS` mode leaves its steps
 `Submitted` and hands the record out through `TakeSubmission`; the record
-then also retains the invocation snapshot and the graphics recordings its
-commands read. Until deferred effects exist (phase 2), asynchronous plans
+then also retains the invocation snapshot and the validated graphics
+recordings its commands read, so the host may edit those recordings at once. Until deferred effects exist (phase 2), asynchronous plans
 are those whose writes are all in place. Resolve records the first other
 effect as the plan's wait requirement: a commit-after-success publication,
 then an autodiff tape. Retaining a pullback also needs a wait, because the
@@ -750,9 +750,11 @@ when the first graphics pipeline is prepared, so invocations create no GL
 objects of their own.
 
 GL reports invalid transfers only through `glGetError`, leaving the
-destination untouched, so image uploads and downloads run inside an error
-scope; an unchecked error would otherwise surface as zeroed data and then fail
-whichever operation next checks the context. Core OpenGL ES cannot
+destination untouched, so downloads, and mipmap generation, which reports an
+unsupported format the same way, check their own errors on every device; an
+unchecked download error would otherwise surface as zeroed data. Uploads run
+inside an error scope on a validation device and otherwise fail the next
+completion ([`hot_path_diagnostics.md`](hot_path_diagnostics.md) section 2). Core OpenGL ES cannot
 `glReadPixels` depth or stencil, so on OpenGL ES 3.1+ a compute pass copies
 one aspect of a depth image region into a buffer, one 32-bit word per texel:
 `texelFetch` for 2D and 2D-array images, and for cube images a `textureLod` of

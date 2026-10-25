@@ -52,10 +52,29 @@ BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &con
 BackendPipelineResult resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                              VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);
-// Encodes one draw of `stream` on `commands`, inside its rendering scope.
-RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCoreCommands *commands,
+// Records one draw of `stream` on `packets`, inside its rendering scope.
+RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
                                           const GraphicsCommand &command, GraphicsStream &stream);
 class CommandStream;
+
+// A packet batch with the payload words it was recorded with, which any command stream of its provider encodes again.
+class StoredPacketBatch {
+public:
+    StoredPacketBatch() = default;
+    StoredPacketBatch(const StoredPacketBatch &) = delete;
+    StoredPacketBatch &operator=(const StoredPacketBatch &) = delete;
+    ~StoredPacketBatch() { vernonRuntimeCorePacketBatchDestroy(batch_); }
+
+    explicit operator bool() const { return batch_ != nullptr; }
+    const std::vector<uint32_t> &payload() const { return payload_; }
+
+private:
+    friend class CommandStream;
+
+    VernonRuntimeCorePacketBatch *batch_{};
+    std::vector<uint32_t> payload_;
+};
+
 // Dispatches on `stream`, whose encoder is the launch's. `owners`, when given, holds the owner of each Stage
 // parameter's argument; otherwise the launch owns them all.
 RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, CommandStream &stream,
@@ -74,8 +93,9 @@ RuntimeResult<VernonRuntimeProviderImageDescription>
 describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
 RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
                                                                           VernonRhiCommandEncoder encoder);
-// The command stream of one provider command encoder: its RuntimeCore commands and the transient groups they bind,
-// which live until the stream ends. Ended on destruction when end() was not called.
+// The command stream of one provider command encoder: its RuntimeCore commands, the commands recorded since the last
+// flush and the transient groups they bind, which live until the stream ends. Ended on destruction when end() was not
+// called, without encoding what was recorded since the last flush.
 class CommandStream {
 public:
     CommandStream() = default;
@@ -86,11 +106,26 @@ public:
     ~CommandStream();
 
     explicit operator bool() const { return commands_ != nullptr; }
-    VernonRuntimeCoreCommands *commands() const { return commands_; }
+    VernonRuntimeCorePackets *packets() const { return packets_; }
     VernonRuntimeProviderObject encoder() const { return encoder_; }
     GroupStore &transient() const { return *transient_; }
+    RuntimeResult<void> beginRendering(const VernonRuntimeProviderRenderingDescriptor &descriptor);
+    RuntimeResult<void> endRendering();
+    // Encodes the commands recorded since the last flush as one packet batch. Called outside a rendering scope before
+    // other commands are recorded on the encoder, such as at the end of each RHI command encode callback.
+    RuntimeResult<void> flush();
+    // Flushes into the empty stored, which keeps the batch. The batch must bind no transient group.
+    RuntimeResult<void> flush(StoredPacketBatch &stored);
+    // Encodes stored with `payload`, a patched copy of its payload, or its own, after flushing; called where flush()
+    // could be.
+    RuntimeResult<void> encode(const StoredPacketBatch &stored, const std::vector<uint32_t> &payload);
     // Called before the next command once other commands were recorded on the encoder, outside a rendering scope.
     RuntimeResult<void> resume();
+    // Writes the inline values of updatable `group` for the batches encoded after the call, including the commands
+    // recorded since the last flush; see vernonRuntimeCoreUpdateGroup.
+    RuntimeResult<void> updateGroup(VernonRuntimeCoreGroup *group, const VernonRuntimeProviderBindingValue *values,
+                                    size_t valueCount);
+    // Flushes, then ends the commands.
     RuntimeResult<void> end();
 
 private:
@@ -98,12 +133,15 @@ private:
 
     VernonRuntimeContext *context_{};
     VernonRuntimeCoreCommands *commands_{};
+    VernonRuntimeCorePackets *packets_{};
     VernonRuntimeProviderObject encoder_{};
     std::unique_ptr<GroupStore> transient_;
 };
 
 // On the provider of `context`: the CPU provider, or the RHI adapter's.
 RuntimeResult<CommandStream> beginCommandStream(VernonRuntimeContext &context, VernonRuntimeProviderObject encoder);
+// Whether the provider of `context` writes updatable groups.
+bool backendUpdatesGroups(VernonRuntimeContext &context);
 
 // The command stream that the nodes of one RHI command plan share on the plan's encoder. Each node acquires it: the
 // first begins it, and later ones resume it, because the plan records barriers, copies and scope commands between
@@ -121,9 +159,6 @@ private:
     VernonRhiCommandEncoder encoder_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     CommandStream stream_;
 };
-RuntimeResult<void> beginBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands,
-                                          const VernonRuntimeProviderRenderingDescriptor &descriptor);
-RuntimeResult<void> endBackendRendering(VernonRuntimeContext &context, VernonRuntimeCoreCommands *commands);
 
 } // namespace vernon::runtime
 

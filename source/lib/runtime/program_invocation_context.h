@@ -16,6 +16,7 @@ namespace vernon::runtime {
 
 struct RecordedGraphicsPasses;
 class InstanceGroups;
+class StoredGraphicsScopes;
 
 struct ProgramInvocationContext {
     const program::InvocationSnapshot &bindings;
@@ -26,6 +27,8 @@ struct ProgramInvocationContext {
     RecordedGraphicsPasses *recordedGraphics{};
     // The instance's persistent groups, which its bindings in `bindings` decide.
     InstanceGroups *groups{};
+    // The instance's stored rendering scopes, which its invocations replay while their inputs are unchanged.
+    StoredGraphicsScopes *storedGraphics{};
 };
 
 } // namespace vernon::runtime

@@ -320,32 +320,6 @@ BindingSetHandleResult createBindingSetOperation(VernonGraphicsPipeline *pipelin
     return BindingSetHandleResult{vernon::ok(handle.release())};
 }
 
-struct WrittenResources {
-    struct Buffer {
-        uint64_t identity{};
-        uint64_t resource{};
-        uint64_t begin{};
-        uint64_t end{};
-    };
-    std::vector<Buffer> buffers;
-    std::vector<uint64_t> images;
-
-    // Saturates instead of wrapping, so an out-of-range view still overlaps what it would reach.
-    static Buffer range(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) {
-        const uint64_t begin = offset > UINT64_MAX - reference.offset ? UINT64_MAX : reference.offset + offset;
-        return {reference.identity, reference.resource.value, begin,
-                size > UINT64_MAX - begin ? UINT64_MAX : begin + size};
-    }
-
-    bool overlapsBuffer(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) const {
-        const Buffer view = range(reference, offset, size);
-        return std::any_of(buffers.begin(), buffers.end(), [&](const Buffer &buffer) {
-            return buffer.identity == view.identity && buffer.resource == view.resource && view.begin < buffer.end &&
-                   buffer.begin < view.end;
-        });
-    }
-};
-
 std::optional<uint64_t> imageParent(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference view) {
     auto described = describeBackendImage(context, view);
     if (described.isErr())
@@ -354,12 +328,12 @@ std::optional<uint64_t> imageParent(VernonRuntimeContext &context, VernonRuntime
 }
 
 bool addWrittenArgument(VernonRuntimeContext &context, const VernonProgramArgument &argument,
-                        WrittenResources &written) {
+                        RecordedWrittenResources &written) {
     if (argument.kind == VERNON_PROGRAM_TENSOR) {
         if (argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
             return true;
-        written.buffers.push_back(
-            WrittenResources::range(argument.tensor.resource, argument.tensor.byte_offset, argument.tensor.byte_size));
+        written.buffers.push_back(RecordedWrittenResources::range(argument.tensor.resource, argument.tensor.byte_offset,
+                                                                  argument.tensor.byte_size));
         return true;
     }
     if (argument.kind != VERNON_PROGRAM_IMAGE)
@@ -373,7 +347,7 @@ bool addWrittenArgument(VernonRuntimeContext &context, const VernonProgramArgume
 
 // Empty when the argument's image cannot be described.
 std::optional<bool> argumentIsWritten(VernonRuntimeContext &context, const VernonProgramArgument &argument,
-                                      const WrittenResources &written) {
+                                      const RecordedWrittenResources &written) {
     if (argument.kind == VERNON_PROGRAM_TENSOR)
         return argument.tensor.storage == VERNON_TENSOR_RHI_RESOURCE &&
                written.overlapsBuffer(argument.tensor.resource, argument.tensor.byte_offset, argument.tensor.byte_size);
@@ -387,7 +361,8 @@ std::optional<bool> argumentIsWritten(VernonRuntimeContext &context, const Verno
 
 // Resources the invocation's Nodes write that callers can also reach: written boundary arguments and attachments.
 bool collectWrittenResources(VernonRuntimeContext &context, const VernonProgramExecutable &executable,
-                             const vernon::runtime::program::InvocationSnapshot &snapshot, WrittenResources &written) {
+                             const vernon::runtime::program::InvocationSnapshot &snapshot,
+                             RecordedWrittenResources &written) {
     const program::Program &program = *executableProgram(executable);
     for (const program::BoundarySlot &slot : program.abi.boundarySlots) {
         if (slot.access == program::BoundaryAccess::Read)
@@ -444,35 +419,27 @@ struct SetPipelineHash {
     }
 };
 
-VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, VernonProgramNodeId nodeId,
-                                       const RuntimeGraphicsRecording &recording, const WrittenResources &written,
+std::string commandPath(VernonProgramNodeId node, size_t command) {
+    return "node " + std::to_string(node) + ".commands[" + std::to_string(command) + "]";
+}
+
+// Everything except the draw values, which buildDrawPayload collects, and hazards, which depend on what each
+// invocation writes.
+VernonStatus validateGraphicsRecording(VernonProgramExecutable &executable,
+                                       const RuntimeGraphicsRecordingState &recording,
+                                       const std::shared_ptr<const RuntimeGraphicsPipelineState> &passPipeline,
                                        RecordedGraphicsPass &pass) {
-    VernonProgramExecutable &executable = *invocation.instance->pipeline;
     VernonRuntimeContext &context = *executable.context;
-    const std::string nodePath = "node " + std::to_string(nodeId);
+    const VernonProgramNodeId nodeId = recording.node;
     const auto invalid = [&](const std::string &path, const std::string &message) {
         return failDiagnostic(&context, {recorded::kRecordingInvalid, recorded::kInvocationEntryPhase, path, message});
     };
-    auto passPipeline = passPipelineState(executable, nodeId);
-    if (passPipeline.isErr())
-        return invalid(nodePath, passPipeline.error());
-    const program::GraphicsOperation &graphics = program::graphicsOperation(*passPipeline.value()->sourceNode);
-    VernonDynamicState dynamic{};
-    dynamic.struct_size = sizeof(dynamic);
-    // Shared by consecutive draws until a dynamic-state command changes `dynamic`.
-    std::shared_ptr<const RuntimeProgramControl> dynamicControl;
-    if (const std::shared_ptr<void> *payload = invocation.snapshot->find(
-            programControlKey(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState))) {
-        dynamicControl = std::static_pointer_cast<const RuntimeProgramControl>(*payload);
-        dynamic = dynamicControl->dynamic;
-    }
-
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
     // Per endpoint of `pipeline`.
     std::vector<BoundParameter> bound;
     std::unordered_map<SetPipelineKey, size_t, SetPipelineHash> frames;
     std::vector<char> frameChecked;
-    std::unordered_set<const RuntimeBindingSetState *> hazardChecked;
+    std::unordered_set<const RuntimeBindingSetState *> distinctSets;
     // Shared by consecutive draws until a bind changes what their parameters take.
     std::shared_ptr<const std::vector<RecordedArgumentSource>> arguments;
     size_t openDebugGroups = 0;
@@ -487,13 +454,13 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
     };
     for (size_t index = 0; index < recording.commands.size(); ++index) {
         const RuntimeRecordedCommand &command = recording.commands[index];
-        const std::string path = nodePath + ".commands[" + std::to_string(index) + "]";
+        const auto path = [&] { return commandPath(nodeId, index); };
         switch (command.kind) {
         case VERNON_GRAPHICS_COMMAND_BIND_PIPELINE: {
             std::shared_ptr<const RuntimeGraphicsPipelineState> next =
-                command.pipeline ? command.pipeline : passPipeline.value();
+                command.pipeline ? command.pipeline : passPipeline;
             if (next->pass != &executable || next->node != nodeId)
-                return invalid(path, "pipeline was created for another graphics Node");
+                return invalid(path(), "pipeline was created for another graphics Node");
             // A parameter stays bound across the switch, by name, when its entry corresponds in the new pipeline.
             std::unordered_map<std::string_view, BoundParameter> named;
             for (size_t endpoint = 0; endpoint < bound.size(); ++endpoint)
@@ -518,60 +485,29 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
         }
         case VERNON_GRAPHICS_COMMAND_BIND_SET: {
             if (!pipeline)
-                return invalid(path, "binding set is bound before any pipeline");
+                return invalid(path(), "binding set is bound before any pipeline");
             const size_t frame = frameFor(*command.set);
             const RuntimeBindingSetMatch &match = *pass.frames[frame].match;
             if (!std::exchange(frameChecked[frame], 1))
                 for (const program::Diagnostic &failure : match.failures)
                     if (failure)
-                        return failDiagnostic(&context, prefixedDiagnostic(failure, path));
-            const bool checkHazards = hazardChecked.insert(command.set.get()).second;
-            for (size_t entry = 0; entry < command.set->entries.size(); ++entry) {
-                const RuntimeBindingSetEntry &binding = command.set->entries[entry];
-                if (checkHazards) {
-                    const std::optional<bool> isWritten =
-                        argumentIsWritten(context, binding.binding->argument, written);
-                    if (!isWritten)
-                        return invalid(path + "." + binding.boundary->path, "cannot describe the bound image");
-                    if (*isWritten)
-                        return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase,
-                                                         path + "." + binding.boundary->path,
-                                                         "resource is written by a Node of the same invocation"});
-                }
+                        return failDiagnostic(&context, prefixedDiagnostic(failure, path()));
+            if (distinctSets.insert(command.set.get()).second)
+                pass.sets.emplace_back(index, command.set);
+            for (size_t entry = 0; entry < command.set->entries.size(); ++entry)
                 for (uint32_t endpoint : match.entryEndpoints[entry])
                     bound[endpoint] = {command.set.get(), entry, frame};
-            }
             arguments.reset();
             ++pass.telemetry.set_binds;
             break;
         }
         case VERNON_GRAPHICS_COMMAND_SET_VIEWPORT:
-            std::copy(command.rect.begin(), command.rect.end(), dynamic.viewport);
-            dynamicControl.reset();
-            break;
         case VERNON_GRAPHICS_COMMAND_SET_SCISSOR:
-            std::copy(command.rect.begin(), command.rect.end(), dynamic.scissor);
-            dynamicControl.reset();
-            break;
         case VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE:
-            dynamic.stencil_reference = command.stencilReference;
-            dynamicControl.reset();
             break;
         case VERNON_GRAPHICS_COMMAND_DRAW: {
             if (!pipeline)
-                return invalid(path, "draw has no bound pipeline");
-            const std::optional<VernonIndexBinding> &index = command.draw->index;
-            if (index && written.overlapsBuffer(index->resource, index->offset,
-                                                static_cast<uint64_t>(index->index_count) * sizeof(uint32_t)))
-                return failDiagnostic(&context,
-                                      {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase, path + ".index",
-                                       "index buffer is written by a Node of the same invocation"});
-            if (!dynamicControl) {
-                auto control = std::make_shared<RuntimeProgramControl>();
-                control->kind = RuntimeProgramControl::DynamicState;
-                control->dynamic = dynamic;
-                dynamicControl = std::move(control);
-            }
+                return invalid(path(), "draw has no bound pipeline");
             if (!arguments) {
                 auto sources = std::make_shared<std::vector<RecordedArgumentSource>>();
                 sources->reserve(pipeline->endpoints.size());
@@ -586,19 +522,18 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
                         continue;
                     }
                     if (!endpoint.initialPassParameter)
-                        return invalid(path,
+                        return invalid(path(),
                                        "per-draw parameter '" + endpointPath(*pipeline, parameter) + "' is unbound");
                     sources->push_back({false, 0, *endpoint.initialPassParameter});
                 }
                 arguments = std::move(sources);
             }
-            pass.draws.push_back({pipeline, arguments, command.draw, dynamicControl});
-            ++pass.telemetry.draws;
+            pass.draws.push_back({pipeline, arguments});
             break;
         }
         case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
             if (!openDebugGroups)
-                return invalid(path, "pops a debug group that is not open");
+                return invalid(path(), "pops a debug group that is not open");
             --openDebugGroups;
             pass.debugCommands.push_back({command.kind, {}, pass.draws.size()});
             break;
@@ -611,7 +546,76 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
         }
     }
     if (openDebugGroups)
-        return invalid(nodePath, "pushes debug groups it does not pop");
+        return invalid("node " + std::to_string(nodeId), "pushes debug groups it does not pop");
+    pass.leases = recording.leases;
+    return VERNON_STATUS_OK;
+}
+
+// The draw values of `recording`, whose dynamic state starts from `initialDynamic`, null when the invocation sets none.
+std::shared_ptr<const RecordedDrawPayload>
+buildDrawPayload(const RuntimeGraphicsRecordingState &recording,
+                 const std::shared_ptr<const RuntimeProgramControl> &initialDynamic) {
+    auto payload = std::make_shared<RecordedDrawPayload>();
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    // Shared by consecutive draws until a dynamic-state command changes `dynamic`.
+    std::shared_ptr<const RuntimeProgramControl> dynamicControl = initialDynamic;
+    if (dynamicControl)
+        dynamic = dynamicControl->dynamic;
+    for (size_t index = 0; index < recording.commands.size(); ++index) {
+        const RuntimeRecordedCommand &command = recording.commands[index];
+        switch (command.kind) {
+        case VERNON_GRAPHICS_COMMAND_SET_VIEWPORT:
+            std::copy(command.rect.begin(), command.rect.end(), dynamic.viewport);
+            dynamicControl.reset();
+            break;
+        case VERNON_GRAPHICS_COMMAND_SET_SCISSOR:
+            std::copy(command.rect.begin(), command.rect.end(), dynamic.scissor);
+            dynamicControl.reset();
+            break;
+        case VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE:
+            dynamic.stencil_reference = command.stencilReference;
+            dynamicControl.reset();
+            break;
+        case VERNON_GRAPHICS_COMMAND_DRAW:
+            if (!dynamicControl) {
+                auto control = std::make_shared<RuntimeProgramControl>();
+                control->kind = RuntimeProgramControl::DynamicState;
+                control->dynamic = dynamic;
+                dynamicControl = std::move(control);
+            }
+            if (command.draw->index)
+                payload->indices.emplace_back(index, *command.draw->index);
+            payload->draws.push_back(command.draw);
+            payload->dynamics.push_back(dynamicControl);
+            payload->drawn += command.draw->draw.instance_count != 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return payload;
+}
+
+VernonStatus checkGraphicsHazards(VernonRuntimeContext &context, VernonProgramNodeId node,
+                                  const RecordedGraphicsPass &pass, const RecordedDrawPayload &payload,
+                                  const RecordedWrittenResources &written) {
+    for (const auto &[command, set] : pass.sets)
+        for (const RuntimeBindingSetEntry &binding : set->entries) {
+            const std::optional<bool> isWritten = argumentIsWritten(context, binding.binding->argument, written);
+            const std::string path = commandPath(node, command) + "." + binding.boundary->path;
+            if (!isWritten)
+                return failDiagnostic(&context, {recorded::kRecordingInvalid, recorded::kInvocationEntryPhase, path,
+                                                 "cannot describe the bound image"});
+            if (*isWritten)
+                return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase, path,
+                                                 "resource is written by a Node of the same invocation"});
+        }
+    for (const auto &[command, index] : payload.indices)
+        if (written.overlapsBuffer(index.resource, 0, index.resource.size))
+            return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase,
+                                             commandPath(node, command) + ".index",
+                                             "index buffer is written by a Node of the same invocation"});
     return VERNON_STATUS_OK;
 }
 } // namespace
@@ -619,13 +623,49 @@ VernonStatus validateGraphicsRecording(VernonProgramInvocation &invocation, Vern
 VernonStatus vernon::runtime::capi::validateGraphicsRecordings(VernonProgramInvocation &invocation,
                                                                RecordedGraphicsPasses &passes) {
     VernonProgramExecutable &executable = *invocation.instance->pipeline;
-    WrittenResources written;
-    if (!collectWrittenResources(*executable.context, executable, *invocation.snapshot, written))
-        return fail(executable.context, "cannot describe the images a recorded invocation writes");
+    VernonRuntimeContext &context = *executable.context;
+    RecordedWrittenResources written;
+    if (!collectWrittenResources(context, executable, *invocation.snapshot, written))
+        return fail(&context, "cannot describe the images a recorded invocation writes");
     for (const auto &[node, recording] : invocation.recordings) {
-        const VernonStatus status = validateGraphicsRecording(invocation, node, recording, written, passes.nodes[node]);
-        if (status != VERNON_STATUS_OK)
-            return status;
+        auto passPipeline = passPipelineState(executable, node);
+        if (passPipeline.isErr())
+            return failDiagnostic(&context, {recorded::kRecordingInvalid, recorded::kInvocationEntryPhase,
+                                             "node " + std::to_string(node), passPipeline.error()});
+        const program::GraphicsOperation &graphics = program::graphicsOperation(*passPipeline.value()->sourceNode);
+        std::shared_ptr<const RuntimeProgramControl> initialDynamic;
+        VernonDynamicState dynamic{};
+        if (const std::shared_ptr<void> *payload = invocation.snapshot->find(
+                programControlKey(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState))) {
+            initialDynamic = std::static_pointer_cast<const RuntimeProgramControl>(*payload);
+            dynamic = initialDynamic->dynamic;
+        }
+        if (!recording->validated) {
+            auto validated = std::make_shared<RecordedGraphicsPass>();
+            if (const VernonStatus status =
+                    validateGraphicsRecording(executable, *recording, passPipeline.value(), *validated);
+                status != VERNON_STATUS_OK)
+                return status;
+            recording->validated = std::move(validated);
+        }
+        if (!recording->payload || !sameDynamicState(recording->payloadDynamic, dynamic)) {
+            recording->payload = buildDrawPayload(*recording, initialDynamic);
+            recording->payloadDynamic = dynamic;
+        }
+        if ((!written.buffers.empty() || !written.images.empty()) &&
+            (recording->hazardFreePass != recording->validated || recording->hazardFreePayload != recording->payload ||
+             !(recording->hazardFreeWritten == written))) {
+            if (const VernonStatus status =
+                    checkGraphicsHazards(context, node, *recording->validated, *recording->payload, written);
+                status != VERNON_STATUS_OK)
+                return status;
+            recording->hazardFreePass = recording->validated;
+            recording->hazardFreePayload = recording->payload;
+            recording->hazardFreeWritten = written;
+        }
+        VernonProgramGraphicsNodeTelemetry telemetry = recording->validated->telemetry;
+        telemetry.draws = recording->payload->drawn;
+        passes.nodes[node] = {recording->validated, recording->payload, telemetry};
     }
     return VERNON_STATUS_OK;
 }
@@ -706,81 +746,195 @@ void vernonRuntimeBindingSetDestroy(VernonBindingSet *set) {
     runtimeVoidBoundary(set && set->state ? set->state->context : nullptr, [&] { delete set; });
 }
 
-VernonStatus vernonRuntimeProgramInvocationRecordGraphics(VernonProgramInvocation *invocation, VernonProgramNodeId node,
-                                                          const VernonGraphicsCommand *commands, size_t commandCount,
-                                                          const VernonProgramResourceLease *leases, size_t leaseCount) {
+namespace {
+using GraphicsRecordingHandleResult = vernon::Result<VernonGraphicsRecording *, vernon::RuntimeError>;
+
+GraphicsRecordingHandleResult createGraphicsRecordingOperation(VernonProgramInstance *instance,
+                                                               VernonProgramNodeId node) {
+    VernonRuntimeContext *context = instance && instance->state ? instance->state->pipeline->context : nullptr;
+    const auto invalid = [&](const std::string &message) {
+        fail(context, message);
+        return GraphicsRecordingHandleResult{vernon::err(
+            vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument, {"graphics recording creation", 0, 0}})};
+    };
+    if (!context)
+        return invalid("invalid graphics recording creation");
+    if (!forwardGraphicsNode(*instance->state->pipeline, node))
+        return invalid("graphics recording Node " + std::to_string(node) +
+                       " is not a resolved graphics Node of the executable");
+    auto state = std::make_shared<RuntimeGraphicsRecordingState>();
+    state->context = context;
+    state->instance = instance->state;
+    state->node = node;
+    auto handle = std::make_unique<VernonGraphicsRecording>();
+    handle->state = std::move(state);
+    return GraphicsRecordingHandleResult{vernon::ok(handle.release())};
+}
+
+VernonStatus convertGraphicsCommand(VernonRuntimeContext *context, const VernonGraphicsCommand &source, size_t index,
+                                    RuntimeRecordedCommand &command) {
+    const auto path = [&] { return "graphics recording command " + std::to_string(index); };
+    command.kind = source.kind;
+    switch (source.kind) {
+    case VERNON_GRAPHICS_COMMAND_BIND_PIPELINE:
+        if (source.pipeline && (!source.pipeline->state || source.pipeline->context != context))
+            return fail(context, path() + " has an invalid pipeline or one of another Runtime context");
+        if (source.pipeline)
+            command.pipeline = source.pipeline->state;
+        break;
+    case VERNON_GRAPHICS_COMMAND_BIND_SET:
+        if (!source.binding_set || !source.binding_set->state || !source.binding_set->state->sealed)
+            return fail(context, path() + " binds a missing or unsealed binding set");
+        if (source.binding_set->state->context != context)
+            return fail(context, path() + " binds a binding set of another Runtime context");
+        command.set = source.binding_set->state;
+        break;
+    case VERNON_GRAPHICS_COMMAND_SET_VIEWPORT:
+    case VERNON_GRAPHICS_COMMAND_SET_SCISSOR:
+        std::copy(std::begin(source.rect), std::end(source.rect), command.rect.begin());
+        break;
+    case VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE:
+        if (source.stencil_reference > 0xff)
+            return fail(context, path() + " has a stencil reference above 255");
+        command.stencilReference = source.stencil_reference;
+        break;
+    case VERNON_GRAPHICS_COMMAND_DRAW:
+        command.draw = makeDrawCommandControl(&source.draw);
+        if (!command.draw)
+            return fail(context, path() + " has an invalid DrawCommand");
+        break;
+    case VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP:
+    case VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER:
+        if (source.label.size && !source.label.data)
+            return fail(context, path() + " has an invalid label");
+        command.label.assign(source.label.size ? source.label.data : "", source.label.size);
+        break;
+    case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
+        break;
+    default:
+        return fail(context, path() + " has an unknown kind");
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonRuntimeContext *recordingContext(const VernonGraphicsRecording *recording) {
+    return recording && recording->state ? recording->state->context : nullptr;
+}
+} // namespace
+
+VernonRuntimeOperationStatus vernonRuntimeGraphicsRecordingCreate(VernonProgramInstance *instance,
+                                                                  VernonProgramNodeId node,
+                                                                  VernonGraphicsRecording **output) {
+    VernonRuntimeContext *context = instance && instance->state ? instance->state->pipeline->context : nullptr;
+    return runtimeHandleResultBoundary(context, output,
+                                       [&] { return createGraphicsRecordingOperation(instance, node); });
+}
+
+void vernonRuntimeGraphicsRecordingDestroy(VernonGraphicsRecording *recording) {
+    runtimeVoidBoundary(recordingContext(recording), [&] { delete recording; });
+}
+
+VernonStatus vernonRuntimeGraphicsRecordingReset(VernonGraphicsRecording *recording) {
+    VernonRuntimeContext *context = recordingContext(recording);
+    return runtimeStatusBoundary(context, [&] {
+        if (!context)
+            return fail(context, "invalid graphics recording reset");
+        RuntimeGraphicsRecordingState &state = *recording->state;
+        state.commands.clear();
+        state.leases.clear();
+        state.validated.reset();
+        state.payload.reset();
+        return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonRuntimeGraphicsRecordingSetCommand(VernonGraphicsRecording *recording, size_t index,
+                                                      const VernonGraphicsCommand *command) {
+    VernonRuntimeContext *context = recordingContext(recording);
+    return runtimeStatusBoundary(context, [&] {
+        if (!context || !command || index >= recording->state->commands.size())
+            return fail(context, "invalid graphics recording command update");
+        RuntimeRecordedCommand &target = recording->state->commands[index];
+        const std::string path = "graphics recording command " + std::to_string(index);
+        switch (command->kind) {
+        case VERNON_GRAPHICS_COMMAND_SET_VIEWPORT:
+        case VERNON_GRAPHICS_COMMAND_SET_SCISSOR:
+        case VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE:
+        case VERNON_GRAPHICS_COMMAND_DRAW:
+            break;
+        default:
+            return fail(context, path + " can only be replaced by a viewport, scissor, stencil reference or draw");
+        }
+        if (command->kind != target.kind)
+            return fail(context, path + " cannot change its kind");
+        RuntimeRecordedCommand replacement;
+        if (const VernonStatus status = convertGraphicsCommand(context, *command, index, replacement);
+            status != VERNON_STATUS_OK)
+            return status;
+        if (replacement.kind == VERNON_GRAPHICS_COMMAND_DRAW) {
+            const std::optional<VernonIndexBinding> &previous = target.draw->index;
+            const std::optional<VernonIndexBinding> &next = replacement.draw->index;
+            if (previous.has_value() != next.has_value() ||
+                (previous && (previous->resource.identity != next->resource.identity ||
+                              previous->resource.resource.value != next->resource.resource.value)))
+                return fail(context, path + " cannot change whether it is indexed or its index buffer");
+        }
+        target = std::move(replacement);
+        recording->state->payload.reset();
+        return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonRuntimeProgramInvocationBindRecording(VernonProgramInvocation *invocation,
+                                                         VernonGraphicsRecording *recording) {
     VernonProgramExecutable *executable = invocationExecutable(invocation);
     VernonRuntimeContext *context = executable ? executable->context : nullptr;
     return runtimeStatusBoundary(context, [&] {
-        if (!invocation || !executable || invocation->executed || invocation->finished || (commandCount && !commands) ||
-            (leaseCount && !leases))
-            return fail(context, "invalid graphics recording");
+        if (!invocation || !executable || invocation->executed || invocation->finished || !recording ||
+            !recording->state)
+            return fail(context, "invalid graphics recording binding");
         auto invocationPin = invocation->lifecycle.pin();
         if (invocationPin.isErr())
             return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
-        if (!forwardGraphicsNode(*executable, node))
-            return fail(context, "graphics recording Node " + std::to_string(node) +
-                                     " is not a resolved graphics Node of the executable");
-        RuntimeGraphicsRecording appended;
-        appended.commands.reserve(commandCount);
+        const std::weak_ptr<RuntimeProgramInstanceState> &owner = recording->state->instance;
+        if (owner.owner_before(invocation->instance) || invocation->instance.owner_before(owner))
+            return fail(context, "graphics recording belongs to another Program instance");
+        invocation->recordings[recording->state->node] = recording->state;
+        return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonRuntimeGraphicsRecordingAppend(VernonGraphicsRecording *recording,
+                                                  const VernonGraphicsCommand *commands, size_t commandCount,
+                                                  const VernonProgramResourceLease *leases, size_t leaseCount) {
+    VernonRuntimeContext *context = recordingContext(recording);
+    return runtimeStatusBoundary(context, [&] {
+        if (!context || (commandCount && !commands) || (leaseCount && !leases))
+            return fail(context, "invalid graphics recording");
+        std::vector<RuntimeRecordedCommand> appended;
+        std::vector<std::shared_ptr<void>> appendedLeases;
+        appended.reserve(commandCount);
         for (size_t index = 0; index < commandCount; ++index) {
-            const VernonGraphicsCommand &source = commands[index];
-            const std::string path = "graphics recording command " + std::to_string(index);
             RuntimeRecordedCommand command;
-            command.kind = source.kind;
-            switch (source.kind) {
-            case VERNON_GRAPHICS_COMMAND_BIND_PIPELINE:
-                if (source.pipeline && (!source.pipeline->state || source.pipeline->context != context))
-                    return fail(context, path + " has an invalid pipeline or one of another Runtime context");
-                if (source.pipeline)
-                    command.pipeline = source.pipeline->state;
-                break;
-            case VERNON_GRAPHICS_COMMAND_BIND_SET:
-                if (!source.binding_set || !source.binding_set->state || !source.binding_set->state->sealed)
-                    return fail(context, path + " binds a missing or unsealed binding set");
-                if (source.binding_set->state->context != context)
-                    return fail(context, path + " binds a binding set of another Runtime context");
-                command.set = source.binding_set->state;
-                break;
-            case VERNON_GRAPHICS_COMMAND_SET_VIEWPORT:
-            case VERNON_GRAPHICS_COMMAND_SET_SCISSOR:
-                std::copy(std::begin(source.rect), std::end(source.rect), command.rect.begin());
-                break;
-            case VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE:
-                if (source.stencil_reference > 0xff)
-                    return fail(context, path + " has a stencil reference above 255");
-                command.stencilReference = source.stencil_reference;
-                break;
-            case VERNON_GRAPHICS_COMMAND_DRAW:
-                command.draw = makeDrawCommandControl(&source.draw);
-                if (!command.draw)
-                    return fail(context, path + " has an invalid DrawCommand");
-                break;
-            case VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP:
-            case VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER:
-                if (source.label.size && !source.label.data)
-                    return fail(context, path + " has an invalid label");
-                command.label.assign(source.label.size ? source.label.data : "", source.label.size);
-                break;
-            case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
-                break;
-            default:
-                return fail(context, path + " has an unknown kind");
-            }
-            appended.commands.push_back(std::move(command));
+            if (const VernonStatus status = convertGraphicsCommand(context, commands[index], index, command);
+                status != VERNON_STATUS_OK)
+                return status;
+            appended.push_back(std::move(command));
         }
         for (size_t index = 0; index < leaseCount; ++index) {
             auto retained = retainProgramResourceLease(leases[index]);
             if (retained.isErr())
                 return publishRuntimeError(context, std::move(retained).error());
             if (retained.value())
-                appended.leases.push_back(std::move(retained).value());
+                appendedLeases.push_back(std::move(retained).value());
         }
-        RuntimeGraphicsRecording &recording = invocation->recordings[node];
-        recording.commands.insert(recording.commands.end(), std::make_move_iterator(appended.commands.begin()),
-                                  std::make_move_iterator(appended.commands.end()));
-        recording.leases.insert(recording.leases.end(), std::make_move_iterator(appended.leases.begin()),
-                                std::make_move_iterator(appended.leases.end()));
+        RuntimeGraphicsRecordingState &state = *recording->state;
+        state.commands.insert(state.commands.end(), std::make_move_iterator(appended.begin()),
+                              std::make_move_iterator(appended.end()));
+        state.leases.insert(state.leases.end(), std::make_move_iterator(appendedLeases.begin()),
+                            std::make_move_iterator(appendedLeases.end()));
+        state.validated.reset();
+        state.payload.reset();
         return VERNON_STATUS_OK;
     });
 }

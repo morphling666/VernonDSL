@@ -50,8 +50,10 @@ Node groups:
   when it has no name. Nesting under the label keeps captures readable when
   one child contributes several passes; the previous `node/<id>/<name>`
   prefix carried no information a capture reader can use.
-- Execute wraps each Node's commands, including its barriers and render
-  scope, in one debug group carrying the label. When graphics Nodes fuse into
+- On a device created with `VERNON_RHI_DEVICE_LABELS`
+  ([`hot_path_diagnostics.md`](hot_path_diagnostics.md) section 4), Execute
+  wraps each Node's commands, including its barriers and render scope, in one
+  debug group carrying the label. When graphics Nodes fuse into
   one render scope (`../program/graphics_execution.md` sections 7 and 9), the
   fused scope's group carries the member labels joined with `+`, and each
   member's draws are nested in a group with its own label.
@@ -147,9 +149,10 @@ ends, and Finish fails while a group is open.
   while a begin/end pair outside rendering scopes maps to every backend.
   Spans instead of elapsed times: overlap and gaps between scopes are what a
   frame timeline shows.
-- Backends: GL `glQueryCounter(GL_TIMESTAMP)` (GL 3.3 or
-  `ARB_timer_query`; ES via `EXT_disjoint_timer_query`, whose disjoint flag
-  fails the read); Vulkan timestamp query pools, reset on the command buffer
+- Backends: GL `glQueryCounter(GL_TIMESTAMP)` on queries from the device's
+  pool (GL 3.3 or `ARB_timer_query`; ES via `EXT_disjoint_timer_query`,
+  whose disjoint flag fails the read where the driver accepts
+  `GL_GPU_DISJOINT_EXT`); Vulkan timestamp query pools, reset on the command buffer
   before their first write, when the queue's `timestampValidBits` is not 0;
   D3D12 timestamp query heaps resolved with `ResolveQueryData` and
   `GetTimestampFrequency`; CUDA `cuEventRecord`, read with

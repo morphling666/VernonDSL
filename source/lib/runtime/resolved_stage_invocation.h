@@ -11,12 +11,10 @@ class CommandStream;
 
 extern "C" {
 void destroyResolvedStage(VernonStageExecutable *stage);
-VernonStatus submitResolvedStage(VernonStageExecutable *stage, const VernonStageInvocationDescriptor *invocation,
-                                 VernonSubmission **output);
 }
 
-// Encodes on `stream`, outside a rendering scope. `owners`, when given, holds the owner of each argument; otherwise
-// the invocation owns them all.
+// Encodes the compute Stage's invocation on `stream`, outside a rendering scope. `owners`, when given, holds the owner
+// of each argument; otherwise the invocation owns them all.
 VernonStatus encodeResolvedStage(CommandStream &stream, VernonStageExecutable *stage,
                                  const VernonStageInvocationDescriptor *invocation, const ArgumentOwner *owners);
 

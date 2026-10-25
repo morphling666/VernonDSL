@@ -676,7 +676,8 @@ vernonRhiCreateBorrowedDirectX12DeviceBusiness(const VernonRhiDirectX12BorrowedD
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->device || !descriptor->queue ||
         !descriptor->command_list ||
         (descriptor->queue_capabilities &
-         ~(VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS)) != 0)
+         ~(VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS)) != 0 ||
+        (descriptor->flags & ~vernon::rhi::deviceFlagMask) != 0)
         return invalidDevice();
     auto reserved = directX12Devices.reserve();
     if (reserved.isErr())
@@ -693,7 +694,7 @@ vernonRhiCreateBorrowedDirectX12DeviceBusiness(const VernonRhiDirectX12BorrowedD
     auto owner = reservation.retainOwner();
     if (owner.isErr())
         return invalidDevice();
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), descriptor->flags);
     if (commandState.isErr())
         return invalidDevice();
     device.commandState = std::move(commandState).value();
@@ -961,7 +962,8 @@ Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDe
         setDeviceCreationError("DirectX 12 device owner retention failed");
         return Result<VernonRhiDevice, RhiError>{err(std::move(owner).error())};
     }
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(
+        std::move(owner).value(), descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE));
     if (commandState.isErr()) {
         setDeviceCreationError("DirectX 12 command state allocation failed");
         return Result<VernonRhiDevice, RhiError>{err(std::move(commandState).error())};
@@ -2292,6 +2294,59 @@ void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
     }
 }
 
+Result<PersistentBlock, RhiError> placeUpdatable(VernonRhiDevice handle, uint64_t size, uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    auto device = lookupDirectX12Device(handle);
+    if (!device || !size || !alignment || (alignment & (alignment - 1)) != 0 ||
+        size > (std::numeric_limits<size_t>::max)() || alignment > (std::numeric_limits<size_t>::max)())
+        return Placed{err(RhiError{RhiErrorCode::InvalidArgument, {"place_directx12_updatable", size, 0}})};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ID3D12Resource *resource{};
+    size_t offset{};
+    uint64_t key{};
+    try {
+        if (!device->state.placeUpdatable(static_cast<size_t>(size), static_cast<size_t>(alignment), resource, offset,
+                                          key, device->error))
+            return Placed{err(backendFailure("place_directx12_updatable", size))};
+    } catch (const std::bad_alloc &) {
+        return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_directx12_updatable", size, 0}})};
+    }
+    return Placed{ok(PersistentBlock{reinterpret_cast<uint64_t>(resource), offset, nullptr, key})};
+}
+
+Result<void, RhiError> writeUpdatable(VernonRhiDevice handle, uint64_t, uint64_t native, const PersistentBlock &block,
+                                      const void *data, uint64_t size) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands || !data || !size || size > (std::numeric_limits<size_t>::max)())
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_directx12_updatable", native, 0}})};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (commands != device->state.commandList())
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"write_directx12_updatable", native, 0}})};
+    ID3D12Resource *upload{};
+    size_t offset{};
+    uint8_t *mapped{};
+    if (!device->state.acquireStaging(true, static_cast<size_t>(size), 4, upload, offset, mapped, device->error))
+        return Result<void, RhiError>{err(backendFailure("write_directx12_updatable", native))};
+    std::memcpy(mapped, data, static_cast<size_t>(size));
+    vernon::rhi::directx12::Buffer &buffer = device->state.updatableBuffer(block.key);
+    vernon::rhi::directx12::transition(commands, buffer.resource, buffer.state, D3D12_RESOURCE_STATE_COPY_DEST);
+    commands->CopyBufferRegion(buffer.resource, block.offset, upload, offset, size);
+    vernon::rhi::directx12::transition(commands, buffer.resource, buffer.state,
+                                       D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                                           D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    return Result<void, RhiError>{ok()};
+}
+
+void releaseUpdatable(VernonRhiDevice handle, uint64_t key) noexcept {
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.releaseUpdatable(key);
+    }
+}
+
 Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
                                        VernonRhiImage source, VernonRhiImage destination,
                                        const VernonRhiImageCopyRegion *regions, size_t regionCount) noexcept {
@@ -2987,6 +3042,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         result.writeTransient.emplace(writeTransient);
         result.placePersistent.emplace(placePersistent);
         result.releasePersistent.emplace(releasePersistent);
+        result.placeUpdatable.emplace(placeUpdatable);
+        result.writeUpdatable.emplace(writeUpdatable);
+        result.releaseUpdatable.emplace(releaseUpdatable);
         result.recordImageCopy.emplace(recordImageCopy);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);

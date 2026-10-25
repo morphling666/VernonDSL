@@ -19,7 +19,9 @@
 #include "runtime/runtime_lifecycle.h"
 #include "runtime/runtime_state.h"
 #include "runtime/stage_binding_plan.h"
+#include "runtime/stored_graphics_scopes.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -194,11 +196,6 @@ struct RuntimeRecordedCommand {
     std::string label;
 };
 
-struct RuntimeGraphicsRecording {
-    std::vector<RuntimeRecordedCommand> commands;
-    std::vector<std::shared_ptr<void>> leases;
-};
-
 // Where one Stage parameter of a recorded draw takes its materialized argument from: the pass Node's own frame,
 // or the frame of a binding set prepared for the draw's pipeline.
 struct RecordedArgumentSource {
@@ -211,8 +208,6 @@ struct RecordedDraw {
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
     // Per Stage parameter; consecutive draws with no bind between them share one vector.
     std::shared_ptr<const std::vector<RecordedArgumentSource>> arguments;
-    std::shared_ptr<const RuntimeProgramControl> draw;
-    std::shared_ptr<const RuntimeProgramControl> dynamic;
 };
 
 struct RecordedSetFrame {
@@ -228,16 +223,108 @@ struct RecordedDebugCommand {
     size_t draw{};
 };
 
+// What a validated recording draws with: everything except the values its viewport, scissor, stencil reference and
+// draw commands set, which RecordedDrawPayload holds. Immutable: every Execute that draws the recording until its next
+// edit other than SetCommand shares it, including submissions still in flight after the edit.
 struct RecordedGraphicsPass {
     std::vector<RecordedSetFrame> frames;
     std::vector<RecordedDraw> draws;
     // Balanced and in recording order.
     std::vector<RecordedDebugCommand> debugCommands;
+    // What each Execute checks against the resources its Nodes write: each distinct set with the first command that
+    // binds it.
+    std::vector<std::pair<size_t, std::shared_ptr<RuntimeBindingSetState>>> sets;
+    std::vector<std::shared_ptr<void>> leases;
+    // Every count except `render_scopes`, which Execute reports.
+    VernonProgramGraphicsNodeTelemetry telemetry{};
+};
+
+// The values of the draws of a validated recording, index-aligned with RecordedGraphicsPass::draws. Immutable like
+// the pass; SetCommand replaces it without replacing the pass.
+inline bool sameDynamicState(const VernonDynamicState &left, const VernonDynamicState &right) {
+    return std::equal(std::begin(left.viewport), std::end(left.viewport), std::begin(right.viewport)) &&
+           std::equal(std::begin(left.scissor), std::end(left.scissor), std::begin(right.scissor)) &&
+           left.stencil_reference == right.stencil_reference;
+}
+
+struct RecordedDrawPayload {
+    std::vector<std::shared_ptr<const RuntimeProgramControl>> draws;
+    // Consecutive draws with no dynamic-state command between them share one control.
+    std::vector<std::shared_ptr<const RuntimeProgramControl>> dynamics;
+    // Each indexed draw's index range with its command, which each Execute checks against the resources its Nodes
+    // write.
+    std::vector<std::pair<size_t, VernonIndexBinding>> indices;
+    // The draws of at least one instance.
+    uint64_t drawn{};
+};
+
+// Resources the Nodes of one invocation write that callers can also reach.
+struct RecordedWrittenResources {
+    struct Buffer {
+        uint64_t identity{};
+        uint64_t resource{};
+        uint64_t begin{};
+        uint64_t end{};
+
+        bool operator==(const Buffer &other) const {
+            return identity == other.identity && resource == other.resource && begin == other.begin && end == other.end;
+        }
+    };
+    std::vector<Buffer> buffers;
+    std::vector<uint64_t> images;
+
+    // Saturates instead of wrapping, so an out-of-range view still overlaps what it would reach.
+    static Buffer range(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) {
+        const uint64_t begin = offset > UINT64_MAX - reference.offset ? UINT64_MAX : reference.offset + offset;
+        return {reference.identity, reference.resource.value, begin,
+                size > UINT64_MAX - begin ? UINT64_MAX : begin + size};
+    }
+
+    bool operator==(const RecordedWrittenResources &other) const {
+        return buffers == other.buffers && images == other.images;
+    }
+
+    bool overlapsBuffer(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) const {
+        const Buffer view = range(reference, offset, size);
+        return std::any_of(buffers.begin(), buffers.end(), [&](const Buffer &buffer) {
+            return buffer.identity == view.identity && buffer.resource == view.resource && view.begin < buffer.end &&
+                   buffer.begin < view.end;
+        });
+    }
+};
+
+struct RuntimeProgramInstanceState;
+
+struct RuntimeGraphicsRecordingState {
+    VernonRuntimeContext *context{};
+    std::weak_ptr<RuntimeProgramInstanceState> instance;
+    VernonProgramNodeId node{};
+    std::vector<RuntimeRecordedCommand> commands;
+    std::vector<std::shared_ptr<void>> leases;
+    // Cleared by every edit except SetCommand.
+    std::shared_ptr<const RecordedGraphicsPass> validated;
+    // Cleared by every edit. It starts from the invocation's initial dynamic state, so it is valid only for invocations
+    // whose initial state equals `payloadDynamic`.
+    std::shared_ptr<const RecordedDrawPayload> payload;
+    VernonDynamicState payloadDynamic{};
+    // The pass, payload and written resources last found free of hazards.
+    std::shared_ptr<const RecordedGraphicsPass> hazardFreePass;
+    std::shared_ptr<const RecordedDrawPayload> hazardFreePayload;
+    RecordedWrittenResources hazardFreeWritten;
+};
+
+struct VernonGraphicsRecording {
+    std::shared_ptr<RuntimeGraphicsRecordingState> state;
+};
+
+struct RecordedGraphicsNode {
+    std::shared_ptr<const RecordedGraphicsPass> pass;
+    std::shared_ptr<const RecordedDrawPayload> payload;
     VernonProgramGraphicsNodeTelemetry telemetry{};
 };
 
 struct vernon::runtime::RecordedGraphicsPasses {
-    std::map<VernonProgramNodeId, RecordedGraphicsPass> nodes;
+    std::map<VernonProgramNodeId, RecordedGraphicsNode> nodes;
 };
 
 struct RuntimeProgramInstanceState {
@@ -262,6 +349,7 @@ struct RuntimeProgramInstanceState {
     VernonProgramExecutable *pipeline;
     vernon::runtime::program::ProgramInstance bindings;
     vernon::runtime::InstanceGroups groups;
+    vernon::runtime::StoredGraphicsScopes storedGraphics;
     const std::shared_ptr<vernon::runtime::ad::ExecutionWorkspacePool> workspaces;
     // Measured on the instance's last Execute; admission charges the next one with them before it allocates. Before
     // the first Execute one RHI submission is assumed.
@@ -292,7 +380,7 @@ struct VernonProgramInvocation {
     std::optional<uint64_t> checkpointMemoryBudget;
     std::string checkpointPolicy;
     std::shared_ptr<vernon::runtime::ad::CanonicalProgramExecutionWorkspace> executionWorkspace;
-    std::map<VernonProgramNodeId, RuntimeGraphicsRecording> recordings;
+    std::map<VernonProgramNodeId, std::shared_ptr<RuntimeGraphicsRecordingState>> recordings;
     std::map<VernonProgramNodeId, VernonProgramGraphicsNodeTelemetry> graphicsTelemetry;
     vernon::runtime::program_execution::CompletionMode completionMode{
         vernon::runtime::program_execution::CompletionMode::Wait};

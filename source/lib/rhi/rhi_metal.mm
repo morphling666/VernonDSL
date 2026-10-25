@@ -298,7 +298,7 @@ Result<VernonRhiDevice, RhiError> createOwnedDevice(const VernonRhiOwnedDeviceDe
     auto owner = reservation.value().retainOwner();
     if (owner.isErr())
         return Result<VernonRhiDevice, RhiError>{err(std::move(owner).error())};
-    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value(), descriptor->flags);
     if (commandState.isErr())
         return Result<VernonRhiDevice, RhiError>{err(std::move(commandState).error())};
     device.commandState = std::move(commandState).value();
@@ -1759,6 +1759,74 @@ void releasePersistent(VernonRhiDevice handle, uint64_t key) noexcept {
     device.state.releasePersistent(key);
 }
 
+Result<PersistentBlock, RhiError> placeUpdatable(VernonRhiDevice handle, uint64_t size, uint64_t alignment) noexcept {
+    using Placed = Result<PersistentBlock, RhiError>;
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Placed{err(std::move(anchor).error())};
+            MetalDevice &device = anchor.value().device();
+            std::lock_guard<std::mutex> guard(device.mutex);
+            id<MTLBuffer> buffer;
+            size_t offset{};
+            uint64_t key{};
+            if (!device.state.reserveUpdatable(static_cast<size_t>(size), static_cast<size_t>(alignment), buffer,
+                                               offset, key, device.error))
+                return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_metal_updatable", size, 0}})};
+            return Placed{ok(PersistentBlock{
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)buffer)), offset, nullptr, key})};
+        } catch (const std::bad_alloc &) {
+            return Placed{err(RhiError{RhiErrorCode::ResourceExhausted, {"place_metal_updatable", size, 0}})};
+        }
+    } @catch (NSException *) {
+        return Placed{err(RhiError{RhiErrorCode::BackendFailure, {"place_metal_updatable_exception", size, 0}})};
+    }
+}
+
+// A blit from the recording's transient memory; Metal orders it against the encoders that read the block.
+Result<void, RhiError> writeUpdatable(VernonRhiDevice handle, uint64_t, uint64_t native, const PersistentBlock &block,
+                                      const void *data, uint64_t size) noexcept {
+    @try {
+        try {
+            auto anchor = lookupMetalDevice(handle);
+            if (anchor.isErr())
+                return Result<void, RhiError>{err(std::move(anchor).error())};
+            MetalDevice &device = anchor.value().device();
+            std::lock_guard<std::mutex> guard(device.mutex);
+            id<MTLBuffer> staging;
+            size_t offset{};
+            if (!block.buffer || !data ||
+                !device.state.reserveTransient(native, static_cast<size_t>(size), 4, staging, offset, device.error))
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::BackendFailure, {"write_metal_updatable", native, 0}})};
+            std::memcpy(static_cast<uint8_t *>(staging.contents) + offset, data, static_cast<size_t>(size));
+            const vernon::rhi::metal::Buffer source{staging};
+            const vernon::rhi::metal::Buffer destination{
+                (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(block.buffer)))};
+            if (!device.state.copyBuffer(native, source, offset, destination, block.offset, size, device.error))
+                return Result<void, RhiError>{
+                    err(RhiError{RhiErrorCode::BackendFailure, {"write_metal_updatable", native, 0}})};
+            return Result<void, RhiError>{ok()};
+        } catch (const std::bad_alloc &) {
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::ResourceExhausted, {"write_metal_updatable", native, 0}})};
+        }
+    } @catch (NSException *) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::BackendFailure, {"write_metal_updatable_exception", native, 0}})};
+    }
+}
+
+void releaseUpdatable(VernonRhiDevice handle, uint64_t key) noexcept {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return;
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.releaseUpdatable(key);
+}
+
 Result<CommandRecording, RhiError> beginCommands(VernonRhiDevice handle) noexcept {
     @try {
         auto anchor = lookupMetalDevice(handle);
@@ -1889,6 +1957,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         result.reserveTransient.emplace(reserveTransient);
         result.placePersistent.emplace(placePersistent);
         result.releasePersistent.emplace(releasePersistent);
+        result.placeUpdatable.emplace(placeUpdatable);
+        result.writeUpdatable.emplace(writeUpdatable);
+        result.releaseUpdatable.emplace(releaseUpdatable);
         result.beginRendering.emplace(beginRendering);
         result.endRendering.emplace(endRendering);
         result.clearColor.emplace(clearColor);

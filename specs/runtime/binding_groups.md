@@ -186,6 +186,7 @@ lives.
 | Sealed binding set covering one group | persistent | at its first match with a pipeline, per distinct group layout | the set |
 | Program instance values of a Node's group | persistent | when a binding token of one of the group's parameters changes | the instance |
 | Values fixed for one invocation (pass values, resolution after `set_viewport`) | transient | at invocation encode | the command encoder |
+| Values of the keyed Nodes of a stored graphics scope that no binding set owns alone | updatable | when the scope is built; their bytes are written again when a replay changes them | the scope ([`stored_plans.md`](stored_plans.md) section 12) |
 
 - A persistent group retains its resources once, when it is made. Binding it
   retains the group object for the command encoder; the RHI deduplicates per
@@ -316,7 +317,7 @@ provider boundary:
 
 ```c
 vernonRuntimeCorePrepareGroupLayout(provider, descriptor, &group_layout);
-vernonRuntimeCoreCreateGroup(group_layout, values, value_count, lifetime, &group);
+vernonRuntimeCoreCreateGroup(group_layout, values, value_count, lifetime, command_encoder, &group);
 vernonRuntimeCoreBeginCommands(provider, command_encoder, &commands);
 vernonRuntimeCoreBindPipeline(commands, pipeline_or_variant);
 vernonRuntimeCoreBindGroup(commands, index, group);
@@ -326,8 +327,15 @@ vernonRuntimeCoreBeginRendering(commands, rendering);
 vernonRuntimeCoreDraw(commands, draw);
 vernonRuntimeCoreEndRendering(commands);
 vernonRuntimeCoreResumeCommands(commands);
+vernonRuntimeCoreUpdateGroup(commands, group, values, value_count);
 vernonRuntimeCoreEndCommands(commands);
 ```
+
+`UpdateGroup` writes the inline values of an updatable group between
+batches: batches encoded before it read the previous values and batches
+encoded after it, including commands recorded but not yet encoded, the new
+ones. Core checks the lifetime, the provider and the values against the
+group layout.
 
 `ResumeCommands` starts a segment outside a rendering scope after other
 commands were recorded on the native encoder. The bound pipeline, groups
@@ -353,11 +361,14 @@ encode_bind_vertex_buffers(user_data, encoder, first_binding, buffers, count);
 encode_dispatch(user_data, encoder, groups[3]);
 encode_draw(user_data, encoder, draw);
 resume_commands(user_data, encoder);
+update_group(user_data, commands, group, values, count);  /* optional */
 ```
 
-`lifetime` is persistent or transient; a transient group belongs to
-`encoder`, may use encoder-scoped memory, and is released with it. The
-provider skips native calls whose state is already current.
+`lifetime` is persistent, transient or updatable; a transient group belongs
+to `encoder`, may use encoder-scoped memory, and is released with it. An
+updatable group is persistent, and its inline values are undefined until
+`update_group` writes them; only a provider with `update_group` makes one.
+The provider skips native calls whose state is already current.
 
 `resume_commands` reapplies only what the RHI's own commands can change:
 
@@ -426,6 +437,26 @@ uploaded on the stream that its kernels read on; Metal shared-storage
 buffers. Chunks are kept until the device is destroyed, so the pool holds
 the peak number of live blocks of each class.
 
+An updatable group's inline values live in an updatable block
+(`placeUpdatableBlock`), which only `writeUpdatableBlock(device, encoder,
+block, bytes, size)` writes, in the encoder's command order outside
+rendering scopes. Updatable blocks are pooled by size class as persistent
+blocks are:
+
+| Backend | Updatable memory | Write |
+|---|---|---|
+| Vulkan | device-local chunks with transfer-destination, uniform and storage usages | encoder upload staging, a barrier from shader reads to the transfer, `vkCmdCopyBuffer`, a barrier back |
+| D3D12 | default-heap chunks, whose tracked state the write moves to `COPY_DEST` and back | encoder upload staging and `CopyBufferRegion` |
+| Metal | private-storage chunks | encoder transient memory and a blit copy |
+| OpenGL/ES | the persistent blocks' buffers | `glBufferSubData`, which GL orders after earlier reads |
+| CUDA, CPU | none | no `update_group` |
+
+`update_group` also rewrites the values the provider keeps on the CPU:
+OpenGL named uniforms, Vulkan push constants, D3D12 root constants and Metal
+direct values, giving the group a new serial so commands apply them again.
+It leaves `commands` ready for their next batch, as `resume_commands` would
+where its writes change bound state (OpenGL rebinds the array buffer).
+
 | Backend | Group object | `bind group` | Transient memory |
 |---|---|---|---|
 | Vulkan | descriptor set from a pool per group layout | `vkCmdBindDescriptorSets` at set `g` | descriptor pools of the encoder's command frame; RHI transient memory of the encoder |
@@ -439,9 +470,11 @@ On OpenGL, buffer, texture and sampler bindings are context state and
 survive a program switch; `glUniform*` values and vertex-array attributes
 are program and vertex-array state and are reapplied after a pipeline bind
 only where the new pipeline needs them. Fixed-function state is compared with
-the last applied pipeline. `glGetError` is read once per render scope and
-encoder end, which reports the failure for that scope; per-command checks
-remain behind the adapter's debug option.
+the last applied pipeline. On a validation device
+([`hot_path_diagnostics.md`](hot_path_diagnostics.md) section 1)
+`glGetError` is read once per render scope and encoder end, which reports
+the failure for that scope; otherwise a GL error fails the submission's
+completion (section 2 there).
 
 ## 9. Interaction with other contracts
 
