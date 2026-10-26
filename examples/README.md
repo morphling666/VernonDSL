@@ -65,6 +65,24 @@ screenshots fail with a clear error.
 The copyright and permission notices from those MIT licenses must be retained
 when substantial portions of these adapted shaders are redistributed.
 
+## Qwen3 language model
+
+[`qwen3/`](qwen3/) decodes [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
+entirely with VernonDSL compute kernels; only tokenization and sampling run on
+the host. The first run downloads the 1.5 GB checkpoint into
+`~/.cache/vernon_qwen3`. CUDA is the tested backend.
+
+```powershell
+$env:PYTHONPATH = "$PWD/python"
+uv sync --extra examples --extra build --frozen
+uv run --frozen --no-sync python examples/qwen3/generate.py --prompt "Why is the sky blue?"
+uv run --frozen --no-sync python examples/qwen3/generate.py           # interactive chat
+uv run --frozen --no-sync python examples/qwen3/generate.py --check   # compare with NumPy
+```
+
+`--think` enables the model's reasoning block, `--temperature 0` decodes
+greedily, and `--model Qwen/Qwen3-1.7B` selects another Qwen3 dense checkpoint.
+
 ## Advanced compute and PBR examples
 
 `dynamic_ocean.py` and `dynamic_terrain_erosion.py` remain available as larger

@@ -529,6 +529,9 @@ VernonStatus validateGraphicsRecording(VernonProgramExecutable &executable,
                 arguments = std::move(sources);
             }
             pass.draws.push_back({pipeline, arguments});
+            pass.drawCommands.push_back(index);
+            if (command.draw->index)
+                pass.indexBuffers.emplace_back(index, command.draw->index->resource);
             break;
         }
         case VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP:
@@ -584,8 +587,6 @@ buildDrawPayload(const RuntimeGraphicsRecordingState &recording,
                 control->dynamic = dynamic;
                 dynamicControl = std::move(control);
             }
-            if (command.draw->index)
-                payload->indices.emplace_back(index, *command.draw->index);
             payload->draws.push_back(command.draw);
             payload->dynamics.push_back(dynamicControl);
             payload->drawn += command.draw->draw.instance_count != 0;
@@ -597,22 +598,36 @@ buildDrawPayload(const RuntimeGraphicsRecordingState &recording,
     return payload;
 }
 
+// `recording.payload` with the draws of `recording.editedDraws` replaced by their current values.
+std::shared_ptr<const RecordedDrawPayload> patchDrawPayload(const RuntimeGraphicsRecordingState &recording) {
+    auto payload = std::make_shared<RecordedDrawPayload>(*recording.payload);
+    const std::vector<size_t> &drawCommands = recording.validated->drawCommands;
+    for (const size_t command : recording.editedDraws) {
+        const auto draw = std::lower_bound(drawCommands.begin(), drawCommands.end(), command) - drawCommands.begin();
+        std::shared_ptr<const RuntimeProgramControl> &value = payload->draws[static_cast<size_t>(draw)];
+        payload->drawn -= value->draw.instance_count != 0;
+        value = recording.commands[command].draw;
+        payload->drawn += value->draw.instance_count != 0;
+    }
+    return payload;
+}
+
 VernonStatus checkGraphicsHazards(VernonRuntimeContext &context, VernonProgramNodeId node,
-                                  const RecordedGraphicsPass &pass, const RecordedDrawPayload &payload,
-                                  const RecordedWrittenResources &written) {
+                                  const RecordedGraphicsPass &pass, const RecordedWrittenResources &written) {
     for (const auto &[command, set] : pass.sets)
         for (const RuntimeBindingSetEntry &binding : set->entries) {
             const std::optional<bool> isWritten = argumentIsWritten(context, binding.binding->argument, written);
+            if (isWritten == false)
+                continue;
             const std::string path = commandPath(node, command) + "." + binding.boundary->path;
             if (!isWritten)
                 return failDiagnostic(&context, {recorded::kRecordingInvalid, recorded::kInvocationEntryPhase, path,
                                                  "cannot describe the bound image"});
-            if (*isWritten)
-                return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase, path,
-                                                 "resource is written by a Node of the same invocation"});
+            return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase, path,
+                                             "resource is written by a Node of the same invocation"});
         }
-    for (const auto &[command, index] : payload.indices)
-        if (written.overlapsBuffer(index.resource, 0, index.resource.size))
+    for (const auto &[command, resource] : pass.indexBuffers)
+        if (written.overlapsBuffer(resource, 0, resource.size))
             return failDiagnostic(&context, {recorded::kBindingSetHazard, recorded::kInvocationEntryPhase,
                                              commandPath(node, command) + ".index",
                                              "index buffer is written by a Node of the same invocation"});
@@ -651,16 +666,16 @@ VernonStatus vernon::runtime::capi::validateGraphicsRecordings(VernonProgramInvo
         if (!recording->payload || !sameDynamicState(recording->payloadDynamic, dynamic)) {
             recording->payload = buildDrawPayload(*recording, initialDynamic);
             recording->payloadDynamic = dynamic;
+        } else if (!recording->editedDraws.empty()) {
+            recording->payload = patchDrawPayload(*recording);
         }
+        recording->editedDraws.clear();
         if ((!written.buffers.empty() || !written.images.empty()) &&
-            (recording->hazardFreePass != recording->validated || recording->hazardFreePayload != recording->payload ||
-             !(recording->hazardFreeWritten == written))) {
-            if (const VernonStatus status =
-                    checkGraphicsHazards(context, node, *recording->validated, *recording->payload, written);
+            (recording->hazardFreePass != recording->validated || !(recording->hazardFreeWritten == written))) {
+            if (const VernonStatus status = checkGraphicsHazards(context, node, *recording->validated, written);
                 status != VERNON_STATUS_OK)
                 return status;
             recording->hazardFreePass = recording->validated;
-            recording->hazardFreePayload = recording->payload;
             recording->hazardFreeWritten = written;
         }
         VernonProgramGraphicsNodeTelemetry telemetry = recording->validated->telemetry;
@@ -844,6 +859,7 @@ VernonStatus vernonRuntimeGraphicsRecordingReset(VernonGraphicsRecording *record
         state.leases.clear();
         state.validated.reset();
         state.payload.reset();
+        state.editedDraws.clear();
         return VERNON_STATUS_OK;
     });
 }
@@ -880,7 +896,13 @@ VernonStatus vernonRuntimeGraphicsRecordingSetCommand(VernonGraphicsRecording *r
                 return fail(context, path + " cannot change whether it is indexed or its index buffer");
         }
         target = std::move(replacement);
-        recording->state->payload.reset();
+        RuntimeGraphicsRecordingState &state = *recording->state;
+        if (target.kind != VERNON_GRAPHICS_COMMAND_DRAW) {
+            state.payload.reset();
+            state.editedDraws.clear();
+        } else if (state.payload) {
+            state.editedDraws.push_back(index);
+        }
         return VERNON_STATUS_OK;
     });
 }
@@ -935,6 +957,7 @@ VernonStatus vernonRuntimeGraphicsRecordingAppend(VernonGraphicsRecording *recor
                             std::make_move_iterator(appendedLeases.end()));
         state.validated.reset();
         state.payload.reset();
+        state.editedDraws.clear();
         return VERNON_STATUS_OK;
     });
 }

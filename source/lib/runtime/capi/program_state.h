@@ -229,31 +229,32 @@ struct RecordedDebugCommand {
 struct RecordedGraphicsPass {
     std::vector<RecordedSetFrame> frames;
     std::vector<RecordedDraw> draws;
+    // The command of each draw.
+    std::vector<size_t> drawCommands;
     // Balanced and in recording order.
     std::vector<RecordedDebugCommand> debugCommands;
     // What each Execute checks against the resources its Nodes write: each distinct set with the first command that
     // binds it.
     std::vector<std::pair<size_t, std::shared_ptr<RuntimeBindingSetState>>> sets;
+    // Each indexed draw's index buffer with its command; SetCommand cannot change it.
+    std::vector<std::pair<size_t, VernonRuntimeProviderResourceReference>> indexBuffers;
     std::vector<std::shared_ptr<void>> leases;
     // Every count except `render_scopes`, which Execute reports.
     VernonProgramGraphicsNodeTelemetry telemetry{};
 };
 
-// The values of the draws of a validated recording, index-aligned with RecordedGraphicsPass::draws. Immutable like
-// the pass; SetCommand replaces it without replacing the pass.
 inline bool sameDynamicState(const VernonDynamicState &left, const VernonDynamicState &right) {
     return std::equal(std::begin(left.viewport), std::end(left.viewport), std::begin(right.viewport)) &&
            std::equal(std::begin(left.scissor), std::end(left.scissor), std::begin(right.scissor)) &&
            left.stencil_reference == right.stencil_reference;
 }
 
+// The values of the draws of a validated recording, index-aligned with RecordedGraphicsPass::draws. Immutable like
+// the pass; SetCommand replaces it without replacing the pass.
 struct RecordedDrawPayload {
     std::vector<std::shared_ptr<const RuntimeProgramControl>> draws;
     // Consecutive draws with no dynamic-state command between them share one control.
     std::vector<std::shared_ptr<const RuntimeProgramControl>> dynamics;
-    // Each indexed draw's index range with its command, which each Execute checks against the resources its Nodes
-    // write.
-    std::vector<std::pair<size_t, VernonIndexBinding>> indices;
     // The draws of at least one instance.
     uint64_t drawn{};
 };
@@ -303,13 +304,15 @@ struct RuntimeGraphicsRecordingState {
     std::vector<std::shared_ptr<void>> leases;
     // Cleared by every edit except SetCommand.
     std::shared_ptr<const RecordedGraphicsPass> validated;
-    // Cleared by every edit. It starts from the invocation's initial dynamic state, so it is valid only for invocations
-    // whose initial state equals `payloadDynamic`.
+    // Cleared by every edit except SetCommand of a draw, which adds the draw's command to `editedDraws` instead. It
+    // starts from the invocation's initial dynamic state, so it is valid only for invocations whose initial state
+    // equals `payloadDynamic`.
     std::shared_ptr<const RecordedDrawPayload> payload;
     VernonDynamicState payloadDynamic{};
-    // The pass, payload and written resources last found free of hazards.
+    // Commands of the draws replaced since `payload` was built; empty while `payload` is null.
+    std::vector<size_t> editedDraws;
+    // The pass and written resources last found free of hazards. Draw values cannot cause hazards.
     std::shared_ptr<const RecordedGraphicsPass> hazardFreePass;
-    std::shared_ptr<const RecordedDrawPayload> hazardFreePayload;
     RecordedWrittenResources hazardFreeWritten;
 };
 

@@ -245,9 +245,11 @@ Rules:
   Validation runs at invocation entry, linear in the command count, before
   any native command is recorded, and only for a recording edited since its
   last validation or validated against a different initial dynamic state.
-  The hazard rule above depends on what each invocation writes, so every
-  Execute checks it, once per distinct set and index buffer, against the
-  whole index view a draw names. Failure follows the ordinary rollback rules.
+  The hazard rule above depends on what each invocation writes and on the
+  recording's structure, never on its draw values, so an Execute checks it,
+  once per distinct set and index buffer against the whole index view a draw
+  names, only when the structure or the written resources differ from the
+  last check that passed. Failure follows the ordinary rollback rules.
 - `SetCommand` replaces a viewport, scissor, stencil reference or draw with
   one of the same kind; a draw keeps whether it is indexed and its index
   buffer. Structure changes go through `Reset` and `Append`.
@@ -259,7 +261,11 @@ Rules:
   ([`../runtime/stored_plans.md`](../runtime/stored_plans.md) section 12,
   draw values).
   Per-frame culling and dynamic state therefore cost no revalidation and no
-  re-recording of native commands.
+  re-recording of native commands. The next Execute copies the draw values
+  once and replaces those of the draws `SetCommand` replaced, instead of
+  collecting them from every command; a replaced viewport, scissor or stencil
+  reference changes the dynamic state of the draws after it, so it collects
+  them again.
 - Editing a recording never waits for submissions that drew it: each
   submission keeps the validated commands and leases it drew until it
   completes. Edits are externally synchronized with Executes of invocations

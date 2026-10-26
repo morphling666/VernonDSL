@@ -391,6 +391,14 @@ struct StoredGraphicsDraw {
     size_t payloadWord{SIZE_MAX};
 };
 
+// The draw values a match of a stored Node last planned, and by draw the payload of each of their draws whose values
+// differ from the stored ones. Planning reads only the stored Node and the values, so a later match reuses it for the
+// draws whose values it still has, whether or not the replay that planned it was encoded.
+struct MatchedDrawValues {
+    std::shared_ptr<const RecordedDrawPayload> values;
+    std::vector<std::pair<size_t, VernonRuntimeProviderDrawPayload>> draws;
+};
+
 // What a stored Node shows the Nodes after it: what fusing decides on, and the buffers its draws read.
 struct StoredGraphicsMember {
     // A copy of the Node's render pass without its leases, which `targets` point into.
@@ -401,6 +409,8 @@ struct StoredGraphicsMember {
     // The draw values of a recorded Node as stored, and its draws.
     std::shared_ptr<const RecordedDrawPayload> payload;
     std::vector<StoredGraphicsDraw> draws;
+    // Read and replaced only with std::atomic_load and std::atomic_store: concurrent invocations match the same scope.
+    mutable std::shared_ptr<const MatchedDrawValues> matched;
 };
 
 } // namespace
@@ -448,20 +458,45 @@ struct GraphicsMemberInputs {
 };
 
 // Whether the draw values of `member` replay `stored`: each draw whose values differ from the stored ones, planned
-// with them, keeps what the stored commands depend on, its payload then going to `payload`.
+// with them, keeps what the stored commands depend on, its payload then going to `payload`. Only the draws whose values
+// also differ from those of the last match are planned.
 bool replaysDrawValues(const StoredGraphicsMember &stored, const GraphicsMemberInputs &member,
                        std::vector<std::pair<size_t, VernonRuntimeProviderDrawPayload>> &payload) {
     payload.clear();
-    const RecordedDrawPayload *values = member.recorded ? member.recorded->payload.get() : nullptr;
-    if (!values || values == stored.payload.get())
+    const std::shared_ptr<const RecordedDrawPayload> values =
+        member.recorded ? member.recorded->payload : std::shared_ptr<const RecordedDrawPayload>();
+    if (!values || values == stored.payload)
         return true;
     if (values->draws.size() != stored.draws.size())
         return false;
+    const auto sameValues = [&](const RecordedDrawPayload &other, size_t index) {
+        return values->draws[index] == other.draws[index] &&
+               sameDynamicState(values->dynamics[index]->dynamic, other.dynamics[index]->dynamic);
+    };
+    const auto toPayload = [&](const MatchedDrawValues &matched) {
+        for (const auto &[index, words] : matched.draws)
+            payload.emplace_back(stored.draws[index].payloadWord, words);
+    };
+    const std::shared_ptr<const MatchedDrawValues> last = std::atomic_load(&stored.matched);
+    if (last && last->values == values) {
+        toPayload(*last);
+        return true;
+    }
+    auto matched = std::make_shared<MatchedDrawValues>();
+    matched->values = values;
+    size_t reused = 0;
     std::string error;
     for (size_t index = 0; index < stored.draws.size(); ++index) {
-        if (values->draws[index] == stored.payload->draws[index] &&
-            sameDynamicState(values->dynamics[index]->dynamic, stored.payload->dynamics[index]->dynamic))
+        if (sameValues(*stored.payload, index))
             continue;
+        if (last) {
+            while (reused < last->draws.size() && last->draws[reused].first < index)
+                ++reused;
+            if (reused < last->draws.size() && last->draws[reused].first == index && sameValues(*last->values, index)) {
+                matched->draws.push_back(last->draws[reused]);
+                continue;
+            }
+        }
         const StoredGraphicsDraw &draw = stored.draws[index];
         PlannedGraphicsDraw planned;
         VernonRuntimeCoreDrawInvocation invocation;
@@ -471,12 +506,12 @@ bool replaysDrawValues(const StoredGraphicsMember &stored, const GraphicsMemberI
                                     &values->dynamics[index]->dynamic, values->draws[index]->draw, planned, error) ||
             planned.resolution != draw.resolution ||
             !prepareGraphicsDrawInvocation(planned, draw.topology, invocation, error) ||
-            vernonRuntimeCoreDrawPayload(&invocation, &words) != VERNON_STATUS_OK) {
-            payload.clear();
+            vernonRuntimeCoreDrawPayload(&invocation, &words) != VERNON_STATUS_OK)
             return false;
-        }
-        payload.emplace_back(draw.payloadWord, words);
+        matched->draws.emplace_back(index, words);
     }
+    toPayload(*matched);
+    std::atomic_store(&stored.matched, std::shared_ptr<const MatchedDrawValues>(std::move(matched)));
     return true;
 }
 

@@ -438,11 +438,14 @@ read is its whole index view, which `SetCommand` cannot change. Culling by
 instance count, as a moving view does every frame, thus replays the stored
 scope.
 
-Planning is against the values the scope was built with, so a draw that
-differs from them is planned again in every replay until the scope is
-rebuilt. Diffing against the last replayed values instead would need
-per-scope mutable state shared by concurrent invocations; it becomes worth
-it if planning shows up in replays.
+Each stored member also keeps the values it last matched and the words
+planned for their draws that differ from the stored ones, so a match plans
+only the draws whose values differ from both; matching the same values
+again plans nothing. Planning reads only the stored member and the values,
+so what a match planned stays right whether or not its replay was encoded,
+and concurrent invocations replace it atomically. Without it, a draw culled
+since the scope was built was planned again in every replay; for 1000
+orbiting boxes matching fell from 4.4% to 1.7% of the main thread.
 
 **Argument arena.** The arena is a scope's own groups: every group of a
 keyed member that no binding set owns alone belongs to the scope, made

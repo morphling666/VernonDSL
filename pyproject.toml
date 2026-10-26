@@ -33,6 +33,7 @@ Documentation = "https://github.com/morphling666/VernonDSL/tree/master/specs"
 [project.optional-dependencies]
 examples = [
     "opencv-python>=4.11",
+    "tokenizers>=0.21",
 ]
 build = [
     "nanobind>=2.7.0",
