@@ -494,6 +494,27 @@ TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDrawsMatchSequentialInvocations) {
     vernonRuntimeGraphicsPipelineDestroy(pipeline);
 }
 
+TEST_P(RuntimeRecordedGraphicsMatrix, VerticesBoundAtAnOffsetReadFromIt) {
+    const std::vector<uint8_t> reference = leftReference();
+    std::array<float, kRightTriangle.size() + kLeftTriangle.size()> both{};
+    std::copy(kRightTriangle.begin(), kRightTriangle.end(), both.begin());
+    std::copy(kLeftTriangle.begin(), kLeftTriangle.end(), both.begin() + kRightTriangle.size());
+    RhiBuffer buffer =
+        vernon::tests::createBuffer(runtime(), sizeof(both), alignof(float), VERNON_RHI_BUFFER_VERTEX, both.data());
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    {
+        // The offset equals the bytes left after it, so a reference size taken as an end would hold no vertices.
+        Target target(runtime());
+        PassInvocation pass(
+            executable_, instance_, target,
+            {verticesArgument(findParameter(executable_, "vertices"), buffer.reference, sizeof(kRightTriangle))},
+            VERNON_RUNTIME_PROVIDER_LOAD_CLEAR, false);
+        ASSERT_EQ(pass.run(), VERNON_STATUS_OK) << lastError(runtime().runtime);
+        EXPECT_EQ(target.pixels(), reference);
+    }
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime().device, buffer.handle), VERNON_RHI_STATUS_OK);
+}
+
 TEST_P(RuntimeRecordedGraphicsMatrix, RecordedDrawsIntoAnAcquiredSurfaceImageMatchAnOrdinaryImage) {
     std::optional<VernonOpenGLSurfaceCallbacks> window = openglSurface();
     if (!window)

@@ -128,7 +128,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Hugging Face repository of a Qwen3 checkpoint")
     parser.add_argument("--model-dir", type=Path, help="checkpoint directory; downloaded into ~/.cache by default")
-    parser.add_argument("--arch", choices=("cuda", "vulkan", "directx", "cpu"), default="cuda")
+    parser.add_argument("--arch", choices=("cuda", "vulkan", "directx", "opengl", "opengles", "cpu"), default="cuda")
     parser.add_argument("--prompt", help="answer one prompt and exit; chat interactively without one")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--context", type=int, default=2048, help="KV cache capacity in tokens")

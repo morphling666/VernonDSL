@@ -1475,10 +1475,10 @@ struct DirectX12PacketDecoder {
             const VernonRuntimeProviderResourceReference &reference = batch.resources[resources[index]];
             const size_t binding = first + index;
             auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(batch.natives[resources[index]]);
-            if (!buffer || !buffer->resource || reference.size - reference.offset > UINT32_MAX)
+            if (!buffer || !buffer->resource || reference.size > UINT32_MAX)
                 return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "d3d12_vertex_buffer_is_invalid",
                                        binding);
-            commands.vertexBuffers[binding] = {buffer, reference.offset, reference.size - reference.offset};
+            commands.vertexBuffers[binding] = {buffer, reference.offset, reference.size};
             commands.vertexEpochs[binding] = 0;
             commands.vertexViews &= ~(1u << binding);
         }

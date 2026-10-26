@@ -450,11 +450,11 @@ bool planGraphicsDrawValues(const GraphicsVertexRecords &records, const PlannedR
                 return fail(error, "graphics Tensor leading dimensions conflict");
             continue;
         }
-        // A draw of no instances reads no instance records.
+        // A draw of no instances reads no instance records; an instance input may hold more records than a draw reads.
         if (!plan.instanceCount)
             continue;
         const uint64_t requiredRecords = (uint64_t{plan.firstInstance} + plan.instanceCount - 1) / divisor + 1;
-        if (plan.firstInstance ? requiredRecords > leading : requiredRecords != leading)
+        if (requiredRecords > leading)
             return fail(error, "graphics Tensor leading dimensions conflict");
     }
     if (!plan.vertexCount && !draw.index_binding)

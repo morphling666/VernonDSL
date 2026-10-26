@@ -211,7 +211,10 @@ the same validation and the same meaning of 0 counts, so one draw description
 serves both forms: a `vertex_count` of 0 is inferred from the per-vertex
 inputs, and an `instance_count` of 0 draws nothing and reads no instance
 records. A renderer culls a draw by setting its instance count to 0 with
-`SetCommand`, which keeps the recording's structure.
+`SetCommand`, which keeps the recording's structure. An instance input must
+hold at least the records the draw reads and may hold more, so a draw that
+binds a fixed range of instance records changes how many it draws with
+`SetCommand` alone.
 
 Blend constants are absent because no blend factor reads one; they join the
 dynamic state together with constant blend factors.

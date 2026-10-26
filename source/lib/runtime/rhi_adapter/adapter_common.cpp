@@ -727,7 +727,7 @@ RhiAdapterResult<void> buildPacketBatch(VernonRuntimeRhiAdapter &adapter,
     for (size_t index = 0; index < descriptor.resource_count; ++index) {
         const VernonRuntimeProviderResourceReference &resource = descriptor.resources[index];
         if (!used[index] || (resource.identity & kRhiResourceKindMask) != kRhiBufferResource ||
-            ((used[index] & kVertexBufferUse) != 0 && resource.offset >= resource.size))
+            ((used[index] & kVertexBufferUse) != 0 && resource.size == 0))
             return invalidPackets(index);
         auto kind = resourceKind(adapter, resource);
         if (!kind)

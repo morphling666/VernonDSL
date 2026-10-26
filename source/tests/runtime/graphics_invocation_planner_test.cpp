@@ -292,7 +292,7 @@ TEST(GraphicsInvocationPlanner, PlansNonSquareAttributesWithInterleavedRecordPad
     EXPECT_EQ(plan.draw.vertexCount, 5u);
 }
 
-TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsAndReadsNoInstanceRecordsForNoInstances) {
+TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsAndReadsAtMostTheBoundInstanceRecords) {
     PlannedGraphicsInvocation plan;
     std::string error;
     const std::vector<uint64_t> shape{2, 4};
@@ -306,6 +306,9 @@ TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsAndReadsNoInstanceRecords
     ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 5, plan, error))
         << error;
     EXPECT_EQ(plan.draw.instanceCount, 5u);
+    ASSERT_TRUE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 3, plan, error))
+        << error;
+    EXPECT_EQ(plan.draw.instanceCount, 3u);
     EXPECT_FALSE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 7, plan, error));
     EXPECT_EQ(error, "graphics Tensor leading dimensions conflict");
 }
