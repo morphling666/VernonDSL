@@ -1,0 +1,229 @@
+{
+  "environment": {
+    "vernon_dsl_revision": "ecb5a2e-dirty",
+    "arch": "cuda",
+    "command": "python.exe examples\\numba_benchmark\\run.py --arch cuda --numba-fma on --result-json reports\\benchmarks\\numba_comparison_cuda_fma.json",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "logical_cpus": 32,
+    "threads": 32,
+    "python": "3.11.9",
+    "numpy": "1.26.4",
+    "numba": "0.68.1",
+    "llvmlite": "0.50.0",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_driver": "610.88",
+    "gpu_driver_model": "WDDM",
+    "numba_cuda": "0.30.4",
+    "numba_fma": "on"
+  },
+  "samples": [
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 0.24189997930079699,
+      "min_ms": 0.2383999526500702,
+      "repeats": 10,
+      "first_call_ms": 125.91230007819831,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 5.460549844428897,
+      "min_ms": 5.304899998009205,
+      "repeats": 10,
+      "first_call_ms": 122.97739996574819,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 24.41035001538694,
+      "min_ms": 24.10160005092621,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 94.21685000415891,
+      "min_ms": 93.65070005878806,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 0.02219993621110916,
+      "min_ms": 0.021099811419844627,
+      "repeats": 2000,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 1.3987000565975904,
+      "min_ms": 1.365999924018979,
+      "repeats": 2000,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 1.1576000833883882,
+      "min_ms": 1.155999954789877,
+      "repeats": 10,
+      "first_call_ms": 267.293700017035,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 4.575499915517867,
+      "min_ms": 4.542300011962652,
+      "repeats": 10,
+      "first_call_ms": 81.16529998369515,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 1.3446001103147864,
+      "min_ms": 1.3417999725788832,
+      "repeats": 10,
+      "first_call_ms": 498.86469985358417,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 23.566749994643033,
+      "min_ms": 23.154699942097068,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 60.0024500163272,
+      "min_ms": 58.72619990259409,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 13.447050005197525,
+      "min_ms": 13.327799970284104,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "host_lattice_hashing",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 8.806300000287592,
+      "min_ms": 8.30129999667406,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 8.787349914200604,
+      "min_ms": 8.765000151470304,
+      "repeats": 10,
+      "first_call_ms": 136.4909999538213,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 15.549249947071075,
+      "min_ms": 15.484000090509653,
+      "repeats": 10,
+      "first_call_ms": 97.02380001544952,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 25.992400012910366,
+      "min_ms": 25.304000126197934,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 78.64209997933358,
+      "min_ms": 78.35069997236133,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    }
+  ],
+  "checks": [
+    {
+      "workload": "axpy",
+      "identical": false,
+      "max_abs_difference": 4.440892098500626e-16,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "relief",
+      "identical": false,
+      "max_abs_difference": 4.440892098500626e-15,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "nearest_segment",
+      "identical": false,
+      "max_abs_difference": 7.105427357601002e-15,
+      "reference_max_abs_difference": 0.0
+    }
+  ]
+}

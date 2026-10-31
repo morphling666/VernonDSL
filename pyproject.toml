@@ -32,6 +32,8 @@ Documentation = "https://github.com/morphling666/VernonDSL/tree/master/specs"
 
 [project.optional-dependencies]
 examples = [
+    "numba>=0.61; python_version < '3.14'",
+    "numba-cuda[cu12]>=0.20; python_version < '3.14' and sys_platform != 'darwin'",
     "opencv-python>=4.11",
     "tokenizers>=0.21",
 ]

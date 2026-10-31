@@ -83,6 +83,39 @@ uv run --frozen --no-sync python examples/qwen3/generate.py --check   # compare 
 `--think` enables the model's reasoning block, `--temperature 0` decodes
 greedily, and `--model Qwen/Qwen3-1.7B` selects another Qwen3 dense checkpoint.
 
+## numba comparison
+
+[`numba_benchmark/`](numba_benchmark/) times VernonDSL kernels against numba,
+on CPU or CUDA, on workloads taken from procedural terrain: a memory-bound
+`axpy`, the fixed cost of a one-workgroup launch, table-driven value noise, and
+a bucketed nearest-segment search. Each workload is written once per side
+(`dsl_kernels.py` against `numba_kernels.py`, or `numba_cuda_kernels.py` for
+CUDA) with the same arithmetic in the same order. A run fails unless both
+outputs agree with a numpy reference, and it reports whether they agree bit
+for bit.
+
+```powershell
+$env:PYTHONPATH = "$PWD/python"
+uv sync --extra examples --extra build --inexact
+uv run --no-sync python examples/numba_benchmark/run.py --result-json build/numba.json
+uv run --no-sync python examples/numba_benchmark/run.py --threads 1
+uv run --no-sync python examples/numba_benchmark/run.py --numba-cpu generic
+uv run --no-sync python examples/numba_benchmark/run.py --arch cuda
+uv run --no-sync python examples/numba_benchmark/run.py --arch cuda --numba-fma on
+```
+
+On CPU, both libraries get the same thread count from `--threads`. numba runs
+with `fastmath` off, matching VernonDSL's IEEE arithmetic. `--numba-cpu generic`
+puts numba on the generic x86-64 target that VernonDSL's JIT uses, separating
+instruction-set effects from the rest. On CUDA, numba-cuda (from the
+`numba-cuda[cu12]` wheels, no CUDA toolkit needed) also stops fusing
+multiply-adds unless `--numba-fma on`, as VernonDSL does not fuse them.
+`resident` samples reuse allocated inputs and outputs; `roundtrip` samples go
+from numpy arrays to numpy arrays, as a numpy caller pays. Results and their attribution are in
+[`reports/benchmarks/numba_comparison.md`](../reports/benchmarks/numba_comparison.md).
+The language gaps the workloads ran into are in
+[`specs/language/kernel_limitations.md`](../specs/language/kernel_limitations.md).
+
 ## Advanced compute and PBR examples
 
 `dynamic_ocean.py` and `dynamic_terrain_erosion.py` remain available as larger

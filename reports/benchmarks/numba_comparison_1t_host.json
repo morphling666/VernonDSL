@@ -1,0 +1,226 @@
+{
+  "environment": {
+    "vernon_dsl_revision": "ecb5a2e-dirty",
+    "arch": "cpu",
+    "command": "python.exe examples\\numba_benchmark\\run.py --threads 1 --repeats 5 --launch-repeats 500 --result-json reports\\benchmarks\\numba_comparison_1t_host.json",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "logical_cpus": 32,
+    "threads": 1,
+    "python": "3.11.9",
+    "numpy": "1.26.4",
+    "numba": "0.68.1",
+    "llvmlite": "0.50.0",
+    "numba_cpu": "host",
+    "numba_threading_layer": "omp"
+  },
+  "samples": [
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 7.112500024959445,
+      "min_ms": 6.985099986195564,
+      "repeats": 5,
+      "first_call_ms": 261.7528000846505,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 44.88230007700622,
+      "min_ms": 44.512500055134296,
+      "repeats": 5,
+      "first_call_ms": 113.77639998681843,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 10.262500029057264,
+      "min_ms": 10.204999940469861,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 72.967299958691,
+      "min_ms": 71.90570002421737,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 0.000600004568696022,
+      "min_ms": 0.0004998873919248581,
+      "repeats": 500,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 0.5912999622523785,
+      "min_ms": 0.5767999682575464,
+      "repeats": 500,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 28.244900051504374,
+      "min_ms": 28.233699966222048,
+      "repeats": 5,
+      "first_call_ms": 541.9934999663383,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 325.59859985485673,
+      "min_ms": 325.48170001246035,
+      "repeats": 5,
+      "first_call_ms": 391.2400999106467,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 14.19110014103353,
+      "min_ms": 14.150300063192844,
+      "repeats": 5,
+      "first_call_ms": 1082.7143001370132,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 41.954300133511424,
+      "min_ms": 40.2189998421818,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 350.5916998255998,
+      "min_ms": 350.3964999690652,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 15.824100002646446,
+      "min_ms": 15.718300128355622,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "host_lattice_hashing",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 8.690000046044588,
+      "min_ms": 8.434199960902333,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 399.924400029704,
+      "min_ms": 399.80989997275174,
+      "repeats": 5,
+      "first_call_ms": 787.4848998617381,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 777.8002000413835,
+      "min_ms": 777.4523999541998,
+      "repeats": 5,
+      "first_call_ms": 846.905600046739,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 399.7599999420345,
+      "min_ms": 399.71640007570386,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 798.3422998804599,
+      "min_ms": 796.5467998292297,
+      "repeats": 5,
+      "first_call_ms": null,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    }
+  ],
+  "checks": [
+    {
+      "workload": "axpy",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "relief",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "nearest_segment",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    }
+  ]
+}
