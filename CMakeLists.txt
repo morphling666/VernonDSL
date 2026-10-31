@@ -65,6 +65,13 @@ if(VERNON_ENABLE_SANITIZERS)
     endif()
 endif()
 
+# Release also emits PDBs so profilers and crash dumps resolve symbols. /DEBUG turns off unreferenced-code removal and
+# identical-code folding, which /OPT:REF and /OPT:ICF restore.
+if(MSVC)
+    add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Zi>")
+    add_link_options("$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
+endif()
+
 set(VERNON_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
 include(cmake/VernonPythonEnvironment.cmake)

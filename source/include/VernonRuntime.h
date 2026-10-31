@@ -134,6 +134,137 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntries(const Ver
                                                                        size_t count);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterStaticCpuEntries(const VernonStaticCpuEntry *entries,
                                                                          size_t count);
+/*
+ * Host modules (`vernon_host/reflect.h` tables) cooked as Program assets. A cooked
+ * object registers its table under the asset id from a static constructor and
+ * unregisters it from its static destructor; Python mode registers the table it
+ * builds the same way, so applications find a module by id in both modes.
+ * Registrations are reference counted per id and table. A lookup returns the
+ * newest live registration of the id, so a Python-mode or reloaded table shadows
+ * the linked one until it is unregistered. Returns null for an unknown id.
+ */
+typedef struct VernonStaticHostModule {
+    VernonStringView id;
+    const struct VhModule *module;
+} VernonStaticHostModule;
+
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticHostModule(const VernonStaticHostModule *module);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterStaticHostModule(const VernonStaticHostModule *module);
+VERNON_RUNTIME_CAPI const struct VhModule *vernonRuntimeFindHostModule(VernonStringView id);
+/*
+ * The container runtime of Host code (`vernon_host/reflect.h` VhList and
+ * VhAllocator), which compiled Host objects and Python mode both call. A null
+ * allocator is the default one, over malloc. Reserve grows `list` to hold at
+ * least `capacity` elements, at least doubling, and keeps its elements; it
+ * returns 0, or the Host OUT_OF_MEMORY status (-4) and leaves `list` unchanged.
+ * Release returns the list's memory and zeroes it.
+ */
+struct VhList;
+struct VhDict;
+struct VhAllocator;
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostListReserve(struct VhList *list, uint64_t capacity, uint64_t element_size,
+                                                         uint64_t alignment, const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI void vernonRuntimeHostListRelease(struct VhList *list, uint64_t element_size, uint64_t alignment,
+                                                      const struct VhAllocator *allocator);
+/*
+ * A `dict[K, V]` is a `vernon_host/reflect.h` VhDict. Its entries are
+ * `{uint64_t hash; K key; V value;}` under C layout rules, which this record
+ * describes. A key passed in points at the key's bytes, or for a str key at
+ * `{uint64_t data; uint64_t size}`, the prefix of a VhList; an entry holds a str
+ * key as a VhList the dict owns.
+ */
+typedef enum VernonHostDictKeyKind {
+    VERNON_HOST_DICT_KEY_BYTES = 0,
+    VERNON_HOST_DICT_KEY_STR = 1
+} VernonHostDictKeyKind;
+
+typedef struct VernonHostDictLayout {
+    uint64_t entry_size;
+    uint64_t entry_alignment;
+    uint64_t key_offset;
+    uint64_t key_size;
+    uint64_t value_offset;
+    /* A VernonHostDictKeyKind. */
+    uint64_t key_kind;
+} VernonHostDictLayout;
+
+/*
+ * Find returns the index of the entry holding `key`, or -1. Insert finds or
+ * appends it, a new entry's value zeroed, and writes its index to `*entry`; it
+ * returns 0 or OUT_OF_MEMORY (-4), leaving the dict's contents unchanged.
+ * Remove returns 1 when it removed `key`, 0 when the dict has none. Entry
+ * indices are stable until an insert of a new key grows or compacts the dict.
+ * Clear removes every entry and keeps the memory; Release returns it all and
+ * zeroes the record.
+ */
+VERNON_RUNTIME_CAPI int64_t vernonRuntimeHostDictFind(const struct VhDict *dict, const void *key,
+                                                      const VernonHostDictLayout *layout);
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostDictInsert(struct VhDict *dict, const void *key,
+                                                        const VernonHostDictLayout *layout,
+                                                        const struct VhAllocator *allocator, uint64_t *entry);
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostDictRemove(struct VhDict *dict, const void *key,
+                                                        const VernonHostDictLayout *layout,
+                                                        const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI void vernonRuntimeHostDictClear(struct VhDict *dict, const VernonHostDictLayout *layout,
+                                                    const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI void vernonRuntimeHostDictRelease(struct VhDict *dict, const VernonHostDictLayout *layout,
+                                                      const struct VhAllocator *allocator);
+/*
+ * A replacement field's format spec in a Host f-string,
+ * `[[fill]align][sign][width][.precision][type]`, parsed by the compiler,
+ * which also turns a `0` before the width into fill '0' and align '='. Every
+ * member zero means no spec.
+ */
+typedef struct VernonHostFormatSpec {
+    /* A code point; 0 is a space. */
+    uint32_t fill;
+    /* 0 for the value's default (left for text, right for numbers), or '<', '>', '^', '='. */
+    uint8_t align;
+    /* 0 or '-' for a sign on negatives only, '+', or ' '. */
+    uint8_t sign;
+    /* 0, 'd', 'x', 'X', 'o' or 'b' for integers; 0, 'f', 'e' or 'E' for floats. */
+    uint8_t type;
+    uint8_t reserved;
+    /* The minimum width in code points. */
+    uint32_t width;
+    /* Digits after the point for 'f', 'e' and 'E', at most 64; -1 for the default of 6. */
+    int32_t precision;
+} VernonHostFormatSpec;
+
+/*
+ * Append text to a `str` record, formatted as Python's format() formats the
+ * value under `spec` (NULL for none): a str's UTF-8 bytes; an integer's
+ * two's-complement bits, signed or not; a float as Python's float, whose repr
+ * (no type) is the shortest text that reads back as the same double. Text may
+ * lie in `str` itself. They return 0, or OUT_OF_MEMORY (-4) and leave `str`
+ * unchanged.
+ */
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostStrAppend(struct VhList *str, const char *data, uint64_t size,
+                                                       const VernonHostFormatSpec *spec,
+                                                       const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostStrAppendInteger(struct VhList *str, uint64_t bits, int32_t is_signed,
+                                                              const VernonHostFormatSpec *spec,
+                                                              const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostStrAppendFloat(struct VhList *str, double value,
+                                                            const VernonHostFormatSpec *spec,
+                                                            const struct VhAllocator *allocator);
+
+/*
+ * Host TensorStorage records (`vernon_host/reflect.h` VhStorage): `{uint64_t data; uint64_t shape[rank]}`, dense
+ * row-major elements of `element_size` bytes. Allocate fills an empty record with zeroed elements of `shape`; it
+ * returns 0, the Host INVALID_SHAPE status (-7) for a negative extent or a rank above
+ * VERNON_HOST_STORAGE_MAX_RANK, or OUT_OF_MEMORY (-4), and leaves the record unchanged on failure. A storage of
+ * no elements holds no memory. Release returns the memory and zeroes the record. Fill copies `value`, one element,
+ * into every element.
+ */
+#define VERNON_HOST_STORAGE_MAX_RANK 8
+VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostStorageAllocate(void *storage, uint32_t rank, const int64_t *shape,
+                                                             uint64_t element_size, uint64_t alignment,
+                                                             const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI void vernonRuntimeHostStorageRelease(void *storage, uint32_t rank, uint64_t element_size,
+                                                         uint64_t alignment, const struct VhAllocator *allocator);
+VERNON_RUNTIME_CAPI void vernonRuntimeHostStorageFill(void *storage, uint32_t rank, const void *value,
+                                                      uint64_t element_size);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,
                                                                VernonCpuEntryPoint entry_point);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,

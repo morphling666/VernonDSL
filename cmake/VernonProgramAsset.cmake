@@ -10,11 +10,17 @@ include_guard(GLOBAL)
 # cooker itself changes.
 #
 # vernon_add_program_asset(<name> SOURCE <file.py:declaration> TARGET <cooker target> OUTPUT_DIRECTORY <dir>
-# [COOK_OPTIONS <cooker arguments>...] [PYTHON_PATH <dirs>...] [DEPENDS <files>...] [MANIFEST_VARIABLE <variable>])
+# [COOK_OPTIONS <cooker arguments>...] [PYTHON_PATH <dirs>...] [DEPENDS <files>...] [MANIFEST_VARIABLE <variable>]
+# [HEADER_VARIABLE <variable>])
 #
 # Cooks into OUTPUT_DIRECTORY, which then holds <directory name>.program.json and its artifacts, and creates the
 # INTERFACE library <name>. Linking <name> orders the consumer after the cook; for a CPU Program it also links the
 # cooked objects, which register their entries from static constructors.
+#
+# A Host module asset (vd.program_asset(program=<imported @vd.host module>)) cooks for TARGET cpu. Its object registers
+# the module's reflection table under the asset id, and OUTPUT_DIRECTORY also holds <directory name>.h, which CPU
+# assets' consumers can include: <name> adds OUTPUT_DIRECTORY and the directory of vernon_host/reflect.h to their
+# include path. HEADER_VARIABLE receives the header's path.
 
 if(EMSCRIPTEN AND NOT DEFINED CMAKE_LINK_LIBRARY_USING_WHOLE_ARCHIVE)
     set(CMAKE_LINK_LIBRARY_USING_WHOLE_ARCHIVE
@@ -40,11 +46,50 @@ function(vernon_configure_program_cooker)
     set_property(GLOBAL PROPERTY VERNON_PROGRAM_COOK_DEPENDS "${COOKER_DEPENDS}")
 endfunction()
 
+# The directory of vernon_host/reflect.h: beside this file in a checkout or an installed wheel, else as the cooker's
+# vernon_dsl reports it.
+function(
+    _vernon_host_include_dir
+    python
+    environment
+    result)
+    foreach(candidate "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../python/vernon_dsl/hostlang/include"
+                      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../hostlang/include")
+        if(EXISTS "${candidate}/vernon_host/reflect.h")
+            get_filename_component(candidate "${candidate}" ABSOLUTE)
+            set(${result}
+                "${candidate}"
+                PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    string(
+        REPLACE "$<SEMICOLON>"
+                ";"
+                configure_environment
+                "${environment}")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env "${configure_environment}" "${python}" -m vernon_dsl.hostlang include-dir
+        OUTPUT_VARIABLE include_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE status)
+    if(NOT
+       status
+       EQUAL
+       0
+       OR NOT EXISTS "${include_dir}/vernon_host/reflect.h")
+        message(FATAL_ERROR "Cannot find vernon_host/reflect.h through ${python}")
+    endif()
+    set(${result}
+        "${include_dir}"
+        PARENT_SCOPE)
+endfunction()
+
 function(vernon_add_program_asset name)
     cmake_parse_arguments(
         ASSET
         ""
-        "SOURCE;TARGET;OUTPUT_DIRECTORY;MANIFEST_VARIABLE"
+        "SOURCE;TARGET;OUTPUT_DIRECTORY;MANIFEST_VARIABLE;HEADER_VARIABLE"
         "COOK_OPTIONS;PYTHON_PATH;DEPENDS"
         ${ARGN})
     if(ASSET_UNPARSED_ARGUMENTS
@@ -136,10 +181,18 @@ function(vernon_add_program_asset name)
         endif()
         # Nothing references the objects' registration constructors, so a plain archive link would drop every member.
         target_link_libraries(${name} INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${archive}>")
+        _vernon_host_include_dir("${python}" "${environment}" host_include_dir)
+        file(MAKE_DIRECTORY "${output_directory}")
+        target_include_directories(${name} INTERFACE "${output_directory}" "${host_include_dir}")
     endif()
     if(ASSET_MANIFEST_VARIABLE)
         set(${ASSET_MANIFEST_VARIABLE}
             "${manifest}"
+            PARENT_SCOPE)
+    endif()
+    if(ASSET_HEADER_VARIABLE)
+        set(${ASSET_HEADER_VARIABLE}
+            "${output_directory}/${output_name}.h"
             PARENT_SCOPE)
     endif()
 endfunction()

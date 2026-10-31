@@ -35,11 +35,15 @@ def cook_program_asset(
     else:
         source, descriptor_name = program_asset_reference(program_asset)
         declaration = load_program_asset_declaration(source, descriptor_name)
+    if isinstance(target, str):
+        target = make_target_options(target)
+    if declaration.is_host:
+        from .host_cooking import cook_host_asset
+
+        return cook_host_asset(declaration, Path(output).resolve(), target or make_target_options("cpu"))
     captured = capture_program(declaration)
     if target is None:
         target = OpenGLTargetOptions()
-    elif isinstance(target, str):
-        target = make_target_options(target)
 
     _validate_captured_target(captured, target)
     plan = compile_captured_program(captured, target)

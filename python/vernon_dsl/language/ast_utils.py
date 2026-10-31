@@ -62,6 +62,21 @@ def subscript_items(node: ast.Subscript) -> list[ast.AST]:
     return list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
 
 
+def tensor_update_parts(node: ast.AST) -> tuple[ast.expr, list[ast.expr], str] | None:
+    """`(v, [i, ...], method)` for a call `v.at[i, ...].method(...)`; None for any other node."""
+
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    subscript = node.func.value
+    if not isinstance(subscript, ast.Subscript):
+        return None
+    at = subscript.value
+    if not isinstance(at, ast.Attribute) or at.attr != "at":
+        return None
+    indices = list(subscript.slice.elts) if isinstance(subscript.slice, ast.Tuple) else [subscript.slice]
+    return at.value, indices, node.func.attr
+
+
 def assigned_names(statements: tuple[ast.stmt, ...] | list[ast.stmt]) -> set[str]:
     """Local names assigned anywhere in the statements, including nested block bodies."""
     names: set[str] = set()

@@ -11,9 +11,9 @@ from . import _formats, ad
 from ._formats import *  # noqa: F403
 from ._texture_format import TextureFormat
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import fragment, func, kernel, params, struct, vertex
+from .decorators import extern, fragment, func, handle, host, kernel, meta, params, struct, vertex
 from .diagnostics import CompileError
-from .host_values import TangentLayout, TangentValue
+from .host_values import TangentLayout, TangentValue, replace
 from .intrinsics import (
     abs,
     acos,
@@ -71,11 +71,13 @@ from .types import (
     f64,
     feature,
     i32,
+    i64,
     read,
     read_write,
     resource,
     specialization,
     u32,
+    u64,
     uniform,
     varying,
     write,
@@ -335,6 +337,7 @@ __all__ = [
     "empty_like",
     "dyn",
     "exp",
+    "extern",
     "f16",
     "f32",
     "f64",
@@ -348,7 +351,11 @@ __all__ = [
     "front_facing",
     "graphics_state",
     "func",
+    "handle",
+    "host",
+    "meta",
     "i32",
+    "i64",
     "instance_id",
     "interop",
     "init",
@@ -379,6 +386,7 @@ __all__ = [
     "resolution",
     "reflect",
     "register_external_opengl_context",
+    "replace",
     "sampler",
     "sin",
     "sqrt",
@@ -392,6 +400,7 @@ __all__ = [
     "triangles",
     "type",
     "u32",
+    "u64",
     "uniform",
     "varying",
     "vertex",

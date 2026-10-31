@@ -892,6 +892,16 @@ divisor's sign. The zero is built by masking the divisor's sign bit, since
 Vulkan and D3D12 compilers may fold `select(c, -0.0, +0.0)` to one constant.
 Float `//` stays unsupported. Division by zero and `SMIN // -1` are undefined.
 
+## Shift semantics
+
+`arith.shli`, `shrui` and `shrsi` are poison for amounts at or past the bit
+width, and the SPIR-V, HLSL and MSL shifts they lower to are undefined or mask
+the amount. The language takes numpy's definition instead, which Python-mode
+Host code already follows. An amount the width or more, or a negative one
+(caught by an unsigned compare), gives 0 for a left or unsigned right shift. A
+signed right shift by such an amount shifts by `width - 1`, which fills with
+the sign. Each shift costs one compare and one select.
+
 No MLIR conversion lowers `floordivsi`/`ceildivsi`/`ceildivui`, so
 `vernon-expand-floor-ceil-division` runs in the CPU, CUDA, and SPIR-V
 pipelines. Float `%` magnitude is the backend's `fmod`. It is exact on CPU and

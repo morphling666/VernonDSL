@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from ..language.scalar_types import SCALAR_TYPES
+from ..language.scalar_types import ALL_SCALAR_TYPES, INTEGER_SCALARS
+
+# The most axes of a Host TensorStorage; VernonRuntime's VERNON_HOST_STORAGE_MAX_RANK.
+HOST_STORAGE_MAX_RANK = 8
+# The elements a Host TensorStorage holds: those a Python `vd.TensorStorage` does, f16 aside, so Python mode runs over
+# the same type.
+HOST_STORAGE_ELEMENTS = frozenset({"bool", "i32", "u32", "f32", "f64"})
 
 
 @dataclass(frozen=True)
@@ -43,7 +49,11 @@ class ConcreteType:
     @property
     def mlir(self) -> str:
         if self.kind == "scalar":
-            return SCALAR_TYPES[self.name].mlir
+            return ALL_SCALAR_TYPES[self.name].mlir
+        if self.kind == "handle":
+            return "i64"
+        if self.kind in {"str", "list", "dict"}:
+            raise ValueError(f"{self.spelling} is a Host type and has no device IR type")
         if self.kind == "index":
             return "index"
         if self.kind == "void":
@@ -97,8 +107,14 @@ class ConcreteType:
             assert isinstance(value, ConcreteType)
             return value.spelling
 
-        if self.kind in {"scalar", "struct"}:
+        if self.kind in {"scalar", "struct", "handle"}:
             return self.name
+        if self.kind == "str":
+            return "str"
+        if self.kind == "list":
+            return f"list[{element_spelling(self.arguments[0])}]"
+        if self.kind == "dict":
+            return f"dict[{element_spelling(self.arguments[0])}, {element_spelling(self.arguments[1])}]"
         if self.kind == "index":
             return "index"
         if self.kind == "void":
@@ -111,6 +127,10 @@ class ConcreteType:
             element, extents, access, _ = self.arguments
             assert isinstance(extents, tuple)
             return f"TensorView[{element_spelling(element)}, {shape(extents)}, {access}]"
+        if self.kind == "storage":
+            element, extents = self.arguments
+            assert isinstance(extents, tuple)
+            return f"TensorStorage[{element_spelling(element)}, {shape(extents)}]"
         if self.kind == "tensor_storage":
             if len(self.arguments) == 1:
                 return f"TensorStorage[{element_spelling(self.arguments[0])}]"
@@ -137,7 +157,7 @@ class ConcreteType:
         if self.kind == "index":
             return True
         if self.kind == "scalar":
-            return self.name in {"i32", "u32"}
+            return self.name in INTEGER_SCALARS
         return self.kind == "tensor" and isinstance(self.arguments[0], ConcreteType) and self.arguments[0].is_integer
 
 
@@ -163,7 +183,7 @@ def is_abi_stable_value(
     active_structs: frozenset[str] = frozenset(),
 ) -> bool:
     """Return whether a type has a finite, deterministic Value ABI."""
-    if value_type.kind == "scalar":
+    if value_type.kind in {"scalar", "handle"}:
         return True
     if value_type.kind == "tensor":
         element = value_type.arguments[0] if value_type.arguments else None

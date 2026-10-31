@@ -49,6 +49,12 @@ Each compiler fact has one owner:
 - [`host_language.md`](host_language.md) — restricted Host language, native
   interop, desktop AOT, and browser WebAssembly. This is a separate track from
   the distributed device optimizer.
+- [`value_updates_and_static_structure.md`](value_updates_and_static_structure.md)
+  — local Value updates, block access, `vd.static` expansion, constant
+  specializations, and their autodiff rules.
+- [`sparse_tensors.md`](sparse_tensors.md) — formats, static-pattern
+  `SparseTensor` Values, runtime-pattern `SparseStorage`/`SparseView`, pattern
+  construction, sparse tangents, and lowering for physics and deep learning.
 
 ## Core vocabulary
 

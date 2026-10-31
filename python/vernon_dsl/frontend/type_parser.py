@@ -6,9 +6,16 @@ from typing import Protocol
 
 from .._formats import TEXTURE_FORMATS_BY_NAME
 from ..language.ast_utils import dotted_name, subscript_items
-from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
+from ..language.scalar_types import HOST_SCALAR_TYPES, SCALAR_ALIASES, SCALAR_TYPES
 from ..types import Interpolation
-from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
+from .model import (
+    HOST_STORAGE_ELEMENTS,
+    HOST_STORAGE_MAX_RANK,
+    ConcreteType,
+    InterfaceMetadata,
+    is_abi_stable_value,
+    semantic_category,
+)
 from .texture_dimensions import STORAGE_TEXTURE_DIMENSIONS, TEXTURE_DIMENSIONS, dimension_list
 
 
@@ -25,8 +32,10 @@ class AnnotatedType:
 
 
 class TypeParser:
-    def __init__(self, context: TypeContext):
+    def __init__(self, context: TypeContext, *, host: bool = False):
         self.context = context
+        # Host parsing also names opaque handles, 64-bit integers, str, and list; device code rejects all three.
+        self.host = host
 
     def parse(self, node: ast.AST) -> AnnotatedType:
         if isinstance(node, ast.Constant) and node.value is None:
@@ -46,6 +55,14 @@ class TypeParser:
         type_name = SCALAR_ALIASES.get(type_name, type_name)
         if type_name in SCALAR_TYPES:
             return ConcreteType("scalar", type_name)
+        if type_name in HOST_SCALAR_TYPES or type_name == "str":
+            if not self.host:
+                raise self.context.error(node, f"'{type_name}' is a Host-only type; device code cannot use it")
+            return ConcreteType("scalar", type_name) if type_name != "str" else ConcreteType("str", "str")
+        if type_name in getattr(self.context, "handles", ()):
+            if not self.host:
+                raise self.context.error(node, f"handle '{type_name}' is a Host-only type; device code cannot use it")
+            return ConcreteType("handle", type_name)
         if type_name in self.context.structs:
             return ConcreteType("struct", type_name)
         if type_name == "Sampler":
@@ -55,6 +72,18 @@ class TypeParser:
 
         constructor = (dotted_name(node.value) or "").split(".")[-1]
         items = subscript_items(node)
+        if constructor == "list" and dotted_name(node.value) == "list":
+            if not self.host:
+                raise self.context.error(node, "'list' is a Host-only type; device code cannot use it")
+            if len(items) != 1:
+                raise self.context.error(node, "list takes one element type")
+            return ConcreteType("list", "list", (self.parse_type(items[0]),))
+        if constructor == "dict" and dotted_name(node.value) == "dict":
+            if not self.host:
+                raise self.context.error(node, "'dict' is a Host-only type; device code cannot use it")
+            if len(items) != 2:
+                raise self.context.error(node, "dict takes a key type and a value type")
+            return ConcreteType("dict", "dict", (self.parse_type(items[0]), self.parse_type(items[1])))
         if constructor == "Tensor":
             if len(items) < 2:
                 raise self.context.error(node, "Tensor requires an element type and shape")
@@ -77,6 +106,23 @@ class TypeParser:
             if any(not is_abi_stable_value(element) for element in elements):
                 raise self.context.error(node, "Tuple elements must be ABI-stable Values")
             return ConcreteType("tuple", "Tuple", elements)
+        if constructor == "TensorStorage" and self.host:
+            # A Host storage owns its elements, so it has no access mode; its rank is static and each extent is
+            # a size or dyn.
+            if len(items) != 2 or not isinstance(items[1], ast.Tuple) or not items[1].elts:
+                raise self.context.error(
+                    node, "a Host TensorStorage takes an element type and a shape, as in TensorStorage[f32, (dyn, 4)]"
+                )
+            element = self.parse_type(items[0])
+            if element.kind != "scalar" or element.name not in HOST_STORAGE_ELEMENTS:
+                raise self.context.error(
+                    items[0],
+                    f"Host TensorStorage elements are bool, i32, u32, f32 or f64; {element.spelling} is not one",
+                )
+            if len(items[1].elts) > HOST_STORAGE_MAX_RANK:
+                raise self.context.error(items[1], f"a Host TensorStorage has at most {HOST_STORAGE_MAX_RANK} axes")
+            extents = tuple(self._host_storage_extent(item) for item in items[1].elts)
+            return ConcreteType("storage", "TensorStorage", (element, extents))
         if constructor == "TensorStorage":
             if len(items) not in {1, 3}:
                 raise self.context.error(
@@ -172,6 +218,11 @@ class TypeParser:
         ):
             raise self.context.error(node, f"{description} must be a positive integer literal")
         return node.value
+
+    def _host_storage_extent(self, node: ast.AST) -> int | str:
+        if (dotted_name(node) or "").split(".")[-1] == "dyn":
+            return "?"
+        return self._positive_int(node, "TensorStorage extent")
 
     def _tensor_view_extent(self, node: ast.AST) -> int | str:
         if (dotted_name(node) or "").split(".")[-1] == "dyn":

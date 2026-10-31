@@ -67,6 +67,33 @@ def tensor_operators(
 
 
 @vd.kernel(workgroup_size=(8, 1, 1))
+def bitwise_operators(
+    signed: vd.TensorView[vd.i32, (vd.dyn, 2), vd.read],
+    unsigned: vd.TensorView[vd.u32, (vd.dyn, 2), vd.read],
+    signed_out: vd.TensorView[vd.i32, (vd.dyn, 6), vd.write],
+    unsigned_out: vd.TensorView[vd.u32, (vd.dyn, 4), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    i = gid[0]
+    a = signed[i, 0]
+    b = signed[i, 1]
+    signed_out[i, 0] = a & b
+    signed_out[i, 1] = a | b
+    signed_out[i, 2] = a ^ b
+    signed_out[i, 3] = ~a
+    signed_out[i, 4] = a << b
+    signed_out[i, 5] = a >> b
+    x = unsigned[i, 0]
+    y = unsigned[i, 1]
+    unsigned_out[i, 0] = x << y
+    unsigned_out[i, 1] = x >> y
+    unsigned_out[i, 2] = ~x
+    mixed = x
+    mixed ^= mixed >> 3
+    unsigned_out[i, 3] = mixed
+
+
+@vd.kernel(workgroup_size=(8, 1, 1))
 def vector_while(
     output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     phase: vd.f32,
@@ -718,6 +745,35 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
         vector_while(output, 0.35, grid=(2, 1, 1))
         return output.to_numpy()
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_bitwise_operators_follow_numpy_at_every_shift_amount(self, backend: BackendRow) -> None:
+        # Shift amounts at and past the bit width, and negative ones, are poison in LLVM, SPIR-V and MSL; the
+        # language defines them as numpy does.
+        signed = np.array(
+            [[-8, 2], [1, 31], [5, 32], [-5, 40], [7, -1], [-7, -1], [0x1234, 0], [-1, 1]], dtype=np.int32
+        )
+        unsigned = np.array(
+            [[1, 31], [3, 32], [0x80000000, 31], [0xDEADBEEF, 4], [7, 0xFFFFFFFF], [5, 0], [9, 33], [1, 1]],
+            dtype=np.uint32,
+        )
+        signed_out = vd.storage.zeros(dtype=vd.i32, shape=(8, 6))
+        unsigned_out = vd.storage.zeros(dtype=vd.u32, shape=(8, 4))
+        bitwise_operators(
+            vd.storage.from_numpy(signed),
+            vd.storage.from_numpy(unsigned),
+            signed_out,
+            unsigned_out,
+            grid=(1, 1, 1),
+        )
+        a, b = signed[:, 0], signed[:, 1]
+        x, y = unsigned[:, 0], unsigned[:, 1]
+        np.testing.assert_array_equal(
+            signed_out.to_numpy(), np.stack([a & b, a | b, a ^ b, ~a, a << b, a >> b], axis=1)
+        )
+        np.testing.assert_array_equal(
+            unsigned_out.to_numpy(), np.stack([x << y, x >> y, ~x, x ^ (x >> np.uint32(3))], axis=1)
+        )
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_rank_zero_tensor_view_backend_parity(self, backend: BackendRow) -> None:

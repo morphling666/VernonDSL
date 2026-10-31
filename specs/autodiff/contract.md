@@ -501,7 +501,12 @@ or stale contract version fails before execution.
 Residual decisions are keyed by active Program Value and ABI leaf. A value may
 be rematerialized only when its dependency slice is pure, reconstructible, and
 exact-version safe. Storage reload uses logical resource versions rather than
-current owner identity.
+current owner identity. A recipe is capped at 8 recomputed ops. A dynamic
+index the reverse pass rebuilds gets 32 when it is an `index`: an `index` has
+no Value ABI layout, so it can never be taped, and a wrapped and clamped
+window start would otherwise fail the gradient. Replay legality (whether a
+loop or branch can be reconstructed) keeps the cap of 8, since a larger one
+changes which loops are replayed.
 
 The planner distinguishes:
 

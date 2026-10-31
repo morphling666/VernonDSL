@@ -218,6 +218,57 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         storage._resident_buffer(_context(state))
         self.assertEqual(uploads, [(4, 4), (24, 4)])
 
+    def test_numpy_indexing_reads_device_writes_and_uploads_only_written_elements(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4, 2))
+        uploads: list[tuple[int, int]] = []
+        backing = bytearray(8 * np.dtype(np.float32).itemsize)
+        native_buffer = mock.Mock()
+
+        def upload_ranges(ranges: list[tuple[int, bytes]]) -> None:
+            for offset, data in ranges:
+                uploads.append((offset, len(data)))
+                backing[offset : offset + len(data)] = data
+
+        native_buffer.upload_ranges.side_effect = upload_ranges
+        native_buffer.download_ranges.side_effect = lambda ranges: [
+            (begin, bytes(backing[begin:end])) for begin, end in ranges
+        ]
+        state = mock.Mock()
+        state.rhi_host.create_buffer.return_value = native_buffer
+        state.identity = 7
+
+        storage._resident_buffer(_context(state))
+        uploads.clear()
+        backing[:] = np.arange(8, dtype=np.float32).tobytes()
+        storage._publish_device_write(_context(state), (storage._region,))
+
+        self.assertEqual(storage[3, -1], np.float32(7.0))
+        self.assertIsInstance(storage[3, -1], np.float32)
+        row = storage[1]
+        self.assertIsInstance(row, vd.Tensor)
+        self.assertEqual(row.tolist(), [2.0, 3.0])
+        with self.assertRaises(ValueError):
+            row[0] = 100.0
+        self.assertEqual((row + 1.0).tolist(), [3.0, 4.0])
+        self.assertEqual(storage[1, 0], 2.0, "a selection reads as a Tensor value, a copy")
+        storage[-1, 0] += 10.0
+        storage[0] = [5.0, 6.0]
+        self.assertEqual(len(storage), 4)
+        with self.assertRaises(IndexError):
+            storage[4, 0]
+        storage._resident_buffer(_context(state))
+
+        self.assertEqual(sorted(uploads), [(0, 8), (24, 4)])
+        np.testing.assert_array_equal(storage.to_numpy(), np.array([[5, 6], [2, 3], [4, 5], [16, 7]], dtype=np.float32))
+        uploads.clear()
+        storage[[0, 2], 1] = 1.0
+        storage.fill(0.5)
+        storage._resident_buffer(_context(state))
+        self.assertEqual(uploads, [(0, 32)])
+        np.testing.assert_array_equal(np.frombuffer(bytes(backing), dtype=np.float32), np.full((8,), 0.5))
+        with self.assertRaisesRegex(TypeError, "Struct TensorStorage"):
+            vd.TensorStorage.zeros(dtype=StorageVertex, shape=(2,))[0]
+
     def test_fragmented_view_update_preserves_gpu_written_gaps(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
         backing = bytearray(1024 * np.dtype(np.float32).itemsize)

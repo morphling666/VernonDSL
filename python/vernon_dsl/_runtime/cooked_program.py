@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -269,10 +270,15 @@ def load_program(
     *,
     specializations: Mapping[Specialization, object] | None = None,
 ) -> CookedProgram:
+    manifest_path = Path(manifest).resolve()
+    bundle = manifest_path.read_bytes()
+    if json.loads(bundle).get("type") == "host_module":
+        raise ValueError(
+            f"{manifest_path.name} is a Host module asset: link its object and find its table by id "
+            "(vernonRuntimeFindHostModule), or load it in Python mode with HostModule.from_asset"
+        )
     with _invocation_context():
-        manifest_path = Path(manifest).resolve()
         assignments = specialization_key(specializations)
-        bundle = manifest_path.read_bytes()
         executable = CookedProgram(
             bundle,
             str(manifest_path.parent),

@@ -14,6 +14,7 @@ set(VERNON_COMPILER_ENGINE_SOURCES
     compiler_dispatch.cpp
     compiler_dxc.cpp
     compiler_frontend.cpp
+    compiler_host.cpp
     compiler_internal.cpp
     compiler_json.cpp
     compiler_program_abi.cpp

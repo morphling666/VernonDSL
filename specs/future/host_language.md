@@ -1,6 +1,17 @@
 # Host language and native interop design
 
-Status: future design, not a current VernonDSL contract.
+Status: future design, not a current VernonDSL contract. The implemented
+subset is described in [`../host/design.md`](../host/design.md). Development
+mode there runs the source as ordinary CPython with numpy values rather than
+the interpreter proposed below, accepting documented numeric differences, and
+AOT objects are tested by linking them. There is no JIT. Classes, reflection,
+generic externs, state migration and host-resident TensorStorage containers go
+beyond this plan.
+
+TensorStorage is implemented as a host container only. Views and slices of a
+storage, device residency, and passing storages to kernel launches or graphics
+work from Host code remain future work; `vh_storage_tensor_view` is the bridge
+an application uses meanwhile.
 
 None of the Host language, C++ extern, desktop Host AOT, or browser
 WebAssembly interfaces described here are part of the current public contract.

@@ -388,7 +388,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_invocation.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_loading.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_state.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/capi/stage_execution.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/stage_execution.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/host_containers.cpp)
 
     add_library(VernonRuntime ${VERNON_RUNTIME_LIBRARY_TYPE} ${_vernon_runtime_api_sources}
                               ${_VERNON_RUNTIME_IMPL_DIR}/runtime_python_bridge.cpp)

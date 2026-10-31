@@ -66,6 +66,10 @@ def lower_binary(emitter: NumericEmitter, node: ast.BinOp) -> Value:
         return emitter._intrinsic(node, "pow", [left, right], result_type)
     if not (floating or left.type.is_integer):
         raise emitter.context.error(node, f"unsupported binary operation for {left.type.name}")
+    if type(node.op) in _BITWISE:
+        if floating:
+            raise emitter.context.error(node, f"{_BITWISE[type(node.op)]} requires integer operands")
+        return Value(_bitwise(emitter, node, left, right).name, result_type)
     if isinstance(node.op, ast.Mod) and not unsigned:
         if floating:
             return Value(_floored_float_remainder(emitter, node, left, right).name, result_type)
@@ -84,6 +88,36 @@ def lower_binary(emitter: NumericEmitter, node: ast.BinOp) -> Value:
     if operation is None:
         raise emitter.context.error(node, f"unsupported binary operation for {left.type.name}")
     return Value(_emit(emitter, operation, (left, right), left.type).name, result_type)
+
+
+_BITWISE = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^", ast.LShift: "<<", ast.RShift: ">>"}
+
+
+def _bitwise(emitter: NumericEmitter, node: ast.BinOp, left: Value, right: Value) -> Value:
+    value_type = left.type
+    if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+        operation = {ast.BitAnd: "arith.andi", ast.BitOr: "arith.ori", ast.BitXor: "arith.xori"}[type(node.op)]
+        return _emit(emitter, operation, (left, right), value_type)
+    # arith shifts are poison from the bit width on. Host code and numpy define them, so device code does too: a
+    # left or unsigned right shift by the width or more, or by a negative amount, is 0, and a signed right shift
+    # fills with the sign. The unsigned compare also catches negative amounts.
+    scalar = element_type(value_type)
+    width = int(scalar.mlir.removeprefix("i"))
+    limit = _constant(emitter, width, value_type)
+    oversized = _emit(emitter, "arith.cmpi uge,", (right, limit), value_type, _mask_type(value_type))
+    if isinstance(node.op, ast.RShift) and not scalar.name.startswith("u"):
+        amount = _select(emitter, oversized, _constant(emitter, width - 1, value_type), right)
+        return _emit(emitter, "arith.shrsi", (left, amount), value_type)
+    operation = "arith.shli" if isinstance(node.op, ast.LShift) else "arith.shrui"
+    shifted = _emit(emitter, operation, (left, right), value_type)
+    return _select(emitter, oversized, _constant(emitter, 0, value_type), shifted)
+
+
+def _constant(emitter: NumericEmitter, value: int, value_type: DslType) -> Value:
+    literal = f"dense<{value}>" if value_type.kind == "tensor" else str(value)
+    result = emitter._fresh()
+    emitter._line(f"{result} = arith.constant {literal} : {value_type.mlir}")
+    return Value(result, value_type)
 
 
 def _mask_type(value_type: DslType) -> DslType:
@@ -166,6 +200,11 @@ def lower_unary(emitter: NumericEmitter, node: ast.UnaryOp) -> Value:
         return Value(result, result_type)
     if isinstance(node.op, ast.UAdd):
         return Value(operand.name, result_type, operand.fields, operand.access)
+    if isinstance(node.op, ast.Invert):
+        if not operand.type.is_integer:
+            raise emitter.context.error(node, "~ requires integer operands")
+        ones = _constant(emitter, -1, operand.type)
+        return Value(_emit(emitter, "arith.xori", (operand, ones), operand.type).name, result_type)
     raise emitter.context.error(node, "unsupported unary operation")
 
 

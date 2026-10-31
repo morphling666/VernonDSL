@@ -100,6 +100,15 @@ def can_convert(value_type: InferenceType, target: ConcreteType) -> bool:
         return True
     if source.kind != target.kind:
         return False
+    if source.kind == "storage":
+        # A storage of known extents is also one of dyn extents; the other direction would need a run-time check.
+        (source_element, source_shape), (target_element, target_shape) = source.arguments, target.arguments
+        assert isinstance(source_shape, tuple) and isinstance(target_shape, tuple)
+        return (
+            source_element == target_element
+            and len(source_shape) == len(target_shape)
+            and all(wanted in {"?", given} for given, wanted in zip(source_shape, target_shape, strict=True))
+        )
     if source.kind == "tuple":
         return len(source.arguments) == len(target.arguments) and all(
             isinstance(source_element, ConcreteType)

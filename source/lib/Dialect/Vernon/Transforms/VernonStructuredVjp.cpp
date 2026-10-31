@@ -1120,7 +1120,7 @@ private:
                 return failure();
             operations = source->recipe;
         } else {
-            rebuiltRecipe = buildAutodiffRematerializationRecipe(
+            rebuiltRecipe = buildAutodiffIndexRematerializationRecipe(
                 value, primal, [&](Value root) { return static_cast<bool>(availablePrimal(root, builder)); });
             if (failed(rebuiltRecipe))
                 return failure();

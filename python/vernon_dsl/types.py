@@ -13,6 +13,7 @@ import numpy as np
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ._markers import declaration_source, is_params, is_struct_class
 from ._texture_format import TextureFormat
+from .language.slicing import runtime_key
 from .source_identity import project_module_name, project_root
 
 
@@ -130,7 +131,29 @@ class Tensor(np.ndarray[Any, Any]):
         return result
 
     def __getitem__(self, index: Any) -> Any:
-        return super().__getitem__(index)
+        return super().__getitem__(runtime_key(index, self.shape, clamp=True))
+
+    @property
+    def at(self) -> _TensorAt:
+        """The functional update, as in JAX: `v.at[i].set(x)` is a new Tensor with element `i` replaced, and
+        `v.at[1:3, :].set(b)` one with a block replaced."""
+
+        return _TensorAt(self)
+
+    def _updated(self, index: Any, value: Any, combine: Any) -> Self:
+        result = np.array(self)
+        key = runtime_key(index, result.shape, clamp=True)
+        result[key] = combine(result[key], value)
+        return self._result(result)
+
+    def __repr__(self) -> str:
+        def components(array: np.ndarray[Any, Any]) -> str:
+            if array.ndim == 0:
+                return str(array[()])
+            return "[" + ", ".join(components(row) for row in array) + "]"
+
+        kind = next(cls for cls in type(self).__mro__ if cls.__module__ == __name__)
+        return f"{kind.__name__}({components(np.asarray(self))})"
 
     def __add__(self, other: Any) -> Any:
         return self._result(np.asarray(self) + other)
@@ -155,6 +178,36 @@ class Tensor(np.ndarray[Any, Any]):
 
     def __neg__(self) -> Any:
         return self._result(-np.asarray(self))
+
+    # A Tensor is a value: `t += x` rebinds `t` (and `s[1:3] += x` writes the sum back) instead of mutating.
+    __iadd__ = __add__
+    __isub__ = __sub__
+    __imul__ = __mul__
+    __itruediv__ = __truediv__
+
+
+class _TensorAt:
+    __slots__ = ("_tensor",)
+
+    def __init__(self, tensor: Tensor) -> None:
+        self._tensor = tensor
+
+    def __getitem__(self, index: Any) -> _TensorUpdate:
+        return _TensorUpdate(self._tensor, index)
+
+
+class _TensorUpdate:
+    __slots__ = ("_index", "_tensor")
+
+    def __init__(self, tensor: Tensor, index: Any) -> None:
+        self._tensor = tensor
+        self._index = index
+
+    def set(self, value: Any) -> Any:
+        return self._tensor._updated(self._index, value, lambda _, new: new)
+
+    def add(self, value: Any) -> Any:
+        return self._tensor._updated(self._index, value, lambda old, new: old + new)
 
 
 class Vector(Tensor):
@@ -229,7 +282,8 @@ class _Scalar(type):
         super().__init__(class_name, bases, resolved_namespace)
 
     def __call__(cls, value: Any) -> Any:
-        return NUMPY_DTYPE_BY_SCALAR[cls.name].type(value)
+        dtype = NUMPY_DTYPE_BY_SCALAR.get(cls.name)
+        return (dtype.type if dtype is not None else cls.__mro__[1])(value)
 
 
 class bool(np.bool_, metaclass=_Scalar):
@@ -256,7 +310,20 @@ class f64(np.float64, metaclass=_Scalar):
     name = "f64"
 
 
+class i64(np.int64, metaclass=_Scalar):
+    """A Host-only 64-bit signed integer."""
+
+    name = "i64"
+
+
+class u64(np.uint64, metaclass=_Scalar):
+    """A Host-only 64-bit unsigned integer, the representation of engine ids and handles."""
+
+    name = "u64"
+
+
 Sampler = TypeExpr("Sampler")
+"""A UTF-8 string literal a Host function passes to an extern, borrowed for the call."""
 
 
 class _TypeKind:

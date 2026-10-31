@@ -508,6 +508,36 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                      results.push_back(negative(context.builder, context.location, context.resultCotangents[0]));
                      return success();
                  }));
+    // The condition has no derivative: the cotangent flows to the chosen operand only.
+    add(DifferentiationRule(
+        arith::SelectOp::getOperationName().str(), 3, 1, {Requirement::operand(0, {1, 2})},
+        [](Operation *operation, const AutodiffVjpBuildContext &context,
+           SmallVectorImpl<Value> &results) -> LogicalResult {
+            Value seed = context.resultCotangents[0];
+            Value condition = context.getPrimalOperand(0);
+            if (failed(requireValues(operation, {condition})))
+                return failure();
+            Value zero = constant(context.builder, context.location, seed.getType(), 0.0);
+            results.push_back(Value{});
+            results.push_back(context.isOperandActive(1)
+                                  ? arith::SelectOp::create(context.builder, context.location, condition, seed, zero)
+                                  : Value{});
+            results.push_back(context.isOperandActive(2)
+                                  ? arith::SelectOp::create(context.builder, context.location, condition, zero, seed)
+                                  : Value{});
+            return success();
+        },
+        {},
+        [](Operation *operation) -> LogicalResult {
+            auto select = dyn_cast<arith::SelectOp>(operation);
+            if (!select)
+                return operation->emitOpError("autodiff select rule requires arith.select");
+            Type result = select.getResult().getType();
+            if (!select.getCondition().getType().isInteger(1) || select.getTrueValue().getType() != result ||
+                select.getFalseValue().getType() != result || failed(getAutodiffDerivativeValueType(result)))
+                return operation->emitOpError("autodiff select rule requires a scalar i1 condition and float operands");
+            return success();
+        }));
     add(DifferentiationRule(
         arith::ExtFOp::getOperationName().str(), 1, 1, {},
         [](Operation *, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {

@@ -5,6 +5,17 @@ from typing import Any, overload
 import numpy as np
 
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES
+from .types import Tensor
+
+
+def _like(result: Any, *operands: Any) -> Any:
+    """A Tensor result as the Tensor class of its operands, immutable like them; numpy returns a bare array."""
+
+    if isinstance(result, np.ndarray) and result.ndim:
+        for operand in operands:
+            if isinstance(operand, Tensor):
+                return type(operand)._result(result)
+    return result
 
 
 def _raise_device_only(name: str) -> Any:
@@ -13,39 +24,39 @@ def _raise_device_only(name: str) -> Any:
 
 
 def sin(value: Any) -> Any:
-    return np.sin(value)
+    return _like(np.sin(value), value)
 
 
 def cos(value: Any) -> Any:
-    return np.cos(value)
+    return _like(np.cos(value), value)
 
 
 def acos(value: Any) -> Any:
-    return np.arccos(value)
+    return _like(np.arccos(value), value)
 
 
 def atan2(y: Any, x: Any) -> Any:
-    return np.arctan2(y, x)
+    return _like(np.arctan2(y, x), y, x)
 
 
 def exp(value: Any) -> Any:
-    return np.exp(value)
+    return _like(np.exp(value), value)
 
 
 def log(value: Any) -> Any:
-    return np.log(value)
+    return _like(np.log(value), value)
 
 
 def sqrt(value: Any) -> Any:
-    return np.sqrt(value)
+    return _like(np.sqrt(value), value)
 
 
 def floor(value: Any) -> Any:
-    return np.floor(value)
+    return _like(np.floor(value), value)
 
 
 def abs(value: Any) -> Any:
-    return np.abs(value)
+    return _like(np.abs(value), value)
 
 
 def dot(left: Any, right: Any) -> Any:
@@ -53,11 +64,11 @@ def dot(left: Any, right: Any) -> Any:
 
 
 def cross(left: Any, right: Any) -> Any:
-    return np.cross(left, right)
+    return _like(np.cross(left, right), left, right)
 
 
 def normalize(value: Any) -> Any:
-    return np.asarray(value) / np.linalg.norm(value)
+    return _like(np.asarray(value) / np.linalg.norm(value), value)
 
 
 def norm(value: Any) -> Any:
@@ -65,23 +76,23 @@ def norm(value: Any) -> Any:
 
 
 def reflect(direction: Any, normal: Any) -> Any:
-    return np.asarray(direction) - 2 * np.dot(direction, normal) * np.asarray(normal)
+    return _like(np.asarray(direction) - 2 * np.dot(direction, normal) * np.asarray(normal), direction, normal)
 
 
 def min(left: Any, right: Any) -> Any:
-    return np.minimum(left, right)
+    return _like(np.minimum(left, right), left, right)
 
 
 def max(left: Any, right: Any) -> Any:
-    return np.maximum(left, right)
+    return _like(np.maximum(left, right), left, right)
 
 
 def pow(left: Any, right: Any) -> Any:
-    return np.power(left, right)
+    return _like(np.power(left, right), left, right)
 
 
 def clamp(value: Any, minimum: Any, maximum: Any) -> Any:
-    return np.clip(value, minimum, maximum)
+    return _like(np.clip(value, minimum, maximum), value, minimum, maximum)
 
 
 def matmul(left: Any, right: Any) -> Any:

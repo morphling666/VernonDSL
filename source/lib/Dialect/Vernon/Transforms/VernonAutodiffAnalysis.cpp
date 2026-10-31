@@ -480,6 +480,14 @@ void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange o
                                 (defining ? defining->getName().getStringRef() : StringRef("block argument")));
         return;
     }
+    // A predicate operand (arith.select) has no derivative, but its rule reads it in the reverse pass, so the tape
+    // planner needs its layout.
+    for (Value operand : operands)
+        if (operand.getType().isInteger(1) && failed(addValue(operand))) {
+            emitDependencyError(resultValue.getDefiningOp(),
+                                "cannot resolve a predicate operand's canonical Value ABI");
+            return;
+        }
     for (auto [resultLeafIndex, resultLeaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
         if (!isDifferentiable(resultLeaf))
             continue;

@@ -7,7 +7,24 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from ..diagnostics import copy_location, fix_missing_locations
-from ..language.ast_utils import assigned_names, decorator_name, dotted_name, rectangular_literal
+from ..language.ast_utils import (
+    assigned_names,
+    decorator_name,
+    dotted_name,
+    rectangular_literal,
+    tensor_update_parts,
+)
+from ..language.slicing import (
+    AxisIndex,
+    AxisRange,
+    AxisSelection,
+    AxisWindow,
+    SelectionError,
+    constant_integer,
+    is_slicing,
+    plan_selection,
+    selection_shape,
+)
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, ENTRY_DECORATORS, GRAPHICS_STAGES
 from ..shader_contracts import (
     ATOMIC_OPERATION_NAMES,
@@ -21,6 +38,8 @@ from ..struct_methods import method_tables
 from .abi import workgroup_physical_bytes
 from .activity import analyze_storage_activity
 from .model import (
+    HOST_STORAGE_ELEMENTS,
+    HOST_STORAGE_MAX_RANK,
     AccessMode,
     AtomicEffect,
     BarrierEffect,
@@ -29,6 +48,7 @@ from .model import (
     EffectScope,
     FragmentDiscardEffect,
     InterfaceMetadata,
+    LiteralType,
     LValue,
     MemoryOrdering,
     ResourceEffect,
@@ -190,14 +210,26 @@ class _Inference:
         parse_interface: ParseInterface,
         error: Error,
         enabled_features: tuple[str, ...],
+        *,
+        host: bool = False,
     ):
+        self.host = host
         self.module = module
         self.parse_type = parse_type
         self.parse_interface = parse_interface
         self.error = error
         self.enabled_features = enabled_features
         self.functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+        # Extern declarations have only a signature: calls type-check against it, and their bodies are never typed.
+        self.externs = {
+            name for name, node in self.functions.items() if decorator_name(node.decorator_list[0]) == "extern"
+        }
         self.methods = method_tables(module)
+        self.handles = {
+            node.name
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and any(decorator_name(item) == "handle" for item in node.decorator_list)
+        }
         self.structs = {
             node.name: tuple(
                 (field.target.id, self.parse_type(field.annotation))
@@ -205,7 +237,7 @@ class _Inference:
                 if isinstance(field, ast.AnnAssign) and isinstance(field.target, ast.Name)
             )
             for node in module.body
-            if isinstance(node, ast.ClassDef)
+            if isinstance(node, ast.ClassDef) and node.name not in self.handles
         }
         self.generic = {
             name
@@ -228,7 +260,7 @@ class _Inference:
             if isinstance(statement, ast.FunctionDef) and statement.name in self.generic:
                 continue
             retained.append(statement)
-            if isinstance(statement, ast.FunctionDef):
+            if isinstance(statement, ast.FunctionDef) and statement.name not in self.externs:
                 roots.append(statement)
         for function in roots:
             self.workgroup_storage_bytes = 0
@@ -357,7 +389,7 @@ class _Inference:
     def _build_typed_functions(self) -> tuple[TypedFunctionInstance, ...]:
         functions: list[TypedFunctionInstance] = []
         for function in self.module.body:
-            if not isinstance(function, ast.FunctionDef):
+            if not isinstance(function, ast.FunctionDef) or function.name in self.externs:
                 continue
             parameters: list[TypedParameter] = []
             for argument in function.args.args:
@@ -945,7 +977,30 @@ class _Inference:
     ) -> list[InferenceType | None]:
         returns: list[InferenceType | None] = []
         for statement in statements:
-            if isinstance(statement, ast.Assign):
+            if (
+                self.host
+                and isinstance(statement, ast.Assign)
+                and isinstance(statement.value, (ast.List, ast.Dict))
+                and not (statement.value.elts if isinstance(statement.value, ast.List) else statement.value.keys)
+            ):
+                # `[]` and `{}` have no type of their own: each is only the empty value of the field it is
+                # assigned to.
+                kind = "list" if isinstance(statement.value, ast.List) else "dict"
+                target_type = self._expression(statement.targets[0], environment)
+                if not isinstance(target_type, ConcreteType) or target_type.kind != kind:
+                    spelling = "[]" if kind == "list" else "{}"
+                    raise self.error(statement.value, f"{spelling} can only be assigned to a {kind} field")
+                self.expression_records[id(statement.value)] = (statement.value, target_type, kind)
+            elif self.host and isinstance(statement, ast.Delete):
+                for target in statement.targets:
+                    container = (
+                        self._expression(target.value, environment) if isinstance(target, ast.Subscript) else None
+                    )
+                    if not isinstance(container, ConcreteType) or container.kind != "dict":
+                        raise self.error(target, "del removes a dict entry, as in del self.counts[key]")
+                    assert isinstance(target, ast.Subscript)
+                    self._dict_key(target.slice, container, environment)
+            elif isinstance(statement, ast.Assign):
                 value_type = self._expression(statement.value, environment)
                 if len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
                     name = statement.targets[0].id
@@ -955,20 +1010,59 @@ class _Inference:
                         raise self.error(statement, f"local '{name}' has incompatible assignment types")
                 elif len(statement.targets) == 1 and isinstance(statement.targets[0], (ast.Tuple, ast.List)):
                     self._bind_destructuring(statement.targets[0], value_type, environment)
+                elif (
+                    self.host
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Subscript)
+                    and self._is_dict(statement.targets[0].value, environment)
+                ):
+                    target_type = self._expression(statement.targets[0].value, environment)
+                    assert isinstance(target_type, ConcreteType)
+                    self._dict_key(statement.targets[0].slice, target_type, environment)
+                    expected = target_type.arguments[1]
+                    assert isinstance(expected, ConcreteType)
+                    if not can_convert(value_type, expected):
+                        raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.spelling}")
+                    self._constrain_literal(statement.value, expected)
+                elif (
+                    self.host
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Subscript)
+                    and isinstance(storage := self._expression(statement.targets[0].value, environment), ConcreteType)
+                    and storage.kind == "storage"
+                ):
+                    expected = self._storage_element(statement.targets[0], storage, environment)
+                    if expected.kind == "tensor":
+                        self._require_block(statement.value, value_type, expected, "store")
+                    elif not can_convert(value_type, expected):
+                        raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.spelling}")
+                    else:
+                        self._constrain_literal(statement.value, expected)
                 elif len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Subscript):
                     target_type = self._expression(statement.targets[0].value, environment)
                     self._infer_indices(statement.targets[0].slice, environment)
+                    self._reject_value_write(statement.targets[0], target_type)
                     if not isinstance(target_type, ConcreteType) or target_type.kind not in {
-                        "tensor",
                         "tensor_view",
+                        *({"list"} if self.host else ()),
                     }:
                         raise self.error(statement.targets[0], "indexed assignment requires writable Storage")
+                    if target_type.kind == "list" and isinstance(statement.targets[0].slice, ast.Tuple):
+                        raise self.error(statement.targets[0].slice, "a list takes one index")
                     if target_type.kind == "tensor_view" and target_type.arguments[2] == "read":
                         raise self.error(statement.targets[0], "cannot assign through a read-only TensorView")
                     expected = target_type.arguments[0]
                     assert isinstance(expected, ConcreteType)
                     if not can_convert(value_type, expected):
                         raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.spelling}")
+                elif self.host and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Attribute):
+                    # Which fields are writable places is a Host rule; the Host validator checks it.
+                    expected = self._expression(statement.targets[0], environment)
+                    if not can_convert(value_type, expected):
+                        raise self.error(
+                            statement.value, f"cannot store {describe(value_type)} as {describe(expected)}"
+                        )
+                    self._constrain_literal(statement.value, expected)
                 else:
                     raise self.error(statement, "assignment target must be a local name or TensorView element")
             elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
@@ -980,6 +1074,8 @@ class _Inference:
                 if isinstance(statement.target, ast.Name):
                     environment[statement.target.id] = expected
             elif isinstance(statement, ast.AugAssign):
+                if isinstance(statement.target, ast.Subscript):
+                    self._reject_value_write(statement.target, self._expression(statement.target.value, environment))
                 target_type = self._expression(statement.target, environment)
                 value_type = self._expression(statement.value, environment)
                 common = _common(target_type, value_type)
@@ -1047,20 +1143,33 @@ class _Inference:
                 )
                 returns.extend((*loop_returns, *else_returns))
             elif isinstance(statement, ast.For):
+                view = self._dict_view(statement.iter, environment) if self.host else None
+                if view is not None:
+                    returns.extend(self._dict_loop(statement, view, environment, loop_depth))
+                    continue
                 if not isinstance(statement.target, ast.Name):
                     raise self.error(statement.target, "for loop target must be a local name")
-                if (
-                    not isinstance(statement.iter, ast.Call)
-                    or dotted_name(statement.iter.func) != "range"
-                    or not 1 <= len(statement.iter.args) <= 3
-                    or statement.iter.keywords
-                ):
+                is_range = (
+                    isinstance(statement.iter, ast.Call)
+                    and dotted_name(statement.iter.func) == "range"
+                    and 1 <= len(statement.iter.args) <= 3
+                    and not statement.iter.keywords
+                )
+                calls_range = isinstance(statement.iter, ast.Call) and dotted_name(statement.iter.func) == "range"
+                iterated = None if calls_range or not self.host else self._expression(statement.iter, environment)
+                if isinstance(iterated, ConcreteType) and iterated.kind == "list":
+                    element = iterated.arguments[0]
+                    assert isinstance(element, ConcreteType)
+                    range_type = element
+                elif not is_range:
                     raise self.error(
                         statement.iter,
-                        "for loops require range(stop), range(start, stop), or range(start, stop, step)",
+                        "for loops require range(stop), range(start, stop), or range(start, stop, step)"
+                        + (", or a list" if self.host else ""),
                     )
-                range_type = ConcreteType("scalar", "i32")
-                for argument in statement.iter.args:
+                else:
+                    range_type = ConcreteType("scalar", "i32")
+                for argument in statement.iter.args if is_range else ():  # type: ignore[union-attr]
                     inferred_argument = self._expression(argument, environment)
                     concrete_argument = default_type(inferred_argument)
                     if concrete_argument.kind != "scalar" or not concrete_argument.is_integer:
@@ -1068,7 +1177,7 @@ class _Inference:
                     if concrete_argument.name == "u32":
                         raise self.error(argument, "range u32 arguments require an explicit i32 conversion")
                     self._constrain_literal(argument, range_type)
-                if len(statement.iter.args) == 3 and self._is_literal_zero(statement.iter.args[2]):
+                if is_range and len(statement.iter.args) == 3 and self._is_literal_zero(statement.iter.args[2]):  # type: ignore[union-attr]
                     raise self.error(statement.iter.args[2], "range step must not be zero")
                 before = environment.copy()
                 loop_environment = {**before, statement.target.id: range_type}
@@ -1101,6 +1210,98 @@ class _Inference:
                 )
                 returns.extend((*loop_returns, *else_returns))
         return returns
+
+    def _is_dict(self, node: ast.expr, environment: dict[str, InferenceType]) -> bool:
+        value_type = self._expression(node, environment)
+        return isinstance(value_type, ConcreteType) and value_type.kind == "dict"
+
+    def _dict_key(self, node: ast.expr, dict_type: ConcreteType, environment: dict[str, InferenceType]) -> None:
+        key = dict_type.arguments[0]
+        assert isinstance(key, ConcreteType)
+        key_type = self._expression(node, environment)
+        if not can_convert(key_type, key):
+            raise self.error(node, f"{dict_type.spelling} has {key.spelling} keys, not {describe(key_type)}")
+        self._constrain_literal(node, key)
+
+    def _dict_view(self, node: ast.expr, environment: dict[str, InferenceType]) -> tuple[str, ConcreteType] | None:
+        """For `d`, `d.keys()`, `d.values()` or `d.items()` over a dict `d`: what the loop visits and the dict's
+        type; None for other iterables."""
+
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"keys", "values", "items"}
+            and self._receiver(node.func.value, environment)
+        ):
+            receiver = self._expression(node.func.value, environment)
+            if isinstance(receiver, ConcreteType) and receiver.kind == "dict":
+                if node.args or node.keywords:
+                    raise self.error(node, f"dict.{node.func.attr} takes no arguments")
+                self.expression_records[id(node)] = (node, receiver, node.func.attr)
+                return node.func.attr, receiver
+            return None
+        if isinstance(node, ast.Call):
+            return None
+        iterated = self._expression(node, environment)
+        if isinstance(iterated, ConcreteType) and iterated.kind == "dict":
+            return "keys", iterated
+        return None
+
+    def _dict_loop(
+        self,
+        statement: ast.For,
+        view: tuple[str, ConcreteType],
+        environment: dict[str, InferenceType],
+        loop_depth: int,
+    ) -> list[InferenceType | None]:
+        kind, dict_type = view
+        key, value = dict_type.arguments
+        assert isinstance(key, ConcreteType) and isinstance(value, ConcreteType)
+        if kind == "items":
+            target = statement.target
+            if not (
+                isinstance(target, ast.Tuple)
+                and len(target.elts) == 2
+                and all(isinstance(item, ast.Name) for item in target.elts)
+            ):
+                raise self.error(target, "a loop over dict.items() binds two local names, as in for key, value in")
+            bound = {target.elts[0].id: key, target.elts[1].id: value}  # type: ignore[attr-defined]
+        else:
+            if not isinstance(statement.target, ast.Name):
+                raise self.error(statement.target, "for loop target must be a local name")
+            bound = {statement.target.id: key if kind == "keys" else value}
+        before = environment.copy()
+        loop_environment = {**before, **bound}
+        loop_returns: list[InferenceType | None] = []
+        assigned = assigned_names(statement.body)
+        for _ in range(8):
+            candidate = loop_environment.copy()
+            loop_returns = self._statements(statement.body, candidate, loop_depth + 1)
+            merged_environment = before.copy()
+            for name in sorted(before.keys() & candidate.keys() & assigned):
+                merged = _common(before[name], candidate[name])
+                if merged is None:
+                    raise self.error(statement, f"loop local '{name}' has incompatible types")
+                merged_environment[name] = merged
+            next_environment = {**merged_environment, **bound}
+            if next_environment == loop_environment:
+                break
+            loop_environment = next_environment
+        else:
+            raise self.error(statement, "loop-carried type inference did not converge")
+        else_environment = {name: item for name, item in loop_environment.items() if name not in bound}
+        else_returns = self._statements(statement.orelse, else_environment, loop_depth)
+        for name in sorted(before.keys() & else_environment.keys() & assigned_names(statement.orelse)):
+            merged = _common(loop_environment[name], else_environment[name])
+            if merged is None:
+                raise self.error(statement, f"loop-else local '{name}' has incompatible types")
+            loop_environment[name] = merged
+        environment.update({name: item for name, item in loop_environment.items() if name not in bound})
+        self.statement_merges[id(statement)] = tuple(
+            BranchMerge(name, default_type(loop_environment[name]))
+            for name in sorted(before.keys() & loop_environment.keys() & assigned)
+        )
+        return [*loop_returns, *else_returns]
 
     def _merge_loop_else(
         self,
@@ -1173,6 +1374,17 @@ class _Inference:
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (bool, int, float)):
                 return literal(node.value)
+            if isinstance(node.value, str) and self.host:
+                return ConcreteType("str", "str")
+        if self.host and isinstance(node, ast.JoinedStr):
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    value = self._expression(part.value, environment)
+                    self._constrain_literal(part.value, default_type(value))
+            return ConcreteType("str", "str")
+        if self.host and isinstance(node, (ast.List, ast.Dict)):
+            kind, empty = ("list", "[]") if isinstance(node, ast.List) else ("dict", "{}")
+            raise self.error(node, f"{kind} displays are not Host Values; {empty} only empties a {kind} field")
         if isinstance(node, ast.BinOp):
             left = self._expression(node.left, environment)
             right = self._expression(node.right, environment)
@@ -1209,6 +1421,12 @@ class _Inference:
             self._constrain_literal(node.body, result)
             self._constrain_literal(node.orelse, result)
             return result
+        if self.host and isinstance(node, ast.Compare) and isinstance(node.ops[0], (ast.In, ast.NotIn)):
+            container = self._expression(node.comparators[0], environment)
+            if len(node.ops) != 1 or not isinstance(container, ConcreteType) or container.kind != "dict":
+                raise self.error(node, "'in' tests whether a dict has a key")
+            self._dict_key(node.left, container, environment)
+            return _scalar("bool")
         if isinstance(node, ast.Compare):
             left = self._expression(node.left, environment)
             for value in node.comparators:
@@ -1245,6 +1463,18 @@ class _Inference:
                 element = value_type.arguments[index]
                 assert isinstance(element, ConcreteType)
                 return element
+            if isinstance(value_type, ConcreteType) and value_type.kind == "dict":
+                self._dict_key(node.slice, value_type, environment)
+                element = value_type.arguments[1]
+                assert isinstance(element, ConcreteType)
+                return element
+            if isinstance(value_type, ConcreteType) and value_type.kind == "storage":
+                return self._storage_element(node, value_type, environment)
+            if isinstance(value_type, ConcreteType) and value_type.kind == "tensor":
+                indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+                rank = len(value_type.arguments) - 1
+                if is_slicing(indices, rank) or len(indices) > rank:
+                    return self._selection_type(node, indices, value_type, environment)
             self._infer_indices(node.slice, environment)
             if (
                 isinstance(value_type, ConcreteType)
@@ -1252,12 +1482,20 @@ class _Inference:
                 and value_type.arguments[2] == "write"
             ):
                 raise self.error(node, "cannot load through a write-only TensorView")
-            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view"}:
+            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view", "list"}:
+                if value_type.kind == "list" and isinstance(node.slice, ast.Tuple):
+                    raise self.error(node.slice, "a list takes one index")
                 element = value_type.arguments[0]
                 assert isinstance(element, ConcreteType)
                 return element
         if isinstance(node, ast.Attribute):
             value_type = self._expression(node.value, environment)
+            if isinstance(value_type, ConcreteType) and value_type.kind == "storage":
+                if node.attr != "shape":
+                    raise self.error(node, f"TensorStorage has no attribute '{node.attr}'")
+                extents = value_type.arguments[1]
+                assert isinstance(extents, tuple)
+                return ConcreteType("tuple", "Tuple", (_scalar("i32"),) * len(extents))
             if node.attr == "shape":
                 rank = _shape_rank(value_type)
                 if rank is None:
@@ -1280,9 +1518,211 @@ class _Inference:
             return self._call(node, environment)
         raise self.error(node, f"cannot infer expression syntax: {type(node).__name__}")
 
+    def _storage_element(
+        self, node: ast.Subscript, storage: ConcreteType, environment: dict[str, InferenceType]
+    ) -> ConcreteType:
+        """The element `storage[i, j, ...]` reads or writes: one integer index per axis, as numpy indexes an
+        element."""
+
+        element, extents = storage.arguments
+        assert isinstance(element, ConcreteType) and isinstance(extents, tuple)
+        indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if any(isinstance(index, ast.Starred) for index in indices):
+            raise self.error(node.slice, f"{storage.spelling} takes one index or slice per axis")
+        if is_slicing(indices, len(extents)) or len(indices) > len(extents):
+            return self._selection_type(node, indices, storage, environment)
+        self._infer_indices(node.slice, environment)
+        return element
+
+    def _selection_type(
+        self,
+        node: ast.Subscript,
+        indices: list[ast.expr],
+        container: ConcreteType,
+        environment: dict[str, InferenceType],
+    ) -> ConcreteType:
+        """The type `v[...]` selects from a Tensor value or a TensorStorage with slices among its indices: the
+        element for no kept axis, otherwise a Tensor of the kept lengths."""
+
+        element = container.arguments[0]
+        assert isinstance(element, ConcreteType)
+        extents = (
+            [int(extent) for extent in container.arguments[1:]]  # type: ignore[arg-type]
+            if container.kind == "tensor"
+            else [extent if isinstance(extent, int) else None for extent in container.arguments[1]]  # type: ignore[union-attr]
+        )
+        if element.kind != "scalar":
+            raise self.error(node, f"slicing selects scalar elements; {container.spelling} has {element.spelling}")
+        shape = selection_shape(self._selection_plan(node, indices, extents, environment))
+        return ConcreteType("tensor", "Tensor", (element, *shape)) if shape else element
+
+    def _selection_plan(
+        self,
+        node: ast.Subscript,
+        indices: list[ast.expr],
+        extents: list[int | None],
+        environment: dict[str, InferenceType],
+    ) -> list[AxisSelection]:
+        try:
+            plan = plan_selection(node, indices, extents)
+        except SelectionError as error:
+            raise self.error(error.node, str(error)) from None
+        for axis, extent in zip(plan, extents, strict=True):
+            if isinstance(axis, AxisRange):
+                continue
+            index_node = axis.node if isinstance(axis, AxisIndex) else axis.start
+            if isinstance(axis, AxisWindow) and any(isinstance(part, ast.Call) for part in ast.walk(index_node)):
+                # Python evaluates the start twice, once in each bound, so it must not call anything.
+                raise self.error(index_node, "a window start has no calls; bind the start to a local first")
+            if not default_type(self._expression(index_node, environment)).is_integer:
+                raise self.error(index_node, "Tensor indices are integers")
+            literal = constant_integer(index_node) if isinstance(axis, AxisIndex) else None
+            if literal is not None and extent is not None and not -extent <= literal < extent:
+                raise self.error(index_node, f"index {literal} is outside an axis of extent {extent}")
+        starts = {id(axis.start) for axis in plan if isinstance(axis, AxisWindow)}
+        for index in indices:
+            if isinstance(index, ast.Slice):
+                for bound in (index.lower, index.upper, index.step):
+                    if bound is not None and id(bound) not in starts:
+                        self._expression(bound, environment)
+        return plan
+
+    def _require_block(self, node: ast.expr, value: InferenceType, block: ConcreteType, what: str) -> None:
+        """A value written into a selection of type `block`: a scalar for every element, or a Tensor of the
+        selection's shape."""
+
+        element = block.arguments[0] if block.kind == "tensor" else block
+        assert isinstance(element, ConcreteType)
+        if block.kind == "tensor" and isinstance(value, ConcreteType) and value.kind == "tensor":
+            if value.arguments[1:] != block.arguments[1:]:
+                raise self.error(node, f"cannot {what} {describe(value)} into a selection of {block.spelling}")
+            value_element = value.arguments[0]
+            assert isinstance(value_element, ConcreteType)
+            if not can_convert(value_element, element):
+                raise self.error(node, f"cannot {what} {describe(value)} into a selection of {block.spelling}")
+            return
+        if not can_convert(value, element):
+            raise self.error(node, f"cannot {what} {describe(value)} into {block.spelling}")
+        self._constrain_literal(node, element)
+
+    def _storage_creation(self, node: ast.Call, environment: dict[str, InferenceType]) -> ConcreteType | None:
+        """The type of `zeros(dtype=T, shape=(...))`, `empty(...)`, `zeros_like(s)`, `empty_like(s)` or
+        `from_values(t, dtype=T)`, spelled through `vd`, `vd.storage` or `vd.TensorStorage`; None when `node` is none
+        of them."""
+
+        name = (dotted_name(node.func) or "").split(".")[-1]
+        if name not in {"zeros", "empty", "zeros_like", "empty_like", "from_values"}:
+            return None
+        if isinstance(node.func, ast.Attribute) and self._receiver(node.func.value, environment):
+            return None
+        if name == "from_values":
+            if len(node.args) != 1 or [keyword.arg for keyword in node.keywords] != ["dtype"]:
+                raise self.error(node, "from_values takes a Tensor and dtype=, as in from_values(t, dtype=f32)")
+            element = self.parse_type(node.keywords[0].value)
+            values = self._expression(node.args[0], environment)
+            if not isinstance(values, ConcreteType) or values.kind != "tensor" or values.arguments[0] != element:
+                raise self.error(
+                    node.args[0],
+                    f"from_values takes a Tensor of {element.spelling} elements; {describe(values)} is not",
+                )
+            if element.name not in HOST_STORAGE_ELEMENTS:
+                raise self.error(
+                    node.keywords[0].value,
+                    f"Host TensorStorage elements are bool, i32, u32, f32 or f64; {element.spelling} is not one",
+                )
+            return ConcreteType("storage", "TensorStorage", (element, tuple(values.arguments[1:])))
+        if name.endswith("_like"):
+            if len(node.args) != 1 or node.keywords:
+                raise self.error(node, f"{name} takes one TensorStorage")
+            source = self._expression(node.args[0], environment)
+            if not isinstance(source, ConcreteType) or source.kind != "storage":
+                raise self.error(node.args[0], f"{name} takes a TensorStorage; {describe(source)} is not one")
+            return source
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if node.args or set(keywords) != {"dtype", "shape"}:
+            raise self.error(
+                node, f"{name} takes only the keywords dtype= and shape=, as in {name}(dtype=f32, shape=(n,))"
+            )
+        element = self.parse_type(keywords["dtype"])
+        if element.kind != "scalar" or element.name not in HOST_STORAGE_ELEMENTS:
+            raise self.error(
+                keywords["dtype"],
+                f"Host TensorStorage elements are bool, i32, u32, f32 or f64; {element.spelling} is not one",
+            )
+        shape = keywords["shape"]
+        extents: list[int | str] = []
+        if isinstance(shape, ast.Tuple):
+            for extent in shape.elts:
+                extent_type = self._expression(extent, environment)
+                if not default_type(extent_type).is_integer:
+                    raise self.error(extent, "TensorStorage extents are integers")
+                self._constrain_literal(extent, default_type(extent_type))
+                if (
+                    isinstance(extent, ast.UnaryOp)
+                    and isinstance(extent.op, ast.USub)
+                    and isinstance(extent.operand, ast.Constant)
+                    and extent.operand.value != 0
+                ):
+                    raise self.error(extent, "TensorStorage extents cannot be negative")
+                static = isinstance(extent, ast.Constant) and isinstance(extent.value, int) and extent.value > 0
+                extents.append(extent.value if static else "?")  # type: ignore[union-attr]
+        else:
+            shape_type = self._expression(shape, environment)
+            if (
+                not isinstance(shape_type, ConcreteType)
+                or shape_type.kind != "tuple"
+                or not all(isinstance(item, ConcreteType) and item.is_integer for item in shape_type.arguments)
+            ):
+                raise self.error(shape, "shape is a tuple of integers, such as (h, w) or another storage's shape")
+            extents = ["?"] * len(shape_type.arguments)
+        if not 1 <= len(extents) <= HOST_STORAGE_MAX_RANK:
+            raise self.error(shape, f"a Host TensorStorage has 1 to {HOST_STORAGE_MAX_RANK} axes")
+        return ConcreteType("storage", "TensorStorage", (element, tuple(extents)))
+
+    def _storage_call(
+        self, node: ast.Call, receiver: ConcreteType, environment: dict[str, InferenceType]
+    ) -> InferenceType:
+        assert isinstance(node.func, ast.Attribute)
+        method = node.func.attr
+        element, extents = receiver.arguments
+        assert isinstance(element, ConcreteType) and isinstance(extents, tuple)
+        arities = {"fill": 1, "copy_from_values": 1, "to_values": 0}
+        if method not in arities:
+            raise self.error(node.func, f"TensorStorage has no method '{method}' in Host code")
+        if len(node.args) != arities[method] or node.keywords:
+            count = arities[method]
+            raise self.error(node, f"TensorStorage.{method} takes {count} argument{'s' if count != 1 else ''}")
+        if method == "to_values":
+            if "?" in extents:
+                raise self.error(
+                    node, f"to_values returns a Tensor, whose shape is static; {receiver.spelling} has dyn extents"
+                )
+            return ConcreteType("tensor", "Tensor", (element, *extents))
+        value = self._expression(node.args[0], environment)
+        if method == "fill":
+            if not can_convert(value, element):
+                raise self.error(node.args[0], f"cannot fill {receiver.spelling} with {describe(value)}")
+            self._constrain_literal(node.args[0], element)
+            return ConcreteType("void", "void")
+        if (
+            not isinstance(value, ConcreteType)
+            or value.kind != "tensor"
+            or value.arguments[0] != element
+            or len(value.arguments) - 1 != len(extents)
+            or any(wanted not in {"?", given} for given, wanted in zip(value.arguments[1:], extents, strict=True))
+        ):
+            raise self.error(
+                node.args[0],
+                f"copy_from_values into {receiver.spelling} takes a Tensor of its element type and shape; "
+                f"{describe(value)} is not one",
+            )
+        return ConcreteType("void", "void")
+
     def _infer_indices(self, node: ast.expr, environment: dict[str, InferenceType]) -> None:
         indices = list(node.elts) if isinstance(node, ast.Tuple) else [node]
         for index in indices:
+            if isinstance(index, ast.Slice):
+                raise self.error(index, "slices select from a Tensor value or a TensorStorage")
             index_type = self._expression(index, environment)
             concrete = default_type(index_type)
             if not concrete.is_integer:
@@ -1299,9 +1739,14 @@ class _Inference:
                 ast.FloorDiv: "floordiv",
                 ast.Mod: "mod",
                 ast.Pow: "pow",
+                ast.BitAnd: "bitand",
+                ast.BitOr: "bitor",
+                ast.BitXor: "bitxor",
+                ast.LShift: "lshift",
+                ast.RShift: "rshift",
             }.get(type(node.op))
         if isinstance(node, ast.UnaryOp):
-            return "not" if isinstance(node.op, ast.Not) else "neg" if isinstance(node.op, ast.USub) else "identity"
+            return {ast.Not: "not", ast.USub: "neg", ast.Invert: "invert"}.get(type(node.op), "identity")
         if isinstance(node, ast.BoolOp):
             return "and" if isinstance(node.op, ast.And) else "or"
         if isinstance(node, ast.IfExp):
@@ -1374,7 +1819,126 @@ class _Inference:
         node.func = copy_location(ast.Name(id=helper, ctx=ast.Load()), node.func)
         return True
 
+    def _list_call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType | None:
+        """The type of `len(x)` or of a method call on a list or dict `x`; None when `node` is neither."""
+
+        if dotted_name(node.func) == "len" and len(node.args) == 1 and not node.keywords:
+            argument = self._expression(node.args[0], environment)
+            if isinstance(argument, ConcreteType) and argument.kind in {"list", "str", "dict", "storage"}:
+                return _scalar("i32")
+            raise self.error(node.args[0], "len requires a list, str, dict or TensorStorage")
+        if (created := self._storage_creation(node, environment)) is not None:
+            return created
+        if not isinstance(node.func, ast.Attribute) or not self._receiver(node.func.value, environment):
+            return None
+        receiver = self._expression(node.func.value, environment)
+        if isinstance(receiver, ConcreteType) and receiver.kind == "dict":
+            return self._dict_call(node, receiver, environment)
+        if isinstance(receiver, ConcreteType) and receiver.kind == "storage":
+            return self._storage_call(node, receiver, environment)
+        if not isinstance(receiver, ConcreteType) or receiver.kind != "list":
+            return None
+        element = receiver.arguments[0]
+        assert isinstance(element, ConcreteType)
+        arity = {"append": 1, "pop": 0, "clear": 0}.get(node.func.attr)
+        if arity is None:
+            raise self.error(node.func, f"list has no method '{node.func.attr}'")
+        if len(node.args) != arity or node.keywords:
+            raise self.error(node, f"list.{node.func.attr} takes {arity} argument{'s' if arity != 1 else ''}")
+        if node.func.attr == "append":
+            value = self._expression(node.args[0], environment)
+            if not can_convert(value, element):
+                raise self.error(node.args[0], f"cannot append {describe(value)} to {receiver.spelling}")
+            self._constrain_literal(node.args[0], element)
+            return ConcreteType("void", "void")
+        return element if node.func.attr == "pop" else ConcreteType("void", "void")
+
+    def _dict_call(
+        self, node: ast.Call, receiver: ConcreteType, environment: dict[str, InferenceType]
+    ) -> InferenceType:
+        assert isinstance(node.func, ast.Attribute)
+        method = node.func.attr
+        value = receiver.arguments[1]
+        assert isinstance(value, ConcreteType)
+        arities = {"get": (2, 2), "pop": (1, 2), "clear": (0, 0)}
+        if method in {"keys", "values", "items"}:
+            raise self.error(node, f"dict.{method}() is iterated by a for loop; it is not a value")
+        if method not in arities:
+            raise self.error(node.func, f"dict has no method '{method}'")
+        low, high = arities[method]
+        if not low <= len(node.args) <= high or node.keywords:
+            expected = str(low) if low == high else f"{low} or {high}"
+            raise self.error(node, f"dict.{method} takes {expected} argument{'s' if high != 1 else ''}")
+        if method == "clear":
+            return ConcreteType("void", "void")
+        self._dict_key(node.args[0], receiver, environment)
+        if len(node.args) == 2:
+            default = self._expression(node.args[1], environment)
+            if not can_convert(default, value):
+                raise self.error(node.args[1], f"the default {describe(default)} is not a {value.spelling}")
+            self._constrain_literal(node.args[1], value)
+        return value
+
+    def _reject_value_write(self, target: ast.Subscript, container: InferenceType) -> None:
+        if isinstance(container, ConcreteType) and container.kind == "tensor":
+            name = ast.unparse(target.value)
+            index = ast.unparse(target.slice)
+            raise self.error(
+                target,
+                f"{name} is a Tensor value, which is never written into; build a new one with "
+                f"{name} = {name}.at[{index}].set(x), or hold the elements in a TensorStorage",
+            )
+
+    def _tensor_update(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType | None:
+        """The type of `v.at[...].set(x)` or `.add(x)`, a new Tensor with the selected elements replaced; None when
+        `node` is not one. The `at` attribute and its subscript are syntax only and get no type of their own."""
+
+        update = tensor_update_parts(node)
+        if update is None:
+            return None
+        tensor_node, index_nodes, method = update
+        tensor = self._expression(tensor_node, environment)
+        if not isinstance(tensor, ConcreteType) or tensor.kind != "tensor":
+            raise self.error(tensor_node, f"only a Tensor value has .at[...]; {describe(tensor)} is not one")
+        if method not in {"set", "add"}:
+            raise self.error(node.func, f".at[...] has set(x) and add(x), not {method}")
+        if len(node.args) != 1 or node.keywords:
+            raise self.error(node, f".at[...].{method} takes one value")
+        element = tensor.arguments[0]
+        assert isinstance(element, ConcreteType)
+        if element.kind != "scalar":
+            raise self.error(tensor_node, f".at[...] updates scalar elements; {tensor.spelling} has {element.spelling}")
+        if method == "add" and element.name == "bool":
+            raise self.error(node.func, ".at[...].add needs numeric elements")
+        assert isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Subscript)
+        extents = [int(extent) for extent in tensor.arguments[1:]]  # type: ignore[arg-type]
+        shape = selection_shape(self._selection_plan(node.func.value, index_nodes, extents, environment))
+        block = ConcreteType("tensor", "Tensor", (element, *shape)) if shape else element
+        self._require_block(node.args[0], self._expression(node.args[0], environment), block, method)
+        return tensor
+
+    def _struct_replace(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
+        if len(node.args) != 1 or not node.keywords or any(keyword.arg is None for keyword in node.keywords):
+            raise self.error(node, "replace takes a Struct and the fields to change, as in replace(p, x=1.0)")
+        struct = self._expression(node.args[0], environment)
+        if not isinstance(struct, ConcreteType) or struct.kind != "struct" or struct.name not in self.structs:
+            raise self.error(node.args[0], f"replace takes a Struct value; {describe(struct)} is not one")
+        fields = dict(self.structs[struct.name])
+        for keyword in node.keywords:
+            expected = fields.get(keyword.arg or "")
+            if expected is None:
+                raise self.error(keyword.value, f"{struct.name} has no field '{keyword.arg}'")
+            value = self._expression(keyword.value, environment)
+            if not can_convert(value, expected):
+                raise self.error(keyword.value, f"cannot pass {describe(value)} as {expected.spelling}")
+            self._constrain_literal(keyword.value, expected)
+        return struct
+
     def _call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
+        if (update := self._tensor_update(node, environment)) is not None:
+            return update
+        if self.host and (container := self._list_call(node, environment)) is not None:
+            return container
         self._resolve_method(node, environment)
         resolved_name = (dotted_name(node.func) or "").split(".")[-1]
         name = getattr(node, "_vernon_generic_name", resolved_name)
@@ -1491,10 +2055,22 @@ class _Inference:
                 if result is None or (isinstance(result, ast.Constant) and result.value is None)
                 else self.parse_type(result)
             )
+        if name in self.handles:
+            if arguments:
+                raise self.error(node, f"handle '{name}' constructs only the null handle and takes no arguments")
+            return ConcreteType("handle", name)
         if name in {"int", "i32"}:
             return _scalar("i32")
-        if name == "u32":
-            return _scalar("u32")
+        if (
+            self.host
+            and name in {"i64", "u64", "u32"}
+            and len(arguments) == 1
+            and isinstance(arguments[0], LiteralType)
+        ):
+            # Host literals beyond i32 are only writable as the argument of a wider cast.
+            self._constrain_literal(node.args[0], _scalar(name))
+        if name == "u32" or (self.host and name in {"i64", "u64", "bool"}):
+            return _scalar(name)
         if name in {"float", "f32"}:
             return _scalar("f32")
         if name in {"f16", "f64"}:
@@ -1503,6 +2079,8 @@ class _Inference:
             if arguments:
                 raise self.error(node, f"{name} does not accept arguments")
             return _contract_type(GENERATED_INTERFACE_CONTRACTS[name].type)
+        if name == "replace" and name not in self.structs:
+            return self._struct_replace(node, environment)
         if name in self.structs:
             fields = self.structs[name]
             if len(arguments) != len(fields):
@@ -1783,5 +2361,7 @@ def infer_and_monomorphize_helpers(
     parse_interface: ParseInterface,
     error: Error,
     enabled_features: tuple[str, ...],
+    *,
+    host: bool = False,
 ) -> ast.Module:
-    return _Inference(module, parse_type, parse_interface, error, enabled_features).run()
+    return _Inference(module, parse_type, parse_interface, error, enabled_features, host=host).run()

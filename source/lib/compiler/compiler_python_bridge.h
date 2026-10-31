@@ -106,6 +106,23 @@ VERNON_DSL_CAPI void vernonCompilerDestroySpecializedKernel(VernonPythonSpeciali
 VERNON_DSL_CAPI VernonPythonSpecializedKernelView
 vernonCompilerGetSpecializedKernelView(const VernonPythonSpecializedKernel *result);
 
+typedef struct VernonPythonHostObject VernonPythonHostObject;
+
+typedef struct VernonPythonHostObjectView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView object;
+    VernonStringView triple;
+    VernonStringView optimized_ir;
+} VernonPythonHostObjectView;
+
+VERNON_DSL_CAPI VernonStringView vernonCompilerDefaultHostTriple(void);
+VERNON_DSL_CAPI VernonPythonHostObject *vernonCompilerCompilePythonHost(VernonStringView ir, VernonStringView triple,
+                                                                        VernonStringView cpu,
+                                                                        VernonStringView features);
+VERNON_DSL_CAPI void vernonCompilerDestroyPythonHostObject(VernonPythonHostObject *result);
+VERNON_DSL_CAPI VernonPythonHostObjectView vernonCompilerGetPythonHostObjectView(const VernonPythonHostObject *result);
+
 #ifdef __cplusplus
 }
 #endif

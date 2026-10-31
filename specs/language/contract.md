@@ -106,6 +106,54 @@ Tuple and Struct share deterministic product-layout rules at ABI boundaries,
 but structural and nominal identity remain distinct. All fields must be
 recursively ABI-stable Values.
 
+#### Value updates
+
+A Value is never written into: `v[i] = x` on a Tensor and `p.f = x` on a
+Struct are rejected in device and Host code alike. Updates build a new Value,
+with JAX's spelling for Tensors and `dataclasses.replace`'s for Structs:
+
+```python
+lanes = lanes.at[i].set(x)                # one element replaced
+lanes = lanes.at[0].add(x)                # x added to one element
+table = table.at[1:3, i : i + 2].set(b)   # a block replaced
+pose = vd.replace(pose, scale=2.0)
+```
+
+- `.at` takes the same selection as a read, with scalar elements only: an
+  index per axis, or numpy slices, whose rules are in
+  [`../host/language.md`](../host/language.md#slices). In short, constant
+  slices follow numpy, a dynamic start is the window `i:i+n` with a literal
+  `n`, and a window that runs off the end has its start clamped, as JAX's
+  `dynamic_slice` does. The value is a scalar or a Tensor of the selection's
+  shape. Reads `v[1:3, :]` take the same selections.
+- A negative index counts from the end. A constant index out of range is a
+  compile error. A dynamic one changes nothing in device code, is an
+  `INDEX_OUT_OF_RANGE` error in compiled Host code, and raises `IndexError`
+  in Python mode.
+- `vd.replace` takes the Struct and at least one keyword naming a field.
+- A selection read lowers to one `tensor.extract` per selected element and
+  one `construct`; a window's extracts use the clamped start (`arith.cmpi`
+  and `arith.select` on `index`, so no `minsi`/`maxsi` is needed on any
+  target), and a signed dynamic index wraps by a select on `index < 0`.
+- `.at` lowers to `tensor.extract` of every element and one `construct`. A
+  dynamic index covers position `p` when it wraps to `p`; a window covers `p`
+  from each start that puts `p` inside it, and the block element is chosen
+  by a select chain over those starts. This is O(N) in the element count
+  (times the window length for windows), which suits the small Tensors held
+  in registers. A dedicated insert operation can replace it later without a
+  language change; it is deferred because an op with dynamic indices needs
+  its own reverse-mode rule and tape handling, while these ops already have
+  them. Autodiff follows the `construct` rule and the `arith.select` rule,
+  which sends the cotangent to the chosen operand.
+- The reverse pass rematerializes `index` values rather than taping them,
+  since `index` has no Value ABI layout. A dynamic index has a recomputation
+  budget of 32 ops instead of 8, which covers a wrapped and clamped window
+  start ([`../autodiff/contract.md`](../autodiff/contract.md#12-residual-planning)).
+- `vd.replace` lowers to `struct_get` of the kept fields and one
+  `struct_create`.
+- Elements that change in place belong in a TensorStorage (Host) or a
+  TensorView (device), which are places.
+
 ### 2.4 Portable Value ABI layout
 
 The canonical Value ABI is backend-independent. Scalar size/alignment pairs
@@ -770,8 +818,11 @@ before typing, and a body that holds only a docstring is empty. Any other
 string expression statement is rejected.
 
 The expression subset includes names, numeric and Boolean literals, arithmetic,
-unary operations, one comparison, calls, indexing, Tensor/Tuple/Struct
-construction, and constant Tuple indexing. Supported attributes are immutable
+bitwise operators and shifts on integers, unary operations (`~` on integers),
+one comparison, calls, indexing, Tensor/Tuple/Struct construction, and
+constant Tuple indexing. A left or unsigned right shift by the bit width or
+more, or by a negative amount, is 0, and a signed right shift by such an
+amount fills with the sign, as in numpy. Supported attributes are immutable
 Struct fields, `.shape` on rank-one-or-greater Tensor/TensorView values, and
 rank-one Tensor swizzles over `xyzw`/`rgba`; color aliases canonicalize to the
 corresponding positional mask.

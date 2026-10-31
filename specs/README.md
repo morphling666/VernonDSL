@@ -70,6 +70,12 @@ Architecture and tutorials link to the contract instead of redefining fields.
    cross-backend invariants, and the assessed `PreparedBindingPlan` end state.
 8. [`autodiff/program_adjoint_ssa.md`](autodiff/program_adjoint_ssa.md) defines
    interior Program cotangent SSA and destination-passing accumulation.
+9. [`host/language.md`](host/language.md) is the Host language reference:
+   types, values and places, statements, effects, externs, classes, and the
+   accepted Python-mode differences.
+10. [`host/design.md`](host/design.md) defines the Host language pipeline,
+    classes, metadata, the reflection table, generic externs, and state
+    migration.
 
 ## Guides and platform documents
 
@@ -115,11 +121,17 @@ Architecture and tutorials link to the contract instead of redefining fields.
   specializations, whose rules are in `language/contract.md` section 6.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   lists remaining language-v4 gates.
+- [`language/kernel_limitations.md`](language/kernel_limitations.md) records
+  compute-kernel gaps and CPU performance limits that a real workload, the
+  Vernon engine's procedural terrain, works around.
 - [`future/README.md`](future/README.md) indexes the non-normative future
   compiler architecture, optimization IR, joint planner, numerical
   representation, backend lowering, and implementation roadmap.
 - [`future/host_language.md`](future/host_language.md) is a non-normative future
   Host-language and native-interop design.
+- [`host/roadmap.md`](host/roadmap.md) plans the Host language's next
+  features, its owned-container memory model, call-site type reflection and
+  the ABI v0.1.3 freezes.
 - [`roadmap.md`](roadmap.md) lists project-wide unfinished work.
 
 ## Program boundary

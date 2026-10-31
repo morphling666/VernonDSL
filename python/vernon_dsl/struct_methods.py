@@ -27,6 +27,16 @@ def _decorator(node: ast.expr, expected: str, filename: str) -> bool:
     shared = False
     seen = False
     for keyword in node.keywords:
+        # `c_type` only names the struct in generated Host C headers, and `meta` only annotates its Host reflection.
+        if (
+            expected == "struct"
+            and keyword.arg == "c_type"
+            and isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, str)
+        ):
+            continue
+        if expected == "struct" and keyword.arg == "meta":
+            continue
         if (
             keyword.arg != "shared"
             or seen

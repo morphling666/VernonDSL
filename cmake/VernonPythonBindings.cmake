@@ -55,6 +55,7 @@ function(vernon_add_python_bindings package_directory source_directory)
     nanobind_add_module(
         vernon-dsl-native
         "${source_directory}/python/native_compiler.cpp"
+        "${source_directory}/python/native_host.cpp"
         "${source_directory}/python/native_module.cpp"
         "${source_directory}/python/native_program.cpp"
         "${source_directory}/python/native_program_autodiff.cpp"

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import ast
-from typing import Iterable
+import itertools
+from typing import Callable, Iterable
 
 from ..diagnostics import copy_location
+from ..language.ast_utils import dotted_name, tensor_update_parts
+from ..language.slicing import (
+    AxisIndex,
+    AxisRange,
+    AxisSelection,
+    constant_integer,
+    plan_selection,
+    selection_shape,
+)
 from ..language.stage_registry import GRAPHICS_STAGES
 from ..language.syntax import INTRINSIC_METHODS
 from ..shader_contracts import (
@@ -548,6 +558,11 @@ class _FunctionEmitter:
                     ast.FloorDiv: "floordiv",
                     ast.Mod: "mod",
                     ast.Pow: "pow",
+                    ast.BitAnd: "bitand",
+                    ast.BitOr: "bitor",
+                    ast.BitXor: "bitxor",
+                    ast.LShift: "lshift",
+                    ast.RShift: "rshift",
                 }.get(type(node.op)),
                 (typed_statement.lvalues[0].type, typed_statement.lvalues[0].type),
             )
@@ -732,9 +747,216 @@ class _FunctionEmitter:
         self._line(f"{result} = tensor.splat {value.name} : {tensor_type.mlir}")
         return Value(result, tensor_type)
 
+    # Selections lower to element extraction, select and `construct`, which every backend and the autodiff rules
+    # already handle; a dedicated insert operation can replace them without changing the language. Each axis
+    # evaluates to a constant position, a dynamic position (an `index` value, negative ones wrapped), constant
+    # positions (a `range`), or a dynamic window `(start, length)` whose start is clamped so the window fits.
+
+    def _constant_pool(self) -> Callable[[int], str]:
+        pool: dict[int, str] = {}
+
+        def constant(number: int) -> str:
+            if number not in pool:
+                pool[number] = self._fresh()
+                self._line(f"{pool[number]} = arith.constant {number} : index")
+            return pool[number]
+
+        return constant
+
+    def _index_operand(self, node: ast.expr) -> tuple[str, bool]:
+        """The `index` value of an integer expression, and whether its type is signed."""
+
+        value = self._expression(node)
+        if not value.type.is_integer:
+            raise self.context.error(node, "tensor index must be an integer")
+        if value.type.mlir == "index":
+            return value.name, True
+        cast = self._fresh()
+        self._line(f"{cast} = arith.index_cast {value.name} : {value.type.mlir} to index")
+        return cast, not value.type.name.startswith("u")
+
+    def _select_index(self, condition: str, true_value: str, false_value: str, type_mlir: str = "index") -> str:
+        result = self._fresh()
+        self._line(f"{result} = arith.select {condition}, {true_value}, {false_value} : {type_mlir}")
+        return result
+
+    def _wrapped_index(self, index: str, signed: bool, extent: int, constant: Callable[[int], str]) -> str:
+        if not signed:
+            return index
+        negative = self._fresh()
+        self._line(f"{negative} = arith.cmpi slt, {index}, {constant(0)} : index")
+        wrapped = self._fresh()
+        self._line(f"{wrapped} = arith.addi {index}, {constant(extent)} : index")
+        return self._select_index(negative, wrapped, index)
+
+    def _selection_axes(
+        self, plan: list[AxisSelection], extents: list[int], constant: Callable[[int], str]
+    ) -> list[int | str | range | tuple[str, int]]:
+        axes: list[int | str | range | tuple[str, int]] = []
+        for axis, extent in zip(plan, extents, strict=True):
+            if isinstance(axis, AxisRange):
+                axes.append(range(axis.start, axis.start + axis.step * axis.length, axis.step))
+            elif isinstance(axis, AxisIndex):
+                literal = constant_integer(axis.node)
+                if literal is not None:
+                    axes.append(literal % extent if -extent <= literal < extent else literal)
+                else:
+                    axes.append(self._wrapped_index(*self._index_operand(axis.node), extent, constant))
+            else:
+                start = self._wrapped_index(*self._index_operand(axis.start), extent, constant)
+                below = self._fresh()
+                self._line(f"{below} = arith.cmpi slt, {start}, {constant(0)} : index")
+                start = self._select_index(below, constant(0), start)
+                last = constant(extent - axis.length)
+                above = self._fresh()
+                self._line(f"{above} = arith.cmpi sgt, {start}, {last} : index")
+                axes.append((self._select_index(above, last, start), axis.length))
+        return axes
+
+    def _extract(self, tensor: Value, coordinate: Iterable[int | str], constant: Callable[[int], str]) -> Value:
+        element = tensor.type.arguments[0]
+        assert isinstance(element, DslType)
+        indices = ", ".join(constant(item) if isinstance(item, int) else item for item in coordinate)
+        result = self._fresh()
+        self._line(f"{result} = tensor.extract {tensor.name}[{indices}] : {tensor.type.mlir}")
+        return Value(result, element)
+
+    def _selection(self, node: ast.Subscript, tensor: Value, indices: list[ast.expr]) -> Value:
+        """`v[...]` of a Tensor of scalars: the element, or a Tensor of the selected elements."""
+
+        extents = [int(extent) for extent in tensor.type.arguments[1:]]  # type: ignore[arg-type]
+        constant = self._constant_pool()
+        axes = self._selection_axes(plan_selection(node, indices, extents), extents, constant)
+        options: list[list[int | str]] = []
+        for axis in axes:
+            if isinstance(axis, tuple):
+                start, length = axis
+                positions: list[int | str] = [start]
+                for offset in range(1, length):
+                    shifted = self._fresh()
+                    self._line(f"{shifted} = arith.addi {start}, {constant(offset)} : index")
+                    positions.append(shifted)
+                options.append(positions)
+            else:
+                options.append(list(axis) if isinstance(axis, range) else [axis])
+        elements = [self._extract(tensor, coordinate, constant) for coordinate in itertools.product(*options)]
+        result_type = self._typed_expression(node).type
+        if result_type.kind == "scalar":
+            return elements[0]
+        return self._intrinsic(node, "construct", elements, result_type)
+
+    def _tensor_update(self, node: ast.Call, tensor_node: ast.expr, index_nodes: list[ast.expr], method: str) -> Value:
+        """`v.at[...].set(x)` or `.add(x)`. Each element is the old one unless the selection covers it. A dynamic
+        index covers position p when it wraps to p, so one out of range changes nothing; a window covers p from each
+        start that puts p inside it, and the block element is picked by which start the clamped window has."""
+
+        tensor = self._expression(tensor_node)
+        element = tensor.type.arguments[0]
+        assert isinstance(element, DslType)
+        extents = [int(extent) for extent in tensor.type.arguments[1:]]  # type: ignore[arg-type]
+        assert isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Subscript)
+        plan = plan_selection(node.func.value, index_nodes, extents)
+        constant = self._constant_pool()
+        axes = self._selection_axes(plan, extents, constant)
+        shape = selection_shape(plan)
+        value = self._expression(node.args[0])
+        if value.type.kind == "scalar":
+            value = self._coerce_implicit(node.args[0], value, element)
+        else:
+            value = self._coerce_implicit(node.args[0], value, DslType("tensor", "Tensor", (element, *shape)))
+        add = "arith.addf" if element.is_float else "arith.addi"
+
+        def conjunction(conditions: list[str]) -> str | None:
+            result: str | None = None
+            for condition in conditions:
+                if result is None:
+                    result = condition
+                else:
+                    both = self._fresh()
+                    self._line(f"{both} = arith.andi {result}, {condition} : i1")
+                    result = both
+            return result
+
+        elements: list[Value] = []
+        for position in itertools.product(*(range(extent) for extent in extents)):
+            old = self._extract(tensor, position, constant)
+            matches: list[str] = []
+            block_options: list[list[tuple[str | None, int]]] = []
+            covered = True
+            for axis, p, extent in zip(axes, position, extents, strict=True):
+                if isinstance(axis, int):
+                    covered = axis == p
+                elif isinstance(axis, str):
+                    match = self._fresh()
+                    self._line(f"{match} = arith.cmpi eq, {axis}, {constant(p)} : index")
+                    matches.append(match)
+                elif isinstance(axis, range):
+                    covered = p in axis
+                    if covered:
+                        block_options.append([(None, axis.index(p))])
+                else:
+                    start, length = axis
+                    starts: list[tuple[str | None, int]] = []
+                    for offset in range(length):
+                        if 0 <= p - offset <= extent - length:
+                            match = self._fresh()
+                            self._line(f"{match} = arith.cmpi eq, {start}, {constant(p - offset)} : index")
+                            starts.append((match, offset))
+                    covered = bool(starts)
+                    block_options.append(starts)
+                if not covered:
+                    break
+            if not covered:
+                elements.append(old)
+                continue
+            result = old
+            for choice in itertools.product(*block_options):
+                source = value
+                if value.type.kind == "tensor":
+                    source = self._extract(value, [offset for _, offset in choice], constant)
+                new = source
+                if method == "add":
+                    new = Value(self._fresh(), element)
+                    self._line(f"{new.name} = {add} {old.name}, {source.name} : {element.mlir}")
+                condition = conjunction(matches + [match for match, _ in choice if match is not None])
+                result = (
+                    new
+                    if condition is None
+                    else Value(self._select_index(condition, new.name, result.name, element.mlir), element)
+                )
+            elements.append(result)
+        return self._intrinsic(node, "construct", elements, tensor.type)
+
+    def _struct_replace(self, node: ast.Call, result_type: DslType) -> Value:
+        struct = self._expression(node.args[0])
+        fields = self._struct_value_fields(node, struct)
+        changes = {keyword.arg: keyword.value for keyword in node.keywords}
+        values = [
+            self._coerce_implicit(changes[name], self._expression(changes[name]), annotation.type)
+            if name in changes
+            else field
+            for (name, annotation), field in zip(self.context.structs[result_type.name], fields, strict=True)
+        ]
+        result = self._fresh()
+        self._line(
+            f'{result} = "vernon.struct_create"({", ".join(value.name for value in values)}) '
+            f'{{type_name = "{result_type.name}"}} : '
+            f"({', '.join(value.type.mlir for value in values)}) -> {result_type.mlir}"
+        )
+        return Value(result, result_type, tuple(values))
+
     def _call(self, node: ast.Call) -> Value:
+        if (update := tensor_update_parts(node)) is not None:
+            return self._tensor_update(node, *update)
         typed_call = self._typed_expression(node)
         name = typed_call.operation or ""
+        if (
+            (dotted_name(node.func) or "").split(".")[-1] == "replace"
+            and typed_call.type.kind == "struct"
+            and node.keywords
+            and "replace" not in self.context.signatures
+        ):
+            return self._struct_replace(node, typed_call.type)
         if node.keywords and name != "workgroup_storage":
             raise self.context.error(node, "function calls do not support keyword arguments")
         if name == "workgroup_storage":
@@ -1124,6 +1346,10 @@ class _FunctionEmitter:
         if value.type.kind != "tensor":
             raise self.context.error(node, "indexing requires a Tensor or Storage value")
         indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        element = value.type.arguments[0]
+        assert isinstance(element, DslType)
+        if element.kind == "scalar":
+            return self._selection(node, value, indices)
         if len(indices) != len(value.type.arguments) - 1:
             raise self.context.error(node, "tensor.extract requires one index per tensor dimension")
         index_values: list[str] = []

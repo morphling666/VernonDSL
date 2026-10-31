@@ -178,6 +178,11 @@ FailureOr<AdRematerializationRecipe> buildAutodiffRematerializationRecipe(Value 
 FailureOr<AdRematerializationRecipe>
 buildAutodiffRematerializationRecipe(Value value, func::FuncOp function,
                                      llvm::function_ref<bool(Value)> isAvailableRoot);
+/// A recipe for a value the reverse pass must rebuild because it has no tape layout. An `index` value gets a larger
+/// recomputation budget; replay legality checks must use the overloads above.
+FailureOr<AdRematerializationRecipe>
+buildAutodiffIndexRematerializationRecipe(Value value, func::FuncOp function,
+                                          llvm::function_ref<bool(Value)> isAvailableRoot);
 
 struct AdPhysicalBuffer {
     AdMemoryDomain domain{AdMemoryDomain::PersistentResidual};

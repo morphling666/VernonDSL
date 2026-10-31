@@ -5,18 +5,44 @@
 #include "runtime/runtime_state.h"
 #include "runtime/tensor_bridge.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 using namespace vernon::runtime;
 using namespace vernon::runtime::capi;
 
 namespace {
+
+struct HostModuleRegistration {
+    const VhModule *module;
+    size_t references;
+};
+
+// Per id, registrations oldest first; lookups take the back so the newest live table wins.
+struct HostModuleRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::vector<HostModuleRegistration>> modules;
+};
+
+// Created on first use, because cooked objects register from static constructors that may run before this file's
+// globals are initialized, and leaked, because their static destructors may unregister after Runtime statics are
+// destroyed.
+HostModuleRegistry &hostModuleRegistry() {
+    static auto *registry = new HostModuleRegistry;
+    return *registry;
+}
+
+bool validHostModule(const VernonStaticHostModule *module) {
+    return module && module->id.data && module->id.size && module->module;
+}
 
 vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError> createRuntimeContext() noexcept {
     auto created = VernonRuntimeContext::create();
@@ -218,6 +244,59 @@ VernonStatus vernonRuntimeRegisterStaticCpuEntries(const VernonStaticCpuEntry *e
 
 VernonStatus vernonRuntimeUnregisterStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count) {
     return runtimeResultBoundary(nullptr, [&] { return unregisterBackendStaticCpuEntries(entries, count); });
+}
+
+VernonStatus vernonRuntimeRegisterStaticHostModule(const VernonStaticHostModule *module) {
+    return runtimeStatusBoundary(nullptr, [&] {
+        if (!validHostModule(module))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        HostModuleRegistry &registry = hostModuleRegistry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto &registrations = registry.modules[std::string(module->id.data, module->id.size)];
+        const auto found = std::find_if(registrations.begin(), registrations.end(), [&](const auto &registration) {
+            return registration.module == module->module;
+        });
+        if (found != registrations.end()) {
+            ++found->references;
+        } else {
+            registrations.push_back({module->module, 1});
+        }
+        return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonRuntimeUnregisterStaticHostModule(const VernonStaticHostModule *module) {
+    return runtimeStatusBoundary(nullptr, [&] {
+        if (!validHostModule(module))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        HostModuleRegistry &registry = hostModuleRegistry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto id = registry.modules.find(std::string(module->id.data, module->id.size));
+        if (id == registry.modules.end())
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto &registrations = id->second;
+        const auto found = std::find_if(registrations.begin(), registrations.end(), [&](const auto &registration) {
+            return registration.module == module->module;
+        });
+        if (found == registrations.end())
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        if (--found->references == 0)
+            registrations.erase(found);
+        if (registrations.empty())
+            registry.modules.erase(id);
+        return VERNON_STATUS_OK;
+    });
+}
+
+const VhModule *vernonRuntimeFindHostModule(VernonStringView id) {
+    return runtimeValueBoundary(nullptr, static_cast<const VhModule *>(nullptr), [&]() -> const VhModule * {
+        if (!id.data || !id.size)
+            return nullptr;
+        HostModuleRegistry &registry = hostModuleRegistry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = registry.modules.find(std::string(id.data, id.size));
+        return found == registry.modules.end() ? nullptr : found->second.back().module;
+    });
 }
 
 VernonStatus vernonRuntimeRegisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,

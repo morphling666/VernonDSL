@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "native_compiler.h"
+#include "native_host.h"
 
 #include <nanobind/nanobind.h>
 
@@ -16,4 +17,5 @@ NB_MODULE(_native, module) {
         .value("OPENGL", VERNON_TARGET_OPENGL)
         .value("OPENGL_ES", VERNON_TARGET_OPENGL_ES);
     bindNativeCompiler(module);
+    bindNativeHost(module);
 }

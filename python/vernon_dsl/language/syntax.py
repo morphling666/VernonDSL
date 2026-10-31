@@ -1,6 +1,8 @@
 from .stage_registry import ENTRY_DECORATORS
 
-FUNCTION_DECORATORS = ENTRY_DECORATORS | {"func"}
+# Host functions run on the CPU host, never as a shader stage; externs declare C functions Host code calls.
+HOST_FUNCTION_DECORATORS = frozenset({"host", "extern"})
+FUNCTION_DECORATORS = ENTRY_DECORATORS | {"func"} | HOST_FUNCTION_DECORATORS
 INTRINSIC_METHODS = frozenset(
     {
         "norm",

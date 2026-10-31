@@ -476,6 +476,15 @@ oldest live one. The registry is created on first use and intentionally
 leaked, so constructors may run before any other Runtime static initializer
 and destructors may run after Runtime statics are destroyed.
 
+Host module assets ([`../host/design.md`](../host/design.md#build-integration))
+register the same way, through `vernonRuntimeRegisterStaticHostModule` and
+`vernonRuntimeUnregisterStaticHostModule`, with `{asset id, VhModule table}`
+records. That registry is also created on first use, leaked, and reference
+counted per id and table. Its lookup, `vernonRuntimeFindHostModule`, returns
+the newest live registration rather than the oldest. A table registered at
+run time, such as a Python-mode table during development or a reloaded one,
+must shadow the linked object, and withdrawing it restores the earlier one.
+
 Chosen over cooked registration `.c`/`.h` glue because that glue had to be
 compiled per Program and invoked by the application, which no other backend
 requires. The cost is the usual constructor rule: objects in a static library

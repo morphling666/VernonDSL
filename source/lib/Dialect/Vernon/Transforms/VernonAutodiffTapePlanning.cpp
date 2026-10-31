@@ -16,6 +16,11 @@ namespace mlir::vernon {
 namespace {
 
 constexpr uint64_t kMaximumRematerializationCost = 8;
+// An `index` value has no Value ABI layout, so it cannot be taped and rematerialization is its only source in the
+// reverse pass. Index arithmetic (wrapping a negative index, clamping a window start) is cheap, so it gets a larger
+// budget rather than failing the gradient. It applies only when saving a dynamic index's source: the replay
+// legality checks keep the normal budget, since raising it there changes which loops are replayed.
+constexpr uint64_t kMaximumIndexRematerializationCost = 32;
 
 FailureOr<uint64_t> checkedAdd(uint64_t left, uint64_t right) {
     if (left > std::numeric_limits<uint64_t>::max() - right)
@@ -160,7 +165,8 @@ bool isRematerializableDialect(Operation *operation) {
 }
 
 FailureOr<AdRematerializationRecipe> buildRematerializationRecipeImpl(Value value, func::FuncOp function,
-                                                                      llvm::function_ref<bool(Value)> isAvailableRoot) {
+                                                                      llvm::function_ref<bool(Value)> isAvailableRoot,
+                                                                      uint64_t maximumCost) {
     AdRematerializationRecipe recipe;
     recipe.value = value;
     DenseSet<Operation *> planned;
@@ -185,7 +191,7 @@ FailureOr<AdRematerializationRecipe> buildRematerializationRecipeImpl(Value valu
         if (!planned.insert(defining).second)
             return success();
         FailureOr<uint64_t> cost = checkedAdd(recipe.estimatedCost, estimateRematerializationCost(defining));
-        if (failed(cost) || *cost > kMaximumRematerializationCost)
+        if (failed(cost) || *cost > maximumCost)
             return failure();
         recipe.estimatedCost = *cost;
         recipe.operations.push_back(defining);
@@ -198,13 +204,22 @@ FailureOr<AdRematerializationRecipe> buildRematerializationRecipeImpl(Value valu
 } // namespace
 
 FailureOr<AdRematerializationRecipe> buildAutodiffRematerializationRecipe(Value value, func::FuncOp function) {
-    return buildRematerializationRecipeImpl(value, function, [](Value) { return false; });
+    return buildRematerializationRecipeImpl(
+        value, function, [](Value) { return false; }, kMaximumRematerializationCost);
 }
 
 FailureOr<AdRematerializationRecipe>
 buildAutodiffRematerializationRecipe(Value value, func::FuncOp function,
                                      llvm::function_ref<bool(Value)> isAvailableRoot) {
-    return buildRematerializationRecipeImpl(value, function, isAvailableRoot);
+    return buildRematerializationRecipeImpl(value, function, isAvailableRoot, kMaximumRematerializationCost);
+}
+
+FailureOr<AdRematerializationRecipe>
+buildAutodiffIndexRematerializationRecipe(Value value, func::FuncOp function,
+                                          llvm::function_ref<bool(Value)> isAvailableRoot) {
+    return buildRematerializationRecipeImpl(value, function, isAvailableRoot,
+                                            isa<IndexType>(value.getType()) ? kMaximumIndexRematerializationCost
+                                                                            : kMaximumRematerializationCost);
 }
 
 StringRef stringifyAdResidualSourceKind(AdResidualSourceKind kind) {
@@ -1045,7 +1060,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return success();
         }
         FailureOr<AdRematerializationRecipe> recipe =
-            buildAutodiffRematerializationRecipe(index, function, isAvailablePlanningRoot);
+            buildAutodiffIndexRematerializationRecipe(index, function, isAvailablePlanningRoot);
         if (succeeded(recipe)) {
             const ValueAbiLayout *knownLayout = analysis.getValueAbi(index);
             FailureOr<ValueAbiLayout> canonical =

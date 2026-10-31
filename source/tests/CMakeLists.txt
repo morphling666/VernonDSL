@@ -242,6 +242,7 @@ if(TARGET VernonRuntime)
         runtime/graphics_invocation_planner_test.cpp
         runtime/program_instance_test.cpp
         runtime/program_manifest_test.cpp
+        runtime/program_tensor_copy_test.cpp
         runtime/resolved_execution_plan_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
@@ -258,8 +259,11 @@ if(TARGET VernonRuntime)
         runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
     target_include_directories(
-        VernonRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
-                                   "${VERNON_TEST_BINARY_ROOT}/generated")
+        VernonRuntimeTests
+        PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                "${VERNON_TEST_ROOT}/support"
+                "${VERNON_TEST_BINARY_ROOT}/generated"
+                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/hostlang/include")
     target_link_libraries(VernonRuntimeTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting
                                                      nlohmann_json::nlohmann_json)
     vernon_enable_glfw_context_owner_for_test(VernonRuntimeTests)
@@ -1202,6 +1206,40 @@ if(TARGET VernonRuntime)
             vernon-opengl-u32-vertex-test-bundle
             vernon-opengl-f32-vertex-test-bundle
             vernon-opengl-storage-image-test-bundle)
+    endif()
+
+    if(TARGET vernon-dsl-native AND Python_FOUND)
+        find_package(nanobind CONFIG QUIET)
+    endif()
+    if(TARGET vernon-dsl-native
+       AND Python_FOUND
+       AND nanobind_FOUND)
+        # One C++ consumer of a Host module asset, driven by asset id against the cooked object it links and against the
+        # table Python mode builds; both must print the same report.
+        set(host_systems_asset "${VERNON_REPOSITORY_ROOT}/python/tests/host_programs/systems_asset.py")
+        vernon_add_program_asset(
+            vernon-host-systems
+            SOURCE
+            "${host_systems_asset}:asset"
+            TARGET
+            cpu
+            OUTPUT_DIRECTORY
+            "${VERNON_TEST_BINARY_ROOT}/host_systems"
+            DEPENDS
+            "${VERNON_REPOSITORY_ROOT}/python/tests/host_programs/systems.py"
+            "${VERNON_REPOSITORY_ROOT}/python/tests/host_programs/abilities.py")
+        nanobind_add_module(VernonHostConsumerFixture NB_STATIC
+                            "${VERNON_TEST_ROOT}/fixtures/host_consumer_fixture.cpp")
+        set_target_properties(VernonHostConsumerFixture PROPERTIES OUTPUT_NAME vernon_host_consumer_fixture)
+        target_include_directories(VernonHostConsumerFixture PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
+        target_link_libraries(VernonHostConsumerFixture PRIVATE vernon-host-systems Vernon::Runtime)
+        vernon_stage_target_files(VernonHostConsumerFixture VernonRuntime)
+        add_test(
+            NAME VernonPythonHostConsumerTest
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/host_consumer_runtime_test.py"
+                "$<TARGET_FILE_DIR:VernonHostConsumerFixture>" "${VERNON_REPOSITORY_ROOT}/python"
+                "${host_systems_asset}")
     endif()
 
     file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")

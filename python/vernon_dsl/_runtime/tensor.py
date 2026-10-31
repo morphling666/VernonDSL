@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Annotated, Any, get_args, get_origin
@@ -20,7 +21,8 @@ from ..host_values import (
     unpack_host_value,
     unpack_tangent_value,
 )
-from ..types import TypeExpr, _Scalar
+from ..language.slicing import runtime_key
+from ..types import Tensor, TypeExpr, _Scalar
 from .residency import _BufferRegion, _ResourceControlBlock, _scoped_host_access
 from .session import _InvocationContext, cpu
 
@@ -432,13 +434,21 @@ class TensorStorage:
         return _storage_array_dtype(layout), layout
 
     @classmethod
-    def zeros_like(cls, value: TensorStorage | TensorView) -> TensorStorage:
+    def _like(cls, value: TensorStorage | TensorView, name: str, allocate: Callable[..., np.ndarray]) -> TensorStorage:
         if not isinstance(value, (TensorStorage, TensorView)):
-            raise TypeError("zeros_like() requires TensorStorage or TensorView")
+            raise TypeError(f"{name}() requires TensorStorage or TensorView")
         owner = value.owner if isinstance(value, TensorView) else value
         if not isinstance(owner, TensorStorage):
             raise TypeError("Transients require TensorStorage-backed values")
-        return cls.zeros(dtype=owner.dtype, shape=tuple(value.shape))
+        return cls(
+            allocate(tuple(value.shape), dtype=owner._array.dtype, order="C"),
+            element_type=owner._element_type,
+            element_layout=owner._element_layout,
+        )
+
+    @classmethod
+    def zeros_like(cls, value: TensorStorage | TensorView) -> TensorStorage:
+        return cls._like(value, "zeros_like", np.zeros)
 
     @classmethod
     def zeros(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
@@ -451,12 +461,7 @@ class TensorStorage:
 
     @classmethod
     def empty_like(cls, value: TensorStorage | TensorView) -> TensorStorage:
-        if not isinstance(value, (TensorStorage, TensorView)):
-            raise TypeError("empty_like() requires TensorStorage or TensorView")
-        owner = value.owner if isinstance(value, TensorView) else value
-        if not isinstance(owner, TensorStorage):
-            raise TypeError("Transients require TensorStorage-backed values")
-        return cls.empty(dtype=owner.dtype, shape=tuple(value.shape))
+        return cls._like(value, "empty_like", np.empty)
 
     @classmethod
     def empty(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
@@ -546,14 +551,86 @@ class TensorStorage:
             dtype=scalar_dtype,
         )
 
-    def __getitem__(self, path: str) -> TensorView:
-        return self._tangent_view(
-            path,
-            shape=self.shape,
-            strides=tuple(stride // self.dtype.itemsize for stride in self._array.strides),
-            offset=0,
-            access="read_write",
+    def __getitem__(self, index: Any) -> Any:
+        """A structural path of a tangent storage is its TensorView. Any other index reads as numpy indexes the
+        storage's array: an element is a numpy scalar, and a selection is a `Tensor` value (a read-only copy), so
+        writes go through `__setitem__`, which tracks what the host changed. A window `i:i+n` that runs off the end
+        raises `IndexError` rather than shortening, as compiled code does."""
+
+        if isinstance(index, str):
+            return self._tangent_view(
+                index,
+                shape=self.shape,
+                strides=tuple(stride // self.dtype.itemsize for stride in self._array.strides),
+                offset=0,
+                access="read_write",
+            )
+        return self._read_elements(index)
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        self._write_elements(index, value)
+
+    def __len__(self) -> int:
+        if not self.shape:
+            raise TypeError("len() of a rank-0 TensorStorage")
+        return self.shape[0]
+
+    def _require_plain_elements(self) -> None:
+        if self._element_layout is not None:
+            raise TypeError("index a Struct TensorStorage through to_values, copy_from_values or update_values")
+
+    @_scoped_host_access("read")
+    def _read_elements(self, index: Any) -> Any:
+        self._require_plain_elements()
+        selected = self._borrowed_array()[runtime_key(index, self.shape, clamp=False)]
+        return Tensor._result(selected.copy()) if isinstance(selected, np.ndarray) else selected
+
+    @_scoped_host_access("write")
+    def _write_elements(self, index: Any, value: Any) -> None:
+        self._require_plain_elements()
+        index = runtime_key(index, self.shape, clamp=False)
+        target = self._native_host_array()
+        window = self._basic_window(target, index)
+        if window is None:
+            # An advanced index selects no single window of the array, so the whole storage is brought to the
+            # host first and then republished.
+            self.synchronize()
+            target[index] = value
+            self._mark_host_dirty([(0, self._array.nbytes)])
+            return
+        dirty_ranges = self._prepare_partial_host_write(_array_byte_ranges(window, self._array))
+        target[index] = value
+        self._mark_host_dirty(dirty_ranges, host_complete=False)
+
+    @staticmethod
+    def _basic_window(target: np.ndarray, index: Any) -> np.ndarray | None:
+        """The view of `target` a basic index (integers, slices, `...`) selects, or None for an advanced one."""
+
+        key = index if isinstance(index, tuple) else (index,)
+        basic = all(
+            item is Ellipsis
+            or isinstance(item, slice)
+            or (isinstance(item, (int, np.integer)) and not isinstance(item, bool))
+            for item in key
         )
+        if not basic:
+            return None
+        selected = target[index]
+        if isinstance(selected, np.ndarray):
+            return selected
+        # An element: numpy has checked the indices, so each integer, wrapped, is its own one-element slice.
+        integers = [int(item) for item in key if item is not Ellipsis]
+        return target[
+            tuple(slice(item % extent, item % extent + 1) for item, extent in zip(integers, target.shape, strict=True))
+        ]
+
+    @_scoped_host_access("write")
+    def fill(self, value: Any) -> None:
+        """Sets every element to `value`, as numpy's `fill`."""
+
+        self._require_plain_elements()
+        self._native_host_array().fill(value)
+        self._mark_host_dirty([(0, self._array.nbytes)])
 
     def _tangent_view(
         self,
@@ -860,12 +937,17 @@ class TensorStorage:
 
     @_scoped_host_access("write")
     def copy_from_values(self, values: Any) -> None:
-        if (
-            self._element_layout is None
-            or isinstance(self._element_layout, TangentLayout)
-            or self._element_type is None
-        ):
-            raise TypeError("copy_from_values requires a Struct TensorStorage")
+        if self._element_layout is None:
+            # A scalar element's logical Value is the scalar itself, so the values are any array of this shape.
+            target = self._native_host_array()
+            source = np.asarray(values)
+            if source.shape != target.shape:
+                raise ValueError(f"logical Value shape {source.shape} does not match storage shape {self.shape}")
+            np.copyto(target, source, casting="same_kind")
+            self._mark_host_dirty([(0, self._array.nbytes)])
+            return
+        if isinstance(self._element_layout, TangentLayout) or self._element_type is None:
+            raise TypeError("copy_from_values requires a Struct or scalar TensorStorage")
         logical_shape = _logical_collection_shape(values, self._element_type)
         if logical_shape != self.shape:
             raise ValueError(f"logical Value shape {logical_shape} does not match storage shape {self.shape}")
@@ -904,8 +986,13 @@ class TensorStorage:
 
     @_scoped_host_access("read")
     def to_values(self) -> Any:
-        if self._element_layout is None or self._element_type is None:
-            raise TypeError("to_values requires a Struct TensorStorage")
+        if self._element_layout is None:
+            self.synchronize()
+            if not self.shape:
+                return self._array[()]
+            return Tensor._result(self._array.copy())
+        if self._element_type is None:
+            raise TypeError("to_values requires a Struct or scalar TensorStorage")
         self.synchronize()
         element_layout = self._element_layout
 
@@ -923,6 +1010,12 @@ class TensorStorage:
 
     def synchronize(self, region: _BufferRegion | None = None) -> None:
         _synchronize_buffer(self, self._region if region is None else region)
+
+    def _detach_host_array(self) -> None:
+        """Moves the elements into an array of the storage's own, before the memory its array views is freed."""
+
+        self.synchronize()
+        self._array = self._array.copy()
 
     def _device_claim_region(self, context: _InvocationContext, region: _BufferRegion, access: str) -> _BufferRegion:
         if context.session.arch == cpu:

@@ -2,6 +2,7 @@
 
 #include "VernonGpuAutodiffAbi.h"
 #include "compiler_frontend.h"
+#include "compiler_host.h"
 #include "compiler_internal.h"
 #include "compiler_program_builtin.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -53,7 +54,17 @@ void appendLayoutTree(const mlir::vernon::CanonicalAbiNode &node, std::vector<Va
 
 VernonStringView viewOf(const std::string &value) { return {value.data(), value.size()}; }
 
+llvm::StringRef stringRefOf(VernonStringView value) {
+    return value.data ? llvm::StringRef(value.data, value.size) : llvm::StringRef();
+}
+
 } // namespace
+
+struct VernonPythonHostObject {
+    VernonStatus status{VERNON_STATUS_INTERNAL_ERROR};
+    std::string diagnostics;
+    vernon::compiler::HostObject object;
+};
 
 struct VernonPythonValueAbiPlan {
     VernonStatus status{VERNON_STATUS_INTERNAL_ERROR};
@@ -512,6 +523,32 @@ VernonPythonSpecializedKernelView vernonCompilerGetSpecializedKernelView(const V
     if (!result)
         return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}};
     return {result->status, viewOf(result->diagnostics), viewOf(result->module)};
+}
+
+VernonStringView vernonCompilerDefaultHostTriple(void) {
+    static const std::string triple = vernon::compiler::defaultHostTriple();
+    return viewOf(triple);
+}
+
+VernonPythonHostObject *vernonCompilerCompilePythonHost(VernonStringView ir, VernonStringView triple,
+                                                        VernonStringView cpu, VernonStringView features) {
+    std::unique_ptr<VernonPythonHostObject> result(new (std::nothrow) VernonPythonHostObject());
+    if (!result)
+        return nullptr;
+    result->status = vernon::compiler::compileHostObject(stringRefOf(ir), stringRefOf(triple), stringRefOf(cpu),
+                                                         stringRefOf(features), result->object, result->diagnostics)
+                         ? VERNON_STATUS_OK
+                         : VERNON_STATUS_INVALID_ARGUMENT;
+    return result.release();
+}
+
+void vernonCompilerDestroyPythonHostObject(VernonPythonHostObject *result) { delete result; }
+
+VernonPythonHostObjectView vernonCompilerGetPythonHostObjectView(const VernonPythonHostObject *result) {
+    if (!result)
+        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, {}};
+    return {result->status, viewOf(result->diagnostics), viewOf(result->object.object), viewOf(result->object.triple),
+            viewOf(result->object.optimizedIr)};
 }
 
 } // extern "C"

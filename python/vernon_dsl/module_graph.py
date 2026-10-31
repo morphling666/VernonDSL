@@ -22,7 +22,7 @@ from .frontend.model import ConcreteType
 from .language.ast_utils import decorator_name as _decorator_name
 from .language.ast_utils import dotted_name as _dotted_name
 from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
+from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS, HOST_FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .source_identity import (
     project_module_name,
@@ -53,7 +53,13 @@ _HOST_MODULES = {
 _SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type", "format"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
-_CLASS_DECORATORS = frozenset({"struct", "params"})
+_CLASS_DECORATORS = frozenset({"struct", "params", "handle", "host"})
+
+
+def _is_host_function(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.FunctionDef) and any(
+        _decorator_name(item) in HOST_FUNCTION_DECORATORS for item in node.decorator_list
+    )
 
 
 def _is_dsl_class(node: ast.AST | None) -> bool:
@@ -904,10 +910,11 @@ class ModuleGraph:
                     is_selected_entry = selected_entry_key == (module.path, original_name)
                     if is_entry:
                         entry_names.add(emitted_names[(module.path, original_name)])
-                    if module is not root and not is_selected_entry:
+                    if module is not root and not is_selected_entry and not _is_host_function(transformed):
                         # Imported entries are retained as private functions.
                         # The call-graph check still remembers their original
-                        # stage identity and rejects calls to them.
+                        # stage identity and rejects calls to them. Host functions
+                        # and externs keep their decorators, which carry their ABI.
                         transformed.decorator_list = [ast.Name(id="func", ctx=ast.Load())]
                 transformed = rewriter.visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
@@ -951,14 +958,19 @@ class ModuleGraph:
     def _emitted_names(self, root: _Module) -> dict[tuple[Path, str], str]:
         """Names definitions in the combined source: imported helpers carry their module prefix, while a Struct keeps
         its declared name from any module, because host Values, reflection, and manifests name a Struct by its class
-        name. Two reachable Structs with one name therefore conflict."""
+        name. So does a handle, and a Host class, whose C symbols and table entry carry the bare name, so that Host
+        modules compiled into one object agree on it. Two reachable such types with one name therefore conflict."""
 
         emitted_names: dict[tuple[Path, str], str] = {}
         owners: dict[str, Path] = {}
         for module in self.order:
             prefix = "" if module is root else self._symbol_prefix(module)
             for symbol, definition in module.definitions.items():
-                emitted = symbol if not prefix or _is_struct_declaration(definition) else f"{prefix}{symbol}"
+                keeps_name = _is_struct_declaration(definition) or (
+                    isinstance(definition, ast.ClassDef)
+                    and any(_decorator_name(item) in {"handle", "host"} for item in definition.decorator_list)
+                )
+                emitted = symbol if not prefix or keeps_name else f"{prefix}{symbol}"
                 emitted_names[(module.path, symbol)] = emitted
                 if (module.path, symbol) not in self.reachable_symbols:
                     continue
@@ -968,7 +980,8 @@ class ModuleGraph:
                         module,
                         definition,
                         f"conflicting declarations named '{emitted}' in {self._display_path(owner)} and "
-                        f"{self._display_path(module.path)}; a Struct keeps its declared name across modules",
+                        f"{self._display_path(module.path)}; Structs, handles, and Host classes keep their declared "
+                        "names across modules",
                     )
         return emitted_names
 
@@ -1471,7 +1484,7 @@ class ModuleGraph:
         functions = {statement.name: statement for statement in body if isinstance(statement, ast.FunctionDef)}
         selected = functions.get(entry)
         if selected is None or not any(
-            _decorator_name(decorator) in _STAGE_DECORATORS for decorator in selected.decorator_list
+            _decorator_name(decorator) in _STAGE_DECORATORS | {"host"} for decorator in selected.decorator_list
         ):
             self._error(root, root.tree, f"unknown shader entry point '{entry}'")
         # A method call left on its receiver resolves only after inference, so it keeps every same-named method.
@@ -1548,6 +1561,15 @@ class ModuleGraph:
                     if node.func.id in entry_names:
                         module, _ = function_sources[statement.name]
                         self._error(module, node, f"entry function '{node.func.id}' cannot be called")
+                    callee = function_nodes.get(node.func.id)
+                    if _is_host_function(callee) and not _is_host_function(statement):
+                        module, _ = function_sources[statement.name]
+                        kind = _decorator_name(callee.decorator_list[0]) if callee is not None else "host"
+                        self._error(
+                            module,
+                            node,
+                            f"device function '{statement.name}' cannot call @{kind} function '{node.func.id}'",
+                        )
 
         states: dict[str, int] = {}
         stack: list[str] = []

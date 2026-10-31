@@ -111,11 +111,11 @@ def write_bundle_artifacts(plan: BundlePlan, output: Path) -> Path:
         encoding="utf-8",
         newline="\n",
     )
-    _prune_stale_outputs(output, owned)
+    prune_stale_artifacts(output, owned)
     return manifest
 
 
-def _prune_stale_outputs(output: Path, owned: set[Path]) -> None:
+def prune_stale_artifacts(output: Path, owned: set[Path]) -> None:
     # Content-addressed artifacts are never overwritten, so an earlier cook's
     # artifacts would otherwise accumulate next to the current ones.
     artifacts = output / "artifacts"
@@ -126,4 +126,10 @@ def _prune_stale_outputs(output: Path, owned: set[Path]) -> None:
             path.unlink()
 
 
-__all__ = ["artifact_extension", "encode_runtime_stage", "write_bundle_artifacts", "write_external_artifact"]
+__all__ = [
+    "artifact_extension",
+    "encode_runtime_stage",
+    "prune_stale_artifacts",
+    "write_bundle_artifacts",
+    "write_external_artifact",
+]

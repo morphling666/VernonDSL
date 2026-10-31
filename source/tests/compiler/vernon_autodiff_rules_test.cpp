@@ -493,6 +493,7 @@ TEST_F(VernonAutodiffRulesTest, RegistryMatchesFrontendPureRuleInventoryAndPrima
         EXPECT_FALSE(rule->hasJvpBuilder());
     }
     const SmallVector<std::pair<StringRef, SmallVector<Requirement>>> tensorRules = {
+        {"arith.select", {Requirement::operand(0, {1, 2})}},
         {"tensor.extract", {}},
         {"tensor.splat", {}},
         {"vernon.swizzle", {}},

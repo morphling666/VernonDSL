@@ -12,8 +12,10 @@ import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ._markers import dsl_options, is_struct_class
-from .language.scalar_types import SCALAR_TYPES
-from .types import TypeExpr, _Scalar
+from .language.scalar_types import ALL_SCALAR_TYPES, SCALAR_TYPES
+from .types import Matrix, Tensor, TypeExpr, Vector, _Scalar
+
+_TENSOR_CLASSES = {"Vector": Vector, "Matrix": Matrix, "Tensor": Tensor}
 
 
 @dataclass(frozen=True)
@@ -643,7 +645,7 @@ def _shape_and_dtype(annotation: TypeExpr) -> tuple[tuple[int, ...], Any] | None
             and isinstance(shape, tuple)
             and all(isinstance(dimension, int) and dimension > 0 for dimension in shape)
         ):
-            return (shape, NUMPY_DTYPE_BY_SCALAR[scalar.name].type)
+            return (shape, np.dtype(ALL_SCALAR_TYPES[scalar.name].numpy).type)
     if name in {"Vector", "Matrix"}:
         rank = 1 if name == "Vector" else 2
         if (
@@ -651,17 +653,21 @@ def _shape_and_dtype(annotation: TypeExpr) -> tuple[tuple[int, ...], Any] | None
             and isinstance(arguments[0], _Scalar)
             and all(isinstance(dimension, int) and dimension > 0 for dimension in arguments[1:])
         ):
-            return (tuple(arguments[1:]), NUMPY_DTYPE_BY_SCALAR[arguments[0].name].type)
+            return (tuple(arguments[1:]), np.dtype(ALL_SCALAR_TYPES[arguments[0].name].numpy).type)
     return None
+
+
+_SCALAR_ALIASES = {bool: "bool", int: "i32", float: "f32"}
 
 
 def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
     annotation = _base_annotation(annotation)
-    if isinstance(annotation, _Scalar):
+    scalar = annotation.name if isinstance(annotation, _Scalar) else _SCALAR_ALIASES.get(annotation)
+    if scalar is not None:
         try:
-            return NUMPY_DTYPE_BY_SCALAR[annotation.name].type(value)
+            return np.dtype(ALL_SCALAR_TYPES[scalar].numpy).type(value)
         except (TypeError, ValueError, OverflowError) as error:
-            raise TypeError(f"field '{field_name}' requires {annotation.name}") from error
+            raise TypeError(f"field '{field_name}' requires {scalar}") from error
     if isinstance(annotation, TypeExpr):
         if annotation.name == "Tuple":
             if not isinstance(value, tuple) or len(value) != len(annotation.arguments):
@@ -677,6 +683,7 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
         result = np.array(value, dtype=dtype, copy=True)
         if result.shape != shape:
             raise TypeError(f"field '{field_name}' requires shape {shape}, got {result.shape}")
+        result = result.view(_TENSOR_CLASSES[annotation.name])
         result.setflags(write=False)
         return result
     if is_struct_class(annotation):
@@ -716,9 +723,29 @@ def make_shared_struct(cls: type[Any]) -> type[Any]:
             raise AttributeError(f"{cls.__name__} values are immutable; cannot assign '{name}'")
         raise AttributeError(f"{cls.__name__} fields are initialized by its constructor")
 
+    def __repr__(self: Any) -> str:
+        return f"{cls.__name__}(" + ", ".join(f"{name}={getattr(self, name)!r}" for name in field_names) + ")"
+
     cls.__init__ = __init__  # type: ignore[method-assign]
     cls.__setattr__ = __setattr__  # type: ignore[method-assign]
+    if "__repr__" not in cls.__dict__:
+        cls.__repr__ = __repr__  # type: ignore[method-assign]
     return cls
+
+
+def replace(value: Any, /, **changes: Any) -> Any:
+    """A new Struct value with the named fields changed, as `dataclasses.replace` gives: `replace(p, x=1.0)`."""
+
+    struct = type(value)
+    if not is_struct_class(struct) or not hasattr(struct, "__vernon_fields__"):
+        raise TypeError(f"replace takes a Struct value, not {struct.__name__}")
+    if not changes:
+        raise TypeError("replace requires at least one field to change")
+    fields = struct.__vernon_fields__
+    for name in changes:
+        if name not in fields:
+            raise TypeError(f"{struct.__name__} has no field named '{name}'")
+    return struct(*(changes[name] if name in changes else getattr(value, name) for name in fields))
 
 
 def forbid_struct_construction(cls: type[Any]) -> type[Any]:

@@ -22,8 +22,24 @@ bool planProgramTensorCopy(const VernonTensorView &source, const VernonTensorVie
         std::any_of(source.shape, source.shape + source.rank, [](uint64_t extent) { return extent == 0; }))
         return true;
 
-    const size_t elementBytes = source.element_layout.byte_size;
-    std::vector<uint64_t> index(source.rank);
+    // Trailing axes packed densely in both views are visited as one block per outer index; walking them element
+    // by element costs O(elements) host time for what is usually a single region.
+    uint32_t outerRank = source.rank;
+    uint64_t blockBytes = source.element_layout.byte_size;
+    while (outerRank) {
+        const uint32_t axis = outerRank - 1;
+        if (blockBytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            source.byte_strides[axis] != static_cast<int64_t>(blockBytes) ||
+            destination.byte_strides[axis] != static_cast<int64_t>(blockBytes) ||
+            source.shape[axis] > std::numeric_limits<uint64_t>::max() / blockBytes)
+            break;
+        blockBytes *= source.shape[axis];
+        --outerRank;
+    }
+    if (blockBytes > std::numeric_limits<size_t>::max())
+        return error = "Program tensor copy layout overflows", false;
+    const size_t elementBytes = static_cast<size_t>(blockBytes);
+    std::vector<uint64_t> index(outerRank);
     for (;;) {
         if (source.byte_offset > std::numeric_limits<int64_t>::max() ||
             destination.byte_offset > std::numeric_limits<int64_t>::max())
@@ -45,7 +61,7 @@ bool planProgramTensorCopy(const VernonTensorView &source, const VernonTensorVie
             offset -= static_cast<int64_t>(coordinate * magnitude);
             return true;
         };
-        for (uint32_t axis = 0; axis < source.rank; ++axis)
+        for (uint32_t axis = 0; axis < outerRank; ++axis)
             if (!advance(sourceOffset, index[axis], source.byte_strides[axis]) ||
                 !advance(destinationOffset, index[axis], destination.byte_strides[axis]))
                 return error = "Program tensor copy layout overflows", false;
@@ -63,9 +79,9 @@ bool planProgramTensorCopy(const VernonTensorView &source, const VernonTensorVie
         } else {
             regions.push_back({sourceByte, destinationByte, elementBytes});
         }
-        if (source.rank == 0)
+        if (outerRank == 0)
             break;
-        uint32_t axis = source.rank;
+        uint32_t axis = outerRank;
         while (axis) {
             --axis;
             if (++index[axis] < source.shape[axis])

@@ -25,6 +25,16 @@ SCALAR_TYPES = {
         ScalarType("f64", "f64", "float64", "float", 64),
     )
 }
+# Host code addresses engine ids and handles, which are 64-bit; device code and its storage dtypes never see these.
+HOST_SCALAR_TYPES = {
+    scalar.name: scalar
+    for scalar in (
+        ScalarType("i64", "i64", "int64", "signed", 64),
+        ScalarType("u64", "i64", "uint64", "unsigned", 64),
+    )
+}
+ALL_SCALAR_TYPES = {**SCALAR_TYPES, **HOST_SCALAR_TYPES}
+INTEGER_SCALARS = frozenset(name for name, scalar in ALL_SCALAR_TYPES.items() if scalar.category != "float") - {"bool"}
 SCALAR_ALIASES = {"int": "i32", "float": "f32"}
 FLOAT_ORDER = ("f16", "f32", "f64")
 
@@ -39,27 +49,27 @@ def common_scalar(left: str, right: str, *, true_division: bool = False) -> str 
 
     if left == "bool" or right == "bool":
         return left if left == right and not true_division else None
-    if true_division and left in {"i32", "u32"} and right in {"i32", "u32"}:
-        return "f32" if left == right else None
+    if true_division and left in INTEGER_SCALARS and right in INTEGER_SCALARS:
+        return "f32" if left == right and left in {"i32", "u32"} else "f64" if left == right else None
     if left == right:
         return left
-    left_type = SCALAR_TYPES[left]
-    right_type = SCALAR_TYPES[right]
+    left_type = ALL_SCALAR_TYPES[left]
+    right_type = ALL_SCALAR_TYPES[right]
     if left_type.category == "float" and right_type.category == "float":
         return FLOAT_ORDER[max(FLOAT_ORDER.index(left), FLOAT_ORDER.index(right))]
     if left_type.category == "float" and right_type.category in {"signed", "unsigned"}:
         return left
     if right_type.category == "float" and left_type.category in {"signed", "unsigned"}:
         return right
-    # i32/u32 have no lossless common representation in language v3.
+    # Integers of different signedness or width have no lossless common representation in language v3.
     return None
 
 
 def can_implicitly_convert(source: str, target: str) -> bool:
     if source == target:
         return True
-    source_type = SCALAR_TYPES[source]
-    target_type = SCALAR_TYPES[target]
+    source_type = ALL_SCALAR_TYPES[source]
+    target_type = ALL_SCALAR_TYPES[target]
     if source_type.category in {"signed", "unsigned"} and target_type.category == "float":
         return True
     return source_type.category == "float" and target_type.category == "float" and source_type.width < target_type.width
