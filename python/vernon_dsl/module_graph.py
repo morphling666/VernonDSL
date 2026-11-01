@@ -24,7 +24,14 @@ from .frontend.model import ConcreteType
 from .language.ast_utils import decorator_name as _decorator_name
 from .language.ast_utils import dotted_name as _dotted_name
 from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS, HOST_FUNCTION_DECORATORS, library_symbol
+from .language.syntax import (
+    ENTRY_DECORATORS,
+    FUNCTION_DECORATORS,
+    HOST_FUNCTION_DECORATORS,
+    handle_method_name,
+    library_symbol,
+    snake_case,
+)
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .source_identity import (
     import_root,
@@ -110,6 +117,92 @@ def _is_dsl_class(node: ast.AST | None) -> bool:
     )
 
 
+def hoist_handle_methods(tree: ast.Module, error: Callable[[ast.AST, str], Exception]) -> None:
+    """Moves the externs a `@handle` class body declares to module level under their C names, as `World.destroy`
+    becomes the extern `world_destroy(world: World)`, so everything after sees plain externs. Each class records
+    `_vernon_handle_methods`, method -> extern, for those taking the handle first, and `_vernon_handle_statics` for
+    its `@staticmethod` externs, called as `World.create()`."""
+
+    body: list[ast.stmt] = []
+    for node in tree.body:
+        body.append(node)
+        if not isinstance(node, ast.ClassDef) or not any(
+            _decorator_name(item) == "handle" for item in node.decorator_list
+        ):
+            continue
+        methods: dict[str, str] = {}
+        statics: dict[str, str] = {}
+        kept: list[ast.stmt] = []
+        hoisted: list[ast.FunctionDef] = []
+        for member in node.body:
+            if not isinstance(member, ast.FunctionDef):
+                kept.append(member)
+                continue
+            decorators = [_decorator_name(item) for item in member.decorator_list]
+            if sorted(decorators) not in (["extern"], ["extern", "staticmethod"]):
+                raise error(member, f"handle '{node.name}' declares only externs, as methods or @staticmethod ones")
+            function = copy.deepcopy(member)
+            function.name = handle_method_name(node.name, member.name)
+            function.decorator_list = [
+                item for item, name in zip(function.decorator_list, decorators, strict=True) if name == "extern"
+            ]
+            if "staticmethod" in decorators:
+                statics[member.name] = function.name
+            else:
+                if not function.args.args:
+                    raise error(member, f"method '{node.name}.{member.name}' takes the handle first, as self")
+                receiver = function.args.args[0]
+                if receiver.annotation is None:
+                    receiver.annotation = copy_location(ast.Name(id=node.name, ctx=ast.Load()), receiver)
+                if receiver.arg == "self":
+                    receiver.arg = snake_case(node.name)
+                methods[member.name] = function.name
+            function._vernon_handle_member = (  # type: ignore[attr-defined]
+                node.name,
+                member.name,
+                "staticmethod" in decorators,
+            )
+            hoisted.append(function)
+        siblings = {**methods, **statics}
+        for function in hoisted:
+            for decorator in function.decorator_list:
+                for keyword in decorator.keywords if isinstance(decorator, ast.Call) else ():
+                    if keyword.arg == "closed_by" and isinstance(keyword.value, ast.Name):
+                        name = siblings.get(keyword.value.id, keyword.value.id)
+                        keyword.value = copy_location(ast.Name(id=name, ctx=ast.Load()), keyword.value)
+                        keyword.value._vernon_handle_internal = True  # type: ignore[attr-defined]
+        node.body = kept or [ast.Pass()]
+        node._vernon_handle_methods = methods  # type: ignore[attr-defined]
+        node._vernon_handle_statics = statics  # type: ignore[attr-defined]
+        body.extend(hoisted)
+    tree.body = body
+
+
+def _handle_method_externs(node: ast.AST) -> dict[str, str]:
+    """Method name -> extern name of a `@handle` class's methods, which `hoist_handle_methods` recorded."""
+
+    return dict(getattr(node, "_vernon_handle_methods", {}))
+
+
+def _handle_externs(node: ast.AST) -> list[str]:
+    """Every extern a `@handle` class body declares, methods and static ones."""
+
+    methods = getattr(node, "_vernon_handle_methods", {})
+    return [*methods.values(), *getattr(node, "_vernon_handle_statics", {}).values()]
+
+
+def _handle_member_misuse(definition: ast.AST | None, symbol: str) -> str | None:
+    """The diagnostic for naming a handle's extern by its C name, which exists only in C: Host code calls
+    `World.create()` and `world.destroy()`, as Python mode does."""
+
+    member = getattr(definition, "_vernon_handle_member", None)
+    if member is None:
+        return None
+    handle, method, static = member
+    call = f"{handle}.{method}(...)" if static else f"{snake_case(handle)}.{method}(...) on a {handle}"
+    return f"'{symbol}' is the C name of '{handle}.{method}'; Host code calls {call}"
+
+
 def _is_struct_declaration(node: ast.AST | None) -> bool:
     return isinstance(node, ast.ClassDef) and any(_decorator_name(item) == "struct" for item in node.decorator_list)
 
@@ -146,6 +239,8 @@ class _Module:
     # The `vd.library(name, version)` statement's name and version, which set the default symbol of this module's
     # externs.
     library: tuple[str, int] | None = None
+    # Its `binding=`, the Python module Python mode binds the externs from.
+    library_binding: str | None = None
 
     def declares_specialization(self, name: str) -> bool:
         return name in self.specializations
@@ -163,6 +258,19 @@ class _Module:
                 name
                 for name, value in self.assignments.items()
                 if isinstance(value, ast.Call) and (_dotted_name(value.func) or "").split(".")[-1] == "TypeVar"
+            )
+        )
+
+    def instance_type_variables(self) -> tuple[str, ...]:
+        """Its type variables bound to `vd.HostClass`, `TypeVar("S", bound=vd.HostClass)`: an extern value of one
+        is a Host class instance the call moves into the callee."""
+
+        return tuple(
+            name
+            for name in self.type_variables()
+            if any(
+                keyword.arg == "bound" and (_dotted_name(keyword.value) or "").split(".")[-1] == "HostClass"
+                for keyword in self.assignments[name].keywords  # type: ignore[attr-defined]
             )
         )
 
@@ -190,10 +298,13 @@ class LoadedProject:
     dependencies: tuple[tuple[str, str], ...]
     features: tuple[str, ...]
     dependency_files: tuple[tuple[Path, str], ...] = ()
-    # Emitted extern name -> the file whose `vd.library` declares it, with the library's name and version.
-    library_externs: Mapping[str, tuple[Path, str, int]] = field(default_factory=dict)
+    # Emitted extern name -> the file whose `vd.library` declares it, with the library's name, version and binding
+    # module.
+    library_externs: Mapping[str, tuple[Path, str, int, str | None]] = field(default_factory=dict)
     # Local name -> module of the names imported from modules that are not DSL sources, which stay Python imports.
     python_imports: Mapping[str, str] = field(default_factory=dict)
+    # Handle -> method -> emitted extern name, for the externs a `@handle` class body declares.
+    handle_methods: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -356,7 +467,7 @@ def _fold_static(
             fail(at, "a type specialization compares only with == and != against a type reference")
 
     def fold(node: ast.expr) -> object:
-        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float, str)):
             return node.value
         if isinstance(node, (ast.Name, ast.Attribute)):
             return leaf(node)
@@ -389,7 +500,7 @@ def _fold_static(
             except ZeroDivisionError:
                 fail(node, "division by zero in a compile-time expression")
             # A negative base to a fractional power is complex, which no DSL scalar holds.
-            return value if isinstance(value, (bool, int, float)) else _NOT_STATIC
+            return value if isinstance(value, (bool, int, float, str)) else _NOT_STATIC
         if isinstance(node, ast.Compare):
             left = fold(node.left)
             if left is _NOT_STATIC:
@@ -728,6 +839,9 @@ class _ReferenceRewriter(ast.NodeTransformer):
                 target, symbol = imported
                 return copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
             if node.id in self.module.definitions:
+                misuse = _handle_member_misuse(self.module.definitions[node.id], node.id)
+                if misuse is not None and not getattr(node, "_vernon_handle_internal", False):
+                    self._error(node, misuse)
                 return copy_location(
                     ast.Name(
                         id=self.emitted_names[(self.module.path, node.id)],
@@ -747,6 +861,9 @@ class _ReferenceRewriter(ast.NodeTransformer):
                     continue
                 if symbol not in target.definitions:
                     self._error(node, f"module '{target.name}' has no symbol '{symbol}'")
+                misuse = _handle_member_misuse(target.definitions[symbol], symbol)
+                if misuse is not None:
+                    self._error(node, misuse)
                 return copy_location(ast.Name(id=self.emitted_names[(target.path, symbol)], ctx=node.ctx), node)
         return node
 
@@ -769,10 +886,25 @@ class _ReferenceRewriter(ast.NodeTransformer):
         return AnnotationRewriter(self).visit(node)
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
+        static = self._handle_static(node.func)
         node = self.generic_visit(node)
         assert isinstance(node, ast.Call)
-        node.func = self._resolve(node.func)
+        node.func = static if static is not None else self._resolve(node.func)
         return node
+
+    def _handle_static(self, func: ast.expr) -> ast.expr | None:
+        """`World.create`, a static extern of a handle class, as the extern's emitted name."""
+
+        if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)):
+            return None
+        owner, name = self.module, func.value.id
+        imported = self.module.symbol_imports.get(name)
+        if imported:
+            owner, name = imported
+        extern = getattr(owner.definitions.get(name), "_vernon_handle_statics", {}).get(func.attr)
+        if extern is None:
+            return None
+        return copy_location(ast.Name(id=self.emitted_names[(owner.path, extern)], ctx=ast.Load()), func)
 
     def visit_arg(self, node: ast.arg) -> ast.arg:
         node.annotation = self._rewrite_annotation(node.annotation)
@@ -784,6 +916,11 @@ class _ReferenceRewriter(ast.NodeTransformer):
         node.args = self.visit(node.args)
         node.returns = self._rewrite_annotation(node.returns)
         node.body = [self.visit(statement) for statement in node.body]
+        # The one decorator option naming a definition: a scoped extern's closer.
+        for decorator in node.decorator_list:
+            for keyword in decorator.keywords if isinstance(decorator, ast.Call) else ():
+                if keyword.arg == "closed_by":
+                    keyword.value = self._resolve(keyword.value)
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
@@ -842,7 +979,7 @@ class ModuleGraph:
         self.reachable_symbols: set[tuple[Path, str]] = set()
         self._resolving_symbols: list[tuple[Path, str]] = []
         # A folded value depends on other files' constants, so it is cached per graph and not on the shared module.
-        self._constant_values: dict[tuple[Path, str], int | float | bool | None] = {}
+        self._constant_values: dict[tuple[Path, str], int | float | bool | str | None] = {}
         self._folding_constants: set[tuple[Path, str]] = set()
         self.absent_files = _AbsentFiles()
 
@@ -952,7 +1089,7 @@ class ModuleGraph:
         function_sources: dict[str, tuple[_Module, ast.FunctionDef]] = {}
         entry_names: set[str] = set()
         host_function_names: set[str] = set()
-        library_externs: dict[str, tuple[Path, str, int]] = {}
+        library_externs: dict[str, tuple[Path, str, int, str | None]] = {}
         for module in self.order:
             rewriter = _ReferenceRewriter(module, emitted_names)
             for original_name, definition in module.definitions.items():
@@ -970,7 +1107,11 @@ class ModuleGraph:
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if module.library is not None and isinstance(transformed, ast.FunctionDef):
                     if _apply_library_symbol(transformed, original_name, module.library):
-                        library_externs[emitted_names[(module.path, original_name)]] = (module.path, *module.library)
+                        library_externs[emitted_names[(module.path, original_name)]] = (
+                            module.path,
+                            *module.library,
+                            module.library_binding,
+                        )
                 if isinstance(transformed, ast.FunctionDef):
                     is_entry = any(
                         _decorator_name(decorator) in _STAGE_DECORATORS for decorator in transformed.decorator_list
@@ -992,6 +1133,7 @@ class ModuleGraph:
                         # The combined source drops the module's assignments, so an extern keeps the names its
                         # module binds to TypeVar: a parameter annotated with one makes the extern generic.
                         transformed._vernon_type_variables = module.type_variables()  # type: ignore[attr-defined]
+                        transformed._vernon_instance_variables = module.instance_type_variables()  # type: ignore[attr-defined]
                 body.append(transformed)
 
         # Analysis runs on hoisted methods so pruning and call-graph checks see calls hidden behind receiver syntax.
@@ -1002,8 +1144,19 @@ class ModuleGraph:
         for statement in analysis_body:
             if isinstance(statement, ast.FunctionDef):
                 function_sources.setdefault(statement.name, (root, statement))
+        handle_methods = {
+            emitted_names[(module.path, name)]: {
+                method: emitted_names[(module.path, extern)]
+                for method, extern in _handle_method_externs(definition).items()
+            }
+            for module in self.order
+            for name, definition in module.definitions.items()
+            if (module.path, name) in self.reachable_symbols and _handle_method_externs(definition)
+        }
         if self.entry is not None:
-            reachable = self._reachable_functions(analysis_body, self.entry, root, method_tables(analysis))
+            reachable = self._reachable_functions(
+                analysis_body, self.entry, root, {**method_tables(analysis), **handle_methods}
+            )
             analysis_body = [
                 statement
                 for statement in analysis_body
@@ -1038,6 +1191,7 @@ class ModuleGraph:
             tuple((path, digest) for path, _, digest in dependency_records),
             library_externs,
             python_imports,
+            handle_methods,
         )
 
     def _emitted_names(self, root: _Module) -> dict[tuple[Path, str], str]:
@@ -1101,6 +1255,7 @@ class ModuleGraph:
                 SourceLocation(str(path), error.lineno or 1, error.offset or 1),
             ) from None
         mark_source_file(tree, str(path))
+        hoist_handle_methods(tree, lambda node, message: CompileError(message, node_location(node, str(path))))
 
         module = _Module(path, name, source, tree)
         self.modules[path] = module
@@ -1153,9 +1308,9 @@ class ModuleGraph:
             self._error(module, call, "vd.library precedes the module's externs, whose symbols it names")
         values: dict[str, ast.expr] = dict(zip(("name", "version"), call.args, strict=False))
         if len(call.args) > 2:
-            self._error(module, call, "vd.library takes a name, a version and meta=")
+            self._error(module, call, "vd.library takes a name, a version, binding= and meta=")
         for keyword in call.keywords:
-            if keyword.arg not in {"name", "version", "meta"} or keyword.arg in values:
+            if keyword.arg not in {"name", "version", "binding", "meta"} or keyword.arg in values:
                 self._error(module, keyword, f"vd.library does not take '{keyword.arg}'")
             values[keyword.arg] = keyword.value  # type: ignore[index]
         name = values.get("name")
@@ -1169,6 +1324,15 @@ class ModuleGraph:
             and version.value >= 0
         ):
             self._error(module, version, "vd.library's version is a non-negative integer literal")
+        binding = values.get("binding")
+        if binding is not None:
+            if not (
+                isinstance(binding, ast.Constant)
+                and isinstance(binding.value, str)
+                and all(part.isidentifier() for part in binding.value.split("."))
+            ):
+                self._error(module, binding, "vd.library's binding is a dotted module name literal")
+            module.library_binding = binding.value
         module.library = (name.value, version.value)
 
     def _collect_specialization(self, module: _Module, node: ast.Assign) -> None:
@@ -1254,6 +1418,9 @@ class ModuleGraph:
         symbol = spec.symbol_name
         if not target.declares_symbol(symbol):
             self._error(module, spec.node, f"module '{target.name}' has no symbol '{symbol}'")
+        misuse = _handle_member_misuse(target.definitions.get(symbol), symbol)
+        if misuse is not None:
+            self._error(module, spec.node, misuse)
         if (
             symbol not in target.definitions
             and not target.declares_specialization(symbol)
@@ -1288,6 +1455,9 @@ class ModuleGraph:
                     isinstance(definition, ast.ClassDef) and not _is_dsl_class(definition)
                 ):
                     self._follow_references(module, definition)
+                # A method call names no extern, and its receiver's type is known only after inference.
+                for extern in _handle_externs(definition):
+                    self._touch_symbol(module, extern)
                 return
             if module.declares_symbol(name):
                 # Folding during discovery loads the modules a constant's value comes from, so they are hashed.
@@ -1410,14 +1580,15 @@ class ModuleGraph:
         member = self._named_member(module, node)
         return member[0].specializations.get(member[1]) if member is not None else None
 
-    def _resolve_constant(self, module: _Module, node: ast.AST) -> int | float | bool | None:
+    def _resolve_constant(self, module: _Module, node: ast.AST) -> int | float | bool | str | None:
         """Returns the value of the module constant `node` names, if any."""
 
         member = self._named_member(module, node)
         return self._constant_value(*member) if member is not None else None
 
-    def _constant_value(self, module: _Module, name: str) -> int | float | bool | None:
-        """The compile-time value of the top-level assignment `name`, or None when it does not fold to a scalar."""
+    def _constant_value(self, module: _Module, name: str) -> int | float | bool | str | None:
+        """The compile-time value of the top-level assignment `name`, or None when it does not fold to a scalar or a
+        `str`."""
 
         expression = module.assignments.get(name)
         if expression is None:
@@ -1436,7 +1607,7 @@ class ModuleGraph:
             )
         finally:
             self._folding_constants.discard(key)
-        folded = value if isinstance(value, (bool, int, float)) else None
+        folded = value if isinstance(value, (bool, int, float, str)) else None
         self._constant_values[key] = folded
         return folded
 
@@ -1669,9 +1840,12 @@ class ModuleGraph:
         while pending:
             current = pending.pop()
             for node in ast.walk(functions[current]):
-                if not isinstance(node, ast.Call):
+                # A scoped extern's closer runs where its `with` ends, though no call names it.
+                if isinstance(node, ast.keyword) and node.arg == "closed_by" and isinstance(node.value, ast.Name):
+                    callees = {node.value.id}
+                elif not isinstance(node, ast.Call):
                     continue
-                if isinstance(node.func, ast.Name):
+                elif isinstance(node.func, ast.Name):
                     callees = {node.func.id}
                 elif isinstance(node.func, ast.Attribute):
                     callees = helpers_by_method.get(node.func.attr, set())

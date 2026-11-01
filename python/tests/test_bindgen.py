@@ -92,7 +92,7 @@ def test_outputs_follow_the_conventions() -> None:
     assert "vh::Result<TallyStats> counter_stats(const tally::Counter &counter);" in implementation
     assert "vh::Result<int32_t> counter_label(tally::Counter &counter, std::string_view label);" in implementation
     assert "// Counts amount; a negative amount fails with status 10." in implementation
-    assert "def counter_stats(counter: Counter) -> Stats: ..." in outputs["tally_api.pyi"]
+    assert "    def stats(self) -> Stats: ..." in outputs["tally_api.pyi"]
 
     # Spans and owned results: VhSpan and VhList in C, C++17 views and owning values in the implementation.
     assert "TALLY_API int32_t tally_v1_counter_add_all(TallyCounter counter, VhSpan amounts);" in header
@@ -120,8 +120,8 @@ def test_outputs_follow_the_conventions() -> None:
     assert "vh::Status counter_load(const tally::Counter &counter, const VhType &type, void *out);" in implementation
     assert "vh::Result<bool> counter_has(const tally::Counter &counter, const VhType &type);" in implementation
     stubs = outputs["tally_api.pyi"]
-    assert "def counter_store(counter: Counter, value: T) -> None: ..." in stubs
-    assert "def counter_load(counter: Counter, type: type[T]) -> T: ..." in stubs
+    assert "    def store(self, value: T) -> None: ..." in stubs
+    assert "    def load(self, type: type[T]) -> T: ..." in stubs
     assert "from vernon_dsl.hostlang import HostExecutionError as HostExecutionError" in stubs
     assert "    def __init__(self, amount: int, weight: float) -> None: ..." in stubs
 
@@ -135,7 +135,7 @@ def test_outputs_follow_the_conventions() -> None:
     ) in outputs["tally_api_thunks.cpp"]
     assert "call_counter_stats = {sizeof(VhCall), 1," in outputs["tally_api_thunks.cpp"]
     assert "call_scaled_total" not in outputs["tally_api_thunks.cpp"]
-    assert "call_live_counters" not in outputs["tally_api_thunks.cpp"]
+    assert "call_live_counters = {sizeof(VhCall), 1," in outputs["tally_api_thunks.cpp"], "a read is checked too"
 
     # Structs with cpp=: Sample is cast after static_asserts, Range converts through declared functions.
     thunks = outputs["tally_api_thunks.cpp"]
@@ -166,92 +166,113 @@ def test_outputs_follow_the_conventions() -> None:
     # The library's own code reaches the objects behind handles; an extension can host the nanobind module.
     assert "tally::Counter *find(TallyCounter handle);" in implementation
     assert "template <> vh::Status destroy_all<TallyCounter>();" in implementation
+    assert "TallyCounter handle_of(const tally::Counter &object);" in implementation
     nanobind = outputs["tally_api_nanobind.cpp"]
     assert "void tally_v1_nanobind(nb::module_ &m) {" in nanobind
     assert "#ifndef TALLY_NANOBIND_HOSTED\nNB_MODULE(tally_api, m) { tally_v1_nanobind(m); }\n#endif" in nanobind
 
+    # The externs `class Counter` declares are its methods and static methods only; free externs stay functions.
+    assert '    counter_class.def("add", [](const TallyCounter &counter, int32_t amount) {' in nanobind
+    assert '    }, "amount"_a);' in nanobind
+    assert '    counter_class.def_static("create", [](TallyMode mode) {' in nanobind
+    assert '    }, "counter"_a, nb::keep_alive<0, 1>());' in nanobind
+    assert 'm.def("counter_add"' not in nanobind and 'm.def("scaled_total"' in nanobind
+    stubs = outputs["tally_api.pyi"]
+    assert "    def add(self, amount: int) -> None: ..." in stubs
+    assert "    def next(self) -> int: ..." in stubs
+    assert "    @staticmethod\n    def create(mode: Mode) -> Counter: ..." in stubs
+    assert "def counter_add(" not in stubs and "def scaled_total(stats: Stats, factor: float) -> float: ..." in stubs
+
 
 def test_nanobind_module_calls_the_library(tally_api: ModuleType) -> None:
     assert tally_api.vh_schema == library_identity(SAMPLE / "tally.py", "tally", 1)
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
-    tally_api.counter_add(counter, 5)
-    tally_api.counter_add(counter, 2)
-    stats = tally_api.counter_stats(counter)
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
+    counter.add(5)
+    counter.add(2)
+    stats = counter.stats()
     assert (stats.count, stats.total, list(stats.recent)) == (2, 7, [2.0, 5.0, 0.0])
     assert tally_api.scaled_total(stats, 2.0) == 14.0
-    assert tally_api.counter_label(counter, "größe") == len("größe".encode())
+    assert counter.label("größe") == len("größe".encode())
     with pytest.raises(HostExecutionError, match="amount -1 is negative") as failed:
-        tally_api.counter_add(counter, -1)
+        counter.add(-1)
     assert failed.value.status == 10
-    tally_api.counter_destroy(counter)
+    counter.destroy()
     with pytest.raises(HostExecutionError, match="counter is not a live Counter") as stale:
-        tally_api.counter_stats(counter)
+        counter.stats()
     assert stale.value.status == 2
+    assert not hasattr(tally_api, "counter_add") and not hasattr(tally_api, "counter_create")
+    other = tally_api.Counter.create(tally_api.Mode.MAX)
+    cursor = tally_api.Cursor.create(other)
+    assert isinstance(other, tally_api.Counter.Owned) and tally_api.Counter.exists(other.bits)
+    assert cursor.counter_bits() == other.bits
+    other.destroy()
+    assert not tally_api.Counter.exists(other.bits)
 
 
 def test_nanobind_module_passes_spans_and_returns_owned_results(tally_api: ModuleType) -> None:
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
     with pytest.raises(HostExecutionError, match="no label") as nameless:
-        tally_api.counter_name(counter)
+        counter.name()
     assert nameless.value.status == 11
-    tally_api.counter_add_all(counter, [3, 1, 3])
+    counter.add_all([3, 1, 3])
     with pytest.raises(HostExecutionError, match="amount -2 is negative"):
-        tally_api.counter_add_all(counter, [5, -2])
-    weighted = tally_api.counter_add_weighted(counter, {2: tally_api.Sample(4, 0.5), 1: tally_api.Sample(6, 1.0)})
+        counter.add_all([5, -2])
+    weighted = counter.add_weighted({2: tally_api.Sample(4, 0.5), 1: tally_api.Sample(6, 1.0)})
     assert weighted == 2 * 0.5 + 1 * 1.0 * 2
-    tally_api.counter_label(counter, "größe")
-    assert tally_api.counter_name(counter) == "größe"
-    assert tally_api.counter_history(counter) == [3, 1, 3, 4, 6]
-    histogram = tally_api.counter_histogram(counter)
+    counter.label("größe")
+    assert counter.name() == "größe"
+    assert counter.history() == [3, 1, 3, 4, 6]
+    histogram = counter.histogram()
     assert histogram == {3: 2, 1: 1, 4: 1, 6: 1} and list(histogram) == [3, 1, 4, 6]
-    samples = tally_api.counter_samples(counter)
+    samples = counter.samples()
     assert [(sample.amount, sample.weight) for sample in samples] == [(3, 1.5), (1, 0.5), (3, 1.5), (4, 2.0), (6, 3.0)]
-    bounds = tally_api.counter_range(counter)
+    bounds = counter.range()
     assert (bounds.low, bounds.high) == (1, 6)
-    assert tally_api.counter_in_range(counter, tally_api.Range(3, 4)) == 3
+    assert counter.in_range(tally_api.Range(3, 4)) == 3
 
-    # A generic function takes the bound Struct's class, whose descriptor the library describes, or a value of it.
-    assert not tally_api.counter_has(counter, tally_api.Sample)
-    tally_api.counter_store(counter, tally_api.Sample(3, 0.25))
-    assert tally_api.counter_has(counter, tally_api.Sample)
+    # A generic method takes the bound Struct's class, whose descriptor the library describes, or a value of it.
+    assert not counter.has(tally_api.Sample)
+    counter.store(tally_api.Sample(3, 0.25))
+    assert counter.has(tally_api.Sample)
     # A Struct of no fields is constructed without arguments.
-    tally_api.counter_store(counter, tally_api.Marker())
-    assert tally_api.counter_has(counter, tally_api.Marker)
-    loaded = tally_api.counter_load(counter, tally_api.Sample)
+    counter.store(tally_api.Marker())
+    assert counter.has(tally_api.Marker)
+    loaded = counter.load(tally_api.Sample)
     assert isinstance(loaded, tally_api.Sample) and (loaded.amount, loaded.weight) == (3, 0.25)
     with pytest.raises(TypeError, match="value is not a Struct of this module"):
-        tally_api.counter_store(counter, 3)
+        counter.store(3)
     with pytest.raises(TypeError, match="type is not a Struct class of this module"):
-        tally_api.counter_has(counter, int)
-    tally_api.counter_destroy(counter)
+        counter.has(int)
+    counter.destroy()
 
 
 def test_effect_check_refuses_before_the_implementation(tally_api: ModuleType) -> None:
     assert tally_api.HostExecutionError is HostExecutionError
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
-    cursor = tally_api.cursor_create(counter)
-    tally_api.counter_add(counter, 4)
-    tally_api.counter_label(counter, "frozen")
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
+    cursor = tally_api.Cursor.create(counter)
+    counter.add(4)
+    counter.label("frozen")
     with pytest.raises(HostExecutionError, match="tally_v1_counter_add: the counter is frozen") as refused:
-        tally_api.counter_add(counter, 1)
+        counter.add(1)
     assert refused.value.status == 16
     with pytest.raises(HostExecutionError, match="the counter is frozen"):
-        tally_api.counter_store(counter, tally_api.Sample(1, 1.0))
+        counter.store(tally_api.Sample(1, 1.0))
     with pytest.raises(HostExecutionError, match="tally_v1_cursor_next: the counter is frozen"):
-        tally_api.cursor_next(cursor)
+        cursor.next()
     # Reads pass, and so do the exemptions: a call with `unfreezes` meta, and storing a Marker, seen through the
     # call's type.
-    assert tally_api.counter_history(counter) == [4]
-    tally_api.counter_store(counter, tally_api.Marker())
-    assert tally_api.counter_has(counter, tally_api.Marker) and not tally_api.counter_has(counter, tally_api.Sample)
+    assert counter.history() == [4]
+    counter.store(tally_api.Marker())
+    assert counter.has(tally_api.Marker) and not counter.has(tally_api.Sample)
     # A refused destroy leaves the counter and its cursor alive.
+    bits = counter.bits
     with pytest.raises(HostExecutionError, match="tally_v1_counter_destroy: the counter is frozen"):
-        tally_api.counter_destroy(counter)
-    assert tally_api.counter_exists(counter.bits) and tally_api.counter_history(counter) == [4]
-    tally_api.counter_label(counter, "thawed")
-    assert tally_api.cursor_next(cursor) == 4
-    tally_api.counter_destroy(counter)
-    assert not tally_api.counter_exists(counter.bits)
+        counter.destroy()
+    assert tally_api.Counter.exists(bits) and counter.history() == [4]
+    counter.label("thawed")
+    assert cursor.next() == 4
+    counter.destroy()
+    assert not tally_api.Counter.exists(bits)
 
 
 def test_library_descriptors_match_host_layouts(tally_api: ModuleType) -> None:
@@ -266,18 +287,18 @@ def test_library_descriptors_match_host_layouts(tally_api: ModuleType) -> None:
 
 
 def test_value_handles_and_converted_items(tally_api: ModuleType) -> None:
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
-    tally_api.counter_add_all(counter, [4, 9, 2])
-    clamped = tally_api.counter_clamp(counter, [tally_api.Range(0, 5), tally_api.Range(3, 20)])
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
+    counter.add_all([4, 9, 2])
+    clamped = counter.clamp([tally_api.Range(0, 5), tally_api.Range(3, 20)])
     assert [(bounds.low, bounds.high) for bounds in clamped] == [(2, 5), (3, 9)]
-    ticket = tally_api.counter_ticket(counter)
-    assert isinstance(ticket, tally_api.Ticket) and tally_api.ticket_position(ticket) == 2
-    tickets = tally_api.counter_tickets(counter)
+    ticket = counter.ticket()
+    assert isinstance(ticket, tally_api.Ticket) and ticket.position() == 2
+    tickets = counter.tickets()
     assert tickets[2] == ticket and len({*tickets}) == 3
-    assert tally_api.counter_redeem(counter, tickets[:2]) == 13
-    other = tally_api.counter_create(tally_api.Mode.SUM)
+    assert counter.redeem(tickets[:2]) == 13
+    other = tally_api.Counter.create(tally_api.Mode.SUM)
     with pytest.raises(HostExecutionError, match="ticket 2 is not this counter's") as foreign:
-        tally_api.counter_redeem(other, [ticket])
+        other.redeem([ticket])
     assert foreign.value.status == 14
 
 
@@ -285,11 +306,11 @@ def test_owned_handles_and_dependents(tally_api: ModuleType) -> None:
     # Objects earlier tests created go first, so the counts below are this test's.
     gc.collect()
     counters, cursors = tally_api.live_counters(), tally_api.live_cursors()
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
     assert isinstance(counter, tally_api.Counter.Owned) and isinstance(counter, tally_api.Counter)
-    tally_api.counter_add_all(counter, [7, 8])
-    cursor = tally_api.cursor_create(counter)
-    assert tally_api.cursor_next(cursor) == 7
+    counter.add_all([7, 8])
+    cursor = tally_api.Cursor.create(counter)
+    assert cursor.next() == 7
     # A plain handle of the same bits names the object without owning it.
     borrowed = tally_api.Counter(counter.bits)
     assert borrowed == counter and hash(borrowed) == hash(counter)
@@ -302,35 +323,36 @@ def test_owned_handles_and_dependents(tally_api: ModuleType) -> None:
     del counter
     gc.collect()
     assert tally_api.live_counters() == counters + 1
-    assert tally_api.cursor_next(cursor) == 8
+    assert cursor.next() == 8
     del cursor
     gc.collect()
     assert (tally_api.live_counters(), tally_api.live_cursors()) == (counters, cursors)
 
     # Destroying a counter destroys its cursors first; their objects then name nothing.
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
-    first, second = tally_api.cursor_create(counter), tally_api.cursor_create(counter)
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
+    first, second = tally_api.Cursor.create(counter), tally_api.Cursor.create(counter)
     assert tally_api.live_cursors() == cursors + 2
-    tally_api.counter_destroy(counter)
+    counter.destroy()
     assert not counter and (tally_api.live_counters(), tally_api.live_cursors()) == (counters, cursors)
     with pytest.raises(HostExecutionError, match="cursor is not a live Cursor"):
-        tally_api.cursor_next(first)
+        first.next()
     del first, second
     gc.collect()
     assert tally_api.live_cursors() == cursors
 
 
 def test_library_code_finds_and_destroys_handles(tally_api: ModuleType) -> None:
-    counter = tally_api.counter_create(tally_api.Mode.SUM)
-    cursor = tally_api.cursor_create(counter)
-    assert tally_api.counter_exists(counter.bits) and not tally_api.counter_exists(0)
+    counter = tally_api.Counter.create(tally_api.Mode.SUM)
+    cursor = tally_api.Cursor.create(counter)
+    assert tally_api.Counter.exists(counter.bits) and not tally_api.Counter.exists(0)
+    assert cursor.counter_bits() == counter.bits
 
     # Destroying every counter goes through counter_destroy's cascade: the cursors go first.
-    tally_api.counter_destroy_all()
+    tally_api.Counter.destroy_all()
     assert (tally_api.live_counters(), tally_api.live_cursors()) == (0, 0)
-    assert not tally_api.counter_exists(counter.bits)
+    assert not tally_api.Counter.exists(counter.bits)
     with pytest.raises(HostExecutionError, match="cursor is not a live Cursor"):
-        tally_api.cursor_next(cursor)
+        cursor.next()
     del cursor, counter
     gc.collect()
 
@@ -536,6 +558,25 @@ def test_generator_rejects(tmp_path: Path, declaration: str, message: str) -> No
         generate(path)
 
 
+def test_moved_instances_reach_only_c(tmp_path: Path) -> None:
+    path = tmp_path / "moving_binding.py"
+    declaration = (
+        'from typing import TypeVar\n\nS = TypeVar("S", bound=vd.HostClass)\n\n\n'
+        '@vd.extern(effects="io", abi="status")\ndef adopt(thing: Thing, system: S) -> None: ...'
+    )
+    path.write_text(_HEADER.format(meta=', meta=vd.meta(cpp_namespace="bad::api")') + "\n\n" + declaration + "\n")
+    outputs = generate(path)
+    assert "BAD_API int32_t bad_v0_adopt(BadThing thing, const VhType *type, void *system);" in outputs["bad_api.h"]
+    assert "vh::Status adopt(bad::Thing &thing, vh::Instance system);" in outputs["bad_api_impl.h"]
+    thunk = outputs["bad_api_thunks.cpp"]
+    # Taken before the handle lookup, so a dead Thing still releases the instance.
+    assert thunk.index("vh::Instance system_instance(*type, system);") < thunk.index("thing_object == nullptr")
+    assert "bad::api::adopt(*thing_object, std::move(system_instance))" in thunk
+    assert 'symbols["bad_v0_adopt"]' in outputs["bad_api_nanobind.cpp"]
+    assert 'm.def("adopt"' not in outputs["bad_api_nanobind.cpp"]
+    assert "def adopt(" not in outputs["bad_api.pyi"]
+
+
 def test_generator_needs_a_cpp_namespace(tmp_path: Path) -> None:
     path = tmp_path / "bare_binding.py"
     path.write_text(_HEADER.format(meta=""))
@@ -547,4 +588,18 @@ def test_generator_needs_an_unqualified_effect_check(tmp_path: Path) -> None:
     path = tmp_path / "checked_binding.py"
     path.write_text(_HEADER.format(meta=', meta=vd.meta(cpp_namespace="bad::api", effect_check="bad::allow")'))
     with pytest.raises(BindgenError, match="effect_check names an unqualified C\\+\\+ function"):
+        generate(path)
+
+
+@pytest.mark.parametrize(("effect", "refused"), [("read", True), ("io", True), ("pure", False)])
+def test_checked_libraries_have_no_unchecked_direct_externs(tmp_path: Path, effect: str, refused: bool) -> None:
+    path = tmp_path / "checked_binding.py"
+    path.write_text(
+        _HEADER.format(meta=', meta=vd.meta(cpp_namespace="bad::api", effect_check="allow")')
+        + f'\n\n@vd.extern(effects="{effect}")\ndef count() -> i32: ...\n'
+    )
+    if not refused:
+        generate(path)
+        return
+    with pytest.raises(BindgenError, match=f"extern count is {effect}, so it is abi='status'"):
         generate(path)

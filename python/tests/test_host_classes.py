@@ -87,7 +87,7 @@ def test_instances_start_from_field_defaults(systems: Any) -> None:
     assert (tuple(mover.rest.position), mover.rest.scale) == ((0.0, 1.0, 0.0), 1.0)
     assert tuple(mover.history) == (0.0, 0.0, 0.0, 0.0)
     assert mover.updates == 0
-    assert mover.target == 0
+    assert mover.target == type(mover.target)() and mover.target.bits == 0
     assert mover.timer.period == 0.5
     assert mover.timer.fired == 0
 
@@ -317,7 +317,7 @@ def test_python_mode_runs_at_source_lines_with_readable_locals(store: Store) -> 
     assert at_set["transform"] == "Transform(position=Vector([0.0, 0.0, 0.0]), scale=1.0)"
     assert at_set["rise"] == "Vector([0.0, 0.5, 0.0])"
     assert at_set["self"].startswith(
-        "Mover(target=0, speed=2.0, rest=Transform(position=Vector([0.0, 1.0, 0.0]), scale=1.0)"
+        "Mover(target=Entity(0), speed=2.0, rest=Transform(position=Vector([0.0, 1.0, 0.0]), scale=1.0)"
     )
     assert "timer=Timer(period=0.5, elapsed=0.25, fired=0)" in at_set["self"]
 
@@ -463,6 +463,83 @@ def test_migration_onto_an_unchanged_layout_copies_everything(tmp_path: Path) ->
     assert (copy.count, copy.inner.ticks) == (1, 2)
 
 
+_ADOPTER = """
+from typing import TypeVar
+
+import vernon_dsl as vd
+from vernon_dsl import i32
+
+S = TypeVar("S", bound=vd.HostClass)
+
+
+@vd.extern(symbol="demo_adopt", effects="io", abi="status")
+def adopt(order: i32, system: S) -> None: ...
+
+
+@vd.host
+class Ticker:
+    ticks: i32 = 2
+    history: list[i32]
+
+    def tick(self) -> None:
+        self.ticks += 1
+        self.history.append(self.ticks)
+
+
+@vd.host
+def start() -> i32:
+    ticker = Ticker()
+    ticker.ticks = 5
+    ticker.history.append(1)
+    adopt(3, ticker)
+    adopt(4, Ticker())
+    ticker = Ticker()
+    return ticker.ticks
+"""
+
+
+class _Adopted:
+    """What an engine does with an instance an extern takes: moves its bytes into memory of its own, calls a method
+    through the class's descriptor, and finalizes it once done."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[int, int, list[int]]] = []
+
+    def __call__(self, order: int, descriptor: Any, address: int) -> None:
+        from vernon_dsl.hostlang.native import VhListRecord
+        from vernon_dsl.hostlang.reflect import CLASS
+
+        assert (descriptor.name, descriptor.kind) == (b"Ticker", CLASS)
+        methods = [descriptor.methods[index] for index in range(descriptor.method_count)]
+        tick = next(method for method in methods if method.name == b"tick")
+        owned = ctypes.create_string_buffer(descriptor.size)
+        ctypes.memmove(owned, address, descriptor.size)
+        method = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)
+        assert method(tick.address)(ctypes.addressof(owned)) == 0
+        fields = _fields(descriptor)
+        history = VhListRecord.from_buffer(owned, fields["history"].offset)
+        values = [ctypes.c_int32.from_address(history.data + 4 * index).value for index in range(history.size)]
+        self.seen.append((order, ctypes.c_int32.from_buffer(owned, fields["ticks"].offset).value, values))
+        ctypes.CFUNCTYPE(None, ctypes.c_void_p)(descriptor.fini)(ctypes.addressof(owned))
+
+
+def test_externs_take_host_class_instances_by_move(tmp_path: Path) -> None:
+    from host_aot import LinkedHost
+    from vernon_dsl.hostlang import HostModule
+    from vernon_dsl.hostlang.aot import load_programs
+
+    source = tmp_path / "adopter.py"
+    source.write_text(_ADOPTER, encoding="utf-8")
+    adopted = _Adopted()
+    registry = ExternRegistry().bind("demo_adopt", adopted)
+    assert HostModule.load(source, registry).call("start") == 2
+    assert adopted.seen == [(3, 6, [1, 6]), (4, 3, [3])]
+    if toolchain() is None:
+        pytest.skip("no C toolchain links Host objects")
+    assert LinkedHost(load_programs(source), tmp_path / "linked", registry).call("start") == 2
+    assert adopted.seen[2:] == [(3, 6, [1, 6]), (4, 3, [3])]
+
+
 def _compile_error(tmp_path: Path, body: str) -> str:
     source = tmp_path / "broken.py"
     source.write_text(
@@ -554,6 +631,51 @@ def _compile_error(tmp_path: Path, body: str) -> str:
         ),
         (
             """
+            S = TypeVar("S", bound=vd.HostClass)
+
+
+            @vd.extern(symbol="demo_swap", abi="status")
+            def swap(system: S) -> S: ...
+            """,
+            "'swap' takes a Host class instance as S, which annotates nothing else",
+        ),
+        (
+            """
+            S = TypeVar("S", bound=vd.HostClass)
+
+
+            @vd.extern(symbol="demo_adopt", abi="status")
+            def adopt(system: S) -> None: ...
+
+
+            @vd.host
+            def twice() -> None:
+                inner = Inner()
+                adopt(inner)
+                adopt(inner)
+            """,
+            "'inner' was moved",
+        ),
+        (
+            """
+            S = TypeVar("S", bound=vd.HostClass)
+
+
+            @vd.extern(symbol="demo_adopt", abi="status")
+            def adopt(system: S) -> None: ...
+
+
+            @vd.host
+            class Holder:
+                inner: Inner
+
+                def give(self) -> None:
+                    adopt(self.inner)
+            """,
+            "names an existing instance",
+        ),
+        (
+            """
             @vd.func(shared=True)
             def poke(inner: Inner) -> f32:
                 return 1.0
@@ -625,6 +747,9 @@ def _compile_error(tmp_path: Path, body: str) -> str:
         "struct-field-store",
         "widening-update",
         "class-in-struct",
+        "instance-variable-returned",
+        "instance-used-after-move",
+        "instance-moved-from-a-place",
         "class-parameter",
         "dunder-method",
         "containment-cycle",

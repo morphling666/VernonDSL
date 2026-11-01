@@ -813,7 +813,10 @@ class _FunctionEmitter:
         self.slots: dict[str, str] = {}
         # Class-typed parameters: the instance pointer itself, never copied into a slot.
         self.places: dict[str, str] = {}
-        self.loops: list[tuple[str, str]] = []
+        # Each loop's continue and break labels, with the depth of `scopes` where its body starts.
+        self.loops: list[tuple[str, str, int]] = []
+        # The open `with` scopes, innermost last: each closer and the slot holding the handle it closes.
+        self.scopes: list[tuple[HostExtern, str]] = []
         self.terminated = False
         # Expressions already evaluated, by node identity: an augmented assignment's indices, which Python
         # evaluates once although the target is both read and written.
@@ -880,14 +883,50 @@ class _FunctionEmitter:
         self.leave(status)
         self.start(passed)
 
-    def leave(self, status: str | int) -> None:
-        """Returns `status`, through the exit block that releases the function's records when it owns any."""
+    def leave(self, status: str | int, scopes: list[tuple[HostExtern, str]] | None = None) -> None:
+        """Returns `status`, through the exit block that releases the function's records when it owns any. The open
+        `scopes` close first, innermost first: on a failure each closes and the failure stands; on success a closer's
+        failure becomes the result, and the scopes outside it close as on any failure."""
 
+        scopes = self.scopes if scopes is None else scopes
+        if status == 0:
+            self.close_scopes(scopes, 0)
+        else:
+            for closer, slot in reversed(scopes):
+                self.call_closer(closer, slot)
         if not self.cleanup:
             self.terminate(f"ret i32 {status}")
             return
         self.instruction(f"store i32 {status}, ptr {self.status_slot}")
         self.jump("vh.exit")
+
+    def close_scopes(self, scopes: list[tuple[HostExtern, str]], depth: int) -> None:
+        """Closes `scopes[depth:]` innermost first on a successful path; a closer's failure leaves the function with
+        its status, closing the scopes outside it."""
+
+        for index in reversed(range(depth, len(scopes))):
+            status = self.call_closer(*scopes[index])
+            if status is not None:
+                failed = self.value(f"icmp ne i32 {status}, 0")
+                bad, passed = self.label("fail"), self.label("ok")
+                self.branch_on(failed, bad, passed)
+                self.start(bad)
+                self.leave(status, scopes[:index])
+                self.start(passed)
+
+    def call_closer(self, closer: HostExtern, slot: str) -> str | None:
+        """Calls `closer` on the handle in `slot`; its status, when its abi returns one."""
+
+        module = self.module
+        module.declare_extern(closer)
+        handle_type = closer.parameters[0][1]
+        handle = self.load(handle_type, slot)
+        lowering, text = next(item for item in module.extern_parameters(closer) if item[0] != "type")
+        argument = f"{text} {handle}" if lowering == "value" else f"ptr {self.spill(handle, handle_type)}"
+        if closer.abi == ExternAbi.STATUS:
+            return self.value(f'call i32 @"{closer.symbol}"({argument})')
+        self.instruction(f'call void @"{closer.symbol}"({argument})')
+        return None
 
     def owned_record(self, value_type: ConcreteType) -> str:
         """A str or storage record the function owns: empty from entry, so every exit can release it."""
@@ -993,7 +1032,30 @@ class _FunctionEmitter:
             return temporary
         init = self.module.function_name(self.program, self.program.classes[name].init)
         self.propagate(self.value(f"call i32 {init}(ptr {temporary})"))
+        self.construct_fields(temporary, value_type, node)
         return temporary
+
+    def construct_fields(self, address: str, class_type: ConcreteType, node: ast.Call) -> None:
+        """Assigns the `field=value` keywords of a constructor, in order, into the new instance at `address`, which
+        nothing else can reach yet. A failing value leaves the instance for the caller's release."""
+
+        fields = self.module.fields(class_type.name)
+        names = [name for name, _ in fields]
+        memory = self.module.memory_type(class_type)
+        for position, keyword in enumerate(node.keywords):
+            assert keyword.arg is not None
+            field_type = dict(fields)[keyword.arg]
+            field = self.value(f"getelementptr {memory}, ptr {address}, i32 0, i32 {names.index(keyword.arg)}")
+            if field_type.kind == "str":
+                later = [item.value for item in node.keywords[position + 1 :]]
+                data, size = self.stable_str_operand(keyword.value, later)
+                self.copy_str(field, data, size)
+            elif self.program.is_place(field_type):
+                source = self.instance(keyword.value)
+                self.release(field, field_type)
+                self.move(field, source, field_type)
+            else:
+                self.store(self.typed(keyword.value, field_type), field_type, field)
 
     def assign_instance(self, target: ast.expr, value: ast.expr) -> None:
         """Binds a borrowed name, or moves a new instance into a place, releasing what the place held. The instance
@@ -1162,6 +1224,11 @@ class _FunctionEmitter:
                 continue
             if value_type.kind in {"scalar", "handle", "enum"}:
                 self.store(f"%a{index}", value_type, self.slots[name])
+            elif value_type.kind == "str":
+                # The caller's view may read a field this function assigns, so the parameter is a copy.
+                data = self.value(f"load ptr, ptr %a{index}")
+                size_pointer = self.value(f"getelementptr inbounds {{ ptr, i64 }}, ptr %a{index}, i32 0, i32 1")
+                self.copy_str(self.slots[name], data, self.value(f"load i64, ptr {size_pointer}"))
             else:
                 memory = module.memory_type(value_type)
                 copied = self.value(f"load {memory}, ptr %a{index}")
@@ -1308,7 +1375,7 @@ class _FunctionEmitter:
             self.start(header)
             self.branch_on(self.condition(statement.test), body, otherwise)
             self.start(body)
-            self.loops.append((header, done))
+            self.loops.append((header, done, len(self.scopes)))
             self.block(statement.body)
             self.loops.pop()
             self.jump(header)
@@ -1318,14 +1385,45 @@ class _FunctionEmitter:
             self.start(done)
         elif isinstance(statement, ast.For):
             self.for_loop(statement)
-        elif isinstance(statement, ast.Break):
-            self.jump(self.loops[-1][1])
-        elif isinstance(statement, ast.Continue):
-            self.jump(self.loops[-1][0])
+        elif isinstance(statement, (ast.Break, ast.Continue)):
+            latch, done, depth = self.loops[-1]
+            self.close_scopes(self.scopes, depth)
+            self.jump(done if isinstance(statement, ast.Break) else latch)
+        elif isinstance(statement, ast.With):
+            self.scoped(statement.items, statement.body)
         elif isinstance(statement, ast.Pass):
             return
         else:
             raise TypeError(f"unsupported Host statement {type(statement).__name__}")
+
+    def scoped(self, items: list[ast.withitem], body: list[ast.stmt]) -> None:
+        """Runs `body` inside the scopes `items` open, the later ones nested in the earlier, as Python nests them.
+        The opener's handle is evaluated once and kept, since its closer runs on every exit."""
+
+        if not items:
+            self.block(body)
+            return
+        item = items[0]
+        call = item.context_expr
+        assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        opener = self.program.externs[call.func.id]
+        assert opener.closed_by is not None
+        handle_type = opener.parameters[0][1]
+        slot = self.alloca(self.module.memory_type(handle_type))
+        handle = self.typed(call.args[0], handle_type)
+        self.store(handle, handle_type, slot)
+        self.evaluated[id(call.args[0])] = handle
+        result = self.extern_call(opener, call)
+        if item.optional_vars is not None:
+            assert opener.result is not None
+            self.assign(item.optional_vars, result, opener.result)
+        self.scopes.append((self.program.externs[opener.closed_by], slot))
+        self.scoped(items[1:], body)
+        scope = self.scopes.pop()
+        if not self.terminated:
+            status = self.call_closer(*scope)
+            if status is not None:
+                self.propagate(status)
 
     def for_loop(self, statement: ast.For) -> None:
         counted = isinstance(statement.iter, ast.Call) and dotted_name(statement.iter.func) == "range"
@@ -1359,7 +1457,7 @@ class _FunctionEmitter:
         self.branch_on(self.value(f"select i1 {upward}, i1 {below}, i1 {above}"), body, otherwise)
         self.start(body)
         self.instruction(f"store i32 {index}, ptr {self.slots[statement.target.id]}")
-        self.loops.append((latch, done))
+        self.loops.append((latch, done, len(self.scopes)))
         self.block(statement.body)
         self.loops.pop()
         self.jump(latch)
@@ -1463,7 +1561,7 @@ class _FunctionEmitter:
             self.instruction(f"store ptr {address}, ptr {self.slots[statement.target.id]}")
         else:
             self.store(self.load(element, address), element, self.slots[statement.target.id])
-        self.loops.append((latch, done))
+        self.loops.append((latch, done, len(self.scopes)))
         self.block(statement.body)
         self.loops.pop()
         self.jump(latch)
@@ -1889,7 +1987,7 @@ class _FunctionEmitter:
                 self.instruction(f"store ptr {pointer}, ptr {self.slots[name]}")
                 continue
             self.store(self.load(member_type, pointer), member_type, self.slots[name])
-        self.loops.append((latch, done))
+        self.loops.append((latch, done, len(self.scopes)))
         self.block(statement.body)
         self.loops.pop()
         self.jump(latch)
@@ -2597,10 +2695,16 @@ class _FunctionEmitter:
             return self.function_call(program.functions[name], node)
         if name in program.structs:
             fields = program.structs[name].fields
-            return self.build(
-                result_type,
-                [self.typed(argument, field) for argument, (_, field) in zip(node.args, fields, strict=True)],
-            )
+            # Positional values, then keywords, evaluate in source order, as Python does.
+            values = {
+                field_name: self.typed(argument, field)
+                for argument, (field_name, field) in zip(node.args, fields, strict=False)
+            }
+            types = dict(fields)
+            for keyword in node.keywords:
+                assert keyword.arg is not None
+                values[keyword.arg] = self.typed(keyword.value, types[keyword.arg])
+            return self.build(result_type, [values[field_name] for field_name, _ in fields])
         if name in program.handles:
             return "0"
         if name in _CAST_NAMES:
@@ -2623,7 +2727,15 @@ class _FunctionEmitter:
 
         arguments = []
         temporaries = []
-        for argument, (_, parameter) in zip(node.args, callee.parameters, strict=True):
+        for position, (argument, (_, parameter)) in enumerate(zip(node.args, callee.parameters, strict=True)):
+            if parameter.kind == "str":
+                data, size = self.stable_str_operand(argument, node.args[position + 1 :])
+                view = self.alloca("{ ptr, i64 }")
+                self.instruction(f"store ptr {data}, ptr {view}")
+                size_pointer = self.value(f"getelementptr inbounds {{ ptr, i64 }}, ptr {view}, i32 0, i32 1")
+                self.instruction(f"store i64 {size}, ptr {size_pointer}")
+                arguments.append(f"ptr {view}")
+                continue
             if self.program.is_place(parameter):
                 if self.creates(argument):
                     address = self.instance(argument)
@@ -2661,9 +2773,16 @@ class _FunctionEmitter:
         module.declare_extern(extern)
         lowerings = [item for item in module.extern_parameters(extern) if item[0] != "type"]
         arguments: list[str] = []
+        # Instances the call moves into the callee, which takes their bytes whatever its status.
+        moved: list[tuple[str, ConcreteType]] = []
         for position, (argument, (_, parameter), (lowering, text)) in enumerate(
             zip(node.args, extern.parameters, lowerings, strict=False)
         ):
+            if self.program.is_place(parameter):
+                address = self.instance(argument)
+                moved.append((address, parameter))
+                arguments.append(f"ptr {address}")
+                continue
             if parameter.kind in TRANSFERRED_KINDS:
                 if parameter.kind == "str":
                     data, size = self.stable_str_operand(argument, node.args[position + 1 :])
@@ -2703,6 +2822,7 @@ class _FunctionEmitter:
                 out = self.alloca(module.memory_type(extern.result))
                 arguments.append(f"ptr {out}")
             status = self.value(f'call i32 @"{extern.symbol}"({", ".join(arguments)})')
+            self.forget(moved)
             # On failure `received` is the function's own record, which its exit releases.
             self.propagate(status)
             if out is None or extern.result is None or out is received:
@@ -2710,10 +2830,23 @@ class _FunctionEmitter:
             return self.load(extern.result, out)
         if extern.result is None:
             self.instruction(f'call void @"{extern.symbol}"({", ".join(arguments)})')
+            self.forget(moved)
             return "poison"
         result_type = module.register_type(extern.result)
         attribute = "zeroext " if result_type == "i1" else ""
-        return self.value(f'call {attribute}{result_type} @"{extern.symbol}"({", ".join(arguments)})')
+        result = self.value(f'call {attribute}{result_type} @"{extern.symbol}"({", ".join(arguments)})')
+        self.forget(moved)
+        return result
+
+    def forget(self, moved: list[tuple[str, ConcreteType]]) -> None:
+        """Zeroes instances a callee took, so the exits releasing their memory release nothing."""
+
+        if not moved:
+            return
+        self.module.declare("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+        for address, value_type in moved:
+            size = self.size_of(value_type)
+            self.instruction(f"call void @llvm.memset.p0.i64(ptr {address}, i8 0, i64 {size}, i1 false)")
 
     def aggregate(self, node: ast.Call, result_type: ConcreteType) -> str:
         element = element_of(result_type)

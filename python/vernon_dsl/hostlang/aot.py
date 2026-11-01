@@ -355,6 +355,9 @@ def _header(programs: list[HostProgram], names: CNames, prefix: str, types_heade
                     parameters.append(f"{names.name(parameter)} *{name}")
                 elif parameter.kind in {"scalar", "handle", "enum"}:
                     parameters.append(f"{names.name(parameter)} {name}")
+                elif parameter.kind == "str":
+                    # A borrowed view, which the callee copies before anything it calls could change the text.
+                    parameters.append(f"const VhStrArg *{name}")
                 else:
                     parameters.append(f"const {names.name(parameter)} *{name}")
             if info.result is not None:

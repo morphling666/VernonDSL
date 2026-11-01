@@ -116,6 +116,7 @@ void tally_v1_nanobind(nb::module_ &m) {
     m.attr("vh_schema") = TALLY_V1_SCHEMA;
     m.def("vh_symbols", []() {
         nb::dict symbols;
+        symbols["tally_v1_ticket_position"] = reinterpret_cast<uintptr_t>(&tally_v1_ticket_position);
         symbols["tally_v1_counter_create"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_create);
         symbols["tally_v1_counter_destroy"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_destroy);
         symbols["tally_v1_counter_add"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_add);
@@ -136,13 +137,13 @@ void tally_v1_nanobind(nb::module_ &m) {
         symbols["tally_v1_counter_ticket"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_ticket);
         symbols["tally_v1_counter_tickets"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_tickets);
         symbols["tally_v1_counter_redeem"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_redeem);
-        symbols["tally_v1_ticket_position"] = reinterpret_cast<uintptr_t>(&tally_v1_ticket_position);
+        symbols["tally_v1_counter_exists"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_exists);
+        symbols["tally_v1_counter_destroy_all"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_destroy_all);
         symbols["tally_v1_cursor_create"] = reinterpret_cast<uintptr_t>(&tally_v1_cursor_create);
         symbols["tally_v1_cursor_destroy"] = reinterpret_cast<uintptr_t>(&tally_v1_cursor_destroy);
         symbols["tally_v1_cursor_next"] = reinterpret_cast<uintptr_t>(&tally_v1_cursor_next);
+        symbols["tally_v1_cursor_counter_bits"] = reinterpret_cast<uintptr_t>(&tally_v1_cursor_counter_bits);
         symbols["tally_v1_live_cursors"] = reinterpret_cast<uintptr_t>(&tally_v1_live_cursors);
-        symbols["tally_v1_counter_exists"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_exists);
-        symbols["tally_v1_counter_destroy_all"] = reinterpret_cast<uintptr_t>(&tally_v1_counter_destroy_all);
         symbols["tally_v1_scaled_total"] = reinterpret_cast<uintptr_t>(&tally_v1_scaled_total);
         symbols["tally_v1_live_counters"] = reinterpret_cast<uintptr_t>(&tally_v1_live_counters);
         return symbols;
@@ -150,6 +151,24 @@ void tally_v1_nanobind(nb::module_ &m) {
     m.def("vh_last_error", &last_error);
     // What a failed status raises, so callers catch it from this module.
     m.attr("HostExecutionError") = nb::module_::import_("vernon_dsl.hostlang").attr("HostExecutionError");
+    auto ticket_class =
+        nb::class_<TallyTicket>(m, "Ticket")
+            .def(nb::init<>())
+            .def(
+                "__init__", [](TallyTicket *self, uint64_t bits) { new (self) TallyTicket{bits}; }, "bits"_a)
+            .def_ro("bits", &TallyTicket::bits)
+            .def("__int__", [](const TallyTicket &self) { return self.bits; })
+            .def("__index__", [](const TallyTicket &self) { return self.bits; })
+            .def("__bool__", [](const TallyTicket &self) { return self.bits != 0; })
+            .def("__hash__", [](const TallyTicket &self) { return std::hash<uint64_t>()(self.bits); })
+            .def(
+                "__eq__",
+                [](const TallyTicket &self, nb::handle other) {
+                    return nb::isinstance<TallyTicket>(other) && nb::cast<const TallyTicket &>(other).bits == self.bits;
+                },
+                "other"_a.none())
+            .def("__repr__", [](const TallyTicket &self) { return "Ticket(" + std::to_string(self.bits) + ")"; });
+    (void)ticket_class;
     auto counter_class =
         nb::class_<TallyCounter>(m, "Counter")
             .def(nb::init<>())
@@ -187,24 +206,6 @@ void tally_v1_nanobind(nb::module_ &m) {
                 "other"_a.none())
             .def("__repr__", [](const TallyCursor &self) { return "Cursor(" + std::to_string(self.bits) + ")"; });
     nb::class_<OwnedCursor, TallyCursor>(cursor_class, "Owned");
-    auto ticket_class =
-        nb::class_<TallyTicket>(m, "Ticket")
-            .def(nb::init<>())
-            .def(
-                "__init__", [](TallyTicket *self, uint64_t bits) { new (self) TallyTicket{bits}; }, "bits"_a)
-            .def_ro("bits", &TallyTicket::bits)
-            .def("__int__", [](const TallyTicket &self) { return self.bits; })
-            .def("__index__", [](const TallyTicket &self) { return self.bits; })
-            .def("__bool__", [](const TallyTicket &self) { return self.bits != 0; })
-            .def("__hash__", [](const TallyTicket &self) { return std::hash<uint64_t>()(self.bits); })
-            .def(
-                "__eq__",
-                [](const TallyTicket &self, nb::handle other) {
-                    return nb::isinstance<TallyTicket>(other) && nb::cast<const TallyTicket &>(other).bits == self.bits;
-                },
-                "other"_a.none())
-            .def("__repr__", [](const TallyTicket &self) { return "Ticket(" + std::to_string(self.bits) + ")"; });
-    (void)ticket_class;
     nb::dict mode_members;
     mode_members["SUM"] = 0;
     mode_members["MAX"] = 1;
@@ -265,52 +266,51 @@ void tally_v1_nanobind(nb::module_ &m) {
             m.attr(types[index]->name).attr("vh_type") = reinterpret_cast<uintptr_t>(types[index]);
         }
     }
+    m.def("live_cursors", []() {
+        int32_t out{};
+        check(tally_v1_live_cursors(&out));
+        return out;
+    });
     m.def(
-        "counter_create",
-        [](TallyMode mode) {
-            TallyCounter out{};
-            check(tally_v1_counter_create(mode, &out));
-            return OwnedCounter(out.bits);
-        },
-        "mode"_a);
-    m.def(
-        "counter_destroy",
-        [](TallyCounter &counter) {
-            int32_t status = tally_v1_counter_destroy(counter);
-            if (status == 0) {
-                counter.bits = 0;
-            }
-            check(status);
-        },
-        "counter"_a);
-    m.def(
-        "counter_add",
-        [](const TallyCounter &counter, int32_t amount) { check(tally_v1_counter_add(counter, amount)); }, "counter"_a,
+        "scaled_total", [](const TallyStats &stats, float factor) { return tally_v1_scaled_total(&stats, factor); },
+        "stats"_a, "factor"_a);
+    m.def("live_counters", []() {
+        int32_t out{};
+        check(tally_v1_live_counters(&out));
+        return out;
+    });
+    ticket_class.def("position", [](const TallyTicket &ticket) { return tally_v1_ticket_position(ticket); });
+    counter_class.def("destroy", [](TallyCounter &counter) {
+        int32_t status = tally_v1_counter_destroy(counter);
+        if (status == 0) {
+            counter.bits = 0;
+        }
+        check(status);
+    });
+    counter_class.def(
+        "add", [](const TallyCounter &counter, int32_t amount) { check(tally_v1_counter_add(counter, amount)); },
         "amount"_a);
-    m.def(
-        "counter_stats",
-        [](const TallyCounter &counter) {
-            TallyStats out{};
-            check(tally_v1_counter_stats(counter, &out));
-            return out;
-        },
-        "counter"_a);
-    m.def(
-        "counter_label",
+    counter_class.def("stats", [](const TallyCounter &counter) {
+        TallyStats out{};
+        check(tally_v1_counter_stats(counter, &out));
+        return out;
+    });
+    counter_class.def(
+        "label",
         [](const TallyCounter &counter, std::string_view label) {
             int32_t out{};
             check(tally_v1_counter_label(counter, VhStrArg{label.data(), label.size()}, &out));
             return out;
         },
-        "counter"_a, "label"_a);
-    m.def(
-        "counter_add_all",
+        "label"_a);
+    counter_class.def(
+        "add_all",
         [](const TallyCounter &counter, const std::vector<int32_t> &amounts) {
             check(tally_v1_counter_add_all(counter, VhSpan{amounts.data(), amounts.size()}));
         },
-        "counter"_a, "amounts"_a);
-    m.def(
-        "counter_add_weighted",
+        "amounts"_a);
+    counter_class.def(
+        "add_weighted",
         [](const TallyCounter &counter, const nb::dict &samples) {
             std::vector<vh::Entry<int32_t, TallySample>> samples_entries;
             for (auto [key, value] : samples) {
@@ -320,99 +320,83 @@ void tally_v1_nanobind(nb::module_ &m) {
             check(tally_v1_counter_add_weighted(counter, VhSpan{samples_entries.data(), samples_entries.size()}, &out));
             return out;
         },
-        "counter"_a, "samples"_a);
-    m.def(
-        "counter_name",
-        [](const TallyCounter &counter) {
-            Received out;
-            check(tally_v1_counter_name(counter, &out.list, &kAllocator));
-            return out.text();
-        },
-        "counter"_a);
-    m.def(
-        "counter_history",
-        [](const TallyCounter &counter) {
-            Received out;
-            check(tally_v1_counter_history(counter, &out.list, &kAllocator));
-            const auto *items = static_cast<const int32_t *>(vh_list_data(&out.list));
-            nb::list result;
-            for (uint64_t index = 0; index < out.list.size; ++index) {
-                result.append(nb::cast(items[index], nb::rv_policy::copy));
-            }
-            return result;
-        },
-        "counter"_a);
-    m.def(
-        "counter_histogram",
-        [](const TallyCounter &counter) {
-            Received out;
-            check(tally_v1_counter_histogram(counter, &out.list, &kAllocator));
-            const auto *items = static_cast<const vh::Entry<int32_t, int32_t> *>(vh_list_data(&out.list));
-            nb::dict result;
-            for (uint64_t index = 0; index < out.list.size; ++index) {
-                result[nb::cast(items[index].key, nb::rv_policy::copy)] =
-                    nb::cast(items[index].value, nb::rv_policy::copy);
-            }
-            return result;
-        },
-        "counter"_a);
-    m.def(
-        "counter_samples",
-        [](const TallyCounter &counter) {
-            Received out;
-            check(tally_v1_counter_samples(counter, &out.list, &kAllocator));
-            const auto *items = static_cast<const TallySample *>(vh_list_data(&out.list));
-            nb::list result;
-            for (uint64_t index = 0; index < out.list.size; ++index) {
-                result.append(nb::cast(items[index], nb::rv_policy::copy));
-            }
-            return result;
-        },
-        "counter"_a);
-    m.def(
-        "counter_range",
-        [](const TallyCounter &counter) {
-            TallyRange out{};
-            check(tally_v1_counter_range(counter, &out));
-            return out;
-        },
-        "counter"_a);
-    m.def(
-        "counter_in_range",
+        "samples"_a);
+    counter_class.def("name", [](const TallyCounter &counter) {
+        Received out;
+        check(tally_v1_counter_name(counter, &out.list, &kAllocator));
+        return out.text();
+    });
+    counter_class.def("history", [](const TallyCounter &counter) {
+        Received out;
+        check(tally_v1_counter_history(counter, &out.list, &kAllocator));
+        const auto *items = static_cast<const int32_t *>(vh_list_data(&out.list));
+        nb::list result;
+        for (uint64_t index = 0; index < out.list.size; ++index) {
+            result.append(nb::cast(items[index], nb::rv_policy::copy));
+        }
+        return result;
+    });
+    counter_class.def("histogram", [](const TallyCounter &counter) {
+        Received out;
+        check(tally_v1_counter_histogram(counter, &out.list, &kAllocator));
+        const auto *items = static_cast<const vh::Entry<int32_t, int32_t> *>(vh_list_data(&out.list));
+        nb::dict result;
+        for (uint64_t index = 0; index < out.list.size; ++index) {
+            result[nb::cast(items[index].key, nb::rv_policy::copy)] = nb::cast(items[index].value, nb::rv_policy::copy);
+        }
+        return result;
+    });
+    counter_class.def("samples", [](const TallyCounter &counter) {
+        Received out;
+        check(tally_v1_counter_samples(counter, &out.list, &kAllocator));
+        const auto *items = static_cast<const TallySample *>(vh_list_data(&out.list));
+        nb::list result;
+        for (uint64_t index = 0; index < out.list.size; ++index) {
+            result.append(nb::cast(items[index], nb::rv_policy::copy));
+        }
+        return result;
+    });
+    counter_class.def("range", [](const TallyCounter &counter) {
+        TallyRange out{};
+        check(tally_v1_counter_range(counter, &out));
+        return out;
+    });
+    counter_class.def(
+        "in_range",
         [](const TallyCounter &counter, const TallyRange &range) {
             int32_t out{};
             check(tally_v1_counter_in_range(counter, &range, &out));
             return out;
         },
-        "counter"_a, "range"_a);
-    m.def(
-        "counter_store",
+        "range"_a);
+    counter_class.def(
+        "store",
         [](const TallyCounter &counter, nb::handle value) {
             const VhType *type_type =
                 descriptor_of(value.type(), "counter_store: value is not a Struct of this module");
             check(tally_v1_counter_store(counter, type_type, nb::inst_ptr<void>(value)));
         },
-        "counter"_a, "value"_a);
-    m.def(
-        "counter_load",
+        "value"_a);
+    counter_class.def(
+        "load",
         [](const TallyCounter &counter, nb::handle type) {
             const VhType *type_type = descriptor_of(type, "counter_load: type is not a Struct class of this module");
             nb::object out = type();
             check(tally_v1_counter_load(counter, type_type, nb::inst_ptr<void>(out)));
             return out;
         },
-        "counter"_a, "type"_a);
-    m.def(
-        "counter_has",
+        "type"_a);
+    counter_class.def(
+        "has",
         [](const TallyCounter &counter, nb::handle type) {
             const VhType *type_type = descriptor_of(type, "counter_has: type is not a Struct class of this module");
             bool out{};
             check(tally_v1_counter_has(counter, type_type, &out));
             return out;
         },
-        "counter"_a, "type"_a);
-    m.def(
-        "counter_clamp",
+        "type"_a);
+    counter_class.def(
+        "clamp",
         [](const TallyCounter &counter, const std::vector<TallyRange> &ranges) {
             Received out;
             check(tally_v1_counter_clamp(counter, VhSpan{ranges.data(), ranges.size()}, &out.list, &kAllocator));
@@ -423,70 +407,72 @@ void tally_v1_nanobind(nb::module_ &m) {
             }
             return result;
         },
-        "counter"_a, "ranges"_a);
-    m.def(
-        "counter_ticket",
-        [](const TallyCounter &counter) {
-            TallyTicket out{};
-            check(tally_v1_counter_ticket(counter, &out));
-            return out;
-        },
-        "counter"_a);
-    m.def(
-        "counter_tickets",
-        [](const TallyCounter &counter) {
-            Received out;
-            check(tally_v1_counter_tickets(counter, &out.list, &kAllocator));
-            const auto *items = static_cast<const TallyTicket *>(vh_list_data(&out.list));
-            nb::list result;
-            for (uint64_t index = 0; index < out.list.size; ++index) {
-                result.append(nb::cast(items[index], nb::rv_policy::copy));
-            }
-            return result;
-        },
-        "counter"_a);
-    m.def(
-        "counter_redeem",
+        "ranges"_a);
+    counter_class.def("ticket", [](const TallyCounter &counter) {
+        TallyTicket out{};
+        check(tally_v1_counter_ticket(counter, &out));
+        return out;
+    });
+    counter_class.def("tickets", [](const TallyCounter &counter) {
+        Received out;
+        check(tally_v1_counter_tickets(counter, &out.list, &kAllocator));
+        const auto *items = static_cast<const TallyTicket *>(vh_list_data(&out.list));
+        nb::list result;
+        for (uint64_t index = 0; index < out.list.size; ++index) {
+            result.append(nb::cast(items[index], nb::rv_policy::copy));
+        }
+        return result;
+    });
+    counter_class.def(
+        "redeem",
         [](const TallyCounter &counter, const std::vector<TallyTicket> &tickets) {
             int32_t out{};
             check(tally_v1_counter_redeem(counter, VhSpan{tickets.data(), tickets.size()}, &out));
             return out;
         },
-        "counter"_a, "tickets"_a);
-    m.def("ticket_position", [](const TallyTicket &ticket) { return tally_v1_ticket_position(ticket); }, "ticket"_a);
-    m.def(
-        "cursor_create",
+        "tickets"_a);
+    cursor_class.def("destroy", [](TallyCursor &cursor) {
+        int32_t status = tally_v1_cursor_destroy(cursor);
+        if (status == 0) {
+            cursor.bits = 0;
+        }
+        check(status);
+    });
+    cursor_class.def("next", [](const TallyCursor &cursor) {
+        int32_t out{};
+        check(tally_v1_cursor_next(cursor, &out));
+        return out;
+    });
+    cursor_class.def("counter_bits", [](const TallyCursor &cursor) {
+        uint64_t out{};
+        check(tally_v1_cursor_counter_bits(cursor, &out));
+        return out;
+    });
+    counter_class.def_static(
+        "create",
+        [](TallyMode mode) {
+            TallyCounter out{};
+            check(tally_v1_counter_create(mode, &out));
+            return OwnedCounter(out.bits);
+        },
+        "mode"_a);
+    counter_class.def_static(
+        "exists",
+        [](uint64_t bits) {
+            bool out{};
+            check(tally_v1_counter_exists(bits, &out));
+            return out;
+        },
+        "bits"_a);
+    counter_class.def_static("destroy_all", []() { check(tally_v1_counter_destroy_all()); });
+    cursor_class.def_static(
+        "create",
         [](const TallyCounter &counter) {
             TallyCursor out{};
             check(tally_v1_cursor_create(counter, &out));
             return OwnedCursor(out.bits);
         },
         "counter"_a, nb::keep_alive<0, 1>());
-    m.def(
-        "cursor_destroy",
-        [](TallyCursor &cursor) {
-            int32_t status = tally_v1_cursor_destroy(cursor);
-            if (status == 0) {
-                cursor.bits = 0;
-            }
-            check(status);
-        },
-        "cursor"_a);
-    m.def(
-        "cursor_next",
-        [](const TallyCursor &cursor) {
-            int32_t out{};
-            check(tally_v1_cursor_next(cursor, &out));
-            return out;
-        },
-        "cursor"_a);
-    m.def("live_cursors", []() { return tally_v1_live_cursors(); });
-    m.def("counter_exists", [](uint64_t bits) { return tally_v1_counter_exists(bits); }, "bits"_a);
-    m.def("counter_destroy_all", []() { check(tally_v1_counter_destroy_all()); });
-    m.def(
-        "scaled_total", [](const TallyStats &stats, float factor) { return tally_v1_scaled_total(&stats, factor); },
-        "stats"_a, "factor"_a);
-    m.def("live_counters", []() { return tally_v1_live_counters(); });
 }
 
 #ifndef TALLY_NANOBIND_HOSTED

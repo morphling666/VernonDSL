@@ -9,6 +9,7 @@ signature, ABI, and effect, and the registry only checks that a binding exists a
 from __future__ import annotations
 
 import ctypes
+import importlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,8 @@ class ExternRegistry:
     def __init__(self) -> None:
         self._bindings: dict[str, _Binding] = {}
         self._libraries: list[tuple[ctypes.CDLL, str | None]] = []
+        # The `vd.library` binding modules imported and bound, each once.
+        self._imported: set[str] = set()
         # Compiled modules resolve symbols once, when loaded; a changed revision tells their owners to reload.
         self.revision = 0
 
@@ -151,10 +154,15 @@ class ExternRegistry:
                     return _Binding(native=address, schema=schema)
         return None
 
-    def resolve(self, symbol: str, schema: str | None = None) -> _Binding:
-        """The binding of `symbol`, checked against the schema its declaration names."""
+    def resolve(self, symbol: str, schema: str | None = None, module: str | None = None) -> _Binding:
+        """The binding of `symbol`, checked against the schema its declaration names. Without one, `module`, the
+        `binding=` of the declaring `vd.library`, is imported and bound (`bind_module`) once, and supplies it."""
 
         binding = self._lookup(symbol)
+        if binding is None and module is not None and module not in self._imported:
+            self._imported.add(module)
+            self.bind_module(importlib.import_module(module))
+            binding = self._lookup(symbol)
         if binding is None:
             raise HostBindingError(f"extern symbol '{symbol}' has no binding")
         if schema is not None and binding.schema is not None and schema != binding.schema:
@@ -164,7 +172,7 @@ class ExternRegistry:
         return binding
 
     def _binding(self, extern: HostExtern) -> _Binding:
-        return self.resolve(extern.symbol, extern.schema)
+        return self.resolve(extern.symbol, extern.schema, extern.binding)
 
     def native_address(self, extern: HostExtern, fields: StructFields, errors: list[BaseException]) -> tuple[int, Any]:
         """The C function address compiled Host code calls for `extern`, and an object that must outlive it.
@@ -239,8 +247,9 @@ def _python_callback(
         descriptor = None
         parameters = [parameter for _, parameter in extern.parameters]
         result_type = extern.result
+        instance: ConcreteType | None = None
         if extern.type_argument is not None:
-            from .reflect import VhType
+            from .reflect import CLASS, VhType
 
             raw = list(raw)
             descriptor = VhType.from_address(raw.pop(extern.type_argument[0]))
@@ -249,10 +258,14 @@ def _python_callback(
             passed = ConcreteType("struct", descriptor.name.decode("utf-8"))
             parameters = [passed if parameter == declared else parameter for parameter in parameters]
             result_type = passed if result_type == declared else result_type
+            # A Host class instance the call moves in reaches the binding as its address, as it reaches C.
+            instance = passed if descriptor.kind == CLASS else None
         try:
             values = []
             for value, parameter in zip(raw, parameters, strict=False):
-                if parameter.kind == "str":
+                if parameter == instance:
+                    values.append(int(value))
+                elif parameter.kind == "str":
                     values.append(ctypes.string_at(value.data, value.size).decode("utf-8"))
                 elif parameter.kind in {"list", "dict"}:
                     values.append(_received(value, parameter, fields))

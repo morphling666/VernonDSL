@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from functools import update_wrapper
 from pathlib import Path
+from types import MethodType
 from typing import TYPE_CHECKING, Any
 
 from .._markers import mark
@@ -13,6 +16,7 @@ from .model import HostProgram
 
 if TYPE_CHECKING:
     from ..decorators import Library
+    from .module import HostModule
     from .native import Entry, HostRuntime
 
 
@@ -72,12 +76,32 @@ class HostFunction:
 
         if registry is None and active_runtime() is not None:
             return self.function(*args)
+        if registry is None:
+            attached = self._module()
+            if attached is not None:
+                # The runtime the module's classes run with (class_runtime), so an instance the function makes and
+                # moves into C carries the module's table, whose methods run this source, as the AOT object's would.
+                return attached.runtime.invoke(attached.entry(self.__name__), args)
         runtime = self.runtime(registry)
         assert self._entry is not None
         return runtime.invoke(self._entry, args)
 
     def __call__(self, *args: Any) -> Any:
         return self.call(*args)
+
+    def _module(self) -> HostModule | None:
+        """The HostModule attached to the imported module defining the function; None for a function whose module
+        is not the source file, such as one a test defines inside another function's scope."""
+
+        from .module import HostModule
+
+        module = sys.modules.get(self.function.__module__)
+        source = getattr(module, "__file__", None)
+        if module is None or source is None or Path(source).resolve() != self.source_path:
+            return None
+        if self.function.__qualname__ != self.function.__name__:
+            return None
+        return HostModule.attach(module, eager=False)
 
 
 class ExternFunction:
@@ -91,27 +115,31 @@ class ExternFunction:
         symbol: str,
         effects: str,
         abi: str,
-        schema: str | None,
         meta: Mapping[str, Any] | None = None,
         library: Library | None = None,
+        closed_by: ExternFunction | None = None,
     ):
         self.function = function
+        self.closed_by = closed_by
+        # The `@handle` class whose body declares the extern as a method, whose first parameter, `self`, it is.
+        self.receiver: type[Any] | None = None
         self.symbol = symbol
         self.effects = effects
         self.abi = abi
-        self.declared_schema = schema
         self.library = library
         self.meta = dict(meta) if meta is not None else {}
-        mark(self, "extern", symbol=symbol, effects=effects, abi=abi, schema=schema, meta=self.meta)
+        mark(self, "extern", symbol=symbol, effects=effects, abi=abi, meta=self.meta)
         update_wrapper(self, function)
 
     @property
     def schema(self) -> str | None:
-        """The declared schema, or else the identity of the extern's `vd.library`."""
+        """The identity of the extern's `vd.library`, which a binding must have been generated from; none
+        outside a library."""
 
-        if self.declared_schema is not None or self.library is None:
-            return self.declared_schema
-        return self.library.identity
+        return None if self.library is None else self.library.identity
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        return self if instance is None else MethodType(self, instance)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         from .native import active_runtime
@@ -119,4 +147,29 @@ class ExternFunction:
         runtime = active_runtime()
         if runtime is None or kwargs:
             raise TypeError(f"@extern '{self.__name__}' is a C function; call it from @host code")
-        return runtime.call_extern(self, args)
+        result = runtime.call_extern(self, args)
+        if self.closed_by is not None:
+            return ExternScope(result, self.closed_by, args[0])
+        return result
+
+
+class ExternScope:
+    """A scoped extern's call in Python mode: `with` binds its result and calls the closer on the handle it opened
+    on however the block exits. A closer failing while an error is already leaving the block is dropped, so that
+    error stands, as in compiled code."""
+
+    def __init__(self, result: Any, closer: ExternFunction, handle: Any):
+        self.result = result
+        self.closer = closer
+        self.handle = handle
+
+    def __enter__(self) -> Any:
+        return self.result
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None, trace: Any) -> bool:
+        if kind is None:
+            self.closer(self.handle)
+        else:
+            with contextlib.suppress(Exception):
+                self.closer(self.handle)
+        return False

@@ -289,6 +289,11 @@ class HostModule:
         )
         return migrated
 
+    def entry(self, symbol: str) -> Entry:
+        """The Python entry behind the table's symbol `symbol`, unprefixed: a function, a method or an initializer."""
+
+        return self._entry(symbol)
+
     def _entry(self, symbol: str) -> Entry:
         for source in self.sources:
             for class_name in source.defined_classes():

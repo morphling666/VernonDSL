@@ -610,6 +610,21 @@ frees it.
 - **Module graph.** A combined module drops its modules' assignments, so
   each extern keeps the names its own module binds to `TypeVar`; an
   importer's names never make an extern generic.
+- **Moved instances.** A variable bound to `vd.HostClass` binds a value
+  parameter to the program's Host classes instead of its Structs, and may
+  annotate nothing else: a result or a second parameter would copy or
+  alias an instance, which classes never do. The ownership checker treats
+  the argument as a move (a new instance or a local, unusable after), the
+  emitter passes the instance's address and zeroes it after the call, and
+  Python mode zeroes the instance's memory the same way. The callee moves
+  the bytes out before returning, since the caller zeroes them on every
+  status.
+  - Why a move rather than a borrow: the callee keeps the instance (an
+    engine schedules a configured system object), and a borrow would leave
+    two owners of its lists and dicts.
+  - Why a bound rather than `type[S]`: what the callee keeps is a
+    configured instance; a class alone would leave its fields, which
+    wire it up, to defaults.
 - **Python bindings.** A binding serves every specialization. It receives the
   C parameters, the descriptor included, and receives and returns `T` values
   as field dicts; in the value form Python mode takes the descriptor from
@@ -618,6 +633,71 @@ frees it.
   component storage it never compiled against. That storage is keyed by the
   descriptor and copies `descriptor->size` bytes, which is how script-declared
   components reach a C++ engine without generated C++ per type.
+
+## Handle methods
+
+- **Declaration.** A handle's methods are the externs its class body
+  declares, as a Python class declares its methods: `def resize(self, ...)`
+  for one taking the handle, `@staticmethod` for constructors and other
+  functions without one. Their C name follows one rule, the snake-cased
+  class name and the method, `Viewport.resize` being `viewport_resize`, so
+  the C API keeps the name a C programmer expects, and no second name or
+  prefix convention exists to keep in sync. Only the handle's own module
+  declares its methods, so an importer cannot add methods to another
+  library's handle.
+- **Hoisting.** The module graph moves each class-body extern to module
+  level under its C name before anything else reads the module, with `self`
+  typed as the handle, so inference, the validator, the ownership checker,
+  the emitter and bindgen see the externs they already handle. The class
+  records its methods and statics; `Viewport.create(...)` resolves to the
+  hoisted static where references are resolved. A body member that is not
+  an extern is an error: handles hold no fields and no Host code.
+- **C names stay C names.** A hoisted extern records its `Class.method`, and
+  an import or reference reaching it by its C name is an error naming the
+  call to write instead, since Python mode has no module-level function of
+  that name either. The hoist's own `closed_by` link is the one exempt
+  reference.
+- **Module graph.** A method call names no extern, and its receiver's type
+  is known only after inference, so reaching a handle reaches its method
+  externs, and `LoadedProject.handle_methods` maps each handle's methods to
+  their emitted extern names. Pruning keeps them by method name, as it keeps
+  class methods.
+- **Resolution.** Inference rewrites `h.m(args)` into the extern call
+  `handle_m(h, args)` through the method table, as it does for Struct and
+  class methods, so the validator, the ownership checker and the emitter
+  only see extern calls.
+- **Generic methods.** A `type[T]` extern is specialized before inference,
+  by call name. A method call is specialized there for each handle method of
+  that name whose type argument names a Struct, the choices recorded on the
+  call, and inference picks the one of the receiver's handle and drops the
+  type argument.
+- **Python mode.** Handles are values of their class rather than ints, so
+  `h.m` resolves: the class-body externs are descriptors that bind the
+  handle as their first argument, their default symbol is the C name, and
+  the handle codec builds handle values from what C and bindings return.
+
+## Scoped externs
+
+- **Declaration.** `closed_by=end` is a name reference rather than a string,
+  so Python mode holds the closer itself and an IDE resolves it. The module
+  graph follows it like any reference, renames it with the closer, and
+  keeps the closer reachable from its opener, since no call names it.
+- **Why only externs.** A scope is the C API's Begin/End pairing. Pairing it
+  in the declaration, rather than accepting any Python context manager,
+  keeps `with` a fixed lowering: the closer takes exactly the opener's
+  handle, so the emitter needs no protocol, object or exception machinery.
+- **Exits.** Every way out of a Host function already goes through
+  `leave(status)` and every loop exit through its labels. The emitter keeps
+  a stack of open scopes (closer, slot holding the handle). `leave` closes
+  all of them, `break` and `continue` close those opened inside the loop,
+  and the block's end closes its own. On a failure path closers' statuses
+  are dropped; on a successful path a failing closer leaves with its status
+  through the scopes outside it. Python mode's context manager drops a
+  closer's error while another is leaving the block, where plain Python
+  would replace it, so the first failure stands in both modes.
+- **Checks.** The validator rejects an opener anywhere but a `with` item,
+  so no scope is opened that nothing closes, and counts the closer among
+  the function's calls for effects and binding.
 
 ## Spans and owned results
 
@@ -696,10 +776,12 @@ any engine-specific declarations.
   it. Both reject a `vd.library` after an extern, the one order in which
   they would disagree.
 - **Schema identity.** A library's identity is `"<name>-v<version>:<hash>"`
-  (`hostlang.library_identity`), and it is the schema of the module's
-  externs that do not declare `schema=`, so the existing check rejects a
-  binding from another revision: at load for a compiled module or an eager
-  runtime, at the first call otherwise.
+  (`hostlang.library_identity`), and it is the schema of every extern of
+  the module, so the existing check rejects a binding from another
+  revision: at load for a compiled module or an eager runtime, at the first
+  call otherwise. An extern has no schema of its own: a revision describes a
+  whole C API, and a second, hand-written name for it could only drift from
+  the hash or override it.
   - The hash covers the module's Struct and handle layouts, its enums'
     members and values, and each extern's
     symbol, effect, ABI and canonical parameter and result layouts. A
@@ -714,6 +796,14 @@ any engine-specific declarations.
   `vh_symbols()` address table under its `vh_schema`, and its
   `vh_last_error()` when it has one: Python mode then adds the library's
   message to the `HostExecutionError` of a failing status extern.
+- **`vd.library(..., binding="pkg.module")`** names that module. When a
+  registry has no binding for one of the library's externs, it imports the
+  module and binds it with `bind_module`, once per registry, and looks
+  again. A program importing the library then runs in Python mode without
+  binding anything, as its AOT object links the library without naming it.
+  It is a dotted name, not the module object, because the library module
+  is imported by the module the binding is generated into: the nanobind
+  module checks its `vh_schema` against the library's identity.
 
 ### Level 1 bindings (`vernon_dsl.bindgen`)
 
@@ -787,7 +877,13 @@ committed output differs. The rest of the proposal is in
   argument is the bound Struct's class, whose `vh_type` is the library's
   descriptor: a value must be an instance of it, and a result is a new one.
   A value-bound function takes no class; the value's class gives the
-  descriptor.
+  descriptor. A moved Host class instance is `void *` after its
+  descriptor in C, and a `vh::Instance` in C++, which owns the bytes and
+  releases them with the type's `fini`: the thunk moves the instance into
+  it before resolving handles or asking the effect check, so every
+  failure releases it. The nanobind module lists the function in
+  `vh_symbols()` only: an instance is Host code's memory, so only Host code
+  passes one.
 - **The effect check**, with `effect_check=<name>` on `vd.library`: every
   `abi="status"` thunk of a non-pure extern calls
   `vh::Status <name>(const VhCall &call[, const T &object])` in
@@ -828,7 +924,9 @@ committed output differs. The rest of the proposal is in
   object's bits, so collecting it does nothing. A dependent handle's
   `Owned` object keeps its parent's Python object alive (`keep_alive`), so
   collection cannot destroy the parent under it. `Handle(bits)` names an
-  object without owning it.
+  object without owning it. A handle's methods are
+  bound on its class, so `Owned` objects have them too, and its static
+  methods with `def_static`; neither is also a module function.
 - **Not yet generated** (rejected with `BindgenError`): Tuple parameters or
   results, and lists of `str`.
 - **No formatter runs.** Outputs are emitted in the project's style, so

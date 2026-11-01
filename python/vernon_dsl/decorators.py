@@ -136,6 +136,8 @@ class Library:
     meta: Mapping[str, Any]
     # The declaring module's file; None for a module without one, whose externs then have no identity.
     source: Path | None = None
+    # The Python module Python mode binds the externs from (`ExternRegistry.bind_module`) when nothing bound them.
+    binding: str | None = None
 
     @property
     def identity(self) -> str | None:
@@ -148,11 +150,15 @@ class Library:
         return library_identity(self.source, self.name, self.version)
 
 
-def library(name: str, version: int = 0, *, meta: Mapping[str, Any] | None = None) -> Library:
+def library(
+    name: str, version: int = 0, *, binding: str | None = None, meta: Mapping[str, Any] | None = None
+) -> Library:
     """Declare the calling module a native library's binding: its externs declared without `symbol=` bind
     `<name>_v<version>_<function>`, so libraries do not collide and a version change renames every symbol. It is a
-    module-level statement before the module's externs. `meta=vd.meta(...)` is for binding generators, such as
-    the C++ namespace implementing the library."""
+    module-level statement before the module's externs. `binding` names the Python module publishing the library's
+    addresses, such as its nanobind module, which Python mode binds an extern of the library from when no binding of
+    its symbol is registered. `meta=vd.meta(...)` is for binding generators, such as the C++ namespace implementing
+    the library."""
 
     from .hostlang.function import ExternFunction
 
@@ -160,6 +166,10 @@ def library(name: str, version: int = 0, *, meta: Mapping[str, Any] | None = Non
         raise ValueError(f"vd.library name '{name}' is not a C identifier")
     if isinstance(version, bool) or not isinstance(version, int) or version < 0:
         raise ValueError("vd.library version is a non-negative integer")
+    if binding is not None and not (
+        isinstance(binding, str) and all(part.isidentifier() for part in binding.split("."))
+    ):
+        raise ValueError("vd.library binding is a dotted module name")
     caller = inspect.currentframe().f_back  # type: ignore[union-attr]
     namespace = caller.f_globals  # type: ignore[union-attr]
     if _LIBRARY_GLOBAL in namespace:
@@ -167,7 +177,7 @@ def library(name: str, version: int = 0, *, meta: Mapping[str, Any] | None = Non
     if any(isinstance(value, ExternFunction) for value in namespace.values()):
         raise ValueError("vd.library precedes the module's externs, whose symbols it names")
     source = namespace.get("__file__")
-    declared = Library(name, version, dict(meta) if meta is not None else {}, Path(source) if source else None)
+    declared = Library(name, version, dict(meta) if meta is not None else {}, Path(source) if source else None, binding)
     namespace[_LIBRARY_GLOBAL] = declared
     return declared
 
@@ -178,49 +188,89 @@ def extern(
     symbol: str | None = None,
     effects: str = "io",
     abi: str = "direct",
-    schema: str | None = None,
     meta: Mapping[str, Any] | None = None,
+    closed_by: Any = None,
 ) -> Any:
     """Declare a C function Host code calls; the body is `...`. `abi="direct"` returns the result, which must be a
     scalar or handle; `abi="status"` returns an int32 status, zero on success, and writes the result through a
     trailing out pointer. Handles and scalars pass by value, aggregates by const pointer, and str as a
-    {const char *data; uint64_t size} pair by value. `schema` identifies the C API revision the declaration was
-    generated from; a binding registered under another schema is rejected. `meta=vd.meta(...)` is recorded on
-    each `VhCall` of the extern and read by binding generators, never by the compiler.
+    {const char *data; uint64_t size} pair by value. In a module declaring `vd.library`, the library's identity
+    is the C API revision the declaration names; a binding registered under another is rejected.
+    `meta=vd.meta(...)` is recorded on each `VhCall` of the extern and read by binding generators, never by the
+    compiler.
 
     A parameter annotated `type[T]` makes the extern generic: Host code passes a `@struct` type there, as in
     `read(entity, Health)`, and the other parameters and the result may use `T`. Each call site's Struct specializes
     the extern, and the C function receives that Struct's `const VhType *` where the type was passed, so one C
     function can store or serialize any Struct by its reflected layout. Without a `type[T]` parameter, the first
     parameter annotated `T` binds it to the type of the Struct value passed there, as in `write(entity, health)`,
-    and the descriptor goes just before that value."""
+    and the descriptor goes just before that value. A type variable bound to `HostClass`,
+    `S = TypeVar("S", bound=vd.HostClass)`, binds a Host class instance instead, as in `add_system(world, walker)`:
+    the call moves the instance into the C function, which receives the class's descriptor and the instance's
+    address and moves its bytes out before returning, whatever its status; the caller's name is then moved.
+
+    `closed_by=end` makes the extern open a scope that the extern `end`, declared earlier, closes: Host code calls
+    it only as the subject of a `with`, which calls `end` on the opener's first argument, a handle, however the
+    block exits, as in `with ui_window(ui, "Scene"): ...`."""
 
     def decorate(value: Callable[..., Any]) -> Any:
         from .hostlang.function import ExternFunction
-        from .language.syntax import library_symbol
+        from .language.syntax import handle_method_name, library_symbol
 
         declared: Library | None = getattr(value, "__globals__", {}).get(_LIBRARY_GLOBAL)
-        default = value.__name__
+        # Declared in a class body, as a `@handle` class's are, it is named after the class.
+        scopes = value.__qualname__.split(".")
+        name = value.__name__
+        if len(scopes) > 1 and scopes[-2] != "<locals>":
+            name = handle_method_name(scopes[-2], name)
+        default = name
         if declared is not None:
-            default = library_symbol((declared.name, declared.version), value.__name__)
-        return ExternFunction(
-            value, symbol=symbol or default, effects=effects, abi=abi, schema=schema, meta=meta, library=declared
+            default = library_symbol((declared.name, declared.version), name)
+        declaration = ExternFunction(
+            value,
+            symbol=symbol or default,
+            effects=effects,
+            abi=abi,
+            meta=meta,
+            library=declared,
+            closed_by=closed_by,
         )
+        return declaration
 
     return decorate(function) if function is not None else decorate
 
 
-def handle(value: _T | None = None, *, c_type: str | None = None, meta: Mapping[str, Any] | None = None) -> Any:
+class HostClass:
+    """The bound of an extern type variable whose values are Host class instances the call moves into the callee;
+    see `extern`. No class derives from it."""
+
+
+def handle(
+    value: _T | None = None,
+    *,
+    c_type: str | None = None,
+    meta: Mapping[str, Any] | None = None,
+) -> Any:
     """Declare an opaque 64-bit Host handle type, such as an engine World or Entity. Host code compares handles and
     constructs only the null handle, `Handle()`; externs make the others. `c_type` names the C type generated headers
     use for it, a struct holding one uint64_t. `meta=vd.meta(...)` is recorded on the handle's `VhType`. In Python a
-    handle is its bits as an int, so `Handle()` is 0."""
+    handle is a value of the class holding its `bits`, and `Handle()` is the null handle.
+
+    The class body declares the handle's externs: a method `def resize(self, extent: Extent) -> None` is the C
+    function `viewport_resize(viewport, extent)`, called as `viewport.resize(extent)`, and a `@staticmethod` one,
+    as `def create(world: World) -> Viewport`, is called as `Viewport.create(world)`. The C name is the class name
+    in snake case, `_`, and the method's."""
 
     def decorate(cls: _T) -> _T:
+        from .host_values import make_handle
+        from .hostlang.function import ExternFunction
+
         mark(cls, "handle", c_type=c_type, meta=dict(meta) if meta is not None else {})
         record_declaration_source(cls)
-        cls.__new__ = staticmethod(lambda _cls, bits=0: int(bits))  # type: ignore[attr-defined]
-        return cls
+        for member in vars(cls).values():
+            if isinstance(member, ExternFunction):
+                member.receiver = cls
+        return make_handle(cls)  # type: ignore[arg-type,return-value]
 
     return decorate(value) if value is not None else decorate
 

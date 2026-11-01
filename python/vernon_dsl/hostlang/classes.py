@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from ..diagnostics import CompileError, copy_location, fix_missing_locations, node_location
@@ -208,14 +209,33 @@ class _Substitute(ast.NodeTransformer):
         return copy_location(ast.Name(id=self.bound, ctx=node.ctx), node) if node.id == self.variable else node
 
 
+def _names_only_its_value(declaration: ast.FunctionDef, index: int, variable: str) -> bool:
+    """Whether a value-bound extern's type variable annotates only its binding parameter: an instance is no value,
+    so an extern taking one cannot return it or receive it anywhere else."""
+
+    annotations = [argument.annotation for position, argument in enumerate(declaration.args.args) if position != index]
+    return not any(
+        isinstance(node, ast.Name) and node.id == variable
+        for annotation in [*annotations, declaration.returns]
+        if annotation is not None
+        for node in ast.walk(annotation)
+    )
+
+
 def _specialize_generic_externs(
-    module: ast.Module, filename: str, struct_names: set[str]
+    module: ast.Module,
+    filename: str,
+    struct_names: set[str],
+    class_names: set[str],
+    handle_methods: Mapping[str, Mapping[str, str]],
 ) -> tuple[dict[str, GenericExtern], dict[str, int]]:
     """Replaces each generic extern by its specializations, one per bound Struct. A `type[T]` extern is specialized
     per Struct type its calls pass, dropping the type argument from the call; the emitter passes the type's
     descriptor in its place. A value-bound extern is specialized for every Struct, since only inference knows a
     value's type: inference points each call at its value's specialization (the returned index of the value by
-    extern name), and the frontend drops the ones no call reaches."""
+    extern name), and the frontend drops the ones no call reaches. One whose type variable is bound to
+    `vd.HostClass` is specialized for every Host class instead: the call moves the instance into the callee, which
+    receives the class's descriptor, its methods included, as an engine taking a configured system needs."""
 
     generic: dict[str, tuple[ast.FunctionDef, int, str]] = {}
     by_value: dict[str, int] = {}
@@ -236,29 +256,61 @@ def _specialize_generic_externs(
             generic[node.name] = (node, index, variable)
             continue
         by_value[node.name] = index
-        for bound in sorted(struct_names):
+        bounds = struct_names
+        if variable in getattr(node, "_vernon_instance_variables", ()):
+            if not _names_only_its_value(node, index, variable):
+                raise _error(
+                    filename,
+                    node,
+                    f"'{node.name}' takes a Host class instance as {variable}, which annotates nothing else: the call "
+                    "moves the instance into the callee",
+                )
+            bounds = class_names
+        for bound in sorted(bounds):
             name = f"{node.name}__{bound}"
             copy_node = _Substitute(variable, bound).visit(copy.deepcopy(node))
             copy_node.name = name
             specialized[name] = copy_node
             generics[name] = GenericExtern(index, bound, passed=False)
-    for node in ast.walk(module):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id not in generic:
-            continue
-        declaration, index, variable = generic[node.func.id]
-        if index >= len(node.args):
-            raise _error(filename, node, f"'{node.func.id}' takes a type argument at position {index}")
-        argument = node.args[index]
+
+    def specialization(extern: str, argument: ast.expr) -> str:
+        declaration, index, variable = generic[extern]
         bound = dotted_name(argument)
         if not isinstance(argument, ast.Name) or bound not in struct_names:
-            raise _error(filename, argument, f"the type argument of '{node.func.id}' is a @struct type")
-        name = f"{node.func.id}__{bound}"
+            raise _error(filename, argument, f"the type argument of '{extern}' is a @struct type")
+        name = f"{extern}__{bound}"
         if name not in specialized:
             copy_node = _Substitute(variable, bound).visit(copy.deepcopy(declaration))
             del copy_node.args.args[index]
             copy_node.name = name
             specialized[name] = copy_node
             generics[name] = GenericExtern(index, bound)
+        return name
+
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute):
+            # A handle method's receiver type is known only to inference, which picks the specialization of the
+            # extern the receiver's method is, recorded here with where its type argument is.
+            # The call may be another receiver's method, so an argument naming no Struct specializes nothing.
+            methods: dict[str, tuple[str, int]] = {}
+            for table in handle_methods.values():
+                extern = table.get(node.func.attr)
+                if extern not in generic:
+                    continue
+                position = generic[extern][1] - 1
+                if position < len(node.args) and dotted_name(node.args[position]) in struct_names:
+                    methods[extern] = (specialization(extern, node.args[position]), position)
+            if methods:
+                node._vernon_method_generics = methods  # type: ignore[attr-defined]
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id not in generic:
+            continue
+        index = generic[node.func.id][1]
+        if index >= len(node.args):
+            raise _error(filename, node, f"'{node.func.id}' takes a type argument at position {index}")
+        name = specialization(node.func.id, node.args[index])
         node.func = copy_location(ast.Name(id=name, ctx=ast.Load()), node.func)
         del node.args[index]
     if not specialized and not generic and not by_value:
@@ -271,7 +323,9 @@ def _specialize_generic_externs(
     return generics, by_value
 
 
-def lower_host_classes(module: ast.Module, filename: str) -> tuple[ast.Module, LoweredClasses]:
+def lower_host_classes(
+    module: ast.Module, filename: str, handle_methods: Mapping[str, Mapping[str, str]] | None = None
+) -> tuple[ast.Module, LoweredClasses]:
     nodes = [node for node in module.body if is_host_class(node)]
     names = {node.name for node in nodes}
     struct_docs = {
@@ -279,7 +333,7 @@ def lower_host_classes(module: ast.Module, filename: str) -> tuple[ast.Module, L
         for node in module.body
         if isinstance(node, ast.ClassDef) and [decorator_name(item) for item in node.decorator_list] == ["struct"]
     }
-    generics, by_value = _specialize_generic_externs(module, filename, set(struct_docs))
+    generics, by_value = _specialize_generic_externs(module, filename, set(struct_docs), names, handle_methods or {})
     classes: dict[str, HostClass] = {}
     owners: dict[str, tuple[str, str]] = {}
     annotations: dict[str, dict[str, ast.expr]] = {}

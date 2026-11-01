@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -48,6 +49,60 @@ private:
 template <typename K, typename V> struct Entry {
     K key;
     V value;
+};
+
+/* An instance of a Host class, owned: its bytes in memory of its own, laid out as its VhType, and what the type's
+ * `fini` releases on destruction. A thunk takes an instance moved into its extern as one before anything can fail, so
+ * the instance is released whatever the call's status. The type's table must outlive it. */
+class Instance {
+public:
+    /* Moves the instance at `bytes` in; the memory at `bytes` owns nothing after, and its caller zeroes it. */
+    Instance(const VhType &type, void *bytes) : type_(&type), bytes_(allocate(type)) {
+        std::memcpy(bytes_, bytes, static_cast<size_t>(type.size));
+    }
+    Instance(Instance &&other) noexcept : type_(other.type_), bytes_(other.bytes_) { other.bytes_ = nullptr; }
+    Instance(const Instance &) = delete;
+    Instance &operator=(const Instance &) = delete;
+    Instance &operator=(Instance &&) = delete;
+    ~Instance() {
+        if (bytes_ == nullptr) {
+            return;
+        }
+        if (type_->fini != nullptr) {
+            type_->fini(bytes_);
+        }
+        ::operator delete(bytes_, std::align_val_t(type_->alignment));
+    }
+
+    /* A new instance, its fields initialized by the type's `init`; its status when that fails. */
+    static int32_t create(const VhType &type, std::optional<Instance> &out) {
+        Instance made(type);
+        if (type.init != nullptr) {
+            if (const int32_t status = type.init(made.bytes_); status != 0) {
+                // A failed init leaves nothing for fini to release.
+                ::operator delete(made.bytes_, std::align_val_t(type.alignment));
+                made.bytes_ = nullptr;
+                return status;
+            }
+        }
+        out.emplace(std::move(made));
+        return 0;
+    }
+
+    const VhType &type() const { return *type_; }
+    void *data() const { return bytes_; }
+
+private:
+    explicit Instance(const VhType &type) : type_(&type), bytes_(allocate(type)) {
+        std::memset(bytes_, 0, static_cast<size_t>(type.size));
+    }
+
+    static void *allocate(const VhType &type) {
+        return ::operator new(static_cast<size_t>(type.size == 0 ? 1 : type.size), std::align_val_t(type.alignment));
+    }
+
+    const VhType *type_;
+    void *bytes_;
 };
 
 /* Fills an extern's empty owned-result record with `count` items through the allocator the caller passed, as the
@@ -131,6 +186,17 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const Slot *slot = live(bits);
         return slot == nullptr ? nullptr : slot->object.get();
+    }
+
+    /* The bits of the live handle holding `object`; 0 when none does. Scans every slot. */
+    uint64_t handle_of(const T *object) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (size_t index = 0; index < slots_.size(); ++index) {
+            if (object != nullptr && slots_[index].object.get() == object) {
+                return (static_cast<uint64_t>(slots_[index].generation) << 32) | index;
+            }
+        }
+        return 0;
     }
 
     /* Removes the object, which the caller then owns; null when `bits` is not a live handle. */

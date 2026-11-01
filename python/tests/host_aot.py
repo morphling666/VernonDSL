@@ -19,6 +19,7 @@ from vernon_dsl import _native
 from vernon_dsl.frontend.model import ConcreteType
 from vernon_dsl.hostlang import ExternRegistry, HostExecutionError, default_registry
 from vernon_dsl.hostlang.aot import compile_programs
+from vernon_dsl.hostlang.externs import HostStr
 from vernon_dsl.hostlang.layout import layout, pack, unpack
 from vernon_dsl.hostlang.model import ExternAbi, HostExtern, HostFunctionInfo, HostProgram
 from vernon_dsl.hostlang.reflect import read_module
@@ -306,6 +307,12 @@ class LinkedHost:
         for value, (_, parameter) in zip(args, info.parameters, strict=True):
             if program.is_place(parameter):
                 native.append(ctypes.c_void_p(int(value)))
+                continue
+            if parameter.kind == "str":
+                encoded = str(value).encode("utf-8")
+                view = HostStr(encoded, len(encoded))
+                buffers.append(view)
+                native.append(ctypes.cast(ctypes.pointer(view), ctypes.c_void_p))
                 continue
             converted = from_python(value, parameter, fields)
             if parameter.kind in {"scalar", "handle", "enum"}:

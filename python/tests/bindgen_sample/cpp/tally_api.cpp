@@ -221,14 +221,18 @@ vh::Result<int32_t> cursor_next(tally::Cursor &cursor) {
     return history[cursor.position()++];
 }
 
-int32_t live_cursors() { return tally::Cursor::live(); }
+vh::Result<int32_t> live_cursors() { return tally::Cursor::live(); }
 
-bool counter_exists(uint64_t bits) { return handles::find(TallyCounter{bits}) != nullptr; }
+vh::Result<bool> counter_exists(uint64_t bits) { return handles::find(TallyCounter{bits}) != nullptr; }
+
+vh::Result<uint64_t> cursor_counter_bits(const tally::Cursor &cursor) {
+    return handles::handle_of(cursor.counter()).bits;
+}
 
 vh::Status counter_destroy_all() { return handles::destroy_all<TallyCounter>(); }
 
 float scaled_total(const TallyStats &stats, float factor) { return static_cast<float>(stats.total) * factor; }
 
-int32_t live_counters() { return tally::Counter::live(); }
+vh::Result<int32_t> live_counters() { return tally::Counter::live(); }
 
 } // namespace tally::api

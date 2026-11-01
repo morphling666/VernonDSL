@@ -132,15 +132,23 @@ class _ScalarCodec(Codec):
 
 
 class _HandleCodec(Codec):
-    """Handles are their 64 bits as a Python int; `Handle()` is the null handle, 0."""
+    """Host code holds a handle as a value of its class; C and Python bindings receive its 64 bits."""
 
     simple = True
     ctype = ctypes.c_uint64
 
+    def __init__(self, cls: type[Any]):
+        self.cls = cls
+
     def value(self, item: Any) -> Any:
+        return item if type(item) is self.cls else self.cls(item)
+
+    read = value
+
+    def boundary(self, item: Any) -> Any:
         return int(getattr(item, "bits", item))
 
-    boundary = read = write = value
+    write = boundary
 
 
 class _EnumCodec(Codec):
@@ -167,6 +175,12 @@ class _EnumCodec(Codec):
         return int(item)
 
     write = boundary
+
+
+class _StrView(ctypes.Structure):
+    """A VhStrArg whose data is read as an address: the bytes are `size` long and need no terminating NUL."""
+
+    _fields_ = [("data", ctypes.c_void_p), ("size", ctypes.c_uint64)]
 
 
 class _StrCodec(Codec):
@@ -1088,7 +1102,7 @@ def _make_codec(annotation: Any) -> Codec:
     if isinstance(annotation, type):
         kind = dsl_kind(annotation)
         if kind == "handle":
-            return _HandleCodec()
+            return _HandleCodec(annotation)
         if kind == "enum":
             return _EnumCodec(annotation)
         if kind == "struct":
@@ -1210,8 +1224,13 @@ def address_of(instance: Any) -> int:
     return ctypes.addressof(instance._vh_state)
 
 
-def _initialize_new(self: Any) -> None:
+def _initialize_new(self: Any, **fields: Any) -> None:
+    """`Cls(field=value, ...)`: the defaults, then each named field assigned in order, as compiled code does."""
+
     built = class_layout(type(self))
+    unknown = [name for name in fields if name not in dict(built.fields)]
+    if unknown:
+        raise TypeError(f"{type(self).__name__} has no field '{unknown[0]}'")
     # An instance Python creates owns its state, which may move into a place; a view only reads a place.
     self._vh_owned = True
     self._vh_state = built.ctype()
@@ -1221,6 +1240,8 @@ def _initialize_new(self: Any) -> None:
         # zeroed, empty records.
         weakref.finalize(self, _finalize, self._vh_state, built, class_runtime(type(self)))
     built.initialize(self)
+    for name, item in fields.items():
+        setattr(self, name, item)
 
 
 def _deepcopy(self: Any, memo: dict[int, Any]) -> Any:
@@ -1349,6 +1370,8 @@ class _ExternShape:
     def of(cls, declaration: ExternFunction) -> _ExternShape:
         hints = get_type_hints(declaration.function, include_extras=True)
         names = list(inspect.signature(declaration.function).parameters)
+        if declaration.receiver is not None and names:
+            hints.setdefault(names[0], declaration.receiver)
         type_index, variable, parameters = None, None, []
         for index, name in enumerate(names):
             annotation = hints[name]
@@ -1370,6 +1393,24 @@ class _ExternShape:
 
         parameters = tuple(extern_codec_of(resolve(annotation)) for annotation in self.parameters)
         return parameters, None if self.result is None else extern_codec_of(resolve(self.result))
+
+
+def _taken(parameters: Sequence[Codec], values: Sequence[Any]) -> list[tuple[int, int]]:
+    """The (address, size) of each instance an extern call takes, checked to be one its caller owns."""
+
+    taken = []
+    for codec, item in zip(parameters, values, strict=True):
+        if isinstance(codec, _PlaceCodec):
+            codec.require_owner(item)
+            taken.append((address_of(item), ctypes.sizeof(codec.ctype)))
+    return taken
+
+
+def _forget(taken: list[tuple[int, int]]) -> None:
+    """Zeroes the instances a callee took, whatever its status, as compiled code leaves a moved local."""
+
+    for address, size in taken:
+        ctypes.memset(address, 0, size)
 
 
 def _ctype_argument(codec: Codec) -> Any:
@@ -1412,7 +1453,7 @@ class HostRuntime:
     def _bind(self) -> None:
         for program in self.programs if self.eager else ():
             for extern in program.reachable_externs():
-                self.registry.resolve(extern.symbol, extern.schema)
+                self.registry.resolve(extern.symbol, extern.schema, extern.binding)
         self._externs.clear()
         self._revision = self.registry.revision
 
@@ -1452,7 +1493,10 @@ class HostRuntime:
         return call(*args)
 
     def _extern(self, declaration: ExternFunction, shape: _ExternShape, bound: Any) -> Callable[..., Any]:
-        binding = self.registry.resolve(declaration.symbol, declaration.schema)
+        library = declaration.library
+        binding = self.registry.resolve(
+            declaration.symbol, declaration.schema, library.binding if library is not None else None
+        )
         parameters, result = shape.codecs(bound)
         index = shape.type_index
         # Where Host code passes the type, the call's arguments hold it; a value-bound call passes only values. Either
@@ -1467,10 +1511,17 @@ class HostRuntime:
                 values = list(args)
                 if passed is not None:
                     del values[passed]
-                converted = [codec.boundary(codec.value(item)) for codec, item in zip(parameters, values, strict=True)]
+                taken = _taken(parameters, values)
+                converted = [
+                    address_of(item) if isinstance(codec, _PlaceCodec) else codec.boundary(codec.value(item))
+                    for codec, item in zip(parameters, values, strict=True)
+                ]
                 if index is not None:
                     converted.insert(index, descriptor)
-                returned = python(*converted)
+                try:
+                    returned = python(*converted)
+                finally:
+                    _forget(taken)
                 return None if result is None else result.value(returned)
 
             return call_python
@@ -1498,8 +1549,11 @@ class HostRuntime:
                 del values[passed]
             alive: list[Any] = []
             arguments: list[Any] = []
+            taken = _taken(parameters, values)
             for codec, item in zip(parameters, values, strict=True):
-                if isinstance(codec, _StrCodec):
+                if isinstance(codec, _PlaceCodec):
+                    arguments.append(address_of(item))
+                elif isinstance(codec, _StrCodec):
                     data = str(item).encode("utf-8")
                     alive.append(data)
                     arguments.append(HostStr(data, len(data)))
@@ -1516,14 +1570,23 @@ class HostRuntime:
             if index is not None:
                 arguments.insert(index, ctypes.addressof(descriptor))
             if not status:
-                returned = native(*arguments)
+                try:
+                    returned = native(*arguments)
+                finally:
+                    _forget(taken)
                 return None if result is None else result.value(returned)
             if owned:
-                return self._receive(native, arguments, result, symbol, last_error)
+                try:
+                    return self._receive(native, arguments, result, symbol, last_error)
+                finally:
+                    _forget(taken)
             out = None if result is None else result.ctype()
             if out is not None:
                 arguments.append(ctypes.addressof(out))
-            code = native(*arguments)
+            try:
+                code = native(*arguments)
+            finally:
+                _forget(taken)
             if code != 0:
                 detail = f": {last_error()}" if last_error is not None else ""
                 raise HostExecutionError(code, f"extern '{symbol}' failed{detail}")
@@ -1645,7 +1708,10 @@ class HostRuntime:
         """A C function with the Host convention, `int32_t (params..., Result *out)`, that runs `entry`. An exception
         other than a Host status cannot unwind into C, so it is kept in `errors` and the call returns 1."""
 
-        argument_types = [_ctype_argument(codec) for codec in entry.parameters]
+        # A str parameter is a `const VhStrArg *`, unlike an extern's by-value one.
+        argument_types = [
+            ctypes.c_void_p if isinstance(codec, _StrCodec) else _ctype_argument(codec) for codec in entry.parameters
+        ]
         if entry.result is not None:
             argument_types.append(ctypes.c_void_p)
 
@@ -1655,6 +1721,9 @@ class HostRuntime:
                 for codec, item in zip(entry.parameters, raw, strict=False):
                     if isinstance(codec, _PlaceCodec):
                         values.append(codec.at(item))
+                    elif isinstance(codec, _StrCodec):
+                        view = _StrView.from_address(item)
+                        values.append(ctypes.string_at(view.data, view.size).decode("utf-8") if view.size else "")
                     elif codec.simple:
                         values.append(codec.read(item))
                     else:

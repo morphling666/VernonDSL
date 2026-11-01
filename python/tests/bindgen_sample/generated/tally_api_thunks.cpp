@@ -259,8 +259,31 @@ const VhType type_7 = {sizeof(VhType),
                        nullptr,
                        nullptr,
                        0};
-const VhMeta type_8_meta[] = {{"cpp", "\"tally::Counter\""}, {"header", "\"tally/counter.h\""}};
+const VhMeta type_8_meta[] = {
+    {"cpp", "\"tally::Ticket\""}, {"header", "\"tally/counter.h\""}, {"convert", "\"convert\""}};
 const VhType type_8 = {sizeof(VhType),
+                       8,
+                       8,
+                       8,
+                       "Ticket",
+                       UINT64_C(0xca73d4dd05c46d71),
+                       nullptr,
+                       nullptr,
+                       0,
+                       0,
+                       nullptr,
+                       nullptr,
+                       0,
+                       nullptr,
+                       nullptr,
+                       type_8_meta,
+                       3,
+                       nullptr,
+                       nullptr,
+                       nullptr,
+                       0};
+const VhMeta type_9_meta[] = {{"cpp", "\"tally::Counter\""}, {"header", "\"tally/counter.h\""}};
+const VhType type_9 = {sizeof(VhType),
                        8,
                        8,
                        8,
@@ -275,43 +298,20 @@ const VhType type_8 = {sizeof(VhType),
                        0,
                        nullptr,
                        nullptr,
-                       type_8_meta,
+                       type_9_meta,
                        2,
                        nullptr,
                        nullptr,
                        nullptr,
                        0};
-const VhMeta type_9_meta[] = {
-    {"cpp", "\"tally::Cursor\""}, {"header", "\"tally/counter.h\""}, {"depends_on", "\"Counter\""}};
-const VhType type_9 = {sizeof(VhType),
-                       8,
-                       8,
-                       8,
-                       "Cursor",
-                       UINT64_C(0x5d9995b665a076c3),
-                       nullptr,
-                       nullptr,
-                       0,
-                       0,
-                       nullptr,
-                       nullptr,
-                       0,
-                       nullptr,
-                       nullptr,
-                       type_9_meta,
-                       3,
-                       nullptr,
-                       nullptr,
-                       nullptr,
-                       0};
 const VhMeta type_10_meta[] = {
-    {"cpp", "\"tally::Ticket\""}, {"header", "\"tally/counter.h\""}, {"convert", "\"convert\""}};
+    {"cpp", "\"tally::Cursor\""}, {"header", "\"tally/counter.h\""}, {"depends_on", "\"Counter\""}};
 const VhType type_10 = {sizeof(VhType),
                         8,
                         8,
                         8,
-                        "Ticket",
-                        UINT64_C(0xca73d4dd05c46d71),
+                        "Cursor",
+                        UINT64_C(0x5d9995b665a076c3),
                         nullptr,
                         nullptr,
                         0,
@@ -376,17 +376,23 @@ const VhCall call_counter_clamp = {sizeof(VhCall), 1, "tally_v1_counter_clamp", 
 const VhCall call_counter_ticket = {sizeof(VhCall), 1, "tally_v1_counter_ticket", nullptr, nullptr, 0};
 const VhCall call_counter_tickets = {sizeof(VhCall), 1, "tally_v1_counter_tickets", nullptr, nullptr, 0};
 const VhCall call_counter_redeem = {sizeof(VhCall), 1, "tally_v1_counter_redeem", nullptr, nullptr, 0};
+const VhCall call_counter_exists = {sizeof(VhCall), 1, "tally_v1_counter_exists", nullptr, nullptr, 0};
+const VhCall call_counter_destroy_all = {sizeof(VhCall), 3, "tally_v1_counter_destroy_all", nullptr, nullptr, 0};
 const VhCall call_cursor_create = {sizeof(VhCall), 3, "tally_v1_cursor_create", nullptr, nullptr, 0};
 const VhMeta call_cursor_destroy_meta[] = {{"destroys", "\"cursor\""}};
 const VhCall call_cursor_destroy = {sizeof(VhCall), 3, "tally_v1_cursor_destroy", nullptr, call_cursor_destroy_meta, 1};
 const VhCall call_cursor_next = {sizeof(VhCall), 2, "tally_v1_cursor_next", nullptr, nullptr, 0};
-const VhCall call_counter_destroy_all = {sizeof(VhCall), 3, "tally_v1_counter_destroy_all", nullptr, nullptr, 0};
+const VhCall call_cursor_counter_bits = {sizeof(VhCall), 1, "tally_v1_cursor_counter_bits", nullptr, nullptr, 0};
+const VhCall call_live_cursors = {sizeof(VhCall), 1, "tally_v1_live_cursors", nullptr, nullptr, 0};
+const VhCall call_live_counters = {sizeof(VhCall), 1, "tally_v1_live_counters", nullptr, nullptr, 0};
 
 } // namespace
 
 namespace tally::api::handles {
 
 tally::Counter *find(TallyCounter handle) { return counter_table().find(handle.bits); }
+
+TallyCounter handle_of(const tally::Counter &object) { return TallyCounter{counter_table().handle_of(&object)}; }
 
 template <> vh::Status destroy_all<TallyCounter>() {
     vh::Status status;
@@ -401,6 +407,8 @@ template <> vh::Status destroy_all<TallyCounter>() {
 
 tally::Cursor *find(TallyCursor handle) { return cursor_table().find(handle.bits); }
 
+TallyCursor handle_of(const tally::Cursor &object) { return TallyCursor{cursor_table().handle_of(&object)}; }
+
 template <> vh::Status destroy_all<TallyCursor>() {
     vh::Status status;
     for (auto &taken : cursor_table().take_all()) {
@@ -413,6 +421,10 @@ template <> vh::Status destroy_all<TallyCursor>() {
 }
 
 } // namespace tally::api::handles
+
+extern "C" int32_t tally_v1_ticket_position(TallyTicket ticket) {
+    return tally::api::ticket_position(tally::api::convert(ticket));
+}
 
 extern "C" int32_t tally_v1_counter_create(TallyMode mode, TallyCounter *out) {
     return guard("tally_v1_counter_create", [&]() -> int32_t {
@@ -811,8 +823,27 @@ extern "C" int32_t tally_v1_counter_redeem(TallyCounter counter, VhSpan tickets,
     });
 }
 
-extern "C" int32_t tally_v1_ticket_position(TallyTicket ticket) {
-    return tally::api::ticket_position(tally::api::convert(ticket));
+extern "C" int32_t tally_v1_counter_exists(uint64_t bits, bool *out) {
+    return guard("tally_v1_counter_exists", [&]() -> int32_t {
+        if (vh::Status allowed = tally::api::allow(call_counter_exists); !allowed.ok()) {
+            return fail(std::move(allowed.error()));
+        }
+        auto returned = tally::api::counter_exists(bits);
+        if (!returned.ok()) {
+            return fail(std::move(returned.error()));
+        }
+        *out = returned.value();
+        return 0;
+    });
+}
+
+extern "C" int32_t tally_v1_counter_destroy_all(void) {
+    return guard("tally_v1_counter_destroy_all", [&]() -> int32_t {
+        if (vh::Status allowed = tally::api::allow(call_counter_destroy_all); !allowed.ok()) {
+            return fail(std::move(allowed.error()));
+        }
+        return finish(tally::api::counter_destroy_all());
+    });
 }
 
 extern "C" int32_t tally_v1_cursor_create(TallyCounter counter, TallyCursor *out) {
@@ -868,16 +899,35 @@ extern "C" int32_t tally_v1_cursor_next(TallyCursor cursor, int32_t *out) {
     });
 }
 
-extern "C" int32_t tally_v1_live_cursors(void) { return tally::api::live_cursors(); }
-
-extern "C" bool tally_v1_counter_exists(uint64_t bits) { return tally::api::counter_exists(bits); }
-
-extern "C" int32_t tally_v1_counter_destroy_all(void) {
-    return guard("tally_v1_counter_destroy_all", [&]() -> int32_t {
-        if (vh::Status allowed = tally::api::allow(call_counter_destroy_all); !allowed.ok()) {
+extern "C" int32_t tally_v1_cursor_counter_bits(TallyCursor cursor, uint64_t *out) {
+    return guard("tally_v1_cursor_counter_bits", [&]() -> int32_t {
+        tally::Cursor *cursor_object = cursor_table().find(cursor.bits);
+        if (cursor_object == nullptr) {
+            return fail(vh::kInvalidHandle, "tally_v1_cursor_counter_bits: cursor is not a live Cursor");
+        }
+        if (vh::Status allowed = tally::api::allow(call_cursor_counter_bits, *cursor_object); !allowed.ok()) {
             return fail(std::move(allowed.error()));
         }
-        return finish(tally::api::counter_destroy_all());
+        auto returned = tally::api::cursor_counter_bits(*cursor_object);
+        if (!returned.ok()) {
+            return fail(std::move(returned.error()));
+        }
+        *out = returned.value();
+        return 0;
+    });
+}
+
+extern "C" int32_t tally_v1_live_cursors(int32_t *out) {
+    return guard("tally_v1_live_cursors", [&]() -> int32_t {
+        if (vh::Status allowed = tally::api::allow(call_live_cursors); !allowed.ok()) {
+            return fail(std::move(allowed.error()));
+        }
+        auto returned = tally::api::live_cursors();
+        if (!returned.ok()) {
+            return fail(std::move(returned.error()));
+        }
+        *out = returned.value();
+        return 0;
     });
 }
 
@@ -885,7 +935,19 @@ extern "C" float tally_v1_scaled_total(const TallyStats *stats, float factor) {
     return tally::api::scaled_total(*stats, factor);
 }
 
-extern "C" int32_t tally_v1_live_counters(void) { return tally::api::live_counters(); }
+extern "C" int32_t tally_v1_live_counters(int32_t *out) {
+    return guard("tally_v1_live_counters", [&]() -> int32_t {
+        if (vh::Status allowed = tally::api::allow(call_live_counters); !allowed.ok()) {
+            return fail(std::move(allowed.error()));
+        }
+        auto returned = tally::api::live_counters();
+        if (!returned.ok()) {
+            return fail(std::move(returned.error()));
+        }
+        *out = returned.value();
+        return 0;
+    });
+}
 
 extern "C" uint64_t tally_v1_last_error(char *buffer, uint64_t capacity) {
     return vh::copy_message(last_error, buffer, capacity);

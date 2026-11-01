@@ -98,7 +98,9 @@ generated:
 
 - AOT objects link the library.
 - Python mode binds it with `ExternRegistry.bind_library(path)`, or with
-  `bind_module` when a nanobind module publishes its addresses.
+  `bind_module` when a nanobind module publishes its addresses, which
+  `vd.library(..., binding="pkg.module")` makes automatic (design.md,
+  "Libraries").
 
 A C function whose parameters the Host ABI cannot express (callbacks,
 tensor storages) needs a small hand-written C wrapper.
@@ -134,6 +136,10 @@ The C++ mapping keys:
     library converts, and no table holds it.
   - A handle without `cpp` passes its bits through, for ids the library
     manages itself.
+  - The externs the handle's class body declares are methods of the nanobind
+    class and its stub, `counter.add(5)` and the static `Counter.create(mode)`,
+    and only those: the module has no function of their C names, so Python
+    calls them as Host code does.
 - **On a Struct:** `cpp` and `header`, a C++ type of the C layout, which
   the thunks cast after generated `static_assert`s on size, alignment and
   trivial copyability. With `convert="<function>"` as well, the layouts may
@@ -142,8 +148,10 @@ The C++ mapping keys:
 
 The library's own C++, such as its other bindings, reaches the tabled
 objects through `<cpp_namespace>::handles` in `<name>_api_impl.h`:
-`find(handle)` returns the object behind a live handle or null, and
-`destroy_all<Handle>()` destroys every object of a handle as destroying
+`find(handle)` returns the object behind a live handle or null,
+`handle_of(object)` returns the live handle of a tabled object or a null
+one, so library code can hand an object it reached by pointer back to
+Host code, and `destroy_all<Handle>()` destroys every object of a handle as destroying
 each would, for a teardown hook. The nanobind module's contents are
 `void <name>_v<version>_nanobind(nb::module_ &)`; defining
 `<NAME>_NANOBIND_HOSTED` leaves out `NB_MODULE`, so an existing extension

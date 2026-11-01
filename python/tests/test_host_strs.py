@@ -166,6 +166,100 @@ def test_strs_format_alike_in_python_mode_and_aot(tmp_path: Path) -> None:
     assert counting.mismatched == []
 
 
+_BADGES = """
+import vernon_dsl as vd
+from vernon_dsl import i32
+
+
+@vd.extern(symbol="badges_log")
+def log(message: str, value: i32) -> None: ...
+
+
+@vd.host
+def shout(word: str, times: i32) -> i32:
+    log(word, times)
+    word = word + "!"
+    i = 0
+    while i < times:
+        word += "!"
+        i += 1
+    log(word, len(word))
+    return len(word)
+
+
+@vd.host
+class Badge:
+    name: str = "anon"
+
+    def rename(self, name: str) -> None:
+        self.name = "[" + name + "]"
+        log(name, len(self.name))
+
+    def run(self, count: i32) -> i32:
+        self.rename(self.name)
+        self.rename(f"crew {count}")
+        if count > 2:
+            return shout(self.name, count)
+        return shout("größe", count)
+"""
+
+
+def _badges(tmp_path: Path) -> Path:
+    source = tmp_path / "badges.py"
+    source.write_text(_BADGES, encoding="utf-8")
+    return source
+
+
+def test_str_parameters_are_copies_of_the_callers_text(tmp_path: Path) -> None:
+    logged: list[tuple[str, int]] = []
+    registry = ExternRegistry().bind("badges_log", lambda message, value: logged.append((str(message), int(value))))
+    module = HostModule(_badges(tmp_path), registry, eager=False)
+    badge = module.namespace.Badge()
+    assert badge.run(1) == len("größe!!")
+    assert badge.name == "[crew 1]"
+    assert logged[0] == ("anon", len("[anon]"))
+    assert module.call("shout", "hey", 2) == len("hey!!!")
+
+
+@pytest.mark.skipif(toolchain() is None, reason="no C toolchain links Host objects")
+def test_str_parameters_pass_alike_in_python_mode_and_aot(tmp_path: Path) -> None:
+    from vernon_dsl.hostlang.aot import load_programs
+
+    source = _badges(tmp_path)
+    script = [1, 3, 0]
+
+    python_logged: list[tuple[str, int]] = []
+    registry = ExternRegistry().bind(
+        "badges_log", lambda message, value: python_logged.append((str(message), int(value)))
+    )
+    badge = HostModule(source, registry, eager=False).namespace.Badge()
+    python = [badge.run(count) for count in script]
+
+    logged: list[tuple[str, int]] = []
+    registry = ExternRegistry().bind("badges_log", lambda message, value: logged.append((str(message), int(value))))
+    library = LinkedHost(load_programs(source), tmp_path / "aot", registry)
+    table = library.table
+    counting = _CountingAllocator()
+    table.allocator[0] = ctypes.addressof(counting.record)
+    descriptor = next(
+        table.types[index].contents for index in range(table.type_count) if table.types[index].contents.name == b"Badge"
+    )
+    instance = ctypes.create_string_buffer(descriptor.size)
+    address = ctypes.addressof(instance)
+    library.call("Badge__init", address)
+    aot = [library.call("Badge_run", address, count) for count in script]
+    shouted = library.call("shout", "hey", 2)
+    ctypes.CFUNCTYPE(None, ctypes.c_void_p)(descriptor.fini)(address)
+    table.allocator[0] = None
+
+    assert library.errors == []
+    assert [int(result) for result in aot] == python
+    assert int(shouted) == len("hey!!!")
+    assert logged[: len(python_logged)] == python_logged
+    assert counting.live == {}, "parameter copies and argument temporaries are released"
+    assert counting.mismatched == []
+
+
 def _compile_error(tmp_path: Path, body: str) -> str:
     source = tmp_path / "bad_strs.py"
     source.write_text(
@@ -194,6 +288,8 @@ def _compile_error(tmp_path: Path, body: str) -> str:
         ("@vd.host\nclass Bad:\n    def f(self) -> None:\n        s = 'a'\n        s -= 'b'\n", "+="),
         ("@vd.host\nclass Bad:\n    def f(self) -> None:\n        s = 'a'\n        log(s - s)\n", "only with +"),
         ("@vd.func\ndef helper(x: i32) -> i32:\n    s = f'{x}'\n    return x\n", "str"),
+        ("@vd.func(shared=True)\ndef helper(s: str) -> i32:\n    return 0\n", "str"),
+        ("@vd.host\ndef named(s: str) -> str:\n    return s\n", "str"),
     ],
 )
 def test_str_misuse_is_reported(tmp_path: Path, body: str, message: str) -> None:

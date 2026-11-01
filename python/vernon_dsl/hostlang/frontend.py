@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -176,7 +177,7 @@ def load_host_library(source_path: str | Path) -> tuple[HostProgram, tuple[str, 
     path = Path(source_path).resolve()
     program = _load(path, None, library=True)
     project = load_project(path, (), None)
-    own = {name for name, (declaring, _, _) in project.library_externs.items() if declaring == path}
+    own = {name for name, (declaring, *_) in project.library_externs.items() if declaring == path}
     generic_signatures = tuple(
         generic_signature(node)
         for node in project.module.body
@@ -267,7 +268,10 @@ def _generic_declarations(
             del context.structs[variable]
             del structs[variable]
         # The source keeps the `type[T]` parameter, whose name binding generators spell.
-        declared.append(replace(extern, type_argument=(index, variable), type_passed=passed, source=original))
+        moves = variable in getattr(original, "_vernon_instance_variables", ())
+        declared.append(
+            replace(extern, type_argument=(index, variable), type_passed=passed, type_moves=moves, source=original)
+        )
     return declared
 
 
@@ -290,7 +294,7 @@ def _load(
     _check_python_imports(project.module, project.python_imports, str(path))
     module = copy.deepcopy(project.module)
     detach_shared_nodes(module)
-    module, lowered = lower_host_classes(module, str(path))
+    module, lowered = lower_host_classes(module, str(path), project.handle_methods)
     enum_docs = {
         node.name: ast.get_docstring(node)
         for node in module.body
@@ -298,7 +302,11 @@ def _load(
     }
     strip_docstrings(module)
     module = normalize_struct_methods(module, str(path))
-    module._vernon_methods = {**method_tables(module), **method_table(lowered)}
+    module._vernon_methods = {
+        **method_tables(module),
+        **method_table(lowered),
+        **{handle: dict(methods) for handle, methods in project.handle_methods.items()},
+    }
     module._vernon_value_generics = lowered.by_value
     context = _HostContext(str(path))
     parser = TypeParser(context, host=True)
@@ -312,7 +320,8 @@ def _load(
         if kinds == {"handle"}:
             options, metadata = _options_and_metadata(context, node.decorator_list[0], {"c_type"})
             context.handles.add(node.name)
-            handles[node.name] = HostHandle(node.name, options.get("c_type"), metadata)
+            methods = tuple(project.handle_methods.get(node.name, {}).items())
+            handles[node.name] = HostHandle(node.name, options.get("c_type"), metadata, methods)
         elif kinds == {"enum"}:
             options, metadata = _options_and_metadata(context, node.decorator_list[0], {"c_type"})
             context.enums.add(node.name)
@@ -326,7 +335,7 @@ def _load(
             continue
         if node.name in handles:
             if any(not isinstance(item, (ast.Pass, ast.Expr)) for item in node.body):
-                raise context.error(node, f"handle '{node.name}' has no fields or methods")
+                raise context.error(node, f"handle '{node.name}' holds no fields; its body declares only externs")
             continue
         decorator = node.decorator_list[0]
         options: dict[str, str] = {}
@@ -435,10 +444,12 @@ def _load(
                 extern = replace(extern, type_argument=(generic.type_index, generic.bound), type_passed=generic.passed)
             declared_name = node.name.removesuffix(f"__{generic.bound}") if generic is not None else node.name
             declaring = project.library_externs.get(declared_name)
+            if declaring is not None:
+                extern = replace(extern, binding=declaring[3])
             if declaring is not None and extern.schema is None and not library:
                 from .library import library_identity
 
-                extern = replace(extern, schema=library_identity(*declaring))
+                extern = replace(extern, schema=library_identity(*declaring[:3]))
             externs[node.name] = extern
             continue
         if kind == "host":
@@ -457,7 +468,8 @@ def _load(
                     raise context.error(argument, f"Host argument '{argument.arg}' requires a type annotation")
                 continue
             annotated = parser.parse(argument.annotation)
-            _require_host_value(context, argument.annotation, annotated.type, struct_field_types)
+            if not (kind == "host" and annotated.type.kind == "str"):
+                _require_host_value(context, argument.annotation, annotated.type, struct_field_types)
             if annotated.metadata:
                 raise context.error(argument.annotation, "Host arguments carry no interface metadata")
             _require_class_boundary(context, argument.annotation, annotated.type, kind, contains_place, "passed")
@@ -467,6 +479,9 @@ def _load(
             result_type = parser.parse_type(node.returns)
             _require_host_value(context, node.returns, result_type, struct_field_types)
             _require_class_boundary(context, node.returns, result_type, kind, contains_place, "returned")
+    for extern in externs.values():
+        if extern.closed_by is not None:
+            _check_closer(context, extern, externs.get(extern.closed_by))
     if generics is not None:
         generics.extend(_generic_declarations(context, parser, project.module, structs, struct_field_types))
 
@@ -686,7 +701,22 @@ def _require_transfer(context: _HostContext, node: ast.AST, value_type: Concrete
 
 def _extern(context: _HostContext, parser: TypeParser, node: ast.FunctionDef, struct_fields) -> HostExtern:
     decorator = node.decorator_list[0]
-    options, metadata = _options_and_metadata(context, decorator, {"symbol", "effects", "abi", "schema"})
+    closed_by = None
+    if isinstance(decorator, ast.Call):
+        for keyword in decorator.keywords:
+            if keyword.arg == "closed_by":
+                if not isinstance(keyword.value, ast.Name):
+                    raise context.error(keyword.value, "extern option 'closed_by' names the extern that closes it")
+                closed_by = keyword.value.id
+        decorator = ast.copy_location(
+            ast.Call(
+                func=decorator.func,
+                args=decorator.args,
+                keywords=[keyword for keyword in decorator.keywords if keyword.arg != "closed_by"],
+            ),
+            decorator,
+        )
+    options, metadata = _options_and_metadata(context, decorator, {"symbol", "effects", "abi"})
     body = [statement for statement in node.body if not isinstance(statement, ast.Pass)]
     if not all(isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) for statement in body):
         raise context.error(node, f"extern '{node.name}' declares a C function; its body must be '...'")
@@ -729,10 +759,39 @@ def _extern(context: _HostContext, parser: TypeParser, node: ast.FunctionDef, st
         result,
         _parse_effect(context, decorator, options.get("effects", "io")),
         abi,
-        options.get("schema"),
+        None,
         node,
         metadata=metadata,
+        closed_by=closed_by,
     )
+
+
+def _declared(name: str) -> str:
+    """A definition's name in its own module, without the prefix an imported one carries in the combined module."""
+
+    return re.sub(r"^__vernon_.*?__", "", name)
+
+
+def _check_closer(context: _HostContext, opener: HostExtern, closer: HostExtern | None) -> None:
+    """A scope closes on the handle it opened on: the closer takes exactly the opener's first parameter and returns
+    nothing, so its `with` can call it on any exit."""
+
+    decorator = opener.source.decorator_list[0]
+    name = _declared(opener.name)
+    if closer is None:
+        raise context.error(
+            decorator, f"extern '{name}' is closed_by '{_declared(str(opener.closed_by))}', which is no extern"
+        )
+    if opener.type_argument is not None or closer.type_argument is not None or closer.closed_by is not None:
+        raise context.error(decorator, f"extern '{name}' and its closer are plain, non-generic externs")
+    if not opener.parameters or opener.parameters[0][1].kind != "handle":
+        raise context.error(decorator, f"scoped extern '{name}' takes the handle it opens on first")
+    if len(closer.parameters) != 1 or closer.parameters[0][1] != opener.parameters[0][1] or closer.result is not None:
+        raise context.error(
+            closer.source,
+            f"closer '{_declared(closer.name)}' takes only the {opener.parameters[0][1].spelling} that '{name}' "
+            "opens on and returns None",
+        )
 
 
 def _index(info: HostFunctionInfo, statements: tuple[TypedStatement, ...]) -> None:
@@ -798,6 +857,26 @@ class _Validator:
                 callee = self.program.externs.get(node.func.id) if isinstance(node.func, ast.Name) else None
                 if callee is not None and callee.result is not None and callee.result.kind in TRANSFERRED_KINDS:
                     self._validate_owned_result(info, node, parents)
+                if callee is not None and callee.closed_by is not None:
+                    if not isinstance(parents.get(id(node)), ast.withitem):
+                        raise self.error(
+                            node,
+                            f"'{_declared(callee.name)}' opens a scope that '{_declared(callee.closed_by)}' closes; "
+                            "call it as the subject of a with statement",
+                        )
+                    self.calls[info.symbol].add(callee.closed_by)
+            elif isinstance(node, ast.With):
+                for item in node.items:
+                    call = item.context_expr
+                    callee = (
+                        self.program.externs.get(call.func.id)
+                        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        else None
+                    )
+                    if callee is None or callee.closed_by is None:
+                        raise self.error(
+                            call, "a Host with statement opens a scope: its subject calls an extern declared closed_by"
+                        )
             elif isinstance(node, ast.BinOp):
                 self._validate_binary(info, node)
             elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
@@ -834,7 +913,7 @@ class _Validator:
                         raise self.error(
                             target, "del removes an entry of a dict field or local, as in del self.counts[key]"
                         )
-            elif isinstance(node, (ast.Global, ast.Nonlocal, ast.With, ast.Try, ast.Raise, ast.Assert)):
+            elif isinstance(node, (ast.Global, ast.Nonlocal, ast.AsyncWith, ast.Try, ast.Raise, ast.Assert)):
                 raise self.error(node, f"{type(node).__name__} is not Host syntax")
             elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
                 self._validate_store(info, node)
@@ -1021,8 +1100,9 @@ class _Validator:
 
     def _validate_str_use(self, info: HostFunctionInfo, node: ast.expr, parents: dict[int, ast.AST]) -> None:
         """A str is read where it appears: copied into a str local or field, compared, formatted, joined, used as a
-        dict key, measured, or passed to an extern. Host functions take and return no strs, so a str never leaves
-        the function or instance owning its bytes."""
+        dict key, measured, or passed to an extern, a Host function's str parameter, or a constructor's str field.
+        A Host function copies a str parameter on entry and returns no str, so a str never leaves the function or
+        instance owning its bytes."""
 
         if info.kind != "host":
             raise self.error(node, f"@func helper '{info.symbol}' cannot use str values; they are Host-only")
@@ -1046,6 +1126,11 @@ class _Validator:
                 raise self.error(parent, "str values compare only with == and !=")
             return
         if isinstance(parent, ast.Call) and self._extern_parameter(parent, node) is not None:
+            return
+        if isinstance(parent, ast.Call) and self._host_str_parameter(parent, node):
+            return
+        if isinstance(parent, ast.keyword):
+            # Only a constructor takes keywords, and it copies the str into the field.
             return
         raise self.error(
             node,
@@ -1071,6 +1156,16 @@ class _Validator:
             return None
         parameter = callee.parameters[call.args.index(node)][1]
         return parameter if parameter.kind in TRANSFERRED_KINDS else None
+
+    def _host_str_parameter(self, call: ast.Call, node: ast.expr) -> bool:
+        """Whether `node` is passed to a str parameter of a Host function or method, which copies it on entry."""
+
+        name = call.func.id if isinstance(call.func, ast.Name) else (dotted_name(call.func) or "").split(".")[-1]
+        callee = self.program.functions.get(name)
+        if callee is None or callee.kind != "host":
+            return False
+        position = next((index for index, argument in enumerate(call.args) if argument is node), None)
+        return position is not None and callee.parameters[position][1].kind == "str"
 
     def _validate_owned_result(self, info: HostFunctionInfo, node: ast.Call, parents: dict[int, ast.AST]) -> None:
         """An extern's str, list or dict result is received like a copy, into a local or field of its type: Host
@@ -1192,7 +1287,16 @@ class _Validator:
             return
         if name == "replace" and name not in self.program.functions and info.expression_type(node).kind == "struct":
             return
-        if node.keywords:
+        if node.keywords and name in self.program.structs and name not in self.program.functions:
+            fields = dict(self.program.structs[name].fields)
+            for keyword in node.keywords:
+                field = fields[keyword.arg]  # type: ignore[index]
+                if field.kind in {"list", "dict", "storage"}:
+                    raise self.error(
+                        keyword.value,
+                        f"{name}(...) sets no {field.kind} field; '{keyword.arg}' starts empty and fills after",
+                    )
+        elif node.keywords:
             raise self.error(node, "Host calls take only positional arguments")
         if name in DEVICE_ONLY_OPERATION_NAMES:
             raise self.error(node, f"'{name}' is a device operation; Host code cannot use it")

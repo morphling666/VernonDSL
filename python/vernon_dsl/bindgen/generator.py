@@ -25,6 +25,7 @@ from ..hostlang.library import library_identity
 from ..hostlang.model import ExternAbi, HostEffect, HostExtern, HostProgram
 from ..hostlang.reflect import STRUCT, describe
 from ..hostlang.values import element_of, key_of
+from ..module_graph import hoist_handle_methods
 
 
 class BindgenError(ValueError):
@@ -89,10 +90,12 @@ class Library:
     docs: dict[str, str]
     # The unqualified C++ function in `cpp_namespace` each hooked thunk asks before calling the implementation.
     effect_check: str | None = None
+    # (handle, method, extern) for each `@staticmethod` extern of a handle class, as `Counter.create`.
+    statics: tuple[tuple[str, str, str], ...] = ()
 
     def hooked(self, extern: HostExtern) -> bool:
-        """Whether the extern's thunk calls the effect check: a direct extern cannot fail, and a pure one has no
-        effect to allow."""
+        """Whether the extern's thunk calls the effect check: a pure one has no effect to allow, and `_check` makes
+        every other extern of a checked library a status one."""
 
         return self.effect_check is not None and extern.abi == ExternAbi.STATUS and extern.effect != HostEffect.PURE
 
@@ -216,6 +219,7 @@ def read_library(path: str | Path) -> Library:
         sorted((*program.externs.values(), *load_generic_externs(path)), key=lambda extern: extern.source.lineno)
     )
     tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    hoist_handle_methods(tree, lambda node, message: BindgenError(message))
     docs = {
         node.name: doc
         for node in tree.body
@@ -234,6 +238,12 @@ def read_library(path: str | Path) -> Library:
         externs,
         docs,
         effect_check,
+        tuple(
+            (node.name, method, extern)
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            for method, extern in getattr(node, "_vernon_handle_statics", {}).items()
+        ),
     )
     for extern in externs:
         _check(library, extern)
@@ -278,6 +288,51 @@ def _is_variable(extern: HostExtern, value_type: ConcreteType) -> bool:
     )
 
 
+def _variable_constness(extern: HostExtern) -> str:
+    """A moved Host class instance is the callee's to move out of, and `type->fini` releases what it leaves."""
+
+    return "" if extern.type_moves else "const "
+
+
+def _handle_methods(library: Library) -> list[tuple[str, str, HostExtern]]:
+    """(handle, method, extern) for each Python-callable extern a handle has as a method."""
+
+    externs = {extern.name: extern for extern in library.externs}
+    return [
+        (name, method, externs[symbol])
+        for name in library.handles
+        for method, symbol in library.program.handles[name].methods
+        if _python_callable(externs[symbol])
+    ]
+
+
+def _handle_statics(library: Library) -> list[tuple[str, str, HostExtern]]:
+    """(handle, method, extern) for each Python-callable `@staticmethod` extern a handle class declares."""
+
+    externs = {extern.name: extern for extern in library.externs}
+    return [
+        (handle, method, externs[name])
+        for handle, method, name in library.statics
+        if name in externs and _python_callable(externs[name])
+    ]
+
+
+def _module_functions(library: Library) -> list[HostExtern]:
+    """The Python-callable externs the module defines as functions: a handle's methods and static methods are
+    reached through its class only, as Host code reaches them."""
+
+    members = {symbol for name in library.handles for _, symbol in library.program.handles[name].methods}
+    members |= {name for _, _, name in library.statics}
+    return [extern for extern in library.externs if _python_callable(extern) and extern.name not in members]
+
+
+def _python_callable(extern: HostExtern) -> bool:
+    """Whether Python code calls the extern through the module: an instance a call moves in is Host code's own
+    memory, so only Host code passes one, through `vh_symbols()`."""
+
+    return not extern.type_moves
+
+
 def _type_parameter(extern: HostExtern) -> tuple[int, str] | None:
     """The position and name of a generic extern's descriptor parameter: its `type[T]` parameter, or `type` just
     before the value that binds `T`."""
@@ -297,6 +352,10 @@ def _items(value_type: ConcreteType) -> list[ConcreteType]:
 def _check(library: Library, extern: HostExtern) -> None:
     where = f"extern {extern.name}"
     status = extern.abi == ExternAbi.STATUS
+    if library.effect_check is not None and not status and extern.effect != HostEffect.PURE:
+        raise BindgenError(
+            f"{where} is {extern.effect.spelling}, so it is abi='status': the effect check refuses a call by failing it"
+        )
     for name, parameter in extern.parameters:
         if _is_variable(extern, parameter):
             continue
@@ -349,7 +408,7 @@ def _converter(library: Library, value_type: ConcreteType) -> str | None:
 
 def _c_parameter(library: Library, extern: HostExtern, name: str, value_type: ConcreteType) -> str:
     if _is_variable(extern, value_type):
-        return f"const void *{name}"
+        return f"{_variable_constness(extern)}void *{name}"
     if value_type.kind in {"list", "dict"}:
         return f"VhSpan {name}"
     c_name = library.names.name(value_type)
@@ -528,7 +587,7 @@ def _cpp_value(library: Library, value_type: ConcreteType) -> str:
 
 def _cpp_parameter(library: Library, extern: HostExtern, name: str, value_type: ConcreteType) -> str:
     if _is_variable(extern, value_type):
-        return f"const void *{name}"
+        return f"vh::Instance {name}" if extern.type_moves else f"const void *{name}"
     handle = library.handle(value_type)
     if handle is not None:
         if _destroys(extern) == name:
@@ -564,7 +623,8 @@ def _cpp_result(library: Library, extern: HostExtern) -> str:
 def _cpp_declaration(library: Library, extern: HostExtern) -> str:
     parameters = [_cpp_parameter(library, extern, name, value) for name, value in extern.parameters]
     typed = _type_parameter(extern)
-    if typed is not None:
+    # A moved instance carries its type.
+    if typed is not None and not extern.type_moves:
         parameters.insert(typed[0], f"const VhType &{typed[1]}")
     if extern.result is not None and _is_variable(extern, extern.result):
         parameters.append("void *out")
@@ -650,6 +710,8 @@ def _impl_header(library: Library) -> str:
             lines += [
                 f"// The object behind a live {handle.name}; null for a stale handle.",
                 f"{handle.cpp} *find({handle.c_name} handle);",
+                f"// The live {handle.name} holding `object`, as Host code receives it; zero for an untabled object.",
+                f"{handle.c_name} handle_of(const {handle.cpp} &object);",
                 f"template <> vh::Status destroy_all<{handle.c_name}>();",
             ]
         lines += ["", "} // namespace handles"]
@@ -674,7 +736,7 @@ def _thunk(library: Library, extern: HostExtern) -> list[str]:
         struct = library.struct(value_type)
         converter = _converter(library, value_type)
         if _is_variable(extern, value_type):
-            arguments.append(name)
+            arguments.append(f"std::move({name}_instance)" if extern.type_moves else name)
         elif handle is not None:
             missing = f'"{extern.symbol}: {name} is not a live {handle.name}"'
             found = f"{name}_object"
@@ -735,11 +797,18 @@ def _thunk(library: Library, extern: HostExtern) -> list[str]:
             arguments.append(name)
     typed = _type_parameter(extern)
     if typed is not None:
-        arguments.insert(typed[0], f"*{typed[1]}")
+        taken: list[str] = []
+        if extern.type_moves:
+            # The instance is the callee's whatever the status, so it is taken before anything can fail.
+            moved = next(name for name, value_type in extern.parameters if _is_variable(extern, value_type))
+            taken.append(f"vh::Instance {moved}_instance(*{typed[1]}, {moved});")
+        else:
+            arguments.insert(typed[0], f"*{typed[1]}")
         body = [
             f"if ({typed[1]} == nullptr) {{",
             f'    return fail(vh::kFailed, "{extern.symbol}: {typed[1]} is a null VhType");',
             "}",
+            *taken,
             *body,
         ]
     if hooked:
@@ -1005,6 +1074,10 @@ def _handle_access(library: Library) -> list[str]:
         lines += [
             f"{handle.cpp} *find({handle.c_name} handle) {{ return {handle.table}().find(handle.bits); }}",
             "",
+            f"{handle.c_name} handle_of(const {handle.cpp} &object) {{",
+            f"    return {handle.c_name}{{{handle.table}().handle_of(&object)}};",
+            "}",
+            "",
             f"template <> vh::Status destroy_all<{handle.c_name}>() {{",
             "    vh::Status status;",
             f"    for (auto &taken : {handle.table}().take_all()) {{",
@@ -1178,7 +1251,12 @@ def _nanobind_parameter(library: Library, extern: HostExtern, name: str, value_t
     return f"{c_name} {name}", name
 
 
-def _nanobind_function(library: Library, extern: HostExtern) -> list[str]:
+def _nanobind_function(
+    library: Library, extern: HostExtern, target: str = "m", method: str | None = None, static: bool = False
+) -> list[str]:
+    """Binds the extern on `target`: the module, or as `method` on a handle's class, which takes the handle as
+    `self`, so its keywords name only the other parameters, unless it is `static`."""
+
     parameters = [_nanobind_parameter(library, extern, name, value) for name, value in extern.parameters]
     names = [name for name, _ in extern.parameters]
     typed = _type_parameter(extern)
@@ -1276,9 +1354,10 @@ def _nanobind_function(library: Library, extern: HostExtern) -> list[str]:
                 policies = f", nb::keep_alive<0, {parent + 1}>()"
         elif result is not None:
             body.append("return out;")
-    keywords = "".join(f', "{name}"_a' for name in names)
+    keywords = "".join(f', "{keyword}"_a' for keyword in (names if target == "m" or static else names[1:]))
     lambda_parameters = ", ".join(parameter for parameter, _ in parameters if parameter)
-    lines = [f'    m.def("{extern.name}", []({lambda_parameters}) {{']
+    definition = "def_static" if static else "def"
+    lines = [f'    {target}.{definition}("{method or extern.name}", []({lambda_parameters}) {{']
     lines += [f"        {line}" for line in body]
     lines.append(f"    }}{keywords}{policies});")
     return lines
@@ -1518,8 +1597,12 @@ def _nanobind(library: Library) -> str:
         '    m.attr("HostExecutionError") = nb::module_::import_("vernon_dsl.hostlang").attr("HostExecutionError");',
     ]
     lines += _nanobind_types(library)
-    for extern in library.externs:
+    for extern in _module_functions(library):
         lines += _nanobind_function(library, extern)
+    for handle, method, extern in _handle_methods(library):
+        lines += _nanobind_function(library, extern, f"{_snake(handle)}_class", method)
+    for handle, method, extern in _handle_statics(library):
+        lines += _nanobind_function(library, extern, f"{_snake(handle)}_class", method, static=True)
     lines += [
         "}",
         "",
@@ -1547,6 +1630,8 @@ def _stubs(library: Library) -> str:
         "def vh_symbols() -> dict[str, int]: ...",
         "def vh_last_error() -> str: ...",
     ]
+    methods = _handle_methods(library)
+    statics = _handle_statics(library)
     for handle in library.handles.values():
         lines += [
             "",
@@ -1556,6 +1641,16 @@ def _stubs(library: Library) -> str:
             "    def __int__(self) -> int: ...",
             "    def __index__(self) -> int: ...",
         ]
+        lines += [
+            f"    def {method}(self{''.join(f', {item}' for item in parameters[1:])}) -> {result}: ..."
+            for owner, method, extern in methods
+            if owner == handle.name
+            for parameters, result in [_stub_signature(library, extern)]
+        ]
+        for owner, method, extern in statics:
+            if owner == handle.name:
+                parameters, result = _stub_signature(library, extern)
+                lines += ["    @staticmethod", f"    def {method}({', '.join(parameters)}) -> {result}: ..."]
     for host_enum in library.program.enums.values():
         lines += ["", f"class {host_enum.name}(IntEnum):"]
         lines += [f"    {name} = {value}" for name, value in host_enum.members]
@@ -1575,15 +1670,20 @@ def _stubs(library: Library) -> str:
         else:
             lines.append("    def __init__(self) -> None: ...")
     lines.append("")
-    for extern in library.externs:
-        parameters = [f"{name}: {_python_type(library, extern, value)}" for name, value in extern.parameters]
-        typed = _type_parameter(extern)
-        if typed is not None and extern.type_passed:
-            parameters.insert(typed[0], f"{typed[1]}: type[T]")
-        result = "None" if extern.result is None else _python_type(library, extern, extern.result)
+    for extern in _module_functions(library):
+        parameters, result = _stub_signature(library, extern)
         lines.append(f"def {extern.name}({', '.join(parameters)}) -> {result}: ...")
     lines.append("")
     return "\n".join(lines)
+
+
+def _stub_signature(library: Library, extern: HostExtern) -> tuple[list[str], str]:
+    parameters = [f"{name}: {_python_type(library, extern, value)}" for name, value in extern.parameters]
+    typed = _type_parameter(extern)
+    if typed is not None and extern.type_passed:
+        parameters.insert(typed[0], f"{typed[1]}: type[T]")
+    result = "None" if extern.result is None else _python_type(library, extern, extern.result)
+    return parameters, result
 
 
 def generate(path: str | Path) -> dict[str, str]:

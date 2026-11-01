@@ -695,7 +695,44 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
             raise TypeError(f"field '{field_name}' requires a {annotation.__name__} or an i32")
         # A value no member has stays a plain int, the way it crosses the C boundary.
         return annotation._value2member_map_.get(int(value), int(value))
+    if dsl_kind(annotation) == "handle":
+        try:
+            return annotation(value)
+        except (TypeError, ValueError, OverflowError):
+            raise TypeError(f"field '{field_name}' requires a {annotation.__name__}") from None
     raise TypeError(f"field '{field_name}' has unsupported host annotation {annotation!r}")
+
+
+def make_handle(cls: type[Any]) -> type[Any]:
+    """Makes a `@handle` class a value of its 64 bits: `Handle()` is the null handle, `Handle(bits)` takes an int or
+    any object with `.bits` (a binding's handle), handles compare and hash by class and bits, and an f-string formats
+    one as its bits, as compiled code does."""
+
+    if cls.__bases__ != (object,):
+        raise TypeError("@handle classes do not support inheritance")
+    name = cls.__name__
+
+    def __init__(self: Any, bits: Any = 0) -> None:
+        bits = getattr(bits, "bits", bits)
+        if isinstance(bits, bool) or not isinstance(bits, (int, np.integer)) or not 0 <= bits < 2**64:
+            raise TypeError(f"{name} takes the 64 bits of a handle, not {bits!r}")
+        self.bits = int(bits)
+
+    def __eq__(self: Any, other: object) -> bool:
+        # A binding's handle class of the same name is the same handle, so Python callers may mix the two.
+        if isinstance(other, cls) or type(other).__name__ == name:
+            return self.bits == getattr(other, "bits", None)
+        return NotImplemented
+
+    cls.__init__ = __init__  # type: ignore[misc]
+    cls.__eq__ = __eq__  # type: ignore[method-assign]
+    cls.__hash__ = lambda self: hash((name, self.bits))  # type: ignore[method-assign]
+    cls.__int__ = cls.__index__ = lambda self: self.bits  # type: ignore[attr-defined]
+    cls.__bool__ = lambda self: self.bits != 0  # type: ignore[attr-defined]
+    cls.__repr__ = lambda self: f"{name}({self.bits})"  # type: ignore[method-assign]
+    cls.__str__ = lambda self: str(self.bits)  # type: ignore[method-assign]
+    cls.__format__ = lambda self, spec: format(self.bits, spec)  # type: ignore[method-assign]
+    return cls
 
 
 def make_shared_struct(cls: type[Any]) -> type[Any]:

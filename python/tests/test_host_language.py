@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import vernon_dsl as vd
 import vernon_dsl.types as vd_types
 from host_aot import LinkedHost, toolchain
 from vernon_dsl.decorators import Library as vd_library
@@ -37,6 +38,17 @@ def _native_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _native_available(), reason="vernon_dsl._native was built without Host AOT")
+
+
+@vd.handle
+class Node:
+    pass
+
+
+@vd.struct(shared=True)
+class Link:
+    node: Node
+    weight: vd.f64
 
 
 class World:
@@ -202,6 +214,16 @@ def test_results_keep_their_host_types() -> None:
     assert vectors[2].y == pytest.approx(0.5345225)
 
 
+def test_struct_handle_fields_hold_their_bits() -> None:
+    assert Link(Node(), 1.5).node == Node() and not Node()
+    link = Link(np.uint64(2**63 + 7), 0.0)
+    assert type(link.node) is Node and link.node.bits == 2**63 + 7 and int(link.node) == 2**63 + 7
+    assert link.node == Node(2**63 + 7) and link.node != Node(7) and f"{link.node:x}" == f"{2**63 + 7:x}"
+    for bits in (-1, 2**64, True, 1.0):
+        with pytest.raises(TypeError, match="field 'node' requires a Node"):
+            Link(bits, 0.0)
+
+
 def test_compiled_runtime_failures_return_statuses(compiled: tuple[LinkedHost, list[int]]) -> None:
     library, _ = compiled
     with pytest.raises(HostExecutionError) as division:
@@ -235,7 +257,9 @@ def test_schema_mismatch_is_rejected(tmp_path: Path) -> None:
             import vernon_dsl as vd
             from vernon_dsl import i32
 
-            @vd.extern(symbol="engine_tick", effects="read", schema="abc")
+            vd.library("engine", version=1)
+
+            @vd.extern(effects="read")
             def tick() -> i32: ...
 
             @vd.host(effects="read")
@@ -244,10 +268,16 @@ def test_schema_mismatch_is_rejected(tmp_path: Path) -> None:
             """
         )
     )
+    from vernon_dsl.hostlang import library_identity
+
     module = _load_module(source, "schema_script")
+    identity = library_identity(source, "engine", 1)
     with pytest.raises(HostBindingError, match="schema"):
-        module.run.call(registry=ExternRegistry().bind("engine_tick", lambda: 1, schema="def"))
-    assert module.run.call(registry=ExternRegistry().bind("engine_tick", lambda: 4, schema="abc")) == 4
+        module.run.call(registry=ExternRegistry().bind("engine_v1_tick", lambda: 1, schema="engine-v1:other"))
+    assert module.run.call(registry=ExternRegistry().bind("engine_v1_tick", lambda: 4, schema=identity)) == 4
+    # The revision is the library's, never one extern's.
+    with pytest.raises(TypeError, match="schema"):
+        vd.extern(schema="abc")
 
 
 _PHYSICS_BINDING = """
@@ -329,7 +359,7 @@ def test_library_identity_checks_bound_modules(tmp_path: Path, monkeypatch: pyte
     assert identity.startswith("physics-v2:") and len(identity) == len("physics-v2:") + 16
     assert sys.modules["physics_binding"].world_step.schema == identity
     program = load_host_program(tmp_path / "physics_user.py", "run")
-    # An explicit symbol= keeps the library's identity; only schema= replaces it.
+    # An explicit symbol= keeps the library's identity.
     assert {extern.schema for extern in program.externs.values()} == {identity}
     from vernon_dsl.hostlang.aot import compile_host
 
@@ -352,6 +382,43 @@ def test_library_identity_checks_bound_modules(tmp_path: Path, monkeypatch: pyte
         user.run.call(1.25, registry=ExternRegistry().bind_module(stale))
     with pytest.raises(HostBindingError, match="not a binding module"):
         ExternRegistry().bind_module(SimpleNamespace())
+
+
+_PHYSICS_NATIVE = """
+import ctypes
+
+from vernon_dsl.hostlang import library_identity
+
+_CALLBACKS = [
+    ctypes.CFUNCTYPE(ctypes.c_uint64)(lambda: 3),
+    ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_uint64, ctypes.c_double)(lambda world, dt: world + dt),
+    ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_uint64)(lambda world: 0.5),
+]
+_NAMES = ["physics_v2_world_create", "physics_v2_world_step", "physics_legacy_gravity"]
+vh_schema = library_identity(__file__.replace("physics_native", "physics_binding"), "physics", 2)
+
+
+def vh_symbols():
+    addresses = [ctypes.cast(callback, ctypes.c_void_p).value for callback in _CALLBACKS]
+    return dict(zip(_NAMES, addresses, strict=True))
+"""
+
+
+def test_a_library_binding_module_binds_its_externs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    binding = _PHYSICS_BINDING.replace("version=2,", 'version=2, binding="physics_native",')
+    (tmp_path / "physics_binding.py").write_text(binding)
+    (tmp_path / "physics_native.py").write_text(_PHYSICS_NATIVE)
+    (tmp_path / "physics_user.py").write_text(_PHYSICS_USER)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("physics_binding", "physics_native"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    user = _load_module(tmp_path / "physics_user.py", "physics_user")
+    assert sys.modules["physics_binding"].__vernon_library__.binding == "physics_native"
+    assert "physics_native" not in sys.modules
+    registry = ExternRegistry()
+    # Nothing binds the externs but the module the library names, which their first call imports.
+    assert user.run.call(1.25, registry=registry) == 4.75
+    assert user.run.call(2.0, registry=registry) == 5.5
 
 
 def test_library_identity_covers_layouts_not_metadata(tmp_path: Path) -> None:
@@ -395,6 +462,7 @@ def test_library_identity_covers_layouts_not_metadata(tmp_path: Path) -> None:
         ),
         ('vd.library("a", version=-1)\n', "non-negative integer"),
         ('vd.library("not an identifier")\n', "C identifier"),
+        ('vd.library("a", binding="not a module")\n', "dotted module name"),
     ],
 )
 def test_library_diagnostics(tmp_path: Path, source: str, message: str) -> None:
@@ -444,6 +512,60 @@ def test_module_reload_runs_the_edited_source(tmp_path: Path) -> None:
     assert module.stale
     assert module.call("value", 5) == 10
     assert module.reload().call("value", 5) == 15
+
+
+def test_a_literal_assigned_to_a_typed_local_takes_its_type(tmp_path: Path) -> None:
+    from vernon_dsl.hostlang import HostModule
+
+    source = tmp_path / "widened.py"
+    source.write_text(
+        textwrap.dedent(
+            """
+            import vernon_dsl as vd
+            from vernon_dsl import f64
+
+            TENTH = 0.1
+
+            @vd.host(effects="pure")
+            def tenth(scaled: bool) -> f64:
+                value: f64 = 0.0
+                if scaled:
+                    value = TENTH
+                return value
+            """
+        )
+    )
+    assert HostModule.load(source).call("tenth", True) == 0.1
+
+
+def test_str_module_constants_are_literals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vernon_dsl.hostlang import HostModule
+
+    (tmp_path / "names.py").write_text('ROOT = "assets"\n')
+    source = tmp_path / "paths.py"
+    source.write_text(
+        textwrap.dedent(
+            """
+            import vernon_dsl as vd
+            from vernon_dsl import i32
+
+            from names import ROOT
+
+            MODEL = ROOT + "/model.glb"
+
+            @vd.host(effects="pure")
+            def model_length(local: bool) -> i32:
+                path = MODEL
+                if local:
+                    path = f"./{ROOT}"
+                return len(path) if path != "" else -1
+            """
+        )
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = HostModule.load(source)
+    assert module.call("model_length", False) == len("assets/model.glb")
+    assert module.call("model_length", True) == len("./assets")
 
 
 def test_rebinding_an_extern_reloads_the_compiled_module() -> None:

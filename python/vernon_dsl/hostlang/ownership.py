@@ -267,6 +267,9 @@ class OwnershipChecker:
         if isinstance(parent, ast.Call) and node in parent.args:
             if isinstance(parent.func, ast.Attribute) and parent.func.attr == "append":
                 self.require_new(node, f"appended to {ast.unparse(parent.func.value)}")
+            elif self.taken(parent, node):
+                # A specialization `name__Class` is spelled as the extern's name.
+                self.require_new(node, f"moved into {parent.func.id.split('__')[0]}")  # type: ignore[attr-defined]
             return
         if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is node:
             targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
@@ -281,11 +284,24 @@ class OwnershipChecker:
             return
         if isinstance(parent, ast.Expr) and created:
             return
+        if isinstance(parent, ast.keyword):
+            self.require_new(node, f"moved into field '{parent.arg}'")
+            return
         raise self.error(
             node,
             f"'{spelled}' is a Host class instance; read its fields, call its methods, pass it to a @host function, "
             "or move a new one into a place",
         )
+
+    def taken(self, call: ast.Call, argument: ast.expr) -> bool:
+        """Whether the call is to an extern taking the instance `argument` (an extern type variable bound to
+        `vd.HostClass`), which moves it."""
+
+        if not isinstance(call.func, ast.Name) or call.func.id not in self.program.externs:
+            return False
+        parameters = self.program.externs[call.func.id].parameters
+        index = next(position for position, item in enumerate(call.args) if item is argument)
+        return index < len(parameters) and self.is_class(parameters[index][1])
 
     def require_new(self, node: ast.expr, where: str) -> None:
         if self.creates(node) or self.owned_name(node):
@@ -556,6 +572,10 @@ class _MoveFlow:
         for node in ast.walk(statement):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "append":
                 values.extend(node.args)
+            elif isinstance(node, ast.Call):
+                values.extend(argument for argument in node.args if checker.taken(node, argument))
+                # Only a constructor takes keywords, and it moves an instance into its field.
+                values.extend(keyword.value for keyword in node.keywords)
         return [value.id for value in values if checker.owned_name(value)]  # type: ignore[attr-defined]
 
     def statement(self, statement: ast.stmt, state: dict[str, ast.AST]) -> dict[str, ast.AST] | None:
@@ -577,6 +597,15 @@ class _MoveFlow:
                 entry = after
             finished = self.block(statement.orelse, dict(entry))
             return self.join(finished, *breaks)
+        if isinstance(statement, ast.With):
+            state = dict(state)
+            for item in statement.items:
+                self.uses([item.context_expr], state)
+                for name in self.moves(ast.Expr(value=item.context_expr)):
+                    state[name] = statement
+                if isinstance(item.optional_vars, ast.Name):
+                    state.pop(item.optional_vars.id, None)
+            return self.block(statement.body, state)
         if isinstance(statement, ast.Break):
             self.breaks[-1].append(dict(state))
             return None

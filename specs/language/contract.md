@@ -582,8 +582,10 @@ whichever module declares it, so two different reachable Structs with one name
 are rejected with `conflicting declarations named`; imported helpers are
 module-qualified. A module-level `NAME = expression` is a module constant when
 the expression is a compile-time expression (section 6.2) over literals and
-other module constants, local or imported, that folds to an `int`, `float`, or
-`bool`; `INV_PI = 1.0 / PI` with `PI` imported from another file is one. Other
+other module constants, local or imported, that folds to an `int`, `float`,
+`bool` or `str`; `INV_PI = 1.0 / PI` with `PI` imported from another file is
+one, and so is `MODEL = ROOT + "/model.glb"`. A `str` constant is a string
+literal where it is used, which only Host code accepts. Other
 modules import a constant by name or read it through an imported module, and
 every use is replaced by its value. Importing an assignment that does not fold
 is rejected with `is not a compile-time constant`, and a constant whose value

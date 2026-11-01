@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 /* The schema identity of the Host module these declarations were generated from. */
-#define TALLY_V1_SCHEMA "tally-v1:c93806b990d950ef"
+#define TALLY_V1_SCHEMA "tally-v1:4f0c443d07fda43e"
 
 typedef int32_t TallyMode;
 enum { TallyMode_SUM = 0, TallyMode_MAX = 1 };
@@ -53,6 +53,10 @@ typedef struct TallyRange {
 VERNON_HOST_STATIC_ASSERT(sizeof(TallyRange) == 8, "TallyRange size");
 VERNON_HOST_STATIC_ASSERT(offsetof(TallyRange, low) == 0, "TallyRange.low offset");
 VERNON_HOST_STATIC_ASSERT(offsetof(TallyRange, high) == 4, "TallyRange.high offset");
+typedef struct TallyTicket {
+    uint64_t bits;
+} TallyTicket;
+VERNON_HOST_STATIC_ASSERT(sizeof(TallyTicket) == 8, "TallyTicket is one uint64_t");
 typedef struct TallyCounter {
     uint64_t bits;
 } TallyCounter;
@@ -61,11 +65,9 @@ typedef struct TallyCursor {
     uint64_t bits;
 } TallyCursor;
 VERNON_HOST_STATIC_ASSERT(sizeof(TallyCursor) == 8, "TallyCursor is one uint64_t");
-typedef struct TallyTicket {
-    uint64_t bits;
-} TallyTicket;
-VERNON_HOST_STATIC_ASSERT(sizeof(TallyTicket) == 8, "TallyTicket is one uint64_t");
 
+/* effects: pure */
+TALLY_API int32_t tally_v1_ticket_position(TallyTicket ticket);
 /* effects: io */
 TALLY_API int32_t tally_v1_counter_create(TallyMode mode, TallyCounter *out);
 /* effects: io */
@@ -117,8 +119,12 @@ TALLY_API int32_t tally_v1_counter_tickets(TallyCounter counter, VhList *out, co
 /* The sum of the tickets' amounts; a ticket past the history fails with status 14. */
 /* effects: read */
 TALLY_API int32_t tally_v1_counter_redeem(TallyCounter counter, VhSpan tickets, int32_t *out);
-/* effects: pure */
-TALLY_API int32_t tally_v1_ticket_position(TallyTicket ticket);
+/* Whether a Counter handle's bits name a live Counter. */
+/* effects: read */
+TALLY_API int32_t tally_v1_counter_exists(uint64_t bits, bool *out);
+/* Destroys every Counter, and their Cursors with them. */
+/* effects: io */
+TALLY_API int32_t tally_v1_counter_destroy_all(void);
 /* effects: io */
 TALLY_API int32_t tally_v1_cursor_create(TallyCounter counter, TallyCursor *out);
 /* effects: io */
@@ -126,19 +132,16 @@ TALLY_API int32_t tally_v1_cursor_destroy(TallyCursor cursor);
 /* The next amount of the counter's history; past its end fails with status 15. */
 /* effects: write */
 TALLY_API int32_t tally_v1_cursor_next(TallyCursor cursor, int32_t *out);
+/* The bits of the live Counter handle the cursor reads. */
 /* effects: read */
-TALLY_API int32_t tally_v1_live_cursors(void);
-/* Whether a Counter handle's bits name a live Counter. */
+TALLY_API int32_t tally_v1_cursor_counter_bits(TallyCursor cursor, uint64_t *out);
 /* effects: read */
-TALLY_API bool tally_v1_counter_exists(uint64_t bits);
-/* Destroys every Counter, and their Cursors with them. */
-/* effects: io */
-TALLY_API int32_t tally_v1_counter_destroy_all(void);
+TALLY_API int32_t tally_v1_live_cursors(int32_t *out);
 /* effects: pure */
 TALLY_API float tally_v1_scaled_total(const TallyStats *stats, float factor);
 /* How many Counters exist. */
 /* effects: read */
-TALLY_API int32_t tally_v1_live_counters(void);
+TALLY_API int32_t tally_v1_live_counters(int32_t *out);
 
 /* Copies the message of the calling thread's last failed call into `buffer`, cut to `capacity` bytes with a
  * NUL, and returns the message's full length. */

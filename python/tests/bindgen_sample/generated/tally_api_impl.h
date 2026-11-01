@@ -30,6 +30,7 @@ vh::Status allow(const VhCall &call);
 vh::Status allow(const VhCall &call, const tally::Counter &object);
 vh::Status allow(const VhCall &call, const tally::Cursor &object);
 
+int32_t ticket_position(tally::Ticket ticket);
 vh::Result<std::unique_ptr<tally::Counter>> counter_create(TallyMode mode);
 // Receives the object behind `counter`, whose handle is already gone.
 vh::Status counter_destroy(std::unique_ptr<tally::Counter> counter);
@@ -63,20 +64,21 @@ vh::Result<tally::Ticket> counter_ticket(const tally::Counter &counter);
 vh::Result<std::vector<tally::Ticket>> counter_tickets(const tally::Counter &counter);
 // The sum of the tickets' amounts; a ticket past the history fails with status 14.
 vh::Result<int32_t> counter_redeem(const tally::Counter &counter, vh::Span<tally::Ticket> tickets);
-int32_t ticket_position(tally::Ticket ticket);
+// Whether a Counter handle's bits name a live Counter.
+vh::Result<bool> counter_exists(uint64_t bits);
+// Destroys every Counter, and their Cursors with them.
+vh::Status counter_destroy_all();
 vh::Result<std::unique_ptr<tally::Cursor>> cursor_create(tally::Counter &counter);
 // Receives the object behind `cursor`, whose handle is already gone.
 vh::Status cursor_destroy(std::unique_ptr<tally::Cursor> cursor);
 // The next amount of the counter's history; past its end fails with status 15.
 vh::Result<int32_t> cursor_next(tally::Cursor &cursor);
-int32_t live_cursors();
-// Whether a Counter handle's bits name a live Counter.
-bool counter_exists(uint64_t bits);
-// Destroys every Counter, and their Cursors with them.
-vh::Status counter_destroy_all();
+// The bits of the live Counter handle the cursor reads.
+vh::Result<uint64_t> cursor_counter_bits(const tally::Cursor &cursor);
+vh::Result<int32_t> live_cursors();
 float scaled_total(const TallyStats &stats, float factor);
 // How many Counters exist.
-int32_t live_counters();
+vh::Result<int32_t> live_counters();
 
 // The objects behind the handles the thunks own, for the library's own code, such as other bindings.
 namespace handles {
@@ -86,9 +88,13 @@ template <typename Handle> vh::Status destroy_all();
 
 // The object behind a live Counter; null for a stale handle.
 tally::Counter *find(TallyCounter handle);
+// The live Counter holding `object`, as Host code receives it; zero for an untabled object.
+TallyCounter handle_of(const tally::Counter &object);
 template <> vh::Status destroy_all<TallyCounter>();
 // The object behind a live Cursor; null for a stale handle.
 tally::Cursor *find(TallyCursor handle);
+// The live Cursor holding `object`, as Host code receives it; zero for an untabled object.
+TallyCursor handle_of(const tally::Cursor &object);
 template <> vh::Status destroy_all<TallyCursor>();
 
 } // namespace handles

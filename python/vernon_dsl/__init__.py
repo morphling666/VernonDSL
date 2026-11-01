@@ -11,7 +11,21 @@ from . import _formats, ad
 from ._formats import *  # noqa: F403
 from ._texture_format import TextureFormat
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import enum, extern, fragment, func, handle, host, kernel, library, meta, params, struct, vertex
+from .decorators import (
+    HostClass,
+    enum,
+    extern,
+    fragment,
+    func,
+    handle,
+    host,
+    kernel,
+    library,
+    meta,
+    params,
+    struct,
+    vertex,
+)
 from .diagnostics import CompileError
 from .host_values import TangentLayout, TangentValue, replace
 from .intrinsics import (
@@ -353,6 +367,7 @@ __all__ = [
     "graphics_state",
     "func",
     "handle",
+    "HostClass",
     "host",
     "meta",
     "i32",

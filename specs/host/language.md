@@ -45,7 +45,9 @@ A program is one module and the modules it imports. Its top level may declare:
 - Each function has exactly one decorator. Other decorators, such as device
   stage decorators, are rejected in Host programs.
 - Parameters are required and positional: no defaults, `*args`, keyword-only
-  or positional-only parameters. Calls pass positional arguments only.
+  or positional-only parameters. Calls pass positional arguments only;
+  constructors also name fields (see [Structs](#aggregates) and
+  [New instances](#values-and-places)).
 - `@host` parameters and results must be annotated. A function returning
   nothing is annotated `-> None`. Every path of a function with a result must
   return.
@@ -75,8 +77,9 @@ A program is one module and the modules it imports. Its top level may declare:
   `Tuple(a, b, ...)` and unpacked with `a, b = ...`. In Python mode it is a
   Python tuple.
 - **Structs.** A `@vd.struct(shared=True)` class has annotation-only fields of
-  value types, without defaults. Construct it positionally, `Point(x, y)`, and
-  read its fields with `p.x`. A Struct may have `@vd.func(shared=True)` methods.
+  value types, without defaults. Construct it with every field, positionally,
+  by name or both, `Point(x, y)` or `Point(x, y=y)`, and read its fields with
+  `p.x`. Device code constructs Structs positionally. A Struct may have `@vd.func(shared=True)` methods.
   Options:
   - `c_type="Name"` names the C typedef;
   - `meta=vd.meta(...)` attaches metadata.
@@ -87,9 +90,34 @@ A program is one module and the modules it imports. Its top level may declare:
   cannot look inside. Each `@vd.handle` class is a distinct type, so a `Node`
   cannot be passed where a `File` is expected, although both are 64 bits.
   `c_type="Name"` gives it its own C typedef, so C callers keep the
-  distinction too. A handle class has no body. Compiled code passes it as its
-  `uint64_t` bits; in Python mode it is an `int`. `Node()` is the null handle,
-  0. Handles compare with `==` and `!=`.
+  distinction too. A handle class holds no fields; its body declares only
+  externs, its methods. Compiled code passes it as its
+  `uint64_t` bits. In Python mode it is a value of its class holding `bits`:
+  `Node(bits)` takes an integer from 0 to 2**64 - 1 or any object with
+  `.bits`, such as a binding's handle, and a Struct's handle field accepts the
+  same. `Node()` is the null handle, 0. Handles compare with `==` and `!=`.
+- **Handle methods.** An extern in a handle's class body is a method of it:
+
+  ```python
+  @vd.handle
+  class Node:
+      @staticmethod
+      @vd.extern
+      def create(name: str) -> Node: ...
+
+      @vd.extern(effects="write")
+      def rename(self, name: str) -> None: ...
+  ```
+
+  Its C function is named by the snake-cased class and the method,
+  `node_create` and `node_rename(node, name)`, and `self` is the handle.
+  The C name is not a Host name: Host code importing or calling
+  `node_rename` is an error.
+  Host code calls `Node.create("a")` and `node.rename(name)`, compiled and
+  in Python mode, and a generic extern's method takes its `type[T]` as the
+  function does, `node.load(Health)`. Importing the handle makes its
+  methods available. The module needs `from __future__ import annotations`
+  when a method names its own class.
 - **Enums.** A `@vd.enum` class derives from the standard `enum.IntEnum`, and
   its body is `NAME = <integer literal>` members (negative values and aliases
   allowed) and an optional docstring. The underlying type is always
@@ -107,8 +135,11 @@ A program is one module and the modules it imports. Its top level may declare:
 - **str.** UTF-8 text. A `str` is a class field (see
   [Containers](#containers)), a local, a string literal, an f-string, or an
   extern `str` parameter, which receives `{const char *data; uint64_t size}`
-  (see [Strings](#strings)). It cannot be a `@host` parameter or result, or a
-  Struct field.
+  (see [Strings](#strings)). A `@host` function or method `str` parameter
+  receives a `const VhStrArg *` view and copies the text into a local on
+  entry, so the parameter is a local, and a caller may pass a field the callee
+  then assigns. A `str` cannot be a `@host` result, a `@func` helper parameter,
+  or a Struct field.
 - **list[T].** A growable sequence of values, owned by the class instance
   whose field it is or the function whose local it is (see
   [Containers](#containers)). `T` is a value type without containers or
@@ -164,8 +195,11 @@ indistinguishable, as immutability does for values.
     `timer = self.timer`, never through an element;
   - a `for` target over a list of classes, or a value target over a dict of
     them, usable only inside the loop body.
-- **New instances** are `A()`, which takes no arguments and gives every field
-  its default, a call returning a class, `list.pop()` or `dict.pop(k)`
+- **New instances** are `A()`, which gives every field its default, and
+  `A(name=n, size=s)`, which then assigns the named fields in order, as
+  statements would: a `str` is copied, and a class instance, which must be
+  new or an owned local, moves in. List, dict and storage fields start empty
+  and are filled after. Also new instances are a call returning a class, `list.pop()` or `dict.pop(k)`
   of a container of classes, and a [copy](#copies). A new instance is bound to a local, stored,
   appended, returned, passed as an argument (a temporary, released after the
   call) or discarded as a statement. `A().x` is rejected: bind it first.
@@ -372,9 +406,11 @@ The supported statements are:
   not change the size. `for` over anything else is rejected;
 - `del self.d[k]` on a dict field or local, which is a `KEY_NOT_FOUND` error if `k`
   is missing;
+- `with` on scoped externs ([Externs](#externs)), with optional `as name`;
+  several items nest, left outermost;
 - `break`, `continue`, `pass`.
 
-`with`, `try`, `raise`, `assert`, other `del` targets, `global` and
+Any other `with`, `try`, `raise`, `assert`, other `del` targets, `global` and
 `nonlocal` are rejected.
 
 ## Calls
@@ -422,7 +458,7 @@ Effects are ordered `pure < read < write < io`.
 ## Externs
 
 ```python
-@vd.extern(symbol="app_find_node", effects="read", abi="status", schema="app-v3")
+@vd.extern(symbol="app_find_node", effects="read", abi="status")
 def find(name: str) -> Node: ...
 ```
 
@@ -431,12 +467,20 @@ def find(name: str) -> Node: ...
   declaring `vd.library(name, version=0)`, to `<name>_v<version>_<function>`.
   `vd.library` is a module-level statement before the module's externs, at
   most one per module; its `meta=` is for binding generators
-  ([bindgen.md](bindgen.md)).
+  ([bindgen.md](bindgen.md)), and its `binding=`, a dotted module name,
+  names the module Python mode binds the externs from.
 - `abi="direct"` (the default) calls `R symbol(params...)` and allows only
   scalar, handle or enum results. `abi="status"` calls
   `int32_t symbol(params..., R *out)`. A nonzero status ends the calling Host
   function with that status.
-- `schema` must match the schema the application binds the symbol with.
+- The C API revision is the library's: in a module declaring `vd.library`,
+  every extern carries the library's identity, a hash of its declarations,
+  and a binding registered under another identity is rejected. An extern
+  outside a library names no revision, and any binding of its symbol
+  serves.
+- A direct extern cannot fail, so it cannot refuse a call either: in a
+  library whose generated C API checks effects (`effect_check`), it is
+  `effects="pure"`.
 - A `str` parameter takes any `str` expression. A `str` field passed before
   an argument that makes a call is copied first, so the extern receives the
   text as it was when that argument was reached, as in Python.
@@ -476,6 +520,40 @@ def find(name: str) -> Node: ...
   parameter, the first parameter annotated `T` binds it: each call passes a
   Struct value there, whose type is the bound Struct, and the descriptor
   goes just before it. A value that is not a Struct is rejected.
+- **Moving Host class instances.** With `S = TypeVar("S", bound=vd.HostClass)`
+  the value form takes a Host class instance instead, and `S` annotates
+  only that parameter. The call moves the instance into the callee: the
+  argument names a local or a new instance, never a field, element or
+  parameter, and a moved local is unusable until reassigned. C receives
+  the class's descriptor and a pointer to the instance's bytes, and must
+  move them out before it returns, whatever its status; the caller then
+  zeroes its copy. The callee owns the instance, calls its methods through
+  `type->methods`, and releases it with `type->fini`. In Python mode a
+  Python binding receives the descriptor and the instance's address.
+- **Scoped externs.** `closed_by=end` names an extern, declared earlier,
+  that closes what this one opens, as `ImGui::Begin` and `ImGui::End` do:
+
+  ```python
+  @vd.extern(symbol="ui_end")
+  def ui_end(ui: Ui) -> None: ...
+
+  @vd.extern(symbol="ui_window", closed_by=ui_end)
+  def ui_window(ui: Ui, name: str) -> None: ...
+
+  with ui.window("Scene"):
+      ui.text("hello")
+  ```
+
+  The opener takes a handle first, and the closer takes only that handle
+  type and returns `None`. Host code calls the opener only as the subject of
+  a `with`, which evaluates the handle once and calls the closer on it
+  however the block exits: at its end, and on `break`, `continue` or
+  `return` out of it, after a `return` value is evaluated. On a failure
+  inside the block the closers run and the failure stands, whatever they
+  return; otherwise a closer's nonzero status fails the call, and the scopes
+  outside it close. `as name` binds the opener's result. A failed opener
+  opens nothing, so nothing closes. In Python mode the call returns a
+  context manager doing the same.
 - In Python mode, an extern call goes to the registry of the active runtime.
   A Python binding receives Structs as field dicts and Tensors as tuples, and
   returns the same forms. A span reaches it as a new Python list or dict, and
@@ -505,7 +583,8 @@ class Mover:
   optional default. The default is a constant or constructor expression.
 - **Initialization.** A new instance is zeroed. Then each field, in
   declaration order, takes its default or, for a class field, is initialized
-  recursively.
+  recursively. `Mover(speed=4.0)` then assigns the named fields, so the
+  application writes no `init` method to fill fields one statement at a time.
 - **Methods** take `self` unannotated. An undecorated method is `effects="io"`;
   `@vd.host(effects=...)` sets one method's effect. A leading underscore makes
   a method private: callable inside the module, but not exported.
@@ -520,8 +599,9 @@ class Mover:
   - a class that contains itself, directly or through class fields. A class
     may hold a list or dict of itself, as a tree node holds its children.
 - **In Python mode:**
-  - `Mover()` creates an initialized instance, and `m.update(dt)` runs with
-    the module's runtime;
+  - `Mover()` creates an initialized instance, `Mover(speed=4.0)` assigns
+    the named fields after, and `m.update(dt)` runs with the module's
+    runtime;
   - scalar fields read as numpy scalars;
   - Tensor fields read as read-only copies;
   - Struct fields read as fresh values, and class fields, elements and values
@@ -676,7 +756,8 @@ class Logbook:
   - join with `+`, format in an f-string, or pick in `a if c else b`;
   - compare with `==` or `!=`;
   - index or test a dict with `str` keys;
-  - pass to `len` or to an extern `str` parameter.
+  - pass to `len`, to an extern `str` parameter, or to a `@host` function or
+    method `str` parameter.
 - `@func` helpers cannot use `str`, since they are shared with device code.
 - **f-strings** format integers, floats, `bool`, handles and `str`. Without
   a format spec a value formats as Python's `str()`: a handle as its bits,

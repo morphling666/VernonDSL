@@ -6,7 +6,8 @@
  * stay valid while the object is loaded.
  *
  * Every function in the table has the Host convention: `int32_t f(params..., Result *out)`, returning zero or a
- * nonzero status; scalars and handles pass by value, aggregates by pointer, and methods take the instance first.
+ * nonzero status; scalars and handles pass by value, aggregates by pointer, a str as a `const VhStrArg *` the callee
+ * copies, and methods take the instance first.
  *
  * Records that may gain members start with their `struct_size`, and later versions only append members. Code built
  * against this header reads a newer table by indexing record arrays through the `vh_*_at` accessors, which stride by

@@ -105,6 +105,8 @@ class HostHandle:
     name: str
     c_type: str | None = None
     metadata: Metadata = ()
+    # Method name -> extern name, for the externs the handle's class body declares taking it first.
+    methods: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,13 @@ class HostExtern:
     # Whether a generic extern's calls pass the bound Struct as a `type: type[T]` argument. If not, the value in
     # `parameters[type_argument[0]]` binds it, and the descriptor goes just before that value.
     type_passed: bool = True
+    # Whether the type variable is bound to `vd.HostClass`: the value binding it is a Host class instance the call
+    # moves into the callee.
+    type_moves: bool = False
+    # The `binding=` module of the declaring `vd.library`, which Python mode binds the symbol from when nothing did.
+    binding: str | None = None
+    # The extern a scoped extern's `with` calls on its first argument however the block exits.
+    closed_by: str | None = None
 
 
 @dataclass
@@ -237,6 +246,10 @@ class HostProgram:
             for node in ast.walk(function.source):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self.externs:
                     called.add(node.func.id)
+                    # The `with` a scoped extern opens calls its closer.
+                    closer = self.externs[node.func.id].closed_by
+                    if closer is not None:
+                        called.add(closer)
         return tuple(self.externs[name] for name in sorted(called))
 
 

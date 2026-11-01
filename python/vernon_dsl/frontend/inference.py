@@ -379,6 +379,8 @@ class _Inference:
         for statement in statements:
             if isinstance(statement, ast.Return) or _is_fragment_discard(statement):
                 return True
+            if isinstance(statement, ast.With) and cls._block_always_returns(statement.body):
+                return True
             if (
                 isinstance(statement, ast.If)
                 and statement.orelse
@@ -680,6 +682,8 @@ class _Inference:
         elif isinstance(statement, (ast.For, ast.While)):
             children.extend(self._typed_block(statement.body, parameters, loop_depth + 1))
             children.extend(self._typed_block(statement.orelse, parameters, loop_depth))
+        elif isinstance(statement, ast.With):
+            children.extend(self._typed_block(statement.body, parameters, loop_depth))
         effects = (
             *self._storage_effects(statement, typed_expressions, parameters),
             *self._resource_effects(typed_expressions, parameters),
@@ -949,6 +953,13 @@ class _Inference:
     ) -> tuple[LValue, ...]:
         target: ast.expr | None = None
         value: ast.expr | None = None
+        if isinstance(statement, ast.With):
+            bound: list[LValue] = []
+            for item in statement.items:
+                record = self.expression_records.get(id(item.context_expr))
+                if isinstance(item.optional_vars, ast.Name) and record is not None:
+                    bound.append(LValue("local", item.optional_vars.id, default_type(record[1])))
+            return tuple(bound)
         if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
             target = statement.targets[0]
             value = statement.value
@@ -1055,6 +1066,8 @@ class _Inference:
                     environment[name] = _common(previous, value_type) if previous is not None else value_type
                     if environment[name] is None:
                         raise self.error(statement, f"local '{name}' has incompatible assignment types")
+                    if previous is not None:
+                        self._constrain_literal(statement.value, environment[name])
                 elif len(statement.targets) == 1 and isinstance(statement.targets[0], (ast.Tuple, ast.List)):
                     self._bind_destructuring(statement.targets[0], value_type, environment)
                 elif (
@@ -1146,6 +1159,18 @@ class _Inference:
             elif isinstance(statement, ast.Return):
                 returns.append(None if statement.value is None else self._expression(statement.value, environment))
                 break
+            elif self.host and isinstance(statement, ast.With):
+                for item in statement.items:
+                    value_type = self._expression(item.context_expr, environment)
+                    if item.optional_vars is None:
+                        continue
+                    if not isinstance(item.optional_vars, ast.Name):
+                        raise self.error(item.optional_vars, "'with ... as' binds one local name")
+                    if value_type is None or (isinstance(value_type, ConcreteType) and value_type.kind == "void"):
+                        raise self.error(item.context_expr, "this scope returns nothing to bind with 'as'")
+                    environment[item.optional_vars.id] = value_type
+                # The body runs exactly once, so its assignments stand after the block.
+                returns.extend(self._statements(statement.body, environment, loop_depth))
             elif isinstance(statement, ast.If):
                 self._expression(statement.test, environment)
                 before = environment.copy()
@@ -1870,13 +1895,19 @@ class _Inference:
         if not isinstance(node.func, ast.Attribute) or not self._receiver(node.func.value, environment):
             return False
         receiver = self._expression(node.func.value, environment)
-        if not isinstance(receiver, ConcreteType) or receiver.kind != "struct":
+        if not isinstance(receiver, ConcreteType) or receiver.kind not in {"struct", "handle"}:
             return False
+        # A handle's methods are the externs its class body declares, which take it first.
         helper = self.methods.get(receiver.name, {}).get(node.func.attr)
         if helper is None:
             chain = " -> ".join(key[0] for key in self.active)
             suffix = f" (in helper specialization {chain})" if chain else ""
             raise self.error(node.func, f"'{receiver.name}' has no method '{node.func.attr}'{suffix}")
+        # A generic extern method was specialized for its type argument, which the call then drops.
+        specialized = getattr(node, "_vernon_method_generics", {}).get(helper)
+        if specialized is not None:
+            helper, position = specialized
+            del node.args[position]
         node.args = [node.func.value, *node.args]
         node.func = copy_location(ast.Name(id=helper, ctx=ast.Load()), node.func)
         return True
@@ -2014,6 +2045,28 @@ class _Inference:
                 raise self.error(keyword.value, f"cannot pass {describe(value)} as {expected.spelling}")
             self._constrain_literal(keyword.value, expected)
         return struct
+
+    def _field_keywords(
+        self, node: ast.Call, name: str, environment: dict[str, InferenceType], positional: set[str]
+    ) -> set[str]:
+        """Types the `field=value` keywords of a constructor of `name`; `positional` are the fields set before."""
+
+        fields = dict(self.structs[name])
+        named: set[str] = set()
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                raise self.error(keyword.value, f"{name}(...) names each field it sets")
+            expected = fields.get(keyword.arg)
+            if expected is None:
+                raise self.error(keyword.value, f"{name} has no field '{keyword.arg}'")
+            if keyword.arg in positional or keyword.arg in named:
+                raise self.error(keyword.value, f"{name}(...) sets field '{keyword.arg}' twice")
+            named.add(keyword.arg)
+            value = self._expression(keyword.value, environment)
+            if not can_convert(value, expected):
+                raise self.error(keyword.value, f"cannot pass {describe(value)} as {expected.spelling}")
+            self._constrain_literal(keyword.value, expected)
+        return named
 
     def _call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
         if (update := self._tensor_update(node, environment)) is not None:
@@ -2177,16 +2230,26 @@ class _Inference:
             return self._struct_replace(node, environment)
         if name in self.host_classes:
             if arguments:
-                raise self.error(node, f"{name}() takes no arguments; a new instance takes its field defaults")
+                raise self.error(
+                    node, f"{name}() names the fields it sets, as in {name}(field=value); the rest take their defaults"
+                )
+            self._field_keywords(node, name, environment, set())
             return ConcreteType("struct", name)
         if name in self.structs:
             fields = self.structs[name]
-            if len(arguments) != len(fields):
+            if len(arguments) > len(fields):
                 raise self.error(node, f"{name} constructor requires {len(fields)} arguments")
-            for source, inferred, (_, expected) in zip(node.args, arguments, fields, strict=True):
+            for source, inferred, (_, expected) in zip(node.args, arguments, fields, strict=False):
                 if not can_convert(inferred, expected):
                     raise self.error(node, f"cannot pass {describe(inferred)} as {expected.spelling}")
                 self._constrain_literal(source, expected)
+            if node.keywords and not self.host:
+                raise self.error(node, f"device code constructs {name} from positional field values")
+            positional = {field for field, _ in fields[: len(arguments)]}
+            named = self._field_keywords(node, name, environment, positional)
+            missing = [field for field, _ in fields if field not in positional and field not in named]
+            if missing:
+                raise self.error(node, f"{name} constructor requires {len(fields)} arguments; '{missing[0]}' is unset")
             return ConcreteType("struct", name)
         if name == "matmul":
             if len(arguments) != 2:
