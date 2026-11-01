@@ -11,7 +11,7 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import numpy as np
 
 from ._dtypes import NUMPY_DTYPE_BY_SCALAR
-from ._markers import dsl_options, is_struct_class
+from ._markers import dsl_kind, dsl_options, is_struct_class
 from .language.scalar_types import ALL_SCALAR_TYPES, SCALAR_TYPES
 from .types import Matrix, Tensor, TypeExpr, Vector, _Scalar
 
@@ -690,6 +690,11 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
         if not isinstance(value, annotation):
             raise TypeError(f"field '{field_name}' requires {annotation.__name__}")
         return value
+    if dsl_kind(annotation) == "enum":
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or not -(2**31) <= value < 2**31:
+            raise TypeError(f"field '{field_name}' requires a {annotation.__name__} or an i32")
+        # A value no member has stays a plain int, the way it crosses the C boundary.
+        return annotation._value2member_map_.get(int(value), int(value))
     raise TypeError(f"field '{field_name}' has unsupported host annotation {annotation!r}")
 
 

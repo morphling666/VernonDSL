@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..frontend.model import ConcreteType
-from .layout import StructFields, layout, pack, unpack
+from .layout import TRANSFERRED_KINDS, StructFields, layout, pack, transfer_item, unpack
 from .model import ExternAbi, HostExtern
 from .values import HostExecutionError, from_python, scalar_value, to_python
 
@@ -36,6 +36,12 @@ class HostStr(ctypes.Structure):
     _fields_ = [("data", ctypes.c_char_p), ("size", ctypes.c_uint64)]
 
 
+class HostSpan(ctypes.Structure):
+    """The by-value `VhSpan`, `{const void *data; uint64_t size;}`, a list or dict argument passes as."""
+
+    _fields_ = [("data", ctypes.c_void_p), ("size", ctypes.c_uint64)]
+
+
 class HostBindingError(LookupError):
     pass
 
@@ -45,15 +51,21 @@ class _Binding:
     native: int | None = None
     python: Callable[..., Any] | None = None
     schema: str | None = None
+    # The message of the calling thread's last failed call of the library, for a native status extern.
+    last_error: Callable[[], str] | None = None
 
 
 def _ctype(value_type: ConcreteType) -> Any:
     if value_type.kind == "handle":
         return ctypes.c_uint64
+    if value_type.kind == "enum":
+        return ctypes.c_int32
     if value_type.kind == "scalar":
         return _CTYPES[value_type.name]
     if value_type.kind == "str":
         return HostStr
+    if value_type.kind in {"list", "dict"}:
+        return HostSpan
     return ctypes.c_void_p
 
 
@@ -73,19 +85,48 @@ class ExternRegistry:
         self.revision += 1
         return self
 
-    def bind_address(self, symbol: str, address: int, *, schema: str | None = None) -> "ExternRegistry":
+    def bind_address(
+        self,
+        symbol: str,
+        address: int,
+        *,
+        schema: str | None = None,
+        last_error: Callable[[], str] | None = None,
+    ) -> "ExternRegistry":
+        """Binds `symbol` to a C function address. `last_error` returns the library's message for the calling
+        thread's last failed call, which Python mode adds to the HostExecutionError of a failing status extern."""
+
         if not address:
             raise HostBindingError(f"extern symbol '{symbol}' is bound to a null address")
-        self._bindings[symbol] = _Binding(native=int(address), schema=schema)
+        self._bindings[symbol] = _Binding(native=int(address), schema=schema, last_error=last_error)
         self.revision += 1
         return self
 
-    def bind_symbols(self, symbols: Mapping[str, int], *, schema: str | None = None) -> "ExternRegistry":
+    def bind_symbols(
+        self,
+        symbols: Mapping[str, int],
+        *,
+        schema: str | None = None,
+        last_error: Callable[[], str] | None = None,
+    ) -> "ExternRegistry":
         """Binds every symbol of an address table, such as one a nanobind module exports for its C API."""
 
         for symbol, address in symbols.items():
-            self.bind_address(symbol, address, schema=schema)
+            self.bind_address(symbol, address, schema=schema, last_error=last_error)
         return self
+
+    def bind_module(self, module: Any) -> "ExternRegistry":
+        """Binds a generated binding module, such as a nanobind module: its `vh_symbols()` table of C symbol
+        addresses, under its `vh_schema` identity, with its `vh_last_error()` when it has one. Host code declared
+        against another revision of the library then fails to load instead of calling functions of a different
+        layout."""
+
+        schema = getattr(module, "vh_schema", None)
+        symbols = getattr(module, "vh_symbols", None)
+        if not isinstance(schema, str) or not callable(symbols):
+            raise HostBindingError(f"{module!r} is not a binding module: it needs vh_schema and vh_symbols()")
+        last_error = getattr(module, "vh_last_error", None)
+        return self.bind_symbols(symbols(), schema=schema, last_error=last_error if callable(last_error) else None)
 
     def bind_library(self, library: str | Path | ctypes.CDLL, *, schema: str | None = None) -> "ExternRegistry":
         """Resolves otherwise unbound symbols from the exports of a shared library."""
@@ -148,10 +189,47 @@ def _prototype(extern: HostExtern) -> Any:
     if extern.abi == ExternAbi.STATUS:
         if extern.result is not None:
             argument_types.append(ctypes.c_void_p)
+            if extern.result.kind in TRANSFERRED_KINDS:
+                argument_types.append(ctypes.c_void_p)
         result_type: Any = ctypes.c_int32
     else:
         result_type = None if extern.result is None else _ctype(extern.result)
     return ctypes.CFUNCTYPE(result_type, *argument_types)
+
+
+def _received(span: HostSpan, value_type: ConcreteType, fields: StructFields) -> Any:
+    """The new Python list or dict a Python binding receives for a span."""
+
+    item = transfer_item(value_type)
+    stride = layout(item, fields).size
+    data = ctypes.string_at(span.data, span.size * stride) if span.size else b""
+    parts = [
+        to_python(unpack(data[index * stride : (index + 1) * stride], item, fields), item, fields)
+        for index in range(span.size)
+    ]
+    return parts if value_type.kind == "list" else {key: value for key, value in parts}
+
+
+def _fill(out: int, allocator: int | None, returned: Any, value_type: ConcreteType, fields: StructFields) -> None:
+    """Fills the empty VhList at `out` with what a Python binding returned, through the caller's allocator."""
+
+    from .native import VhListRecord, reserve_record
+
+    if value_type.kind == "str":
+        data = str(returned).encode("utf-8")
+        count, size, alignment = len(data), 1, 1
+    else:
+        item = transfer_item(value_type)
+        parts = list(returned) if value_type.kind == "list" else list(dict(returned).items())
+        data = b"".join(pack(from_python(part, item, fields), item, fields) for part in parts)
+        item_layout = layout(item, fields)
+        count, size, alignment = len(parts), item_layout.size, item_layout.alignment
+    if count == 0:
+        return
+    record = VhListRecord.from_address(out)
+    reserve_record(record, count, size, alignment, allocator)
+    ctypes.memmove(record.data, data, len(data))
+    record.size = count
 
 
 def _python_callback(
@@ -176,7 +254,9 @@ def _python_callback(
             for value, parameter in zip(raw, parameters, strict=False):
                 if parameter.kind == "str":
                     values.append(ctypes.string_at(value.data, value.size).decode("utf-8"))
-                elif parameter.kind == "handle":
+                elif parameter.kind in {"list", "dict"}:
+                    values.append(_received(value, parameter, fields))
+                elif parameter.kind in {"handle", "enum"}:
                     values.append(int(value))
                 elif parameter.kind == "scalar":
                     values.append(to_python(scalar_value(value, parameter.name), parameter, fields))
@@ -187,9 +267,12 @@ def _python_callback(
                 values.insert(extern.type_argument[0], descriptor)
             result = function(*values)
             if extern.abi == ExternAbi.STATUS:
-                if result_type is not None:
+                out = len(extern.parameters)
+                if result_type is not None and result_type.kind in TRANSFERRED_KINDS:
+                    _fill(raw[out], raw[out + 1], result, result_type, fields)
+                elif result_type is not None:
                     packed = pack(from_python(result, result_type, fields), result_type, fields)
-                    ctypes.memmove(raw[len(extern.parameters)], packed, len(packed))
+                    ctypes.memmove(raw[out], packed, len(packed))
                 return 0
             if result_type is None:
                 return None

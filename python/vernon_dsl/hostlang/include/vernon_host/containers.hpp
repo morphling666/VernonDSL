@@ -103,10 +103,11 @@ private:
     VhList record_{};
 };
 
-/* A `list[T]` field. T is a Host value type: a scalar, handle, Struct, Tuple or Tensor (a C array). */
+/* A `list[T]` field. T is a Host value type (a scalar, handle, Struct, Tuple or Tensor, a C array) or a Host class.
+ * Elements of a class are read and edited in place; adding, removing or releasing them copies or drops memory each
+ * one owns, so those operations take value types only, and an instance's fini releases a list of classes. T may be
+ * the class declaring the list, so the class body requires nothing of T. */
 template <typename T> class List {
-    static_assert(std::is_trivially_copyable_v<T>, "list elements are Host value types");
-
 public:
     using value_type = T;
 
@@ -135,6 +136,7 @@ public:
     }
     /* `value` may be an element of this list, which growing moves, so it is copied first. */
     [[nodiscard]] bool push_back(Allocator allocator, const T &value) {
+        static_assert(std::is_trivially_copyable_v<T>, "only lists of Host value types grow from C++");
         T copy;
         std::memcpy(&copy, &value, sizeof(T));
         if (!reserve(allocator, record_.size + 1)) {
@@ -145,10 +147,17 @@ public:
         return true;
     }
     /* Requires a nonempty list. */
-    void pop_back() { --record_.size; }
+    void pop_back() {
+        static_assert(std::is_trivially_copyable_v<T>, "only lists of Host value types shrink from C++");
+        --record_.size;
+    }
     /* Keeps the memory, as Host code's clear does. */
-    void clear() { record_.size = 0; }
+    void clear() {
+        static_assert(std::is_trivially_copyable_v<T>, "only lists of Host value types shrink from C++");
+        record_.size = 0;
+    }
     void release(Allocator allocator) {
+        static_assert(std::is_trivially_copyable_v<T>, "an instance's fini releases a list of classes");
         vernonRuntimeHostListRelease(&record_, sizeof(T), alignof(T), allocator.get());
     }
 
@@ -159,14 +168,14 @@ private:
     VhList record_{};
 };
 
-/* A `dict[K, V]` field, iterated in insertion order. K is an integer, bool, handle or vh::Str; V is a Host value type.
- * A str-keyed dict takes and yields its keys as std::string_view. Inserting a new key may move every entry, so it
- * invalidates value pointers and iterators; assigning to an existing key does not. */
+/* A `dict[K, V]` field, iterated in insertion order. K is an integer, bool, handle or vh::Str; V is a Host value type
+ * or a Host class, whose values, like a List's class elements, are edited in place and released by an instance's
+ * fini. A str-keyed dict takes and yields its keys as std::string_view. Inserting a new key may move every entry, so
+ * it invalidates value pointers and iterators; assigning to an existing key does not. */
 template <typename K, typename V> class Dict {
     static constexpr bool kStrKey = std::is_same_v<K, Str>;
     static_assert(kStrKey || (std::is_trivially_copyable_v<K> && !std::is_floating_point_v<K>),
                   "dict keys are integers, bools, handles or vh::Str");
-    static_assert(std::is_trivially_copyable_v<V>, "dict values are Host value types");
 
     struct Entry {
         uint64_t hash;
@@ -255,6 +264,7 @@ public:
     }
     /* `value` may be a value of this dict, which inserting moves, so it is copied first. */
     [[nodiscard]] bool assign(Allocator allocator, key_argument key, const V &value) {
+        static_assert(std::is_trivially_copyable_v<V>, "only dicts of Host value types are assigned from C++");
         V copy;
         std::memcpy(&copy, &value, sizeof(V));
         V *slot = emplace(allocator, key);
@@ -266,16 +276,19 @@ public:
     }
     /* Whether `key` was present. */
     bool erase(Allocator allocator, key_argument key) {
+        static_assert(std::is_trivially_copyable_v<V>, "only dicts of Host value types shrink from C++");
         const Key passed(key);
         const VernonHostDictLayout entry = layout();
         return vernonRuntimeHostDictRemove(&record_, passed.get(), &entry, allocator.get()) != 0;
     }
     /* Keeps the memory, as Host code's clear does. */
     void clear(Allocator allocator) {
+        static_assert(std::is_trivially_copyable_v<V>, "only dicts of Host value types shrink from C++");
         const VernonHostDictLayout entry = layout();
         vernonRuntimeHostDictClear(&record_, &entry, allocator.get());
     }
     void release(Allocator allocator) {
+        static_assert(std::is_trivially_copyable_v<V>, "an instance's fini releases a dict of classes");
         const VernonHostDictLayout entry = layout();
         vernonRuntimeHostDictRelease(&record_, &entry, allocator.get());
     }

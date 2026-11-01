@@ -63,6 +63,10 @@ class TypeParser:
             if not self.host:
                 raise self.context.error(node, f"handle '{type_name}' is a Host-only type; device code cannot use it")
             return ConcreteType("handle", type_name)
+        if type_name in getattr(self.context, "enums", ()):
+            if not self.host:
+                raise self.context.error(node, f"enum '{type_name}' is a Host-only type; device code cannot use it")
+            return ConcreteType("enum", type_name)
         if type_name in self.context.structs:
             return ConcreteType("struct", type_name)
         if type_name == "Sampler":

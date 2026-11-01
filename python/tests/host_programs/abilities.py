@@ -31,7 +31,7 @@ class Poison:
             return f32(0.0)
         health = read(target, Health)
         drained = min(scaled(self.rate, f32(dt)), health.current)
-        write(target, Health, Health(health.current - drained, health.maximum))
+        write(target, Health(health.current - drained, health.maximum))
         self.ticks += 1
         self.drains.append(drained)
         self.hits[target] = self.hits.get(target, f32(0.0)) + drained

@@ -11,7 +11,7 @@ from . import _formats, ad
 from ._formats import *  # noqa: F403
 from ._texture_format import TextureFormat
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import extern, fragment, func, handle, host, kernel, meta, params, struct, vertex
+from .decorators import enum, extern, fragment, func, handle, host, kernel, library, meta, params, struct, vertex
 from .diagnostics import CompileError
 from .host_values import TangentLayout, TangentValue, replace
 from .intrinsics import (
@@ -335,6 +335,7 @@ __all__ = [
     "dynamic_state",
     "empty",
     "empty_like",
+    "enum",
     "dyn",
     "exp",
     "extern",
@@ -360,6 +361,7 @@ __all__ = [
     "interop",
     "init",
     "index_buffer",
+    "library",
     "lines",
     "load",
     "load_program",

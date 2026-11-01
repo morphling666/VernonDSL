@@ -498,7 +498,11 @@ cooked objects as one archive through `$<LINK_LIBRARY:WHOLE_ARCHIVE,...>`.
 Cooked artifacts are specific to one target (CPU objects are native code for
 one triple), so repositories keep only DSL sources. The engine, the
 external-engine example, the benchmarks and the Runtime test fixtures all use
-this helper instead of per-project cook rules.
+this helper instead of per-project cook rules. Including it also defines
+`Vernon::HostHeaders`, an INTERFACE target of the `vernon_host/` headers
+(`reflect.h`, `bindgen.hpp`), from a checkout or the wheel; a library that
+implements externs, such as the engine's C API, links it for `VhList`,
+`VhAllocator` and `VhType` without linking the Runtime.
 
 Interactive CPU execution may use compiler-owned LLJIT. LLVM IR and ORC state
 are not persistent deployment formats.

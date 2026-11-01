@@ -20,6 +20,7 @@ import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
 
@@ -28,7 +29,7 @@ import numpy as np
 from .._markers import dsl_kind
 from ..frontend.model import ConcreteType
 from ..types import Matrix, Tensor, TypeExpr, Vector, _Scalar
-from .externs import ExternRegistry, HostStr
+from .externs import ExternRegistry, HostSpan, HostStr
 from .layout import layout, storage_rank
 from .model import ExternAbi, HostProgram, HostStatus
 from .reflect import BuiltTable, VhType, describe
@@ -142,6 +143,32 @@ class _HandleCodec(Codec):
     boundary = read = write = value
 
 
+class _EnumCodec(Codec):
+    """Enums are their int32_t value. Host code holds the IntEnum member, or the plain int for a value that names
+    none, which compiled code passes along unchecked and which equals no member there either."""
+
+    simple = True
+    ctype = ctypes.c_int32
+
+    def __init__(self, cls: type[Any]):
+        self.cls = cls
+
+    def value(self, item: Any) -> Any:
+        if isinstance(item, bool) or not isinstance(item, (int, np.integer)):
+            raise TypeError(f"{self.cls.__name__} expects a member or int, got {type(item).__name__}")
+        number = int(item)
+        if not -(1 << 31) <= number < 1 << 31:
+            raise OverflowError(f"{number} is out of range for the int32_t of {self.cls.__name__}")
+        return self.cls._value2member_map_.get(number, number)
+
+    read = value
+
+    def boundary(self, item: Any) -> Any:
+        return int(item)
+
+    write = boundary
+
+
 class _StrCodec(Codec):
     ctype = HostStr
 
@@ -243,6 +270,7 @@ _POINTER, _U64 = ctypes.c_void_p, ctypes.c_uint64
 _RUNTIME_SIGNATURES: dict[str, tuple[Any, ...]] = {
     "vernonRuntimeHostListReserve": (ctypes.c_int32, _POINTER, _U64, _U64, _U64, _POINTER),
     "vernonRuntimeHostListRelease": (None, _POINTER, _U64, _U64, _POINTER),
+    "vernonRuntimeHostDefaultAllocator": (_POINTER,),
     "vernonRuntimeHostDictFind": (ctypes.c_int64, _POINTER, _POINTER, _POINTER),
     "vernonRuntimeHostDictInsert": (ctypes.c_int32, _POINTER, _POINTER, _POINTER, _POINTER, _POINTER),
     "vernonRuntimeHostDictRemove": (ctypes.c_int32, _POINTER, _POINTER, _POINTER, _POINTER),
@@ -268,6 +296,13 @@ def reserve_record(record: VhListRecord, capacity: int, size: int, alignment: in
     status = _container_runtime()["ListReserve"](ctypes.addressof(record), capacity, size, alignment, allocator)
     if status != 0:
         raise HostExecutionError(status, "the allocator could not grow a container")
+
+
+def transfer_allocator(allocator: int | None) -> int:
+    """The allocator an extern fills an owned result through: the module's, or VernonRuntime's default as an
+    object, never NULL, so a library linking another C runtime allocates from the heap that frees the result."""
+
+    return allocator or _container_runtime()["DefaultAllocator"]()
 
 
 def release_record(address: int, size: int, alignment: int, allocator: int | None) -> None:
@@ -389,9 +424,20 @@ class HostDict:
         pointer, alive = self._codec.key_argument(key)
         entry = insert_dict_entry(self._record, pointer, self._codec.layout, _allocator(self._owner))
         del alive
+        instances = _instance_codec(self._codec.item)
+        if instances is not None:
+            # A new entry's value is zeroed, so releasing it is a no-op.
+            instances.replace(entry + self._codec.layout.value_offset, value, _allocator(self._owner))
+            return
         self._codec.item.write_at(entry + self._codec.layout.value_offset, value)
 
     def __delitem__(self, key: Any) -> None:
+        instances = _instance_codec(self._codec.item)
+        if instances is not None:
+            index = self._find(key)
+            if index < 0:
+                raise _missing(key)
+            instances.release(self._entry(index) + self._codec.layout.value_offset, _allocator(self._owner))
         pointer, alive = self._codec.key_argument(key)
         removed = self._call("DictRemove", pointer, _allocator(self._owner))
         del alive
@@ -423,11 +469,17 @@ class HostDict:
             if default:
                 return self._codec.item.value(default[0])
             raise _missing(key)
-        value = self._read_value(self._entry(index))
+        instances = _instance_codec(self._codec.item)
+        if instances is not None:
+            # The value moves out, so removing the zeroed entry releases nothing.
+            value = instances.take(self._entry(index) + self._codec.layout.value_offset)
+        else:
+            value = self._read_value(self._entry(index))
         del self[key]
         return value
 
     def clear(self) -> None:
+        self._codec.release_values(ctypes.addressof(self._record), _allocator(self._owner))
         clear_dict(ctypes.addressof(self._record), self._codec.layout, _allocator(self._owner))
 
     def __eq__(self, other: object) -> bool:
@@ -437,6 +489,12 @@ class HostDict:
 
     def __repr__(self) -> str:
         return repr(dict(self.items()))
+
+    def copy(self) -> dict[Any, Any]:
+        return dict(self.items())
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[Any, Any]:
+        return {key: deepcopy(item, memo) for key, item in self.items()}
 
 
 def _out_of_range(index: int, size: int) -> HostExecutionError:
@@ -474,6 +532,10 @@ class HostList:
         return self._read(self._address(int(index)))
 
     def __setitem__(self, index: int, item: Any) -> None:
+        instances = _instance_codec(self._codec)
+        if instances is not None:
+            instances.replace(self._address(int(index)), item, _allocator(self._owner))
+            return
         self._write(self._address(int(index)), item)
 
     def __iter__(self) -> Iterator[Any]:
@@ -491,6 +553,14 @@ class HostList:
     def __repr__(self) -> str:
         return repr(list(self))
 
+    def copy(self) -> list[Any]:
+        """A Python list of the elements, which are values: Host code takes `copy.deepcopy` for instances."""
+
+        return list(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
+        return [deepcopy(item, memo) for item in self]
+
     def append(self, item: Any) -> None:
         codec = self._codec
         value = codec.value(item)
@@ -498,18 +568,29 @@ class HostList:
         reserve_record(
             self._record, size + 1, ctypes.sizeof(codec.ctype), ctypes.alignment(codec.ctype), _allocator(self._owner)
         )
-        self._write(self._record.data + size * ctypes.sizeof(codec.ctype), value)
+        address = self._record.data + size * ctypes.sizeof(codec.ctype)
+        instances = _instance_codec(codec)
+        if instances is not None:
+            instances.move_in(address, value)
+        else:
+            self._write(address, value)
         self._record.size = size + 1
 
     def pop(self) -> Any:
         size = self._record.size
         if size == 0:
             raise HostExecutionError(HostStatus.INDEX_OUT_OF_RANGE, "pop from an empty list")
-        value = self._read(self._record.data + (size - 1) * ctypes.sizeof(self._codec.ctype))
+        address = self._record.data + (size - 1) * ctypes.sizeof(self._codec.ctype)
+        instances = _instance_codec(self._codec)
+        value = instances.take(address) if instances is not None else self._read(address)
         self._record.size = size - 1
         return value
 
     def clear(self) -> None:
+        instances = _instance_codec(self._codec)
+        if instances is not None:
+            stride = ctypes.sizeof(instances.ctype)
+            instances.release_elements(self._record.data, self._record.size, stride, _allocator(self._owner))
         self._record.size = 0
 
     def extend(self, items: Any) -> None:
@@ -534,13 +615,46 @@ class _ListCodec(Codec):
         return HostList(getattr(state, name), self.element, type(owner))
 
     def set(self, state: Any, name: str, item: Any, owner: Any = None) -> None:
+        # Built in a record of its own before the field's is released, as compiled code assigns a copy, so a failed
+        # allocation leaves the field as it was.
         items = self.value(item)
-        placed = HostList(getattr(state, name), self.element, type(owner))
-        placed.clear()
-        placed.extend(items)
+        allocator = _allocator(type(owner))
+        built = VhListRecord()
+        try:
+            HostList(built, self.element, type(owner)).extend(items)
+        except BaseException:
+            self.release(ctypes.addressof(built), allocator)
+            raise
+        address = ctypes.addressof(getattr(state, name))
+        self.release(address, allocator)
+        ctypes.memmove(address, ctypes.addressof(built), ctypes.sizeof(VhListRecord))
 
     def release(self, address: int, allocator: int | None) -> None:
+        instances = _instance_codec(self.element)
+        if instances is not None:
+            record = VhListRecord.from_address(address)
+            instances.release_elements(record.data, record.size, ctypes.sizeof(instances.ctype), allocator)
         release_record(address, ctypes.sizeof(self.element.ctype), ctypes.alignment(self.element.ctype), allocator)
+
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        """The compiled `vh.copy`: deep-copies the record at `source` into the zeroed record at `target`. Each
+        instance element is counted in the target's size before it is copied into, so a failure leaves what the
+        target's release frees."""
+
+        stride = ctypes.sizeof(self.element.ctype)
+        copied, record = VhListRecord.from_address(source), VhListRecord.from_address(target)
+        size = copied.size
+        reserve_record(record, size, stride, ctypes.alignment(self.element.ctype), allocator)
+        instances = _instance_codec(self.element)
+        if instances is None or not instances.layout.owned:
+            if size:
+                ctypes.memmove(record.data, copied.data, size * stride)
+            record.size = size
+            return
+        for index in range(size):
+            ctypes.memset(record.data + index * stride, 0, stride)
+            record.size = index + 1
+            instances.copy_at(record.data + index * stride, copied.data + index * stride, allocator)
 
 
 class _OwnedStrCodec(Codec):
@@ -568,6 +682,13 @@ class _OwnedStrCodec(Codec):
     def release(self, address: int, allocator: int | None) -> None:
         release_record(address, 1, 1, allocator)
 
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        copied, record = VhListRecord.from_address(source), VhListRecord.from_address(target)
+        reserve_record(record, copied.size, 1, 1, allocator)
+        if copied.size:
+            ctypes.memmove(record.data, copied.data, copied.size)
+        record.size = copied.size
+
 
 class _DictCodec(Codec):
     """A dict field: a VhDict record whose entries hold the key as `key` lays it out, a str key as an owned
@@ -579,11 +700,26 @@ class _DictCodec(Codec):
         self.key = key
         self.item = item
         self.str_key = isinstance(key, _OwnedStrCodec)
-        self.layout = dict_layout(
+
+    @functools.cached_property
+    def layout(self) -> Any:
+        # Built at first use, since the values may be instances of the class declaring the dict.
+        key, item = self.key, self.item
+        return dict_layout(
             (ctypes.sizeof(key.ctype), ctypes.alignment(key.ctype)),
             (ctypes.sizeof(item.ctype), ctypes.alignment(item.ctype)),
             self.str_key,
         )
+
+    def release_values(self, address: int, allocator: int | None) -> None:
+        instances = _instance_codec(self.item)
+        if instances is None or not instances.layout.owned:
+            return
+        record = VhDictRecord.from_address(address)
+        for index in range(record.used):
+            entry = record.entries + index * self.layout.entry_size
+            if ctypes.c_uint64.from_address(entry).value != _REMOVED:
+                instances.release(entry + self.layout.value_offset, allocator)
 
     def key_argument(self, key: Any) -> tuple[int, Any]:
         """The pointer the runtime takes for `key`, and what must stay alive while it is used."""
@@ -604,14 +740,99 @@ class _DictCodec(Codec):
         return HostDict(getattr(state, name), self, type(owner))
 
     def set(self, state: Any, name: str, item: Any, owner: Any = None) -> None:
+        # Built in a record of its own first, as `_ListCodec.set` is.
         items = self.value(item)
-        placed = HostDict(getattr(state, name), self, type(owner))
-        placed.clear()
-        for key, part in items.items():
-            placed[key] = part
+        allocator = _allocator(type(owner))
+        built = VhDictRecord()
+        try:
+            placed = HostDict(built, self, type(owner))
+            for key, part in items.items():
+                placed[key] = part
+        except BaseException:
+            self.release(ctypes.addressof(built), allocator)
+            raise
+        address = ctypes.addressof(getattr(state, name))
+        self.release(address, allocator)
+        ctypes.memmove(address, ctypes.addressof(built), ctypes.sizeof(VhDictRecord))
 
     def release(self, address: int, allocator: int | None) -> None:
+        self.release_values(address, allocator)
         release_dict(address, self.layout, allocator)
+
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        """Inserts each live entry's key in insertion order, then copies its value into the entry the insert
+        zeroed. A str key's VhList record starts with the `{data, size}` view the insert takes."""
+
+        entry_layout = self.layout
+        copied, record = VhDictRecord.from_address(source), VhDictRecord.from_address(target)
+        instances = _instance_codec(self.item)
+        owned = instances is not None and instances.layout.owned
+        size = ctypes.sizeof(self.item.ctype)
+        for index in range(copied.used):
+            entry = copied.entries + index * entry_layout.entry_size
+            if ctypes.c_uint64.from_address(entry).value == _REMOVED:
+                continue
+            placed = insert_dict_entry(record, entry + entry_layout.key_offset, entry_layout, allocator)
+            value, source_value = placed + entry_layout.value_offset, entry + entry_layout.value_offset
+            if owned:
+                instances.copy_at(value, source_value, allocator)  # type: ignore[union-attr]
+            else:
+                ctypes.memmove(value, source_value, size)
+
+
+class _TransferCodec(Codec):
+    """A list or dict of plain values crossing to an extern: a borrowed `VhSpan` of its items as an argument, and
+    a VhList of them, filled by the extern, as an owned result. A dict's items are `{K key; V value;}` entries in
+    insertion order. Python bindings receive and return a new Python list or dict."""
+
+    ctype = HostSpan
+
+    def __init__(self, element: Codec, key: Codec | None = None):
+        self.element, self.key = element, key
+        self.item = element if key is None else _TupleCodec([key, element])
+
+    def value(self, item: Any) -> Any:
+        if self.key is None:
+            return [self.element.value(part) for part in item]
+        return {self.key.value(key): self.element.value(part) for key, part in item.items()}
+
+    def boundary(self, item: Any) -> Any:
+        if self.key is None:
+            return [self.element.boundary(part) for part in item]
+        return {self.key.boundary(key): self.element.boundary(part) for key, part in item.items()}
+
+    def items(self, item: Any) -> Any:
+        """A ctypes array of the items, which the span points into while it lives."""
+
+        values = self.value(item)
+        parts = values if self.key is None else list(values.items())
+        written = [self.item.write(self.item.value(part)) for part in parts]
+        return (self.item.ctype * len(written))(*written)
+
+    def received(self, record: VhListRecord) -> Any:
+        """What Host code holds for a result the extern filled `record` with; a repeated dict key keeps its last
+        value."""
+
+        stride = ctypes.sizeof(self.item.ctype)
+        parts = [self.item.read_at(record.data + index * stride) for index in range(record.size)]
+        return parts if self.key is None else dict(parts)
+
+    @property
+    def item_layout(self) -> tuple[int, int]:
+        return ctypes.sizeof(self.item.ctype), ctypes.alignment(self.item.ctype)
+
+
+def extern_codec_of(annotation: Any) -> Codec:
+    """The codec of an extern parameter or result, which, unlike a Host function's, may be a list or dict."""
+
+    annotation = _base(annotation)
+    if get_origin(annotation) is list:
+        (element,) = get_args(annotation)
+        return _TransferCodec(codec_of(element))
+    if get_origin(annotation) is dict:
+        key, element = get_args(annotation)
+        return _TransferCodec(codec_of(element), codec_of(key))
+    return codec_of(annotation)
 
 
 @functools.cache
@@ -677,6 +898,11 @@ class _StorageCodec(Codec):
     def release(self, address: int, allocator: int | None) -> None:
         release_storage(address, len(self.extents), self.dtype.itemsize, allocator)
 
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        record = self.ctype.from_address(source)
+        shape = tuple(int(extent) for extent in record.shape)
+        replace_storage(target, shape, self.dtype.itemsize, record.data, allocator)
+
 
 def replace_storage(
     address: int, shape: Sequence[int], element_size: int, source: int | None, allocator: int | None
@@ -738,12 +964,20 @@ def field_codec_of(annotation: Any) -> Codec:
 
 
 class _PlaceCodec(Codec):
-    """A Host class: never copied. A field of this type reads as a view of the parent's memory."""
+    """A Host class: never copied. A field or element of this type reads as a view of the memory holding it, and
+    an instance stored into one moves there, leaving the Python object it came from empty, as compiled code leaves
+    a moved local zeroed. The layout is built at first use, so a class may hold a list or dict of itself."""
 
     def __init__(self, cls: type[Any]):
         self.cls = cls
-        self.layout = class_layout(cls)
-        self.ctype = self.layout.ctype
+
+    @functools.cached_property
+    def layout(self) -> ClassLayout:
+        return class_layout(self.cls)
+
+    @property
+    def ctype(self) -> Any:  # type: ignore[override]
+        return self.layout.ctype
 
     def value(self, item: Any) -> Any:
         if isinstance(item, self.cls):
@@ -753,14 +987,66 @@ class _PlaceCodec(Codec):
     def at(self, address: int) -> Any:
         return self.layout.view(self.ctype.from_address(address))
 
+    def read_at(self, address: int) -> Any:
+        return self.at(address)
+
     def get(self, state: Any, name: str, owner: Any) -> Any:
         return self.layout.view(getattr(state, name))
 
     def set(self, state: Any, name: str, item: Any, owner: Any = None) -> None:
-        raise AttributeError(f"'{name}' is a class instance; assign its fields instead")
+        self.replace(ctypes.addressof(getattr(state, name)), item, _allocator(type(owner)))
 
     def release(self, address: int, allocator: int | None) -> None:
         self.layout.release(address, allocator)
+
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        self.layout.copy_at(target, source, allocator)
+
+    def require_owner(self, item: Any) -> None:
+        if not isinstance(item, self.cls) or not item.__dict__.get("_vh_owned", False):
+            raise TypeError(
+                f"a {self.cls.__name__} place takes a new {self.cls.__name__} instance, which moves in; "
+                f"got {type(item).__name__}{' viewing another place' if isinstance(item, self.cls) else ''}"
+            )
+
+    def move_in(self, address: int, item: Any) -> None:
+        """Moves `item`'s state to `address`, which holds no instance, and zeroes the state it leaves."""
+
+        self.require_owner(item)
+        source = address_of(item)
+        if source == address:
+            return
+        size = ctypes.sizeof(self.ctype)
+        ctypes.memmove(address, source, size)
+        ctypes.memset(source, 0, size)
+
+    def replace(self, address: int, item: Any, allocator: int | None) -> None:
+        self.require_owner(item)
+        self.release(address, allocator)
+        self.move_in(address, item)
+
+    def take(self, address: int) -> Any:
+        """An instance owning the state at `address`, which is moved out and left zeroed."""
+
+        built = self.layout
+        instance = self.cls.__new__(self.cls)
+        instance._vh_owned = True
+        instance._vh_state = state = built.ctype()
+        size = ctypes.sizeof(state)
+        ctypes.memmove(ctypes.addressof(state), address, size)
+        ctypes.memset(address, 0, size)
+        if built.owned:
+            weakref.finalize(instance, _finalize, state, built, class_runtime(self.cls))
+        return instance
+
+    def release_elements(self, data: int, count: int, stride: int, allocator: int | None) -> None:
+        if self.layout.owned:
+            for index in range(count):
+                self.release(data + index * stride, allocator)
+
+
+def _instance_codec(codec: Codec) -> _PlaceCodec | None:
+    return codec if isinstance(codec, _PlaceCodec) else None
 
 
 _CODECS: dict[Any, Codec] = {}
@@ -803,6 +1089,8 @@ def _make_codec(annotation: Any) -> Codec:
         kind = dsl_kind(annotation)
         if kind == "handle":
             return _HandleCodec()
+        if kind == "enum":
+            return _EnumCodec(annotation)
         if kind == "struct":
             return _StructCodec(annotation)
         if kind == "host":
@@ -884,6 +1172,16 @@ class ClassLayout:
         for offset, codec in self.owned:
             codec.release(address + offset, allocator)
 
+    def copy_at(self, target: int, source: int, allocator: int | None) -> None:
+        """The compiled `vh.copy` of a class: its bytes, then each field owning memory copied into, after every
+        such field is emptied, since until then it holds the source's memory."""
+
+        ctypes.memmove(target, source, ctypes.sizeof(self.ctype))
+        for offset, codec in self.owned:
+            ctypes.memset(target + offset, 0, ctypes.sizeof(codec.ctype))
+        for offset, codec in self.owned:
+            codec.copy_at(target + offset, source + offset, allocator)  # type: ignore[attr-defined]
+
 
 def _finalize(state: Any, built: ClassLayout, runtime: HostRuntime) -> None:
     built.release(ctypes.addressof(state), runtime.allocator.value)
@@ -914,6 +1212,8 @@ def address_of(instance: Any) -> int:
 
 def _initialize_new(self: Any) -> None:
     built = class_layout(type(self))
+    # An instance Python creates owns its state, which may move into a place; a view only reads a place.
+    self._vh_owned = True
     self._vh_state = built.ctype()
     if built.owned:
         # An instance Python creates owns its containers; one C creates is freed by C through the table's fini.
@@ -921,6 +1221,20 @@ def _initialize_new(self: Any) -> None:
         # zeroed, empty records.
         weakref.finalize(self, _finalize, self._vh_state, built, class_runtime(type(self)))
     built.initialize(self)
+
+
+def _deepcopy(self: Any, memo: dict[int, Any]) -> Any:
+    """`copy.deepcopy` of an instance or a view: a new instance owning a copy of everything the state holds."""
+
+    cls = type(self)
+    built = class_layout(cls)
+    instance = cls.__new__(cls)
+    instance._vh_owned = True
+    instance._vh_state = state = built.ctype()
+    if built.owned:
+        weakref.finalize(instance, _finalize, state, built, class_runtime(cls))
+    built.copy_at(ctypes.addressof(state), address_of(self), _allocator(cls))
+    return instance
 
 
 def _repr(self: Any) -> str:
@@ -964,6 +1278,7 @@ def make_host_class(cls: type[Any]) -> type[Any]:
     cls.__vernon_defaults__ = defaults
     cls.__init__ = _initialize_new  # type: ignore[misc]
     cls.__repr__ = _repr  # type: ignore[method-assign]
+    cls.__deepcopy__ = _deepcopy  # type: ignore[attr-defined]
     return cls
 
 
@@ -1021,12 +1336,14 @@ class Entry:
 @dataclass(frozen=True)
 class _ExternShape:
     """An extern declaration's annotations. A generic extern's type parameter is where Host code passes the Struct
-    class, and its TypeVar stands for that class in the other annotations."""
+    class, and its TypeVar stands for that class in the other annotations. Without one, the first parameter
+    annotated with a TypeVar binds it to the class of the value passed there (`passed` is false)."""
 
     type_index: int | None
     variable: Any
     parameters: tuple[Any, ...]
     result: Any
+    passed: bool = True
 
     @classmethod
     def of(cls, declaration: ExternFunction) -> _ExternShape:
@@ -1040,18 +1357,23 @@ class _ExternShape:
             else:
                 parameters.append(annotation)
         returned = hints.get("return", type(None))
-        return cls(type_index, variable, tuple(parameters), None if returned is type(None) else returned)
+        result = None if returned is type(None) else returned
+        if type_index is None:
+            for index, annotation in enumerate(parameters):
+                if isinstance(annotation, TypeVar):
+                    return cls(index, annotation, tuple(parameters), result, passed=False)
+        return cls(type_index, variable, tuple(parameters), result)
 
     def codecs(self, bound: type[Any] | None) -> tuple[tuple[Codec, ...], Codec | None]:
         def resolve(annotation: Any) -> Any:
             return bound if isinstance(annotation, TypeVar) and annotation is self.variable else annotation
 
-        parameters = tuple(codec_of(resolve(annotation)) for annotation in self.parameters)
-        return parameters, None if self.result is None else codec_of(resolve(self.result))
+        parameters = tuple(extern_codec_of(resolve(annotation)) for annotation in self.parameters)
+        return parameters, None if self.result is None else extern_codec_of(resolve(self.result))
 
 
 def _ctype_argument(codec: Codec) -> Any:
-    return codec.ctype if codec.simple or isinstance(codec, _StrCodec) else ctypes.c_void_p
+    return codec.ctype if codec.simple or isinstance(codec, (_StrCodec, _TransferCodec)) else ctypes.c_void_p
 
 
 class HostRuntime:
@@ -1120,7 +1442,9 @@ class HostRuntime:
         shape = self._shapes.get(id(declaration))
         if shape is None:
             shape = self._shapes[id(declaration)] = _ExternShape.of(declaration)
-        bound = args[shape.type_index] if shape.type_index is not None else None
+        bound = None
+        if shape.type_index is not None:
+            bound = args[shape.type_index] if shape.passed else type(args[shape.type_index])
         key = (id(declaration), bound)
         call = self._externs.get(key)
         if call is None:
@@ -1131,6 +1455,9 @@ class HostRuntime:
         binding = self.registry.resolve(declaration.symbol, declaration.schema)
         parameters, result = shape.codecs(bound)
         index = shape.type_index
+        # Where Host code passes the type, the call's arguments hold it; a value-bound call passes only values. Either
+        # way the binding, like the C function, receives the descriptor at `index`.
+        passed = index if shape.passed else None
         descriptor = None if bound is None else self.descriptor(bound.__name__)
 
         if binding.python is not None:
@@ -1138,8 +1465,8 @@ class HostRuntime:
 
             def call_python(*args: Any) -> Any:
                 values = list(args)
-                if index is not None:
-                    del values[index]
+                if passed is not None:
+                    del values[passed]
                 converted = [codec.boundary(codec.value(item)) for codec, item in zip(parameters, values, strict=True)]
                 if index is not None:
                     converted.insert(index, descriptor)
@@ -1149,22 +1476,26 @@ class HostRuntime:
             return call_python
 
         status = declaration.abi == ExternAbi.STATUS
+        owned = isinstance(result, (_StrCodec, _TransferCodec))
         argument_types = [_ctype_argument(codec) for codec in parameters]
         if index is not None:
             argument_types.insert(index, ctypes.c_void_p)
         if status:
             if result is not None:
                 argument_types.append(ctypes.c_void_p)
+            if owned:
+                argument_types.append(ctypes.c_void_p)
             result_type: Any = ctypes.c_int32
         else:
             result_type = None if result is None else result.ctype
         native = ctypes.CFUNCTYPE(result_type, *argument_types)(binding.native)
         symbol = declaration.symbol
+        last_error = binding.last_error
 
         def call_native(*args: Any) -> Any:
             values = list(args)
-            if index is not None:
-                del values[index]
+            if passed is not None:
+                del values[passed]
             alive: list[Any] = []
             arguments: list[Any] = []
             for codec, item in zip(parameters, values, strict=True):
@@ -1172,6 +1503,10 @@ class HostRuntime:
                     data = str(item).encode("utf-8")
                     alive.append(data)
                     arguments.append(HostStr(data, len(data)))
+                elif isinstance(codec, _TransferCodec):
+                    items = codec.items(item)
+                    alive.append(items)
+                    arguments.append(HostSpan(ctypes.addressof(items) if len(items) else None, len(items)))
                 elif codec.simple:
                     arguments.append(codec.write(codec.value(item)))
                 else:
@@ -1183,17 +1518,40 @@ class HostRuntime:
             if not status:
                 returned = native(*arguments)
                 return None if result is None else result.value(returned)
+            if owned:
+                return self._receive(native, arguments, result, symbol, last_error)
             out = None if result is None else result.ctype()
             if out is not None:
                 arguments.append(ctypes.addressof(out))
             code = native(*arguments)
             if code != 0:
-                raise HostExecutionError(code, f"extern '{symbol}' failed")
+                detail = f": {last_error()}" if last_error is not None else ""
+                raise HostExecutionError(code, f"extern '{symbol}' failed{detail}")
             if out is None or result is None:
                 return None
             return result.read(out.value if result.simple else out)
 
         return call_native
+
+    def _receive(
+        self, native: Any, arguments: list[Any], result: Codec, symbol: str, last_error: Callable[[], str] | None
+    ) -> Any:
+        """Calls a native extern returning a str, list or dict: it fills an empty VhList through the module's
+        allocator, which is read into a Python value and released, whatever the status."""
+
+        out = VhListRecord()
+        allocator = self.allocator.value
+        size, alignment = result.item_layout if isinstance(result, _TransferCodec) else (1, 1)
+        try:
+            code = native(*arguments, ctypes.addressof(out), transfer_allocator(allocator))
+            if code != 0:
+                detail = f": {last_error()}" if last_error is not None else ""
+                raise HostExecutionError(code, f"extern '{symbol}' failed{detail}")
+            if isinstance(result, _TransferCodec):
+                return result.received(out)
+            return ctypes.string_at(out.data, out.size).decode("utf-8") if out.size else ""
+        finally:
+            release_record(ctypes.addressof(out), size, alignment, allocator)
 
     # The C face: the reflection table and trampolines.
 
@@ -1211,6 +1569,9 @@ class HostRuntime:
     def _struct_fields(self, name: str) -> tuple[tuple[str, ConcreteType], ...]:
         return next(program.structs[name].fields for program in self.programs if name in program.structs)
 
+    def _is_class(self, value_type: ConcreteType) -> bool:
+        return value_type.kind == "struct" and any(value_type.name in program.classes for program in self.programs)
+
     def release(self, address: int, value_type: ConcreteType) -> None:
         """What the table's fini of `value_type` does: frees the memory the value at `address` owns."""
 
@@ -1220,9 +1581,19 @@ class HostRuntime:
             key, item = (layout(part, self._struct_fields) for part in value_type.arguments)  # type: ignore[arg-type]
             str_key = key_of(value_type).kind == "str"
             entry = dict_layout((key.size, key.alignment), (item.size, item.alignment), str_key)
+            if self._is_class(element_of(value_type)):
+                record = VhDictRecord.from_address(address)
+                for index in range(record.used):
+                    at = record.entries + index * entry.entry_size
+                    if ctypes.c_uint64.from_address(at).value != _REMOVED:
+                        self.release(at + entry.value_offset, element_of(value_type))
             release_dict(address, entry, self.allocator.value)
         elif value_type.kind == "list":
             element = layout(element_of(value_type), self._struct_fields)
+            if self._is_class(element_of(value_type)):
+                record = VhListRecord.from_address(address)
+                for index in range(record.size):
+                    self.release(record.data + index * element.size, element_of(value_type))
             release_record(address, element.size, element.alignment, self.allocator.value)
         elif value_type.kind == "storage":
             element = layout(element_of(value_type), self._struct_fields)
@@ -1292,7 +1663,10 @@ class HostRuntime:
                     returned = entry.function(*values)
                 result = entry.result
                 if result is not None:
-                    if result.simple:
+                    if isinstance(result, _PlaceCodec):
+                        # The out pointer holds no instance, as for a compiled callee.
+                        result.move_in(raw[-1], returned)
+                    elif result.simple:
                         result.ctype.from_address(raw[-1]).value = result.write(result.value(returned))
                     else:
                         converted = result.write(returned)

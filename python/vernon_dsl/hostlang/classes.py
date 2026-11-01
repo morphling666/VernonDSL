@@ -30,10 +30,12 @@ class StructDocs:
 @dataclass(frozen=True)
 class GenericExtern:
     """A specialization of an extern generic over a Struct type: `type_index` is where the C call receives the
-    type's reflection descriptor, which Host code passes as a type argument."""
+    type's reflection descriptor. `passed` says whether Host code passes the type as an argument; if not, the value
+    at `type_index` binds it."""
 
     type_index: int
     bound: str
+    passed: bool = True
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class LoweredClasses:
     annotations: dict[str, dict[str, ast.expr]]
     structs: dict[str, StructDocs]
     generics: dict[str, GenericExtern]
+    # Value-bound generic externs: the index of the value whose Struct type binds `T`, by extern name.
+    by_value: dict[str, int]
 
 
 def _error(filename: str, node: ast.AST, message: str) -> CompileError:
@@ -71,7 +75,7 @@ def _metadata_value(filename: str, node: ast.expr) -> object:
     raise _error(filename, node, "metadata values are str, int, float, or bool constants, or tuples of them")
 
 
-def _metadata(filename: str, node: ast.expr) -> Metadata:
+def parse_metadata(filename: str, node: ast.expr) -> Metadata:
     if not isinstance(node, ast.Call) or decorator_name(node) != "meta":
         raise _error(filename, node, "Host metadata is written as vd.meta(key=value, ...)")
     if node.args:
@@ -94,7 +98,7 @@ def _split_annotation(filename: str, annotation: ast.expr) -> tuple[ast.expr, Me
         raise _error(filename, annotation, "Annotated needs a type and metadata")
     merged: dict[str, str] = {}
     for item in items[1:]:
-        for key, value in _metadata(filename, item):
+        for key, value in parse_metadata(filename, item):
             if key in merged:
                 raise _error(filename, item, f"metadata key '{key}' is given twice")
             merged[key] = value
@@ -119,7 +123,7 @@ def _class_options(filename: str, node: ast.ClassDef) -> Metadata:
     for keyword in decorator.keywords:
         if keyword.arg != "meta":
             raise _error(filename, keyword, f"a @host class takes only meta=, not '{keyword.arg}'")
-        metadata = _metadata(filename, keyword.value)
+        metadata = parse_metadata(filename, keyword.value)
     return metadata
 
 
@@ -146,7 +150,7 @@ def _struct_docs(filename: str, node: ast.ClassDef) -> StructDocs:
     if isinstance(decorator, ast.Call):
         for keyword in list(decorator.keywords):
             if keyword.arg == "meta":
-                metadata = _metadata(filename, keyword.value)
+                metadata = parse_metadata(filename, keyword.value)
                 decorator.keywords.remove(keyword)
     doc = _docstring(node.body[0]) if node.body else None
     fields: list[HostField] = []
@@ -163,7 +167,7 @@ def _struct_docs(filename: str, node: ast.ClassDef) -> StructDocs:
     return StructDocs(doc, metadata, tuple(fields))
 
 
-def _type_parameter(annotation: ast.expr | None) -> str | None:
+def type_parameter(annotation: ast.expr | None) -> str | None:
     """The type variable of a `type[T]` annotation."""
 
     if (
@@ -172,6 +176,26 @@ def _type_parameter(annotation: ast.expr | None) -> str | None:
         and isinstance(annotation.slice, ast.Name)
     ):
         return annotation.slice.id
+    return None
+
+
+def generic_parameter(node: ast.FunctionDef) -> tuple[int, str, bool] | None:
+    """Where a generic extern's C function receives the bound Struct's descriptor, the type variable, and whether
+    Host code passes the Struct there as a `type: type[T]` argument. Without one, the first parameter annotated `T`
+    binds it: Host code passes a Struct value, whose type is the bound Struct, and the descriptor goes just before
+    it. A `type[T]` parameter is needed where no value says the type, as for a getter."""
+
+    typed = [
+        (index, variable)
+        for index, argument in enumerate(node.args.args)
+        if (variable := type_parameter(argument.annotation)) is not None
+    ]
+    if typed:
+        return typed[0][0], typed[0][1], True
+    variables = getattr(node, "_vernon_type_variables", ())
+    for index, argument in enumerate(node.args.args):
+        if isinstance(argument.annotation, ast.Name) and argument.annotation.id in variables:
+            return index, argument.annotation.id, False
     return None
 
 
@@ -184,27 +208,40 @@ class _Substitute(ast.NodeTransformer):
         return copy_location(ast.Name(id=self.bound, ctx=node.ctx), node) if node.id == self.variable else node
 
 
-def _specialize_generic_externs(module: ast.Module, filename: str, struct_names: set[str]) -> dict[str, GenericExtern]:
-    """Replaces each extern generic over `type[T]` by one specialization per Struct type its calls pass,
-    dropping the type argument from the call; the emitter passes the type's descriptor in its place."""
+def _specialize_generic_externs(
+    module: ast.Module, filename: str, struct_names: set[str]
+) -> tuple[dict[str, GenericExtern], dict[str, int]]:
+    """Replaces each generic extern by its specializations, one per bound Struct. A `type[T]` extern is specialized
+    per Struct type its calls pass, dropping the type argument from the call; the emitter passes the type's
+    descriptor in its place. A value-bound extern is specialized for every Struct, since only inference knows a
+    value's type: inference points each call at its value's specialization (the returned index of the value by
+    extern name), and the frontend drops the ones no call reaches."""
 
     generic: dict[str, tuple[ast.FunctionDef, int, str]] = {}
+    by_value: dict[str, int] = {}
+    specialized: dict[str, ast.FunctionDef] = {}
+    generics: dict[str, GenericExtern] = {}
     for node in module.body:
         if not isinstance(node, ast.FunctionDef) or not any(
             decorator_name(item) == "extern" for item in node.decorator_list
         ):
             continue
-        variables = [(index, _type_parameter(argument.annotation)) for index, argument in enumerate(node.args.args)]
-        typed = [(index, variable) for index, variable in variables if variable is not None]
-        if not typed:
-            continue
-        if len(typed) != 1:
+        if sum(type_parameter(argument.annotation) is not None for argument in node.args.args) > 1:
             raise _error(filename, node, "a generic extern takes one type[T] parameter")
-        generic[node.name] = (node, *typed[0])
-    if not generic:
-        return {}
-    specialized: dict[str, ast.FunctionDef] = {}
-    generics: dict[str, GenericExtern] = {}
+        found = generic_parameter(node)
+        if found is None:
+            continue
+        index, variable, passed = found
+        if passed:
+            generic[node.name] = (node, index, variable)
+            continue
+        by_value[node.name] = index
+        for bound in sorted(struct_names):
+            name = f"{node.name}__{bound}"
+            copy_node = _Substitute(variable, bound).visit(copy.deepcopy(node))
+            copy_node.name = name
+            specialized[name] = copy_node
+            generics[name] = GenericExtern(index, bound, passed=False)
     for node in ast.walk(module):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id not in generic:
             continue
@@ -224,12 +261,14 @@ def _specialize_generic_externs(module: ast.Module, filename: str, struct_names:
             generics[name] = GenericExtern(index, bound)
         node.func = copy_location(ast.Name(id=name, ctx=ast.Load()), node.func)
         del node.args[index]
+    if not specialized and not generic and not by_value:
+        return {}, {}
     module.body = [
         statement
         for statement in module.body
-        if not (isinstance(statement, ast.FunctionDef) and statement.name in generic)
+        if not (isinstance(statement, ast.FunctionDef) and (statement.name in generic or statement.name in by_value))
     ] + list(specialized.values())
-    return generics
+    return generics, by_value
 
 
 def lower_host_classes(module: ast.Module, filename: str) -> tuple[ast.Module, LoweredClasses]:
@@ -240,7 +279,7 @@ def lower_host_classes(module: ast.Module, filename: str) -> tuple[ast.Module, L
         for node in module.body
         if isinstance(node, ast.ClassDef) and [decorator_name(item) for item in node.decorator_list] == ["struct"]
     }
-    generics = _specialize_generic_externs(module, filename, set(struct_docs))
+    generics, by_value = _specialize_generic_externs(module, filename, set(struct_docs))
     classes: dict[str, HostClass] = {}
     owners: dict[str, tuple[str, str]] = {}
     annotations: dict[str, dict[str, ast.expr]] = {}
@@ -369,7 +408,7 @@ def lower_host_classes(module: ast.Module, filename: str) -> tuple[ast.Module, L
         )
         annotations[statement.name] = field_annotations
     module.body = body + hoisted
-    return fix_missing_locations(module), LoweredClasses(classes, owners, annotations, struct_docs, generics)
+    return fix_missing_locations(module), LoweredClasses(classes, owners, annotations, struct_docs, generics, by_value)
 
 
 def method_table(lowered: LoweredClasses) -> dict[str, dict[str, str]]:

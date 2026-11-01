@@ -57,7 +57,17 @@ void release(const VhAllocator *allocator, void *pointer, uint64_t size, uint64_
 
 void *address(uint64_t data) { return reinterpret_cast<void *>(static_cast<uintptr_t>(data)); }
 
+void *allocateDefault(void * /*user*/, uint64_t size, uint64_t alignment) { return allocate(nullptr, size, alignment); }
+
+void releaseDefault(void * /*user*/, void *pointer, uint64_t size, uint64_t alignment) {
+    release(nullptr, pointer, size, alignment);
+}
+
+constexpr VhAllocator kDefaultAllocator{sizeof(VhAllocator), nullptr, allocateDefault, releaseDefault};
+
 } // namespace
+
+const VhAllocator *vernonRuntimeHostDefaultAllocator() { return &kDefaultAllocator; }
 
 int32_t vernonRuntimeHostListReserve(VhList *list, uint64_t capacity, uint64_t element_size, uint64_t alignment,
                                      const VhAllocator *allocator) {

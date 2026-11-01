@@ -249,7 +249,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
             def run(values: list[f32]) -> i32:
                 return 0
             """,
-            "lives only in a class field",
+            "lives in a class field or a local, which owns its memory; it is not passed",
         ),
         (
             """
@@ -268,8 +268,12 @@ def _compile_error(tmp_path: Path, body: str) -> str:
             @vd.host
             class Bag:
                 inner: list[Inner]
+                one: Inner
+
+                def keep(self) -> None:
+                    self.inner.append(self.one)
             """,
-            "list elements are Host Values without classes",
+            "which Python would share rather than copy once appended",
         ),
         (
             """
@@ -277,7 +281,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
             class Bag:
                 nested: list[list[f32]]
             """,
-            "list elements are Host Values without classes",
+            "list elements are Host Values or Host class instances; list[f32] is neither",
         ),
         (
             """
@@ -299,7 +303,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
                 def fill(self) -> None:
                     self.values = [1.0]
             """,
-            "[] only empties a list field",
+            "[] declares a list local (x: list[T] = []) or empties a list field or local",
         ),
         (
             """

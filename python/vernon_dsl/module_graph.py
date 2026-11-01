@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import copy
+import importlib.machinery
 import re
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, RLock
@@ -22,9 +24,11 @@ from .frontend.model import ConcreteType
 from .language.ast_utils import decorator_name as _decorator_name
 from .language.ast_utils import dotted_name as _dotted_name
 from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS, HOST_FUNCTION_DECORATORS
+from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS, HOST_FUNCTION_DECORATORS, library_symbol
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .source_identity import (
+    import_root,
+    package_module_name,
     project_module_name,
     project_module_path,
     project_root,
@@ -39,7 +43,9 @@ if TYPE_CHECKING:
 _HOST_MODULES = {
     "__future__",
     "argparse",
+    "copy",
     "cv2",
+    "enum",
     "importlib",
     "numpy",
     "os",
@@ -50,16 +56,52 @@ _HOST_MODULES = {
     "unittest",
     "vernon_dsl",
 }
+_STANDARD_FINDERS = (
+    importlib.machinery.BuiltinImporter,
+    importlib.machinery.FrozenImporter,
+    importlib.machinery.PathFinder,
+)
+
+
+def _imports_vernon_dsl(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.Import) and any(alias.name.split(".")[0] == "vernon_dsl" for alias in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and not node.level and (node.module or "").split(".")[0] == "vernon_dsl":
+            return True
+    return False
+
+
 _SPECIALIZATION_KINDS = frozenset({"bool", "i32", "u32", "f32", "f64", "type", "format"})
 _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
-_CLASS_DECORATORS = frozenset({"struct", "params", "handle", "host"})
+_CLASS_DECORATORS = frozenset({"struct", "params", "handle", "host", "enum"})
 
 
 def _is_host_function(node: ast.AST | None) -> bool:
     return isinstance(node, ast.FunctionDef) and any(
         _decorator_name(item) in HOST_FUNCTION_DECORATORS for item in node.decorator_list
     )
+
+
+def _apply_library_symbol(node: ast.FunctionDef, name: str, library: tuple[str, int]) -> bool:
+    """Gives an extern of a `vd.library` module its default symbol; whether `node` is an extern."""
+
+    for index, decorator in enumerate(node.decorator_list):
+        if _decorator_name(decorator) != "extern":
+            continue
+        if not isinstance(decorator, ast.Call):
+            decorator = copy_location(ast.Call(func=decorator, args=[], keywords=[]), decorator)
+            node.decorator_list[index] = decorator
+        if not any(keyword.arg == "symbol" for keyword in decorator.keywords):
+            symbol = ast.Constant(value=library_symbol(library, name))
+            decorator.keywords.append(ast.keyword(arg="symbol", value=symbol))
+        return True
+    return False
 
 
 def _is_dsl_class(node: ast.AST | None) -> bool:
@@ -101,6 +143,9 @@ class _Module:
     import_specs: dict[str, _ImportSpec] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module", str]] = field(default_factory=dict)
     module_imports: dict[str, "_Module"] = field(default_factory=dict)
+    # The `vd.library(name, version)` statement's name and version, which set the default symbol of this module's
+    # externs.
+    library: tuple[str, int] | None = None
 
     def declares_specialization(self, name: str) -> bool:
         return name in self.specializations
@@ -109,6 +154,17 @@ class _Module:
         """Whether this module binds `name` at top level; an assignment only exports a value if it folds."""
 
         return name in self.definitions or name in self.specializations or name in self.assignments
+
+    def type_variables(self) -> tuple[str, ...]:
+        """The names this module binds to `TypeVar(...)`, which its generic externs' annotations use."""
+
+        return tuple(
+            sorted(
+                name
+                for name, value in self.assignments.items()
+                if isinstance(value, ast.Call) and (_dotted_name(value.func) or "").split(".")[-1] == "TypeVar"
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -134,6 +190,10 @@ class LoadedProject:
     dependencies: tuple[tuple[str, str], ...]
     features: tuple[str, ...]
     dependency_files: tuple[tuple[Path, str], ...] = ()
+    # Emitted extern name -> the file whose `vd.library` declares it, with the library's name and version.
+    library_externs: Mapping[str, tuple[Path, str, int]] = field(default_factory=dict)
+    # Local name -> module of the names imported from modules that are not DSL sources, which stay Python imports.
+    python_imports: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -172,7 +232,7 @@ class _ModuleGraphSnapshot:
     absent_files: _AbsentFiles
 
 
-_CacheKey = tuple[Path, Path | None, str | None, tuple[tuple[str, str, str], ...]]
+_CacheKey = tuple[Path, Path | None, str | None, tuple[tuple[str, str, str], ...], tuple[str, ...]]
 
 
 class _ModuleGraphCache:
@@ -201,6 +261,8 @@ class _ModuleGraphCache:
                     for name, identity in graph.type_assignments.items()
                 )
             ),
+            # Imports of other installed packages resolve along it.
+            tuple(sys.path),
         )
 
     def restore(self, graph: "ModuleGraph") -> bool:
@@ -801,9 +863,11 @@ class ModuleGraph:
         return None
 
     def _project_module_name(self, path: Path) -> str | None:
-        """The module name a type identity uses for `path`: relative to the file's own project root, as
-        `vd.types.type_identity` names it."""
+        """The module name a type identity uses for `path`, as `source_identity.module_identity` names it."""
 
+        name = package_module_name(path, self._is_file)
+        if name is not None:
+            return name
         root = self._project_root(path.parent)
         return project_module_name(path, root) if root is not None else None
 
@@ -888,6 +952,7 @@ class ModuleGraph:
         function_sources: dict[str, tuple[_Module, ast.FunctionDef]] = {}
         entry_names: set[str] = set()
         host_function_names: set[str] = set()
+        library_externs: dict[str, tuple[Path, str, int]] = {}
         for module in self.order:
             rewriter = _ReferenceRewriter(module, emitted_names)
             for original_name, definition in module.definitions.items():
@@ -903,6 +968,9 @@ class ModuleGraph:
                 transformed = copy.deepcopy(definition)
                 transformed = _Specializer(self, module, emitted_names).visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
+                if module.library is not None and isinstance(transformed, ast.FunctionDef):
+                    if _apply_library_symbol(transformed, original_name, module.library):
+                        library_externs[emitted_names[(module.path, original_name)]] = (module.path, *module.library)
                 if isinstance(transformed, ast.FunctionDef):
                     is_entry = any(
                         _decorator_name(decorator) in _STAGE_DECORATORS for decorator in transformed.decorator_list
@@ -920,6 +988,10 @@ class ModuleGraph:
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if isinstance(transformed, ast.FunctionDef):
                     function_sources[transformed.name] = (module, definition)
+                    if any(_decorator_name(item) == "extern" for item in transformed.decorator_list):
+                        # The combined source drops the module's assignments, so an extern keeps the names its
+                        # module binds to TypeVar: a parameter annotated with one makes the extern generic.
+                        transformed._vernon_type_variables = module.type_variables()  # type: ignore[attr-defined]
                 body.append(transformed)
 
         # Analysis runs on hoisted methods so pruning and call-graph checks see calls hidden behind receiver syntax.
@@ -948,18 +1020,31 @@ class ModuleGraph:
             )
             for module in sorted(self.modules.values(), key=lambda value: self._display_path(value.path))
         )
+        python_imports = {
+            spec.local_name: spec.module_name
+            for module in self.order
+            for spec in module.import_specs.values()
+            if not spec.level
+            and spec.symbol_name is not None
+            and spec.local_name not in module.symbol_imports
+            and spec.local_name not in module.module_imports
+            # An import of a Host source that no reachable code used stays unresolved but is not a Python import.
+            and self._find_local_path(module, spec.module_name, spec.level) is None
+        }
         return LoadedProject(
             combined,
             tuple((display_path, digest) for _, display_path, digest in dependency_records),
             tuple(sorted(declared_features)),
             tuple((path, digest) for path, _, digest in dependency_records),
+            library_externs,
+            python_imports,
         )
 
     def _emitted_names(self, root: _Module) -> dict[tuple[Path, str], str]:
         """Names definitions in the combined source: imported helpers carry their module prefix, while a Struct keeps
         its declared name from any module, because host Values, reflection, and manifests name a Struct by its class
-        name. So does a handle, and a Host class, whose C symbols and table entry carry the bare name, so that Host
-        modules compiled into one object agree on it. Two reachable such types with one name therefore conflict."""
+        name. So does a handle, an enum, and a Host class, whose C symbols and table entry carry the bare name, so that
+        Host modules compiled into one object agree on it. Two reachable such types with one name therefore conflict."""
 
         emitted_names: dict[tuple[Path, str], str] = {}
         owners: dict[str, Path] = {}
@@ -968,7 +1053,7 @@ class ModuleGraph:
             for symbol, definition in module.definitions.items():
                 keeps_name = _is_struct_declaration(definition) or (
                     isinstance(definition, ast.ClassDef)
-                    and any(_decorator_name(item) in {"handle", "host"} for item in definition.decorator_list)
+                    and any(_decorator_name(item) in {"handle", "host", "enum"} for item in definition.decorator_list)
                 )
                 emitted = symbol if not prefix or keeps_name else f"{prefix}{symbol}"
                 emitted_names[(module.path, symbol)] = emitted
@@ -989,12 +1074,13 @@ class ModuleGraph:
         path = path.resolve()
         if path in self.modules:
             return self.modules[path]
-        # Display paths name emitted symbols, so two projects defining the same module path would collide.
-        display = self._display_path(path)
-        clash = next((other for other in self.modules if self._display_path(other) == display), None)
+        # Module names name emitted symbols, so two projects defining the same module would collide.
+        emitted = self._module_name(path)
+        clash = next((other for other in self.modules if self._module_name(other) == emitted), None)
         if clash is not None:
             raise CompileError(
-                f"modules {clash.as_posix()} and {path.as_posix()} share the project module path '{display}'",
+                f"modules {clash.as_posix()} and {path.as_posix()} share the project module path "
+                f"'{self._display_path(path)}'",
                 SourceLocation(str(path), 1, 1),
             )
         cached = _module_graph_cache.restore_parsed_module(path)
@@ -1035,6 +1121,10 @@ class ModuleGraph:
                 ):
                     module.assignments[node.targets[0].id] = node.value
                 continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                if _decorator_name(node.value) == "library":
+                    self._collect_library(module, node.value)
+                continue
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 continue
             if node.name in module.definitions or module.declares_specialization(node.name):
@@ -1051,6 +1141,35 @@ class ModuleGraph:
                         "DSL functions require exactly one of @func, @vertex, @fragment, or @kernel",
                     )
             module.definitions[node.name] = node
+
+    def _collect_library(self, module: _Module, call: ast.Call) -> None:
+        if module.library is not None:
+            self._error(module, call, "a module declares at most one vd.library")
+        if any(
+            isinstance(definition, ast.FunctionDef)
+            and any(_decorator_name(item) == "extern" for item in definition.decorator_list)
+            for definition in module.definitions.values()
+        ):
+            self._error(module, call, "vd.library precedes the module's externs, whose symbols it names")
+        values: dict[str, ast.expr] = dict(zip(("name", "version"), call.args, strict=False))
+        if len(call.args) > 2:
+            self._error(module, call, "vd.library takes a name, a version and meta=")
+        for keyword in call.keywords:
+            if keyword.arg not in {"name", "version", "meta"} or keyword.arg in values:
+                self._error(module, keyword, f"vd.library does not take '{keyword.arg}'")
+            values[keyword.arg] = keyword.value  # type: ignore[index]
+        name = values.get("name")
+        if not (isinstance(name, ast.Constant) and isinstance(name.value, str) and name.value.isidentifier()):
+            self._error(module, call, "vd.library's name is a C identifier string")
+        version = values.get("version", ast.Constant(value=0))
+        if not (
+            isinstance(version, ast.Constant)
+            and isinstance(version.value, int)
+            and not isinstance(version.value, bool)
+            and version.value >= 0
+        ):
+            self._error(module, version, "vd.library's version is a non-negative integer literal")
+        module.library = (name.value, version.value)
 
     def _collect_specialization(self, module: _Module, node: ast.Assign) -> None:
         if not isinstance(node.value, ast.Call):
@@ -1203,15 +1322,54 @@ class ModuleGraph:
                 base = base.parent
             bases.append(base)
         else:
-            # A module from another project (a type value's) imports absolutely from its own project root first.
+            # A module from another project (a type value's) imports absolutely from its own project root first; a
+            # package module also from the directory its package is imported from, as with a `src/` layout.
             own_root = self._project_root(module.path.parent)
-            bases.extend((module.path.parent, *((own_root,) if own_root is not None else ()), self.search_root))
+            package_root = import_root(module.path, self._is_file)
+            bases.extend(
+                (
+                    module.path.parent,
+                    *((package_root,) if package_root is not None else ()),
+                    *((own_root,) if own_root is not None else ()),
+                    self.search_root,
+                )
+            )
         for base in dict.fromkeys(bases):
             candidate = base.joinpath(*parts)
             paths = (candidate.with_suffix(".py"), candidate / "__init__.py")
             for path in paths:
                 if self._is_file(path):
                     return path.resolve()
+        return None if level else self._find_installed(parts)
+
+    def _find_installed(self, parts: tuple[str, ...]) -> Path | None:
+        """The source of another installed package's module, found as Python would import it but without running
+        anything: on `sys.path`, then through the finders of editable installs. A module that does not import
+        vernon_dsl is a Python import Host code does not reach, such as `numpy` or the standard library."""
+
+        if not parts or parts[0] in sys.stdlib_module_names:
+            return None
+        for entry in sys.path:
+            base = Path(entry or ".")
+            if not base.is_dir():
+                continue
+            candidate = base.joinpath(*parts)
+            for path in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+                if self._is_file(path):
+                    return path.resolve() if _imports_vernon_dsl(path) else None
+        dotted = ".".join(parts)
+        for finder in sys.meta_path:
+            if finder in _STANDARD_FINDERS or not hasattr(finder, "find_spec"):
+                continue
+            try:
+                spec = finder.find_spec(dotted, None)
+            except (ImportError, ValueError):
+                continue
+            if spec is not None:
+                origin = Path(spec.origin) if spec.origin else None
+                if origin is None or origin.suffix != ".py" or not origin.is_file():
+                    return None
+                return origin.resolve() if _imports_vernon_dsl(origin) else None
         return None
 
     def _add_symbol_import(self, module: _Module, local_name: str, target: _Module, symbol: str, node: ast.AST) -> None:
@@ -1341,6 +1499,10 @@ class ModuleGraph:
             source: Path | None = declared_in
         else:
             source = project_module_path(module_name, self.project_root) if self.project_root is not None else None
+            if (source is None or not self._is_file(source)) and all(
+                part.isidentifier() for part in module_name.split(".")
+            ):
+                source = self._find_local_path(module, module_name, 0)
         if source is None or not self._is_file(source):
             self._error(module, node, f"type value has no portable identity: '{identity}' names no source module")
         owner = self._load_module(source, module_name)
@@ -1492,6 +1654,16 @@ class ModuleGraph:
         for table in methods.values():
             for method, helper in table.items():
                 helpers_by_method.setdefault(method, set()).add(helper)
+        # Host class methods stay in their class until the Host frontend hoists them, under the same helper names.
+        for statement in body:
+            if isinstance(statement, ast.ClassDef) and any(
+                _decorator_name(decorator) == "host" for decorator in statement.decorator_list
+            ):
+                for member in statement.body:
+                    if isinstance(member, ast.FunctionDef):
+                        helper = f"{statement.name}__{member.name}"
+                        functions.setdefault(helper, member)
+                        helpers_by_method.setdefault(member.name, set()).add(helper)
         reachable = {entry}
         pending = [entry]
         while pending:
@@ -1582,6 +1754,9 @@ class ModuleGraph:
                     visit(callee)
                 elif states.get(callee) == 1:
                     cycle = stack[stack.index(callee) :] + [callee]
+                    # Host functions compile to native calls, so they may recurse; device code cannot.
+                    if all(_is_host_function(function_nodes.get(member)) for member in cycle):
+                        continue
                     module, _ = function_sources[name]
                     self._error(
                         module,
@@ -1628,8 +1803,7 @@ class ModuleGraph:
                 self._error(module, value, f"shared function '{node.name}' uses device-only operation '{name}'")
 
     def _symbol_prefix(self, module: _Module) -> str:
-        relative = self._display_path(module.path).removesuffix(".py")
-        normalized = re.sub(r"[^A-Za-z0-9_]", "_", relative)
+        normalized = re.sub(r"[^A-Za-z0-9_]", "_", self._module_name(module.path))
         return f"__vernon_{normalized}__"
 
     def _display_path(self, path: Path) -> str:
@@ -1646,9 +1820,17 @@ class ModuleGraph:
                 return path.relative_to(own_root).as_posix()
             except ValueError:
                 pass
+        package_root = import_root(path, self._is_file)
+        if package_root is not None:
+            return path.relative_to(package_root).as_posix()
         return path.as_posix()
 
     def _module_name(self, path: Path) -> str:
+        """A module of a regular package is named by its import name, wherever it is installed."""
+
+        name = package_module_name(path, self._is_file)
+        if name is not None:
+            return name
         return self._display_path(path).removesuffix(".py").replace("/", ".")
 
     @staticmethod

@@ -4,7 +4,7 @@ import vernon_dsl as vd
 from vernon_dsl import Vector, f32, f64, i32
 
 
-@vd.handle(c_type="DemoEntity")
+@vd.handle(c_type="DemoEntity", meta=vd.meta(cpp="demo::Entity", header="demo/entity.h"))
 class Entity:
     pass
 
@@ -15,7 +15,7 @@ class Transform:
     scale: f32
 
 
-@vd.extern(symbol="demo_get_transform", effects="read", abi="status")
+@vd.extern(symbol="demo_get_transform", effects="read", abi="status", meta=vd.meta(cpp="demo::getTransform", owns=()))
 def get_transform(entity: Entity) -> Transform: ...
 
 
@@ -94,7 +94,7 @@ def read(entity: Entity, type: type[T]) -> T: ...
 
 
 @vd.extern(symbol="demo_write", effects="write", abi="status")
-def write(entity: Entity, type: type[T], value: T) -> None: ...
+def write(entity: Entity, value: T) -> None: ...
 
 
 @vd.host
@@ -104,5 +104,5 @@ class Regen:
     def update(self, target: Entity, dt: f64) -> f32:
         health = read(target, Health)
         healed = min(health.current + self.rate * f32(dt), health.maximum)
-        write(target, Health, Health(healed, health.maximum))
+        write(target, Health(healed, health.maximum))
         return healed + read(target, Transform).scale

@@ -85,6 +85,25 @@ function(
         PARENT_SCOPE)
 endfunction()
 
+# Vernon::HostHeaders: the directory of vernon_host/*.h, for libraries whose C API uses Host ABI types (VhList,
+# VhAllocator, VhType) without cooking a Host asset. Defined when the headers are beside this file.
+function(_vernon_add_host_headers)
+    if(TARGET VernonHostHeaders)
+        return()
+    endif()
+    foreach(candidate "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../python/vernon_dsl/hostlang/include"
+                      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../hostlang/include")
+        if(EXISTS "${candidate}/vernon_host/reflect.h")
+            get_filename_component(candidate "${candidate}" ABSOLUTE)
+            add_library(VernonHostHeaders INTERFACE)
+            target_include_directories(VernonHostHeaders INTERFACE "${candidate}")
+            add_library(Vernon::HostHeaders ALIAS VernonHostHeaders)
+            return()
+        endif()
+    endforeach()
+endfunction()
+_vernon_add_host_headers()
+
 function(vernon_add_program_asset name)
     cmake_parse_arguments(
         ASSET

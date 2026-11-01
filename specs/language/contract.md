@@ -737,15 +737,31 @@ helper specialization chain. Methods are not first-class values.
   the declaration from its defining source and never executes that module.
 - Conformance is checked at each use, not declared.
 
-A declared type's canonical identity is `<module>:<Class>`, where `<module>`
-is its defining source path relative to that source's own project root (the
-nearest directory containing `pyproject.toml`), with `.` separators and no
-`.py` suffix. The type may belong to a different project than the template it
+A declared type's canonical identity is `<module>:<Class>`. For a source in a
+regular package (its directory holds `__init__.py`), `<module>` is the import
+name, counted from the first ancestor directory that is not a package, so a
+checkout, an editable install and an installed wheel agree. That directory
+must be one Python imports the package from: the project root or its `src/`
+directory, a `sys.path` entry, or any directory outside a project (an
+installed wheel). Otherwise it is the source path relative to that source's
+own project root (the nearest directory containing `pyproject.toml`), with
+`.` separators and no `.py` suffix. A regular package nested in namespace
+packages, `<root>/a/b/pkg/` with no `a/__init__.py`, is therefore
+`a.b.pkg`, the name Python imports it by, never `pkg`. The type may belong to a different project than the template it
 specializes: the graph loads it from its declaring file, and its modules
 import absolutely from their own project root before the template's. Two
-modules of different projects with the same relative path fail with
-`share the project module path`, because the path names their emitted
-symbols. Variant keys are scoped to one Program, so identities need only be
+modules of different projects with the same module name fail with
+`share the project module path`, because the name prefixes their emitted
+symbols.
+
+An absolute import is resolved, without running anything, in this order: the
+importing file's directory; for a package module, the directory its package
+is imported from (a `src/` layout); the importing file's project root; the
+program's project root. After those come `sys.path` entries and then the
+`sys.meta_path` finders of editable installs. A source found through the last
+two joins the graph only if it imports `vernon_dsl`. Any other module, such as
+the standard library or `numpy`, stays a Python import that DSL code cannot
+name. The module graph cache keys on `sys.path`. Variant keys are scoped to one Program, so identities need only be
 unique among one Program's variants: types from two files with one identity
 in the same Program fail with `share the identity`. A scalar type's identity is
 its scalar name. A class without such a

@@ -2,6 +2,7 @@
  * through its reflection table. Prints one `name=value` line per check for the test to compare. */
 #include "systems.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,8 +141,15 @@ int main(void) {
     }
     for (uint32_t index = 0; index < update->call_count; ++index) {
         const VhCall *call = vh_call_at(update, index);
-        printf("mover_call=%s:%u:%s\n", call->symbol, call->effect, call->type == NULL ? "-" : call->type->name);
+        const char *cpp = NULL;
+        if (call->struct_size >= offsetof(VhCall, meta_count) + sizeof call->meta_count) {
+            cpp = vh_find_meta(call->meta, call->meta_count, "cpp");
+        }
+        printf("mover_call=%s:%u:%s:%s\n", call->symbol, call->effect, call->type == NULL ? "-" : call->type->name,
+               cpp == NULL ? "-" : cpp);
     }
+    const VhType *entity = vh_find_type(module, "Entity");
+    printf("entity_meta=%s\n", vh_find_meta(entity->meta, entity->meta_count, "header"));
     /* The JSON form, sized by a first call with no buffer. */
     char json[512];
     size_t needed = vh_write_json(health, &after, NULL, 0);

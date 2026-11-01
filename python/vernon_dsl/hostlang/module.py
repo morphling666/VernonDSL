@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..source_identity import source_file_digest
+from ..source_identity import import_root, package_module_name, source_file_digest
 from .aot import HostSources, load_programs, source_paths
 from .externs import ExternRegistry, default_registry
 from .model import HostProgram
@@ -30,16 +30,20 @@ _ATTACHED: dict[str, HostModule] = {}
 def _execute(path: Path) -> types.ModuleType:
     """Runs `path` as a new module. It is registered in `sys.modules` under a unique name, because type annotations
     resolve through the module of the class that declares them; its directory is importable while it runs, as it is
-    for a script."""
+    for a script. A module of a regular package runs in that package, its import root importable, so its relative
+    imports and those of its own package import what an ordinary import of it would."""
 
     name = f"_vernon_host_{path.stem}_{next(_MODULE_NAMES)}"
     module = types.ModuleType(name)
     module.__file__ = str(path)
+    package_name = package_module_name(path)
+    roots = [str(path.parent)]
+    if package_name is not None:
+        module.__package__ = package_name if path.name == "__init__.py" else package_name.rpartition(".")[0]
+        roots.append(str(import_root(path)))
     sys.modules[name] = module
-    directory = str(path.parent)
-    added = directory not in sys.path
-    if added:
-        sys.path.insert(0, directory)
+    added = [root for root in dict.fromkeys(roots) if root not in sys.path]
+    sys.path[0:0] = added
     try:
         # Compiled from the text, not through the bytecode cache, which keys on whole-second modification times.
         exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)  # noqa: S102
@@ -47,8 +51,8 @@ def _execute(path: Path) -> types.ModuleType:
         del sys.modules[name]
         raise
     finally:
-        if added:
-            sys.path.remove(directory)
+        for root in added:
+            sys.path.remove(root)
     return module
 
 

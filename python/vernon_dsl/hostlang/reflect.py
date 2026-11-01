@@ -25,16 +25,19 @@ if TYPE_CHECKING:
 
 REFLECT_VERSION = 3
 KIND_CODES = {"bool": 1, "i32": 2, "u32": 3, "i64": 4, "u64": 5, "f32": 6, "f64": 7}
-HANDLE, ARRAY, STRUCT, TUPLE, CLASS, LIST, STR, DICT, STORAGE = 8, 9, 10, 11, 12, 13, 14, 15, 16
+HANDLE, ARRAY, STRUCT, TUPLE, CLASS, LIST, STR, DICT, STORAGE, ENUM = 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
 
 # Records starting with `i32` begin with their `struct_size`.
 _TYPES = {
     "meta": "{ ptr, ptr }",
     "field": "{ i32, ptr, ptr, i64, ptr, ptr, i32 }",
     "param": "{ ptr, ptr }",
-    "call": "{ i32, i32, ptr, ptr }",
+    "call": "{ i32, i32, ptr, ptr, ptr, i32 }",
     "function": "{ i32, ptr, ptr, ptr, ptr, i32, i32, ptr, ptr, i32 }",
-    "type": "{ i32, i32, i32, i64, ptr, i64, ptr, ptr, i32, i32, ptr, ptr, i32, ptr, ptr, ptr, i32, ptr, ptr }",
+    "enumerator": "{ ptr, i64 }",
+    "type": (
+        "{ i32, i32, i32, i64, ptr, i64, ptr, ptr, i32, i32, ptr, ptr, i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 }"
+    ),
     "module": "{ i32, i32, i32, ptr, i64, ptr, ptr, i32, ptr }",
 }
 
@@ -61,30 +64,42 @@ def fnv1a(text: str) -> int:
 class _Fields:
     def __init__(self, programs: list[HostProgram]):
         self.structs = {name: value for program in programs for name, value in program.structs.items()}
+        self.enums = {name: value for program in programs for name, value in program.enums.items()}
 
     def __call__(self, name: str) -> tuple[tuple[str, ConcreteType], ...]:
         return self.structs[name].fields
 
 
-def canonical(value_type: ConcreteType, fields: _Fields) -> str:
-    """The layout spelling layout hashes are taken of."""
+def canonical(value_type: ConcreteType, fields: _Fields, spelling: frozenset[str] = frozenset()) -> str:
+    """The layout spelling layout hashes are taken of. A class met again inside its own spelling, through a list or
+    dict of itself, is spelled by name, so a recursive type has a finite spelling."""
 
     if value_type.kind == "scalar":
         return value_type.name
     if value_type.kind == "handle":
         return f"handle {value_type.name}"
+    if value_type.kind == "enum":
+        enumerators = ",".join(f"{name}={value}" for name, value in fields.enums[value_type.name].members)
+        return f"enum {value_type.name}{{{enumerators}}}i32"
     if value_type.kind == "tensor":
         shape = "x".join(str(extent) for extent in value_type.arguments[1:])
-        return f"[{shape}]{canonical(element_of(value_type), fields)}"
+        return f"[{shape}]{canonical(element_of(value_type), fields, spelling)}"
     if value_type.kind == "str":
         return "str"
     if value_type.kind == "list":
-        return f"list[{canonical(element_of(value_type), fields)}]"
+        return f"list[{canonical(element_of(value_type), fields, spelling)}]"
     if value_type.kind == "dict":
-        return f"dict[{canonical(key_of(value_type), fields)},{canonical(element_of(value_type), fields)}]"
+        key, value = (
+            canonical(key_of(value_type), fields, spelling),
+            canonical(element_of(value_type), fields, spelling),
+        )
+        return f"dict[{key},{value}]"
     if value_type.kind == "storage":
         shape = "x".join(str(extent) for extent in value_type.arguments[1])  # type: ignore[union-attr]
-        return f"storage[{shape}]{canonical(element_of(value_type), fields)}"
+        return f"storage[{shape}]{canonical(element_of(value_type), fields, spelling)}"
+    if value_type.kind == "struct" and value_type.name in spelling:
+        return f"class {value_type.name}"
+    inner = spelling | {value_type.name} if value_type.kind == "struct" else spelling
     value_layout = layout(value_type, fields)
     if value_type.kind == "tuple":
         names = [f"item{index}" for index in range(len(value_layout.offsets))]
@@ -93,7 +108,7 @@ def canonical(value_type: ConcreteType, fields: _Fields) -> str:
         names = [name for name, _ in fields(value_type.name)]
         title = ("class " if fields.structs[value_type.name].place else "struct ") + value_type.name
     body = ",".join(
-        f"{name}@{offset}:{canonical(member, fields)}"
+        f"{name}@{offset}:{canonical(member, fields, inner)}"
         for name, offset, member in zip(names, value_layout.offsets, members(value_type, fields), strict=True)
     )
     return f"{title}{{{body}}}{value_layout.size}/{value_layout.alignment}"
@@ -114,6 +129,7 @@ class CallRecord:
     effect: int
     # The Struct bound to a generic extern's type parameter.
     type: ConcreteType | None
+    metadata: Metadata = ()
 
 
 @dataclass(frozen=True)
@@ -147,6 +163,8 @@ class TypeRecord:
     owns: bool = False
     # A dict's key type.
     key: ConcreteType | None = None
+    # An enum's members, in declaration order.
+    enumerators: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -178,6 +196,7 @@ class _Describer:
         self.seen: set[ConcreteType] = set()
         self.ordered: list[TypeRecord] = []
         self.records: dict[ConcreteType, TypeRecord] = {}
+        self.handles = {name: value for program in programs for name, value in program.handles.items()}
 
     def function(self, name: str, info: HostFunctionInfo, method: bool) -> FunctionRecord:
         parameters = info.parameters[1:] if method else info.parameters
@@ -192,7 +211,7 @@ class _Describer:
             if extern.type_argument is not None:
                 bound = ConcreteType("struct", extern.type_argument[1])
                 self.type(bound)
-            calls.add(CallRecord(extern.symbol, int(extern.effect), bound))
+            calls.add(CallRecord(extern.symbol, int(extern.effect), bound, extern.metadata))
         return FunctionRecord(
             name,
             info.symbol,
@@ -215,6 +234,15 @@ class _Describer:
             record.kind, record.name = KIND_CODES[value_type.name], value_type.name
         elif value_type.kind == "handle":
             record.kind, record.name = HANDLE, value_type.name
+            declared_handle = self.handles.get(value_type.name)
+            record.metadata = declared_handle.metadata if declared_handle is not None else ()
+        elif value_type.kind == "enum":
+            declared_enum = self.fields.enums[value_type.name]
+            record.kind, record.name = ENUM, value_type.name
+            record.element = ConcreteType("scalar", "i32")
+            self.type(record.element)
+            record.doc, record.metadata = declared_enum.doc, declared_enum.metadata
+            record.enumerators = declared_enum.members
         elif value_type.kind == "tensor":
             record.kind, record.name = ARRAY, value_type.spelling
             record.element = element_of(value_type)
@@ -278,6 +306,8 @@ class _Describer:
                 self.type(ConcreteType("struct", name))
             for name in program.handles:
                 self.type(ConcreteType("handle", name))
+            for name in program.enums:
+                self.type(ConcreteType("enum", name))
         class_symbols = {
             symbol
             for host_class in self.classes.values()
@@ -292,7 +322,9 @@ class _Describer:
                 seen.add(info.symbol)
                 functions.append(self.function(name, info, False))
         listed = [
-            record.value_type for record in self.ordered if record.value_type.kind in {"struct", "tuple", "handle"}
+            record.value_type
+            for record in self.ordered
+            if record.value_type.kind in {"struct", "tuple", "handle", "enum"}
         ]
         signature = "|".join(canonical(value, self.fields) for value in listed)
         signature += "|" + "|".join(
@@ -347,11 +379,13 @@ class _LlvmTable:
         ]
         params = self.array("params", "%vh.param", items)
         result = "null" if record.result is None else self.descriptors[record.result]
-        call_items = [
-            f"%vh.call {{ {_size_of('call')}, i32 {call.effect}, ptr {self.string(call.symbol)}, "
-            f"ptr {'null' if call.type is None else self.descriptors[call.type]} }}"
-            for call in record.calls
-        ]
+        call_items = []
+        for call in record.calls:
+            meta, meta_count = self.metadata(call.metadata)
+            call_items.append(
+                f"%vh.call {{ {_size_of('call')}, i32 {call.effect}, ptr {self.string(call.symbol)}, "
+                f"ptr {'null' if call.type is None else self.descriptors[call.type]}, ptr {meta}, i32 {meta_count} }}"
+            )
         calls = self.array("calls", "%vh.call", call_items)
         return (
             f"%vh.function {{ {_size_of('function')}, ptr {self.string(record.name)}, "
@@ -380,13 +414,18 @@ class _LlvmTable:
             fini = self.module.fini_function(record.value_type) if record.owns else "null"
             key = "null" if record.key is None else self.descriptors[record.key]
             meta, meta_count = self.metadata(record.metadata)
+            enumerators = self.array(
+                "enumerators",
+                "%vh.enumerator",
+                [f"%vh.enumerator {{ ptr {self.string(name)}, i64 {value} }}" for name, value in record.enumerators],
+            )
             self.lines.append(
                 f"{self.descriptors[record.value_type]} = private unnamed_addr constant %vh.type {{ "
                 f"{_size_of('type')}, i32 {record.kind}, i32 {record.alignment}, i64 {record.size}, "
                 f"ptr {self.string(record.name)}, i64 {_signed(record.layout_hash)}, ptr {element}, ptr {shape}, "
                 f"i32 {len(record.shape)}, i32 {len(items)}, ptr {fields}, ptr {methods}, i32 {len(record.methods)}, "
                 f"ptr {init}, ptr {self.string(record.doc)}, ptr {meta}, i32 {meta_count}, ptr {fini}, "
-                f"ptr {key} }}, align 8"
+                f"ptr {key}, ptr {enumerators}, i32 {len(record.enumerators)} }}, align 8"
             )
         functions = self.array("functions", "%vh.function", [self.function(item) for item in table.functions])
         types = self.array("types", "ptr", [f"ptr {self.descriptors[value]}" for value in table.listed])
@@ -471,12 +510,18 @@ class VhField(ctypes.Structure):
     ]
 
 
+class VhEnumerator(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("value", ctypes.c_int64)]
+
+
 class VhCall(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
         ("effect", ctypes.c_uint32),
         ("symbol", ctypes.c_char_p),
         ("type", ctypes.POINTER(VhType)),
+        ("meta", ctypes.POINTER(VhMeta)),
+        ("meta_count", ctypes.c_uint32),
     ]
 
 
@@ -515,6 +560,8 @@ VhType._fields_ = [
     ("meta_count", ctypes.c_uint32),
     ("fini", ctypes.c_void_p),
     ("key", ctypes.POINTER(VhType)),
+    ("enumerators", ctypes.POINTER(VhEnumerator)),
+    ("enumerator_count", ctypes.c_uint32),
 ]
 
 
@@ -592,6 +639,11 @@ class BuiltTable:
                 descriptor.fini = fini_of(record.value_type)
             descriptor.doc = self._text(record.doc)
             descriptor.meta, descriptor.meta_count = self._metadata(record.metadata)
+            if record.enumerators:
+                descriptor.enumerators = self._array(
+                    VhEnumerator, [VhEnumerator(self._text(name), value) for name, value in record.enumerators]
+                )
+                descriptor.enumerator_count = len(record.enumerators)
         self.module = VhModule()
         self.module.struct_size = ctypes.sizeof(VhModule)
         self.module.version, self.module.type_count = REFLECT_VERSION, len(table.listed)
@@ -659,6 +711,7 @@ class BuiltTable:
                 item.symbol = self._text(call.symbol)
                 if call.type is not None:
                     item.type = ctypes.pointer(self.descriptors[call.type])
+                item.meta, item.meta_count = self._metadata(call.metadata)
                 calls.append(item)
             entry.calls = self._array(VhCall, calls)
             entry.call_count = len(calls)

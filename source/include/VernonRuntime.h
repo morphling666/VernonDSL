@@ -167,6 +167,13 @@ VERNON_RUNTIME_CAPI int32_t vernonRuntimeHostListReserve(struct VhList *list, ui
 VERNON_RUNTIME_CAPI void vernonRuntimeHostListRelease(struct VhList *list, uint64_t element_size, uint64_t alignment,
                                                       const struct VhAllocator *allocator);
 /*
+ * The default allocator as a VhAllocator, over this runtime's malloc and free.
+ * Callers hand it to code that fills containers the runtime later frees, such as
+ * an extern's owned result, so the memory comes from the heap that frees it even
+ * where each shared library links a C runtime of its own.
+ */
+VERNON_RUNTIME_CAPI const struct VhAllocator *vernonRuntimeHostDefaultAllocator(void);
+/*
  * A `dict[K, V]` is a `vernon_host/reflect.h` VhDict. Its entries are
  * `{uint64_t hash; K key; V value;}` under C layout rules, which this record
  * describes. A key passed in points at the key's bytes, or for a str key at

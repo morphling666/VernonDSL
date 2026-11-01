@@ -71,8 +71,14 @@ def key_of(value_type: ConcreteType) -> ConcreteType:
 
 def from_python(value: Any, value_type: ConcreteType, fields: StructFields) -> Any:
     """Checks and flattens a Python argument: scalars stay scalars, Tensors become flat tuples, and Structs and
-    Tuples become member tuples. Structs may be given as mappings, sequences, or objects with the field names."""
+    Tuples become member tuples. Structs may be given as mappings, sequences, or objects with the field names. An
+    enum is its int32_t value: an IntEnum member is an int, and values are not checked against the members, as in
+    C."""
 
+    if value_type.kind == "enum":
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{value_type.spelling} expects an IntEnum member or int, got {type(value).__name__}")
+        value_type = ConcreteType("scalar", "i32")
     if value_type.kind == "scalar":
         if value_type.name == "bool":
             return bool(value)
@@ -116,7 +122,7 @@ def to_python(value: Any, value_type: ConcreteType, fields: StructFields) -> Any
     """Structs become dicts in field order, Vectors tuples, Matrices tuples of rows; f32 keeps numpy.float32 so its
     rounding stays visible."""
 
-    if value_type.kind in {"scalar", "handle"}:
+    if value_type.kind in {"scalar", "handle", "enum"}:
         return value
     if value_type.kind == "tensor":
         shape = tuple(int(extent) for extent in value_type.arguments[1:])  # type: ignore[arg-type]

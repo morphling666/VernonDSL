@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import update_wrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,6 +12,7 @@ from .externs import ExternRegistry, default_registry
 from .model import HostProgram
 
 if TYPE_CHECKING:
+    from ..decorators import Library
     from .native import Entry, HostRuntime
 
 
@@ -83,14 +84,34 @@ class ExternFunction:
     """An `@extern` declaration. It names a C function; Host code calling it reaches the binding of the registry the
     outermost Host call runs with."""
 
-    def __init__(self, function: Callable[..., Any], *, symbol: str, effects: str, abi: str, schema: str | None):
+    def __init__(
+        self,
+        function: Callable[..., Any],
+        *,
+        symbol: str,
+        effects: str,
+        abi: str,
+        schema: str | None,
+        meta: Mapping[str, Any] | None = None,
+        library: Library | None = None,
+    ):
         self.function = function
         self.symbol = symbol
         self.effects = effects
         self.abi = abi
-        self.schema = schema
-        mark(self, "extern", symbol=symbol, effects=effects, abi=abi, schema=schema)
+        self.declared_schema = schema
+        self.library = library
+        self.meta = dict(meta) if meta is not None else {}
+        mark(self, "extern", symbol=symbol, effects=effects, abi=abi, schema=schema, meta=self.meta)
         update_wrapper(self, function)
+
+    @property
+    def schema(self) -> str | None:
+        """The declared schema, or else the identity of the extern's `vd.library`."""
+
+        if self.declared_schema is not None or self.library is None:
+            return self.declared_schema
+        return self.library.identity
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         from .native import active_runtime

@@ -54,7 +54,9 @@ typedef enum VhKind {
     VH_KIND_DICT = 15,
     /* `TensorStorage[element, (e0, ...)]`, a VH_STORAGE record of `rank` axes; `shape` holds each axis's static
      * extent, 0 for a dyn one. */
-    VH_KIND_STORAGE = 16
+    VH_KIND_STORAGE = 16,
+    /* An IntEnum, an int32_t; `element` is the i32 type and `enumerators` lists its members. */
+    VH_KIND_ENUM = 17
 } VhKind;
 
 /* The memory of a `list[T]` or `str` class field: `capacity` elements at the address `data`, the first `size` of
@@ -112,6 +114,13 @@ static inline uint64_t vh_storage_count(const void *storage, uint32_t rank) {
     }
 #endif
 
+/* A `str` argument of an extern, passed by value: UTF-8 bytes, not NUL-terminated, that the caller keeps alive only
+ * for the call. */
+typedef struct VhStrArg {
+    const char *data;
+    uint64_t size;
+} VhStrArg;
+
 /* Where a module's containers get memory. `allocate` returns NULL when it cannot; `release` receives the size and
  * alignment `allocate` was asked for. */
 typedef struct VhAllocator {
@@ -120,6 +129,37 @@ typedef struct VhAllocator {
     void *(*allocate)(void *user, uint64_t size, uint64_t alignment);
     void (*release)(void *user, void *pointer, uint64_t size, uint64_t alignment);
 } VhAllocator;
+
+/* A `list[T]` or `dict[K, V]` argument of an extern, passed by value like a VhStrArg: `size` elements, or entries
+ * `{K key; V value;}` in insertion order, that the caller keeps alive only for the call. */
+typedef struct VhSpan {
+    const void *data;
+    uint64_t size;
+} VhSpan;
+
+/* The status an extern returns when `allocator` cannot give it memory for an owned result. */
+#define VH_STATUS_OUT_OF_MEMORY (-4)
+
+/* Fills the empty `*out` of an extern's owned `str`, `list[T]` or `dict[K, V]` result with `count` items of
+ * `item_size` bytes (UTF-8 bytes, elements, or entries `{K key; V value;}`) copied from `data`, in memory from
+ * `allocator`, the one the extern received. Returns 0 or VH_STATUS_OUT_OF_MEMORY, leaving `*out` empty. The caller
+ * releases the record through that allocator, which is never NULL: with no module allocator installed it is
+ * VernonRuntime's default, so a library linking another C runtime still allocates from the heap that frees it. */
+static inline int32_t vh_list_assign(VhList *out, const void *data, uint64_t count, uint64_t item_size,
+                                     uint64_t alignment, const VhAllocator *allocator) {
+    if (count == 0) {
+        return 0;
+    }
+    void *memory = allocator->allocate(allocator->user, count * item_size, alignment);
+    if (memory == NULL) {
+        return VH_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(memory, data, (size_t)(count * item_size));
+    out->data = (uint64_t)(uintptr_t)memory;
+    out->size = count;
+    out->capacity = count;
+    return 0;
+}
 
 typedef enum VhEffect { VH_EFFECT_PURE = 0, VH_EFFECT_READ = 1, VH_EFFECT_WRITE = 2, VH_EFFECT_IO = 3 } VhEffect;
 
@@ -130,6 +170,12 @@ typedef struct VhMeta {
     const char *key;
     const char *value;
 } VhMeta;
+
+/* A member of an enum. Two members may share a value, as aliases do. */
+typedef struct VhEnumerator {
+    const char *name;
+    int64_t value;
+} VhEnumerator;
 
 typedef struct VhField {
     uint32_t struct_size;
@@ -154,8 +200,13 @@ typedef struct VhCall {
     uint32_t effect;
     /* The C symbol the extern binds. */
     const char *symbol;
-    /* The Struct a generic extern's `type[T]` parameter receives at this call; NULL for other externs. */
+    /* The Struct a generic extern is bound to at this call, passed as its `type[T]` argument or as the type of its
+     * `T` value; NULL for other externs. */
     const VhType *type;
+    /* The extern's `meta=` entries. Tables built before these members existed end at `type`: read them only when
+     * `struct_size` covers them. */
+    const VhMeta *meta;
+    uint32_t meta_count;
 } VhCall;
 
 typedef struct VhFunction {
@@ -205,6 +256,10 @@ struct VhType {
     VhFini fini;
     /* A dict's key type, whose values `element` maps; NULL for other kinds. */
     const VhType *key;
+    /* An enum's members in declaration order; NULL for other kinds. Read them only when `struct_size` covers
+     * them, as for every appended member. */
+    const VhEnumerator *enumerators;
+    uint32_t enumerator_count;
 };
 
 static inline uint64_t vh_align_up(uint64_t value, uint64_t alignment) {
@@ -424,6 +479,16 @@ static inline void vh_json_storage_axis(VhJsonWriter *writer, const VhType *type
     vh_json_text(writer, "]");
 }
 
+/* The name of an enum's first member with `value`, or NULL if no member has it. */
+static inline const char *vh_enum_name(const VhType *type, int32_t value) {
+    for (uint32_t index = 0; index < type->enumerator_count; ++index) {
+        if (type->enumerators[index].value == value) {
+            return type->enumerators[index].name;
+        }
+    }
+    return NULL;
+}
+
 static inline void vh_json_value(VhJsonWriter *writer, const VhType *type, const char *bytes) {
     char buffer[32];
     switch (type->kind) {
@@ -433,6 +498,19 @@ static inline void vh_json_value(VhJsonWriter *writer, const VhType *type, const
     case VH_KIND_I32:
         snprintf(buffer, sizeof buffer, "%" PRId32, *(const int32_t *)bytes);
         break;
+    case VH_KIND_ENUM: {
+        /* A value no member has stays a number. */
+        const int32_t value = *(const int32_t *)bytes;
+        const char *name = vh_enum_name(type, value);
+        if (name != NULL) {
+            vh_json_text(writer, "\"");
+            vh_json_text(writer, name);
+            vh_json_text(writer, "\"");
+            return;
+        }
+        snprintf(buffer, sizeof buffer, "%" PRId32, value);
+        break;
+    }
     case VH_KIND_U32:
         snprintf(buffer, sizeof buffer, "%" PRIu32, *(const uint32_t *)bytes);
         break;
@@ -509,7 +587,10 @@ static inline void vh_json_value(VhJsonWriter *writer, const VhType *type, const
             }
             vh_json_text(writer, first ? "" : ",");
             first = 0;
-            const int quoted = type->key->kind != VH_KIND_STR;
+            /* str keys and enum member names write their own quotes; other keys are the text of their JSON. */
+            const int quoted = type->key->kind != VH_KIND_STR &&
+                               (type->key->kind != VH_KIND_ENUM ||
+                                vh_enum_name(type->key, *(const int32_t *)(entry + key_offset)) == NULL);
             vh_json_text(writer, quoted ? "\"" : "");
             vh_json_value(writer, type->key, entry + key_offset);
             vh_json_text(writer, quoted ? "\":" : ":");

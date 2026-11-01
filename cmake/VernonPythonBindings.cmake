@@ -17,6 +17,25 @@ function(_vernon_set_python_module_output target package_directory)
                    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${package_directory}")
 endfunction()
 
+# The tally sample library's generated nanobind module (python/tests/bindgen_sample), which the bindgen tests bind
+# Python-mode Host code to. It builds next to the sample, where the tests import it as tally_api.
+function(_vernon_add_bindgen_sample package_directory)
+    set(sample "${VERNON_REPOSITORY_ROOT}/python/tests/bindgen_sample")
+    nanobind_add_module(
+        vernon-bindgen-tally-api
+        "${sample}/generated/tally_api_nanobind.cpp"
+        "${sample}/generated/tally_api_thunks.cpp"
+        "${sample}/cpp/tally_api.cpp"
+        "${sample}/cpp/counter.cpp")
+    target_include_directories(vernon-bindgen-tally-api PRIVATE "${sample}/generated" "${sample}/cpp"
+                                                                "${package_directory}/hostlang/include")
+    if(MSVC)
+        target_compile_options(vernon-bindgen-tally-api PRIVATE /EHsc)
+    endif()
+    set_target_properties(vernon-bindgen-tally-api PROPERTIES OUTPUT_NAME "tally_api")
+    _vernon_set_python_module_output(vernon-bindgen-tally-api "${sample}")
+endfunction()
+
 function(vernon_add_python_bindings package_directory source_directory)
     if(NOT TARGET VernonRuntime OR NOT TARGET VernonDSLCompiler)
         message(FATAL_ERROR "Python bindings require VernonRuntime and VernonDSLCompiler")
@@ -87,6 +106,9 @@ function(vernon_add_python_bindings package_directory source_directory)
         VernonRuntime
         VernonRHI)
     set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
+    if(BUILD_TESTING)
+        _vernon_add_bindgen_sample("${package_directory}")
+    endif()
     install(
         TARGETS vernon-dsl-native
         RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel

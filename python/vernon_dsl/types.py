@@ -14,7 +14,7 @@ from ._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ._markers import declaration_source, is_params, is_struct_class
 from ._texture_format import TextureFormat
 from .language.slicing import runtime_key
-from .source_identity import project_module_name, project_root
+from .source_identity import module_identity
 
 
 def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
@@ -462,12 +462,11 @@ def type_identity(value: object) -> str:
         raise TypeError(f"type specialization requires a declared type or scalar type, not {value!r}")
     assert isinstance(value, builtins.type)
     source = declaration_source(value)
-    root = project_root(source.parent) if source is not None else None
-    module = project_module_name(source, root) if source is not None and root is not None else None
+    module = module_identity(source) if source is not None else None
     if module is None or value.__qualname__ != value.__name__:
         raise TypeError(
-            f"type value has no portable identity: '{value.__qualname__}' must be a module-level class in a source "
-            "file under a project root (the nearest directory containing pyproject.toml)"
+            f"type value has no portable identity: '{value.__qualname__}' must be a module-level class of a regular "
+            "package or in a source file under a project root (the nearest directory containing pyproject.toml)"
         )
     return f"{module}:{value.__name__}"
 

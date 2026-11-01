@@ -132,6 +132,15 @@ Architecture and tutorials link to the contract instead of redefining fields.
 - [`host/roadmap.md`](host/roadmap.md) plans the Host language's next
   features, its owned-container memory model, call-site type reflection and
   the ABI v0.1.3 freezes.
+- [`host/bindgen.md`](host/bindgen.md) describes native-library bindings:
+  the Host extern module is the schema, C libraries need only externs, and
+  C++ libraries get generated thunks and a nanobind symbol table
+  (`vernon_dsl.bindgen`, level 1, implemented), so both modes call the same
+  C functions.
+- [`host/protocols.md`](host/protocols.md) proposes Host protocols, Rust
+  trait style without inheritance: explicit `implements=`, static dispatch by
+  specialization, and C function tables in reflection for engines and C++
+  plugins.
 - [`roadmap.md`](roadmap.md) lists project-wide unfinished work.
 
 ## Program boundary

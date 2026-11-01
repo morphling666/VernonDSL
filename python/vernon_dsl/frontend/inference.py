@@ -224,11 +224,28 @@ class _Inference:
         self.externs = {
             name for name, node in self.functions.items() if decorator_name(node.decorator_list[0]) == "extern"
         }
+        # Value-bound generic externs, declared only as their per-Struct specializations `name__Struct`: a call
+        # resolves to the specialization of its value's Struct type. Maps the name to the value's index.
+        self.value_generics: dict[str, int] = getattr(module, "_vernon_value_generics", {})
         self.methods = method_tables(module)
         self.handles = {
             node.name
             for node in module.body
             if isinstance(node, ast.ClassDef) and any(decorator_name(item) == "handle" for item in node.decorator_list)
+        }
+        # Host enum name -> its member names; the Host frontend has checked the declarations.
+        self.enums = {
+            node.name: {
+                target.id
+                for statement in node.body
+                if isinstance(statement, ast.Assign)
+                for target in statement.targets
+                if isinstance(target, ast.Name)
+            }
+            for node in module.body
+            if host
+            and isinstance(node, ast.ClassDef)
+            and any(decorator_name(item) == "enum" for item in node.decorator_list)
         }
         self.structs = {
             node.name: tuple(
@@ -237,7 +254,13 @@ class _Inference:
                 if isinstance(field, ast.AnnAssign) and isinstance(field.target, ast.Name)
             )
             for node in module.body
-            if isinstance(node, ast.ClassDef) and node.name not in self.handles
+            if isinstance(node, ast.ClassDef) and node.name not in self.handles and node.name not in self.enums
+        }
+        # The layouts of Host classes, whose `Name()` creates an instance from the field defaults.
+        self.host_classes = {
+            node.name
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and getattr(node, "_vernon_host_class", False)
         }
         self.generic = {
             name
@@ -437,6 +460,10 @@ class _Inference:
                 return existing
             function = by_symbol[symbol]
             if symbol in active:
+                # Host functions may recurse. They take no device resources, so they carry no storage effects
+                # for a caller to map, and the unresolved instance stands for the one being resolved.
+                if self.host and decorator_name(function.source.decorator_list[0]) == "host":
+                    return function
                 raise self.error(function.source, f"recursive typed effect propagation for '{function.qualified_name}'")
             active.append(symbol)
             body = tuple(resolve_statement(statement, function) for statement in function.body)
@@ -983,14 +1010,34 @@ class _Inference:
                 and isinstance(statement.value, (ast.List, ast.Dict))
                 and not (statement.value.elts if isinstance(statement.value, ast.List) else statement.value.keys)
             ):
-                # `[]` and `{}` have no type of their own: each is only the empty value of the field it is
-                # assigned to.
+                # `[]` and `{}` have no type of their own: each is only the empty value of the field or local it
+                # is assigned to.
                 kind = "list" if isinstance(statement.value, ast.List) else "dict"
-                target_type = self._expression(statement.targets[0], environment)
+                spelling = "[]" if kind == "list" else "{}"
+                target = statement.targets[0]
+                if isinstance(target, ast.Name) and target.id not in environment:
+                    raise self.error(
+                        statement,
+                        f"a {kind} local is declared with its type, as in {target.id}: "
+                        f"{'list[T]' if kind == 'list' else 'dict[K, V]'} = {spelling}",
+                    )
+                target_type = self._expression(target, environment)
                 if not isinstance(target_type, ConcreteType) or target_type.kind != kind:
-                    spelling = "[]" if kind == "list" else "{}"
-                    raise self.error(statement.value, f"{spelling} can only be assigned to a {kind} field")
+                    raise self.error(statement.value, f"{spelling} can only be assigned to a {kind} field or local")
                 self.expression_records[id(statement.value)] = (statement.value, target_type, kind)
+            elif (
+                self.host
+                and isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.value, (ast.List, ast.Dict))
+                and not (statement.value.elts if isinstance(statement.value, ast.List) else statement.value.keys)
+            ):
+                kind = "list" if isinstance(statement.value, ast.List) else "dict"
+                expected = self.parse_type(statement.annotation)
+                if expected.kind != kind or not isinstance(statement.target, ast.Name):
+                    spelling = "[]" if kind == "list" else "{}"
+                    raise self.error(statement.value, f"{spelling} declares a local annotated {kind}[...]")
+                environment[statement.target.id] = expected
+                self.expression_records[id(statement.value)] = (statement.value, expected, kind)
             elif self.host and isinstance(statement, ast.Delete):
                 for target in statement.targets:
                     container = (
@@ -1384,7 +1431,11 @@ class _Inference:
             return ConcreteType("str", "str")
         if self.host and isinstance(node, (ast.List, ast.Dict)):
             kind, empty = ("list", "[]") if isinstance(node, ast.List) else ("dict", "{}")
-            raise self.error(node, f"{kind} displays are not Host Values; {empty} only empties a {kind} field")
+            raise self.error(
+                node,
+                f"a {kind} is not passed as a value; {empty} declares a {kind} local "
+                f"(x: {'list[T]' if kind == 'list' else 'dict[K, V]'} = {empty}) or empties a {kind} field or local",
+            )
         if isinstance(node, ast.BinOp):
             left = self._expression(node.left, environment)
             right = self._expression(node.right, environment)
@@ -1488,6 +1539,15 @@ class _Inference:
                 element = value_type.arguments[0]
                 assert isinstance(element, ConcreteType)
                 return element
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.enums
+            and node.value.id not in environment
+        ):
+            if node.attr not in self.enums[node.value.id]:
+                raise self.error(node, f"enum '{node.value.id}' has no member '{node.attr}'")
+            return ConcreteType("enum", node.value.id)
         if isinstance(node, ast.Attribute):
             value_type = self._expression(node.value, environment)
             if isinstance(value_type, ConcreteType) and value_type.kind == "storage":
@@ -1686,12 +1746,14 @@ class _Inference:
         method = node.func.attr
         element, extents = receiver.arguments
         assert isinstance(element, ConcreteType) and isinstance(extents, tuple)
-        arities = {"fill": 1, "copy_from_values": 1, "to_values": 0}
+        arities = {"fill": 1, "copy_from_values": 1, "to_values": 0, "copy": 0}
         if method not in arities:
             raise self.error(node.func, f"TensorStorage has no method '{method}' in Host code")
         if len(node.args) != arities[method] or node.keywords:
             count = arities[method]
             raise self.error(node, f"TensorStorage.{method} takes {count} argument{'s' if count != 1 else ''}")
+        if method == "copy":
+            return receiver
         if method == "to_values":
             if "?" in extents:
                 raise self.error(
@@ -1829,6 +1891,21 @@ class _Inference:
             raise self.error(node.args[0], "len requires a list, str, dict or TensorStorage")
         if (created := self._storage_creation(node, environment)) is not None:
             return created
+        if dotted_name(node.func) in {"deepcopy", "copy.deepcopy"} and "deepcopy" not in environment:
+            if len(node.args) != 1 or node.keywords:
+                raise self.error(node, "deepcopy takes one class instance, list, dict or TensorStorage")
+            source = self._expression(node.args[0], environment)
+            copyable = isinstance(source, ConcreteType) and (
+                source.kind in {"list", "dict", "storage"}
+                or (source.kind == "struct" and source.name in self.host_classes)
+            )
+            if not copyable:
+                raise self.error(
+                    node.args[0],
+                    f"deepcopy copies a class instance, list, dict or TensorStorage; {describe(source)} is a value, "
+                    "which needs no copy",
+                )
+            return source
         if not isinstance(node.func, ast.Attribute) or not self._receiver(node.func.value, environment):
             return None
         receiver = self._expression(node.func.value, environment)
@@ -1840,11 +1917,13 @@ class _Inference:
             return None
         element = receiver.arguments[0]
         assert isinstance(element, ConcreteType)
-        arity = {"append": 1, "pop": 0, "clear": 0}.get(node.func.attr)
+        arity = {"append": 1, "pop": 0, "clear": 0, "copy": 0}.get(node.func.attr)
         if arity is None:
             raise self.error(node.func, f"list has no method '{node.func.attr}'")
         if len(node.args) != arity or node.keywords:
             raise self.error(node, f"list.{node.func.attr} takes {arity} argument{'s' if arity != 1 else ''}")
+        if node.func.attr == "copy":
+            return receiver
         if node.func.attr == "append":
             value = self._expression(node.args[0], environment)
             if not can_convert(value, element):
@@ -1860,7 +1939,7 @@ class _Inference:
         method = node.func.attr
         value = receiver.arguments[1]
         assert isinstance(value, ConcreteType)
-        arities = {"get": (2, 2), "pop": (1, 2), "clear": (0, 0)}
+        arities = {"get": (2, 2), "pop": (1, 2), "clear": (0, 0), "copy": (0, 0)}
         if method in {"keys", "values", "items"}:
             raise self.error(node, f"dict.{method}() is iterated by a for loop; it is not a value")
         if method not in arities:
@@ -1871,6 +1950,8 @@ class _Inference:
             raise self.error(node, f"dict.{method} takes {expected} argument{'s' if high != 1 else ''}")
         if method == "clear":
             return ConcreteType("void", "void")
+        if method == "copy":
+            return receiver
         self._dict_key(node.args[0], receiver, environment)
         if len(node.args) == 2:
             default = self._expression(node.args[1], environment)
@@ -2020,6 +2101,19 @@ class _Inference:
             and (not isinstance(node.func.value, ast.Name) or node.func.value.id in environment)
         ):
             arguments.insert(0, self._expression(node.func.value, environment))
+        if name in self.value_generics:
+            index = self.value_generics[name]
+            if index >= len(arguments):
+                raise self.error(node, f"'{name}' takes a @struct value at position {index}")
+            value = arguments[index]
+            if (
+                not isinstance(value, ConcreteType)
+                or value.kind != "struct"
+                or f"{name}__{value.name}" not in self.functions
+            ):
+                raise self.error(node.args[index], f"'{name}' takes a @struct value, not {describe(value)}")
+            name = f"{name}__{value.name}"
+            node.func = copy_location(ast.Name(id=name, ctx=ast.Load()), node.func)
         if name in self.generic:
             symbol, result = self._specialize(name, tuple(arguments), node)
             node._vernon_generic_name = name
@@ -2081,6 +2175,10 @@ class _Inference:
             return _contract_type(GENERATED_INTERFACE_CONTRACTS[name].type)
         if name == "replace" and name not in self.structs:
             return self._struct_replace(node, environment)
+        if name in self.host_classes:
+            if arguments:
+                raise self.error(node, f"{name}() takes no arguments; a new instance takes its field defaults")
+            return ConcreteType("struct", name)
         if name in self.structs:
             fields = self.structs[name]
             if len(arguments) != len(fields):
@@ -2212,6 +2310,8 @@ class _Inference:
             return default_type(_element(arguments[0]))
         if name == "cross":
             return arguments[0]
+        if name in self.enums:
+            raise self.error(node, f"an enum is not constructed from an integer; name a member, {name}.<member>")
         raise self.error(node, f"cannot infer call to '{name}'")
 
     def _aggregate(

@@ -47,6 +47,7 @@ void bindNativeHost(nb::module_ &module) {
         nb::dict symbols;
         symbols["vernonRuntimeHostListReserve"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostListReserve);
         symbols["vernonRuntimeHostListRelease"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostListRelease);
+        symbols["vernonRuntimeHostDefaultAllocator"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostDefaultAllocator);
         symbols["vernonRuntimeHostDictFind"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostDictFind);
         symbols["vernonRuntimeHostDictInsert"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostDictInsert);
         symbols["vernonRuntimeHostDictRemove"] = reinterpret_cast<uintptr_t>(&vernonRuntimeHostDictRemove);

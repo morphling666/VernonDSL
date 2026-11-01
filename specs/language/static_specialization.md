@@ -106,8 +106,9 @@ declared bounds, for example
 `vd.specialization("MATERIAL", vd.type, bound=Surface)`.
 
 The canonical identity reuses the module name the source graph already uses
-for imports, relative to the value's own project root, so manifest keys do not
-depend on the checkout location; a value with no such path has no portable
+for imports: the import name in a regular package, else the path relative to
+the value's own project root, so manifest keys depend on neither the checkout
+location nor whether the package is installed (contract.md section 6.6); a value with no such path has no portable
 identity and is rejected rather than given a machine-local one. The root is
 the value's and not the template's because an engine library and the content
 that specializes it are separate projects; the key assignment carries the

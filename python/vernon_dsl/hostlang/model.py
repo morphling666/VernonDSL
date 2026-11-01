@@ -104,6 +104,22 @@ class HostClass:
 class HostHandle:
     name: str
     c_type: str | None = None
+    metadata: Metadata = ()
+
+
+@dataclass(frozen=True)
+class HostEnum:
+    """A `@vd.enum` IntEnum, held as an int32_t. Members keep declaration order; two may share a value, as
+    aliases do in Python and C."""
+
+    name: str
+    members: tuple[tuple[str, int], ...]
+    c_type: str | None = None
+    doc: str | None = None
+    metadata: Metadata = ()
+
+    def value(self, member: str) -> int:
+        return dict(self.members)[member]
 
 
 @dataclass(frozen=True)
@@ -122,6 +138,10 @@ class HostExtern:
     # A generic extern's specialization: the C parameter index receiving the bound Struct's `const VhType *`,
     # which `parameters` omits, and the Struct's name.
     type_argument: tuple[int, str] | None = None
+    metadata: Metadata = ()
+    # Whether a generic extern's calls pass the bound Struct as a `type: type[T]` argument. If not, the value in
+    # `parameters[type_argument[0]]` binds it, and the descriptor goes just before that value.
+    type_passed: bool = True
 
 
 @dataclass
@@ -138,6 +158,9 @@ class HostFunctionInfo:
     expressions: dict[int, TypedExpression] = field(default_factory=dict)
     statements: dict[int, TypedStatement] = field(default_factory=dict)
     local_types: dict[str, ConcreteType] = field(default_factory=dict)
+    # Class-typed locals: "owned" for an instance the function holds and releases, "borrowed" for a name of a field
+    # reached from a parameter, "element" for a loop's element.
+    class_locals: dict[str, str] = field(default_factory=dict)
 
     @property
     def symbol(self) -> str:
@@ -180,6 +203,7 @@ class HostProgram:
     classes: dict[str, HostClass] = field(default_factory=dict)
     # The module name the reflection table records; empty for single-entry programs.
     module_name: str = ""
+    enums: dict[str, HostEnum] = field(default_factory=dict)
 
     @property
     def entry_function(self) -> HostFunctionInfo:

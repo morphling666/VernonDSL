@@ -52,6 +52,8 @@ class ConcreteType:
             return ALL_SCALAR_TYPES[self.name].mlir
         if self.kind == "handle":
             return "i64"
+        if self.kind == "enum":
+            return "i32"
         if self.kind in {"str", "list", "dict"}:
             raise ValueError(f"{self.spelling} is a Host type and has no device IR type")
         if self.kind == "index":
@@ -107,7 +109,7 @@ class ConcreteType:
             assert isinstance(value, ConcreteType)
             return value.spelling
 
-        if self.kind in {"scalar", "struct", "handle"}:
+        if self.kind in {"scalar", "struct", "handle", "enum"}:
             return self.name
         if self.kind == "str":
             return "str"
@@ -183,7 +185,7 @@ def is_abi_stable_value(
     active_structs: frozenset[str] = frozenset(),
 ) -> bool:
     """Return whether a type has a finite, deterministic Value ABI."""
-    if value_type.kind in {"scalar", "handle"}:
+    if value_type.kind in {"scalar", "handle", "enum"}:
         return True
     if value_type.kind == "tensor":
         element = value_type.arguments[0] if value_type.arguments else None

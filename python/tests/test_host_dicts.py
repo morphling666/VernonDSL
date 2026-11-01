@@ -282,15 +282,18 @@ def _compile_error(tmp_path: Path, body: str) -> str:
             class Bag:
                 values: dict[f32, i32]
             """,
-            "dict keys are integers, bools, handles or str",
+            "dict keys are integers, bools, handles, enums or str",
         ),
         (
             """
             @vd.host
             class Bag:
                 values: dict[i32, Inner]
+
+                def peek(self) -> i32:
+                    return self.values.get(1, Inner()).ticks
             """,
-            "dict values are Host Values without classes",
+            "get would copy a class instance",
         ),
         (
             """
@@ -312,7 +315,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
                 def fill(self) -> None:
                     self.values = {1: 2.0}
             """,
-            "{} only empties a dict field",
+            "{} declares a dict local (x: dict[K, V] = {}) or empties a dict field or local",
         ),
         (
             """

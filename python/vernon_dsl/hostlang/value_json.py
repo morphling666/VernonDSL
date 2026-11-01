@@ -3,7 +3,8 @@
 Works on any `VhType`, from a Python-mode table or a loaded AOT object, so editors, inspection tools and error
 reports share one textual form of a value: Structs and classes are objects in field order, Tuples, Tensors and
 TensorStorages (nested by shape) and lists are lists, strs are strings, dicts are objects in insertion order whose
-keys are str keys or the JSON text of other keys ("7", "true"), handles are their uint64 bits, and non-finite floats
+keys are str keys, enum member names, or the JSON text of other keys ("7", "true"), handles are their uint64 bits,
+enums are their member's name (a value no member has stays a number; reading takes either), and non-finite floats
 are the strings "nan", "inf" and "-inf", which JSON has no numbers for. `vh_write_json` in `vernon_host/reflect.h`
 writes the same form from C.
 """
@@ -28,7 +29,7 @@ from .native import (
     replace_storage,
     reserve_record,
 )
-from .reflect import ARRAY, CLASS, DICT, HANDLE, KIND_CODES, LIST, STORAGE, STR, STRUCT, TUPLE, VhType
+from .reflect import ARRAY, CLASS, DICT, ENUM, HANDLE, KIND_CODES, LIST, STORAGE, STR, STRUCT, TUPLE, VhType
 
 _SCALARS = {
     KIND_CODES["bool"]: ctypes.c_bool,
@@ -56,10 +57,29 @@ def _fields(descriptor: VhType) -> list[Any]:
     return [descriptor.fields[index] for index in range(descriptor.field_count)]
 
 
+def _members(descriptor: VhType) -> list[tuple[str, int]]:
+    return [
+        (descriptor.enumerators[index].name.decode("utf-8"), descriptor.enumerators[index].value)
+        for index in range(descriptor.enumerator_count)
+    ]
+
+
+def _enumerators(descriptor: VhType) -> dict[int, str]:
+    """Each value's first member, the name JSON writes it as."""
+
+    names: dict[int, str] = {}
+    for member, value in _members(descriptor):
+        names.setdefault(value, member)
+    return names
+
+
 def to_json(descriptor: VhType, address: int) -> Any:
     """The JSON value of the `descriptor` value at `address`, as Python lists, dicts and scalars."""
 
     kind = descriptor.kind
+    if kind == ENUM:
+        value = ctypes.c_int32.from_address(address).value
+        return _enumerators(descriptor).get(value, value)
     if kind in _SCALARS:
         value = _SCALARS[kind].from_address(address).value
         if kind not in _FLOATS:
@@ -100,7 +120,7 @@ def to_json(descriptor: VhType, address: int) -> Any:
             at = record.entries + index * entry.entry_size
             if ctypes.c_uint64.from_address(at).value != _REMOVED:
                 text = to_json(key, at + entry.key_offset)
-                name = text if key.kind == STR else json.dumps(text)
+                name = text if isinstance(text, str) and key.kind in {STR, ENUM} else json.dumps(text)
                 result[name] = to_json(element, at + entry.value_offset)
         return result
     if kind in {STRUCT, CLASS}:
@@ -148,6 +168,37 @@ def _replace(
 
 
 _REMOVED = (1 << 64) - 1
+_INIT = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)
+_FINI = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+def _initialize(descriptor: VhType, address: int, path: str) -> Callable[[], None]:
+    """Gives a class element or value staged in zeroed scratch its field defaults, as `A()` does, before the
+    fields the JSON names are written over them."""
+
+    def write() -> None:
+        status = _INIT(descriptor.init)(address)
+        if status != 0:
+            raise ValueJsonError(f"{path}: initializing {descriptor.name.decode('utf-8')} failed with status {status}")
+
+    return write
+
+
+def _release_elements(descriptor: VhType, data: int, count: int) -> None:
+    if descriptor.fini:
+        fini = _FINI(descriptor.fini)
+        for index in range(count):
+            fini(data + index * descriptor.size)
+
+
+def _release_list(element: VhType, address: int) -> Callable[[], None]:
+    """Releases what the elements a list holds own, before the list is replaced."""
+
+    def write() -> None:
+        record = VhListRecord.from_address(address)
+        _release_elements(element, record.data, record.size)
+
+    return write
 
 
 def _entry_layout(descriptor: VhType) -> DictLayout:
@@ -158,17 +209,25 @@ def _entry_layout(descriptor: VhType) -> DictLayout:
 def _refill(
     address: int,
     entry: DictLayout,
-    value_size: int,
+    element: VhType,
     entries: list[tuple[Any, int, Any]],
     staged: list[Callable[[], None]],
     allocator: int | None,
 ) -> Callable[[], None]:
-    """Replaces a dict's entries with `entries`, (alive, key pointer, value buffer), once `staged` filled them."""
+    """Replaces a dict's entries with `entries`, (alive, key pointer, value buffer), once `staged` filled them. The
+    values replaced are released first, since clearing a dict releases only its keys."""
+
+    value_size = element.size
 
     def write() -> None:
         for step in staged:
             step()
         record = VhDictRecord.from_address(address)
+        if element.fini:
+            for index in range(record.used):
+                at = record.entries + index * entry.entry_size
+                if ctypes.c_uint64.from_address(at).value != _REMOVED:
+                    _release_elements(element, at + entry.value_offset, 1)
         clear_dict(address, entry, allocator)
         for _, key, value in entries:
             target = insert_dict_entry(record, key, entry, allocator)
@@ -187,7 +246,14 @@ def _plan(
 ) -> None:
     kind = descriptor.kind
     name = descriptor.name.decode("utf-8")
-    if kind in _SCALARS:
+    if kind == ENUM:
+        by_name = dict(_members(descriptor))
+        if isinstance(value, str):
+            if value not in by_name:
+                raise ValueJsonError(f"{path}: {name} has no member '{value}'; its members are {', '.join(by_name)}")
+            value = by_name[value]
+        writes.append(_store(ctypes.c_int32, address, _scalar(KIND_CODES["i32"], name, value, path)))
+    elif kind in _SCALARS:
         writes.append(_store(_SCALARS[kind], address, _scalar(kind, name, value, path)))
     elif kind == STR:
         if not isinstance(value, str):
@@ -198,21 +264,24 @@ def _plan(
     elif kind == LIST:
         if not isinstance(value, list):
             raise ValueJsonError(f"{path}: {name} expects a list")
-        # Elements are built in a zeroed scratch buffer, so an element object names all its fields or leaves
-        # the rest zero, and the list's memory is only grown once every element checked.
+        # Elements are built in a zeroed scratch buffer, so a Struct element object names all its fields or leaves
+        # the rest zero, while a class element starts from its defaults; the list's memory is only grown once every
+        # element checked. Class elements then move into the list, and those it held are released.
         element = descriptor.element.contents
         scratch = ctypes.create_string_buffer(len(value) * element.size)
         staged: list[Callable[[], None]] = []
         for index, item in enumerate(value):
-            _plan(
-                element, item, ctypes.addressof(scratch) + index * element.size, f"{path}[{index}]", staged, allocator
-            )
+            at = ctypes.addressof(scratch) + index * element.size
+            if element.kind == CLASS and element.init:
+                staged.append(_initialize(element, at, f"{path}[{index}]"))
+            _plan(element, item, at, f"{path}[{index}]", staged, allocator)
 
         def build() -> None:
             for write in staged:
                 write()
 
         writes.append(build)
+        writes.append(_release_list(element, address))
         record = VhListRecord.from_address(address)
         writes.append(_replace(record, scratch, len(value), element.size, element.alignment, allocator))
     elif kind == DICT:
@@ -225,7 +294,7 @@ def _plan(
         staged = []
         for text, item in value.items():
             entry_path = f"{path}[{text!r}]"
-            if key.kind == STR:
+            if key.kind == STR or (key.kind == ENUM and text in dict(_members(key))):
                 parsed: Any = text
             else:
                 try:
@@ -242,8 +311,10 @@ def _plan(
             else:
                 _plan(key, parsed, ctypes.addressof(key_scratch), entry_path, staged, allocator)
                 entries.append((key_scratch, ctypes.addressof(key_scratch), value_scratch))
+            if element.kind == CLASS and element.init:
+                staged.append(_initialize(element, ctypes.addressof(value_scratch), entry_path))
             _plan(element, item, ctypes.addressof(value_scratch), entry_path, staged, allocator)
-        writes.append(_refill(address, _entry_layout(descriptor), element.size, entries, staged, allocator))
+        writes.append(_refill(address, _entry_layout(descriptor), element, entries, staged, allocator))
     elif kind == ARRAY:
         element = descriptor.element.contents
         shape = [descriptor.shape[index] for index in range(descriptor.rank)]

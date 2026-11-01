@@ -11,7 +11,28 @@ from plugins"). Nothing here is specific to it.
 
 ## Decisions
 
-- **General purpose.** The language has no engine concepts. An application
+- **Not a general language: a glue language over native libraries.** Host
+  code integrates existing C and C++ libraries, develops fast in Python
+  mode, and deploys as AOT objects to desktop, mobile and web. Features are
+  chosen for that loop, not to compete with C++, Rust or Mojo as a systems
+  language.
+- **One binding per native function, used by both modes.** Python mode
+  calls the same C function an AOT object links, through
+  `ExternRegistry.bind_symbols` over an address table the library's nanobind
+  module exports. Both modes then run one native function with one argument
+  layout, so binding drift and Python-side conversions cannot make them
+  differ. Python callables (`ExternRegistry.bind`) are for what only exists
+  in Python, such as a torch policy on desktop.
+- **The Host extern module is the schema.** A library's `@vd.extern`,
+  `@vd.struct` and `@vd.handle` declarations are what Host code imports and
+  what the generator reads; there is no second declaration language. A
+  library with a C API needs only the externs. For a C++ library, VernonDSL
+  generates the C thunks and the nanobind module with its symbol table from
+  the same module. Application concepts, such as Vernon's components, are
+  generator extensions. Level 1 (`vernon_dsl.bindgen`) is implemented
+  ([`design.md`](design.md#libraries)); [`bindgen.md`](bindgen.md) proposes
+  the rest.
+- **No engine concepts.** The language serves any application. An application
   expresses its own (systems, components, phases) through `vd.meta` keys,
   its own extern modules and its own conventions, as Vernon does.
 - **A feature enters only with AOT semantics.** A construct is accepted only
@@ -32,6 +53,16 @@ from plugins"). Nothing here is specific to it.
   device storages live in instance fields and are freed with the instance. Nothing references into
   them from outside the instance, so there is no garbage collector and no
   reference counting, and migration and the place rules extend to them.
+- **`=` moves only where Python cannot tell.** Assigning a class instance
+  or container is accepted only from a new value or from a local that is
+  never used again, so Python's aliasing and the compiled move give the same
+  result. Copies are explicit. Reference counting was rejected: it would box
+  every instance (no inline class fields, no C struct layout), need weak
+  references for back links, atomic counts across threads, and identity in
+  JSON and migration. Graphs with back links (a node's parent) use an index
+  arena, or handles with generations, which act as weak references; a tree
+  whose children are only walked downward owns `list[Node]` and passes the
+  parent down.
 - **Callers reach Host code only through the module's reflection table.** An
   application calls methods by the addresses in `VhModule` and never caches
   them elsewhere. Swapping the table is then the whole of a reload in Python
@@ -68,9 +99,9 @@ comes after the Python-mode tools.
 reflection version 3 with the allocator slot and generated `fini`, and
 migration that moves containers are implemented and described in
 [`design.md`](design.md#containers) and
-[`language.md`](language.md#containers). `str` locals, `+` and f-strings
-are implemented and described in [`design.md`](design.md#strings) and
-[`language.md`](language.md#strings).
+[`language.md`](language.md#containers), and so are list and dict locals.
+`str` locals, `+` and f-strings are implemented and described in
+[`design.md`](design.md#strings) and [`language.md`](language.md#strings).
 
 ## Device resources
 
@@ -109,23 +140,24 @@ left out of its first version.
 ## Language growth order
 
 1. Small and broadly needed (bitwise operators and shifts have landed, in
-   device code too):
-   - `IntEnum`, and `match` over enums and scalars;
+   device code too, and so have `@vd.enum` IntEnums):
+   - `match` over enums and scalars;
    - `Optional[T]` for value types;
-   - recursion, which only device rules forbid. It is rejected today by
-     checks shared with device code (the module call graph, helper
-     specialization and typed-effect resolution); a recursive `@host`
-     function types against its declared result instead;
    - comprehensions over `range` and fixed Tensors, lowered to loops;
    - the [known gaps](language.md#known-gaps): `is`, Tensor `==`, Tuple
      indexing and nested `def`.
-2. Owned containers and strings: `list`, `dict` and `str` fields, and
-   `str` locals with f-strings, have landed.
+2. Owned containers and strings: `list`, `dict` and `str` fields and
+   locals, with f-strings, have landed, and so have class values (class
+   parameters, results and locals, lists and dicts of classes, recursive
+   types, and `@host` recursion) on move and borrow rules, and so have
+   explicit copies (`.copy()` and `copy.deepcopy`; `=` already copies a
+   `str`). Non-empty displays (`values: list[i32] = [1, 2]`) and
+   element-wise migration of a list of a class whose layout changed remain.
 3. Device resources, as above, on the ownership rules of the containers.
 4. `Protocol` interfaces, lowered to function-pointer tables and listed in
    reflection. They give polymorphism without inheritance, so a class layout
    stays a C struct, and they serve Vernon's general traits (Vernon
-   `architecture.md` section 11).
+   `architecture.md` section 11). Designed in [`protocols.md`](protocols.md).
 5. Errors: `raise HostError(code)` and `try`/`except` over statuses, on the
    existing status convention.
 

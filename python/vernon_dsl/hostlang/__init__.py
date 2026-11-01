@@ -25,6 +25,14 @@ def load_host_module(source_path: Any) -> HostProgram:
     return load(source_path)
 
 
+def library_identity(source_path: Any, name: str, version: int) -> str:
+    """The `<name>-v<version>:<hash>` schema identity of the `vd.library` module `source_path`."""
+
+    from .library import library_identity as identity
+
+    return identity(source_path, name, version)
+
+
 def address_of(instance: Any) -> int:
     """The address of a Host class instance's state, as C callers and the reflection table's methods take it."""
 
@@ -51,6 +59,7 @@ __all__ = [
     "HostStatus",
     "address_of",
     "default_registry",
+    "library_identity",
     "load_host_module",
     "load_host_program",
 ]

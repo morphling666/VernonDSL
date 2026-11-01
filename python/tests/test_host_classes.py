@@ -136,7 +136,7 @@ def test_nested_class_fields_are_views_of_the_parent(systems: Any) -> None:
 
     assert mover.timer.fired == 1
     assert mover.timer.elapsed == pytest.approx(0.15)
-    with pytest.raises(AttributeError, match="assign its fields"):
+    with pytest.raises(TypeError, match="takes a new Timer instance"):
         mover.timer = None
 
 
@@ -217,6 +217,15 @@ def test_reflection_lists_reachable_extern_calls(systems: Any) -> None:
     assert mover.fields[0].struct_size == ctypes.sizeof(VhField)
     assert methods["update"].struct_size == ctypes.sizeof(VhFunction)
     assert regen.methods[0].calls[0].struct_size == ctypes.sizeof(VhCall)
+
+
+def test_reflection_records_extern_and_handle_metadata(systems: Any) -> None:
+    mover = systems.type("Mover")
+    methods = {mover.methods[index].name.decode(): mover.methods[index] for index in range(mover.method_count)}
+    get_call, set_call = (methods["update"].calls[index] for index in range(2))
+    assert _meta(get_call) == {"cpp": "demo::getTransform", "owns": []}
+    assert _meta(set_call) == {}
+    assert _meta(systems.type("Entity")) == {"cpp": "demo::Entity", "header": "demo/entity.h"}
 
 
 def test_instances_read_and_write_as_json(systems: Any) -> None:
@@ -499,8 +508,21 @@ def _compile_error(tmp_path: Path, body: str) -> str:
 
                 def copy(self) -> None:
                     local = self.inner
+                    local = self.inner
             """,
-            "not copied into locals",
+            "a borrowed name is bound once",
+        ),
+        (
+            """
+            @vd.extern(symbol="demo_store", abi="status")
+            def store(value: T) -> None: ...
+
+
+            @vd.host(effects="pure")
+            def keep(scale: f32) -> None:
+                store(scale)
+            """,
+            "'store' takes a @struct value, not f32",
         ),
         (
             """
@@ -509,7 +531,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
                 point.x = 1.0
                 return point.x
             """,
-            "only fields reached through self are writable",
+            "only fields of class instances are writable",
         ),
         (
             """
@@ -532,11 +554,11 @@ def _compile_error(tmp_path: Path, body: str) -> str:
         ),
         (
             """
-            @vd.host
-            def poke(inner: Inner) -> None:
-                pass
+            @vd.func(shared=True)
+            def poke(inner: Inner) -> f32:
+                return 1.0
             """,
-            "is passed only as self",
+            "a Host class is not passed to one",
         ),
         (
             """
@@ -567,7 +589,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
                     self.inner.ticks = 1
                     self.inner = self.inner
             """,
-            "is a class instance",
+            "copy once stored in self.inner",
         ),
         (
             """
@@ -599,6 +621,7 @@ def _compile_error(tmp_path: Path, body: str) -> str:
     ],
     ids=[
         "copy-into-local",
+        "value-generic-scalar",
         "struct-field-store",
         "widening-update",
         "class-in-struct",
@@ -781,6 +804,8 @@ def test_c_application_drives_the_object_through_its_reflection_table(tmp_path: 
     from vernon_dsl.hostlang.reflect import include_dir
 
     artifacts = compile_host(SYSTEMS, prefix="demo_")
+    assert artifacts.reflection["externs"]["demo_get_transform"]["meta"] == {"cpp": "demo::getTransform", "owns": []}
+    assert artifacts.reflection["handles"]["Entity"]["meta"]["header"] == "demo/entity.h"
     paths = artifacts.write(tmp_path, "systems")
     consumer = PROGRAMS / "systems_consumer.c"
     executable = tmp_path / "consumer.exe"
@@ -851,8 +876,9 @@ def test_c_application_drives_the_object_through_its_reflection_table(tmp_path: 
         "regen_call=demo_read:1:Health",
         "regen_call=demo_read:1:Transform",
         "regen_call=demo_write:2:Health",
-        "mover_call=demo_get_transform:1:-",
-        "mover_call=demo_set_transform:2:-",
+        'mover_call=demo_get_transform:1:-:"demo::getTransform"',
+        "mover_call=demo_set_transform:2:-:-",
+        'entity_meta="demo/entity.h"',
         'health_json={"current":4.5,"maximum":5} needed=27',
         'truncated={"curre',
         "sizes=1 fini=null",

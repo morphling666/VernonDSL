@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import vernon_dsl.types as vd_types
 from host_aot import LinkedHost, toolchain
+from vernon_dsl.decorators import Library as vd_library
 from vernon_dsl.diagnostics import CompileError
 from vernon_dsl.hostlang import ExternRegistry, HostBindingError, HostExecutionError, HostStatus, load_host_program
 
@@ -249,6 +250,166 @@ def test_schema_mismatch_is_rejected(tmp_path: Path) -> None:
     assert module.run.call(registry=ExternRegistry().bind("engine_tick", lambda: 4, schema="abc")) == 4
 
 
+_PHYSICS_BINDING = """
+import vernon_dsl as vd
+from vernon_dsl import f64
+
+vd.library("physics", version=2, meta=vd.meta(cpp_namespace="physics::impl"))
+
+
+@vd.handle
+class World:
+    pass
+
+
+@vd.extern(effects="io")
+def world_create() -> World: ...
+
+
+@vd.extern(effects="write")
+def world_step(world: World, dt: f64) -> f64: ...
+
+
+@vd.extern(symbol="physics_legacy_gravity", effects="read")
+def gravity(world: World) -> f64: ...
+"""
+
+_PHYSICS_USER = """
+import vernon_dsl as vd
+from vernon_dsl import f64
+
+from physics_binding import gravity, world_create, world_step
+
+
+@vd.host(effects="io")
+def run(dt: f64) -> f64:
+    world = world_create()
+    return world_step(world, dt) + gravity(world)
+"""
+
+
+def test_library_names_its_extern_symbols(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "physics_binding.py").write_text(_PHYSICS_BINDING)
+    (tmp_path / "physics_user.py").write_text(_PHYSICS_USER)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "physics_binding", raising=False)
+    user = _load_module(tmp_path / "physics_user.py", "physics_user")
+    binding = sys.modules["physics_binding"]
+    declared: vd_library = binding.__vernon_library__
+    assert (declared.name, declared.version, declared.meta) == ("physics", 2, {"cpp_namespace": "physics::impl"})
+    assert binding.world_step.symbol == "physics_v2_world_step"
+    assert binding.gravity.symbol == "physics_legacy_gravity"
+
+    program = load_host_program(tmp_path / "physics_user.py", "run")
+    assert sorted(extern.symbol for extern in program.externs.values()) == [
+        "physics_legacy_gravity",
+        "physics_v2_world_create",
+        "physics_v2_world_step",
+    ]
+    registry = (
+        ExternRegistry()
+        .bind("physics_v2_world_create", lambda: 7)
+        .bind("physics_v2_world_step", lambda world, dt: world * dt)
+        .bind("physics_legacy_gravity", lambda world: -9.75)
+    )
+    assert user.run.call(2.0, registry=registry) == 14.0 - 9.75
+
+
+def test_library_identity_checks_bound_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from vernon_dsl.hostlang import library_identity
+
+    (tmp_path / "physics_binding.py").write_text(_PHYSICS_BINDING)
+    (tmp_path / "physics_user.py").write_text(_PHYSICS_USER)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "physics_binding", raising=False)
+    user = _load_module(tmp_path / "physics_user.py", "physics_user")
+    identity = library_identity(tmp_path / "physics_binding.py", "physics", 2)
+    assert identity.startswith("physics-v2:") and len(identity) == len("physics-v2:") + 16
+    assert sys.modules["physics_binding"].world_step.schema == identity
+    program = load_host_program(tmp_path / "physics_user.py", "run")
+    # An explicit symbol= keeps the library's identity; only schema= replaces it.
+    assert {extern.schema for extern in program.externs.values()} == {identity}
+    from vernon_dsl.hostlang.aot import compile_host
+
+    reflection = compile_host(tmp_path / "physics_user.py", ["run"], prefix="demo_").reflection
+    assert reflection["externs"]["physics_v2_world_step"]["schema"] == identity
+
+    callbacks = [
+        ctypes.CFUNCTYPE(ctypes.c_uint64)(lambda: 3),
+        ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_uint64, ctypes.c_double)(lambda world, dt: world + dt),
+        ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_uint64)(lambda world: 0.5),
+    ]
+    addresses = [ctypes.cast(callback, ctypes.c_void_p).value for callback in callbacks]
+    names = ["physics_v2_world_create", "physics_v2_world_step", "physics_legacy_gravity"]
+    symbols = dict(zip(names, addresses, strict=True))
+    native = SimpleNamespace(vh_schema=identity, vh_symbols=lambda: symbols)
+    assert user.run.call(1.25, registry=ExternRegistry().bind_module(native)) == 4.75
+
+    stale = SimpleNamespace(vh_schema="physics-v2:0000000000000000", vh_symbols=lambda: symbols)
+    with pytest.raises(HostBindingError, match="physics-v2:0000000000000000"):
+        user.run.call(1.25, registry=ExternRegistry().bind_module(stale))
+    with pytest.raises(HostBindingError, match="not a binding module"):
+        ExternRegistry().bind_module(SimpleNamespace())
+
+
+def test_library_identity_covers_layouts_not_metadata(tmp_path: Path) -> None:
+    from vernon_dsl.hostlang import library_identity
+
+    def identity(directory: str, source: str) -> str:
+        path = tmp_path / directory / "binding.py"
+        path.parent.mkdir()
+        path.write_text(source)
+        return library_identity(path, "physics", 2)
+
+    base = identity("base", _PHYSICS_BINDING)
+    assert identity("same", _PHYSICS_BINDING) == base
+    assert identity("meta", _PHYSICS_BINDING.replace('cpp_namespace="physics::impl"', 'cpp_namespace="x"')) == base
+    assert identity("effect", _PHYSICS_BINDING.replace('effects="write"', 'effects="io"')) != base
+    assert identity("type", _PHYSICS_BINDING.replace("dt: f64", "dt: f32")) != base
+    added = _PHYSICS_BINDING + "\n\n@vd.extern(effects='io')\ndef world_clear(world: World) -> None: ...\n"
+    assert identity("added", added) != base
+    generic = (
+        _PHYSICS_BINDING.replace(
+            "from vernon_dsl import f64", "from typing import TypeVar\n\nfrom vernon_dsl import f64"
+        )
+        + "\n\nT = TypeVar('T')\n\n\n@vd.extern(effects='read', abi='status')\n"
+        + "def read(world: World, kind: type[T]) -> T: ...\n"
+    )
+    generic_base = identity("generic", generic)
+    assert generic_base != base
+    assert identity("generic_effect", generic.replace("effects='read'", "effects='io'")) != generic_base
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            'vd.library("a")\nvd.library("b")\n',
+            "at most one vd.library",
+        ),
+        (
+            '@vd.extern\ndef early() -> i32: ...\n\nvd.library("a")\n',
+            "precedes the module's externs",
+        ),
+        ('vd.library("a", version=-1)\n', "non-negative integer"),
+        ('vd.library("not an identifier")\n', "C identifier"),
+    ],
+)
+def test_library_diagnostics(tmp_path: Path, source: str, message: str) -> None:
+    path = tmp_path / "bad_library.py"
+    path.write_text(
+        "import vernon_dsl as vd\nfrom vernon_dsl import i32\n\n"
+        + source
+        + '\n@vd.host(effects="pure")\ndef run() -> i32:\n    return 0\n'
+    )
+    with pytest.raises(CompileError, match=message):
+        load_host_program(path, "run")
+    with pytest.raises(ValueError, match=message):
+        _load_module(path, "bad_library")
+
+
 def test_native_extern_address_binds_through_ctypes() -> None:
     @ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_int32)
     def native_count(value: int) -> bool:
@@ -454,6 +615,29 @@ def test_rebinding_an_extern_reloads_the_compiled_module() -> None:
                 return bad()
             """,
             "body must be '...'",
+        ),
+        (
+            """
+            @vd.extern(symbol="bad", meta={"cpp": "x"})
+            def bad() -> i32: ...
+
+            @vd.host(effects="io")
+            def run() -> i32:
+                return bad()
+            """,
+            r"written as vd.meta\(key=value",
+        ),
+        (
+            """
+            @vd.handle(meta=vd.meta(cpp=len))
+            class Thing:
+                pass
+
+            @vd.host(effects="pure")
+            def run(thing: Thing) -> bool:
+                return thing == Thing()
+            """,
+            "metadata values are str, int, float, or bool",
         ),
         (
             """

@@ -17,6 +17,7 @@ from ..frontend.model import ConcreteType
 StructFields = Callable[[str], tuple[tuple[str, ConcreteType], ...]]
 # Types whose values own memory: a class field of one is released by the class's fini and moved, not copied.
 OWNED_KINDS = frozenset({"list", "str", "dict", "storage"})
+TRANSFERRED_KINDS = frozenset({"list", "str", "dict"})
 
 _SCALARS = {
     "bool": (1, "?"),
@@ -62,7 +63,12 @@ def members(value_type: ConcreteType, fields: StructFields) -> tuple[ConcreteTyp
     raise ValueError(f"{value_type.spelling} has no members")
 
 
+_ENUM_VALUE = ConcreteType("scalar", "i32")
+
+
 def layout(value_type: ConcreteType, fields: StructFields) -> Layout:
+    if value_type.kind == "enum":
+        value_type = _ENUM_VALUE
     if value_type.kind == "scalar":
         size, _ = _SCALARS[value_type.name]
         return Layout(size, size)
@@ -95,6 +101,27 @@ def layout(value_type: ConcreteType, fields: StructFields) -> Layout:
     raise ValueError(f"{value_type.spelling} has no Host layout")
 
 
+def transfer_item(value_type: ConcreteType) -> ConcreteType:
+    """What a span of a list or dict holds and an owned result of it is a list of: a list's element, or a dict's
+    `{K key; V value;}` entry as the Tuple with its layout."""
+
+    if value_type.kind == "dict":
+        key, value = value_type.arguments
+        assert isinstance(key, ConcreteType) and isinstance(value, ConcreteType)
+        return ConcreteType("tuple", "Tuple", (key, value))
+    element = value_type.arguments[0]
+    assert value_type.kind == "list" and isinstance(element, ConcreteType)
+    return element
+
+
+def transfer_record(value_type: ConcreteType) -> ConcreteType:
+    """The VhList an extern fills for an owned result of `value_type`: the str itself, or a list of its items."""
+
+    if value_type.kind == "str":
+        return value_type
+    return ConcreteType("list", "list", (transfer_item(value_type),))
+
+
 def dict_entry(value_type: ConcreteType) -> ConcreteType:
     """A `dict[K, V]` entry, `{uint64_t hash; K key; V value;}`, as the Tuple with its layout."""
 
@@ -113,6 +140,8 @@ def pack(value: object, value_type: ConcreteType, fields: StructFields) -> bytes
 
 
 def _pack_into(buffer: bytearray, offset: int, value: object, value_type: ConcreteType, fields: StructFields) -> None:
+    if value_type.kind == "enum":
+        value_type = _ENUM_VALUE
     if value_type.kind == "scalar":
         struct.pack_into("<" + _SCALARS[value_type.name][1], buffer, offset, value)
     elif value_type.kind == "handle":
@@ -138,6 +167,8 @@ def unpack(data: bytes | bytearray | memoryview, value_type: ConcreteType, field
 def _unpack_from(data: bytes, offset: int, value_type: ConcreteType, fields: StructFields) -> object:
     from .values import scalar_value
 
+    if value_type.kind == "enum":
+        value_type = _ENUM_VALUE
     if value_type.kind == "scalar":
         (raw,) = struct.unpack_from("<" + _SCALARS[value_type.name][1], data, offset)
         return scalar_value(raw, value_type.name)

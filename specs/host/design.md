@@ -131,6 +131,26 @@ source.py -> module graph -> class lowering -> typed Host model (frontend.py)
   mode the sources run in order, and while a later one runs, importing an
   earlier one by name finds the module this `HostModule` ran, so both
   modes bind the same class objects.
+- **Packages ship Host sources, and the deployable unit compiles them
+  together.** A Host package is a Python package, so its wheel already holds
+  its `.py` sources. An application or Program asset compiles everything it
+  reaches from other packages into its own object, found along `sys.path` or
+  through an editable install's finder. Packages are named by import name,
+  so an editable checkout and an installed wheel compile alike. Whole-program
+  compilation is chosen over objects per library:
+  - generic functions specialize for the importer's types;
+  - calls between packages inline;
+  - no binary interface between packages needs to stay stable;
+  - one object fits every target.
+
+  Objects per library would also put a private copy of a shared class's
+  functions in each library's object, fragile once instances cross between
+  them. A boundary between separately built units (the engine, binary
+  plugins) is a `vd.library` of externs instead (bindgen.md). Host classes,
+  handles and enums keep bare names in the object, so two packages' Host
+  classes of one name cannot share an object. In Python mode a package
+  module runs in its package (`__package__` set, its import root
+  importable), so its imports bind the classes an ordinary import does.
 - **Cooking** (`_program_assets/host_cooking.py`) targets `cpu` only, since
   the object is native code for one triple. The output directory holds:
   - `<dir>.program.json`, with `"type": "host_module"`, the id, the target,
@@ -176,33 +196,67 @@ defaults, and methods taking a mutable `self`.
 - **Methods.** Undecorated methods are `effects="io"`; `@vd.host(effects=...)`
   narrows one method. A leading underscore makes a method private: it is
   callable inside the module, but not exported.
-- **Places.** An instance is a place, not a value: `self` is the instance
-  pointer, and field and element accesses rooted at it compile to address
-  arithmetic with loads and stores.
-  - A class value cannot be copied into a local, returned, or held in a
-    Struct, tuple or array.
-  - A class value can only be a class field or `self`; the application owns
-    the top-level instances.
-  - The only writable places are fields reached through `self`.
-  - `+=` must keep the field's type.
-  - Containment cycles are rejected.
+- **Places.** An instance is a place, not a value: a class parameter is the
+  instance pointer, and field and element accesses rooted at it compile to
+  address arithmetic with loads and stores. `+=` must keep the field's type.
+- **Ownership** (`ownership.py`, run after typing). Python shares an instance
+  where C would copy it, so the checker admits only programs in which no
+  instance is reachable through two owners, which makes the two
+  indistinguishable without copying anything. The model is Rust's, without
+  lifetimes in the syntax:
+  - Parameters, locals bound to a place and loop elements borrow;
+    constructors, calls returning a class and pops create; owned locals hold
+    a created instance until it moves. A move is a `memcpy` and a zeroed
+    source, so releasing every owned slot at `vh.exit` needs no drop flags;
+    `_MoveFlow`, a forward dataflow over statements with a loop fixpoint,
+    rejects a use that some path reaches after a move.
+  - Borrows are paths: a root, then field names, with `*` for any element.
+    Restructuring a path invalidates the borrows it is a prefix of: whole
+    assignment of a class field or element, `append`, `pop`, `clear`, `del`,
+    and rebinding an owned or container local. A summary records, per
+    function, the parameters it may restructure through, transitively; it
+    is a fixpoint over the call graph, since `@host` functions may recurse.
+  - A borrowed local is bound once, rooted at a parameter and reached through
+    fields only. An element moves whenever its container grows, so naming
+    one outside a loop over the container would need every later operation
+    proved harmless; indexing it at each use stays simple and safe.
+- **Results and temporaries.** A class result is built in the caller's out
+  pointer, which holds no instance. A created instance passed as an argument
+  lives in a zeroed temporary slot the caller releases after the call, so
+  `weigh(make_item(3), 1)` frees what `make_item` allocated.
+- **Containers of classes.** Elements are stored inline, like values. The
+  runtime's list and dict functions move bytes and release only str keys, so
+  the emitter releases elements: `vh.release_elements.<type>` runs each
+  element's fini before `clear`, `[]`, `{}` and the container's own fini, and
+  `del` and stores release the one value they replace. Python mode's
+  `HostList` and `HostDict` do the same over the same records, and move an
+  instance in by copying its state and zeroing the Python object's.
+- **Recursive types.** A class may hold a list or dict of itself; a class
+  inline in itself would have no finite size and stays rejected. The layout
+  hash spells a class met inside its own spelling by name, the header
+  declares such a class ahead (`typedef struct Node Node;`), and the C++
+  `vh::List<T>` checks `T` only in the operations that copy elements, so the
+  class body can name its own incomplete type.
 - **Why these rules.** Value semantics for classes would need copies of every
   nested class and hidden temporaries in the ABI. Place semantics keep a
   method a plain C function over a pointer the application allocated. That is
-  what an engine stores in its own tables and hands to a scheduler.
-- **No class locals in v1.** Instances exist only in application memory or as
-  fields of other classes. This removes lifetime and aliasing questions until
-  a real use needs a local.
+  what an engine stores in its own tables and hands to a scheduler; moves and
+  borrows add owned instances without changing that ABI.
 - **No inheritance, dunder methods or `self` annotations.** Composition
   through class fields covers reuse without vtables, so the layout stays a C
   struct.
 
 ## Metadata and docstrings
 
-- `vd.meta(**entries)` attaches metadata in three places:
+- `vd.meta(**entries)` attaches metadata in six places:
   - classes: `@vd.host(meta=...)`;
   - Structs: `@vd.struct(meta=...)`;
-  - fields: `Annotated[T, vd.meta(...)]`.
+  - fields: `Annotated[T, vd.meta(...)]`;
+  - handles: `@vd.handle(meta=...)`, on the handle's `VhType`;
+  - enums: `@vd.enum(meta=...)`, on the enum's `VhType`;
+  - externs: `@vd.extern(meta=...)`, on every `VhCall` reaching the extern
+    and in the AOT reflection JSON. Binding generators keep their C++
+    mapping here ([bindgen.md](bindgen.md)).
 - A string literal directly after a field is that field's docstring.
 - Metadata values must be compile-time constants (numbers, strings, booleans,
   None, and tuples of them). They are stored as JSON text, so the language
@@ -232,14 +286,19 @@ exported constant.
     `key`, a member appended to `VhType`;
   - for a TensorStorage (kind 16), its element type, rank, and static
     extents in `shape`, with 0 for `dyn`;
+  - for an enum (kind 17), `i32` in `element` and its members in
+    declaration order as `VhEnumerator {name, int64_t value}` records in
+    `enumerators`, appended members of `VhType`; `vh_enum_name` finds a
+    value's first member;
   - plus the module's free functions, and the module's allocator slot.
 - **Call-site reflection.** Each function lists the externs it can reach,
   through any chain of helpers and methods, as `VhCall` entries: the C
-  symbol, the extern's declared effect, and for a generic extern the Struct
-  descriptor that call passes. The bound type at a call site is static, so the
-  list is exact. An application derives type-granular access from it, such
-  as the components a system reads and writes, instead of trusting a
-  hand-written list.
+  symbol, the extern's declared effect, for a generic extern the Struct
+  descriptor that call passes, and the extern's metadata (`meta` and
+  `meta_count`, appended members). The bound type at a call site is static,
+  so the list is exact. An application derives type-granular access from
+  it, such as the components a system reads and writes, instead of trusting
+  a hand-written list.
 - **Growth.** The module, type, field, function and call records start with
   their `struct_size`, and later versions only append members. C code indexes
   record arrays through `vh_field_at`, `vh_method_at`, `vh_function_at` and
@@ -253,10 +312,13 @@ exported constant.
   - Structs and classes are objects in field order; Tuples, Tensors and
     TensorStorages (nested by shape, as numpy's `tolist`) and lists are
     lists; `str`s are strings; handles are their
-    bits; non-finite floats are `"nan"`, `"inf"` and `"-inf"`.
+    bits; enums are their first matching member's name, or the number when
+    no member has the value, and read back from either; non-finite floats
+    are `"nan"`, `"inf"` and `"-inf"`.
   - A dict is an object in insertion order. JSON keys are strings, so a
-    non-`str` key is written as its own JSON text: `{"7": 1.5}`,
-    `{"true": 2}`.
+    `str` key or an enum member's name is the key itself, and any other key
+    is written as its own JSON text: `{"7": 1.5}`, `{"true": 2}`,
+    `{"RUN": 3}`.
   - An edit may name only some fields, and every check runs before any write,
     so a rejected edit changes nothing. A list, dict, `str` or TensorStorage
     is replaced whole, growing through the module's allocator; a storage's
@@ -330,6 +392,20 @@ frees it.
   container fields, recursively through class fields. Each leaves the
   records zeroed, so a released instance reads as empty. The application
   calls `fini` before freeing an instance it allocated.
+- **Copies.** `vh.copy.<type>(target, source) -> status` deep-copies into
+  zeroed memory, beside `fini`. A list reserves the source's size, then
+  memcpys elements that own nothing or copies each in turn, counting it in
+  the target's size first. A dict inserts each live key in insertion order
+  (a `str` key's record starts with the `{data, size}` view `Insert` takes)
+  and copies the value into the entry `Insert` zeroed. A class memcpys its
+  bytes, then zeroes and copies each field that owns memory. A failure
+  returns the status with a partial copy that `fini` frees, so the
+  assignment copies into a temporary record and only then releases the
+  target and moves the copy in. Python mode's `HostList`, `HostDict` and
+  class `__deepcopy__` call the same steps through ctypes (`copy_at` on
+  each codec), so `copy.deepcopy` of a Python-mode instance is the
+  compiled copy. Python mode's list and dict field setters likewise fill a
+  record of their own before releasing the field's.
 - **Evaluation order.** `append(v)` evaluates `v` before growing, and an
   index or key is evaluated before the size and data are read, because
   evaluating either may change the container. An augmented assignment
@@ -386,14 +462,28 @@ frees it.
   instance's state rather than the instance, so a view that outlives it reads
   zeroed, empty records. An instance C creates through the table is freed
   by C, through the table's `fini` trampoline.
-- **Why fields only.** Containers as locals, parameters or results would
-  need moves or copies at every boundary and destructors on every exit
-  path. Keeping them in instance fields keeps the ownership rule to "the
-  instance frees it", which the place rules already enforce: a container is
-  reached only through `self` and never escapes. `str` locals are the one
-  exception, since a `str` is a value: it is copied on assignment, never
-  aliased, and never leaves its function except as an extern argument,
-  which only borrows it. TensorStorage locals are the other, below.
+- **Fields and locals, never passed.** Containers as parameters or results
+  would need moves or copies at every boundary. A container is owned by
+  exactly one instance or one function call, and freed by it, so there is
+  no reference counting:
+  - A field is freed by the instance's `fini`.
+  - A local is one of the function's owned records, as `str` and
+    TensorStorage locals are: zeroed at entry, released in the `vh.exit`
+    block every return and failing status goes through. Its name is the
+    record's address, as `self.d` is for a field, so every container
+    operation takes either.
+  - Neither escapes: a container is used only in place, never assigned to
+    another name, passed or returned. Python would alias where C would copy
+    the record.
+- **Locals are Python containers in Python mode.** Host code runs as
+  written, so `counts: dict[K, V] = {}` makes a Python `dict`, and Python
+  mode does not rewrite it into a `HostDict` over allocated memory. That
+  keeps a local a plain value in a debugger. It fits the existing rule
+  that between boundaries locals hold whatever Python computes. The cost is
+  that a local's failures are Python's (`KeyError`, `IndexError`,
+  `RuntimeError`) where a field's are `HostExecutionError` statuses.
+  Rebinding a local that a loop iterates is rejected, because that is the
+  one use where a new Python container and a cleared C record differ.
 
 ## Tensor storages
 
@@ -501,17 +591,248 @@ frees it.
 
 - **Declaration.** An extern parameter `type: type[T]` (with
   `T = TypeVar("T")`) makes the extern generic over Structs. Other parameters
-  and the result may mention `T`.
-- **Call sites.** Each call site's Struct argument specializes the extern
-  (`name__Struct`) for type checking. The C symbol is shared: the descriptor
-  `const VhType *` is inserted at the parameter's position, and every
-  `T`-typed value is passed by pointer.
+  and the result may mention `T`. Without one, the first parameter annotated
+  `T` binds it: Host code passes a Struct value there, as in
+  `write(entity, Health(...))`, and its static type is the bound Struct.
+- **Call sites.** Each call site's Struct specializes the extern
+  (`name__Struct`) for type checking: the type argument names it, or
+  inference types the value. A value-bound extern is declared for every
+  Struct of the program before inference and the uncalled specializations
+  are dropped after, because only inference knows a value's type. The C
+  symbol is shared: the descriptor `const VhType *` is inserted at the
+  type parameter's position, or just before the binding value, and every
+  `T`-typed value is passed by pointer. Both forms therefore have the same C
+  signature, and a library can switch a setter between them without
+  changing its C API.
+- **Which form.** A function with a `T` value to pass takes the value form,
+  so a call does not name its Struct twice; a getter, `has` or `remove`,
+  which has no value, takes `type[T]`.
+- **Module graph.** A combined module drops its modules' assignments, so
+  each extern keeps the names its own module binds to `TypeVar`; an
+  importer's names never make an extern generic.
 - **Python bindings.** A binding serves every specialization. It receives the
-  descriptor and receives and returns `T` values as field dicts.
+  C parameters, the descriptor included, and receives and returns `T` values
+  as field dicts; in the value form Python mode takes the descriptor from
+  the value's class.
 - **Why.** An engine exposes one `read`/`write`/`has` entry point over
   component storage it never compiled against. That storage is keyed by the
   descriptor and copies `descriptor->size` bytes, which is how script-declared
   components reach a C++ engine without generated C++ per type.
+
+## Spans and owned results
+
+The rules are in language.md (Externs). They let a library take and return
+variable-size data, such as a component's name or its child list, without
+any engine-specific declarations.
+
+- **Spans borrow.** A list argument passes the field's own data pointer and
+  size. A dict argument is laid out as a temporary list of `{K key; V value;}`
+  entries, which the function owns and releases at exit. Elements are plain
+  values, so C reads them as bytes. Python passes the container object
+  itself, and compiled code reads it when the argument is reached. A later
+  argument that calls a Host function, method or extern could change or
+  rebind the container in between, so the validator rejects one.
+  Copying would not help: a `str` field is copied because Python strs are
+  immutable, but a copied list would miss changes Python sees.
+- **The callee fills an empty record.** C APIs often have callers pass a
+  buffer and retry when `BUFFER_TOO_SMALL` comes back. That calls the
+  function twice, so an `io` extern's effect would happen twice, and a
+  result can change between the calls. Instead the extern receives a zeroed
+  `VhList` and the allocator to fill it with, and is called once. Every
+  result is a list, so one record type and one release path serve `str`,
+  list and dict.
+- **A dict result is a list of entries.** C has no hash table to hand back,
+  and building one would tie the library to VernonRuntime's layout. The
+  caller inserts the entries in order into a new dict, so a repeated key
+  keeps its last value, as in a Python dict literal.
+- **Received like a copy.** The call is only ever the value of an
+  assignment. The result is built in a record of the function's own, then
+  the target is released and the result moved in, as `assign_copy` does. A
+  failed call leaves the target unchanged, and the function's exit releases
+  whatever the extern left in the record.
+- **Never a NULL allocator.** VernonRuntime's NULL allocator means its own
+  `malloc` and `free`. Shipped builds link the Host object, VernonRuntime
+  and the libraries statically (iOS, web, packaged desktop), so there is one
+  heap. During development, Python mode loads `vernon_dsl._native` and each
+  library's nanobind module as separate shared libraries. On Windows each
+  can link its own C runtime, so a library's `malloc` and VernonRuntime's
+  `free` would use different heaps. Callers therefore pass the module's
+  allocator or `vernonRuntimeHostDefaultAllocator()`, a plain function of
+  the static runtime. That works the same in both setups and costs one
+  indirect call per result in a static build.
+
+## Enums
+
+- **Declared as `IntEnum`.** A `@vd.enum` class is a standard
+  `enum.IntEnum`, so the same class is the Python-mode value, a binding
+  generator's input and an ordinary Python enum to tools that never heard
+  of Host code.
+- **Always `int32_t`.** C leaves the size of an `enum` type to the compiler,
+  so the header spells the type `typedef int32_t Name;` and the members as
+  an anonymous `enum` of constants; Struct layouts and the call ABI never
+  depend on the C compiler. One fixed underlying type keeps the layout,
+  reflection and JSON rules single; a library with wider values binds them
+  as integers.
+- **Equality only.** Ordering, arithmetic, comparing with an integer and
+  `Mode(x)` are rejected, so every use of an enum names its constants and
+  a renumbering cannot change what Host code means. `i32(mode)` is the
+  explicit way out.
+- **Unknown values survive.** C code may pass a value no member has. Python
+  mode then holds a plain `int` instead of raising, and JSON writes the
+  number, so a value crosses both modes and every tool unchanged.
+- **Names across modules.** An enum keeps its declared name in the module
+  graph, as Structs and handles do, because reflection and the header name
+  it.
+
+## Libraries
+
+- **Default symbols.** `vd.library(name, version)` gives the module's externs
+  declared without `symbol=` the symbol `<name>_v<version>_<function>`, so
+  libraries do not collide and a version change renames every symbol.
+- **One rule in both modes.** The module graph applies it while emitting the
+  declaring module's externs, by their declared names, so an importing
+  module's prefix never reaches the symbol. In Python mode `vd.library`
+  records itself in the calling module's globals, where `@vd.extern` reads
+  it. Both reject a `vd.library` after an extern, the one order in which
+  they would disagree.
+- **Schema identity.** A library's identity is `"<name>-v<version>:<hash>"`
+  (`hostlang.library_identity`), and it is the schema of the module's
+  externs that do not declare `schema=`, so the existing check rejects a
+  binding from another revision: at load for a compiled module or an eager
+  runtime, at the first call otherwise.
+  - The hash covers the module's Struct and handle layouts, its enums'
+    members and values, and each extern's
+    symbol, effect, ABI and canonical parameter and result layouts. A
+    generic extern counts as its signature as written, since only call
+    sites type it.
+  - Metadata is not covered: it changes how a generator reaches C++, not
+    the C functions a binding calls.
+  - It is computed by loading the library module alone, with no `@host`
+    code required, and cached by the digests of the files it was computed
+    from. Python mode's `ExternFunction.schema` computes it on first use.
+- **`ExternRegistry.bind_module(module)`** binds a generated module's
+  `vh_symbols()` address table under its `vh_schema`, and its
+  `vh_last_error()` when it has one: Python mode then adds the library's
+  message to the `HostExecutionError` of a failing status extern.
+
+### Level 1 bindings (`vernon_dsl.bindgen`)
+
+`python -m vernon_dsl.bindgen generate|check <module.py> [--output-dir DIR]
+[--pyi PATH]` reads a `vd.library` module with `meta=vd.meta(cpp_namespace=...)` and emits
+`<name>_api.h`, `<name>_api_impl.h`, `<name>_api_thunks.cpp`,
+`<name>_api_nanobind.cpp` and `<name>_api.pyi`. `check` exits 1 when a
+committed output differs. The rest of the proposal is in
+[`bindgen.md`](bindgen.md).
+
+- **One C function per extern, in both modes.** The thunks are the C
+  functions: the nanobind module publishes their addresses for Python mode,
+  and AOT objects link them. The nanobind module's Python functions call the
+  same C functions, for scripts that use the library without Host code.
+- **The C header** spells types as AOT headers do (`aot.type_declarations`,
+  with the camel-cased library name as type prefix) and declares
+  `<name>_v<version>_last_error(buffer, capacity)` and
+  `<name>_v<version>_schema()`, the identity also defined as
+  `<NAME>_V<VERSION>_SCHEMA`. A `str` argument is `VhStrArg` (`reflect.h`).
+- **Type descriptors.** `<name>_v<version>_types(&count)` lists `VhType`
+  descriptors of the library's Structs, handles and enums, which the thunks
+  define as constants from the records `reflect.describe` builds for Host
+  objects. A Struct's layout hash is therefore the one Host code passes to
+  a generic extern, and a library can read field names, offsets and
+  metadata from them, as for scene files. They describe layout only: no
+  `fini`, `init` or methods.
+- **The C++ side** (`vernon_host/bindgen.hpp`): status externs return
+  `vh::Result<T>` or `vh::Status`; direct externs return the value and must
+  not throw. Structs arrive as `const T &`, Tensors as `const T (&)[N]`,
+  `str` as `std::string_view`, enums and handles without `cpp=` as their C
+  types.
+- **Value handles**, with `cpp=` and `convert=<name>`: the bits are a C++
+  value, such as an entity id, which the library converts with
+  `Cpp <name>(C)` and `C <name>(const Cpp &)` in `cpp_namespace`. No table
+  holds them; the implementation receives and returns the C++ value.
+- **Handles with `cpp=`** live in a `vh::HandleTable<T>` the thunks own:
+  index and generation in the 64 bits, generations from 1, so the zero
+  handle and a destroyed handle's bits never find an object. A creating
+  extern's implementation returns `vh::Result<std::unique_ptr<T>>`; an
+  extern with `destroys="<parameter>"` takes the object out of the table
+  before calling the implementation, which receives the `std::unique_ptr`,
+  so the handle is gone even when the call fails. Taking or returning such a
+  handle requires `abi="status"`, since a stale handle must fail. Its
+  parameter is `const T &` for `pure` and `read` externs and `T &` otherwise.
+- **Dependent handles**, with `depends_on="<Handle>"`: each extern creating
+  one takes exactly one parent of that handle, whose bits the table records.
+  Destroying the parent first takes every object created with it and
+  destroys each, its own dependents first, through its destroying extern's
+  implementation, which must take only the handle. The cascade runs after
+  the parent's handle is gone, so no new dependent is created with it, and a
+  failure does not stop the others: the first is the result. This is how an
+  object that refers to another (a viewport to its world) cannot outlive it.
+- **Statuses.** Thunks report `vh::kFailed` (1), `vh::kInvalidHandle` (2)
+  and `vh::kOutOfMemory` (3) themselves, and a thrown C++ exception becomes
+  one of these, because C callers cannot unwind it. An implementation's
+  status of zero or below is reported as `kFailed`, so positive statuses
+  stay the library's and negative ones Host code's. The message goes to a
+  thread-local last error.
+- **Spans and owned results**, in C++17 types (no `std::span`). A list
+  parameter is `vh::Span<T>` and a dict parameter `vh::Span<vh::Entry<K,
+  V>>`, borrowed for the call. An owned result is `vh::Result<std::string>`
+  or `vh::Result<std::vector<T>>` (a dict as a vector of entries, in
+  order); the thunk copies it into `*out` through the caller's allocator
+  with `vh::assign_result`, and fails with `vh::kOutOfMemory` when that
+  allocator cannot hold it. The nanobind module passes its own malloc
+  allocator and returns Python lists and dicts.
+- **Generic externs** keep their `type[T]` parameter as `const VhType *` in
+  C and `const VhType &` in C++, and a value-bound one has a parameter
+  `type` there; `T` values are `const void *` (a result, `void *out`) of
+  `type.size` bytes. The thunk rejects a null descriptor. In nanobind the
+  argument is the bound Struct's class, whose `vh_type` is the library's
+  descriptor: a value must be an instance of it, and a result is a new one.
+  A value-bound function takes no class; the value's class gives the
+  descriptor.
+- **The effect check**, with `effect_check=<name>` on `vd.library`: every
+  `abi="status"` thunk of a non-pure extern calls
+  `vh::Status <name>(const VhCall &call[, const T &object])` in
+  `cpp_namespace` after its handles resolve and before the implementation,
+  and returns the refusal as the call's status. `call` is a static
+  `VhCall` with the extern's effect, symbol and `meta=` entries; a generic
+  extern's thunk passes a copy whose `type` is the call's descriptor.
+  `object` is that of the extern's first table handle parameter, and
+  `<name>_api_impl.h` declares one overload per object type the externs
+  pass, plus the one without. A destroying extern finds its object, asks,
+  and only then takes it, so a refused destroy leaves the handle live.
+  - Why a hook rather than a check per implementation: an application's
+    rules (Vernon's "structural changes only from a structural system")
+    then hold for every function, including ones added later, and read the
+    same facts the schema declares, its effects and metadata, instead of
+    restating them in C++.
+  - Direct externs skip it: they cannot fail, so they cannot report a
+    refusal. A library that needs to refuse one declares it `abi="status"`.
+- **Stub placement.** `--pyi PATH` writes the stub to `PATH` instead of
+  the output directory, and `check` compares it there, so it can sit beside
+  the Python module that re-exports the extension's names, where editors
+  find it. The stub gives each Struct its field constructor and re-exports
+  `HostExecutionError`, which the nanobind module also sets as an
+  attribute, so callers catch failures from the module they call.
+- **Structs with `cpp=`**: without `convert=`, the thunks cast between the
+  C and C++ types after `static_assert`s on size, alignment and trivial
+  copyability. With `convert=<name>`, `<name>_api_impl.h` declares
+  `Cpp <name>(const C &)` and `C <name>(const Cpp &)` in `cpp_namespace`,
+  which the library defines. A list or dict of converted Structs or value
+  handles converts item by item into a `std::vector` the `vh::Span` views,
+  and a result's items back. Table handles cannot be items, as each would
+  need a table lookup.
+- **Python handle classes.** Each handle is a class over its C struct, with
+  `bits`, equality and hashing by bits, and `__index__`, so Host calls in
+  Python mode take it. A table handle with a one-parameter destroying extern
+  has a subclass `<Handle>.Owned`, which its creating functions return and
+  which destroys the object when collected. An explicit destroy zeroes the
+  object's bits, so collecting it does nothing. A dependent handle's
+  `Owned` object keeps its parent's Python object alive (`keep_alive`), so
+  collection cannot destroy the parent under it. `Handle(bits)` names an
+  object without owning it.
+- **Not yet generated** (rejected with `BindgenError`): Tuple parameters or
+  results, and lists of `str`.
+- **No formatter runs.** Outputs are emitted in the project's style, so
+  `check` does not depend on clang-format or ruff versions.
 
 ## State migration
 
@@ -582,6 +903,21 @@ application uses:
   its externs, and drives it again. Both reports must be identical, and
   withdrawing the Python-mode table restores the linked one.
 
+`python/tests/test_host_copies.py` runs `host_programs/copies.py`, which
+copies lists, dicts, storages, class instances and containers of them and
+then changes the copy, in Python mode and against the linked library. Both
+must give identical results and release everything under a counting
+allocator. It also covers `copy.deepcopy` of a whole instance from Python,
+and the copy diagnostics.
+
+`python/tests/test_host_packages.py` builds two `src/` layout projects, where
+one imports a class and a function from the other. The other is found
+through `sys.path` or through a setuptools-style editable finder. The
+importer's module must compile, run in Python mode and run linked, with the
+other's code named by its import name in a checkout and in an installed
+copy alike. It also covers imports inside one `src/` layout package and the
+diagnostic for names a Python import brought in.
+
 `python/tests/test_host_containers.py` runs one script of every list and
 `str` operation on `host_programs/inventory.py` in Python mode and against
 the linked library, and requires identical results. The `LinkedHost` shim
@@ -604,6 +940,34 @@ every allocation released, including on early returns; the program covers
 every format type, fill, alignment and sign, `str` locals, `+` and `+=`,
 borrowed and copied field operands, dict keys bound in loops, and
 non-ASCII text. It also covers the `str` diagnostics.
+`python/tests/test_host_composition.py` runs `host_programs/composition.py`,
+where a class holds classes (one two levels down) that each own a list,
+dict, `str` and `TensorStorage`, through nested fields and nested method
+calls. It requires identical results in Python mode and AOT, and that the
+outer `fini` releases every allocation.
+`python/tests/test_host_class_values.py` runs `host_programs/class_values.py`
+in Python mode and AOT with a counting allocator: class parameters and
+results, owned and borrowed locals, moves into fields, elements and dict
+values, pops, temporaries, and a `Node` tree holding `list[Node]` built by
+recursive methods; nothing may stay allocated after `fini`. It also checks
+JSON rebuilding lists and dicts of classes from their defaults, Python
+callers moving instances, the header declaring the recursive class for C and
+C++, and a diagnostic for each ownership rule.
+`python/tests/test_host_container_locals.py` runs
+`host_programs/container_locals.py` in Python mode and against the linked
+library with a counting `VhAllocator`. It covers list and dict locals
+(enum, `str` and integer keys, Struct elements), declarations in a loop
+body, early returns, a missing key and a failing extern, and requires
+identical results with every allocation released. It also covers the
+container local diagnostics.
+`python/tests/test_host_enums.py` runs `host_programs/enums.py` in Python
+mode and against the linked library: enum parameters, results, aliases,
+Struct and Tuple items, values no member has, and an extern taking and
+returning an enum. It also covers enum dict keys and class fields through
+the Python-mode table and JSON, the reflection records, the header and
+reflection JSON, the library identity, the diagnostics, and a C program
+(`host_programs/enums_consumer.c`) that uses the header's constants and
+writes enum JSON with `vh_write_json`.
 `python/tests/test_host_storages.py` runs `host_programs/storages.py` in
 Python mode and against the linked library with a counting allocator, and
 requires identical results, statuses and logs, and every allocation
@@ -614,6 +978,32 @@ instance memory, JSON, migration, the header's `VH_STORAGE` fields and the
 storage diagnostics. The consumer fixture's `Trail` holds two storages; the
 fixture indexes them through `vh::TensorStorage`, resizes one, checks its
 `VernonTensorView`, and moves it with `vh_migrate`, in both modes.
+`python/tests/test_bindgen.py` covers level 1 bindings on the sample
+library `bindgen_sample/tally.py`, a C++ `tally::Counter` (`cpp/`) whose
+generated outputs are committed in `generated/`. CMake builds its nanobind
+module `tally_api` with `BUILD_TESTING`, next to the sample. The tests run
+the drift check (and that `check` reports an edited or missing output) and
+call the nanobind functions. They run `bindgen_sample/tally_user.py` in
+Python mode through `bind_module` and from a linked AOT object over the same
+library, and require identical results and statuses for successful runs, a
+library failure, a destroyed handle, and live-object counts. The sample
+passes list and dict spans (with a repeated dict key), receives `str`, list
+and dict results, converts a `Range` Struct, casts a `Sample` Struct, and
+stores a Host Struct through generic externs keyed by its descriptor. They
+also link a C program (`bindgen_sample/consumer.c`) from the Host object,
+the thunks, the library and VernonRuntime's container functions compiled
+with `VERNON_RUNTIME_STATIC`, as a static mobile or web build links them,
+and cover the generator's rejections.
+`python/tests/test_host_transfers.py` runs `host_programs/transfers.py`
+against Python bindings and against C implementations
+(`host_programs/transfers_impl.c`, built with `vh_list_assign`). It runs
+them in Python mode and from the linked library with a counting allocator,
+and requires identical results, with every allocation released and released
+at its allocated size. The program passes list and dict fields and locals
+as spans and receives `str`, list and dict results into fields and locals,
+including repeated keys, a failing call and calls in a loop. One run has no
+allocator installed and uses the runtime default across the C library's
+heap. The file also covers the declaration and position diagnostics.
 `RuntimeCApi.HostStrFormattingMatchesPython` checks the formatter against
 about 40 values formatted by Python.
 `test_generated_header_compiles_as_c_records_and_typed_cpp` compiles a

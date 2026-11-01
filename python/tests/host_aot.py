@@ -81,7 +81,10 @@ def _c_type(value_type: ConcreteType) -> str:
         return _C_SCALARS[value_type.name]
     if value_type.kind == "handle":
         return "uint64_t"
-    if value_type.kind == "str":
+    if value_type.kind == "enum":
+        return "int32_t"
+    if value_type.kind in {"str", "list", "dict"}:
+        # A str and a VhSpan share the `{pointer, uint64_t}` shape.
         return "VhShimStr"
     return "const void *"
 
@@ -89,6 +92,7 @@ def _c_type(value_type: ConcreteType) -> str:
 _RUNTIME_FUNCTIONS = (
     ("int32_t", "vernonRuntimeHostListReserve", ("void *", "uint64_t", "uint64_t", "uint64_t", "const void *")),
     ("void", "vernonRuntimeHostListRelease", ("void *", "uint64_t", "uint64_t", "const void *")),
+    ("const void *", "vernonRuntimeHostDefaultAllocator", ()),
     ("int64_t", "vernonRuntimeHostDictFind", ("const void *", "const void *", "const void *")),
     ("int32_t", "vernonRuntimeHostDictInsert", ("void *", "const void *", "const void *", "const void *", "void *")),
     ("int32_t", "vernonRuntimeHostDictRemove", ("void *", "const void *", "const void *", "const void *")),
@@ -124,9 +128,9 @@ def _shim(externs: list[HostExtern]) -> str:
     ]
     # Containers call into VernonRuntime; the slots take the runtime linked into vernon_dsl._native.
     for result, name, parameters in _RUNTIME_FUNCTIONS:
-        declared = ", ".join(f"{kind} a{index}" for index, kind in enumerate(parameters))
+        declared = ", ".join(f"{kind} a{index}" for index, kind in enumerate(parameters)) or "void"
         forwarded = ", ".join(f"a{index}" for index in range(len(parameters)))
-        pointer = f"({result} (*)({', '.join(parameters)}))vh_slot_{name}"
+        pointer = f"({result} (*)({', '.join(parameters) or 'void'}))vh_slot_{name}"
         lines.append(f"VH_EXPORT void *vh_slot_{name};")
         lines.append(
             f"{result} {name}({declared}) {{ {'' if result == 'void' else 'return '}({pointer})({forwarded}); }}"
@@ -139,6 +143,8 @@ def _shim(externs: list[HostExtern]) -> str:
             result = "int32_t"
             if extern.result is not None:
                 parameters.append("void *")
+                if extern.result.kind in {"str", "list", "dict"}:
+                    parameters.append("const void *")
         else:
             result = "void" if extern.result is None else _c_type(extern.result)
         declared = ", ".join(f"{kind} a{index}" for index, kind in enumerate(parameters)) or "void"
@@ -148,6 +154,50 @@ def _shim(externs: list[HostExtern]) -> str:
         lines.append(f"VH_EXPORT void *vh_slot_{extern.symbol};")
         lines.append(f"{result} {extern.symbol}({declared}) {{ {'' if result == 'void' else 'return '}{call}; }}")
     return "\n".join(lines) + "\n"
+
+
+HOST_INCLUDE = Path(__file__).resolve().parents[1] / "vernon_dsl" / "hostlang" / "include"
+
+
+def build_c_library(source: Path, directory: Path, name: str) -> Path:
+    """Builds `source` into a shared library exporting its `VH_EXPORT` functions, with `vernon_host/` headers on
+    the include path, as a library a registry binds through `bind_library`."""
+
+    found = toolchain()
+    if found is None:
+        raise RuntimeError("no C toolchain builds libraries on this machine")
+    kind, compiler, environment = found
+    directory.mkdir(parents=True, exist_ok=True)
+    if kind == "msvc":
+        library = directory / f"{name}.dll"
+        command = [
+            compiler,
+            "/nologo",
+            "/LD",
+            "/DVH_EXPORT=__declspec(dllexport)",
+            f"/I{HOST_INCLUDE}",
+            str(source),
+            f"/Fe{library}",
+            f"/Fo{directory}{os.sep}",
+        ]
+    else:
+        library = directory / f"lib{name}.so"
+        command = [
+            compiler,
+            "-shared",
+            "-fPIC",
+            '-DVH_EXPORT=__attribute__((visibility("default")))',
+            f"-I{HOST_INCLUDE}",
+            str(source),
+            "-o",
+            str(library),
+        ]
+    built = subprocess.run(
+        command, capture_output=True, text=True, errors="replace", env=environment, cwd=directory, check=False
+    )
+    if built.returncode != 0:
+        raise RuntimeError(f"building {source.name} failed:\n{built.stdout}{built.stderr}")
+    return library
 
 
 class LinkedHost:
@@ -233,6 +283,8 @@ class LinkedHost:
                     arguments.append(_CTYPES[parameter.name])
                 elif parameter.kind == "handle":
                     arguments.append(ctypes.c_uint64)
+                elif parameter.kind == "enum":
+                    arguments.append(ctypes.c_int32)
                 else:
                     arguments.append(ctypes.c_void_p)
             if info.result is not None:
@@ -256,7 +308,7 @@ class LinkedHost:
                 native.append(ctypes.c_void_p(int(value)))
                 continue
             converted = from_python(value, parameter, fields)
-            if parameter.kind in {"scalar", "handle"}:
+            if parameter.kind in {"scalar", "handle", "enum"}:
                 native.append(converted)
             else:
                 buffer = ctypes.create_string_buffer(pack(converted, parameter, fields))

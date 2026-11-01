@@ -43,7 +43,17 @@ from ..frontend.type_solver import common_type
 from ..language.ast_utils import dotted_name, tensor_update_parts
 from ..language.slicing import AxisIndex, AxisRange, AxisSelection, is_slicing, plan_selection
 from .format_spec import FormatSpec, parse_format_spec, spec_text, value_kind
-from .layout import OWNED_KINDS, StructFields, dict_entry, layout, members, storage_rank, tensor_count
+from .layout import (
+    OWNED_KINDS,
+    TRANSFERRED_KINDS,
+    StructFields,
+    dict_entry,
+    layout,
+    members,
+    storage_rank,
+    tensor_count,
+    transfer_record,
+)
 from .model import ExternAbi, HostExtern, HostFunctionInfo, HostProgram, HostStatus
 from .values import element_of, key_of, literal_value
 
@@ -69,6 +79,8 @@ _SWIZZLE = {"x": 0, "y": 1, "z": 2, "w": 3, "r": 0, "g": 1, "b": 2, "a": 3}
 _CAST_NAMES = frozenset({"bool", "int", "float", "i32", "u32", "i64", "u64", "f32", "f64"})
 _LLVM_SCALARS = {"bool": "i1", "i32": "i32", "u32": "i32", "i64": "i64", "u64": "i64", "f32": "float", "f64": "double"}
 _BITS = {"i32": 32, "u32": 32, "i64": 64, "u64": 64}
+# Locals holding a record the function owns, zeroed at entry and released by every exit.
+_OWNED_LOCAL_KINDS = frozenset({"str", "storage", "list", "dict"})
 _UNARY_INTRINSICS = {"sqrt": "sqrt", "floor": "floor", "sin": "sin", "cos": "cos", "exp": "exp", "log": "log"}
 _LIBM = {"acos": ("acosf", "acos"), "atan2": ("atan2f", "atan2")}
 
@@ -119,6 +131,19 @@ def _call_name(node: ast.Call) -> str:
     return (dotted_name(node.func) or "").split(".")[-1]
 
 
+def _copied(node: ast.expr) -> ast.expr | None:
+    """What a copy, `x.copy()` or `deepcopy(x)`, copies; None when `node` is no copy. Typing has resolved method
+    calls on classes to helpers, so an attribute call `copy` is a container's."""
+
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and not node.args:
+        return node.func.value
+    if dotted_name(node.func) in {"deepcopy", "copy.deepcopy"} and len(node.args) == 1:
+        return node.args[0]
+    return None
+
+
 class ModuleEmitter:
     def __init__(self, abi: TargetAbi, prefix: str, asset_id: str | None = None, module_name: str | None = None):
         self.abi = abi
@@ -151,6 +176,8 @@ class ModuleEmitter:
             return "i8" if value_type.name == "bool" else _LLVM_SCALARS[value_type.name]
         if kind == "handle":
             return "i64"
+        if kind == "enum":
+            return "i32"
         if kind == "tensor":
             return f"[{tensor_count(value_type)} x {self.memory_type(element_of(value_type))}]"
         if kind == "struct":
@@ -350,6 +377,8 @@ class ModuleEmitter:
             return name
         self.function_text[name] = ""
         lines = ["entry:"]
+        if value_type.kind in {"list", "dict"} and self.owns_memory(element_of(value_type)):
+            lines.append(f"  call void {self.release_elements_function(value_type)}(ptr %self)")
         if value_type.kind == "dict":
             lines.append('  %allocator = load ptr, ptr @"vh.allocator"')
             lines.append(
@@ -378,6 +407,254 @@ class ModuleEmitter:
         lines.append("  ret void")
         self.function_text[name] = f"define internal void {name}(ptr %self) {{\n" + "\n".join(lines) + "\n}\n"
         return name
+
+    def release_elements_function(self, value_type: ConcreteType) -> str:
+        """Releases every element of a list, or every live value of a dict, of instances that own memory, leaving
+        the container's records for the caller to empty or release."""
+
+        name = f'@"vh.release_elements.{value_type.spelling}"'
+        if name in self.function_text:
+            return name
+        self.function_text[name] = ""
+        element = element_of(value_type)
+        fini = self.fini_function(element)
+        if value_type.kind == "list":
+            memory, count = self.memory_type(element), "%size"
+            lines = [
+                "entry:",
+                "  %size_pointer = getelementptr %vh.list, ptr %self, i32 0, i32 1",
+                "  %size = load i64, ptr %size_pointer",
+                "  %address = load i64, ptr %self",
+                "  %data = inttoptr i64 %address to ptr",
+                "  br label %loop",
+                "loop:",
+                "  %index = phi i64 [ 0, %entry ], [ %next, %step ]",
+                f"  %done = icmp eq i64 %index, {count}",
+                "  br i1 %done, label %exit, label %body",
+                "body:",
+                f"  %element = getelementptr {memory}, ptr %data, i64 %index",
+                f"  call void {fini}(ptr %element)",
+                "  br label %step",
+            ]
+        else:
+            memory = self.memory_type(dict_entry(value_type))
+            lines = [
+                "entry:",
+                "  %used_pointer = getelementptr %vh.dict, ptr %self, i32 0, i32 2",
+                "  %used = load i64, ptr %used_pointer",
+                "  %address = load i64, ptr %self",
+                "  %data = inttoptr i64 %address to ptr",
+                "  br label %loop",
+                "loop:",
+                "  %index = phi i64 [ 0, %entry ], [ %next, %step ]",
+                "  %done = icmp eq i64 %index, %used",
+                "  br i1 %done, label %exit, label %live",
+                "live:",
+                f"  %entry_pointer = getelementptr {memory}, ptr %data, i64 %index",
+                "  %hash = load i64, ptr %entry_pointer",
+                "  %removed = icmp eq i64 %hash, -1",
+                "  br i1 %removed, label %step, label %body",
+                "body:",
+                f"  %element = getelementptr {memory}, ptr %entry_pointer, i32 0, i32 2",
+                f"  call void {fini}(ptr %element)",
+                "  br label %step",
+            ]
+        lines += ["step:", "  %next = add i64 %index, 1", "  br label %loop", "exit:", "  ret void"]
+        self.function_text[name] = f"define internal void {name}(ptr %self) {{\n" + "\n".join(lines) + "\n}\n"
+        return name
+
+    def copy_function(self, value_type: ConcreteType) -> str:
+        """`vh.copy.<type>(ptr %target, ptr %source) -> i32`, the deep copy of a type that owns memory into zeroed
+        memory. It returns a status; a failed copy leaves the target holding what it copied so far, which the
+        target's fini releases, so the target is zeroed before each part is copied into it."""
+
+        name = f'@"vh.copy.{value_type.spelling}"'
+        if name in self.function_text:
+            return name
+        self.function_text[name] = ""
+        self.declare("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
+        self.declare("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+        memory = self.memory_type(value_type)
+        if value_type.kind == "storage":
+            lines = self._copy_storage(value_type, memory)
+        elif value_type.kind == "dict":
+            lines = self._copy_dict(value_type)
+        elif value_type.kind in OWNED_KINDS:
+            lines = self._copy_list(value_type)
+        else:
+            lines = [
+                "entry:",
+                f"  call void @llvm.memcpy.p0.p0.i64(ptr %target, ptr %source, i64 "
+                f"{layout(value_type, self.fields).size}, i1 false)",
+            ]
+            owning = [
+                (index, field)
+                for index, (_, field) in enumerate(self.fields(value_type.name))
+                if self.owns_memory(field)
+            ]
+            # Every owning field is emptied before any is copied: until then it holds the source's memory.
+            for index, field in owning:
+                lines.append(f"  %t{index} = getelementptr {memory}, ptr %target, i32 0, i32 {index}")
+                lines.append(
+                    f"  call void @llvm.memset.p0.i64(ptr %t{index}, i8 0, i64 {layout(field, self.fields).size}, "
+                    "i1 false)"
+                )
+            for index, field in owning:
+                lines += [
+                    f"  %s{index} = getelementptr {memory}, ptr %source, i32 0, i32 {index}",
+                    f"  %status{index} = call i32 {self.copy_function(field)}(ptr %t{index}, ptr %s{index})",
+                    f"  %failed{index} = icmp ne i32 %status{index}, 0",
+                    f"  br i1 %failed{index}, label %fail{index}, label %copied{index}",
+                    f"fail{index}:",
+                    f"  ret i32 %status{index}",
+                    f"copied{index}:",
+                ]
+            lines.append("  ret i32 0")
+        self.function_text[name] = (
+            f"define internal i32 {name}(ptr %target, ptr %source) {{\n" + "\n".join(lines) + "\n}\n"
+        )
+        return name
+
+    def _copy_storage(self, value_type: ConcreteType, memory: str) -> list[str]:
+        rank = storage_rank(value_type)
+        size = self.storage_element_size(value_type)
+        lines = [
+            "entry:",
+            f"  %shape = getelementptr {memory}, ptr %source, i32 0, i32 1",
+            '  %allocator = load ptr, ptr @"vh.allocator"',
+            f"  %status = call i32 {self.storage_runtime('Allocate')}(ptr %target, i32 {rank}, ptr %shape, "
+            f"i64 {size}, i64 {size}, ptr %allocator)",
+            "  %failed = icmp ne i32 %status, 0",
+            "  br i1 %failed, label %fail, label %copy",
+            "fail:",
+            "  ret i32 %status",
+            "copy:",
+        ]
+        count = f"{size}"
+        for axis in range(rank):
+            lines.append(f"  %extent{axis}.pointer = getelementptr [{rank} x i64], ptr %shape, i32 0, i32 {axis}")
+            lines.append(f"  %extent{axis} = load i64, ptr %extent{axis}.pointer")
+            lines.append(f"  %bytes{axis} = mul i64 {count}, %extent{axis}")
+            count = f"%bytes{axis}"
+        lines += [
+            "  %source.address = load i64, ptr %source",
+            "  %source.data = inttoptr i64 %source.address to ptr",
+            "  %target.address = load i64, ptr %target",
+            "  %target.data = inttoptr i64 %target.address to ptr",
+            f"  call void @llvm.memcpy.p0.p0.i64(ptr %target.data, ptr %source.data, i64 {count}, i1 false)",
+            "  ret i32 0",
+        ]
+        return lines
+
+    def _copy_list(self, value_type: ConcreteType) -> list[str]:
+        """A list or str: reserved at the source's size, then its elements copied. Elements that own memory are
+        copied one at a time, each counted in the target's size before it is copied into."""
+
+        size, alignment = self.element_layout(value_type)
+        lines = [
+            "entry:",
+            "  %source.size.pointer = getelementptr %vh.list, ptr %source, i32 0, i32 1",
+            "  %size = load i64, ptr %source.size.pointer",
+            '  %allocator = load ptr, ptr @"vh.allocator"',
+            f"  %status = call i32 {self.container_runtime('reserve')}(ptr %target, i64 %size, i64 {size}, "
+            f"i64 {alignment}, ptr %allocator)",
+            "  %failed = icmp ne i32 %status, 0",
+            "  br i1 %failed, label %fail, label %reserved",
+            "fail:",
+            "  ret i32 %status",
+            "reserved:",
+            "  %source.address = load i64, ptr %source",
+            "  %source.data = inttoptr i64 %source.address to ptr",
+            "  %target.address = load i64, ptr %target",
+            "  %target.data = inttoptr i64 %target.address to ptr",
+            "  %target.size.pointer = getelementptr %vh.list, ptr %target, i32 0, i32 1",
+        ]
+        element = None if value_type.kind == "str" else element_of(value_type)
+        if element is None or not self.owns_memory(element):
+            lines += [
+                f"  %bytes = mul i64 %size, {size}",
+                "  call void @llvm.memcpy.p0.p0.i64(ptr %target.data, ptr %source.data, i64 %bytes, i1 false)",
+                "  store i64 %size, ptr %target.size.pointer",
+                "  ret i32 0",
+            ]
+            return lines
+        memory = self.memory_type(element)
+        return lines + [
+            "  br label %loop",
+            "loop:",
+            "  %index = phi i64 [ 0, %reserved ], [ %next, %body ]",
+            "  %done = icmp eq i64 %index, %size",
+            "  br i1 %done, label %exit, label %body",
+            "body:",
+            f"  %target.element = getelementptr {memory}, ptr %target.data, i64 %index",
+            f"  %source.element = getelementptr {memory}, ptr %source.data, i64 %index",
+            f"  call void @llvm.memset.p0.i64(ptr %target.element, i8 0, i64 {size}, i1 false)",
+            "  %next = add i64 %index, 1",
+            "  store i64 %next, ptr %target.size.pointer",
+            f"  %element.status = call i32 {self.copy_function(element)}(ptr %target.element, ptr %source.element)",
+            "  %element.failed = icmp ne i32 %element.status, 0",
+            "  br i1 %element.failed, label %element.fail, label %loop",
+            "element.fail:",
+            "  ret i32 %element.status",
+            "exit:",
+            "  ret i32 0",
+        ]
+
+    def _copy_dict(self, value_type: ConcreteType) -> list[str]:
+        """Inserts each live entry's key in insertion order, then copies its value into the entry Insert zeroed.
+        A str key's VhList record starts with the `{data, size}` view Insert takes."""
+
+        entry = self.memory_type(dict_entry(value_type))
+        element = element_of(value_type)
+        lines = [
+            "entry:",
+            "  %out = alloca i64",
+            "  %used.pointer = getelementptr %vh.dict, ptr %source, i32 0, i32 2",
+            "  %used = load i64, ptr %used.pointer",
+            "  %source.address = load i64, ptr %source",
+            "  %source.data = inttoptr i64 %source.address to ptr",
+            '  %allocator = load ptr, ptr @"vh.allocator"',
+            "  br label %loop",
+            "loop:",
+            "  %index = phi i64 [ 0, %entry ], [ %next, %step ]",
+            "  %done = icmp eq i64 %index, %used",
+            "  br i1 %done, label %exit, label %live",
+            "live:",
+            f"  %source.entry = getelementptr {entry}, ptr %source.data, i64 %index",
+            "  %hash = load i64, ptr %source.entry",
+            "  %removed = icmp eq i64 %hash, -1",
+            "  br i1 %removed, label %step, label %body",
+            "body:",
+            f"  %key = getelementptr {entry}, ptr %source.entry, i32 0, i32 1",
+            f"  %status = call i32 {self.dict_runtime('Insert')}(ptr %target, ptr %key, "
+            f"ptr {self.dict_layout(value_type)}, ptr %allocator, ptr %out)",
+            "  %failed = icmp ne i32 %status, 0",
+            "  br i1 %failed, label %fail, label %inserted",
+            "fail:",
+            "  ret i32 %status",
+            "inserted:",
+            "  %target.index = load i64, ptr %out",
+            "  %target.address = load i64, ptr %target",
+            "  %target.data = inttoptr i64 %target.address to ptr",
+            f"  %target.entry = getelementptr {entry}, ptr %target.data, i64 %target.index",
+            f"  %target.value = getelementptr {entry}, ptr %target.entry, i32 0, i32 2",
+            f"  %source.value = getelementptr {entry}, ptr %source.entry, i32 0, i32 2",
+        ]
+        if self.owns_memory(element):
+            lines += [
+                f"  %value.status = call i32 {self.copy_function(element)}(ptr %target.value, ptr %source.value)",
+                "  %value.failed = icmp ne i32 %value.status, 0",
+                "  br i1 %value.failed, label %value.fail, label %step",
+                "value.fail:",
+                "  ret i32 %value.status",
+            ]
+        else:
+            size = layout(element, self.fields).size
+            lines += [
+                f"  call void @llvm.memcpy.p0.p0.i64(ptr %target.value, ptr %source.value, i64 {size}, i1 false)",
+                "  br label %step",
+            ]
+        return lines + ["step:", "  %next = add i64 %index, 1", "  br label %loop", "exit:", "  ret i32 0"]
 
     def register_type(self, value_type: ConcreteType) -> str:
         if value_type.kind == "scalar" and value_type.name == "bool":
@@ -428,7 +705,7 @@ class ModuleEmitter:
         for _, value_type in parameters:
             if value_type.kind == "scalar" and value_type.name == "bool":
                 lowered.append("i1 zeroext")
-            elif value_type.kind in {"scalar", "handle"}:
+            elif value_type.kind in {"scalar", "handle", "enum"}:
                 lowered.append(self.register_type(value_type))
             else:
                 lowered.append("ptr")
@@ -473,7 +750,8 @@ class ModuleEmitter:
                 lowered.append(("type", "ptr"))
                 free_integer_registers = max(free_integer_registers - 1, 0)
                 continue
-            if value_type.kind == "str":
+            if value_type.kind in TRANSFERRED_KINDS:
+                # A str and a VhSpan are both `{pointer, uint64_t}`, passed alike.
                 if self.abi.kind == "sysv":
                     # An aggregate of two INTEGER eightbytes goes in registers only if both fit; otherwise on the stack.
                     if free_integer_registers >= 2:
@@ -490,7 +768,7 @@ class ModuleEmitter:
                 continue
             if value_type.kind == "scalar" and value_type.name == "bool":
                 lowered.append(("value", "i1 zeroext"))
-            elif value_type.kind in {"scalar", "handle"}:
+            elif value_type.kind in {"scalar", "handle", "enum"}:
                 lowered.append(("value", self.register_type(value_type)))
             else:
                 lowered.append(("pointer", "ptr"))
@@ -498,6 +776,8 @@ class ModuleEmitter:
                 free_integer_registers = max(free_integer_registers - 1, 0)
         if extern.abi == ExternAbi.STATUS and extern.result is not None:
             lowered.append(("out", "ptr"))
+            if extern.result.kind in TRANSFERRED_KINDS:
+                lowered.append(("allocator", "ptr"))
         return lowered
 
     def declare_extern(self, extern: HostExtern) -> None:
@@ -621,6 +901,116 @@ class _FunctionEmitter:
     def owned_str(self) -> str:
         return self.owned_record(ConcreteType("str", "str"))
 
+    # Class instances: a function owns the instances its owned locals hold and the temporaries that new instances
+    # are built in. Each starts zeroed and is released at every exit; a move zeroes its source, so releasing it again
+    # does nothing.
+
+    def instance_slot(self, value_type: ConcreteType) -> str:
+        if self.module.owns_memory(value_type):
+            return self.owned_record(value_type)
+        memory = self.module.memory_type(value_type)
+        slot = self.alloca(memory)
+        self.allocas.append(f"  store {memory} zeroinitializer, ptr {slot}")
+        return slot
+
+    def size_of(self, value_type: ConcreteType) -> int:
+        return layout(value_type, self.module.fields).size
+
+    def release(self, address: str, value_type: ConcreteType) -> None:
+        if self.module.owns_memory(value_type):
+            self.instruction(f"call void {self.module.fini_function(value_type)}(ptr {address})")
+
+    def move(self, target: str, source: str, value_type: ConcreteType) -> None:
+        """Moves an instance into memory holding none, leaving the source zeroed: empty, with nothing to release."""
+
+        size = self.size_of(value_type)
+        self.memcpy(target, source, size)
+        self.module.declare("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+        self.instruction(f"call void @llvm.memset.p0.i64(ptr {source}, i8 0, i64 {size}, i1 false)")
+
+    def copy_into(self, target: str, source: str, value_type: ConcreteType) -> None:
+        """Deep-copies `source` into zeroed memory at `target`; a failure leaves a partial copy that releasing the
+        target frees."""
+
+        if self.module.owns_memory(value_type):
+            self.propagate(self.value(f"call i32 {self.module.copy_function(value_type)}(ptr {target}, ptr {source})"))
+        else:
+            self.memcpy(target, source, self.size_of(value_type))
+
+    def assign_copy(self, target: ast.expr, value: ast.expr) -> None:
+        """Copies a list, dict or storage into a record of its own, then releases the target's and moves the copy
+        in, so the copy may read the container it replaces and a failed one leaves the target as it was."""
+
+        value_type = self.local_or_expression_type(value)
+        copied = _copied(value)
+        assert copied is not None
+        source = self.storage_record(copied) if value_type.kind == "storage" else self.container(copied)
+        built = self.owned_record(value_type)
+        self.copy_into(built, source, value_type)
+        record = self.storage_record(target) if value_type.kind == "storage" else self.container(target)
+        self.release(record, value_type)
+        self.move(record, built, value_type)
+
+    def creates(self, node: ast.expr) -> bool:
+        """Whether `node` evaluates to a new instance: a constructor, a call returning one, a pop or a deepcopy."""
+
+        return isinstance(node, ast.Call) and self.program.is_place(self.info.expression_type(node))
+
+    def instance(self, node: ast.expr) -> str:
+        """The address of the new instance `node` evaluates to, which the caller moves or releases: an owned local
+        moved out, or a temporary built by a constructor, a call or a pop."""
+
+        if isinstance(node, ast.Name):
+            return self.slots[node.id]
+        assert isinstance(node, ast.Call)
+        value_type = self.info.expression_type(node)
+        temporary = self.instance_slot(value_type)
+        if (copied := _copied(node)) is not None:
+            source = self.instance(copied) if self.creates(copied) else self.place_address(copied)
+            assert source is not None
+            self.copy_into(temporary, source, value_type)
+            return temporary
+        if isinstance(node.func, ast.Attribute):
+            container = node.func.value
+            container_type = self.info.expression_type(container)
+            if container_type.kind == "list":
+                record = self.container(container)
+                size = self.list_size(record)
+                self.fail_if(self.value(f"icmp eq i64 {size}, 0"), HostStatus.INDEX_OUT_OF_RANGE)
+                last = self.value(f"sub i64 {size}, 1")
+                self.memcpy(temporary, self.list_element(record, container_type, last), self.size_of(value_type))
+                self.instruction(f"store i64 {last}, ptr {self.list_size_pointer(record)}")
+                return temporary
+            key = self.dict_key(node.args[0], container_type)
+            index = self.dict_call("Find", container, key)
+            self.fail_if(self.value(f"icmp slt i64 {index}, 0"), HostStatus.KEY_NOT_FOUND)
+            self.memcpy(temporary, self.dict_member(container, index, 2), self.size_of(value_type))
+            self.dict_call("Remove", container, key, self.allocator())
+            return temporary
+        name = _call_name(node)
+        if name in self.program.functions:
+            self.function_call(self.program.functions[name], node, temporary)
+            return temporary
+        init = self.module.function_name(self.program, self.program.classes[name].init)
+        self.propagate(self.value(f"call i32 {init}(ptr {temporary})"))
+        return temporary
+
+    def assign_instance(self, target: ast.expr, value: ast.expr) -> None:
+        """Binds a borrowed name, or moves a new instance into a place, releasing what the place held. The instance
+        is built first, as Python evaluates the value before the target."""
+
+        if isinstance(target, ast.Name) and self.info.class_locals.get(target.id) != "owned":
+            address = self.place_address(value)
+            assert address is not None
+            self.instruction(f"store ptr {address}, ptr {self.slots[target.id]}")
+            return
+        value_type = self.info.expression_type(value)
+        source = self.instance(value)
+        address = self.slots[target.id] if isinstance(target, ast.Name) else self.place_address(target, True)
+        assert address is not None
+        self.release(address, value_type)
+        self.move(address, source, value_type)
+
     # Memory and aggregates.
 
     def to_memory(self, value: str, value_type: ConcreteType) -> str:
@@ -689,6 +1079,8 @@ class _FunctionEmitter:
             )
         if target.kind == "scalar" and source.kind == "scalar":
             return self.convert_scalar(value, source.name, target.name)
+        if target.kind == "scalar" and source.kind == "enum":
+            return self.convert_scalar(value, "i32", target.name)
         if target.kind == "tuple" and source.kind == "tuple":
             sources = self.member_types(source)
             return self.build(
@@ -741,7 +1133,7 @@ class _FunctionEmitter:
         parameters = module.parameter_types(info.parameters, info.result)
         declared = ", ".join(f"{kind} %a{index}" for index, kind in enumerate(parameters))
         self.start("entry")
-        self.cleanup = _owns_records(info)
+        self.cleanup = _owns_records(info, self.program)
         if self.cleanup:
             self.status_slot = self.alloca("i32")
         for index, (name, value_type) in enumerate(info.parameters):
@@ -750,11 +1142,16 @@ class _FunctionEmitter:
         for name, value_type in info.local_types.items():
             if name in self.places:
                 continue
-            self.slots[name] = (
-                self.owned_record(value_type)
-                if value_type.kind in {"str", "storage"}
-                else self.alloca(module.memory_type(value_type))
-            )
+            class_local = info.class_locals.get(name)
+            if class_local == "owned":
+                self.slots[name] = self.instance_slot(value_type)
+            elif class_local is not None:
+                # A borrowed name or a loop's element holds the address of the instance it refers to.
+                self.slots[name] = self.alloca("ptr")
+            elif value_type.kind in _OWNED_LOCAL_KINDS:
+                self.slots[name] = self.owned_record(value_type)
+            else:
+                self.slots[name] = self.alloca(module.memory_type(value_type))
         if any(host_class.init == info.symbol for host_class in self.program.classes.values()):
             # Fields without a default, and a class field's padding, start zeroed.
             self_type = info.parameters[0][1]
@@ -763,7 +1160,7 @@ class _FunctionEmitter:
         for index, (name, value_type) in enumerate(info.parameters):
             if name in self.places:
                 continue
-            if value_type.kind in {"scalar", "handle"}:
+            if value_type.kind in {"scalar", "handle", "enum"}:
                 self.store(f"%a{index}", value_type, self.slots[name])
             else:
                 memory = module.memory_type(value_type)
@@ -791,12 +1188,46 @@ class _FunctionEmitter:
 
     def statement(self, statement: ast.stmt) -> None:
         info = self.info
-        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.List):
-            self.instruction(f"store i64 0, ptr {self.list_size_pointer(self.container(statement.targets[0]))}")
-        elif isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Dict):
-            self.dict_clear(statement.targets[0])
+        # `[]` and `{}` empty a container field, or (re)declare a container local, which Python makes a new empty one.
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)) and isinstance(statement.value, ast.List):
+            self.list_clear(statement.targets[0] if isinstance(statement, ast.Assign) else statement.target)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and isinstance(statement.value, ast.Dict):
+            self.dict_clear(statement.targets[0] if isinstance(statement, ast.Assign) else statement.target)
+        elif (
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and statement.value is not None
+            and self.program.is_place(info.expression_type(statement.value))
+        ):
+            self.assign_instance(
+                statement.targets[0] if isinstance(statement, ast.Assign) else statement.target, statement.value
+            )
+        elif (
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and (extern := self.transferring_extern(statement.value)) is not None
+        ):
+            assert isinstance(statement.value, ast.Call)
+            self.assign_extern_result(
+                statement.targets[0] if isinstance(statement, ast.Assign) else statement.target,
+                extern,
+                statement.value,
+            )
+        elif isinstance(statement, ast.Expr) and self.creates(statement.value):
+            self.release(self.instance(statement.value), info.expression_type(statement.value))
+        elif isinstance(statement, ast.Return) and info.result is not None and self.program.is_place(info.result):
+            assert statement.value is not None
+            self.move(self.out_pointer, self.instance(statement.value), info.result)
+            self.leave(0)
         elif isinstance(statement, ast.Assign) and info.expression_type(statement.value).kind == "str":
             self.assign_str(statement.targets[0], statement.value)
+        elif (
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and statement.value is not None
+            and info.expression_type(statement.value).kind in {"list", "dict", "storage"}
+            and _copied(statement.value) is not None
+        ):
+            self.assign_copy(
+                statement.targets[0] if isinstance(statement, ast.Assign) else statement.target, statement.value
+            )
         elif (
             isinstance(statement, (ast.Assign, ast.AnnAssign))
             and statement.value is not None
@@ -810,6 +1241,10 @@ class _FunctionEmitter:
                 assert isinstance(target, ast.Subscript)
                 dict_type = info.expression_type(target.value)
                 key = self.dict_key(target.slice, dict_type)
+                if self.module.owns_memory(element_of(dict_type)):
+                    index = self.dict_call("Find", target.value, key)
+                    self.fail_if(self.value(f"icmp slt i64 {index}, 0"), HostStatus.KEY_NOT_FOUND)
+                    self.release(self.dict_member(target.value, index, 2), element_of(dict_type))
                 removed = self.dict_call("Remove", target.value, key, self.value('load ptr, ptr @"vh.allocator"'))
                 self.fail_if(self.value(f"icmp eq i32 {removed}, 0"), HostStatus.KEY_NOT_FOUND)
         elif isinstance(statement, ast.Assign):
@@ -941,7 +1376,7 @@ class _FunctionEmitter:
 
     def container(self, node: ast.expr) -> str:
         address = self.place_address(node)
-        assert address is not None, "the Host validator admits lists and strs only as class fields"
+        assert address is not None, "the Host validator admits lists and dicts only as fields and locals"
         return address
 
     def list_size_pointer(self, record: str) -> str:
@@ -984,18 +1419,22 @@ class _FunctionEmitter:
         element = element_of(list_type)
         if node.func.attr == "append":
             # Python evaluates the argument before appending, and evaluating it may change the list.
-            value = self.typed(node.args[0], element)
+            instance = self.program.is_place(element)
+            value = self.instance(node.args[0]) if instance else self.typed(node.args[0], element)
             record = self.container(node.func.value)
             size = self.list_size(record)
             grown = self.value(f"add i64 {size}, 1")
             self.reserve(record, grown, list_type)
-            self.store(value, element, self.list_element(record, list_type, size))
+            if instance:
+                self.move(self.list_element(record, list_type, size), value, element)
+            else:
+                self.store(value, element, self.list_element(record, list_type, size))
             self.instruction(f"store i64 {grown}, ptr {self.list_size_pointer(record)}")
             return "poison"
-        record = self.container(node.func.value)
         if node.func.attr == "clear":
-            self.instruction(f"store i64 0, ptr {self.list_size_pointer(record)}")
+            self.list_clear(node.func.value)
             return "poison"
+        record = self.container(node.func.value)
         size = self.list_size(record)
         self.fail_if(self.value(f"icmp eq i64 {size}, 0"), HostStatus.INDEX_OUT_OF_RANGE)
         last = self.value(f"sub i64 {size}, 1")
@@ -1019,9 +1458,11 @@ class _FunctionEmitter:
         self.branch_on(self.value(f"icmp ult i64 {index}, {self.list_size(record)}"), body, otherwise)
         self.start(body)
         element = element_of(list_type)
-        self.store(
-            self.load(element, self.list_element(record, list_type, index)), element, self.slots[statement.target.id]
-        )
+        address = self.list_element(record, list_type, index)
+        if self.program.is_place(element):
+            self.instruction(f"store ptr {address}, ptr {self.slots[statement.target.id]}")
+        else:
+            self.store(self.load(element, address), element, self.slots[statement.target.id])
         self.loops.append((latch, done))
         self.block(statement.body)
         self.loops.pop()
@@ -1181,7 +1622,11 @@ class _FunctionEmitter:
         """Calls VernonRuntime's `vernonRuntimeHostDict<function>` on the dict field `container`, passing the
         key when the function takes one, the type's layout, then `rest`."""
 
-        dict_type = self.info.expression_type(container)
+        # A local's declaration is a store target, which typing records only as the local's type.
+        if isinstance(container, ast.Name) and container.id in self.info.local_types:
+            dict_type = self.info.local_types[container.id]
+        else:
+            dict_type = self.info.expression_type(container)
         arguments = [self.container(container), *([key] if key is not None else []), self.module.dict_layout(dict_type)]
         text = f"{self.module.dict_runtime(function)}({', '.join(f'ptr {item}' for item in (*arguments, *rest))})"
         result = {"Find": "i64", "Insert": "i32", "Remove": "i32"}.get(function)
@@ -1193,6 +1638,15 @@ class _FunctionEmitter:
     def allocator(self) -> str:
         return self.value('load ptr, ptr @"vh.allocator"')
 
+    def transfer_allocator(self) -> str:
+        """The module's allocator, or VernonRuntime's default as an object: an extern filling an owned result
+        never sees NULL, so a library linking another C runtime allocates from the heap that frees it."""
+
+        installed = self.allocator()
+        self.module.declare("vernonRuntimeHostDefaultAllocator", "declare ptr @vernonRuntimeHostDefaultAllocator()")
+        default = self.value("call ptr @vernonRuntimeHostDefaultAllocator()")
+        return self.value(f"select i1 {self.value(f'icmp eq ptr {installed}, null')}, ptr {default}, ptr {installed}")
+
     def dict_member(self, container: ast.expr, index: str, member: int) -> str:
         """The key (1) or value (2) of entry `index`, read after any call that may have moved the entries."""
 
@@ -1201,6 +1655,126 @@ class _FunctionEmitter:
         entry_type = self.module.memory_type(dict_entry(dict_type))
         entry = self.value(f"getelementptr {entry_type}, ptr {entries}, i64 {index}")
         return self.value(f"getelementptr {entry_type}, ptr {entry}, i32 0, i32 {member}")
+
+    def dict_span(self, container: ast.expr) -> tuple[str, str]:
+        """The data and size of a span of the dict's `{K key; V value;}` entries in insertion order, laid out in a
+        list the function owns."""
+
+        dict_type = self.local_or_expression_type(container)
+        span_type = transfer_record(dict_type)
+        pair = self.module.memory_type(element_of(span_type))
+        key, value = key_of(dict_type), element_of(dict_type)
+        span = self.owned_record(span_type)
+        size_pointer = self.list_size_pointer(span)
+        self.instruction(f"store i64 0, ptr {size_pointer}")
+        record = self.container(container)
+        self.reserve(
+            span,
+            self.value(f"load i64, ptr {self.value(f'getelementptr %vh.dict, ptr {record}, i32 0, i32 1')}"),
+            span_type,
+        )
+        used = self.value(f"load i64, ptr {self.value(f'getelementptr %vh.dict, ptr {record}, i32 0, i32 2')}")
+        position = self.alloca("i64")
+        self.instruction(f"store i64 0, ptr {position}")
+        header, live, copy, latch, done = (
+            self.label(hint) for hint in ("span", "spanentry", "spancopy", "spannext", "spanend")
+        )
+        self.jump(header)
+        self.start(header)
+        index = self.value(f"load i64, ptr {position}")
+        self.branch_on(self.value(f"icmp ult i64 {index}, {used}"), live, done)
+        self.start(live)
+        removed = self.value(f"icmp eq i64 {self.value(f'load i64, ptr {self.dict_member(container, index, 0)}')}, -1")
+        self.branch_on(removed, latch, copy)
+        self.start(copy)
+        filled = self.value(f"load i64, ptr {size_pointer}")
+        slot = self.value(f"getelementptr {pair}, ptr {self.list_data(span)}, i64 {filled}")
+        self.memcpy(
+            self.value(f"getelementptr {pair}, ptr {slot}, i32 0, i32 0"),
+            self.dict_member(container, index, 1),
+            self.size_of(key),
+        )
+        self.memcpy(
+            self.value(f"getelementptr {pair}, ptr {slot}, i32 0, i32 1"),
+            self.dict_member(container, index, 2),
+            self.size_of(value),
+        )
+        self.instruction(f"store i64 {self.value(f'add i64 {filled}, 1')}, ptr {size_pointer}")
+        self.jump(latch)
+        self.start(latch)
+        self.instruction(f"store i64 {self.value(f'add i64 {index}, 1')}, ptr {position}")
+        self.jump(header)
+        self.start(done)
+        return self.list_data(span), self.value(f"load i64, ptr {size_pointer}")
+
+    def transferring_extern(self, node: ast.expr | None) -> HostExtern | None:
+        """The extern `node` calls when it returns a str, list or dict."""
+
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            return None
+        extern = self.program.externs.get(node.func.id)
+        if extern is None or extern.result is None or extern.result.kind not in TRANSFERRED_KINDS:
+            return None
+        return extern
+
+    def assign_extern_result(self, target: ast.expr, extern: HostExtern, node: ast.Call) -> None:
+        """Receives an extern's str, list or dict like a copy: into a record of its own, then releases the target's
+        and moves the result in, so a failed call leaves the target as it was."""
+
+        result = extern.result
+        assert result is not None
+        received = self.owned_record(transfer_record(result))
+        self.extern_call(extern, node, received)
+        built = received
+        if result.kind == "dict":
+            built = self.owned_record(result)
+            self.insert_entries(built, received, result)
+            # The entries record is reused by the next call, which finds it empty.
+            self.release(received, transfer_record(result))
+        record = self.str_record(target) if result.kind == "str" else self.container(target)
+        self.release(record, result)
+        self.move(record, built, result)
+
+    def insert_entries(self, built: str, entries: str, dict_type: ConcreteType) -> None:
+        """Inserts a list of `{K key; V value;}` entries into the empty dict `built` in order, so a repeated key keeps
+        its last value."""
+
+        entries_type = transfer_record(dict_type)
+        pair = self.module.memory_type(element_of(entries_type))
+        value = element_of(dict_type)
+        entry_type = self.module.memory_type(dict_entry(dict_type))
+        layout_name = self.module.dict_layout(dict_type)
+        size = self.list_size(entries)
+        position = self.alloca("i64")
+        self.instruction(f"store i64 0, ptr {position}")
+        header, body, done = (self.label(hint) for hint in ("insert", "insertentry", "insertend"))
+        self.jump(header)
+        self.start(header)
+        index = self.value(f"load i64, ptr {position}")
+        self.branch_on(self.value(f"icmp ult i64 {index}, {size}"), body, done)
+        self.start(body)
+        slot = self.value(f"getelementptr {pair}, ptr {self.list_data(entries)}, i64 {index}")
+        out = self.alloca("i64")
+        insert = self.module.dict_runtime("Insert")
+        key_pointer = self.value(f"getelementptr {pair}, ptr {slot}, i32 0, i32 0")
+        allocator = self.allocator()
+        self.propagate(
+            self.value(
+                f"call i32 {insert}(ptr {built}, ptr {key_pointer}, ptr {layout_name}, ptr {allocator}, ptr {out})"
+            )
+        )
+        entries_pointer = self.value(f"inttoptr i64 {self.value(f'load i64, ptr {built}')} to ptr")
+        entry = self.value(
+            f"getelementptr {entry_type}, ptr {entries_pointer}, i64 {self.value(f'load i64, ptr {out}')}"
+        )
+        self.memcpy(
+            self.value(f"getelementptr {entry_type}, ptr {entry}, i32 0, i32 2"),
+            self.value(f"getelementptr {pair}, ptr {slot}, i32 0, i32 1"),
+            self.size_of(value),
+        )
+        self.instruction(f"store i64 {self.value(f'add i64 {index}, 1')}, ptr {position}")
+        self.jump(header)
+        self.start(done)
 
     def dict_value(self, node: ast.Subscript, store: bool) -> str:
         """The value of `node`'s key: an entry it is stored into is inserted if missing, and one read must exist."""
@@ -1215,7 +1789,24 @@ class _FunctionEmitter:
             self.fail_if(self.value(f"icmp slt i64 {index}, 0"), HostStatus.KEY_NOT_FOUND)
         return self.dict_member(node.value, index, 2)
 
+    def release_elements(self, container: ast.expr) -> None:
+        container_type = self.local_or_expression_type(container)
+        if self.module.owns_memory(element_of(container_type)):
+            function = self.module.release_elements_function(container_type)
+            self.instruction(f"call void {function}(ptr {self.container(container)})")
+
+    def local_or_expression_type(self, node: ast.expr) -> ConcreteType:
+        # A local's declaration is a store target, which typing records only as the local's type.
+        if isinstance(node, ast.Name) and node.id in self.info.local_types:
+            return self.info.local_types[node.id]
+        return self.info.expression_type(node)
+
+    def list_clear(self, container: ast.expr) -> None:
+        self.release_elements(container)
+        self.instruction(f"store i64 0, ptr {self.list_size_pointer(self.container(container))}")
+
     def dict_clear(self, container: ast.expr) -> None:
+        self.release_elements(container)
         self.dict_call("Clear", container, None, self.allocator())
 
     def dict_method(self, node: ast.Call) -> str:
@@ -1293,6 +1884,9 @@ class _FunctionEmitter:
             if member_type.kind == "str":
                 # The key is copied, as Python binds the key object: the body may remove it from the dict.
                 self.copy_str(self.slots[name], self.list_data(pointer), self.list_size(pointer))
+                continue
+            if self.program.is_place(member_type):
+                self.instruction(f"store ptr {pointer}, ptr {self.slots[name]}")
                 continue
             self.store(self.load(member_type, pointer), member_type, self.slots[name])
         self.loops.append((latch, done))
@@ -1479,6 +2073,14 @@ class _FunctionEmitter:
         if isinstance(node, ast.Subscript) and self.info.expression_type(node.value).kind == "storage":
             return self.storage_element(node)
         if isinstance(node, ast.Name):
+            local = self.info.local_types.get(node.id)
+            if local is not None and local.kind in {"list", "dict"}:
+                return self.slots[node.id]
+            class_local = self.info.class_locals.get(node.id)
+            if class_local == "owned":
+                return self.slots[node.id]
+            if class_local is not None:
+                return self.value(f"load ptr, ptr {self.slots[node.id]}")
             return self.places.get(node.id)
         if isinstance(node, ast.Attribute):
             base_type = self.info.expression_type(node.value)
@@ -1614,6 +2216,8 @@ class _FunctionEmitter:
             if info.expression_type(node.value).kind == "storage":
                 return self.gathered(result_type, element_of(result_type), self.storage_selection(node, plan))
             return self.tensor_selection(node, plan)
+        if isinstance(node, ast.Attribute) and result_type.kind == "enum" and id(node.value) not in info.expressions:
+            return _int_literal(self.program.enums[result_type.name].value(node.attr), "i32")
         if isinstance(node, (ast.Attribute, ast.Subscript)) and (address := self.place_address(node)):
             return self.load(result_type, address)
         if isinstance(node, ast.Subscript):
@@ -1773,8 +2377,9 @@ class _FunctionEmitter:
         common = typed.operand_types[0] if typed.operand_types else self.info.expression_type(node.left)
         left = self.typed(node.left, common)
         right = self.typed(node.comparators[0], common)
-        if common.kind == "handle":
-            return self.value(f"icmp {'eq' if operation == 'eq' else 'ne'} i64 {left}, {right}")
+        if common.kind in {"handle", "enum"}:
+            width = self.module.memory_type(common)
+            return self.value(f"icmp {'eq' if operation == 'eq' else 'ne'} {width} {left}, {right}")
         return self.compare_scalar(operation, left, right, common.name)
 
     # Calls.
@@ -2012,31 +2617,46 @@ class _FunctionEmitter:
             )
         return self.intrinsic(name, node, result_type)
 
-    def function_call(self, callee: HostFunctionInfo, node: ast.Call) -> str:
+    def function_call(self, callee: HostFunctionInfo, node: ast.Call, out: str | None = None) -> str:
+        """Calls a Host function. A class result is built in `out`, which holds no instance; a new instance passed
+        as an argument lives in a temporary, released after the call."""
+
         arguments = []
+        temporaries = []
         for argument, (_, parameter) in zip(node.args, callee.parameters, strict=True):
             if self.program.is_place(parameter):
-                address = self.place_address(argument)
-                assert address is not None, "the Host validator admits only places as self"
+                if self.creates(argument):
+                    address = self.instance(argument)
+                    temporaries.append((address, parameter))
+                else:
+                    address = self.place_address(argument)
+                assert address is not None, "the Host validator admits only places and new instances as instances"
                 arguments.append(f"ptr {address}")
                 continue
             value = self.typed(argument, parameter)
-            if parameter.kind in {"scalar", "handle"}:
+            if parameter.kind in {"scalar", "handle", "enum"}:
                 arguments.append(f"{self.module.register_type(parameter)} {value}")
             else:
                 arguments.append(f"ptr {self.spill(value, parameter)}")
-        out = None
+        instance_result = callee.result is not None and self.program.is_place(callee.result)
+        assert (out is not None) == instance_result, "a class result is built where the caller says"
         if callee.result is not None:
-            out = self.alloca(self.module.memory_type(callee.result))
+            if out is None:
+                out = self.alloca(self.module.memory_type(callee.result))
             arguments.append(f"ptr {out}")
         callee_name = self.module.function_name(self.program, callee.symbol)
         status = self.value(f"call i32 {callee_name}({', '.join(arguments)})")
         self.propagate(status)
-        if out is None or callee.result is None:
+        for address, parameter in temporaries:
+            self.release(address, parameter)
+        if out is None or callee.result is None or instance_result:
             return "poison"
         return self.load(callee.result, out)
 
-    def extern_call(self, extern: HostExtern, node: ast.Call) -> str:
+    def extern_call(self, extern: HostExtern, node: ast.Call, received: str | None = None) -> str:
+        """Calls `extern`; one returning a str, list or dict fills `received`, an empty record of its
+        `transfer_record` type."""
+
         module = self.module
         module.declare_extern(extern)
         lowerings = [item for item in module.extern_parameters(extern) if item[0] != "type"]
@@ -2044,8 +2664,14 @@ class _FunctionEmitter:
         for position, (argument, (_, parameter), (lowering, text)) in enumerate(
             zip(node.args, extern.parameters, lowerings, strict=False)
         ):
-            if parameter.kind == "str":
-                data, size = self.stable_str_operand(argument, node.args[position + 1 :])
+            if parameter.kind in TRANSFERRED_KINDS:
+                if parameter.kind == "str":
+                    data, size = self.stable_str_operand(argument, node.args[position + 1 :])
+                elif parameter.kind == "dict":
+                    data, size = self.dict_span(argument)
+                else:
+                    record = self.container(argument)
+                    data, size = self.list_data(record), self.list_size(record)
                 if lowering == "str_pair":
                     arguments.append(f"ptr {data}, i64 {size}")
                 elif lowering == "str_array":
@@ -2069,12 +2695,17 @@ class _FunctionEmitter:
             arguments.insert(index, f"ptr {type_descriptor(ConcreteType('struct', bound))}")
         if extern.abi == ExternAbi.STATUS:
             out = None
-            if extern.result is not None:
+            if extern.result is not None and extern.result.kind in TRANSFERRED_KINDS:
+                assert received is not None, "the Host validator admits these results only as assigned values"
+                out = received
+                arguments.append(f"ptr {out}, ptr {self.transfer_allocator()}")
+            elif extern.result is not None:
                 out = self.alloca(module.memory_type(extern.result))
                 arguments.append(f"ptr {out}")
             status = self.value(f'call i32 @"{extern.symbol}"({", ".join(arguments)})')
+            # On failure `received` is the function's own record, which its exit releases.
             self.propagate(status)
-            if out is None or extern.result is None:
+            if out is None or extern.result is None or out is received:
                 return "poison"
             return self.load(extern.result, out)
         if extern.result is None:
@@ -2198,17 +2829,32 @@ class _FunctionEmitter:
         return self.value(f"call {llvm_type} {function}({llvm_type} {left}, {llvm_type} {right})")
 
 
-def _owns_records(info: HostFunctionInfo) -> bool:
-    """Whether a function needs records of its own: a str or storage local, or a str expression other than a
-    literal, which an f-string or + builds into, or which a field is copied into before a call could change it."""
+def _owns_records(info: HostFunctionInfo, program: HostProgram) -> bool:
+    """Whether a function needs records of its own: a str, storage, list or dict local, an instance an owned local
+    or a temporary holds, or a str expression other than a literal, which an f-string or + builds into, or which a
+    field is copied into before a call could change it."""
 
-    if any(value_type.kind in {"str", "storage"} for value_type in info.local_types.values()):
+    if any(value_type.kind in _OWNED_LOCAL_KINDS for value_type in info.local_types.values()):
         return True
-    return any(
-        id(node) in info.expressions and info.expression_type(node).kind == "str" and not isinstance(node, ast.Constant)
-        for statement in info.source.body
-        for node in ast.walk(statement)
-    )
+    if "owned" in info.class_locals.values():
+        return True
+
+    def owns(node: ast.AST) -> bool:
+        # The span of a dict passed to an extern is laid out in a list of the function's own.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in program.externs:
+            if any(parameter.kind == "dict" for _, parameter in program.externs[node.func.id].parameters):
+                return True
+        if id(node) not in info.expressions:
+            return False
+        value_type = info.expression_type(node)  # type: ignore[arg-type]
+        if value_type.kind == "str":
+            return not isinstance(node, ast.Constant)
+        # A container copy and an extern's container result are built in records of the function's own.
+        if isinstance(node, ast.Call) and value_type.kind in {"list", "dict"}:
+            return True
+        return isinstance(node, ast.Call) and program.is_place(value_type)
+
+    return any(owns(node) for statement in info.source.body for node in ast.walk(statement))
 
 
 def _common_tensor(left: ConcreteType, right: ConcreteType) -> ConcreteType:

@@ -158,7 +158,7 @@ def compile_programs(
     abi = TargetAbi.from_triple(triple)
     ir = emit_llvm(programs, abi, prefix, asset_id, module_name=asset_id)
     compiled = _native()._compile_host(ir, triple, cpu, features)
-    names = _CNames(programs, type_prefix or _camel(prefix))
+    names = CNames(programs, type_prefix or camel(prefix))
     return HostArtifacts(
         object=bytes(compiled["object"]),
         object_suffix=_object_suffix(compiled["triple"]),
@@ -171,21 +171,23 @@ def compile_programs(
     )
 
 
-def _camel(prefix: str) -> str:
+def camel(prefix: str) -> str:
     return "".join(part[:1].upper() + part[1:] for part in prefix.split("_") if part)
 
 
-class _CNames:
+class CNames:
     """C spellings of Host types: `c_type` names where declared, prefixed generated names otherwise."""
 
     def __init__(self, programs: list[HostProgram], type_prefix: str):
         self.type_prefix = type_prefix
         self.structs: dict[str, Any] = {}
         self.handles: dict[str, Any] = {}
+        self.enums: dict[str, Any] = {}
         self.tuples: dict[ConcreteType, str] = {}
         for program in programs:
             self.structs.update(program.structs)
             self.handles.update(program.handles)
+            self.enums.update(program.enums)
 
     def fields(self, name: str) -> tuple[tuple[str, ConcreteType], ...]:
         return self.structs[name].fields
@@ -195,6 +197,8 @@ class _CNames:
             return _C_SCALARS[value_type.name]
         if value_type.kind == "handle":
             return self.handles[value_type.name].c_type or f"{self.type_prefix}{value_type.name}"
+        if value_type.kind == "enum":
+            return self.enums[value_type.name].c_type or f"{self.type_prefix}{value_type.name}"
         if value_type.kind == "struct":
             return self.structs[value_type.name].c_type or f"{self.type_prefix}{value_type.name}"
         if value_type.kind == "tuple":
@@ -230,6 +234,8 @@ class _CNames:
     def external(self, value_type: ConcreteType) -> bool:
         if value_type.kind == "handle":
             return self.handles[value_type.name].c_type is not None
+        if value_type.kind == "enum":
+            return self.enums[value_type.name].c_type is not None
         if value_type.kind == "struct":
             return self.structs[value_type.name].c_type is not None
         return False
@@ -242,10 +248,15 @@ def _program_struct_fields(programs: list[HostProgram]) -> Any:
     return fields
 
 
-def _boundary_types(programs: list[HostProgram]) -> list[ConcreteType]:
-    """Struct, handle, and Tuple types entries exchange, dependencies first."""
+def boundary_types(
+    programs: list[HostProgram], roots: Iterable[ConcreteType] = ()
+) -> tuple[list[ConcreteType], set[ConcreteType]]:
+    """Struct, handle, and Tuple types entries and `roots` exchange, dependencies first, and the classes a list or
+    dict of them is declared before they are: a recursive type, which is declared ahead by name."""
 
     ordered: list[ConcreteType] = []
+    visiting: list[ConcreteType] = []
+    forward: set[ConcreteType] = set()
 
     def visit(value_type: ConcreteType) -> None:
         if value_type.kind == "tensor":
@@ -257,15 +268,23 @@ def _boundary_types(programs: list[HostProgram]) -> list[ConcreteType]:
                 if isinstance(argument, ConcreteType):
                     visit(argument)
             return
-        if value_type.kind not in {"struct", "handle", "tuple"} or value_type in ordered:
+        if value_type.kind not in {"struct", "handle", "enum", "tuple"} or value_type in ordered:
             return
-        if value_type.kind != "handle":
+        if value_type in visiting:
+            # Only a container reaches a type being declared: the frontend rejects classes holding themselves inline.
+            forward.add(value_type)
+            return
+        if value_type.kind not in {"handle", "enum"}:
             fields = _program_struct_fields(programs)
+            visiting.append(value_type)
             for member in members(value_type, fields):
                 visit(member)
+            visiting.pop()
         ordered.append(value_type)
 
     for program in programs:
+        for host_enum in program.enums.values():
+            visit(ConcreteType("enum", host_enum.name))
         for host_struct in program.structs.values():
             visit(ConcreteType("struct", host_struct.name))
         for handle in program.handles.values():
@@ -275,10 +294,12 @@ def _boundary_types(programs: list[HostProgram]) -> list[ConcreteType]:
                 visit(parameter)
             if info.result is not None:
                 visit(info.result)
-    return ordered
+    for root in roots:
+        visit(root)
+    return ordered, forward
 
 
-def _header(programs: list[HostProgram], names: _CNames, prefix: str, types_header: str | None) -> str:
+def _header(programs: list[HostProgram], names: CNames, prefix: str, types_header: str | None) -> str:
     guard = re.sub(r"[^A-Za-z0-9]", "_", prefix).upper() + "H"
     status = prefix.upper()
     lines = [
@@ -294,11 +315,11 @@ def _header(programs: list[HostProgram], names: _CNames, prefix: str, types_head
     ]
     if types_header:
         lines.append(f'#include "{types_header}"')
-    boundary = _boundary_types(programs)
+    boundary, forward = boundary_types(programs)
     if any(
         member.kind in OWNED_KINDS
         for value_type in boundary
-        if value_type.kind != "handle"
+        if value_type.kind not in {"handle", "enum"}
         for member in members(value_type, names.fields)
     ):
         lines += ["#ifdef __cplusplus", '#include "vernon_host/containers.hpp"', "#endif"]
@@ -317,30 +338,7 @@ def _header(programs: list[HostProgram], names: _CNames, prefix: str, types_head
         if value is not HostStatus.OK:
             lines.append(f"#define {status}{value.name} ({int(value)})")
     lines.append("")
-    for value_type in boundary:
-        c_name = names.name(value_type)
-        external = types_header is not None and names.external(value_type)
-        if value_type.kind == "handle":
-            if not external:
-                lines.append(f"typedef struct {c_name} {{ uint64_t bits; }} {c_name};")
-            lines.append(f'VERNON_HOST_STATIC_ASSERT(sizeof({c_name}) == 8, "{c_name} is one uint64_t");')
-            continue
-        value_layout = layout(value_type, names.fields)
-        if value_type.kind == "struct":
-            field_names = [name for name, _ in names.fields(value_type.name)]
-        else:
-            field_names = [f"item{index}" for index in range(len(value_layout.offsets))]
-        member_types = members(value_type, names.fields)
-        if not external:
-            body = " ".join(
-                f"{names.declarator(member, name)};" for name, member in zip(field_names, member_types, strict=True)
-            )
-            lines.append(f"typedef struct {c_name} {{ {body or 'uint8_t unused;'} }} {c_name};")
-        lines.append(f'VERNON_HOST_STATIC_ASSERT(sizeof({c_name}) == {value_layout.size}, "{c_name} size");')
-        for name, offset in zip(field_names, value_layout.offsets, strict=True):
-            lines.append(
-                f'VERNON_HOST_STATIC_ASSERT(offsetof({c_name}, {name}) == {offset}, "{c_name}.{name} offset");'
-            )
+    lines += type_declarations(boundary, forward, names, external_declared=types_header is not None)
     lines.append("")
     lines.append("/* The reflection table of every type and function below. */")
     lines.append(f"extern const VhModule {prefix}module;")
@@ -355,7 +353,7 @@ def _header(programs: list[HostProgram], names: _CNames, prefix: str, types_head
             for name, parameter in info.parameters:
                 if program.is_place(parameter):
                     parameters.append(f"{names.name(parameter)} *{name}")
-                elif parameter.kind in {"scalar", "handle"}:
+                elif parameter.kind in {"scalar", "handle", "enum"}:
                     parameters.append(f"{names.name(parameter)} {name}")
                 else:
                     parameters.append(f"const {names.name(parameter)} *{name}")
@@ -367,13 +365,64 @@ def _header(programs: list[HostProgram], names: _CNames, prefix: str, types_head
     return "\n".join(lines)
 
 
+def type_declarations(
+    boundary: list[ConcreteType], forward: set[ConcreteType], names: CNames, *, external_declared: bool
+) -> list[str]:
+    """C declarations of `boundary` types in order, with layout checks. Types with a declared `c_type` are only
+    checked when `external_declared`, since an included header then declares them. Uses VERNON_HOST_STATIC_ASSERT."""
+
+    lines: list[str] = []
+    declared_ahead = {value_type for value_type in forward if not (external_declared and names.external(value_type))}
+    for value_type in boundary:
+        if value_type in declared_ahead:
+            lines.append(f"typedef struct {names.name(value_type)} {names.name(value_type)};")
+    for value_type in boundary:
+        c_name = names.name(value_type)
+        external = external_declared and names.external(value_type)
+        if value_type.kind == "handle":
+            if not external:
+                lines.append(f"typedef struct {c_name} {{ uint64_t bits; }} {c_name};")
+            lines.append(f'VERNON_HOST_STATIC_ASSERT(sizeof({c_name}) == 8, "{c_name} is one uint64_t");')
+            continue
+        if value_type.kind == "enum":
+            if not external:
+                members_text = ", ".join(
+                    f"{c_name}_{member} = {value}" for member, value in names.enums[value_type.name].members
+                )
+                lines.append(f"typedef int32_t {c_name};")
+                lines.append(f"enum {{ {members_text} }};")
+            lines.append(f'VERNON_HOST_STATIC_ASSERT(sizeof({c_name}) == 4, "{c_name} is an int32_t");')
+            continue
+        value_layout = layout(value_type, names.fields)
+        if value_type.kind == "struct":
+            field_names = [name for name, _ in names.fields(value_type.name)]
+        else:
+            field_names = [f"item{index}" for index in range(len(value_layout.offsets))]
+        member_types = members(value_type, names.fields)
+        if not external:
+            body = " ".join(
+                f"{names.declarator(member, name)};" for name, member in zip(field_names, member_types, strict=True)
+            )
+            if value_type in declared_ahead:
+                lines.append(f"struct {c_name} {{ {body or 'uint8_t unused;'} }};")
+            else:
+                lines.append(f"typedef struct {c_name} {{ {body or 'uint8_t unused;'} }} {c_name};")
+        lines.append(f'VERNON_HOST_STATIC_ASSERT(sizeof({c_name}) == {value_layout.size}, "{c_name} size");')
+        for name, offset in zip(field_names, value_layout.offsets, strict=True):
+            lines.append(
+                f'VERNON_HOST_STATIC_ASSERT(offsetof({c_name}, {name}) == {offset}, "{c_name}.{name} offset");'
+            )
+    return lines
+
+
 def _type_record(value_type: ConcreteType) -> str:
     return value_type.spelling
 
 
-def _reflection(programs: list[HostProgram], names: _CNames, prefix: str, triple: str) -> dict[str, Any]:
+def _reflection(programs: list[HostProgram], names: CNames, prefix: str, triple: str) -> dict[str, Any]:
     structs = {}
     handles = {}
+    enums = {}
     externs = {}
     classes: dict[str, Any] = {}
     entries = []
@@ -392,7 +441,17 @@ def _reflection(programs: list[HostProgram], names: _CNames, prefix: str, triple
                 ],
             }
         for handle in program.handles.values():
-            handles[handle.name] = {"c_type": names.name(ConcreteType("handle", handle.name))}
+            handles[handle.name] = {
+                "c_type": names.name(ConcreteType("handle", handle.name)),
+                "meta": {key: json.loads(value) for key, value in handle.metadata},
+            }
+        for host_enum in program.enums.values():
+            enums[host_enum.name] = {
+                "c_type": names.name(ConcreteType("enum", host_enum.name)),
+                "doc": host_enum.doc,
+                "members": [{"name": name, "value": value} for name, value in host_enum.members],
+                "meta": {key: json.loads(value) for key, value in host_enum.metadata},
+            }
         for extern in program.reachable_externs():
             externs[extern.symbol] = {
                 "abi": extern.abi,
@@ -400,6 +459,7 @@ def _reflection(programs: list[HostProgram], names: _CNames, prefix: str, triple
                 "schema": extern.schema,
                 "parameters": [{"name": name, "type": _type_record(value)} for name, value in extern.parameters],
                 "result": None if extern.result is None else _type_record(extern.result),
+                "meta": {key: json.loads(value) for key, value in extern.metadata},
             }
         for exported, info in program.exported():
             entries.append(
@@ -446,6 +506,7 @@ def _reflection(programs: list[HostProgram], names: _CNames, prefix: str, triple
         "structs": structs,
         "classes": classes,
         "handles": handles,
+        "enums": enums,
         "sources": sources,
     }
 

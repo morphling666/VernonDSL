@@ -712,6 +712,17 @@ class TensorStorage:
         self.synchronize()
         return self._native_host_array().copy(order="C")
 
+    def copy(self) -> TensorStorage:
+        """A new storage of this shape and element type holding these elements, as numpy's `copy`."""
+
+        self.synchronize()
+        return type(self)(
+            self._array.copy(order="C"), element_type=self._element_type, element_layout=self._element_layout
+        )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> TensorStorage:
+        return self.copy()
+
     def _borrowed_array(self) -> np.ndarray:
         self.synchronize()
         return self._array
