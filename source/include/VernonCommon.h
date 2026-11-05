@@ -44,6 +44,22 @@ typedef struct VernonCpuInvocation {
 
 typedef VernonStatus (*VernonCpuEntryPoint)(const VernonCpuInvocation *invocation);
 
+/*
+ * Every lane of workgroups [group_begin, group_end), in workgroup-linear order (x fastest), for a kernel with no
+ * barriers, workgroup or lane storage, results or texture sampling. A kernel compiles a chunk entry only then.
+ */
+typedef struct VernonCpuChunk {
+    size_t struct_size;
+    const void *arguments;
+    size_t arguments_size;
+    uint32_t grid[3];
+    uint32_t workgroup[3];
+    uint64_t group_begin;
+    uint64_t group_end;
+} VernonCpuChunk;
+
+typedef VernonStatus (*VernonCpuChunkEntryPoint)(const VernonCpuChunk *chunk);
+
 typedef struct VernonStaticCpuEntry {
     VernonStringView symbol;
     VernonCpuEntryPoint entry_point;

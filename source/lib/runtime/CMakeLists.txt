@@ -268,6 +268,7 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonProgramPlanTypes.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonProgramSemanticTypes.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGraphicsState.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonHal.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
@@ -277,6 +278,7 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeRHIAdapter.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonSchedule.h"
         DESTINATION vernon_dsl/runtime_src/include
         COMPONENT VernonWheel)
     install(
@@ -292,13 +294,6 @@ if(SKBUILD)
         PATTERN "*.mm"
         PATTERN "*.h")
     install(
-        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/"
-        DESTINATION vernon_dsl/runtime_src/lib/execution_graph
-        COMPONENT VernonWheel
-        FILES_MATCHING
-        PATTERN "*.cpp"
-        PATTERN "*.h")
-    install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../rhi/"
         DESTINATION vernon_dsl/runtime_src/lib/rhi
         COMPONENT VernonWheel
@@ -307,6 +302,13 @@ if(SKBUILD)
         PATTERN "*.mm"
         PATTERN "*.h"
         PATTERN "*.hlsl")
+    install(
+        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../hal/"
+        DESTINATION vernon_dsl/runtime_src/lib/hal
+        COMPONENT VernonWheel
+        FILES_MATCHING
+        PATTERN "*.cpp"
+        PATTERN "*.h")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"
         DESTINATION vernon_dsl/runtime_src/lib/platform

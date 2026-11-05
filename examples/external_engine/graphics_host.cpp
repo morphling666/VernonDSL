@@ -1,86 +1,50 @@
 #include "graphics_host.h"
 
-#include <cstddef>
+#include "embedded_bundles.h"
+
+#include <algorithm>
+#include <array>
 #include <iostream>
+#include <iterator>
+#include <string>
 
 namespace {
 
-using GlEnum = unsigned int;
-using GlInt = int;
-using GlSizei = int;
-using GlUint = unsigned int;
+constexpr std::array<float, 6> kFullscreenTriangle{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
+constexpr uint64_t kTriangleShape[] = {3, 2};
+constexpr int64_t kTriangleStrides[] = {2 * sizeof(float), sizeof(float)};
 
-constexpr GlEnum kReadFramebuffer = 0x8CA8;
-constexpr GlEnum kDrawFramebuffer = 0x8CA9;
-constexpr GlEnum kFramebufferComplete = 0x8CD5;
-constexpr GlEnum kColorAttachment0 = 0x8CE0;
-constexpr GlEnum kTexture2d = 0x0DE1;
-constexpr GlEnum kColorBufferBit = 0x00004000;
-constexpr GlEnum kScissorTest = 0x0C11;
-constexpr GlEnum kLinear = 0x2601;
-constexpr GlEnum kNoError = 0;
+GLFWwindow *window(void *userData) { return static_cast<GLFWwindow *>(userData); }
 
-void makeCurrent(void *userData) { glfwMakeContextCurrent(static_cast<GLFWwindow *>(userData)); }
+void makeCurrent(void *userData) { glfwMakeContextCurrent(window(userData)); }
 
 void *getProcAddress(void *, const char *name) { return reinterpret_cast<void *>(glfwGetProcAddress(name)); }
 
+void swapInterval(void *, int32_t interval) {
+#if defined(__EMSCRIPTEN__)
+    // The browser paces frames through the main loop instead.
+    (void)interval;
+#else
+    glfwSwapInterval(interval);
+#endif
+}
+
+void swapBuffers(void *userData) { glfwSwapBuffers(window(userData)); }
+
+void drawableSize(void *userData, uint32_t *width, uint32_t *height) {
+    int framebufferWidth = 0;
+    int framebufferHeight = 0;
+    glfwGetFramebufferSize(window(userData), &framebufferWidth, &framebufferHeight);
+    *width = static_cast<uint32_t>(std::max(framebufferWidth, 0));
+    *height = static_cast<uint32_t>(std::max(framebufferHeight, 0));
+}
+
+std::string halError() {
+    const VernonStringView error = vernonHalGetLastError();
+    return error.data && error.size ? std::string(error.data, error.size) : std::string("unknown HAL error");
+}
+
 } // namespace
-
-struct GraphicsHost::PresentationState {
-    using GenFramebuffers = void (*)(GlSizei, GlUint *);
-    using BindFramebuffer = void (*)(GlEnum, GlUint);
-    using FramebufferTexture2D = void (*)(GlEnum, GlEnum, GlEnum, GlUint, GlInt);
-    using CheckFramebufferStatus = GlEnum (*)(GlEnum);
-    using BlitFramebuffer = void (*)(GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlInt, GlEnum, GlEnum);
-    using DeleteFramebuffers = void (*)(GlSizei, const GlUint *);
-    using ReadBuffer = void (*)(GlEnum);
-    using Disable = void (*)(GlEnum);
-    using ClearColor = void (*)(float, float, float, float);
-    using Clear = void (*)(GlEnum);
-    using GetError = GlEnum (*)();
-
-    GenFramebuffers genFramebuffers{};
-    BindFramebuffer bindFramebuffer{};
-    FramebufferTexture2D framebufferTexture2D{};
-    CheckFramebufferStatus checkFramebufferStatus{};
-    BlitFramebuffer blitFramebuffer{};
-    DeleteFramebuffers deleteFramebuffers{};
-    ReadBuffer readBuffer{};
-    Disable disable{};
-    ClearColor clearColor{};
-    Clear clear{};
-    GetError getError{};
-    GlUint framebuffers[2]{};
-
-    bool initialize() {
-        genFramebuffers = reinterpret_cast<GenFramebuffers>(glfwGetProcAddress("glGenFramebuffers"));
-        bindFramebuffer = reinterpret_cast<BindFramebuffer>(glfwGetProcAddress("glBindFramebuffer"));
-        framebufferTexture2D = reinterpret_cast<FramebufferTexture2D>(glfwGetProcAddress("glFramebufferTexture2D"));
-        checkFramebufferStatus =
-            reinterpret_cast<CheckFramebufferStatus>(glfwGetProcAddress("glCheckFramebufferStatus"));
-        blitFramebuffer = reinterpret_cast<BlitFramebuffer>(glfwGetProcAddress("glBlitFramebuffer"));
-        deleteFramebuffers = reinterpret_cast<DeleteFramebuffers>(glfwGetProcAddress("glDeleteFramebuffers"));
-        readBuffer = reinterpret_cast<ReadBuffer>(glfwGetProcAddress("glReadBuffer"));
-        disable = reinterpret_cast<Disable>(glfwGetProcAddress("glDisable"));
-        clearColor = reinterpret_cast<ClearColor>(glfwGetProcAddress("glClearColor"));
-        clear = reinterpret_cast<Clear>(glfwGetProcAddress("glClear"));
-        getError = reinterpret_cast<GetError>(glfwGetProcAddress("glGetError"));
-        if (!genFramebuffers || !bindFramebuffer || !framebufferTexture2D || !checkFramebufferStatus ||
-            !blitFramebuffer || !deleteFramebuffers || !readBuffer || !disable || !clearColor || !clear || !getError)
-            return false;
-        genFramebuffers(2, framebuffers);
-        return framebuffers[0] && framebuffers[1] && getError() == kNoError;
-    }
-
-    void shutdown() {
-        if (deleteFramebuffers && (framebuffers[0] || framebuffers[1]))
-            deleteFramebuffers(2, framebuffers);
-        framebuffers[0] = 0;
-        framebuffers[1] = 0;
-    }
-};
-
-GraphicsHost::GraphicsHost() = default;
 
 GraphicsHost::~GraphicsHost() { shutdown(); }
 
@@ -106,119 +70,220 @@ bool GraphicsHost::initialize(const char *title, uint32_t width, uint32_t height
     window_ = glfwCreateWindow(static_cast<int>(width), static_cast<int>(height), title, nullptr, nullptr);
     if (!window_) {
         std::cerr << "failed to create a GLFW graphics context\n";
-        glfwTerminate();
-        glfwInitialized_ = false;
+        shutdown();
         return false;
     }
     glfwMakeContextCurrent(window_);
-#if !defined(__EMSCRIPTEN__)
-    glfwSwapInterval(1);
-#endif
 
-    VernonOpenGLContextCallbacks callbacks{};
-    callbacks.struct_size = sizeof(callbacks);
-    callbacks.user_data = window_;
-    callbacks.make_current = &makeCurrent;
-    callbacks.get_proc_address = &getProcAddress;
+    VernonOpenGLContextCallbacks context{};
+    context.struct_size = sizeof(context);
+    context.user_data = window_;
+    context.make_current = &makeCurrent;
+    context.get_proc_address = &getProcAddress;
+    context.api_version_major = 3;
+    VernonHalDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
 #if defined(__EMSCRIPTEN__)
-    callbacks.api_version_major = 3;
-    callbacks.api_version_minor = 0;
-    device_ = vernonRhiCreateOpenGLDevice(&callbacks, 1);
+    context.api_version_minor = 0;
+    deviceDescriptor.backend = VERNON_RUNTIME_OPENGL_ES;
 #else
-    callbacks.api_version_major = 3;
-    callbacks.api_version_minor = 3;
-    device_ = vernonRhiCreateOpenGLDevice(&callbacks, 0);
+    context.api_version_minor = 3;
+    deviceDescriptor.backend = VERNON_RUNTIME_OPENGL;
 #endif
-    if (device_.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
-        std::cerr << "failed to create the Vernon OpenGL device\n";
+    deviceDescriptor.opengl = &context;
+    if (vernonHalCreateDevice(&deviceDescriptor, &device_) != VERNON_HAL_OK) {
+        std::cerr << "failed to create the Vernon OpenGL device: " << halError() << '\n';
         shutdown();
         return false;
     }
-    presentation_ = std::make_unique<PresentationState>();
-    if (!presentation_->initialize()) {
-        std::cerr << "failed to initialize OpenGL presentation resources\n";
+
+    VernonOpenGLSurfaceCallbacks presentation{};
+    presentation.struct_size = sizeof(presentation);
+    presentation.user_data = window_;
+    presentation.make_current = &makeCurrent;
+    presentation.swap_interval = &swapInterval;
+    presentation.swap_buffers = &swapBuffers;
+    presentation.drawable_size = &drawableSize;
+    VernonHalSurfaceDescriptor surfaceDescriptor{};
+    surfaceDescriptor.struct_size = sizeof(surfaceDescriptor);
+    surfaceDescriptor.native.opengl = &presentation;
+    if (vernonHalCreateSurface(device_, &surfaceDescriptor, &surface_) != VERNON_HAL_OK) {
+        std::cerr << "failed to create the window surface: " << halError() << '\n';
         shutdown();
+        return false;
+    }
+
+    VernonHalBufferDescriptor vertexDescriptor{};
+    vertexDescriptor.struct_size = sizeof(vertexDescriptor);
+    vertexDescriptor.size = sizeof(kFullscreenTriangle);
+    vertexDescriptor.usage = VERNON_HAL_BUFFER_VERTEX;
+    const VernonHalBufferWrite vertexWrite{0, kFullscreenTriangle.data(), sizeof(kFullscreenTriangle)};
+    VernonHalSamplerDescriptor samplerDescriptor{};
+    samplerDescriptor.struct_size = sizeof(samplerDescriptor);
+    samplerDescriptor.min_filter = VERNON_HAL_FILTER_LINEAR;
+    samplerDescriptor.mag_filter = VERNON_HAL_FILTER_LINEAR;
+    samplerDescriptor.address_u = VERNON_HAL_ADDRESS_CLAMP_TO_EDGE;
+    samplerDescriptor.address_v = VERNON_HAL_ADDRESS_CLAMP_TO_EDGE;
+    samplerDescriptor.address_w = VERNON_HAL_ADDRESS_CLAMP_TO_EDGE;
+    if (vernonHalCreateBuffer(device_, &vertexDescriptor, &vertices_) != VERNON_HAL_OK ||
+        vernonHalBufferWrite(vertices_, &vertexWrite, 1) != VERNON_HAL_OK ||
+        vernonHalReferenceBuffer(vertices_, 0, sizeof(kFullscreenTriangle), &verticesReference_) != VERNON_HAL_OK ||
+        vernonHalCreateSampler(device_, &samplerDescriptor, &sampler_) != VERNON_HAL_OK ||
+        vernonHalReferenceSampler(sampler_, &samplerReference_) != VERNON_HAL_OK) {
+        std::cerr << "failed to create the compositor resources: " << halError() << '\n';
+        shutdown();
+        return false;
+    }
+
+    std::string error;
+    if (!compositor_.link(runtime(), vernon_external_engine::panel_bundle::kManifest,
+                          vernon_external_engine::panel_bundle::kManifestSize,
+                          vernon_external_engine::panel_bundle::kCookedDirectory, error) ||
+        !compositor_.bindDeviceTensor("position", verticesReference_, sizeof(kFullscreenTriangle), 2, kTriangleShape,
+                                      kTriangleStrides) ||
+        !compositor_.bindSampler("panel_sampler", samplerReference_)) {
+        std::cerr << "failed to link the panel compositor: " << error << '\n';
+        shutdown();
+        return false;
+    }
+    passSlot_ = compositor_.slotOfKind(VERNON_SCHEDULE_SLOT_PASS);
+    drawSlot_ = compositor_.slotOfKind(VERNON_SCHEDULE_SLOT_DRAW);
+    dynamicSlot_ = compositor_.slotOfKind(VERNON_SCHEDULE_SLOT_DYNAMIC);
+    if (passSlot_ == SIZE_MAX || drawSlot_ == SIZE_MAX || dynamicSlot_ == SIZE_MAX) {
+        std::cerr << "the panel compositor is not a graphics schedule\n";
+        shutdown();
+        return false;
+    }
+    attachment_.location = 0;
+    attachment_.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    attachment_.clear_color.f32[3] = 1.0F;
+    renderPass_.struct_size = sizeof(renderPass_);
+    renderPass_.color_attachments = &attachment_;
+    renderPass_.color_attachment_count = 1;
+    compositor_.write(passSlot_, static_cast<const VernonRenderPass *>(&renderPass_));
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    compositor_.write(drawSlot_, draw);
+    return true;
+}
+
+bool GraphicsHost::configureSurface(uint32_t width, uint32_t height) {
+    VernonHalSurfaceCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    if (vernonHalSurfaceGetCapabilities(surface_, &capabilities) != VERNON_HAL_OK)
+        return false;
+    VernonHalSurfaceConfiguration configuration{};
+    configuration.struct_size = sizeof(configuration);
+    configuration.format = VERNON_TEXTURE_RGBA8_UNORM;
+    configuration.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+    configuration.width = width;
+    configuration.height = height;
+    configuration.present_mode = VERNON_HAL_PRESENT_FIFO;
+    configuration.image_count = std::max(capabilities.min_image_count, 2u);
+    if (capabilities.max_image_count)
+        configuration.image_count = std::min(configuration.image_count, capabilities.max_image_count);
+    if (vernonHalSurfaceConfigure(surface_, &configuration) != VERNON_HAL_OK)
+        return false;
+    surfaceWidth_ = width;
+    surfaceHeight_ = height;
+    return true;
+}
+
+bool GraphicsHost::drawPanel(VernonRuntimeProviderResourceReference target, const VernonHalImageView *panel, uint32_t x,
+                             uint32_t width, uint32_t height, bool clear) {
+    const VernonImageDescriptor *source = vernonHalImageGetDescriptor(vernonHalImageViewGetImage(panel));
+    VernonRuntimeProviderResourceReference panelReference{};
+    if (!source || !source->extent.width || !source->extent.height ||
+        vernonHalReferenceImageView(panel, &panelReference) != VERNON_HAL_OK)
+        return false;
+    const double sourceAspect = static_cast<double>(source->extent.width) / source->extent.height;
+    uint32_t fitWidth = width;
+    uint32_t fitHeight = height;
+    if (sourceAspect > static_cast<double>(width) / height)
+        fitHeight = std::max(1u, static_cast<uint32_t>(width / sourceAspect));
+    else
+        fitWidth = std::max(1u, static_cast<uint32_t>(height * sourceAspect));
+
+    attachment_.view = target;
+    attachment_.load_operation = clear ? VERNON_RUNTIME_PROVIDER_LOAD_CLEAR : VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    renderPass_.render_area[0] = 0;
+    renderPass_.render_area[1] = 0;
+    renderPass_.render_area[2] = surfaceWidth_;
+    renderPass_.render_area[3] = surfaceHeight_;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.viewport[0] = x + (width - fitWidth) / 2;
+    dynamic.viewport[1] = (height - fitHeight) / 2;
+    dynamic.viewport[2] = fitWidth;
+    dynamic.viewport[3] = fitHeight;
+    std::copy(std::begin(dynamic.viewport), std::end(dynamic.viewport), std::begin(dynamic.scissor));
+    compositor_.write(dynamicSlot_, dynamic);
+    if (!compositor_.bindImage("panel", panelReference))
+        return false;
+    std::string error;
+    if (!compositor_.call(error)) {
+        std::cerr << "failed to draw a panel: " << error << '\n';
         return false;
     }
     return true;
 }
 
-bool GraphicsHost::presentSplit(VernonRhiImage leftImage, uint32_t leftWidth, uint32_t leftHeight,
-                                VernonRhiImage rightImage, uint32_t rightWidth, uint32_t rightHeight) {
-    if (!presentation_)
+bool GraphicsHost::presentSplit(const VernonHalImageView *leftView, const VernonHalImageView *rightView) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!surface_ || !leftView || !rightView || !framebufferSize(width, height))
         return false;
-    PresentationState &gl = *presentation_;
-
-    uint32_t framebufferWidth = 0;
-    uint32_t framebufferHeight = 0;
-    if (!framebufferSize(framebufferWidth, framebufferHeight))
+    if ((width != surfaceWidth_ || height != surfaceHeight_) && !configureSurface(width, height))
         return false;
-    uint64_t nativeTextures[2]{};
-    if (vernonRhiDeviceGetImageNativeHandle(device_, leftImage, &nativeTextures[0]) != VERNON_RHI_STATUS_OK ||
-        vernonRhiDeviceGetImageNativeHandle(device_, rightImage, &nativeTextures[1]) != VERNON_RHI_STATUS_OK)
+    VernonHalSurfaceImage image{};
+    VernonHalStatus acquired = vernonHalSurfaceAcquire(surface_, &image);
+    if (acquired == VERNON_HAL_SURFACE_OUT_OF_DATE && configureSurface(width, height))
+        acquired = vernonHalSurfaceAcquire(surface_, &image);
+    VernonRuntimeProviderResourceReference target{};
+    if (acquired != VERNON_HAL_OK || vernonHalReferenceImageView(image.view, &target) != VERNON_HAL_OK) {
+        std::cerr << "failed to acquire the window surface: " << halError() << '\n';
         return false;
-
-    struct Rect {
-        GlInt x0;
-        GlInt y0;
-        GlInt x1;
-        GlInt y1;
-    };
-    const auto fit = [](uint32_t panelX, uint32_t panelWidth, uint32_t panelHeight, uint32_t sourceWidth,
-                        uint32_t sourceHeight) {
-        const double sourceAspect = static_cast<double>(sourceWidth) / sourceHeight;
-        const double panelAspect = static_cast<double>(panelWidth) / panelHeight;
-        uint32_t width = panelWidth;
-        uint32_t height = panelHeight;
-        if (sourceAspect > panelAspect)
-            height = static_cast<uint32_t>(panelWidth / sourceAspect);
-        else
-            width = static_cast<uint32_t>(panelHeight * sourceAspect);
-        const uint32_t x = panelX + (panelWidth - width) / 2;
-        const uint32_t y = (panelHeight - height) / 2;
-        return Rect{static_cast<GlInt>(x), static_cast<GlInt>(y), static_cast<GlInt>(x + width),
-                    static_cast<GlInt>(y + height)};
-    };
-    const uint32_t leftPanelWidth = framebufferWidth / 2;
-    const Rect destinations[] = {
-        fit(0, leftPanelWidth, framebufferHeight, leftWidth, leftHeight),
-        fit(leftPanelWidth, framebufferWidth - leftPanelWidth, framebufferHeight, rightWidth, rightHeight)};
-    const uint32_t sourceWidths[] = {leftWidth, rightWidth};
-    const uint32_t sourceHeights[] = {leftHeight, rightHeight};
-
-    gl.bindFramebuffer(kDrawFramebuffer, 0);
-    gl.disable(kScissorTest);
-    gl.clearColor(0.0F, 0.0F, 0.0F, 1.0F);
-    gl.clear(kColorBufferBit);
-    for (size_t index = 0; index < 2; ++index) {
-        gl.bindFramebuffer(kReadFramebuffer, gl.framebuffers[index]);
-        gl.framebufferTexture2D(kReadFramebuffer, kColorAttachment0, kTexture2d,
-                                static_cast<GlUint>(nativeTextures[index]), 0);
-        gl.readBuffer(kColorAttachment0);
-        if (gl.checkFramebufferStatus(kReadFramebuffer) != kFramebufferComplete) {
-            gl.bindFramebuffer(kReadFramebuffer, 0);
-            return false;
-        }
-        gl.bindFramebuffer(kDrawFramebuffer, 0);
-        const Rect &destination = destinations[index];
-        gl.blitFramebuffer(0, 0, static_cast<GlInt>(sourceWidths[index]), static_cast<GlInt>(sourceHeights[index]),
-                           destination.x0, destination.y0, destination.x1, destination.y1, kColorBufferBit, kLinear);
     }
-    gl.bindFramebuffer(kReadFramebuffer, 0);
-    glfwSwapBuffers(window_);
-    return gl.getError() == kNoError;
+    const uint32_t leftWidth = width / 2;
+    const bool drawn = drawPanel(target, leftView, 0, leftWidth, height, true) &&
+                       drawPanel(target, rightView, leftWidth, width - leftWidth, height, false);
+    const bool presented = vernonHalSurfacePresent(surface_) == VERNON_HAL_OK;
+    if (!presented)
+        std::cerr << "failed to present the window surface: " << halError() << '\n';
+    return drawn && presented;
+}
+
+bool GraphicsHost::createPanelImage(uint32_t width, uint32_t height, uint32_t usage, VernonHalImage *&image,
+                                    VernonHalImageView *&view) const {
+    destroyPanelImage(image, view);
+    const VernonImageDescriptor imageDescriptor{
+        VERNON_TEXTURE_2D, {width, height, 1}, VERNON_TEXTURE_RGBA8_UNORM, 1, 1, 1, usage | VERNON_IMAGE_SAMPLED};
+    const VernonImageViewDescriptor viewDescriptor{
+        VERNON_TEXTURE_2D, VERNON_TEXTURE_RGBA8_UNORM, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
+    if (device_ && vernonHalCreateImage(device_, &imageDescriptor, &image) == VERNON_HAL_OK &&
+        vernonHalCreateImageView(image, &viewDescriptor, &view) == VERNON_HAL_OK)
+        return true;
+    std::cerr << "failed to create a panel image: " << halError() << '\n';
+    destroyPanelImage(image, view);
+    return false;
+}
+
+void GraphicsHost::destroyPanelImage(VernonHalImage *&image, VernonHalImageView *&view) {
+    if (view)
+        (void)vernonHalDestroyImageView(view);
+    view = nullptr;
+    if (image)
+        (void)vernonHalDestroyImage(image);
+    image = nullptr;
 }
 
 bool GraphicsHost::framebufferSize(uint32_t &width, uint32_t &height) const {
-    int framebufferWidth = 0;
-    int framebufferHeight = 0;
-    if (window_)
-        glfwGetFramebufferSize(window_, &framebufferWidth, &framebufferHeight);
-    if (framebufferWidth <= 0 || framebufferHeight <= 0)
+    if (!window_)
         return false;
-    width = static_cast<uint32_t>(framebufferWidth);
-    height = static_cast<uint32_t>(framebufferHeight);
-    return true;
+    drawableSize(window_, &width, &height);
+    return width && height;
 }
 
 void GraphicsHost::pollEvents() { glfwPollEvents(); }
@@ -226,22 +291,25 @@ void GraphicsHost::pollEvents() { glfwPollEvents(); }
 bool GraphicsHost::shouldClose() const { return !window_ || glfwWindowShouldClose(window_) != 0; }
 
 void GraphicsHost::shutdown() {
-    if (presentation_) {
-        if (window_)
-            glfwMakeContextCurrent(window_);
-        presentation_->shutdown();
-        presentation_.reset();
-    }
-    if (device_.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
-        vernonRhiDestroyDevice(device_);
-        device_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    }
-    if (window_) {
+    compositor_.reset();
+    if (sampler_)
+        vernonHalDestroySampler(sampler_);
+    sampler_ = nullptr;
+    if (vertices_)
+        vernonHalDestroyBuffer(vertices_);
+    vertices_ = nullptr;
+    if (surface_)
+        (void)vernonHalDestroySurface(surface_);
+    surface_ = nullptr;
+    surfaceWidth_ = 0;
+    surfaceHeight_ = 0;
+    if (device_ && vernonHalDestroyDevice(device_) != VERNON_HAL_OK)
+        std::cerr << "failed to destroy the Vernon OpenGL device: " << halError() << '\n';
+    device_ = nullptr;
+    if (window_)
         glfwDestroyWindow(window_);
-        window_ = nullptr;
-    }
-    if (glfwInitialized_) {
+    window_ = nullptr;
+    if (glfwInitialized_)
         glfwTerminate();
-        glfwInitialized_ = false;
-    }
+    glfwInitialized_ = false;
 }

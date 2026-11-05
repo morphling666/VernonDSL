@@ -5,8 +5,8 @@ Status: normative compute Program VJP contract.
 > Canonical forward/backward Program graphs, typed derivative groups, checked
 > dynamic tape, explicit accumulation plans, persistent boundary binding, and
 > invocation-time `(x,y,z)` carriers are implemented. Direct Kernel VJP is a
-> one-node Program; Module VJP uses the same runtime invocation frame and
-> pullback implementation. CPU supports recursive
+> one-node Program; Module VJP uses the same linked VJP and residuals. CPU
+> supports recursive
 > Scalar/Tensor/Tuple/Struct Storage elements, dynamic and signed-stride
 > TensorViews, mutable scratch versioning, structured control flow,
 > gather/scatter accumulation, reusable pullbacks, and packed tangent owners.
@@ -104,7 +104,9 @@ Values derive gradient structure recursively from floating leaves.
   logical shape.
 - A TensorView or mutable Storage gradient is newly owned Storage at the public
   pullback boundary. In the compute-node ABI it is a writable TensorView
-  endpoint of the backward stage, not a fixed-shape SSA result.
+  endpoint of the backward stage, not a fixed-shape SSA result. It is compact
+  and has the view's logical shape: a strided or offset view's gradient does
+  not reproduce the view's owner or layout.
 - Vector, Matrix, Tensor, Tuple, and Struct Storage elements derive one
   structural tangent schema recursively. Their public gradient is one packed
   tangent `TensorStorage`, not one owner per ABI leaf.
@@ -179,7 +181,13 @@ canonical derivative paths; `Zero` projections fail deterministically.
 All compatible `wrt` views of one primal allocation accumulate into one fresh
 tangent owner. Separately bound overlapping read/write aliases remain invalid.
 A legal in-place `read_write` binding is differentiated through explicit
-Storage versions.
+Storage versions. The cotangent of its final version seeds the backward once,
+as the difference the kernel adds to the entry version, so a `wrt` of the
+binding is the gradient of its entry contents and counts that cotangent once.
+On GPU targets a kernel whose backward needs an internal Storage adjoint (a
+device Storage the same kernel writes and then reads, or updates in place)
+fails lowering with that diagnostic; only the CPU lowers lane-private adjoint
+buffers.
 
 ## 4. Source and asset declaration
 
@@ -389,13 +397,15 @@ Backend capability does not change the frontend derivative graph.
 ## 8. Deferred graphics VJP
 
 Compute GPU autodiff supports no-Tape and captured static/dynamic Storage
-pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured implementations use
-complete-workgroup bounded replay with original virtual IDs, device-local Tape,
-fixed lane-status readback, transactional gradient publication, and no
-GPU-to-host Tape payload readback. RHI graph resources provide checkpoint
-snapshots for Program forward-graph replay segments. Cotangents and gradients use the same canonical
-`VernonProgramArgument` boundary binding as primal Values and may remain
-device-resident; there is no device-specific pullback ABI. Derivative execution
+pullbacks on CUDA, Vulkan, and OpenGL; DirectX 12 and Metal return with their
+HAL devices. Captured implementations use complete-workgroup bounded replay
+with original virtual IDs, device-local Tape, fixed lane-status readback,
+gradients written in place, and no GPU-to-host Tape payload readback.
+Checkpointed VJPs, which rerun a forward prefix
+([`../runtime/design.md`](../runtime/design.md) section 7), link on the CPU
+and CUDA. Cotangents and gradients are slots of the backward schedule's
+argument record like primal Values and may remain device-resident; there is
+no device-specific pullback ABI. Derivative execution
 and temporary Tape/gradient storage remain backend-local. Graphics autodiff
 remains unsupported. Graphics support must
 account for the fact that
@@ -415,72 +425,50 @@ compatibility branch.
 
 ## 9. Program composition
 
-`ProgramGraph` is a primal compute/resource scheduling graph, not a
-differentiable Program. Value connections and Storage-version chains carry no
-derivative semantics. Linking never constructs a composite backward graph,
-cotangent fan-in, or graph pullback.
+`ProgramGraph` is a primal compute/resource scheduling graph. Value
+connections and Storage-version chains carry no derivative semantics of their
+own. A differentiated cooked Program remains differentiable when used as one
+graph node: `vernonScheduleLinkVjp` of a graph of such nodes links a backward
+schedule that runs the nodes' backward graphs in reverse order, each node's
+input gradient feeding the cotangent of the output it reads. A Value read by
+several nodes, or by a node and the caller, needs cotangent fan-in and does
+not link. A derivative with fan-in is authored as one Module and cooked as
+one VJP Program, where the compiler owns reverse topology and cotangent
+accumulation. That transform differentiates only the operands that
+depend on a `wrt` input: a node none of whose operands vary contributes no
+backward node, and a constant operand of a varied node, such as a scale
+factor, gets no gradient, so its kernel VJP never computes one.
 
-A differentiated cooked Program remains differentiable when used as one graph
-node. Execute with retention enabled prepares that node's own immutable
-residual and tape state. Only after commit may the caller retrieve a reusable
-pullback for that node and apply it with the child Program's original
-Cotangent and Gradient boundary slots. Pullbacks for different nodes are
-independent.
+## 10. C deployment API
 
-For `A -> B`, the caller applies `B`'s pullback, explicitly binds the resulting
-cotangent as input to `A`'s pullback, and decides whether or how to accumulate
-multiple contributions. The Runtime does not traverse ProgramGraph edges in
-reverse. A whole-graph derivative must instead be authored as one Module and
-cooked as one VJP Program, where the compiler owns reverse topology and
-cotangent accumulation.
-
-## 10. C and C++ deployment API
-
-C++ resolves a differentiated Program and invokes its VJP:
-
-```cpp
-auto program = bundle.resolveProgram("pipeline/render");
-auto [image, pullback] = program.vjp(bindings, {gridX, gridY, gridZ});
-auto gradients = pullback({{"color", dImage}});
-```
-
-The application-facing C ABI uses the ordinary persistent Program invocation
-for forward and an opaque retained pullback handle. Pullback arguments bind
-exact Cotangent and Gradient boundary slots:
+The C ABI links a differentiated Program's VJP once and calls it per step
+([`../runtime/design.md`](../runtime/design.md) section 7). The backward
+schedule's slots are a cotangent per differentiated output and a gradient per
+differentiated input, in boundary slot order; `vernonScheduleVjpSlotRole`
+tells them apart:
 
 ```c
-VernonPullback *pullback = NULL;
-VernonProgramInvocation *invocation =
-    vernonRuntimeProgramInstanceBeginInvocation(instance);
-/* Bind each canonical primal parameter with vernonRuntimeProgramInvocationBind. */
-vernonRuntimeProgramInvocationExecute(invocation, 1, NULL);
-vernonRuntimeProgramInvocationCommit(invocation, &pullback);
-vernonProgramPullbackApply(pullback, derivative_arguments, derivative_argument_count);
-vernonProgramPullbackDestroy(pullback);
+VernonScheduleVjp *vjp = vernonScheduleLinkVjp(context, executable);
+/* Write each record from the template, slots and fields of
+   vernonScheduleVjpSchedule(vjp, 0) and vernonScheduleVjpSchedule(vjp, 1). */
+VernonScheduleResiduals *residuals = NULL;
+uint64_t point = 0;
+vernonScheduleVjpForward(vjp, forward_record, forward_size, &residuals, &point);
+vernonScheduleVjpBackward(vjp, backward_record, backward_size, residuals, &point);
+vernonScheduleWait(context, point);
+vernonScheduleResidualsDestroy(residuals);
+vernonScheduleVjpDestroy(vjp);
 ```
 
-For a ProgramGraph, execute with retention enabled prepares node-local state,
-but no pullback is transferable until commit. Commit returns no composite
-pullback. The caller then retrieves each retained child pullback explicitly
-before destroying the invocation:
-
-```c
-VernonPullback *composite = NULL;
-vernonRuntimeProgramInvocationExecute(invocation, 1, NULL);
-vernonRuntimeProgramInvocationCommit(invocation, &composite); /* remains NULL */
-vernonRuntimeProgramInvocationGetNodePullback(invocation, node, &pullback);
-```
-
-The C structures use `struct_size` and reserved fields. C++ provides RAII over
-the same ownership rules. Deployment never runs Python or performs the
-autodiff transform.
+The C structures use `struct_size`. Deployment never runs Python or performs
+the autodiff transform.
 
 ## 11. Versioning and acceptance
 
 The current Compiler Contract and Program Version define the Program VJP
 boundary. Older profile manifests are rejected rather than reinterpreted,
 normalized, or retained as a parallel loading path. CPU and supported GPU VJP
-use the same Program/ResolveProgram/ExecuteProgram path. Differentiated
+use the same linked VJP path. Differentiated
 graphics remains unsupported.
 
 CPU acceptance covers direct and cooked structured Storage VJP, recursive
@@ -507,6 +495,13 @@ no Value ABI layout, so it can never be taped, and a wrapped and clamped
 window start would otherwise fail the gradient. Replay legality (whether a
 loop or branch can be reconstructed) keeps the cap of 8, since a larger one
 changes which loops are replayed.
+
+A branch is reconstructed instead of taped when its predicate is. Shape
+queries are pure for this purpose, so a bounds guard over `gid` and a
+TensorView's shape costs no tape. A branch that writes or reads Storage is
+reversed under its recomputed predicate, which the reverse pass rebuilds only
+from pure operations of entry values; such a branch whose predicate depends on
+loaded data keeps its tape record.
 
 The planner distinguishes:
 

@@ -415,6 +415,12 @@ use, not merely for the duration of the host call. The runtime retains owners
 until completion and rejects host mutation, destruction, or incompatible
 borrows while device work is outstanding.
 
+`wait()` on a TensorStorage, RawBuffer or TensorView blocks until every
+device write submitted to the owner has completed, and copies nothing: the
+host copy stays stale until a host read synchronizes it. A failure of that
+write raises from `wait()`. On the CPU, where calls return after their work
+completes, it returns at once.
+
 Typed semantic nodes record effects independently from types:
 
 - `read(owner, region)`;
@@ -482,7 +488,7 @@ effects allowed by their stage and parameter access modes. Host runtime
 allocation, uploads, dispatch, downloads, and resource lifetime are not parsed
 device-language expressions.
 Multi-node ordering, render state, resource transitions, and cross-backend
-synchronization are canonical Program and Runtime Command DAG semantics. They
+synchronization are canonical Program and linked-schedule semantics. They
 are not shader-language semantics.
 
 ## 6. Functions, interfaces, and specialization
@@ -849,6 +855,12 @@ The portable floating-point math surface includes `sin`, `cos`, `acos`,
 `atan2`, `exp`, `log`, `sqrt`, `floor`, `abs`, `min`, `max`, `pow`, and
 `clamp`, plus vector `dot`, `cross`, `norm`, `normalize`, and `reflect`.
 `atan2(y, x)` follows the conventional quadrant-aware argument order.
+`min(a, b)` is `a if a < b else b`, `max(a, b)` is `a if a > b else b`, and
+`clamp(x, low, high)` is `min(max(x, low), high)`. So a NaN in either operand,
+or two equal operands such as `0.0` and `-0.0`, select the second operand, on
+every backend and in compiled host code. These are x86's `minsd`/`maxsd`; the
+IEEE 754-2019 `minimum`/`maximum`, which propagate NaN and order `-0.0` below
+`0.0`, cost several instructions more per call on x86 and are not used.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented
@@ -902,6 +914,10 @@ Floating-point Scalar leaves are differentiable. Tensor, Tuple, and Struct
 Values derive adjoint structure recursively from floating leaves. Floating
 Scalar and immutable Tensor gradients are ordinary Values. A differentiated
 TensorView or mutable Storage input produces newly owned gradient Storage.
+A TensorView's gradient is shaped as the view's owner rather than as the view:
+the differentiated views of one owner share one gradient Storage, which each
+view's gradient accumulates into where that view lies (aliased views add), and
+which is zero where no differentiated view lies.
 The backward compiler ABI receives that Storage as a writable TensorView
 argument, with dynamic extents preserved in its descriptor; it is not returned
 as a fixed-shape Value.
@@ -925,6 +941,21 @@ non-differentiable.
 Applying `vd.ad.vjp` to a Module produces explicit forward, backward, and
 residual Program topology. Runtime executes that topology without a separate
 host pass graph.
+
+A Module VJP binds inputs once with
+`step.bind(name=value, ..., gradients={name: storage})`, as a Program
+instance binds its parameters (`../program/execution_manifest.md` section
+5). The bound VJP is called with the remaining `forward()` parameters, in
+order. Its pullback writes the gradient of each bound input in `wrt` into
+that input's gradient Storage, replacing its contents, and returns those
+Storages, the same objects on every application; the gradients of unbound
+inputs are newly owned. A gradient Storage `gradients` omits is allocated by
+`bind` with the input's shape and element type; a supplied one must have
+them and must not alias a bound input. Binding neither copies nor freezes
+an input: writes to it between calls are seen by the next call, while a
+pullback reads it as of its forward call, as for every input the backward
+graph reads. `step.bind` requires every `forward()`
+parameter to be positional and DSL-annotated.
 
 JVP, full-Jacobian materialization, convenience `grad` aliases, implicit
 gradient accumulation, nested transforms, Hessians, and Hessian-vector

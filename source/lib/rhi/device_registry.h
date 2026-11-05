@@ -34,6 +34,13 @@ struct DeviceRegistryHandle {
     std::uint32_t generation{};
 };
 
+// Advances whenever any registry publishes or removes a device. Registries of different backends hand out the same
+// handles, so a handle's backend, once found, stays the same only while this is unchanged.
+inline std::atomic<std::uint64_t> &deviceRegistryEpoch() noexcept {
+    static std::atomic<std::uint64_t> epoch{0};
+    return epoch;
+}
+
 namespace detail {
 
 [[nodiscard]] constexpr std::uint32_t nextRhiGeneration(std::uint32_t generation) noexcept {
@@ -320,6 +327,7 @@ private:
         Snapshot *old = current_.exchange(next, std::memory_order_seq_cst);
         if (old != expectedCurrent)
             resultContractViolation();
+        deviceRegistryEpoch().fetch_add(1, std::memory_order_seq_cst);
         if (old) {
             old->nextRetired = retired_;
             retired_ = old;

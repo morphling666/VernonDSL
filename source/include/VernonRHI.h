@@ -834,6 +834,7 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateImageView(VernonRhiDevice d
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetImageSampler(VernonRhiDevice device, VernonRhiImage image,
                                                                const VernonRhiSamplerDescriptor *descriptor);
 /*
+ * An empty batch (upload_count 0, `uploads` may be null) checks the image and uploads nothing.
  * Depth and stencil download on every backend; OpenGL ES needs OpenGL ES 3.1 for them. OpenGL and OpenGL ES upload
  * the depth and stencil of a D32_FLOAT_S8_UINT image only together and return VERNON_RHI_STATUS_UNSUPPORTED for one
  * aspect alone.

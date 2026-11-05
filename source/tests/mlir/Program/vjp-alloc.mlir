@@ -36,4 +36,7 @@ module {
 // CHECK: callee = "square.vjp"
 // CHECK-SAME: operand_names = ["tape", "primal.source", "primal.output", "result.output", "cotangent.output", "gradient.source"]
 // CHECK-SAME: result_names = ["source"]}>
+// The kernel's gradient dest is the public gradient; no boundary copy follows it.
+// CHECK-NOT: vernon.builtin.copy
+// CHECK: return
 // CHECK-NOT: name = "empty_like"

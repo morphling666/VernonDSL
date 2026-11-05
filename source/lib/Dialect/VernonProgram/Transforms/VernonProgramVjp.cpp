@@ -11,6 +11,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -168,6 +169,39 @@ Value createDestinationPassingCompute(OpBuilder &builder, Location location, Str
     Value result = builder.create(state)->getResult(0);
     applyProgramLanguageAbi(result.getDefiningOp(), getProgramValueLanguageAbi(operands[destOperand]));
     return result;
+}
+
+// The values from `value` back to a zeroed allocation of the backward graph that is its Storage, following each
+// compute result to the operand it writes, when every earlier value is used only as the next one's write dest; empty
+// when the Storage may be one the caller holds, such as a public cotangent, or is read along the way.
+SmallVector<Value> ownedZeroChain(Value value) {
+    SmallVector<Value> chain;
+    while (value) {
+        if (!chain.empty() && !value.hasOneUse())
+            return {};
+        chain.push_back(value);
+        Operation *defining = value.getDefiningOp();
+        if (!defining)
+            return {};
+        if (auto intrinsic = dyn_cast<IntrinsicOp>(defining))
+            return intrinsic.getName() == "zeros" || intrinsic.getName() == "zeros_like" ? chain : SmallVector<Value>{};
+        auto compute = dyn_cast<ComputeOp>(defining);
+        auto sources =
+            compute ? compute->getAttrOfType<DenseI64ArrayAttr>("vernon_program.result_resource_sources") : nullptr;
+        const unsigned result = cast<OpResult>(value).getResultNumber();
+        if (!sources || result >= sources.size() || sources[result] < 0 ||
+            sources[result] >= static_cast<int64_t>(compute->getNumOperands()))
+            return {};
+        value = compute->getOperand(static_cast<unsigned>(sources[result]));
+    }
+    return {};
+}
+
+bool sameStorageType(Type left, Type right) {
+    auto leftView = dyn_cast<TensorViewType>(left);
+    auto rightView = dyn_cast<TensorViewType>(right);
+    return leftView && rightView && leftView.getElementType() == rightView.getElementType() &&
+           leftView.getShape() == rightView.getShape() && leftView.getAddressSpace() == rightView.getAddressSpace();
 }
 
 Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {},
@@ -464,8 +498,26 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     for (unsigned index : context.activeOperandIndices) {
         if (isWriteOnlyProgramOperand(operation, index))
             continue;
-        if (succeeded(derivativeType(operation.getOperand(index).getType(), operation)))
-            contributions[index] = vjp->getResult(result++);
+        if (failed(derivativeType(operation.getOperand(index).getType(), operation)))
+            continue;
+        Value contribution = vjp->getResult(result++);
+        // An in-place operand's kernel gradient holds only what the kernel changed (VernonStructuredVjp's buffer
+        // seeds); the elements it leaves alone pass the result's cotangent through, which is added here once.
+        const StringRef name = index < operation.getOperandNames().size()
+                                   ? cast<StringAttr>(operation.getOperandNames()[index]).getValue()
+                                   : StringRef();
+        for (auto [cotangent, resultIndex] : llvm::enumerate(cotangentResults)) {
+            if (name.empty() || cast<StringAttr>(operation.getResultNames()[resultIndex]).getValue() != name ||
+                !isa<TensorViewType>(contribution.getType()))
+                continue;
+            Value passed = copyValue(builder, context.location, context.resultCotangents[cotangent],
+                                     contribution.getType(), context.getPrimalOperand(index));
+            Value sum = passed ? addValues(builder, context.location, passed, contribution) : Value{};
+            if (!sum)
+                return operation.emitOpError("Program VJP cannot pass an in-place operand's cotangent through");
+            contribution = sum;
+        }
+        contributions[index] = contribution;
     }
     return contributions;
 }
@@ -703,6 +755,15 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     forward->removeAttr("vernon.stage");
     moduleBuilder.insert(forward);
 
+    // An operand needs a gradient only when it depends on a wrt input; a kernel asked for the gradient of a constant
+    // operand (a scalar factor) computes it anyway, often with a workgroup reduction.
+    DenseSet<Value> varied;
+    for (unsigned index : wrtIndices)
+        varied.insert(primal.getArgument(index));
+    for (Operation *operation : primalOperations)
+        if (llvm::any_of(operation->getOperands(), [&](Value operand) { return varied.contains(operand); }))
+            varied.insert(operation->getResults().begin(), operation->getResults().end());
+
     llvm::DenseSet<Operation *> activeNestedComputes;
     {
         DenseMap<Value, char> live;
@@ -716,7 +777,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
                 if (isWriteOnlyProgramOperand(operation, index))
                     continue;
                 live[operand] = 1;
-                if (succeeded(derivativeType(operand.getType(), operation)))
+                if (varied.contains(operand) && succeeded(derivativeType(operand.getType(), operation)))
                     activeOperands.push_back(static_cast<unsigned>(index));
             }
             if (auto compute = dyn_cast<ComputeOp>(operation);
@@ -845,7 +906,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             // buffer. Write-only dests are kernel outputs / cotangents.
             if (isWriteOnlyProgramOperand(operation, index))
                 continue;
-            if (succeeded(derivativeType(operand.getType(), operation)))
+            if (varied.contains(operand) && succeeded(derivativeType(operand.getType(), operation)))
                 activeOperands.push_back(index);
         }
         for (auto [index, result] : llvm::enumerate(operation->getResults())) {
@@ -860,6 +921,9 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         }
         if (resultCotangents.empty())
             return operation->emitError("Program VJP active operation has no result cotangents");
+        // An empty operand list means every operand to the rules; a node independent of wrt contributes nothing.
+        if (activeOperands.empty())
+            continue;
         AutodiffVjpBuildContext context{builder,          operation->getLoc(), primalOperands, primalResults,
                                         resultCotangents, activeOperands,      activeResults};
         FailureOr<SmallVector<Value>> contributions = failure();
@@ -897,13 +961,24 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     }
 
     SmallVector<Value> gradients;
+    // A public gradient is newly owned, write-only Storage. An adjoint already in a zeroed allocation of this graph
+    // that is only ever written, and that no other gradient is in, becomes the gradient as it is, retyped to the
+    // write-only public type; any other is copied, since it may be the caller's cotangent or be read.
+    llvm::DenseSet<Value> published;
     for (unsigned index : wrtIndices) {
         Value primalArgument = primal.getArgument(index);
         Value gradient = adjoints.lookup(primalArgument);
         Type publicType = backwardResults[gradients.size()];
+        SmallVector<Value> chain = gradient && gradient.use_empty() && sameStorageType(gradient.getType(), publicType)
+                                       ? ownedZeroChain(gradient)
+                                       : SmallVector<Value>{};
+        const bool inPlace = !chain.empty() && published.insert(chain.back()).second;
+        if (inPlace)
+            for (Value link : chain)
+                link.setType(publicType);
         if (!gradient)
             gradient = createZero(builder, primal.getLoc(), publicType, lookupPrimal(primalArgument));
-        else if (isa<TensorViewType>(publicType))
+        else if (isa<TensorViewType>(publicType) && !inPlace)
             gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument), true);
         else if (gradient.getType() != publicType)
             gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument));
@@ -912,6 +987,19 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         gradients.push_back(gradient);
     }
     func::ReturnOp::create(builder, primal.getLoc(), gradients);
+    // Kernel VJPs return a gradient for every differentiable operand, so contributions to inputs outside wrt (a
+    // scalar shared by two nodes) are summed with arith ops that no Program implementation lowers; they are dead.
+    // Erasing them precedes the capture sweep so residuals only they read are dropped too.
+    SmallVector<Operation *> dead;
+    do {
+        dead.clear();
+        backward.walk([&](Operation *operation) {
+            if (operation != backward && isOpTriviallyDead(operation))
+                dead.push_back(operation);
+        });
+        for (Operation *operation : dead)
+            operation->erase();
+    } while (!dead.empty());
     llvm::BitVector unusedCaptures(backward.getNumArguments());
     for (unsigned index = 0; index < retainedValues.size(); ++index)
         if (backward.getArgument(index).use_empty())

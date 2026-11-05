@@ -91,18 +91,24 @@ Architecture and tutorials link to the contract instead of redefining fields.
 - [`runtime/tensor_view_metadata_abi_plan.md`](runtime/tensor_view_metadata_abi_plan.md)
   records the implemented aggregate TensorView metadata ABI.
 - [`program/recorded_draws.md`](program/recorded_draws.md) proposes graphics
-  Nodes whose draws, pipelines, and per-draw parameter bindings are recorded
-  per invocation.
+  Nodes whose draws, pipelines, and per-draw parameter bindings come from a
+  pass table per call.
 - [`program/fragment_discard.md`](program/fragment_discard.md) proposes the
   `vd.discard_fragment()` statement for masked raster.
 - [`program/integer_targets.md`](program/integer_targets.md) records the
   design of the single format table, `r32_uint`/`rg32_uint` color targets,
   interpolation qualifiers, sampled texel fetch, and typed clear values.
-- [`runtime/pipelined_submission.md`](runtime/pipelined_submission.md)
-  specifies asynchronous submission for graphics, compute and autodiff:
-  every Execute returns after submission and completion effects belong to
-  the submission. Phase 1, asynchronous plans whose writes are all in
-  place, is implemented.
+- [`runtime/architecture_v2.md`](runtime/architecture_v2.md) is the accepted
+  runtime architecture: the compiler emits a schedule fragment per Program,
+  the runtime links a graph's fragments when its structure changes, a thin
+  asynchronous HAL records the result once, with grids and sizes as data, a
+  call writes changed bytes and submits, buffers have one home, outputs are
+  written in place and draws are data. It supersedes stored plans, binding groups, transactional
+  publication and the per-Execute interpreter.
+- [`performance.md`](performance.md) designs compute and graphics
+  performance on that runtime: targets, the source epoch, ISPC-style
+  SIMT-to-SIMD CPU kernels, host-CPU targets, aliasing classes, exact
+  floating point, fusion, 64-bit integers and the Vulkan high tier.
 - [`runtime/presentable_surfaces.md`](runtime/presentable_surfaces.md)
   proposes RHI-owned swapchains for host windows, whose acquired images
   Runtime binds as ordinary color targets.
@@ -153,10 +159,9 @@ Kernel / vd.pipeline / initialized Module / Program transform
   -> Program + target ArtifactSystem
   -> load Program bundle
   -> resolve immutable execution plan
-  -> create instance
-  -> begin invocation
-  -> bind
-  -> invoke
+  -> link schedule
+  -> write argument record
+  -> call -> timeline point
 ```
 
 Standalone compute and graphics executables are one-node Programs. A Module

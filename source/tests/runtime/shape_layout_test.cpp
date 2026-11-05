@@ -1,6 +1,3 @@
-#include "runtime/autodiff/program_shape_resolver.h"
-#include "runtime/program_execution/program_invocation_state.h"
-#include "runtime/program_execution_manifest.h"
 #include "runtime/shape_layout.h"
 
 #include <gtest/gtest.h>
@@ -54,46 +51,6 @@ TEST(ShapeLayout, LeafProjectionPreservesConcreteOwnerStrides) {
     ASSERT_TRUE(materializeCompactProjection({3}, {Extent::dynamic()}, 8, projectedShape, projectedStrides));
     EXPECT_EQ(projectedShape, (ConcreteShape{3}));
     EXPECT_EQ(projectedStrides, (ByteStrides{8}));
-}
-
-TEST(ProgramShapeResolver, PropagatesOnlyAcrossExplicitStorageAliases) {
-    program::Program execution;
-    execution.values.resize(3);
-    execution.values[0].id = 0;
-    execution.values[0].name = "source";
-    execution.values[0].shape = {2, 0};
-    execution.values[0].storage = 0;
-    execution.values[1].id = 1;
-    execution.values[1].name = "alias";
-    execution.values[1].shape = {0, 3};
-    execution.values[1].storage = 0;
-    execution.values[2].id = 2;
-    execution.values[2].name = "unrelated";
-    execution.values[2].shape = {2, 3};
-    execution.storages.resize(1);
-    execution.storages[0].id = 0;
-    execution.storages[0].initialValue = 0;
-    std::vector<program_execution::ProgramValueState> values(execution.values.size());
-    values[0].concreteShape = ConcreteShape{2, 3};
-
-    std::string error;
-    ASSERT_TRUE(ad::resolveProgramShapes(execution, nullptr, values, error)) << error;
-    EXPECT_EQ(values[1].concreteShape, values[0].concreteShape);
-    EXPECT_EQ(values[2].concreteShape, std::optional<ConcreteShape>(ConcreteShape{2, 3}));
-}
-
-TEST(ProgramShapeResolver, RejectsConflictingConcreteBindings) {
-    program::Program execution;
-    execution.values.resize(1);
-    execution.values[0].id = 0;
-    execution.values[0].name = "value";
-    execution.values[0].shape = {2, 0};
-    std::vector<program_execution::ProgramValueState> values(1);
-    values[0].concreteShape = ConcreteShape{3, 4};
-
-    std::string error;
-    EXPECT_FALSE(ad::resolveProgramShapes(execution, nullptr, values, error));
-    EXPECT_NE(error.find("conflicts"), std::string::npos);
 }
 
 } // namespace

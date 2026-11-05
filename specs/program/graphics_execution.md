@@ -83,8 +83,9 @@ Every graphics Node references three canonical Program controls:
 - **DynamicState**: viewport, scissor, stencil reference, blend constants, and
   other supported dynamic backend state.
 
-Controls are bound on `VernonProgramInvocation`. They are not shader
-parameters and do not use Stage endpoint slots.
+Controls are a linked schedule's PASS, DRAW and DYNAMIC slots
+(`VernonSchedule.h`). They are not shader parameters and do not use Stage
+endpoint slots.
 
 Programs may declare static defaults where the manifest contract permits.
 Runtime never infers vertex or index counts from shader inputs.
@@ -125,10 +126,13 @@ allocation format belongs to the Storage descriptor.
 
 Every backend uses one coordinate convention, the one Direct3D 12, Metal and
 WebGPU define. Vulkan reaches it with a negative-height viewport and OpenGL
-with a vertex y flip ([runtime design](../runtime/design.md) section 10):
+with a vertex y flip and depth remap ([runtime design](../runtime/design.md)
+section 10):
 
 - Normalized device y = +1 is image row 0, the first row a host upload
   writes and a readback returns.
+- Clip depth is [0, w]: normalized device z 0 is the near plane, and a depth
+  attachment stores z / w.
 - Framebuffer coordinates, `fragment_coord()`, viewport, scissor and render
   area have their origin at the top-left corner of row 0, and y grows with
   the row index.
@@ -137,7 +141,7 @@ with a vertex y flip ([runtime design](../runtime/design.md) section 10):
 
 ## 7. Render-scope planning
 
-The private Command DAG may fuse adjacent graphics Nodes into one native
+Linking may fuse adjacent graphics Nodes into one native
 render pass when all of the following hold:
 
 - attachment views and geometry are compatible;

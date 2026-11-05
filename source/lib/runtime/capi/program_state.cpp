@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
-#include <set>
 
 namespace vernon::runtime::capi {
 
@@ -91,18 +90,6 @@ size_t publicBoundaryCount(const program::Program &program) {
                       [&](const program::BoundarySlot &slot) { return publicBoundarySlot(slot); }));
 }
 
-size_t mutationCapacity(const VernonProgramExecutable &pipeline) {
-    if (!pipeline.executionPlan || !pipeline.executionPlan->resolvedProgram)
-        return 0;
-    const program::Program &program = pipeline.executionPlan->resolvedProgram->program;
-    std::set<uint32_t> renderPassControls;
-    for (const program::Graph &graph : program.graphs)
-        for (const program::Node &node : graph.nodes)
-            if (program::executionKind(node) == program::ExecutionKind::Graphics)
-                renderPassControls.insert(program::graphicsOperation(node).renderPassControl);
-    return pipeline.executionPlan->publications.transactions.size() + renderPassControls.size();
-}
-
 const program::BoundarySlot *publicBoundaryAt(const program::Program &program, size_t publicIndex) {
     for (const program::BoundarySlot &slot : program.abi.boundarySlots)
         if (publicBoundarySlot(slot) && publicIndex-- == 0)
@@ -132,15 +119,10 @@ const program::BoundarySlot *findParameterBoundary(const VernonProgramExecutable
     return nullptr;
 }
 
-uint64_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind) {
-    return (static_cast<uint64_t>(kind) + 1) << 32 | slot;
-}
-
 void buildExecutableBindingIndex(VernonProgramExecutable &pipeline) {
     const program::Program &program = *executableProgram(pipeline);
     pipeline.bindableParameterSlots.clear();
     pipeline.bindingAliases.clear();
-    pipeline.graphicsControlKeys.clear();
     if (pipeline.programGraphId)
         pipeline.bindableParameterSlots.insert(pipeline.publicParameterSlots.begin(),
                                                pipeline.publicParameterSlots.end());
@@ -150,17 +132,6 @@ void buildExecutableBindingIndex(VernonProgramExecutable &pipeline) {
         if (publicBoundarySlot(slot))
             pipeline.bindingAliases[programOwnerKey(slot.aliasOwner)].push_back(slot.id);
     }
-    for (const program::Graph &graph : program.graphs)
-        for (const program::Node &node : graph.nodes)
-            if (program::executionKind(node) == program::ExecutionKind::Graphics) {
-                const program::GraphicsOperation &graphics = program::graphicsOperation(node);
-                pipeline.graphicsControlKeys.insert(
-                    programControlKey(graphics.renderPassControl, RuntimeProgramControl::RenderPass));
-                pipeline.graphicsControlKeys.insert(
-                    programControlKey(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand));
-                pipeline.graphicsControlKeys.insert(
-                    programControlKey(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState));
-            }
 }
 
 bool bindableParameterSlot(const VernonProgramExecutable &pipeline, uint32_t slot) {
@@ -270,19 +241,6 @@ ProgramBindingValueResult makeProgramBinding(const VernonProgramArgument &argume
     }
     binding->refresh();
     return ProgramBindingValueResult{vernon::ok(std::move(binding))};
-}
-
-std::shared_ptr<RuntimeProgramControl> makeDrawCommandControl(const VernonDrawCommand *draw) {
-    if (!draw || draw->struct_size < sizeof(*draw) ||
-        (draw->index_binding && (draw->vertex_count || draw->index_binding->type != VERNON_INDEX_U32)))
-        return nullptr;
-    auto control = std::make_shared<RuntimeProgramControl>();
-    control->kind = RuntimeProgramControl::DrawCommand;
-    control->draw = *draw;
-    if (draw->index_binding)
-        control->index = *draw->index_binding;
-    control->refresh();
-    return control;
 }
 
 } // namespace vernon::runtime::capi

@@ -110,6 +110,20 @@ bool Driver::loadInstance(VkInstance instance) {
     VERNON_LOAD_VULKAN_INSTANCE(createDevice, "vkCreateDevice");
     VERNON_LOAD_VULKAN_INSTANCE(getDeviceProcAddr, "vkGetDeviceProcAddr");
 #undef VERNON_LOAD_VULKAN_INSTANCE
+    destroySurface = reinterpret_cast<PFN_vkDestroySurfaceKHR>(getInstanceProcAddr(instance, "vkDestroySurfaceKHR"));
+    getPhysicalDeviceSurfaceSupport = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(
+        getInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    getPhysicalDeviceSurfaceCapabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+        getInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    getPhysicalDeviceSurfaceFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+        getInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    getPhysicalDeviceSurfacePresentModes = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+        getInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+#if defined(_WIN32)
+    createPlatformSurface = getInstanceProcAddr(instance, "vkCreateWin32SurfaceKHR");
+#else
+    createPlatformSurface = nullptr;
+#endif
     return true;
 }
 
@@ -163,6 +177,7 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(cmdBindPipeline, "vkCmdBindPipeline");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
     VERNON_LOAD_VULKAN_DEVICE(cmdDispatch, "vkCmdDispatch");
+    VERNON_LOAD_VULKAN_DEVICE(cmdDispatchIndirect, "vkCmdDispatchIndirect");
     VERNON_LOAD_VULKAN_DEVICE(createImage, "vkCreateImage");
     VERNON_LOAD_VULKAN_DEVICE(destroyImage, "vkDestroyImage");
     VERNON_LOAD_VULKAN_DEVICE(getImageMemoryRequirements, "vkGetImageMemoryRequirements");
@@ -191,13 +206,22 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(cmdBindIndexBuffer, "vkCmdBindIndexBuffer");
     VERNON_LOAD_VULKAN_DEVICE(cmdDraw, "vkCmdDraw");
     VERNON_LOAD_VULKAN_DEVICE(cmdDrawIndexed, "vkCmdDrawIndexed");
+    VERNON_LOAD_VULKAN_DEVICE(cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect");
     VERNON_LOAD_VULKAN_DEVICE(cmdPushConstants, "vkCmdPushConstants");
     VERNON_LOAD_VULKAN_DEVICE(createQueryPool, "vkCreateQueryPool");
     VERNON_LOAD_VULKAN_DEVICE(destroyQueryPool, "vkDestroyQueryPool");
     VERNON_LOAD_VULKAN_DEVICE(cmdResetQueryPool, "vkCmdResetQueryPool");
     VERNON_LOAD_VULKAN_DEVICE(cmdWriteTimestamp, "vkCmdWriteTimestamp");
     VERNON_LOAD_VULKAN_DEVICE(getQueryPoolResults, "vkGetQueryPoolResults");
+    VERNON_LOAD_VULKAN_DEVICE(createSemaphore, "vkCreateSemaphore");
+    VERNON_LOAD_VULKAN_DEVICE(destroySemaphore, "vkDestroySemaphore");
 #undef VERNON_LOAD_VULKAN_DEVICE
+    createSwapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(getDeviceProcAddr(device, "vkCreateSwapchainKHR"));
+    destroySwapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(getDeviceProcAddr(device, "vkDestroySwapchainKHR"));
+    getSwapchainImages =
+        reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(getDeviceProcAddr(device, "vkGetSwapchainImagesKHR"));
+    acquireNextImage = reinterpret_cast<PFN_vkAcquireNextImageKHR>(getDeviceProcAddr(device, "vkAcquireNextImageKHR"));
+    queuePresent = reinterpret_cast<PFN_vkQueuePresentKHR>(getDeviceProcAddr(device, "vkQueuePresentKHR"));
     cmdBeginRendering = reinterpret_cast<PFN_vkCmdBeginRendering>(getDeviceProcAddr(device, "vkCmdBeginRendering"));
     cmdEndRendering = reinterpret_cast<PFN_vkCmdEndRendering>(getDeviceProcAddr(device, "vkCmdEndRendering"));
     if (!cmdBeginRendering || !cmdEndRendering) {
@@ -205,6 +229,8 @@ bool Driver::loadDevice(VkDevice device) {
             reinterpret_cast<PFN_vkCmdBeginRendering>(getDeviceProcAddr(device, "vkCmdBeginRenderingKHR"));
         cmdEndRendering = reinterpret_cast<PFN_vkCmdEndRendering>(getDeviceProcAddr(device, "vkCmdEndRenderingKHR"));
     }
+    cmdDrawIndexedIndirectCount = reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCount>(
+        getDeviceProcAddr(device, "vkCmdDrawIndexedIndirectCountKHR"));
     return true;
 }
 

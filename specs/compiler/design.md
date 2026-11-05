@@ -455,8 +455,8 @@ is rejected.
 ## Host orchestration boundary
 
 Program semantic topology, attachment operations, resource transitions, and
-forward/backward/residual AD topology belong to typed Program IR. The native
-private runtime Command DAG consumes the resolved static graph and owns hazards,
+forward/backward/residual AD topology belong to typed Program IR. A linked
+schedule consumes the resolved static graph and owns hazards,
 barriers, render-scope fusion, scheduling, and submission; it does not define a
 parallel deployment or AD topology. The target Program contract contains only
 static compute and graphics DAG nodes. Transfer and deployment control-flow
@@ -1113,7 +1113,7 @@ representations; mutable inputs produce separate owned gradient Storage.
 Program VJP alone constructs the Program forward graph, backward graph, and
 residual contract, including fan-in accumulation. Kernel structured VJP is only
 a compute-node implementation transform and owns only its local tape ABI.
-The private runtime Command DAG executes the resolved Program topology; it does not
+A linked schedule executes the resolved Program topology; it does not
 compose node profiles into a second reverse topology.
 
 Vertex and instance Tensor inputs use one rank-independent attribute ABI.

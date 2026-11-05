@@ -1500,6 +1500,12 @@ struct DirectX12PacketDecoder {
         return RhiAdapterResult<void>{vernon::ok()};
     }
 
+    RhiAdapterResult<void> drawStream(uint32_t, uint32_t, uint32_t, uint32_t,
+                                      const VernonRuntimeProviderStreamPayload &,
+                                      const vernon::rhi::OpenedRendering &) {
+        return providerFailure(vernon::ProviderErrorCode::Unsupported, "d3d12_draw_streams_are_unsupported");
+    }
+
     RhiAdapterResult<void> draw(uint32_t topology, uint32_t indexResource, const VernonRuntimeProviderDrawPayload &draw,
                                 const vernon::rhi::OpenedRendering &) {
         if (!commands.pipeline || !commands.pipeline->graphics || !commands.rendering)

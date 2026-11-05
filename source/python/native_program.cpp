@@ -338,6 +338,41 @@ ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &vie
     return result;
 }
 
+ProgramParameterMetadata slotParameterMetadata(VernonProgramExecutable *executable, uint32_t slot) {
+    VernonProgramParameterView view{};
+    const VernonProgramBoundaryRole roles[] = {
+        VERNON_PROGRAM_BOUNDARY_INPUT,
+        VERNON_PROGRAM_BOUNDARY_OUTPUT,
+        VERNON_PROGRAM_BOUNDARY_COTANGENT,
+        VERNON_PROGRAM_BOUNDARY_GRADIENT,
+    };
+    for (VernonProgramBoundaryRole role : roles) {
+        const size_t boundaryCount = vernonRuntimeProgramExecutableGetBoundaryCount(executable, role);
+        for (size_t index = 0; index < boundaryCount; ++index)
+            if (vernonRuntimeProgramExecutableGetBoundaryByIndex(executable, role, index, &view) == VERNON_STATUS_OK &&
+                view.slot == slot && view.kind != VERNON_PROGRAM_IMAGE)
+                return parameterMetadata(view);
+    }
+    const size_t count = vernonRuntimeProgramExecutableGetParameterCount(executable);
+    for (size_t index = 0; index < count; ++index) {
+        if (vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &view) == VERNON_STATUS_OK &&
+            view.slot == slot) {
+            ProgramParameterMetadata metadata = parameterMetadata(view);
+            if (view.kind == VERNON_PROGRAM_IMAGE) {
+                VernonProgramImageConstraintView constraint{};
+                constraint.struct_size = sizeof(constraint);
+                if (vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint) !=
+                    VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot query executable image constraint");
+                metadata.imageBindingRole = constraint.binding_role;
+                metadata.storageImageFormat = constraint.storage_format;
+            }
+            return metadata;
+        }
+    }
+    throw std::invalid_argument("unknown executable parameter slot " + std::to_string(slot));
+}
+
 const char *numpyDtypeName(VernonDataType dtype) {
     if (dtype == VERNON_DATA_BOOL)
         return "bool_";

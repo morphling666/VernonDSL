@@ -1,0 +1,229 @@
+{
+  "environment": {
+    "vernon_dsl_revision": "6fcb25d-dirty",
+    "arch": "cuda",
+    "command": "python.exe examples\\numba_benchmark\\run.py --arch cuda --result-json reports\\benchmarks\\linked_schedules_cuda_phase2.json",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "logical_cpus": 32,
+    "threads": 32,
+    "python": "3.11.9",
+    "numpy": "1.26.4",
+    "numba": "0.68.1",
+    "llvmlite": "0.50.0",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_driver": "610.88",
+    "gpu_driver_model": "WDDM",
+    "numba_cuda": "0.30.4",
+    "numba_fma": "off"
+  },
+  "samples": [
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 0.25365001056343317,
+      "min_ms": 0.2500000409781933,
+      "repeats": 10,
+      "first_call_ms": 256.7729000002146,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 8388608,
+      "median_ms": 0.22739998530596495,
+      "min_ms": 0.2264000941067934,
+      "repeats": 10,
+      "first_call_ms": 144.50219995342195,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 25.97419999074191,
+      "min_ms": 24.920199997723103,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "axpy",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 8388608,
+      "median_ms": 97.21184999216348,
+      "min_ms": 96.96699981577694,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 0.02450007013976574,
+      "min_ms": 0.022500054910779,
+      "repeats": 2000,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "launch_64",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 64,
+      "median_ms": 0.011600088328123093,
+      "min_ms": 0.009499955922365189,
+      "repeats": 2000,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 1.2870500795543194,
+      "min_ms": 1.2855001259595156,
+      "repeats": 10,
+      "first_call_ms": 269.3740001413971,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 1.2703000102192163,
+      "min_ms": 1.2695998884737492,
+      "repeats": 10,
+      "first_call_ms": 162.69579995423555,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 1.5329500893130898,
+      "min_ms": 1.5315001364797354,
+      "repeats": 10,
+      "first_call_ms": 506.17649988271296,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 25.318400003015995,
+      "min_ms": 24.24230007454753,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 61.387799913063645,
+      "min_ms": 60.779100051149726,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "relief",
+      "implementation": "numba_hashed",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 13.97504995111376,
+      "min_ms": 13.750100042670965,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": "hashes the lattice in the kernel with u64; VernonDSL has no 64-bit integers"
+    },
+    {
+      "workload": "relief",
+      "implementation": "host_lattice_hashing",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 9.049299987964332,
+      "min_ms": 8.583299815654755,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 10.402349987998605,
+      "min_ms": 10.367500130087137,
+      "repeats": 10,
+      "first_call_ms": 153.56270014308393,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "resident",
+      "size": 4194304,
+      "median_ms": 9.756600018590689,
+      "min_ms": 9.738299995660782,
+      "repeats": 10,
+      "first_call_ms": 161.5557000041008,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "numba",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 28.49089994560927,
+      "min_ms": 27.403299929574132,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": ""
+    },
+    {
+      "workload": "nearest_segment",
+      "implementation": "vernon",
+      "mode": "roundtrip",
+      "size": 4194304,
+      "median_ms": 79.69654991757125,
+      "min_ms": 78.5502998623997,
+      "repeats": 10,
+      "first_call_ms": null,
+      "note": "24000 segments, 36.9 candidates per bucket"
+    }
+  ],
+  "checks": [
+    {
+      "workload": "axpy",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "relief",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    },
+    {
+      "workload": "nearest_segment",
+      "identical": true,
+      "max_abs_difference": 0.0,
+      "reference_max_abs_difference": 0.0
+    }
+  ]
+}

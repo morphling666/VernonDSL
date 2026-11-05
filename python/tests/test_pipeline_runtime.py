@@ -467,7 +467,7 @@ def assert_oversized_aggregate_attribute_reports_location_limit(test: unittest.T
         dtype=ComplexAggregateVertex,
     )
     target = vd.Texture.zeros(shape=(8, 8))
-    with test.assertRaisesRegex(RuntimeError, "location or format capabilities"):
+    with test.assertRaisesRegex(ValueError, "location or format capabilities"):
         vd.pipeline(oversized_aggregate_attribute_vertex, solid_fragment)(
             values=values, render_pass=render_target(target)
         )
@@ -1222,25 +1222,24 @@ class PipelineContractTests(unittest.TestCase):
     def test_owned_gl_context_is_selected_and_retained(self) -> None:
         runtime_calls: list[tuple[object, ...]] = []
 
-        class FakeRhiHost:
+        class FakeHalDevice:
             def create_runtime(self) -> object:
                 return types.SimpleNamespace(capabilities={"available": True})
 
             @staticmethod
             def create_owned_opengl(*arguments: object) -> object:
                 runtime_calls.append(arguments)
-                return FakeRhiHost()
+                return FakeHalDevice()
 
         fake_native = types.SimpleNamespace(
-            RhiHost=FakeRhiHost,
-            RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
+            HalDevice=FakeHalDevice,
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
         previous_default = runtime_module._registry._default
         try:
             with mock.patch.object(runtime_module, "_native", fake_native):
                 session = vd.init(arch=vd.opengl)
-                self.assertIsNotNone(session.rhi_host)
+                self.assertIsInstance(session.device, FakeHalDevice)
                 self.assertEqual(runtime_calls[-1], (3, 4, 3))
                 vd.init(arch=vd.opengles)
                 self.assertEqual(runtime_calls[-1], (4, 3, 1))
@@ -1248,7 +1247,7 @@ class PipelineContractTests(unittest.TestCase):
             runtime_module._registry._default = previous_default
 
     def test_registered_context_takes_priority_over_owned_factory(self) -> None:
-        class FakeRhiHost:
+        class FakeHalDevice:
             calls: list[tuple[object, ...]] = []
 
             def create_runtime(self) -> object:
@@ -1256,12 +1255,11 @@ class PipelineContractTests(unittest.TestCase):
 
             @staticmethod
             def create_external_opengl(*arguments: object) -> object:
-                FakeRhiHost.calls.append(arguments)
-                return FakeRhiHost()
+                FakeHalDevice.calls.append(arguments)
+                return FakeHalDevice()
 
         fake_native = types.SimpleNamespace(
-            RhiHost=FakeRhiHost,
-            RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
+            HalDevice=FakeHalDevice,
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
         registry = runtime_module._registry
@@ -1278,7 +1276,7 @@ class PipelineContractTests(unittest.TestCase):
             )
             with mock.patch.object(runtime_module, "_native", fake_native):
                 vd.init(arch=vd.opengl)
-                self.assertEqual(FakeRhiHost.calls[-1], (3, 21, 22, 23, 3, 3))
+                self.assertEqual(FakeHalDevice.calls[-1], (3, 21, 22, 23, 3, 3))
         finally:
             with registry._lock:
                 registry._default = previous_default
@@ -1312,7 +1310,7 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_oversized_tensor_attribute_reports_device_location_limit(self) -> None:
         values = vd.storage.from_numpy(np.zeros((3, 8, 8, 4), dtype=np.float32))
         target = vd.Texture.zeros(shape=(8, 8))
-        with self.assertRaisesRegex(RuntimeError, "location or format capabilities"):
+        with self.assertRaisesRegex(ValueError, "location or format capabilities"):
             vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(
                 value=values, render_pass=render_target(target)
             )
@@ -1365,13 +1363,10 @@ class OpenGLPipelineTests(unittest.TestCase):
             render_pass=render_pass,
             dynamic_state=dynamic_state,
         )
-        compiled = next(iter(render._cache._partition(vd.current_session()).snapshot.values()))
-        initial_telemetry = dict(compiled.specialization.binding_telemetry)
+        specializations = dict(render._cache._partition(vd.current_session()).snapshot)
         target.upload(np.zeros((32, 32, 4), dtype=np.uint8))
         render(position=positions, render_pass=render_pass, dynamic_state=dynamic_state)
-        reused_telemetry = dict(compiled.specialization.binding_telemetry)
-        self.assertEqual(reused_telemetry["prepare_count"], initial_telemetry["prepare_count"])
-        self.assertEqual(reused_telemetry["upload_bytes"], initial_telemetry["upload_bytes"])
+        self.assertEqual(dict(render._cache._partition(vd.current_session()).snapshot), specializations)
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         invalid = vd.RenderTarget.from_attachments(
@@ -1672,12 +1667,12 @@ class VulkanPipelineTests(unittest.TestCase):
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
-        _native._testing_set_program_failure("completion")
+        _native._testing_fail_schedule_waits(1)
         try:
             with self.assertRaisesRegex(RuntimeError, "wait failure"):
                 render(position=positions, render_pass=render_target(target))
         finally:
-            _native._testing_set_program_failure("")
+            _native._testing_fail_schedule_waits(0)
         with self.assertRaisesRegex(RuntimeError, "poisoned"):
             target.to_numpy()
         replacement = np.zeros((16, 16, 4), dtype=np.uint8)

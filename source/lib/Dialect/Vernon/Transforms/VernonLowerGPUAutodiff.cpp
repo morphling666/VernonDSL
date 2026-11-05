@@ -1139,6 +1139,15 @@ struct VernonLowerGPUAutodiffPass : public PassWrapper<VernonLowerGPUAutodiffPas
     }
 
     void runOnOperation() override {
+        WalkResult internalAdjoint = getOperation().walk([](AdAdjointBufferCreateOp create) {
+            create.emitError("GPU backward kernels do not support an internal Storage adjoint (a device Storage "
+                             "written and then read, or updated in place, by the same kernel)");
+            return WalkResult::interrupt();
+        });
+        if (internalAdjoint.wasInterrupted()) {
+            signalPassFailure();
+            return;
+        }
         for (func::FuncOp function : getOperation().getOps<func::FuncOp>())
             if (failed(FunctionLowering(function).run())) {
                 signalPassFailure();

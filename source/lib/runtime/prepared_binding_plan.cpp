@@ -423,12 +423,12 @@ bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared,
     return true;
 }
 
-std::vector<PipelineGroups::SlotDependencies>
-preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &stagePlan) {
-    std::vector<PipelineGroups::SlotDependencies> result(prepared.size());
+std::vector<SlotDependencies> preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared,
+                                                              const StageBindingPlan &stagePlan) {
+    std::vector<SlotDependencies> result(prepared.size());
     for (size_t index = 0; index < prepared.size(); ++index) {
         const PreparedBindingSource &source = prepared.sources[index];
-        PipelineGroups::SlotDependencies &dependencies = result[index];
+        SlotDependencies &dependencies = result[index];
         if (source.parameter != UINT32_MAX) {
             dependencies.parameters.push_back(source.parameter);
         } else if (source.metadataCarrier && prepared.metadataCarrier) {
@@ -1036,12 +1036,11 @@ bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepare
     return false;
 }
 
-std::vector<PipelineGroups::SlotDependencies>
-preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared) {
-    std::vector<PipelineGroups::SlotDependencies> result(prepared.size());
+std::vector<SlotDependencies> preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared) {
+    std::vector<SlotDependencies> result(prepared.size());
     for (size_t index = 0; index < prepared.size(); ++index) {
         const PreparedGraphicsBindingSource &source = prepared.sources[index];
-        PipelineGroups::SlotDependencies &dependencies = result[index];
+        SlotDependencies &dependencies = result[index];
         if (source.parameter != UINT32_MAX)
             dependencies.parameters.push_back(source.parameter);
         else if (source.kind == PreparedGraphicsBindingSourceKind::ModuleMetadata)

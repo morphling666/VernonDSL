@@ -46,6 +46,7 @@ bool Driver::load() {
     VERNON_LOAD_CUDA_VERSIONED(copyHostToDeviceAsync, "cuMemcpyHtoDAsync");
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToHostAsync, "cuMemcpyDtoHAsync");
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToDeviceAsync, "cuMemcpyDtoDAsync");
+    VERNON_LOAD_CUDA(memsetD8Async, "cuMemsetD8Async");
     VERNON_LOAD_CUDA(moduleLoadData, "cuModuleLoadDataEx");
     VERNON_LOAD_CUDA(moduleGetFunction, "cuModuleGetFunction");
     VERNON_LOAD_CUDA(moduleUnload, "cuModuleUnload");
@@ -59,7 +60,20 @@ bool Driver::load() {
     VERNON_LOAD_CUDA(eventSynchronize, "cuEventSynchronize");
     VERNON_LOAD_CUDA(eventElapsedTime, "cuEventElapsedTime");
     VERNON_LOAD_CUDA(launchKernel, "cuLaunchKernel");
-
+    // KernelNodeParams is the v2 layout, which the unsuffixed v1 kernel-node symbols read a prefix of.
+    graphCreate = reinterpret_cast<GraphCreate>(library.symbol("cuGraphCreate"));
+    graphDestroy = reinterpret_cast<GraphDestroy>(library.symbol("cuGraphDestroy"));
+    graphAddKernelNode = reinterpret_cast<GraphAddKernelNode>(library.symbol("cuGraphAddKernelNode_v2"));
+    if (!graphAddKernelNode)
+        graphAddKernelNode = reinterpret_cast<GraphAddKernelNode>(library.symbol("cuGraphAddKernelNode"));
+    graphInstantiate = reinterpret_cast<GraphInstantiate>(library.symbol("cuGraphInstantiateWithFlags"));
+    graphExecDestroy = reinterpret_cast<GraphExecDestroy>(library.symbol("cuGraphExecDestroy"));
+    graphLaunch = reinterpret_cast<GraphLaunch>(library.symbol("cuGraphLaunch"));
+    graphExecKernelNodeSetParams =
+        reinterpret_cast<GraphExecKernelNodeSetParams>(library.symbol("cuGraphExecKernelNodeSetParams_v2"));
+    if (!graphExecKernelNodeSetParams)
+        graphExecKernelNodeSetParams =
+            reinterpret_cast<GraphExecKernelNodeSetParams>(library.symbol("cuGraphExecKernelNodeSetParams"));
 #undef VERNON_LOAD_CUDA_VERSIONED
 #undef VERNON_LOAD_CUDA
     available = true;

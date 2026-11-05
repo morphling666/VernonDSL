@@ -758,4 +758,12 @@ VernonCpuEntryPoint vernonCompileResultGetCpuEntry(const VernonCompileResult *re
     return vernon::compiler::findCompiledCpuEntry(result->cpuExecution.get(), name);
 }
 
+VernonCpuChunkEntryPoint vernonCompileResultGetCpuChunkEntry(const VernonCompileResult *result, const char *entryName,
+                                                             size_t entryNameSize) {
+    if (!result || result->status != VERNON_STATUS_OK || (!entryName && entryNameSize != 0))
+        return nullptr;
+    const std::string_view name(entryName ? entryName : "", entryNameSize);
+    return vernon::compiler::findCompiledCpuChunkEntry(result->cpuExecution.get(), name);
+}
+
 } // extern "C"

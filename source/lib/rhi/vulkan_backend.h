@@ -142,9 +142,30 @@ struct VERNON_RHI_CAPI DeviceState {
     void shutdown();
     bool synchronize(std::string &error);
     bool beginCommands(VkCommandBuffer &command, std::string &error);
+    // Binary semaphores a submission waits on before `waitStage` and signals once it completes; null ones are skipped.
+    struct SubmitSemaphores {
+        VkSemaphore wait{};
+        VkPipelineStageFlags waitStage{};
+        VkSemaphore signal{};
+    };
+
     // Submits without waiting. `serial` is the point of the device timeline at which the work completes; a borrowed
-    // device submits nothing, since its host executes the command buffer, and numbers the submission instead.
-    bool submitCommands(VkCommandBuffer command, uint64_t &serial, std::string &error);
+    // device submits nothing, since its host executes the command buffer, and numbers the submission instead, and
+    // takes no semaphores.
+    bool submitCommands(VkCommandBuffer command, uint64_t &serial, std::string &error,
+                        const SubmitSemaphores &semaphores = {});
+    // Submits `command`, which the caller recorded, ended and keeps, ahead of nothing but the pending uploads and a
+    // prologue that transitions the images of `layouts` to the layouts it begins from. Afterwards the images are in
+    // the layouts it leaves. Not for borrowed devices.
+    bool submitRecorded(VkCommandBuffer command, const std::unordered_map<Image *, ImageLayoutUse> &layouts,
+                        uint64_t &serial, std::string &error);
+    // Device-level buffer uploads record into one pending recording instead of submitting one each, and every
+    // submission and synchronization submits it ahead of itself, so that uploads keep queue order. `command` follows
+    // the earlier uploads of the recording, after a barrier ordering their transfers. End the upload with
+    // endUploadCommands, which submits only a borrowed device's.
+    bool beginUploadCommands(VkCommandBuffer &command, std::string &error);
+    bool endUploadCommands(VkCommandBuffer command, std::string &error);
+    bool flushUploads(std::string &error);
     bool waitForSerial(uint64_t serial, std::string &error);
     bool pollSerial(uint64_t serial, bool &completed, std::string &error);
     // Releases the staging of borrowed submission `serial` and of everything recorded before it, once the host
@@ -194,6 +215,9 @@ struct VERNON_RHI_CAPI DeviceState {
                          std::optional<VkImageLayout> &from, std::string &error);
     // The layout subresource `subresource` of `owner` has at this point of recording `command`.
     VkImageLayout recordedImageLayout(VkCommandBuffer command, Image &owner, size_t subresource);
+    // Whether recording `command` already moved every subresource of `range` of `owner` to `layout`, so that moving
+    // them there again changes nothing.
+    bool movedToLayout(VkCommandBuffer command, Image &owner, const ImageSubresources &range, VkImageLayout layout);
 
     VkInstance instance{};
     VkPhysicalDevice physicalDevice{};
@@ -210,8 +234,16 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t maxComputeWorkGroupSize[3]{};
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
+    // VK_KHR_draw_indirect_count is enabled, which only a device this state created can have.
+    bool drawIndirectCount{};
+    // multiDrawIndirect and drawIndirectFirstInstance are enabled, which device draw streams need; likewise only on a
+    // device this state created.
+    bool multiDrawIndirect{};
     bool shaderBufferFloat32AtomicAdd{};
     bool imageCubeArray{};
+    // VK_KHR_surface, the platform's surface extension and VK_KHR_swapchain are enabled, which only a device this
+    // state created can have.
+    bool presentation{};
     bool portabilityEnumeration{};
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};
@@ -223,6 +255,8 @@ struct VERNON_RHI_CAPI DeviceState {
     VkCommandBuffer borrowedCommandBuffer{};
     std::vector<CommandFrame> availableCommandFrames;
     std::unordered_map<uintptr_t, CommandFrame> recordingCommandFrames;
+    // The recording of the uploads not yet submitted, one of recordingCommandFrames; null when there are none.
+    VkCommandBuffer pendingUploads{};
     // Submitted frames in serial order. A fence signal covers every batch submitted before it on the queue, so the
     // first unsignaled frame bounds the completed prefix of the timeline.
     std::deque<CommandFrame> inFlightCommandFrames;
@@ -257,7 +291,9 @@ private:
     void recycleCommandFrame(CommandFrame frame);
     CommandFrame *recordingFrame(VkCommandBuffer command);
     bool recordLayoutPrologue(CommandFrame &frame, bool &recorded, std::string &error);
+    bool recordPrologue(CommandFrame &frame, const std::vector<VkImageMemoryBarrier> &barriers, std::string &error);
     void commitImageLayouts(CommandFrame &frame);
+    static void commitLayouts(const std::unordered_map<Image *, ImageLayoutUse> &layouts);
     void retireFrameMemory(StagingArena<StagingChunk> &upload, StagingArena<StagingChunk> &readback,
                            std::vector<VkDescriptorPool> &descriptorPools);
     bool createStagingChunk(bool upload, VkDeviceSize capacity, StagingChunk &chunk, std::string &error);
@@ -277,6 +313,35 @@ VERNON_RHI_CAPI Result<bool, RhiError> imageInLayout(VernonRhiDevice device, VkC
 // A descriptor set of `layout` that recording `command` owns until its frame retires.
 VERNON_RHI_CAPI Result<VkDescriptorSet, RhiError>
 allocateCommandDescriptorSet(VernonRhiDevice device, VkCommandBuffer command, VkDescriptorSetLayout layout) noexcept;
+// DeviceState::submitRecorded on the device's queue; the result is the serial at which the submission completes.
+VERNON_RHI_CAPI Result<uint64_t, RhiError>
+submitRecordedCommands(VernonRhiDevice device, VkCommandBuffer command,
+                       const std::unordered_map<Image *, DeviceState::ImageLayoutUse> &layouts) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> waitForSubmission(VernonRhiDevice device, uint64_t serial) noexcept;
+VERNON_RHI_CAPI Result<bool, RhiError> submissionCompleted(VernonRhiDevice device, uint64_t serial) noexcept;
+// The device's state. Its native handles, limits and features never change once created; its other members change
+// only under the device's lock, which the functions above take.
+VERNON_RHI_CAPI Result<DeviceState *, RhiError> deviceStateOf(VernonRhiDevice device) noexcept;
+// The device's state and its lock, for callers that drive the state's other members themselves.
+struct DeviceAccess {
+    DeviceState *state{};
+    std::mutex *mutex{};
+};
+VERNON_RHI_CAPI Result<DeviceAccess, RhiError> deviceAccess(VernonRhiDevice device) noexcept;
+
+// Buffers the device's registry does not track; the caller owns them and destroys them with destroyBuffer.
+// `usage` holds VernonRhiBufferUsage bits. Uploads and downloads are ordered with the device's queue.
+VERNON_RHI_CAPI Result<void, RhiError> createBuffer(VernonRhiDevice device, uint64_t size, uint32_t usage,
+                                                    VernonRhiMemoryClass memoryClass, Buffer &buffer) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> uploadBuffer(VernonRhiDevice device, Buffer &buffer, uint64_t size,
+                                                    VernonRhiMemoryClass memoryClass,
+                                                    const VernonRhiBufferUploadRange *ranges,
+                                                    size_t rangeCount) noexcept;
+VERNON_RHI_CAPI Result<void, RhiError> downloadBuffer(VernonRhiDevice device, Buffer &buffer, uint64_t size,
+                                                      const VernonRhiBufferDownloadRange *ranges,
+                                                      size_t rangeCount) noexcept;
+// Destroys `buffer` once every submission made so far completes.
+VERNON_RHI_CAPI Result<void, RhiError> destroyBuffer(VernonRhiDevice device, Buffer &buffer) noexcept;
 
 } // namespace vernon::rhi::vulkan
 

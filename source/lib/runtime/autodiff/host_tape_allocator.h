@@ -145,9 +145,6 @@ private:
     friend class HostDynamicTapeBatch;
     friend class HostStaticTapeBatch;
     friend class HostTapeDispatchBudget;
-#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-    friend size_t hostTapeMemoryPolicyChargedBytesForTesting(AutodiffMemoryPolicy &policy);
-#endif
 
     bool reserveContext(size_t additionalBytes);
     void release(size_t bytes);

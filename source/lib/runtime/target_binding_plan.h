@@ -187,7 +187,6 @@ bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBa
                                  ResolvedExecutablePlan &plan, Diagnostic &diagnostic);
 bool buildStageBindingPlan(const TargetBindingPlan &plan, vernon::runtime::StageBindingPlan &view,
                            vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
-
 } // namespace vernon::runtime::program
 
 #endif

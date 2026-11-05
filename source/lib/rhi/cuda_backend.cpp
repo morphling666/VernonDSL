@@ -69,6 +69,11 @@ void DeviceState::shutdown() {
     transientPool.retire(recordingTransients);
     transientPool.clear(freeChunk);
     persistentBlocks.clear(freeChunk);
+    {
+        std::lock_guard<std::mutex> guard(cacheMutex);
+        releaseCachedAllocations();
+        allocationSizes.clear();
+    }
     for (PinnedBlock &block : stagingPool) {
         if (block.retirement)
             api.eventDestroy(block.retirement);
@@ -143,19 +148,87 @@ Result DeviceState::waitCompletion(Event completion) {
     return status;
 }
 
+namespace {
+
+// Small allocations round to a power of two, larger ones to whole MiB, so a cached allocation serves any request of
+// its rounded size and wastes at most half of a small one.
+constexpr size_t kCacheGranule = size_t{1} << 20;
+constexpr size_t kMaximumCachedBytes = size_t{1} << 30;
+
+size_t roundedAllocation(size_t size) {
+    if (size >= kCacheGranule)
+        return size > std::numeric_limits<size_t>::max() - (kCacheGranule - 1)
+                   ? size
+                   : (size + kCacheGranule - 1) / kCacheGranule * kCacheGranule;
+    size_t rounded = 256;
+    while (rounded < size)
+        rounded <<= 1;
+    return rounded;
+}
+
+} // namespace
+
 Result DeviceState::allocate(DevicePointer &pointer, size_t size) const {
     Result status = makeCurrent();
     if (status != kSuccess || size == 0)
         return kInvalidValue;
     allocations.fetch_add(1, std::memory_order_relaxed);
-    return driver().memoryAllocate(&pointer, size);
+    const size_t rounded = roundedAllocation(size);
+    std::lock_guard<std::mutex> guard(cacheMutex);
+    try {
+        if (auto cached = cachedAllocations.find(rounded);
+            cached != cachedAllocations.end() && !cached->second.empty()) {
+            pointer = cached->second.back();
+            cached->second.pop_back();
+            cachedBytes -= rounded;
+            allocationSizes[pointer] = rounded;
+            return kSuccess;
+        }
+        status = driver().memoryAllocate(&pointer, rounded);
+        if (status != kSuccess && cachedBytes) {
+            releaseCachedAllocations();
+            status = driver().memoryAllocate(&pointer, rounded);
+        }
+        if (status == kSuccess)
+            allocationSizes[pointer] = rounded;
+    } catch (const std::bad_alloc &) {
+        if (status == kSuccess && pointer)
+            driver().memoryFree(pointer);
+        return kInvalidValue;
+    }
+    return status;
 }
 
 Result DeviceState::free(DevicePointer pointer) const {
     if (!pointer)
         return kSuccess;
     Result status = makeCurrent();
-    return status == kSuccess ? driver().memoryFree(pointer) : status;
+    if (status != kSuccess)
+        return status;
+    std::lock_guard<std::mutex> guard(cacheMutex);
+    const auto found = allocationSizes.find(pointer);
+    if (found == allocationSizes.end())
+        return driver().memoryFree(pointer);
+    const size_t rounded = found->second;
+    allocationSizes.erase(found);
+    if (cachedBytes + rounded <= kMaximumCachedBytes) {
+        try {
+            cachedAllocations[rounded].push_back(pointer);
+            cachedBytes += rounded;
+            return kSuccess;
+        } catch (const std::bad_alloc &) {
+        }
+    }
+    return driver().memoryFree(pointer);
+}
+
+// The caller holds `cacheMutex` and has made the context current.
+void DeviceState::releaseCachedAllocations() const {
+    for (auto &[size, pointers] : cachedAllocations)
+        for (DevicePointer pointer : pointers)
+            driver().memoryFree(pointer);
+    cachedAllocations.clear();
+    cachedBytes = 0;
 }
 
 DeviceState::PinnedBlock *DeviceState::acquirePinned(size_t size, Result &status) {

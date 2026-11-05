@@ -16,6 +16,33 @@ from ._params import assemble_params, is_params, params_leaf_items
 from ._runtime.session import _SessionArtifactCache
 from ._runtime.tensor import TensorStorage, TensorView
 
+_RUNTIME_FIELDS = frozenset({"_module_initialized", "_modules", "_program_cache", "_configuration_cache"})
+# Bumped by every Module attribute write; a child's write changes its parents' configurations too, so the counter is
+# global rather than per instance.
+_configuration_epoch = [0]
+
+
+def _annotation_signature(annotation: Any) -> Any:
+    """A DSL-annotated parameter's part of the specialization key, which its value does not change; None when the
+    annotation is not a Storage, Value or Resource and the value's own signature is used."""
+    if annotation is None:
+        return None
+    from .frontend.model import SemanticCategory
+    from .frontend.runtime_types import runtime_parameter_descriptor
+
+    try:
+        descriptor = runtime_parameter_descriptor(annotation)
+    except TypeError:
+        return None
+    if descriptor.kind not in {SemanticCategory.STORAGE, SemanticCategory.VALUE, SemanticCategory.RESOURCE}:
+        return None
+    return (
+        descriptor.kind.value,
+        descriptor.logical,
+        getattr(descriptor, "access", None),
+        getattr(descriptor, "as_view", None),
+    )
+
 
 @dataclass(frozen=True)
 class ModuleDefinition:
@@ -37,6 +64,35 @@ class ModuleDefinition:
             for name, value in bound.arguments.items()
             for leaf in params_leaf_items(name, self.resolved_annotations.get(name), value)
         ]
+
+    def fast_leaves(self) -> tuple[tuple[str, ...], tuple[Any, ...]] | None:
+        """Parameter names and the leaf part of the specialization key when positional arguments bind one to one
+        and the key does not depend on their values; None when calls must bind through the signature."""
+        cached = self.__dict__.get("_fast_leaves", self)
+        if cached is not self:
+            return cached
+        from .program import _program_control_kind
+
+        names: list[str] = []
+        leaves: list[tuple[str, Any]] = []
+        plan: tuple[tuple[str, ...], tuple[Any, ...]] | None = None
+        for parameter in self.signature.parameters.values():
+            annotation = self.resolved_annotations.get(parameter.name)
+            annotated = None
+            if (
+                parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                and not is_params(annotation)
+                and _program_control_kind(annotation) is None
+            ):
+                annotated = _annotation_signature(annotation)
+            if annotated is None:
+                break
+            names.append(parameter.name)
+            leaves.append((parameter.name, annotated))
+        else:
+            plan = (tuple(names), tuple(leaves))
+        object.__setattr__(self, "_fast_leaves", plan)
+        return plan
 
     def assemble_arguments(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
         """The inverse of `bind_leaves`: rebuilds each params parameter from its dotted Program inputs."""
@@ -112,7 +168,13 @@ class Module:
         object.__setattr__(self, "_modules", {})
         object.__setattr__(self, "_program_cache", _SessionArtifactCache())
 
+    def __delattr__(self, name: str) -> None:
+        _configuration_epoch[0] += 1
+        self.__dict__.get("_modules", {}).pop(name, None)
+        object.__delattr__(self, name)
+
     def __setattr__(self, name: str, value: Any) -> None:
+        _configuration_epoch[0] += 1
         initialized = self.__dict__.get("_module_initialized", False)
         if initialized and not name.startswith("_"):
             if isinstance(value, (TensorStorage, TensorView)):
@@ -206,55 +268,52 @@ class Module:
             return (type(value).__module__, type(value).__qualname__)
 
         def module_configuration(module: Module) -> tuple[Any, ...]:
-            runtime_fields = {
-                "_module_initialized",
-                "_modules",
-                "_program_cache",
-            }
             local = tuple(
                 (name, signature(value))
                 for name, value in sorted(module.__dict__.items())
-                if name not in runtime_fields and not isinstance(value, Module)
+                if name not in _RUNTIME_FIELDS and not isinstance(value, Module)
             )
             children = tuple((name, module_configuration(child)) for name, child in sorted(module._modules.items()))
             return type(module)._module_definition.source_identity, local, children
 
-        configuration = module_configuration(self)
         definition = type(self)._module_definition
 
         def invocation_signature(annotation: Any, value: Any) -> Any:
-            if annotation is not None:
-                from .frontend.model import SemanticCategory
-                from .frontend.runtime_types import runtime_parameter_descriptor
-
-                try:
-                    descriptor = runtime_parameter_descriptor(annotation)
-                except TypeError:
-                    pass
-                else:
-                    category = descriptor.kind
-                    if category in {
-                        SemanticCategory.STORAGE,
-                        SemanticCategory.VALUE,
-                        SemanticCategory.RESOURCE,
-                    }:
-                        return (
-                            category.value,
-                            descriptor.logical,
-                            getattr(descriptor, "access", None),
-                            getattr(descriptor, "as_view", None),
-                        )
-            return signature(value)
+            annotated = _annotation_signature(annotation)
+            return signature(value) if annotated is None else annotated
 
         return (
             definition.source_identity,
-            configuration,
+            self._configuration_key(module_configuration),
             tuple(
                 (leaf, invocation_signature(annotation, value))
                 for leaf, annotation, value in definition.bind_leaves(arguments, keywords)
             ),
             variant,
         )
+
+    def _configuration_key(self, compute: Any) -> tuple[Any, ...]:
+        """The configuration part of the specialization key, recomputed only after some Module attribute changes;
+        attribute values enter the key by type or by immutable scalar value, so a write is the only way it changes."""
+        epoch = _configuration_epoch[0]
+        cached = self.__dict__.get("_configuration_cache")
+        if cached is not None and cached[0] == epoch:
+            return cached[1]
+        configuration = compute(self)
+        # The epoch is read before computing, so a write racing with the walk only forces a recompute.
+        object.__setattr__(self, "_configuration_cache", (epoch, configuration))
+        return configuration
+
+    def _fast_primal_key(self, arguments: tuple[Any, ...], variant: Any = "primal") -> tuple[Any, ...] | None:
+        """The specialization key `_program_specialization_key` builds, without binding, when every forward()
+        parameter is positional, DSL-annotated and supplied; None otherwise."""
+        plan = type(self)._module_definition.fast_leaves()
+        if plan is None or len(arguments) != len(plan[0]):
+            return None
+        cached = self.__dict__.get("_configuration_cache")
+        if cached is None or cached[0] != _configuration_epoch[0]:
+            return None
+        return (type(self)._module_definition.source_identity, cached[1], plan[1], variant)
 
     def _require_initialized(self) -> None:
         if not self.__dict__.get("_module_initialized", False):

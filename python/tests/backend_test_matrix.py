@@ -24,24 +24,22 @@ class BackendRow:
     architecture: object
     compiler_target: str
     runtime_backend: str
-    rhi_backend: str | None
 
 
 BACKEND_TEST_MATRIX = (
-    BackendRow("CPU", vd.cpu, "CPU", "CPU", None),
-    BackendRow("CUDA", vd.cuda, "CUDA", "CUDA", "CUDA"),
-    BackendRow("Vulkan", vd.vulkan, "VULKAN", "VULKAN", "VULKAN"),
-    BackendRow("DirectX12", vd.directx, "DIRECTX", "DIRECTX12", "DIRECTX12"),
-    BackendRow("Metal", vd.metal, "METAL", "METAL", "METAL"),
-    BackendRow("OpenGL", vd.opengl, "OPENGL", "OPENGL", "OPENGL"),
-    BackendRow("OpenGLES", vd.opengles, "OPENGL_ES", "OPENGL_ES", "OPENGL_ES"),
+    BackendRow("CPU", vd.cpu, "CPU", "CPU"),
+    BackendRow("CUDA", vd.cuda, "CUDA", "CUDA"),
+    BackendRow("Vulkan", vd.vulkan, "VULKAN", "VULKAN"),
+    BackendRow("DirectX12", vd.directx, "DIRECTX", "DIRECTX12"),
+    BackendRow("Metal", vd.metal, "METAL", "METAL"),
+    BackendRow("OpenGL", vd.opengl, "OPENGL", "OPENGL"),
+    BackendRow("OpenGLES", vd.opengles, "OPENGL_ES", "OPENGL_ES"),
 )
 
 
 @dataclass(frozen=True)
 class BackendRequirements:
     gpu: bool = False
-    rhi: bool = False
     dynamic_range_step: bool = False
     f16: bool = False
     f64: bool = False
@@ -125,8 +123,6 @@ def probe_compiler(row: BackendRow, requirements: BackendRequirements) -> ProbeR
         )
     if requirements.gpu and row.architecture == vd.cpu:
         return _unsupported(row, "gpu")
-    if requirements.rhi and row.rhi_backend is None:
-        return _unsupported(row, "rhi")
     for required, key in (
         (requirements.dynamic_range_step, "dynamic_range_step"),
         (requirements.f16, "f16"),

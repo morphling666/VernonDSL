@@ -1,18 +1,13 @@
 #include "host_tape_allocator.h"
 
-#include "runtime/runtime_state.h"
-
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
 #include <utility>
 
 namespace vernon::runtime::ad {
-
-size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &policy) {
-    return policy ? policy->contextLimit() : 0;
-}
 
 namespace {
 
@@ -386,18 +381,6 @@ bool HostTapeDispatchBudget::beginRecycledConstruction() {
     committed_ = false;
     return true;
 }
-
-#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-void setHostTapeMemoryPolicyForTesting(VernonRuntimeContext &context, std::shared_ptr<HostTapeMemoryPolicy> policy) {
-    std::lock_guard lock(context.autodiffMemoryPolicyMutex);
-    context.autodiffMemoryPolicy = std::move(policy);
-}
-
-size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy) {
-    std::lock_guard lock(policy.mutex_);
-    return policy.contextBytes_;
-}
-#endif
 
 class HostDynamicTapeBatch::Impl {
 public:

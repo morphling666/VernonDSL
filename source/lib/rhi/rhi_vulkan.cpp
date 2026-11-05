@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -29,6 +30,7 @@ using VulkanBufferLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::Bu
 using VulkanImageLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::ImageResourceTag>;
 using VulkanImageViewLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::ImageViewResourceTag>;
 using VulkanSamplerLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::SamplerResourceTag>;
+using VulkanSurfaceLifecycle = vernon::rhi::ResourceLifecycleSlot<vernon::rhi::SurfaceResourceTag>;
 
 struct VulkanBufferSlot {
     explicit VulkanBufferSlot(VulkanBufferLifecycle value) noexcept : lifecycle(std::move(value)) {}
@@ -46,6 +48,8 @@ struct VulkanImageSlot {
     vernon::rhi::vulkan::Image image;
     VernonRhiVulkanBorrowedImageDescriptor descriptor{};
     VernonRhiImageDescriptor ownedDescriptor{};
+    // A surface owns the image, so only configuring or destroying the surface destroys it.
+    std::atomic<bool> surfaceOwned{};
 };
 
 struct VulkanImageViewSlot {
@@ -56,6 +60,45 @@ struct VulkanImageViewSlot {
     VernonRhiImageViewDescriptor descriptor{};
     std::optional<vernon::rhi::RetainedResourceLease<vernon::rhi::ImageResourceTag>> parent;
     bool ownedNative{};
+    std::atomic<bool> surfaceOwned{};
+};
+
+struct VulkanSurfaceImage {
+    VernonRhiImage image{};
+    VernonRhiImageView view{};
+};
+
+// The binary semaphore one swapchain acquire signals, and the device serial of the submission that waits on it, after
+// which it may signal again.
+struct VulkanAcquireSemaphore {
+    VkSemaphore semaphore{};
+    uint64_t serial{};
+};
+
+// Frames render into `images`, device images in the configured format, and present blits the acquired one into a
+// swapchain image. The swapchain's formats are the window system's, often BGRA only, and the blit converts, as the
+// OpenGL surface's present blit does; the swapchain is acquired only while presenting, so a frame's submissions wait
+// on no acquire.
+struct VulkanSurfaceSlot {
+    explicit VulkanSurfaceSlot(VulkanSurfaceLifecycle value) noexcept : lifecycle(std::move(value)) {}
+
+    VulkanSurfaceLifecycle lifecycle;
+    // Guards the fields below. It is taken before the device's mutexes.
+    std::mutex mutex;
+    VkSurfaceKHR surface{};
+    VernonRhiSurfaceConfiguration configuration{};
+    std::vector<VulkanSurfaceImage> images;
+    size_t next{};
+    bool acquired{};
+    VkSwapchainKHR swapchain{};
+    VkExtent2D swapchainExtent{};
+    std::vector<VkImage> swapchainImages;
+    // Signaled by the present blit of the swapchain image at the same index; its present waits on it.
+    std::vector<VkSemaphore> presentReady;
+    std::vector<VulkanAcquireSemaphore> acquires;
+    size_t nextAcquire{};
+    // The window no longer matches the swapchain; the next present rebuilds it.
+    bool stale{};
 };
 
 struct VulkanSamplerSlot {
@@ -97,6 +140,7 @@ struct VulkanInteropDevice {
     vernon::rhi::StableResourceSlotContainer<VulkanImageSlot> images;
     vernon::rhi::StableResourceSlotContainer<VulkanSamplerSlot> samplers;
     vernon::rhi::StableResourceSlotContainer<VulkanImageViewSlot> imageViews;
+    vernon::rhi::StableResourceSlotContainer<VulkanSurfaceSlot> surfaces;
     vernon::rhi::CommandDeviceStateRef commandState;
     uint32_t queueCapabilities{};
     std::string error;
@@ -348,9 +392,10 @@ void vulkanBufferDependency(VernonRhiResourceState state, VkPipelineStageFlags &
         return;
     case VERNON_RHI_STATE_SHADER_READ:
         stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
         access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
-                 VK_ACCESS_INDEX_READ_BIT;
+                 VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         return;
     case VERNON_RHI_STATE_SHADER_WRITE:
         stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
@@ -500,7 +545,7 @@ bool transitionVulkanSubresources(vernon::rhi::vulkan::DeviceState &state, VkCom
                                   vernon::rhi::vulkan::Image &owner,
                                   const vernon::rhi::vulkan::ImageSubresources &range, VkImageLayout target,
                                   std::string &error) {
-    if (!range.mipLevelCount || !range.arrayLayerCount)
+    if (!range.mipLevelCount || !range.arrayLayerCount || state.movedToLayout(command, owner, range, target))
         return true;
     try {
         // A subresource whose source is `target` needs no barrier here.
@@ -693,6 +738,7 @@ teardownImage(void *context, vernon::rhi::ResourceHandle<vernon::rhi::ImageResou
     device.state.destroyAfterSubmittedWork(std::move(destruction));
     device.images[handle.index].descriptor = {};
     device.images[handle.index].ownedDescriptor = {};
+    device.images[handle.index].surfaceOwned.store(false, std::memory_order_relaxed);
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -719,6 +765,7 @@ teardownImageView(void *context, vernon::rhi::ResourceHandle<vernon::rhi::ImageV
         slot.bindingImage = {};
         slot.descriptor = {};
         slot.ownedNative = false;
+        slot.surfaceOwned.store(false, std::memory_order_relaxed);
     }
     if (prepared.value().commit().isErr())
         vernon::resultContractViolation();
@@ -797,6 +844,61 @@ vernon::rhi::vulkan::allocateCommandDescriptorSet(VernonRhiDevice device, VkComm
         return Result<VkDescriptorSet, RhiError>{
             err(backendFailure("allocate_vulkan_command_descriptor_set", vulkanHandleBits(command)))};
     return Result<VkDescriptorSet, RhiError>{ok(set)};
+}
+
+vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::vulkan::submitRecordedCommands(
+    VernonRhiDevice device, VkCommandBuffer command,
+    const std::unordered_map<Image *, DeviceState::ImageLayoutUse> &layouts) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice || !command)
+        return Result<uint64_t, RhiError>{err(invalidResource("submit_vulkan_recorded_commands"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    uint64_t serial{};
+    if (!vulkanDevice->state.submitRecorded(command, layouts, serial, vulkanDevice->error))
+        return Result<uint64_t, RhiError>{
+            err(backendFailure("submit_vulkan_recorded_commands", vulkanHandleBits(command)))};
+    return Result<uint64_t, RhiError>{ok(serial)};
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::vulkan::waitForSubmission(VernonRhiDevice device,
+                                                                              uint64_t serial) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice)
+        return Result<void, RhiError>{err(invalidResource("wait_for_vulkan_submission"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    if (!vulkanDevice->state.waitForSerial(serial, vulkanDevice->error))
+        return Result<void, RhiError>{err(backendFailure("wait_for_vulkan_submission", serial))};
+    return Result<void, RhiError>{ok()};
+}
+
+vernon::Result<bool, vernon::RhiError> vernon::rhi::vulkan::submissionCompleted(VernonRhiDevice device,
+                                                                                uint64_t serial) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice)
+        return Result<bool, RhiError>{err(invalidResource("poll_vulkan_submission"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    if (serial <= vulkanDevice->state.completedSerial)
+        return Result<bool, RhiError>{ok(true)};
+    bool completed = false;
+    if (!vulkanDevice->state.pollSerial(serial, completed, vulkanDevice->error))
+        return Result<bool, RhiError>{err(backendFailure("poll_vulkan_submission", serial))};
+    return Result<bool, RhiError>{ok(completed)};
+}
+
+vernon::Result<vernon::rhi::vulkan::DeviceState *, vernon::RhiError>
+vernon::rhi::vulkan::deviceStateOf(VernonRhiDevice device) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice)
+        return Result<DeviceState *, RhiError>{err(invalidResource("get_vulkan_device_state"))};
+    return Result<DeviceState *, RhiError>{ok(&vulkanDevice->state)};
+}
+
+vernon::Result<vernon::rhi::vulkan::DeviceAccess, vernon::RhiError>
+vernon::rhi::vulkan::deviceAccess(VernonRhiDevice device) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice)
+        return Result<DeviceAccess, RhiError>{err(invalidResource("get_vulkan_device_access"))};
+    return Result<DeviceAccess, RhiError>{ok(DeviceAccess{&vulkanDevice->state, &vulkanDevice->mutex})};
 }
 
 namespace vernon::rhi::vulkan_api {
@@ -1172,6 +1274,8 @@ vernon::Result<void, vernon::RhiError> destroyImageView(VernonRhiDevice handle, 
                                 "destroy_vulkan_image_view");
     if (found.isErr())
         return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(found).error())};
+    if (found.value()->surfaceOwned.load(std::memory_order_relaxed))
+        return invalidResult("destroy_vulkan_image_view", imageView.generation, imageView.index);
     return found.value()->lifecycle.destroyPublic(typedHandle<vernon::rhi::ImageViewResourceTag>(imageView));
 }
 
@@ -1255,6 +1359,48 @@ vernon::Option<VernonStringView> lastError(VernonRhiDevice handle) {
     return vernon::Option<VernonStringView>{vernon::some(VernonStringView{context.error.data(), context.error.size()})};
 }
 
+// Creates `buffer` of `size` bytes, mapped unless it is device memory, with the device's lock held; false with the
+// device's error set on failure.
+bool createVulkanBuffer(VulkanInteropDevice &device, uint64_t size, uint32_t usageFlags,
+                        VernonRhiMemoryClass memoryClass, vernon::rhi::vulkan::Buffer &buffer) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if ((usageFlags & VERNON_RHI_BUFFER_STORAGE) != 0)
+        usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if ((usageFlags & VERNON_RHI_BUFFER_VERTEX) != 0)
+        usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    if ((usageFlags & VERNON_RHI_BUFFER_INDEX) != 0)
+        usage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if ((usageFlags & VERNON_RHI_BUFFER_INDIRECT) != 0)
+        usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    if ((usageFlags & VERNON_RHI_BUFFER_UNIFORM) != 0)
+        usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    if (size > (std::numeric_limits<VkDeviceSize>::max)() - 3) {
+        device.error = "the Vulkan buffer is too large";
+        return false;
+    }
+    const VkDeviceSize allocationSize = (size + 3) & ~VkDeviceSize{3};
+    const VkMemoryPropertyFlags requiredMemory =
+        memoryClass == VERNON_RHI_MEMORY_DEVICE
+            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags preferredMemory =
+        memoryClass == VERNON_RHI_MEMORY_DEVICE ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    if (!device.state.createBuffer(buffer, allocationSize, usage, requiredMemory, device.error, preferredMemory))
+        return false;
+    if (memoryClass != VERNON_RHI_MEMORY_DEVICE) {
+        void *mapped = nullptr;
+        const VkResult mapResult =
+            vernon::rhi::vulkan::driver().mapMemory(device.state.device, buffer.memory, 0, allocationSize, 0, &mapped);
+        if (mapResult != VK_SUCCESS) {
+            device.error = "vkMapMemory failed with Vulkan error " + std::to_string(static_cast<int>(mapResult));
+            device.state.destroyBuffer(buffer);
+            return false;
+        }
+        buffer.mapped = static_cast<uint8_t *>(mapped);
+    }
+    return true;
+}
+
 vernon::Result<VernonRhiBuffer, vernon::RhiError> createBuffer(VernonRhiDevice handle,
                                                                const VernonRhiBufferDescriptor *descriptor) {
     auto device = lookupVulkanDevice(handle);
@@ -1276,42 +1422,10 @@ vernon::Result<VernonRhiBuffer, vernon::RhiError> createBuffer(VernonRhiDevice h
         return vernon::Result<VernonRhiBuffer, vernon::RhiError>{vernon::err(std::move(reserved).error())};
     VulkanBufferSlot &slot = *reserved.value();
     std::lock_guard<std::mutex> guard(device->mutex);
-    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if ((descriptor->usage & VERNON_RHI_BUFFER_STORAGE) != 0)
-        usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if ((descriptor->usage & VERNON_RHI_BUFFER_VERTEX) != 0)
-        usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    if ((descriptor->usage & VERNON_RHI_BUFFER_INDEX) != 0)
-        usage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-    if ((descriptor->usage & VERNON_RHI_BUFFER_UNIFORM) != 0)
-        usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    if (descriptor->size > (std::numeric_limits<VkDeviceSize>::max)() - 3)
-        return vernon::Result<VernonRhiBuffer, vernon::RhiError>{
-            vernon::err(invalidResource("create_vulkan_buffer", descriptor->size))};
-    const VkDeviceSize allocationSize = (descriptor->size + 3) & ~VkDeviceSize{3};
-    const VkMemoryPropertyFlags requiredMemory =
-        descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE
-            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-            : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const VkMemoryPropertyFlags preferredMemory =
-        descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    if (!device->state.createBuffer(slot.buffer, allocationSize, usage, requiredMemory, device->error,
-                                    preferredMemory)) {
+    if (!createVulkanBuffer(device.value().device(), descriptor->size, descriptor->usage, descriptor->memory_class,
+                            slot.buffer))
         return vernon::Result<VernonRhiBuffer, vernon::RhiError>{
             vernon::err(backendFailure("create_vulkan_buffer", descriptor->size))};
-    }
-    if (descriptor->memory_class != VERNON_RHI_MEMORY_DEVICE) {
-        void *mapped = nullptr;
-        const VkResult mapResult = vernon::rhi::vulkan::driver().mapMemory(device->state.device, slot.buffer.memory, 0,
-                                                                           allocationSize, 0, &mapped);
-        if (mapResult != VK_SUCCESS) {
-            device->error = "vkMapMemory failed with Vulkan error " + std::to_string(static_cast<int>(mapResult));
-            device->state.destroyBuffer(slot.buffer);
-            return vernon::Result<VernonRhiBuffer, vernon::RhiError>{
-                vernon::err(backendFailure("map_vulkan_buffer", allocationSize))};
-        }
-        slot.buffer.mapped = static_cast<uint8_t *>(mapped);
-    }
     slot.ownedDescriptor = *descriptor;
     auto published = slot.lifecycle.publish(std::move(creation).value(), &device.value().device(), teardownBuffer);
     if (published.isErr()) {
@@ -1325,6 +1439,14 @@ vernon::Result<VernonRhiBuffer, vernon::RhiError> createBuffer(VernonRhiDevice h
 
 vernon::Result<void, vernon::RhiError> uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
                                                           const VernonRhiBufferUploadRange *ranges, size_t rangeCount);
+vernon::Result<void, vernon::RhiError> uploadVulkanBufferRanges(VernonRhiDevice handle, VulkanInteropDevice &interop,
+                                                                vernon::rhi::vulkan::Buffer &buffer,
+                                                                uint64_t bufferSize, VernonRhiMemoryClass memoryClass,
+                                                                const VernonRhiBufferUploadRange *ranges,
+                                                                size_t rangeCount);
+vernon::Result<void, vernon::RhiError>
+downloadVulkanBufferRanges(VulkanInteropDevice &interop, vernon::rhi::vulkan::Buffer &buffer, uint64_t bufferSize,
+                           const VernonRhiBufferDownloadRange *ranges, size_t rangeCount);
 
 // Copies `size` bytes that `fill` writes into frame staging to `destination`, in queue order. `copies` are relative
 // to the staging allocation.
@@ -1333,21 +1455,20 @@ vernon::Result<void, vernon::RhiError> submitBufferUpload(VulkanInteropDevice &d
                                                           VkDeviceSize size, std::vector<VkBufferCopy> &copies,
                                                           Fill &&fill) {
     VkCommandBuffer command{};
-    if (!device.state.beginCommands(command, device.error))
+    if (!device.state.beginUploadCommands(command, device.error))
         return backendResult("begin_vulkan_upload_commands");
     VkBuffer staging{};
     VkDeviceSize stagingOffset{};
     uint8_t *mapped = nullptr;
-    if (!device.state.acquireStaging(command, true, size, 16, staging, stagingOffset, mapped, device.error)) {
-        device.state.abandonCommands(command);
+    // A failed upload leaves the pending recording with the earlier uploads, which still submit.
+    if (!device.state.acquireStaging(command, true, size, 16, staging, stagingOffset, mapped, device.error))
         return backendResult("acquire_vulkan_upload_staging", size);
-    }
     fill(mapped);
     for (VkBufferCopy &copy : copies)
         copy.srcOffset += stagingOffset;
     vernon::rhi::vulkan::driver().cmdCopyBuffer(command, staging, destination, static_cast<uint32_t>(copies.size()),
                                                 copies.data());
-    if (!submitQueueOrdered(device.state, command, device.error))
+    if (!device.state.endUploadCommands(command, device.error))
         return backendResult("submit_vulkan_upload_commands");
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
@@ -1371,15 +1492,26 @@ vernon::Result<void, vernon::RhiError> uploadBufferRanges(VernonRhiDevice handle
         return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(pinned).error())};
     VulkanBufferSlot *slot = pinned.value().slot;
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
-        if (!slot->buffer.mapped)
+    return uploadVulkanBufferRanges(handle, device.value().device(), slot->buffer, slot->ownedDescriptor.size,
+                                    slot->ownedDescriptor.memory_class, ranges, rangeCount);
+}
+
+// Writes `ranges` into `buffer` of `size` bytes in memory `memoryClass`, in queue order, with the device's lock held.
+vernon::Result<void, vernon::RhiError> uploadVulkanBufferRanges(VernonRhiDevice handle, VulkanInteropDevice &interop,
+                                                                vernon::rhi::vulkan::Buffer &buffer,
+                                                                uint64_t bufferSize, VernonRhiMemoryClass memoryClass,
+                                                                const VernonRhiBufferUploadRange *ranges,
+                                                                size_t rangeCount) {
+    VulkanInteropDevice *device = &interop;
+    if (memoryClass == VERNON_RHI_MEMORY_UPLOAD) {
+        if (!buffer.mapped)
             return backendResult("upload_vulkan_buffer");
         for (size_t index = 0; index < rangeCount; ++index) {
             const VernonRhiBufferUploadRange &range = ranges[index];
             if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
-                range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+                range.offset > bufferSize || range.size > bufferSize - range.offset)
                 return invalidResult("upload_vulkan_buffer_ranges", index);
-            std::memcpy(slot->buffer.mapped + range.offset, range.source, static_cast<size_t>(range.size));
+            std::memcpy(buffer.mapped + range.offset, range.source, static_cast<size_t>(range.size));
         }
         return vernon::Result<void, vernon::RhiError>{vernon::ok()};
     }
@@ -1394,7 +1526,7 @@ vernon::Result<void, vernon::RhiError> uploadBufferRanges(VernonRhiDevice handle
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
-            range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+            range.offset > bufferSize || range.size > bufferSize - range.offset)
             return invalidResult("upload_vulkan_buffer_ranges", index);
         if (packedSize > (std::numeric_limits<VkDeviceSize>::max)() - 15)
             return invalidResult("upload_vulkan_buffer_ranges", index);
@@ -1451,8 +1583,8 @@ vernon::Result<void, vernon::RhiError> uploadBufferRanges(VernonRhiDevice handle
         }
         for (VkBufferCopy &copy : readbackCopies)
             copy.dstOffset += readbackOffset;
-        driver.cmdCopyBuffer(readbackCommand, slot->buffer.buffer, readback,
-                             static_cast<uint32_t>(readbackCopies.size()), readbackCopies.data());
+        driver.cmdCopyBuffer(readbackCommand, buffer.buffer, readback, static_cast<uint32_t>(readbackCopies.size()),
+                             readbackCopies.data());
         if (!submitAndWait(device->state, readbackCommand, device->error))
             return backendResult("submit_vulkan_upload_readback");
         for (size_t index = 0; index < alignedRanges.size(); ++index) {
@@ -1478,10 +1610,10 @@ vernon::Result<void, vernon::RhiError> uploadBufferRanges(VernonRhiDevice handle
             copies.push_back({sourceOffset, begin, end - begin});
             sourceOffset += end - begin;
         }
-        return submitBufferUpload(device.value().device(), slot->buffer.buffer, alignedSize, copies,
+        return submitBufferUpload(interop, buffer.buffer, alignedSize, copies,
                                   [&](uint8_t *staging) { std::memcpy(staging, contents.data(), contents.size()); });
     }
-    return submitBufferUpload(device.value().device(), slot->buffer.buffer, packedSize, copies, [&](uint8_t *staging) {
+    return submitBufferUpload(interop, buffer.buffer, packedSize, copies, [&](uint8_t *staging) {
         for (size_t index = 0; index < rangeCount; ++index)
             std::memcpy(staging + copies[index].srcOffset, ranges[index].source,
                         static_cast<size_t>(ranges[index].size));
@@ -1513,13 +1645,22 @@ vernon::Result<void, vernon::RhiError> downloadBufferRanges(VernonRhiDevice hand
         return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(pinned).error())};
     VulkanBufferSlot *slot = pinned.value().slot;
     std::lock_guard<std::mutex> guard(device->mutex);
+    return downloadVulkanBufferRanges(device.value().device(), slot->buffer, slot->ownedDescriptor.size, ranges,
+                                      rangeCount);
+}
+
+// Reads `ranges` of `buffer` of `size` bytes once the queue's earlier work completed, with the device's lock held.
+vernon::Result<void, vernon::RhiError>
+downloadVulkanBufferRanges(VulkanInteropDevice &interop, vernon::rhi::vulkan::Buffer &buffer, uint64_t bufferSize,
+                           const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    VulkanInteropDevice *device = &interop;
     std::vector<VkBufferCopy> copies;
     copies.reserve(rangeCount);
     VkDeviceSize stagingSize = 0;
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferDownloadRange &range = ranges[index];
-        if (!range.destination || range.size == 0 || range.offset > slot->ownedDescriptor.size ||
-            range.size > slot->ownedDescriptor.size - range.offset)
+        if (!range.destination || range.size == 0 || range.offset > bufferSize ||
+            range.size > bufferSize - range.offset)
             return invalidResult("download_vulkan_buffer_ranges", index);
         const VkDeviceSize begin = range.offset & ~VkDeviceSize{3};
         const VkDeviceSize end = (range.offset + range.size + 3) & ~VkDeviceSize{3};
@@ -1541,8 +1682,8 @@ vernon::Result<void, vernon::RhiError> downloadBufferRanges(VernonRhiDevice hand
     }
     for (VkBufferCopy &copy : copies)
         copy.dstOffset += stagingOffset;
-    vernon::rhi::vulkan::driver().cmdCopyBuffer(command, slot->buffer.buffer, staging,
-                                                static_cast<uint32_t>(copies.size()), copies.data());
+    vernon::rhi::vulkan::driver().cmdCopyBuffer(command, buffer.buffer, staging, static_cast<uint32_t>(copies.size()),
+                                                copies.data());
     if (!submitAndWait(device->state, command, device->error))
         return backendResult("submit_vulkan_download_commands");
     for (size_t index = 0; index < rangeCount; ++index) {
@@ -1667,7 +1808,7 @@ vernon::Result<void, vernon::RhiError> uploadImage(VernonRhiDevice handle, Verno
     if (!device)
         return unsupportedResult("upload_vulkan_image");
 
-    if (!uploads || uploadCount == 0)
+    if (!uploads && uploadCount != 0)
         return invalidResult("upload_vulkan_image", uploadCount);
     auto pinned = findAndPinVulkanSlot(device.value().device(), device->images,
                                        typedHandle<vernon::rhi::ImageResourceTag>(image), "upload_vulkan_image");
@@ -1677,6 +1818,8 @@ vernon::Result<void, vernon::RhiError> uploadImage(VernonRhiDevice handle, Verno
     std::lock_guard<std::mutex> guard(device->mutex);
     if (!slot || !slot->image.owned)
         return invalidResult("upload_vulkan_image");
+    if (uploadCount == 0)
+        return vernon::Result<void, vernon::RhiError>{vernon::ok()};
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
     if (!vernon::rhi::validImageShape(descriptor))
         return invalidResult("upload_vulkan_image");
@@ -2039,6 +2182,8 @@ vernon::Result<void, vernon::RhiError> destroyImage(VernonRhiDevice handle, Vern
                                 typedHandle<vernon::rhi::ImageResourceTag>(image), "destroy_vulkan_image");
     if (found.isErr())
         return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(found).error())};
+    if (found.value()->surfaceOwned.load(std::memory_order_relaxed))
+        return invalidResult("destroy_vulkan_image", image.generation, image.index);
     return found.value()->lifecycle.destroyPublic(typedHandle<vernon::rhi::ImageResourceTag>(image));
 }
 
@@ -2605,30 +2750,42 @@ Result<OpenedRendering, RhiError> beginRendering(VernonRhiDevice handle, uint64_
     const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
     if (!device || !command)
         return Result<OpenedRendering, RhiError>{err(invalidArgument("beginRendering_vulkan", native))};
-    // Layout transitions are recorded before the native scope begins, since barriers cannot be inside it.
-    for (size_t index = 0; index < readCount; ++index) {
-        auto resolved = retainResolvedCommandResource(handle, encoderKey, reads[index].kind, reads[index].key);
-        if (resolved.isErr())
-            return Result<OpenedRendering, RhiError>{err(std::move(resolved).error())};
-        auto transitioned = vernon::rhi::vulkan::transitionCommandImage(
-            handle, command, *reinterpret_cast<vernon::rhi::vulkan::Image *>(static_cast<uintptr_t>(resolved.value())),
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        if (transitioned.isErr())
-            return Result<OpenedRendering, RhiError>{err(std::move(transitioned).error())};
+    // The sampled images, then the attachments.
+    std::vector<CommandResource> resources;
+    std::vector<uint64_t> natives;
+    try {
+        resources.reserve(readCount + scope.attachmentCount());
+        for (size_t index = 0; index < readCount; ++index)
+            resources.push_back({reads[index].kind, reads[index].key});
+        for (size_t index = 0; index < scope.attachmentCount(); ++index)
+            resources.push_back({ResourceKind::ImageView, scope.attachmentView(index)});
+        natives.resize(resources.size());
+    } catch (const std::bad_alloc &) {
+        return Result<OpenedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"beginRendering_vulkan", resources.size(), 0}})};
     }
+    if (auto retained =
+            retainResolvedCommandResources(handle, encoderKey, resources.data(), resources.size(), natives.data());
+        retained.isErr())
+        return Result<OpenedRendering, RhiError>{err(std::move(retained).error())};
+    const auto image = [&](size_t index) {
+        return reinterpret_cast<vernon::rhi::vulkan::Image *>(static_cast<uintptr_t>(natives[index]));
+    };
     std::array<vernon::rhi::vulkan::Image *, vulkanMaxRenderingAttachments> images{};
-    for (size_t index = 0; index < scope.attachmentCount(); ++index) {
-        auto resolved =
-            retainResolvedCommandResource(handle, encoderKey, ResourceKind::ImageView, scope.attachmentView(index));
-        if (resolved.isErr())
-            return Result<OpenedRendering, RhiError>{err(std::move(resolved).error())};
-        images[index] = reinterpret_cast<vernon::rhi::vulkan::Image *>(static_cast<uintptr_t>(resolved.value()));
-        auto transitioned = vernon::rhi::vulkan::transitionCommandImage(
-            handle, command, *images[index],
-            index < scope.colorCount ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-                                     : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        if (transitioned.isErr())
-            return Result<OpenedRendering, RhiError>{err(std::move(transitioned).error())};
+    for (size_t index = 0; index < scope.attachmentCount(); ++index)
+        images[index] = image(readCount + index);
+    {
+        // Layout transitions are recorded before the native scope begins, since barriers cannot be inside it.
+        std::lock_guard<std::mutex> guard(device->mutex);
+        for (size_t index = 0; index < resources.size(); ++index) {
+            const VkImageLayout layout = index < readCount ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                         : index - readCount < scope.colorCount
+                                             ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            const auto [owner, range] = vulkanLayoutSubresources(*image(index));
+            if (!transitionVulkanSubresources(device->state, command, *owner, range, layout, device->error))
+                return Result<OpenedRendering, RhiError>{err(backendFailure("transition_vulkan_command_image"))};
+        }
     }
     VulkanRenderPassKey key{};
     key.depth = scope.hasDepth;
@@ -3104,6 +3261,531 @@ vernon::Result<ImageViewResourceDescription, vernon::RhiError> describeImageView
         resourceKey(parentHandle)})};
 }
 
+// Encoders that retained a surface image keep it alive until they complete.
+Result<void, RhiError> destroyVulkanSurfaceImages(VulkanInteropDevice &device,
+                                                  std::vector<VulkanSurfaceImage> &images) noexcept {
+    std::optional<RhiError> failure;
+    const auto keep = [&](Result<void, RhiError> destroyed) {
+        if (destroyed.isErr() && !failure)
+            failure.emplace(std::move(destroyed).error());
+    };
+    for (const VulkanSurfaceImage &image : images) {
+        const auto viewHandle = typedHandle<ImageViewResourceTag>(image.view);
+        if (auto view = findVulkanSlot(device, device.imageViews, viewHandle, "destroy_vulkan_surface_image");
+            view.isOk())
+            keep(view.value()->lifecycle.destroyPublic(viewHandle));
+        const auto imageHandle = typedHandle<ImageResourceTag>(image.image);
+        if (auto slot = findVulkanSlot(device, device.images, imageHandle, "destroy_vulkan_surface_image"); slot.isOk())
+            keep(slot.value()->lifecycle.destroyPublic(imageHandle));
+    }
+    images.clear();
+    if (failure)
+        return Result<void, RhiError>{err(std::move(*failure))};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<VulkanSurfaceImage, RhiError> createVulkanSurfaceImage(VernonRhiDevice handle, VulkanInteropDevice &device,
+                                                              const VernonRhiImageDescriptor &descriptor) {
+    auto image = createImage(handle, &descriptor);
+    if (image.isErr())
+        return Result<VulkanSurfaceImage, RhiError>{err(std::move(image).error())};
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image.value();
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = descriptor.format;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    auto view = createImageView(handle, &viewDescriptor);
+    if (view.isErr()) {
+        if (destroyImage(handle, image.value()).isErr())
+            vernon::resultContractViolation();
+        return Result<VulkanSurfaceImage, RhiError>{err(std::move(view).error())};
+    }
+    findVulkanSlot(device, device.images, typedHandle<ImageResourceTag>(image.value()), "create_vulkan_surface_image")
+        .value()
+        ->surfaceOwned.store(true, std::memory_order_relaxed);
+    findVulkanSlot(device, device.imageViews, typedHandle<ImageViewResourceTag>(view.value()),
+                   "create_vulkan_surface_image")
+        .value()
+        ->surfaceOwned.store(true, std::memory_order_relaxed);
+    return Result<VulkanSurfaceImage, RhiError>{ok(VulkanSurfaceImage{image.value(), view.value()})};
+}
+
+// Runs under the device's mutex with the queue idle, so no submission or present still uses what it destroys.
+void destroyVulkanSwapchain(VulkanInteropDevice &device, VulkanSurfaceSlot &slot) noexcept {
+    const vulkan::Driver &api = vulkan::driver();
+    for (VkSemaphore semaphore : slot.presentReady)
+        api.destroySemaphore(device.state.device, semaphore, nullptr);
+    for (const VulkanAcquireSemaphore &acquire : slot.acquires)
+        api.destroySemaphore(device.state.device, acquire.semaphore, nullptr);
+    if (slot.swapchain)
+        api.destroySwapchain(device.state.device, slot.swapchain, nullptr);
+    slot.presentReady.clear();
+    slot.acquires.clear();
+    slot.nextAcquire = 0;
+    slot.swapchain = VK_NULL_HANDLE;
+    slot.swapchainImages.clear();
+    slot.swapchainExtent = {};
+}
+
+VkPresentModeKHR vulkanPresentMode(VernonRhiPresentMode mode) noexcept {
+    switch (mode) {
+    case VERNON_RHI_PRESENT_MAILBOX:
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    case VERNON_RHI_PRESENT_IMMEDIATE:
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    case VERNON_RHI_PRESENT_FIFO:
+        break;
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+// Replaces the swapchain with one at the window's extent in the configured present mode. Runs under the device's
+// mutex. A minimized window has no extent and leaves the surface without a swapchain until it has one.
+bool rebuildVulkanSwapchain(VulkanInteropDevice &device, VulkanSurfaceSlot &slot, std::string &error) {
+    const vulkan::Driver &api = vulkan::driver();
+    vulkan::DeviceState &state = device.state;
+    // The old swapchain's images and semaphores are idle once the queue is.
+    if (!state.synchronize(error))
+        return false;
+    slot.stale = false;
+    VkSurfaceCapabilitiesKHR capabilities{};
+    if (api.getPhysicalDeviceSurfaceCapabilities(state.physicalDevice, slot.surface, &capabilities) != VK_SUCCESS) {
+        error = "vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed";
+        return false;
+    }
+    VkExtent2D extent = capabilities.currentExtent;
+    if (extent.width == UINT32_MAX)
+        extent = {
+            std::clamp(slot.configuration.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+            std::clamp(slot.configuration.height, capabilities.minImageExtent.height,
+                       capabilities.maxImageExtent.height)};
+    if (!extent.width || !extent.height) {
+        destroyVulkanSwapchain(device, slot);
+        return true;
+    }
+    if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        error = "Vulkan swapchain images cannot be transfer destinations";
+        return false;
+    }
+    uint32_t formatCount = 0;
+    std::vector<VkSurfaceFormatKHR> formats;
+    if (api.getPhysicalDeviceSurfaceFormats(state.physicalDevice, slot.surface, &formatCount, nullptr) == VK_SUCCESS) {
+        formats.resize(formatCount);
+        if (api.getPhysicalDeviceSurfaceFormats(state.physicalDevice, slot.surface, &formatCount, formats.data()) !=
+            VK_SUCCESS)
+            formats.clear();
+        formats.resize(std::min<size_t>(formats.size(), formatCount));
+    }
+    if (formats.empty()) {
+        error = "Vulkan surface reports no formats";
+        return false;
+    }
+    // The surface images hold display-encoded RGBA8 values, which a UNORM swapchain shows unchanged.
+    VkSurfaceFormatKHR format = formats.front();
+    for (const VkSurfaceFormatKHR &candidate : formats)
+        if ((candidate.format == VK_FORMAT_B8G8R8A8_UNORM || candidate.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            format = candidate;
+            break;
+        }
+    if (format.format == VK_FORMAT_UNDEFINED)
+        format = {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    uint32_t imageCount = std::max(capabilities.minImageCount + 1, slot.configuration.image_count);
+    if (capabilities.maxImageCount)
+        imageCount = std::min(imageCount, capabilities.maxImageCount);
+    VkCompositeAlphaFlagBitsKHR compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(capabilities.supportedCompositeAlpha & compositeAlpha))
+        compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(capabilities.supportedCompositeAlpha &
+                                                                  (~capabilities.supportedCompositeAlpha + 1));
+    VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    info.surface = slot.surface;
+    info.minImageCount = imageCount;
+    info.imageFormat = format.format;
+    info.imageColorSpace = format.colorSpace;
+    info.imageExtent = extent;
+    info.imageArrayLayers = 1;
+    info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.preTransform = capabilities.currentTransform;
+    info.compositeAlpha = compositeAlpha;
+    info.presentMode = vulkanPresentMode(slot.configuration.present_mode);
+    info.clipped = VK_TRUE;
+    info.oldSwapchain = slot.swapchain;
+    VkSwapchainKHR swapchain{};
+    const VkResult created = api.createSwapchain(state.device, &info, nullptr, &swapchain);
+    destroyVulkanSwapchain(device, slot);
+    if (created != VK_SUCCESS) {
+        error = "vkCreateSwapchainKHR failed with Vulkan error " + std::to_string(static_cast<int>(created));
+        return false;
+    }
+    slot.swapchain = swapchain;
+    slot.swapchainExtent = extent;
+    try {
+        uint32_t count = 0;
+        if (api.getSwapchainImages(state.device, swapchain, &count, nullptr) != VK_SUCCESS) {
+            error = "vkGetSwapchainImagesKHR failed";
+            return false;
+        }
+        slot.swapchainImages.resize(count);
+        if (api.getSwapchainImages(state.device, swapchain, &count, slot.swapchainImages.data()) != VK_SUCCESS) {
+            error = "vkGetSwapchainImagesKHR failed";
+            return false;
+        }
+        slot.swapchainImages.resize(count);
+        // One acquire more than images, so the acquire that reuses a semaphore follows the present that waited on it.
+        const VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        slot.presentReady.reserve(count);
+        slot.acquires.reserve(size_t{count} + 1);
+        for (uint32_t index = 0; index <= count; ++index) {
+            VkSemaphore semaphore{};
+            if (api.createSemaphore(state.device, &semaphoreInfo, nullptr, &semaphore) != VK_SUCCESS) {
+                error = "vkCreateSemaphore failed";
+                return false;
+            }
+            slot.acquires.push_back({semaphore, 0});
+            if (index == count)
+                break;
+            if (api.createSemaphore(state.device, &semaphoreInfo, nullptr, &semaphore) != VK_SUCCESS) {
+                error = "vkCreateSemaphore failed";
+                return false;
+            }
+            slot.presentReady.push_back(semaphore);
+        }
+    } catch (const std::bad_alloc &) {
+        error = "Vulkan swapchain ran out of memory";
+        return false;
+    }
+    return true;
+}
+
+Result<void, RhiError> teardownSurface(void *context, VulkanSurfaceLifecycle::Handle handle) noexcept {
+    auto &device = *static_cast<VulkanInteropDevice *>(context);
+    VulkanSurfaceSlot *slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        if (handle.index >= device.surfaces.size())
+            return Result<void, RhiError>{err(invalidResource("teardown_vulkan_surface"))};
+        slot = &device.surfaces[handle.index];
+        std::string ignored;
+        (void)device.state.synchronize(ignored);
+        destroyVulkanSwapchain(device, *slot);
+        if (slot->surface)
+            vulkan::driver().destroySurface(device.state.instance, slot->surface, nullptr);
+        slot->surface = VK_NULL_HANDLE;
+    }
+    auto destroyed = destroyVulkanSurfaceImages(device, slot->images);
+    slot->configuration = {};
+    slot->next = 0;
+    slot->acquired = false;
+    slot->stale = false;
+    return destroyed;
+}
+
+Result<VernonRhiSurface, RhiError> createSurface(VernonRhiDevice handle, const VernonRhiSurfaceDescriptor &descriptor) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return Result<VernonRhiSurface, RhiError>{err(invalidResource("create_vulkan_surface"))};
+    VulkanInteropDevice &context = device.value().device();
+    if (!context.state.presentation)
+        return Result<VernonRhiSurface, RhiError>{err(unsupported("create_vulkan_surface"))};
+    auto owner = device.value().retainOwner();
+    if (owner.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(owner).error())};
+    auto creation = ResourceCreationReservation::create(owner.value());
+    if (creation.isErr())
+        return Result<VernonRhiSurface, RhiError>{err(std::move(creation).error())};
+    const vulkan::Driver &api = vulkan::driver();
+    VkSurfaceKHR surface{};
+    std::string error;
+    if (!vulkan::createPlatformSurface(context.state.instance, descriptor, surface, error)) {
+        std::lock_guard<std::mutex> guard(context.mutex);
+        context.error = std::move(error);
+        return Result<VernonRhiSurface, RhiError>{err(backendFailure("create_vulkan_surface"))};
+    }
+    VkBool32 presentable = VK_FALSE;
+    if (api.getPhysicalDeviceSurfaceSupport(context.state.physicalDevice, context.state.queueFamily, surface,
+                                            &presentable) != VK_SUCCESS ||
+        !presentable) {
+        api.destroySurface(context.state.instance, surface, nullptr);
+        return Result<VernonRhiSurface, RhiError>{err(unsupported("create_vulkan_surface"))};
+    }
+    std::lock_guard<std::mutex> creationGuard(context.creationMutex);
+    auto reserved = reserveVulkanSlot<SurfaceResourceTag>(context, context.surfaces);
+    if (reserved.isErr()) {
+        api.destroySurface(context.state.instance, surface, nullptr);
+        return Result<VernonRhiSurface, RhiError>{err(std::move(reserved).error())};
+    }
+    VulkanSurfaceSlot &slot = *reserved.value();
+    slot.surface = surface;
+    auto published = slot.lifecycle.publish(std::move(creation).value(), &context, teardownSurface);
+    if (published.isErr()) {
+        api.destroySurface(context.state.instance, surface, nullptr);
+        slot.surface = VK_NULL_HANDLE;
+        return Result<VernonRhiSurface, RhiError>{err(std::move(published).error())};
+    }
+    return Result<VernonRhiSurface, RhiError>{ok(publicHandle<VernonRhiSurface>(published.value()))};
+}
+
+Result<VernonRhiSurfaceCapabilities, RhiError> surfaceCapabilities(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return Result<VernonRhiSurfaceCapabilities, RhiError>{err(invalidResource("vulkan_surface_capabilities"))};
+    VulkanInteropDevice &context = device.value().device();
+    auto pinned = findAndPinVulkanSlot(context, context.surfaces, typedHandle<SurfaceResourceTag>(surface),
+                                       "vulkan_surface_capabilities");
+    if (pinned.isErr())
+        return Result<VernonRhiSurfaceCapabilities, RhiError>{err(std::move(pinned).error())};
+    const vulkan::Driver &api = vulkan::driver();
+    VkSurfaceCapabilitiesKHR native{};
+    if (api.getPhysicalDeviceSurfaceCapabilities(context.state.physicalDevice, pinned.value().slot->surface, &native) !=
+        VK_SUCCESS)
+        return Result<VernonRhiSurfaceCapabilities, RhiError>{err(backendFailure("vulkan_surface_capabilities"))};
+    std::array<VkPresentModeKHR, 8> modes{};
+    uint32_t modeCount = static_cast<uint32_t>(modes.size());
+    const VkResult listed = api.getPhysicalDeviceSurfacePresentModes(
+        context.state.physicalDevice, pinned.value().slot->surface, &modeCount, modes.data());
+    if (listed != VK_SUCCESS && listed != VK_INCOMPLETE)
+        modeCount = 0;
+    VernonRhiSurfaceCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.formats[0] = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    capabilities.format_count = 1;
+    capabilities.present_modes = 1u << VERNON_RHI_PRESENT_FIFO;
+    for (uint32_t index = 0; index < modeCount; ++index) {
+        if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR)
+            capabilities.present_modes |= 1u << VERNON_RHI_PRESENT_MAILBOX;
+        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR)
+            capabilities.present_modes |= 1u << VERNON_RHI_PRESENT_IMMEDIATE;
+    }
+    // Without sampled or storage usage, an acquired image is read only by a preserving rendering scope, a copy or a
+    // download, which are the reads the command layer rejects while its contents are undefined.
+    capabilities.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    capabilities.min_image_count = 1;
+    capabilities.current_width = native.currentExtent.width;
+    capabilities.current_height = native.currentExtent.height;
+    return Result<VernonRhiSurfaceCapabilities, RhiError>{ok(capabilities)};
+}
+
+// The new images replace the old ones only once all of them exist.
+Result<void, RhiError> configureSurface(VernonRhiDevice handle, VernonRhiSurface surface,
+                                        const VernonRhiSurfaceConfiguration &configuration) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return invalidResult("configure_vulkan_surface");
+    VulkanInteropDevice &context = device.value().device();
+    auto pinned = findAndPinVulkanSlot(context, context.surfaces, typedHandle<SurfaceResourceTag>(surface),
+                                       "configure_vulkan_surface");
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    VulkanSurfaceSlot &slot = *pinned.value().slot;
+    std::lock_guard<std::mutex> slotGuard(slot.mutex);
+    if (slot.acquired)
+        return invalidResult("configure_vulkan_surface", surface.generation, surface.index);
+    std::vector<VulkanSurfaceImage> images;
+    try {
+        images.reserve(configuration.image_count);
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"configure_vulkan_surface", configuration.image_count, 0}})};
+    }
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = configuration.format;
+    descriptor.width = configuration.width;
+    descriptor.height = configuration.height;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage = configuration.usage | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    for (uint32_t index = 0; index < configuration.image_count; ++index) {
+        auto created = createVulkanSurfaceImage(handle, context, descriptor);
+        if (created.isErr()) {
+            if (destroyVulkanSurfaceImages(context, images).isErr())
+                vernon::resultContractViolation();
+            return Result<void, RhiError>{err(std::move(created).error())};
+        }
+        images.push_back(created.value());
+    }
+    std::vector<VulkanSurfaceImage> previous = std::exchange(slot.images, std::move(images));
+    slot.configuration = configuration;
+    slot.next = 0;
+    bool rebuilt = false;
+    {
+        std::lock_guard<std::mutex> guard(context.mutex);
+        rebuilt = rebuildVulkanSwapchain(context, slot, context.error);
+    }
+    auto destroyed = destroyVulkanSurfaceImages(context, previous);
+    if (!rebuilt)
+        return backendResult("configure_vulkan_surface", configuration.width, configuration.height);
+    return destroyed;
+}
+
+// A window whose extent is no longer the configured one, or a swapchain a present found out of date, reports out of
+// date here, so the host configures again.
+Result<VernonRhiSurfaceImage, RhiError> acquireSurfaceImage(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return Result<VernonRhiSurfaceImage, RhiError>{err(invalidResource("acquire_vulkan_surface_image"))};
+    VulkanInteropDevice &context = device.value().device();
+    auto pinned = findAndPinVulkanSlot(context, context.surfaces, typedHandle<SurfaceResourceTag>(surface),
+                                       "acquire_vulkan_surface_image");
+    if (pinned.isErr())
+        return Result<VernonRhiSurfaceImage, RhiError>{err(std::move(pinned).error())};
+    VulkanSurfaceSlot &slot = *pinned.value().slot;
+    std::lock_guard<std::mutex> slotGuard(slot.mutex);
+    if (slot.acquired || slot.images.empty())
+        return Result<VernonRhiSurfaceImage, RhiError>{
+            err(invalidResource("acquire_vulkan_surface_image", surface.generation, surface.index))};
+    VkSurfaceCapabilitiesKHR native{};
+    if (vulkan::driver().getPhysicalDeviceSurfaceCapabilities(context.state.physicalDevice, slot.surface, &native) !=
+        VK_SUCCESS)
+        return Result<VernonRhiSurfaceImage, RhiError>{err(backendFailure("acquire_vulkan_surface_image"))};
+    const bool resized =
+        native.currentExtent.width != UINT32_MAX && (native.currentExtent.width != slot.configuration.width ||
+                                                     native.currentExtent.height != slot.configuration.height);
+    if (slot.stale || resized)
+        return Result<VernonRhiSurfaceImage, RhiError>{
+            err(RhiError{RhiErrorCode::SurfaceOutOfDate,
+                         {"acquire_vulkan_surface_image", native.currentExtent.width, native.currentExtent.height}})};
+    slot.acquired = true;
+    VernonRhiSurfaceImage acquired{};
+    acquired.image = slot.images[slot.next].image;
+    acquired.view = slot.images[slot.next].view;
+    return Result<VernonRhiSurfaceImage, RhiError>{ok(acquired)};
+}
+
+// A frame whose swapchain is out of date, or whose window is minimized, is dropped, and the surface goes stale.
+Result<void, RhiError> presentSurface(VernonRhiDevice handle, VernonRhiSurface surface, VernonRhiImage &released) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return invalidResult("present_vulkan_surface");
+    VulkanInteropDevice &context = device.value().device();
+    auto pinned = findAndPinVulkanSlot(context, context.surfaces, typedHandle<SurfaceResourceTag>(surface),
+                                       "present_vulkan_surface");
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    VulkanSurfaceSlot &slot = *pinned.value().slot;
+    std::lock_guard<std::mutex> slotGuard(slot.mutex);
+    if (!slot.acquired)
+        return invalidResult("present_vulkan_surface", surface.generation, surface.index);
+    const VulkanSurfaceImage presented = slot.images[slot.next];
+    released = presented.image;
+    slot.acquired = false;
+    slot.next = (slot.next + 1) % slot.images.size();
+    auto found = findVulkanSlot(context, context.images, typedHandle<ImageResourceTag>(presented.image),
+                                "present_vulkan_surface");
+    if (found.isErr())
+        return Result<void, RhiError>{err(std::move(found).error())};
+    VulkanImageSlot &image = *found.value();
+
+    std::lock_guard<std::mutex> guard(context.mutex);
+    const vulkan::Driver &api = vulkan::driver();
+    vulkan::DeviceState &state = context.state;
+    if ((!slot.swapchain || slot.stale) && !rebuildVulkanSwapchain(context, slot, context.error))
+        return backendResult("present_vulkan_surface");
+    if (!slot.swapchain)
+        return Result<void, RhiError>{ok()};
+    VulkanAcquireSemaphore &acquire = slot.acquires[slot.nextAcquire];
+    slot.nextAcquire = (slot.nextAcquire + 1) % slot.acquires.size();
+    if (acquire.serial && !state.waitForSerial(acquire.serial, context.error))
+        return backendResult("present_vulkan_surface");
+    acquire.serial = 0;
+    uint32_t index = 0;
+    const VkResult acquired =
+        api.acquireNextImage(state.device, slot.swapchain, UINT64_MAX, acquire.semaphore, VK_NULL_HANDLE, &index);
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        slot.stale = true;
+        return Result<void, RhiError>{ok()};
+    }
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+        context.error = "vkAcquireNextImageKHR failed with Vulkan error " + std::to_string(static_cast<int>(acquired));
+        return backendResult("present_vulkan_surface");
+    }
+    slot.stale = acquired == VK_SUBOPTIMAL_KHR;
+    // From here a failure leaves the acquire semaphore signaled with no wait; the rebuild that staleness causes
+    // replaces it.
+    VkCommandBuffer command{};
+    if (!state.beginCommands(command, context.error)) {
+        slot.stale = true;
+        return backendResult("present_vulkan_surface");
+    }
+    if (!transitionVulkanImage(state, command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, context.error)) {
+        state.abandonCommands(command);
+        slot.stale = true;
+        return backendResult("present_vulkan_surface");
+    }
+    const VkImage target = slot.swapchainImages[index];
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // The acquire semaphore's wait covers the transfer stage, which this barrier's source scope chains from.
+    api.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &barrier);
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffsets[1] = {static_cast<int32_t>(slot.configuration.width),
+                            static_cast<int32_t>(slot.configuration.height), 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffsets[1] = {static_cast<int32_t>(slot.swapchainExtent.width),
+                            static_cast<int32_t>(slot.swapchainExtent.height), 1};
+    const bool scaled = slot.swapchainExtent.width != slot.configuration.width ||
+                        slot.swapchainExtent.height != slot.configuration.height;
+    api.cmdBlitImage(command, image.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    api.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
+                           0, nullptr, 1, &barrier);
+    uint64_t serial = 0;
+    if (!state.submitCommands(command, serial, context.error,
+                              {acquire.semaphore, VK_PIPELINE_STAGE_TRANSFER_BIT, slot.presentReady[index]})) {
+        slot.stale = true;
+        return backendResult("present_vulkan_surface");
+    }
+    acquire.serial = serial;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &slot.presentReady[index];
+    present.swapchainCount = 1;
+    present.pSwapchains = &slot.swapchain;
+    present.pImageIndices = &index;
+    const VkResult shown = api.queuePresent(state.queue, &present);
+    if (shown == VK_ERROR_OUT_OF_DATE_KHR || shown == VK_SUBOPTIMAL_KHR) {
+        slot.stale = true;
+    } else if (shown != VK_SUCCESS) {
+        context.error = "vkQueuePresentKHR failed with Vulkan error " + std::to_string(static_cast<int>(shown));
+        return backendResult("present_vulkan_surface");
+    }
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> destroySurface(VernonRhiDevice handle, VernonRhiSurface surface) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return invalidResult("destroy_vulkan_surface", surface.generation, surface.index);
+    VulkanInteropDevice &context = device.value().device();
+    auto found =
+        findVulkanSlot(context, context.surfaces, typedHandle<SurfaceResourceTag>(surface), "destroy_vulkan_surface");
+    if (found.isErr())
+        return Result<void, RhiError>{err(std::move(found).error())};
+    std::lock_guard<std::mutex> slotGuard(found.value()->mutex);
+    if (found.value()->acquired)
+        return invalidResult("destroy_vulkan_surface", surface.generation, surface.index);
+    return found.value()->lifecycle.destroyPublic(typedHandle<SurfaceResourceTag>(surface));
+}
+
 constexpr uint32_t commandCapabilities = BackendCommandIndependentRecording | BackendCommandConcurrentSubmission;
 
 uint32_t commandCapabilitiesForDevice(VernonRhiDevice handle) {
@@ -3184,6 +3866,12 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         result.getImageViewNativeHandle.emplace(getImageViewNativeHandle);
         result.imageViewResource.emplace(imageViewResource);
         result.describeImageViewResource.emplace(describeImageViewResource);
+        result.createSurface.emplace(createSurface);
+        result.surfaceCapabilities.emplace(surfaceCapabilities);
+        result.configureSurface.emplace(configureSurface);
+        result.acquireSurfaceImage.emplace(acquireSurfaceImage);
+        result.presentSurface.emplace(presentSurface);
+        result.destroySurface.emplace(destroySurface);
         return result;
     }();
     return dispatch;
@@ -3200,4 +3888,54 @@ vernon::rhi::VulkanCacheStats vernon::rhi::getVulkanCacheStats(VernonRhiDevice h
         result.dynamicRendering = device->state.dynamicRendering;
     }
     return result;
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::vulkan::createBuffer(VernonRhiDevice device, uint64_t size,
+                                                                         uint32_t usage,
+                                                                         VernonRhiMemoryClass memoryClass,
+                                                                         Buffer &buffer) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice || size == 0 || memoryClass > VERNON_RHI_MEMORY_READBACK)
+        return Result<void, RhiError>{err(invalidResource("create_vulkan_buffer"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    if (!vulkan_api::createVulkanBuffer(vulkanDevice.value().device(), size, usage, memoryClass, buffer))
+        return Result<void, RhiError>{err(backendFailure("create_vulkan_buffer", size))};
+    return Result<void, RhiError>{ok()};
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::vulkan::uploadBuffer(VernonRhiDevice device, Buffer &buffer,
+                                                                         uint64_t size,
+                                                                         VernonRhiMemoryClass memoryClass,
+                                                                         const VernonRhiBufferUploadRange *ranges,
+                                                                         size_t rangeCount) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice || !buffer.buffer || !ranges || rangeCount == 0)
+        return Result<void, RhiError>{err(invalidResource("upload_vulkan_buffer"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    return vulkan_api::uploadVulkanBufferRanges(device, vulkanDevice.value().device(), buffer, size, memoryClass,
+                                                ranges, rangeCount);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::vulkan::downloadBuffer(VernonRhiDevice device, Buffer &buffer,
+                                                                           uint64_t size,
+                                                                           const VernonRhiBufferDownloadRange *ranges,
+                                                                           size_t rangeCount) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice || !buffer.buffer || !ranges || rangeCount == 0)
+        return Result<void, RhiError>{err(invalidResource("download_vulkan_buffer"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    return vulkan_api::downloadVulkanBufferRanges(vulkanDevice.value().device(), buffer, size, ranges, rangeCount);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::vulkan::destroyBuffer(VernonRhiDevice device,
+                                                                          Buffer &buffer) noexcept {
+    auto vulkanDevice = lookupVulkanDevice(device);
+    if (!vulkanDevice)
+        return Result<void, RhiError>{err(invalidResource("destroy_vulkan_buffer"))};
+    std::lock_guard<std::mutex> guard(vulkanDevice->mutex);
+    DeviceState::DeferredDestruction destruction;
+    destruction.buffer = buffer;
+    vulkanDevice->state.destroyAfterSubmittedWork(std::move(destruction));
+    buffer = {};
+    return Result<void, RhiError>{ok()};
 }

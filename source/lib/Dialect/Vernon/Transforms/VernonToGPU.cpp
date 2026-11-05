@@ -22,6 +22,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <limits>
 
@@ -663,21 +664,92 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
             }
 
-            for (Operation &operation : source.front()) {
-                if (isa<func::ReturnOp>(operation)) {
-                    gpu::ReturnOp::create(bodyBuilder, operation.getLoc());
-                    continue;
+            // A TensorView's strides are kernel parameters, so every access multiplies by them. On CUDA the body is
+            // emitted twice under a uniform branch on whether every innermost stride is 1, and the first copy reads
+            // those strides as the constant 1. Both copies compute the same addresses. Kernels with barriers,
+            // workgroup storage or workgroup reductions keep one copy: their lowering assumes the body is the
+            // function's, and a second copy would reserve the workgroup storage twice.
+            SmallVector<int64_t> unitStrideMembers;
+            if (unitStrideVersions && !useSpirvStorage && metadataKernelIndex && metadataSourceIndex) {
+                bool versionable = true;
+                source.walk([&](Operation *operation) {
+                    if (isa<BarrierOp, WorkgroupAllocOp>(operation) ||
+                        (isa<ReduceSumOp>(operation) && operation->hasAttr(kAccumulationStrategyAttrName)))
+                        versionable = false;
+                });
+                for (const SemanticMetadataField &field : (*semanticMetadata)->getFields()) {
+                    if (!versionable || field.identity.kind != MetadataFieldKind::Stride || !field.identity.dimension ||
+                        field.identity.argumentIndex >= source.getNumArguments())
+                        continue;
+                    auto view = dyn_cast<TensorViewType>(source.getArgumentTypes()[field.identity.argumentIndex]);
+                    if (view && *field.identity.dimension + 1 == view.getShape().size())
+                        unitStrideMembers.push_back(field.ordinal);
                 }
-                if (auto reduce = dyn_cast<ReduceSumOp>(operation);
-                    reduce && reduce->hasAttr(kAccumulationStrategyAttrName)) {
-                    if (failed(lowerWorkgroupReduction(reduce, bodyBuilder, mapping, useSpirvWorkgroupReduction)))
-                        return signalPassFailure();
-                    continue;
+            }
+            scf::IfOp unitStrides;
+            if (!unitStrideMembers.empty()) {
+                Value carrier = entry->getArgument(*metadataKernelIndex);
+                auto carrierType = cast<TupleType>(carrier.getType());
+                Value allUnit;
+                for (int64_t member : unitStrideMembers) {
+                    OperationState state(source.getLoc(), TupleGetOp::getOperationName());
+                    state.addOperands(carrier);
+                    state.addTypes(carrierType.getType(member));
+                    state.addAttribute("index", bodyBuilder.getI64IntegerAttr(member));
+                    Value stride = bodyBuilder.create(state)->getResult(0);
+                    Value one = arith::ConstantOp::create(bodyBuilder, source.getLoc(),
+                                                          bodyBuilder.getIntegerAttr(stride.getType(), 1));
+                    Value unit =
+                        arith::CmpIOp::create(bodyBuilder, source.getLoc(), arith::CmpIPredicate::eq, stride, one);
+                    allUnit = allUnit ? arith::AndIOp::create(bodyBuilder, source.getLoc(), allUnit, unit) : unit;
                 }
-                bodyBuilder.clone(operation, mapping);
+                unitStrides = scf::IfOp::create(bodyBuilder, source.getLoc(), allUnit, /*withElseRegion=*/true);
+                for (Region *region : {&unitStrides.getThenRegion(), &unitStrides.getElseRegion()}) {
+                    OpBuilder branchBuilder = OpBuilder::atBlockTerminator(&region->front());
+                    IRMapping branchMapping = mapping;
+                    for (Operation &operation : source.front())
+                        if (!isa<func::ReturnOp>(operation))
+                            branchBuilder.clone(operation, branchMapping);
+                }
+                gpu::ReturnOp::create(bodyBuilder, source.getLoc());
+            } else {
+                for (Operation &operation : source.front()) {
+                    if (isa<func::ReturnOp>(operation)) {
+                        gpu::ReturnOp::create(bodyBuilder, operation.getLoc());
+                        continue;
+                    }
+                    if (auto reduce = dyn_cast<ReduceSumOp>(operation);
+                        reduce && reduce->hasAttr(kAccumulationStrategyAttrName)) {
+                        if (failed(lowerWorkgroupReduction(reduce, bodyBuilder, mapping, useSpirvWorkgroupReduction)))
+                            return signalPassFailure();
+                        continue;
+                    }
+                    bodyBuilder.clone(operation, mapping);
+                }
             }
             if (failed(materializeTensorViewProjections(kernel)))
                 return signalPassFailure();
+            if (unitStrides) {
+                const llvm::DenseSet<int64_t> members(unitStrideMembers.begin(), unitStrideMembers.end());
+                SmallVector<TupleGetOp> unitReads;
+                unitStrides.getThenRegion().walk([&](TupleGetOp read) {
+                    auto input = dyn_cast<BlockArgument>(read.getInput());
+                    if (input && input.getOwner() == &kernel.front() && input.getArgNumber() == *metadataKernelIndex &&
+                        members.contains(read.getIndex()))
+                        unitReads.push_back(read);
+                });
+                for (TupleGetOp read : unitReads) {
+                    OpBuilder readBuilder(read);
+                    Type type = read.getResult().getType();
+                    Value one =
+                        type.isIndex()
+                            ? arith::ConstantIndexOp::create(readBuilder, read.getLoc(), 1).getResult()
+                            : arith::ConstantOp::create(readBuilder, read.getLoc(), readBuilder.getIntegerAttr(type, 1))
+                                  .getResult();
+                    read.getResult().replaceAllUsesWith(one);
+                    read.erase();
+                }
+            }
             SmallVector<TupleGetOp> nestedMetadataReads;
             kernel.walk([&](TupleGetOp read) {
                 auto input = dyn_cast<BlockArgument>(read.getInput());
@@ -820,6 +892,10 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
     Option<bool> useSpirvWorkgroupReduction{
         *this, "use-spirv-workgroup-reduction",
         llvm::cl::desc("Lower workgroup reductions to explicit SPIR-V shared-memory trees"), llvm::cl::init(false)};
+    Option<bool> unitStrideVersions{
+        *this, "unit-stride-versions",
+        llvm::cl::desc("On CUDA, add a copy of each kernel body that reads innermost TensorView strides as 1"),
+        llvm::cl::init(true)};
 };
 
 } // namespace

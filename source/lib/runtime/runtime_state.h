@@ -3,10 +3,11 @@
 
 #include "VernonLifecycle.hpp"
 #include "VernonRuntime.h"
-#include "program_execution/submission_queue.h"
-#include "program_execution/submission_record.h"
+#include "autodiff/autodiff_metadata.h"
 #include "program_execution_manifest.h"
 #include "runtime_lifecycle.h"
+
+#include <nlohmann/json_fwd.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -24,15 +25,13 @@
 #include <variant>
 #include <vector>
 
-namespace vernon::runtime::ad {
-class CanonicalProgramExecution;
-class AutodiffMemoryPolicy;
-size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &policy);
-} // namespace vernon::runtime::ad
 namespace vernon::runtime::program {
 struct ResolvedProgram;
 struct ResolvedExecutionPlan;
 } // namespace vernon::runtime::program
+namespace vernon::hal {
+class Device;
+} // namespace vernon::hal
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
     [[nodiscard]] static vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError> create() noexcept {
@@ -64,13 +63,13 @@ struct VernonRuntimeContext {
     void (*destroyBackendState)(void *){};
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     vernon::Option<vernon::ChildLease> rhiDeviceLease;
-    mutable std::mutex autodiffMemoryPolicyMutex;
-    std::shared_ptr<vernon::runtime::ad::AutodiffMemoryPolicy> autodiffMemoryPolicy;
     std::mutex cpuEntriesMutex;
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
     std::mutex referencedRhiBuffersMutex;
     std::map<std::pair<uint64_t, uint64_t>, VernonRhiBuffer> referencedRhiBuffers;
-    vernon::runtime::program_execution::SubmissionQueue submissions;
+    // The HAL device linked schedules record on, created by the first one; it shares the backend's CPU scheduler.
+    std::mutex halDeviceMutex;
+    std::shared_ptr<vernon::hal::Device> halDevice;
 };
 
 namespace vernon::runtime {
@@ -99,18 +98,6 @@ private:
 };
 
 } // namespace vernon::runtime
-
-struct VernonSubmission {
-    VernonSubmission(VernonRuntimeContext &runtime,
-                     std::shared_ptr<vernon::runtime::program_execution::SubmissionRecord> submitted) noexcept
-        : context(&runtime), record(std::move(submitted)) {}
-
-    vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
-    VernonRuntimeContext *context;
-    // Shared with the context's submission queue, which only observes it. State queries take a const submission
-    // but retire its finished work.
-    std::shared_ptr<vernon::runtime::program_execution::SubmissionRecord> record;
-};
 
 template <typename State, typename Handle> State &runtimeBackendState(Handle &handle) {
     return *static_cast<State *>(handle.backendState);
@@ -162,6 +149,8 @@ struct ProgramSpecialization {
 struct ProgramVariantDeployment {
     std::vector<ProgramSpecialization> key;
     program::Program program;
+    // The variant's `program` JSON, from which a linked schedule builds its fragments.
+    std::shared_ptr<const nlohmann::json> source;
     program::ArtifactSystem artifactSystem;
 };
 
@@ -180,17 +169,33 @@ struct VernonProgramBundle {
 };
 
 struct CanonicalProgramAutodiffState {
-    std::shared_ptr<vernon::runtime::ad::CanonicalProgramExecution> canonicalExecution;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
 };
 
 struct VernonProgramExecutable;
 struct RuntimeGraphicsPipelineState;
 
-struct ProgramGraphNodeAutodiffState {
-    std::shared_ptr<VernonProgramExecutable> executable;
-    std::vector<uint32_t> globalValues;
-    std::vector<uint32_t> globalStorages;
+// A composed Program graph as the CPU and CUDA link it: one schedule node per Program node, in run order.
+struct ProgramGraphComposition {
+    // A boundary slot of a node's own Program, by the node's index in `nodes`.
+    struct Site {
+        uint32_t node{};
+        uint32_t slot{};
+    };
+    struct Connection {
+        // A Value edge's source then its destinations, or a Storage chain's versions in order.
+        std::vector<Site> sites;
+        bool storage{};
+    };
+    struct Export {
+        Site site;
+        // The composed executable's boundary slot.
+        uint32_t boundary{};
+    };
+
+    std::vector<std::shared_ptr<VernonProgramExecutable>> nodes;
+    std::vector<Connection> connections;
+    std::vector<Export> exports;
 };
 
 struct VernonProgramExecutable {
@@ -212,9 +217,11 @@ struct VernonProgramExecutable {
     std::vector<uint32_t> publicParameterSlots;
     std::unordered_set<uint32_t> bindableParameterSlots;
     std::unordered_map<uint64_t, std::vector<uint32_t>> bindingAliases;
-    std::unordered_set<uint64_t> graphicsControlKeys;
-    std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> programGraphNodeAutodiff;
     CanonicalProgramAutodiffState programAutodiff;
+    // The `program` JSON of a bundle variant's executable; null for a composed graph, which links per node.
+    std::shared_ptr<const nlohmann::json> programSource;
+    // Set for a composed graph resolved on the CPU or CUDA.
+    std::shared_ptr<const ProgramGraphComposition> composition;
     // Pipeline 0 of each recorded graphics Node. The states hold no lease on this executable, so every handle,
     // binding set, or recording that keeps one alive must itself keep this executable alive.
     std::mutex passPipelineMutex;

@@ -15,11 +15,6 @@
 static VernonStatus registered_stub(const VernonCpuInvocation *) { return VERNON_STATUS_OK; }
 static VernonStatus other_image_stub(const VernonCpuInvocation *) { return VERNON_STATUS_INTERNAL_ERROR; }
 
-TEST(RuntimeCApi, PullbackOpaqueHandleRejectsInvalidCalls) {
-    EXPECT_EQ(vernonProgramPullbackApply(nullptr, nullptr, 0, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
-    vernonProgramPullbackDestroy(nullptr);
-}
-
 TEST(RuntimeCApi, StaticCpuRegistrationValidatesIdentity) {
     static const char static_symbol[] = "__vernon_cpu_test_fill";
     const VernonStaticCpuEntry entry{{static_symbol, sizeof(static_symbol) - 1}, registered_stub};

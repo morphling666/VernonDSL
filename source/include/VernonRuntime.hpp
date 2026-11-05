@@ -6,10 +6,8 @@
 
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <new>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -42,51 +40,6 @@ namespace detail {
     return {RuntimeErrorCode::ResourceExhausted, {operation}};
 }
 } // namespace detail
-
-struct Float16 {
-    uint16_t bits{};
-};
-
-class Pullback {
-public:
-    Pullback() = default;
-    explicit Pullback(VernonPullback *handle) : handle_(handle) {}
-    Pullback(const Pullback &) = delete;
-    Pullback &operator=(const Pullback &) = delete;
-    Pullback(Pullback &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
-    Pullback &operator=(Pullback &&other) noexcept {
-        if (this != &other) {
-            vernonProgramPullbackDestroy(handle_);
-            handle_ = std::exchange(other.handle_, nullptr);
-        }
-        return *this;
-    }
-    ~Pullback() { vernonProgramPullbackDestroy(handle_); }
-
-    [[nodiscard]] Result<void, RuntimeError> apply(const VernonProgramArgument *arguments, size_t argumentCount,
-                                                   uint64_t maximumTemporaryBytes) const noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramPullback.apply"))};
-        const VernonPullbackApplyOptions options{
-            sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, maximumTemporaryBytes, {}};
-        const VernonStatus status =
-            vernonProgramPullbackApplyWithOptions(handle_, arguments, argumentCount, &options, nullptr);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramPullback.apply"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> apply(const VernonProgramArgument *arguments,
-                                                   size_t argumentCount) const noexcept {
-        return apply(arguments, argumentCount, std::numeric_limits<uint64_t>::max());
-    }
-
-    explicit operator bool() const noexcept { return handle_ != nullptr; }
-    VernonPullback *get() const noexcept { return handle_; }
-
-private:
-    VernonPullback *handle_{};
-};
 
 class ProgramExecutable;
 
@@ -226,7 +179,6 @@ struct ProgramGraphStorage {
 };
 
 class ProgramGraph;
-class ProgramInvocation;
 namespace detail {
 struct ProgramGraphState {
     explicit ProgramGraphState(VernonProgramGraph *value) noexcept : handle(value) {}
@@ -247,7 +199,6 @@ private:
     std::shared_ptr<detail::ProgramGraphState> owner_;
     VernonProgramNodeId id_{};
     friend class ProgramGraph;
-    friend class ProgramInvocation;
 };
 
 using ProgramNodeHandle = ProgramNode;
@@ -277,7 +228,6 @@ private:
     std::shared_ptr<VernonProgramExecutable> handle_;
     std::shared_ptr<detail::ProgramGraphState> graphOwner_;
     friend class ProgramAsset;
-    friend class ProgramInstance;
     friend class ProgramGraph;
 };
 
@@ -477,289 +427,6 @@ inline Result<ProgramNodeBinding, RuntimeError> ProgramNode::boundary(VernonProg
         return Result<ProgramNodeBinding, RuntimeError>{err(detail::runtimeError(status, "ProgramNode.boundary"))};
     return Result<ProgramNodeBinding, RuntimeError>{ok(result)};
 }
-
-struct ProgramInvocationOptions {
-    VernonCompletionMode completionMode{VERNON_COMPLETION_WAIT};
-    bool timings{};
-};
-
-class Submission {
-public:
-    Submission() = default;
-    explicit Submission(VernonSubmission *handle) noexcept : handle_(handle) {}
-    Submission(const Submission &) = delete;
-    Submission &operator=(const Submission &) = delete;
-    Submission(Submission &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
-    Submission &operator=(Submission &&other) noexcept {
-        if (this != &other) {
-            vernonSubmissionDestroy(handle_);
-            handle_ = std::exchange(other.handle_, nullptr);
-        }
-        return *this;
-    }
-    ~Submission() { vernonSubmissionDestroy(handle_); }
-
-    [[nodiscard]] Result<VernonSubmissionState, RuntimeError> state() const noexcept {
-        if (!handle_)
-            return Result<VernonSubmissionState, RuntimeError>{err(detail::invalidArgument("Submission.state"))};
-        VernonSubmissionState state = VERNON_SUBMISSION_PENDING;
-        const VernonStatus status = vernonSubmissionGetState(handle_, &state);
-        if (status != VERNON_STATUS_OK)
-            return Result<VernonSubmissionState, RuntimeError>{err(detail::runtimeError(status, "Submission.state"))};
-        return Result<VernonSubmissionState, RuntimeError>{ok(state)};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> wait() noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("Submission.wait"))};
-        const VernonStatus status = vernonSubmissionWait(handle_);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "Submission.wait"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<std::vector<VernonScopeTiming>, RuntimeError> scopeTimings() const noexcept {
-        using Timings = Result<std::vector<VernonScopeTiming>, RuntimeError>;
-        if (!handle_)
-            return Timings{err(detail::invalidArgument("Submission.scopeTimings"))};
-        size_t count = 0;
-        VernonStatus status = vernonSubmissionGetScopeTimings(handle_, nullptr, 0, &count);
-        if (status != VERNON_STATUS_OK)
-            return Timings{err(detail::runtimeError(status, "Submission.scopeTimings"))};
-        try {
-            std::vector<VernonScopeTiming> scopes(count);
-            status = vernonSubmissionGetScopeTimings(handle_, scopes.data(), scopes.size(), &count);
-            if (status != VERNON_STATUS_OK)
-                return Timings{err(detail::runtimeError(status, "Submission.scopeTimings"))};
-            return Timings{ok(std::move(scopes))};
-        } catch (const std::bad_alloc &) {
-            return Timings{err(detail::resourceExhausted("Submission.scopeTimings"))};
-        }
-    }
-
-    VernonSubmission *get() const noexcept { return handle_; }
-
-private:
-    VernonSubmission *handle_{};
-};
-
-class ProgramInvocation {
-public:
-    ProgramInvocation() = default;
-    explicit ProgramInvocation(VernonProgramInvocation *handle,
-                               std::shared_ptr<detail::ProgramGraphState> graphOwner = {})
-        : handle_(handle), graphOwner_(std::move(graphOwner)) {}
-    ProgramInvocation(const ProgramInvocation &) = delete;
-    ProgramInvocation &operator=(const ProgramInvocation &) = delete;
-    ProgramInvocation(ProgramInvocation &&other) noexcept
-        : handle_(std::exchange(other.handle_, nullptr)), graphOwner_(std::move(other.graphOwner_)) {}
-    ProgramInvocation &operator=(ProgramInvocation &&other) noexcept {
-        if (this != &other) {
-            vernonRuntimeProgramInvocationDestroy(handle_);
-            handle_ = std::exchange(other.handle_, nullptr);
-            graphOwner_ = std::move(other.graphOwner_);
-        }
-        return *this;
-    }
-    ~ProgramInvocation() { vernonRuntimeProgramInvocationDestroy(handle_); }
-
-    [[nodiscard]] Result<void, RuntimeError> bind(const VernonProgramBindingToken &token,
-                                                  const VernonProgramArgument &argument,
-                                                  const VernonProgramResourceLease *lease = nullptr,
-                                                  uint64_t uploadBytes = 0, uint64_t uploadRanges = 0) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.bind"))};
-        const VernonStatus status =
-            vernonRuntimeProgramInvocationBind(handle_, &token, &argument, lease, uploadBytes, uploadRanges);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.bind"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> bindRenderPass(uint32_t slot, const VernonProgramBindingToken &token,
-                                                            const VernonRenderPass &renderPass,
-                                                            const VernonProgramResourceLease *leases = nullptr,
-                                                            size_t leaseCount = 0) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.bindRenderPass"))};
-        const VernonStatus status =
-            vernonRuntimeProgramInvocationBindRenderPass(handle_, slot, &token, &renderPass, leases, leaseCount);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.bindRenderPass"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError>
-    bindDrawCommand(uint32_t slot, const VernonProgramBindingToken &token, const VernonDrawCommand &draw,
-                    const VernonProgramResourceLease *lease = nullptr) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.bindDrawCommand"))};
-        const VernonStatus status = vernonRuntimeProgramInvocationBindDrawCommand(handle_, slot, &token, &draw, lease);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.bindDrawCommand"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> bindDynamicState(uint32_t slot, const VernonProgramBindingToken &token,
-                                                              const VernonDynamicState &dynamicState) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.bindDynamicState"))};
-        const VernonStatus status =
-            vernonRuntimeProgramInvocationBindDynamicState(handle_, slot, &token, &dynamicState);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.bindDynamicState"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> setAutodiffOptions(const std::optional<uint64_t> &checkpointMemoryBudget,
-                                                                std::string_view checkpointPolicy) noexcept {
-        VernonProgramAutodiffInvocationOptions options{};
-        options.struct_size = sizeof(options);
-        options.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
-        options.has_checkpoint_memory_budget = checkpointMemoryBudget.has_value();
-        options.checkpoint_memory_budget = checkpointMemoryBudget.value_or(0);
-        options.checkpoint_policy = {checkpointPolicy.data(), checkpointPolicy.size()};
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.setAutodiffOptions"))};
-        const VernonStatus status = vernonRuntimeProgramInvocationSetAutodiffOptions(handle_, &options);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{
-                err(detail::runtimeError(status, "ProgramInvocation.setAutodiffOptions"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> setOptions(const ProgramInvocationOptions &invocationOptions) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.setOptions"))};
-        const VernonProgramInvocationOptions options{sizeof(VernonProgramInvocationOptions),
-                                                     VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION,
-                                                     invocationOptions.completionMode,
-                                                     invocationOptions.timings ? 1u : 0u,
-                                                     {}};
-        const VernonStatus status = vernonRuntimeProgramInvocationSetOptions(handle_, &options);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.setOptions"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<Submission, RuntimeError> takeSubmission() noexcept {
-        if (!handle_)
-            return Result<Submission, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.takeSubmission"))};
-        VernonSubmission *submission = nullptr;
-        const VernonStatus status = vernonRuntimeProgramInvocationTakeSubmission(handle_, &submission);
-        if (status != VERNON_STATUS_OK)
-            return Result<Submission, RuntimeError>{
-                err(detail::runtimeError(status, "ProgramInvocation.takeSubmission"))};
-        return Result<Submission, RuntimeError>{ok(Submission(submission))};
-    }
-
-    [[nodiscard]] Result<void, RuntimeError> execute(bool retainPullback = true) noexcept {
-        if (!handle_)
-            return Result<void, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.execute"))};
-        const VernonStatus status = vernonRuntimeProgramInvocationExecute(handle_, retainPullback, nullptr);
-        if (status != VERNON_STATUS_OK)
-            return Result<void, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.execute"))};
-        return Result<void, RuntimeError>{ok()};
-    }
-
-    [[nodiscard]] Result<Pullback, RuntimeError> commit() noexcept {
-        if (!handle_)
-            return Result<Pullback, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.commit"))};
-        VernonPullback *pullback = nullptr;
-        const VernonStatus status = vernonRuntimeProgramInvocationCommit(handle_, &pullback);
-        if (status != VERNON_STATUS_OK)
-            return Result<Pullback, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.commit"))};
-        return Result<Pullback, RuntimeError>{ok(Pullback(pullback))};
-    }
-
-    [[nodiscard]] Result<Pullback, RuntimeError> pullback(const ProgramNodeHandle &node) noexcept {
-        if (!handle_)
-            return Result<Pullback, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.pullback"))};
-        if (!graphOwner_ || graphOwner_ != node.owner_)
-            return Result<Pullback, RuntimeError>{err(detail::invalidArgument("ProgramInvocation.pullback"))};
-        VernonPullback *pullback = nullptr;
-        const VernonStatus status = vernonRuntimeProgramInvocationGetNodePullback(handle_, node.id(), &pullback);
-        if (status != VERNON_STATUS_OK)
-            return Result<Pullback, RuntimeError>{err(detail::runtimeError(status, "ProgramInvocation.pullback"))};
-        return Result<Pullback, RuntimeError>{ok(Pullback(pullback))};
-    }
-
-    void rollback() {
-        if (handle_)
-            vernonRuntimeProgramInvocationRollback(handle_);
-    }
-
-    VernonProgramInvocation *get() const noexcept { return handle_; }
-
-private:
-    VernonProgramInvocation *handle_{};
-    std::shared_ptr<detail::ProgramGraphState> graphOwner_;
-};
-
-class ProgramInstance {
-public:
-    [[nodiscard]] static Result<ProgramInstance, RuntimeError> create(const ProgramExecutable &executable) noexcept {
-        if (!executable.handle_)
-            return Result<ProgramInstance, RuntimeError>{err(detail::invalidArgument("ProgramInstance.create"))};
-        VernonProgramInstance *handle = nullptr;
-        const VernonRuntimeOperationStatus status =
-            vernonRuntimeProgramInstanceCreateResult(executable.handle_.get(), &handle);
-        if (status != VERNON_RUNTIME_OPERATION_OK)
-            return Result<ProgramInstance, RuntimeError>{err(detail::runtimeError(status, "ProgramInstance.create"))};
-        return Result<ProgramInstance, RuntimeError>{
-            ok(ProgramInstance(executable.handle_, executable.graphOwner_, handle))};
-    }
-    ProgramInstance(const ProgramInstance &) = delete;
-    ProgramInstance &operator=(const ProgramInstance &) = delete;
-    ProgramInstance(ProgramInstance &&other) noexcept
-        : executable_(std::move(other.executable_)), graphOwner_(std::move(other.graphOwner_)),
-          handle_(std::exchange(other.handle_, nullptr)) {}
-    ProgramInstance &operator=(ProgramInstance &&other) noexcept {
-        if (this != &other) {
-            vernonRuntimeProgramInstanceDestroy(handle_);
-            executable_ = std::move(other.executable_);
-            graphOwner_ = std::move(other.graphOwner_);
-            handle_ = std::exchange(other.handle_, nullptr);
-        }
-        return *this;
-    }
-    ~ProgramInstance() { vernonRuntimeProgramInstanceDestroy(handle_); }
-
-    [[nodiscard]] Result<ProgramInvocation, RuntimeError> begin() noexcept {
-        if (!handle_)
-            return Result<ProgramInvocation, RuntimeError>{err(detail::invalidArgument("ProgramInstance.begin"))};
-        VernonProgramInvocation *invocation = nullptr;
-        const VernonRuntimeOperationStatus status =
-            vernonRuntimeProgramInstanceBeginInvocationResult(handle_, &invocation);
-        if (status != VERNON_RUNTIME_OPERATION_OK)
-            return Result<ProgramInvocation, RuntimeError>{err(detail::runtimeError(status, "ProgramInstance.begin"))};
-        return Result<ProgramInvocation, RuntimeError>{ok(ProgramInvocation(invocation, graphOwner_))};
-    }
-
-    [[nodiscard]] Result<VernonProgramBindingTelemetry, RuntimeError> telemetry() const noexcept {
-        if (!handle_)
-            return Result<VernonProgramBindingTelemetry, RuntimeError>{
-                err(detail::invalidArgument("ProgramInstance.telemetry"))};
-        VernonProgramBindingTelemetry result{};
-        result.struct_size = sizeof(result);
-        const VernonStatus status = vernonRuntimeProgramInstanceGetTelemetry(handle_, &result);
-        if (status != VERNON_STATUS_OK)
-            return Result<VernonProgramBindingTelemetry, RuntimeError>{
-                err(detail::runtimeError(status, "ProgramInstance.telemetry"))};
-        return Result<VernonProgramBindingTelemetry, RuntimeError>{ok(result)};
-    }
-
-    VernonProgramInstance *get() const noexcept { return handle_; }
-
-private:
-    ProgramInstance(std::shared_ptr<VernonProgramExecutable> executable,
-                    std::shared_ptr<detail::ProgramGraphState> graphOwner, VernonProgramInstance *handle)
-        : executable_(std::move(executable)), graphOwner_(std::move(graphOwner)), handle_(handle) {}
-
-    std::shared_ptr<VernonProgramExecutable> executable_;
-    std::shared_ptr<detail::ProgramGraphState> graphOwner_;
-    VernonProgramInstance *handle_{};
-};
 
 } // namespace vernon::runtime
 

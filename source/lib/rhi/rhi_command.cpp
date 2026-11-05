@@ -15,6 +15,7 @@
 #include <mutex>
 #include <new>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -102,7 +103,13 @@ struct EncoderSlot {
     std::vector<Cleanup> rollbacks;
     std::unordered_set<ActionIdentity, ActionIdentityHash> cleanupIdentities;
     std::unordered_set<ActionIdentity, ActionIdentityHash> rollbackIdentities;
-    std::unordered_set<RetainedResource, RetainedResourceHash> retainedResourceIdentities;
+    // A retained resource's lease in `retainedResourceLeases`, and its native object once resolved, which the lease
+    // keeps valid.
+    struct RetainedEntry {
+        size_t lease{};
+        uint64_t native{};
+    };
+    std::unordered_map<RetainedResource, RetainedEntry, RetainedResourceHash> retainedResourceIdentities;
     std::vector<vernon::rhi::RetainedRhiResourceLease> retainedResourceLeases;
     std::unordered_set<RetainedResource, RetainedResourceHash> pendingWriteResources;
     // Image keys this encoder writes while their contents are undefined on the device. Its own later reads of them
@@ -319,6 +326,39 @@ bool imageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept 
     return commandDeviceState(stateRef).imageUndefined(imageKey);
 }
 
+void forgetUndefinedImages(VernonRhiDevice device, const uint64_t *imageKeys, size_t count) noexcept {
+    if (count == 0)
+        return;
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return;
+    auto stateRef = std::move(retained).value();
+    auto &state = commandDeviceState(stateRef);
+    std::lock_guard<std::mutex> guard(state.undefinedImageMutex);
+    if (state.undefinedImages.empty())
+        return;
+    for (size_t index = 0; index < count; ++index)
+        state.undefinedImages.erase(
+            std::remove(state.undefinedImages.begin(), state.undefinedImages.end(), imageKeys[index]),
+            state.undefinedImages.end());
+}
+
+bool anyImageContentsUndefined(VernonRhiDevice device, const uint64_t *imageKeys, size_t count) noexcept {
+    if (count == 0)
+        return false;
+    auto retained = commandState(device);
+    if (retained.isErr())
+        return false;
+    auto stateRef = std::move(retained).value();
+    auto &state = commandDeviceState(stateRef);
+    std::lock_guard<std::mutex> guard(state.undefinedImageMutex);
+    for (size_t index = 0; index < count; ++index)
+        if (std::find(state.undefinedImages.begin(), state.undefinedImages.end(), imageKeys[index]) !=
+            state.undefinedImages.end())
+            return true;
+    return false;
+}
+
 } // namespace vernon::rhi
 
 namespace {
@@ -504,8 +544,9 @@ vernon::Result<void, vernon::RhiError> rollbackRetainedResources(VernonRhiDevice
         bool foundIdentity = false;
         for (auto identity = slot.retainedResourceIdentities.begin(); identity != slot.retainedResourceIdentities.end();
              ++identity)
-            if (storedLease.authorizes(device.index, device.generation, static_cast<uint32_t>(identity->kind),
-                                       identity->key)) {
+            if (identity->second.lease == slot.retainedResourceLeases.size() - 1 &&
+                storedLease.authorizes(device.index, device.generation, static_cast<uint32_t>(identity->first.kind),
+                                       identity->first.key)) {
                 foundIdentity = true;
                 auto identityNode = slot.retainedResourceIdentities.extract(identity);
                 auto lease = std::move(storedLease);
@@ -1348,84 +1389,115 @@ renderingReadSubresources(VernonRhiDevice device, const vernon::rhi::RenderingRe
         read.key, 0, image.mip_levels, 0, image.array_layers, vernon::formats::aspects(image.format)})};
 }
 
+vernon::Result<vernon::rhi::PreparedRendering, vernon::RhiError>
+vernon::rhi::prepareRendering(VernonRhiDevice device, const RenderingScope &scope, const RenderingRead *reads,
+                              size_t readCount) noexcept {
+    const auto invalid = [] {
+        return Result<PreparedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"begin_rendering", 0, 0}})};
+    };
+    if (!validRenderingScope(scope) || (readCount && !reads))
+        return invalid();
+    try {
+        PreparedRendering prepared;
+        prepared.scope = scope;
+        RenderingScope &prepping = prepared.scope;
+        std::array<RenderingSubresources, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> attachments{};
+        std::array<bool, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> preserves{};
+        size_t attachmentCount = 0;
+        for (size_t index = 0; index < prepping.colorCount; ++index) {
+            auto attachment =
+                renderingAttachment(device, prepping.colors[index].view, prepping, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+            if (attachment.isErr())
+                return Result<PreparedRendering, RhiError>{err(std::move(attachment).error())};
+            prepping.colors[index].format = attachment.value().format;
+            preserves[attachmentCount] = prepping.colors[index].load == VERNON_RHI_LOAD_PRESERVE;
+            attachments[attachmentCount++] = attachment.value().subresources;
+        }
+        if (prepping.hasDepth) {
+            auto attachment =
+                renderingAttachment(device, prepping.depth.view, prepping, VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+            if (attachment.isErr())
+                return Result<PreparedRendering, RhiError>{err(std::move(attachment).error())};
+            prepping.depth.format = attachment.value().format;
+            prepping.depth.stencil = vernon::formats::hasStencil(prepping.depth.format);
+            if (!prepping.depth.stencil && prepping.depth.stencilLoad == VERNON_RHI_LOAD_CLEAR)
+                return invalid();
+            preserves[attachmentCount] =
+                prepping.depth.depthLoad == VERNON_RHI_LOAD_PRESERVE ||
+                (prepping.depth.stencil && prepping.depth.stencilLoad == VERNON_RHI_LOAD_PRESERVE);
+            attachments[attachmentCount++] = attachment.value().subresources;
+        }
+        prepared.attachmentImages.reserve(attachmentCount);
+        prepared.readImages.reserve(attachmentCount + readCount);
+        for (size_t index = 0; index < attachmentCount; ++index) {
+            prepared.attachmentImages.push_back(attachments[index].image);
+            if (preserves[index])
+                prepared.readImages.push_back(attachments[index].image);
+        }
+        for (size_t index = 0; index < readCount; ++index) {
+            auto read = renderingReadSubresources(device, reads[index]);
+            if (read.isErr())
+                return Result<PreparedRendering, RhiError>{err(std::move(read).error())};
+            prepared.readImages.push_back(read.value().image);
+            for (size_t attachment = 0; attachment < attachmentCount; ++attachment)
+                if (renderingSubresourcesOverlap(attachments[attachment], read.value()))
+                    return invalid();
+        }
+        prepared.reads.assign(reads, reads + readCount);
+        return Result<PreparedRendering, RhiError>{ok(std::move(prepared))};
+    } catch (const std::bad_alloc &) {
+        return Result<PreparedRendering, RhiError>{
+            err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", 0, 0}})};
+    }
+}
+
+vernon::Result<void, vernon::RhiError>
+vernon::rhi::beginPreparedEncoderRendering(VernonRhiDevice device, uint64_t key, const PreparedRendering &prepared,
+                                           const RenderingScope &clears) noexcept {
+    const auto invalid = [key] {
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"begin_rendering", key, 0}})};
+    };
+    if (clears.colorCount != prepared.scope.colorCount || clears.hasDepth != prepared.scope.hasDepth ||
+        (clears.hasDepth && (clears.depth.clearDepth < 0.0f || clears.depth.clearDepth > 1.0f)))
+        return invalid();
+    auto slot = lookupKey(device, key);
+    if (!slot)
+        return invalid();
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+        return invalid();
+    for (const uint64_t image : prepared.readImages)
+        if (encoderSeesUndefinedImage(*slot.slot, image))
+            return invalid();
+    try {
+        slot->renderingReads.assign(prepared.reads.begin(), prepared.reads.end());
+        slot->definedImages.reserve(slot->definedImages.size() + prepared.attachmentImages.size());
+    } catch (const std::bad_alloc &) {
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
+    }
+    for (const uint64_t image : prepared.attachmentImages)
+        recordDefinedImage(*slot.slot, image);
+    slot->scope = prepared.scope;
+    for (size_t index = 0; index < clears.colorCount; ++index)
+        slot->scope.colors[index].clear = clears.colors[index].clear;
+    slot->scope.depth.clearDepth = clears.depth.clearDepth;
+    slot->scope.depth.clearStencil = clears.depth.clearStencil;
+    slot->opened = {};
+    slot->renderingDebugGroupDepth = slot->debugGroupDepth;
+    slot->rendering = true;
+    ++slot->stats.rendering_scope_count;
+    return Result<void, RhiError>{ok()};
+}
+
 vernon::Result<void, vernon::RhiError> vernon::rhi::beginEncoderRendering(VernonRhiDevice device, uint64_t key,
                                                                           RenderingScope scope,
                                                                           const RenderingRead *reads,
                                                                           size_t readCount) noexcept {
-    const auto invalid = [key] {
-        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"begin_rendering", key, 0}})};
-    };
-    if (!validRenderingScope(scope) || (readCount && !reads))
-        return invalid();
-    std::array<RenderingSubresources, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> attachments{};
-    std::array<bool, VERNON_RHI_MAX_COLOR_ATTACHMENTS + 1> preserves{};
-    size_t attachmentCount = 0;
-    for (size_t index = 0; index < scope.colorCount; ++index) {
-        auto attachment =
-            renderingAttachment(device, scope.colors[index].view, scope, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-        if (attachment.isErr())
-            return Result<void, RhiError>{err(std::move(attachment).error())};
-        scope.colors[index].format = attachment.value().format;
-        preserves[attachmentCount] = scope.colors[index].load == VERNON_RHI_LOAD_PRESERVE;
-        attachments[attachmentCount++] = attachment.value().subresources;
-    }
-    if (scope.hasDepth) {
-        auto attachment =
-            renderingAttachment(device, scope.depth.view, scope, VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
-        if (attachment.isErr())
-            return Result<void, RhiError>{err(std::move(attachment).error())};
-        scope.depth.format = attachment.value().format;
-        scope.depth.stencil = vernon::formats::hasStencil(scope.depth.format);
-        if (!scope.depth.stencil && scope.depth.stencilLoad == VERNON_RHI_LOAD_CLEAR)
-            return invalid();
-        preserves[attachmentCount] = scope.depth.depthLoad == VERNON_RHI_LOAD_PRESERVE ||
-                                     (scope.depth.stencil && scope.depth.stencilLoad == VERNON_RHI_LOAD_PRESERVE);
-        attachments[attachmentCount++] = attachment.value().subresources;
-    }
-    // The images whose contents the scope reads: preserved attachments and sampled reads.
-    std::vector<uint64_t> readImages;
-    try {
-        readImages.reserve(attachmentCount + readCount);
-    } catch (const std::bad_alloc &) {
-        return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
-    }
-    for (size_t index = 0; index < attachmentCount; ++index)
-        if (preserves[index])
-            readImages.push_back(attachments[index].image);
-    for (size_t index = 0; index < readCount; ++index) {
-        auto read = renderingReadSubresources(device, reads[index]);
-        if (read.isErr())
-            return Result<void, RhiError>{err(std::move(read).error())};
-        readImages.push_back(read.value().image);
-        for (size_t attachment = 0; attachment < attachmentCount; ++attachment)
-            if (renderingSubresourcesOverlap(attachments[attachment], read.value()))
-                return invalid();
-    }
-    auto slot = lookupKey(device, key);
-    if (!slot)
-        return invalid();
-    {
-        std::lock_guard<std::mutex> guard(slot->mutex);
-        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
-            return invalid();
-        for (const uint64_t image : readImages)
-            if (encoderSeesUndefinedImage(*slot.slot, image))
-                return invalid();
-        try {
-            slot->renderingReads.assign(reads, reads + readCount);
-            slot->definedImages.reserve(slot->definedImages.size() + attachmentCount);
-        } catch (const std::bad_alloc &) {
-            return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"begin_rendering", key, 0}})};
-        }
-        for (size_t index = 0; index < attachmentCount; ++index)
-            recordDefinedImage(*slot.slot, attachments[index].image);
-        slot->scope = scope;
-        slot->opened = {};
-        slot->renderingDebugGroupDepth = slot->debugGroupDepth;
-        slot->rendering = true;
-        ++slot->stats.rendering_scope_count;
-    }
-    return Result<void, RhiError>{ok()};
+    auto prepared = prepareRendering(device, scope, reads, readCount);
+    if (prepared.isErr())
+        return Result<void, RhiError>{err(std::move(prepared).error())};
+    return beginPreparedEncoderRendering(device, key, prepared.value(), scope);
 }
 
 static VernonRhiStatus vernonRhiCommandEncoderBeginRenderingBusiness(VernonRhiDevice device,
@@ -2353,7 +2425,8 @@ static vernon::Result<void, vernon::RhiError> retainCommandResourceImpl(VernonRh
             releaseLease = true;
         } else {
             try {
-                slot->retainedResourceIdentities.insert(identity);
+                slot->retainedResourceIdentities.emplace(
+                    identity, EncoderSlot::RetainedEntry{slot->retainedResourceLeases.size(), 0});
                 slot->retainedResourceLeases.push_back(std::move(lease));
             } catch (const std::bad_alloc &) {
                 slot->retainedResourceIdentities.erase(identity);
@@ -2390,17 +2463,64 @@ vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::resolveCommandResource(V
     if (!slot->alive || slot->initializing || slot->finished)
         return Result<uint64_t, RhiError>{
             err(RhiError{RhiErrorCode::LifecycleFailure, {"resolve_command_resource", resourceKey, 0}})};
-    for (auto &lease : slot->retainedResourceLeases) {
-        if (!lease.authorizes(device.index, device.generation, static_cast<uint32_t>(kind), resourceKey))
-            continue;
-        auto pinned = lease.pin();
-        if (pinned.isErr())
-            return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
-        guard.unlock();
-        return resolvePinnedResource(device, kind, resourceKey);
+    const EncoderSlot::RetainedResource identity{kind, resourceKey};
+    const auto entry = slot->retainedResourceIdentities.find(identity);
+    if (entry == slot->retainedResourceIdentities.end() || entry->second.lease >= slot->retainedResourceLeases.size() ||
+        !slot->retainedResourceLeases[entry->second.lease].authorizes(device.index, device.generation,
+                                                                      static_cast<uint32_t>(kind), resourceKey))
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"resolve_command_resource", resourceKey, 0}})};
+    if (entry->second.native)
+        return Result<uint64_t, RhiError>{ok(entry->second.native)};
+    auto pinned = slot->retainedResourceLeases[entry->second.lease].pin();
+    if (pinned.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
+    guard.unlock();
+    auto resolved = resolvePinnedResource(device, kind, resourceKey);
+    if (resolved.isErr())
+        return resolved;
+    guard.lock();
+    // The slot may have dropped its leases while unlocked; only a still-retained resource keeps its native object.
+    if (const auto kept = slot->retainedResourceIdentities.find(identity);
+        kept != slot->retainedResourceIdentities.end())
+        kept->second.native = resolved.value();
+    return resolved;
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::retainResolvedCommandResources(VernonRhiDevice device, uint64_t key,
+                                                                                   const CommandResource *resources,
+                                                                                   size_t count,
+                                                                                   uint64_t *natives) noexcept {
+    if (!count)
+        return Result<void, RhiError>{ok()};
+    if (!resources || !natives)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::InvalidArgument, {"retain_command_resources", 0, 0}})};
+    {
+        auto slot = lookupKey(device, key);
+        if (!slot)
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"retain_command_resources", key, 0}})};
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (slot->alive && !slot->initializing && !slot->finished && !slot->busy) {
+            size_t resolved = 0;
+            for (; resolved < count; ++resolved) {
+                const auto entry =
+                    slot->retainedResourceIdentities.find({resources[resolved].kind, resources[resolved].key});
+                if (entry == slot->retainedResourceIdentities.end() || !entry->second.native)
+                    break;
+                natives[resolved] = entry->second.native;
+            }
+            if (resolved == count)
+                return Result<void, RhiError>{ok()};
+        }
     }
-    return Result<uint64_t, RhiError>{
-        err(RhiError{RhiErrorCode::LifecycleFailure, {"resolve_command_resource", resourceKey, 0}})};
+    for (size_t index = 0; index < count; ++index) {
+        auto resolved = retainResolvedCommandResource(device, key, resources[index].kind, resources[index].key);
+        if (resolved.isErr())
+            return Result<void, RhiError>{err(std::move(resolved).error())};
+        natives[index] = resolved.value();
+    }
+    return Result<void, RhiError>{ok()};
 }
 
 vernon::Result<void, vernon::RhiError> vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key,

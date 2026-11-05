@@ -1,40 +1,27 @@
-#include "VernonRuntime.h"
 #include "acceptance_descriptor.h"
-#include "program_fixture_manifest_table.h"
-#include "program_fixture_runtime_test.h"
-#include "runtime/autodiff/runtime_autodiff_telemetry.h"
+#include "runtime/autodiff/runtime_autodiff_memory.h"
 #include "runtime/autodiff/runtime_gpu_replay.h"
-#include "runtime/program_execution/failure_injection.h"
-#include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
-#include <filesystem>
-#include <iterator>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace {
 
 using vernon::runtime::ad::gpu::BatchSummary;
 using vernon::runtime::ad::gpu::Segment;
-using vernon::runtime::program_execution::FailureBoundary;
 using vernon::tests::AcceptanceDescriptor;
+using vernon::tests::DeviceTensor;
+using vernon::tests::LinkedVjp;
+using vernon::tests::ResolvedProgram;
 
 #include "language_contract_acceptance_descriptors.inc"
-
-TEST(RuntimeGpuAutodiff, FailureInjectionSelectsBoundaryAndOccurrence) {
-    using namespace vernon::runtime::program_execution;
-    setFailureInjectionForTesting(FailureBoundary::Transfer, 2);
-    EXPECT_FALSE(injectFailure(FailureBoundary::Allocation));
-    EXPECT_FALSE(injectFailure(FailureBoundary::Transfer));
-    EXPECT_TRUE(injectFailure(FailureBoundary::Transfer));
-    EXPECT_FALSE(injectFailure(FailureBoundary::Transfer));
-}
 
 TEST(RuntimeGpuAutodiff, MemoryAccountingSeparatesLogicalObservationalAndBudgetedBytes) {
     vernon::runtime::ad::MemoryAccounting usage;
@@ -198,461 +185,126 @@ TEST(RuntimeGpuAutodiff, TapeReadbackIsOneFixedBatchSummary) {
     EXPECT_EQ(manyGroups.statusBytes, sizeof(BatchSummary));
 }
 
-std::string lastError(VernonRuntimeContext *context) {
-    const VernonStringView error = vernonRuntimeGetLastError(context);
-    return error.data ? std::string(error.data, error.size) : std::string();
-}
+constexpr VernonProgramBoundaryRole kCotangent = VERNON_PROGRAM_BOUNDARY_COTANGENT;
+constexpr VernonProgramBoundaryRole kGradient = VERNON_PROGRAM_BOUNDARY_GRADIENT;
 
-VernonStatus canonicalProgramForward(VernonProgramExecutable *pipeline, VernonLaunchSize grid,
-                                     const vernon::tests::DerivativeLeafSetFixture &inputs, VernonPullback **pullback) {
-    std::vector<VernonProgramArgument> arguments(inputs.value_count);
-    std::vector<std::vector<int64_t>> strides(inputs.value_count);
-    for (size_t index = 0; index < inputs.value_count; ++index) {
-        const vernon::tests::DerivativeLeafFixture &input = inputs.values[index];
-        VernonProgramParameterView parameter{};
-        if (vernonRuntimeProgramExecutableFindParameter(pipeline, input.path, &parameter) != VERNON_STATUS_OK)
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        VernonProgramArgument &argument = arguments[index];
-        argument.slot = parameter.slot;
-        argument.kind = VERNON_PROGRAM_TENSOR;
-        argument.tensor.struct_size = sizeof(VernonTensorView);
-        argument.tensor.storage = VERNON_TENSOR_HOST;
-        argument.tensor.host_data = input.data;
-        argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(input.dtype);
-        argument.tensor.access = parameter.access;
-        argument.tensor.rank = input.rank;
-        argument.tensor.shape = input.shape;
-        argument.tensor.byte_size = input.size;
-        strides[index].resize(input.rank);
-        int64_t stride = static_cast<int64_t>(argument.tensor.element_layout.byte_size);
-        for (size_t axis = input.rank; axis-- > 0;) {
-            strides[index][axis] = stride;
-            stride *= static_cast<int64_t>(input.shape[axis]);
-        }
-        argument.tensor.byte_strides = strides[index].empty() ? nullptr : strides[index].data();
-    }
-    return vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments.data(), arguments.size(), grid,
-                                                             pullback);
-}
-
-void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
-                  const AcceptanceDescriptor &acceptance) {
-    VernonRuntimeContext *context = owned.get();
-
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    constexpr uint64_t shape[]{2, 2};
-    std::array<float, 4> values{2.0f, 3.0f, 5.0f, 7.0f};
-    std::array<float, 4> loss{};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values.data(),
-         sizeof(values),
-         2,
-         shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"loss", 4},
-         VERNON_DATA_F32,
-         loss.data(),
-         sizeof(loss),
-         2,
-         shape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(canonicalProgramForward(pipeline, {1, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    ASSERT_EQ(acceptance.expectedCount, 8u);
-    for (size_t index = 0; index < loss.size(); ++index)
-        EXPECT_FLOAT_EQ(loss[index], acceptance.expected[index]);
-
-    values.fill(100.0f);
-    std::array<float, 4> cotangent{1.0f, 1.0f, 1.0f, 1.0f};
-    std::array<float, 4> gradient{};
-    vernon::tests::DerivativeLeafFixture cotangentValue{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                        {"loss", 4},
-                                                        VERNON_DATA_F32,
-                                                        cotangent.data(),
-                                                        sizeof(cotangent),
-                                                        2,
-                                                        shape};
-    vernon::tests::DerivativeLeafSetFixture cotangents{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &cotangentValue, 1, {}};
-    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                       {"values", 6},
-                                                       VERNON_DATA_F32,
-                                                       gradient.data(),
-                                                       sizeof(gradient),
-                                                       2,
-                                                       shape};
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
-
-    VernonPullbackApplyOptions applyOptions{
-        sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, {}};
-    gradient.fill(-23.0f);
-    vernon::runtime::program_execution::setFailureInjectionForTesting(
-        vernon::runtime::program_execution::FailureBoundary::Allocation);
-    EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(gradient, (std::array<float, 4>{-23.0f, -23.0f, -23.0f, -23.0f}));
-    applyOptions.maximum_temporary_bytes = std::numeric_limits<uint64_t>::max();
-    EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
-              VERNON_STATUS_OK)
-        << "the rejected under-budget apply must not consume the pending allocation failure";
-    vernon::runtime::program_execution::clearFailureInjectionForTesting();
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    for (size_t index = 0; index < gradient.size(); ++index)
-        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
-
-    gradient.fill(0.0f);
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    for (size_t index = 0; index < gradient.size(); ++index)
-        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
-    const vernon::runtime::AutodiffPullbackControlPlaneUsage control =
-        vernon::runtime::autodiffPullbackControlPlaneUsage(pullback);
-    EXPECT_EQ(control.submissions, 2u);
-    EXPECT_EQ(control.waits, 2u);
-    EXPECT_EQ(control.readbacks, 2u);
-    EXPECT_EQ(control.atomicPublications, 2u);
-    EXPECT_GT(control.temporaryAllocationBytes, 0u);
-    EXPECT_GT(control.deviceWaitNanoseconds, 0u);
-
-    gradient.fill(0.0f);
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    for (size_t index = 0; index < gradient.size(); ++index)
-        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-}
-
-void runNoTapeFailureInjection(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
-    using namespace vernon::runtime::ad::gpu;
-    using namespace vernon::runtime::program_execution;
-    VernonRuntimeContext *context = owned.get();
-
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    constexpr uint64_t shape[]{2, 2};
-    const std::array<float, 4> original{2.0f, 3.0f, 5.0f, 7.0f};
-    std::array<float, 4> values = original;
-    std::array<float, 4> loss{};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values.data(),
-         sizeof(values),
-         2,
-         shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"loss", 4},
-         VERNON_DATA_F32,
-         loss.data(),
-         sizeof(loss),
-         2,
-         shape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-
-    constexpr std::array forwardBoundaries{
-        FailureBoundary::Allocation,
-        FailureBoundary::Transfer,
-        FailureBoundary::Submission,
-        FailureBoundary::Readback,
-    };
-    for (FailureBoundary boundary : forwardBoundaries) {
-        values = original;
-        loss.fill(-91.0f);
-        VernonPullback *failedPullback = nullptr;
-        setFailureInjectionForTesting(boundary);
-        EXPECT_NE(canonicalProgramForward(pipeline, {1, 1, 1}, inputs, &failedPullback), VERNON_STATUS_OK)
-            << static_cast<int>(boundary);
-        clearFailureInjectionForTesting();
-        EXPECT_EQ(failedPullback, nullptr);
-        EXPECT_EQ(values, original);
-        EXPECT_EQ(loss, (std::array<float, 4>{-91.0f, -91.0f, -91.0f, -91.0f}));
-    }
-
-    values = original;
-    loss.fill(0.0f);
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(canonicalProgramForward(pipeline, {1, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-
-    std::array<float, 4> cotangent{1.0f, 1.0f, 1.0f, 1.0f};
-    std::array<float, 4> gradient{};
-    vernon::tests::DerivativeLeafFixture cotangentValue{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                        {"loss", 4},
-                                                        VERNON_DATA_F32,
-                                                        cotangent.data(),
-                                                        sizeof(cotangent),
-                                                        2,
-                                                        shape};
-    vernon::tests::DerivativeLeafSetFixture cotangents{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &cotangentValue, 1, {}};
-    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                       {"values", 6},
-                                                       VERNON_DATA_F32,
-                                                       gradient.data(),
-                                                       sizeof(gradient),
-                                                       2,
-                                                       shape};
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
-    for (FailureBoundary boundary : forwardBoundaries) {
-        gradient.fill(-37.0f);
-        setFailureInjectionForTesting(boundary);
-        EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-            << static_cast<int>(boundary);
-        clearFailureInjectionForTesting();
-        EXPECT_EQ(gradient, (std::array<float, 4>{-37.0f, -37.0f, -37.0f, -37.0f}));
-    }
-    gradient.fill(0.0f);
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-}
-
-void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath, bool dynamic,
-                        const AcceptanceDescriptor &acceptance) {
-    VernonRuntimeContext *context = owned.get();
-
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    constexpr size_t laneCount = 8;
-    constexpr uint64_t outputShape[]{laneCount};
-    float x = dynamic ? 2.0f : 3.0f;
-    float y = 2.0f;
-    int32_t count = 2;
-    std::array<float, laneCount> output{};
-    vernon::tests::DerivativeLeafFixture inputValues[3]{
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {dynamic ? "count" : "y", dynamic ? 5u : 1u},
-         dynamic ? VERNON_DATA_I32 : VERNON_DATA_F32,
-         dynamic ? static_cast<void *>(&count) : static_cast<void *>(&y),
-         dynamic ? sizeof(count) : sizeof(y),
-         0,
-         nullptr},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"output", 6},
-         VERNON_DATA_F32,
-         output.data(),
-         sizeof(output),
-         1,
-         outputShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(canonicalProgramForward(pipeline, {2, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    ASSERT_EQ(acceptance.expectedCount, dynamic ? 2u : 3u);
-    for (size_t lane = 0; lane < laneCount; ++lane)
-        EXPECT_FLOAT_EQ(output[lane], acceptance.expected[0]);
-
-    x = 100.0f;
-    std::array<float, laneCount> seeds{};
-    seeds.fill(1.0f);
-    vernon::tests::DerivativeLeafFixture seed{
-        sizeof(vernon::tests::DerivativeLeafFixture),  {"output", 6}, VERNON_DATA_F32, seeds.data(), sizeof(seeds),
-        static_cast<uint32_t>(std::size(outputShape)), outputShape};
-    vernon::tests::DerivativeLeafSetFixture cotangents{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
-    std::array<float, 2> gradientStorage{};
-    vernon::tests::DerivativeLeafFixture gradientValues[2]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"x", 1},
-         VERNON_DATA_F32,
-         &gradientStorage[0],
-         sizeof(float),
-         0,
-         nullptr},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"y", 1},
-         VERNON_DATA_F32,
-         &gradientStorage[1],
-         sizeof(float),
-         0,
-         nullptr},
-    };
-    if (!dynamic)
-        std::swap(gradientValues[0], gradientValues[1]);
-    vernon::tests::DerivativeLeafSetFixture gradients{sizeof(vernon::tests::DerivativeLeafSetFixture),
-                                                      gradientValues,
-                                                      dynamic ? size_t{1} : std::size(gradientValues),
-                                                      {}};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
-    if (!dynamic)
-        EXPECT_NEAR(gradientStorage[1], acceptance.expected[2], 1e-4f);
-    std::array<float, laneCount> sharedSeeds{};
-    sharedSeeds.fill(1.0f);
-    vernon::tests::DerivativeLeafFixture sharedSeed{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                    {"output", 6},
-                                                    VERNON_DATA_F32,
-                                                    sharedSeeds.data(),
-                                                    sizeof(sharedSeeds),
-                                                    1,
-                                                    outputShape};
-    vernon::tests::DerivativeLeafSetFixture sharedCotangents{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &sharedSeed, 1, {}};
-    gradientStorage.fill(-19.0f);
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &sharedCotangents, &gradients),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
-    if (!dynamic)
-        EXPECT_NEAR(gradientStorage[1], acceptance.expected[2], 1e-4f);
-    const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
-    EXPECT_GT(memory.logicalResidualBytes, 0u);
-    EXPECT_GT(memory.residentBytes, 0u);
-    EXPECT_GE(memory.allocatedBytes, memory.residentBytes);
-    EXPECT_EQ(memory.peakTemporaryBytes, 0u);
-
-    gradientStorage.fill(0.0f);
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-}
-
-void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
-                                  const AcceptanceDescriptor &acceptance) {
-    VernonRuntimeContext *context = owned.get();
-
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    constexpr size_t laneCount = 192;
-    constexpr uint64_t shape[]{laneCount};
-    float scale = 2.0f;
-    std::array<float, laneCount> values{};
-    std::array<float, laneCount> carriedLoss{};
-    std::array<float, laneCount> sharedLoss{};
-    for (size_t lane = 0; lane < laneCount; ++lane)
-        values[lane] = static_cast<float>(lane + 1);
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"scale", 5},
-         VERNON_DATA_F32,
-         &scale,
-         sizeof(scale),
-         0,
-         nullptr},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values.data(),
-         sizeof(values),
-         1,
-         shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"carried_loss", 12},
-         VERNON_DATA_F32,
-         carriedLoss.data(),
-         sizeof(carriedLoss),
-         1,
-         shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"shared_loss", 11},
-         VERNON_DATA_F32,
-         sharedLoss.data(),
-         sizeof(sharedLoss),
-         1,
-         shape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(canonicalProgramForward(pipeline, {2, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    for (size_t lane = 0; lane < laneCount; ++lane) {
-        EXPECT_FLOAT_EQ(carriedLoss[lane], 2.0f * values[lane]);
-        EXPECT_FLOAT_EQ(sharedLoss[lane], 2.0f * values[lane] * values[lane]);
-    }
-
-    std::array<float, laneCount> carriedSeeds{};
-    carriedSeeds.fill(1.0f);
-    std::array<float, laneCount> sharedSeeds{};
-    sharedSeeds.fill(1.0f);
-    vernon::tests::DerivativeLeafFixture seeds[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"carried_loss", 12},
-         VERNON_DATA_F32,
-         carriedSeeds.data(),
-         sizeof(carriedSeeds),
-         1,
-         shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"shared_loss", 11},
-         VERNON_DATA_F32,
-         sharedSeeds.data(),
-         sizeof(sharedSeeds),
-         1,
-         shape},
-    };
-    vernon::tests::DerivativeLeafSetFixture cotangents{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), seeds, std::size(seeds), {}};
-    float gradient = 0.0f;
-    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                       {"scale", 5},
-                                                       VERNON_DATA_F32,
-                                                       &gradient,
-                                                       sizeof(gradient),
-                                                       0,
-                                                       nullptr};
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_EQ(acceptance.expectedCount, 1u);
-    EXPECT_NEAR(gradient, acceptance.expected[0], 0.5f);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-}
-
-const std::vector<vernon::tests::ProgramFixtureManifest> &gpuAutodiffBackendCases() {
-    static const auto cases = vernon::tests::programFixtureCases("gpu_autodiff");
-    return cases;
-}
-
-class RuntimeGpuAutodiffMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
+class RuntimeGpuAutodiffMatrix : public vernon::tests::HalProgramTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
         return vernon::tests::programVjpFixtureRequirements(GetParam().runtime);
+    }
+
+    // A device scalar a backward call writes a gradient into.
+    DeviceTensor scalarGradient() const {
+        const float zero = 0.0f;
+        return DeviceTensor(device_, &zero, sizeof(zero), {}, sizeof(zero));
+    }
+
+    // loss = values * values elementwise, with no tape: every pullback reads only the forward inputs.
+    void runNoTapeVjp(VernonProgramExecutable *program, const AcceptanceDescriptor &acceptance) {
+        ASSERT_EQ(acceptance.expectedCount, 8u);
+        LinkedVjp vjp(runtime(), program);
+        ASSERT_TRUE(vjp) << vjp.error();
+        const DeviceTensor values(device_, std::vector<float>{2.0f, 3.0f, 5.0f, 7.0f}, {2, 2});
+        const DeviceTensor loss(device_, std::vector<float>(4), {2, 2});
+        vjp.forwardRecord().bind("values", values);
+        vjp.forwardRecord().bind("loss", loss);
+        vjp.forwardRecord().bindGrid(1);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        const std::vector<float> forward = loss.values<float>();
+        for (size_t index = 0; index < forward.size(); ++index)
+            EXPECT_FLOAT_EQ(forward[index], acceptance.expected[index]);
+
+        const DeviceTensor cotangent(device_, std::vector<float>(4, 1.0f), {2, 2});
+        DeviceTensor gradient(device_, std::vector<float>(4), {2, 2});
+        vjp.backwardRecord().bind("loss", cotangent, kCotangent);
+        vjp.backwardRecord().bind("values", gradient, kGradient);
+        for (int pullback = 0; pullback < 2; ++pullback) {
+            SCOPED_TRACE(pullback);
+            const std::vector<float> cleared(4, -23.0f);
+            gradient.buffer().write(cleared.data(), cleared.size() * sizeof(float));
+            ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+            const std::vector<float> result = gradient.values<float>();
+            for (size_t index = 0; index < result.size(); ++index)
+                EXPECT_FLOAT_EQ(result[index], acceptance.expected[index + 4]);
+        }
+    }
+
+    // A 192-lane workgroup reduction, which is no power of two, feeds two losses that both reach `scale`.
+    void runNonPowerOfTwoReductionVjp(VernonProgramExecutable *program, const AcceptanceDescriptor &acceptance) {
+        ASSERT_EQ(acceptance.expectedCount, 1u);
+        constexpr size_t laneCount = 192;
+        LinkedVjp vjp(runtime(), program);
+        ASSERT_TRUE(vjp) << vjp.error();
+        std::vector<float> initial(laneCount);
+        for (size_t lane = 0; lane < laneCount; ++lane)
+            initial[lane] = static_cast<float>(lane + 1);
+        const DeviceTensor values(device_, initial);
+        const DeviceTensor carriedLoss(device_, std::vector<float>(laneCount));
+        const DeviceTensor sharedLoss(device_, std::vector<float>(laneCount));
+        vjp.forwardRecord().bindScalar("scale", 2.0f);
+        vjp.forwardRecord().bind("values", values);
+        vjp.forwardRecord().bind("carried_loss", carriedLoss);
+        vjp.forwardRecord().bind("shared_loss", sharedLoss);
+        vjp.forwardRecord().bindGrid(2);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        const std::vector<float> carried = carriedLoss.values<float>();
+        const std::vector<float> shared = sharedLoss.values<float>();
+        for (size_t lane = 0; lane < laneCount; ++lane) {
+            EXPECT_FLOAT_EQ(carried[lane], 2.0f * initial[lane]);
+            EXPECT_FLOAT_EQ(shared[lane], 2.0f * initial[lane] * initial[lane]);
+        }
+
+        const DeviceTensor seeds(device_, std::vector<float>(laneCount, 1.0f));
+        const DeviceTensor gradient = scalarGradient();
+        vjp.backwardRecord().bind("carried_loss", seeds, kCotangent);
+        vjp.backwardRecord().bind("shared_loss", seeds, kCotangent);
+        vjp.backwardRecord().bind("scale", gradient, kGradient);
+        ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+        EXPECT_NEAR(gradient.values<float>()[0], acceptance.expected[0], 0.5f);
+    }
+
+    // Eight lanes over two workgroups record a static tape of x and y, or a dynamic one of x through `count`
+    // iterations, that every pullback of the forward call replays.
+    void runCapturedTapeVjp(VernonProgramExecutable *program, bool dynamic, const AcceptanceDescriptor &acceptance) {
+        ASSERT_EQ(acceptance.expectedCount, dynamic ? 2u : 3u);
+        constexpr size_t laneCount = 8;
+        LinkedVjp vjp(runtime(), program);
+        ASSERT_TRUE(vjp) << vjp.error();
+        const DeviceTensor output(device_, std::vector<float>(laneCount));
+        vjp.forwardRecord().bindScalar("x", dynamic ? 2.0f : 3.0f);
+        if (dynamic)
+            vjp.forwardRecord().bindScalar("count", int32_t{2});
+        else
+            vjp.forwardRecord().bindScalar("y", 2.0f);
+        vjp.forwardRecord().bind("output", output);
+        vjp.forwardRecord().bindGrid(2);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        for (float value : output.values<float>())
+            EXPECT_FLOAT_EQ(value, acceptance.expected[0]);
+        const VernonScheduleVjpPass tapes = vjp.passTotals();
+        EXPECT_GT(tapes.tape_count, 0u);
+        EXPECT_GT(tapes.tape_logical_bytes, 0u);
+        EXPECT_GE(tapes.tape_allocated_bytes, tapes.tape_logical_bytes);
+
+        const DeviceTensor seeds(device_, std::vector<float>(laneCount, 1.0f));
+        const DeviceTensor xGradient = scalarGradient();
+        const DeviceTensor yGradient = scalarGradient();
+        vjp.backwardRecord().bind("output", seeds, kCotangent);
+        vjp.backwardRecord().bind("x", xGradient, kGradient);
+        if (!dynamic)
+            vjp.backwardRecord().bind("y", yGradient, kGradient);
+        ASSERT_TRUE(vjp.backwardRecord().unbound().empty());
+        for (int pullback = 0; pullback < 2; ++pullback) {
+            SCOPED_TRACE(pullback);
+            ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+            EXPECT_NEAR(xGradient.values<float>()[0], acceptance.expected[1], 1e-4f);
+            if (!dynamic)
+                EXPECT_NEAR(yGradient.values<float>()[0], acceptance.expected[2], 1e-4f);
+        }
     }
 };
 
@@ -663,24 +315,24 @@ TEST_P(RuntimeGpuAutodiffMatrix, ExecutesRegisteredAcceptanceOracles) {
             continue;
         ++executed;
         SCOPED_TRACE(acceptance.fixtureId);
-        const std::filesystem::path &manifestPath = fixture(acceptance.fixtureId).manifestPath;
-        if (acceptance.oracle == "no_tape_vjp") {
-            runNoTapeVjp(owned(), manifestPath, acceptance);
-            runNoTapeFailureInjection(owned(), manifestPath);
-        } else if (acceptance.oracle == "reduction_vjp") {
-            runNonPowerOfTwoReductionVjp(owned(), manifestPath, acceptance);
-        } else if (acceptance.oracle == "static_vjp") {
-            runCapturedTapeVjp(owned(), manifestPath, false, acceptance);
-        } else if (acceptance.oracle == "dynamic_vjp") {
-            runCapturedTapeVjp(owned(), manifestPath, true, acceptance);
-        } else {
+        const ResolvedProgram program(runtime(), fixture(acceptance.fixtureId).manifestPath);
+        ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+        if (acceptance.oracle == "no_tape_vjp")
+            runNoTapeVjp(program.get(), acceptance);
+        else if (acceptance.oracle == "reduction_vjp")
+            runNonPowerOfTwoReductionVjp(program.get(), acceptance);
+        else if (acceptance.oracle == "static_vjp")
+            runCapturedTapeVjp(program.get(), false, acceptance);
+        else if (acceptance.oracle == "dynamic_vjp")
+            runCapturedTapeVjp(program.get(), true, acceptance);
+        else
             FAIL() << "GPU autodiff acceptance has no executor: " << acceptance.oracle;
-        }
     }
     EXPECT_GT(executed, 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeGpuAutodiffMatrix, testing::ValuesIn(gpuAutodiffBackendCases()),
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeGpuAutodiffMatrix,
+                         testing::ValuesIn(vernon::tests::programFixtureCases("gpu_autodiff")),
                          [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
                              return std::string(info.param.target);
                          });

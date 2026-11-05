@@ -178,6 +178,10 @@ VERNON_DSL_CAPI VernonStringView vernonCompileResultGetArtifactData(const Vernon
 VERNON_DSL_CAPI VernonStringView vernonCompileResultGetReflection(const VernonCompileResult *result);
 VERNON_DSL_CAPI VernonCpuEntryPoint vernonCompileResultGetCpuEntry(const VernonCompileResult *result,
                                                                    const char *entry_name, size_t entry_name_size);
+/* The entry's chunk entry, or null when the kernel has none (see VernonCpuChunk). */
+VERNON_DSL_CAPI VernonCpuChunkEntryPoint vernonCompileResultGetCpuChunkEntry(const VernonCompileResult *result,
+                                                                             const char *entry_name,
+                                                                             size_t entry_name_size);
 
 #ifdef __cplusplus
 }

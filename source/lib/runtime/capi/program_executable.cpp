@@ -86,15 +86,6 @@ size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecut
     });
 }
 
-size_t vernonRuntimeProgramExecutableGetMutationCapacity(const VernonProgramExecutable *pipeline) {
-    return runtimeValueBoundary<size_t>(pipeline ? pipeline->context : nullptr, 0, [&] {
-        if (!pipeline)
-            return size_t{0};
-        auto pipelinePin = pipeline->lifecycle.pin();
-        return pipelinePin.isOk() ? mutationCapacity(*pipeline) : size_t{0};
-    });
-}
-
 VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(const VernonProgramExecutable *pipeline, size_t index,
                                                                VernonProgramParameterView *parameter) {
     return runtimeStatusBoundary(pipeline ? pipeline->context : nullptr, [&] {
@@ -323,5 +314,65 @@ VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutab
             return VernonStringView{nullptr, 0};
         auto pin = pipeline->lifecycle.pin();
         return pin.isOk() ? VernonStringView{pipeline->id.data(), pipeline->id.size()} : VernonStringView{nullptr, 0};
+    });
+}
+
+uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline) {
+    return runtimeValueBoundary<uint8_t>(pipeline ? pipeline->context : nullptr, 0, [&] {
+        if (!pipeline)
+            return uint8_t{0};
+        auto pin = pipeline->lifecycle.pin();
+        return static_cast<uint8_t>(pin.isOk() &&
+                                    program::findGraph(pipeline->executionPlan->resolvedProgram->program, "backward"));
+    });
+}
+
+size_t vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline) {
+    return runtimeValueBoundary<size_t>(pipeline ? pipeline->context : nullptr, 0, [&] {
+        if (!pipeline)
+            return size_t{0};
+        auto pin = pipeline->lifecycle.pin();
+        return pin.isOk() ? pipeline->programAutodiff.derivativeGroups.size() : size_t{0};
+    });
+}
+
+VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(const VernonProgramExecutable *pipeline,
+                                                                       size_t groupIndex,
+                                                                       VernonAdDerivativeGroupView *view) {
+    return runtimeStatusBoundary(pipeline ? pipeline->context : nullptr, [&] {
+        if (!pipeline)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto pin = pipeline->lifecycle.pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
+        const std::vector<AutodiffDerivativeGroup> &groups = pipeline->programAutodiff.derivativeGroups;
+        if (!view || view->struct_size < sizeof(*view) || groupIndex >= groups.size())
+            return fail(pipeline->context, "invalid autodiff derivative group query");
+        const AutodiffDerivativeGroup &group = groups[groupIndex];
+        *view = {sizeof(*view),
+                 group.role == AutodiffDerivativeRole::Gradient ? VERNON_AD_DERIVATIVE_GRADIENT
+                                                                : VERNON_AD_DERIVATIVE_COTANGENT,
+                 {group.declaredPath.data(), group.declaredPath.size()},
+                 group.leafPaths.size(),
+                 {}};
+        return VERNON_STATUS_OK;
+    });
+}
+
+VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const VernonProgramExecutable *pipeline,
+                                                                    size_t groupIndex, size_t leafIndex,
+                                                                    VernonStringView *leafPath) {
+    return runtimeStatusBoundary(pipeline ? pipeline->context : nullptr, [&] {
+        if (!pipeline)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        auto pin = pipeline->lifecycle.pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
+        const std::vector<AutodiffDerivativeGroup> &groups = pipeline->programAutodiff.derivativeGroups;
+        if (!leafPath || groupIndex >= groups.size() || leafIndex >= groups[groupIndex].leafPaths.size())
+            return fail(pipeline->context, "invalid autodiff derivative group leaf query");
+        const std::string &path = groups[groupIndex].leafPaths[leafIndex];
+        *leafPath = {path.data(), path.size()};
+        return VERNON_STATUS_OK;
     });
 }

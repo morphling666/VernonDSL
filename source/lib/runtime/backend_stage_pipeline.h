@@ -9,12 +9,17 @@
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 struct VernonRuntimeContext;
+
+namespace vernon::schedule {
+struct Fragment;
+} // namespace vernon::schedule
 
 namespace vernon::runtime {
 
@@ -31,7 +36,6 @@ enum class BackendPipelineError : uint8_t {
     BackendResolutionFailed,
     LifecycleUnavailable,
     InvalidArtifact,
-    CpuPreparationFailed,
 };
 
 struct BackendPipelineFailure {
@@ -67,6 +71,10 @@ struct VernonStageExecutable {
     vernon::runtime::DispatchContract dispatchContract;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
     std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
+    // A CPU or CUDA compute Stage as the one-kernel fragment a linked schedule runs it with; null with the reason
+    // when the Stage uses what fragments do not carry.
+    std::shared_ptr<const vernon::schedule::Fragment> kernelFragment;
+    std::string kernelFragmentError;
     void *backendState{};
     void (*destroyBackendState)(void *){};
 };

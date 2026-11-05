@@ -59,38 +59,16 @@ struct PlannedGraphicsDraw {
     uint32_t scissor[4]{};
 };
 
-struct PreparedGraphicsBindingPlan;
-
-// Told of each updatable group a draw's groups make, with the binding plan that fills it; see GroupSink.
-struct GraphicsGroupSink {
-    VernonStatus (*made)(void *userData, VernonRuntimeCoreGroup *group, const PreparedGraphicsBindingPlan &plan,
-                         const std::vector<uint32_t> &slots, const VernonRuntimeProviderBindingValue *values,
-                         size_t valueCount){};
-    void *userData{};
-};
-
-// One draw of a graphics command stream, encoded inside the stream's rendering scope.
-struct GraphicsCommand {
-    // Per Stage parameter.
-    const VernonProgramArgument *const *arguments{};
-    const PlannedRenderTargets *targets{};
-    const VernonGraphicsState *graphicsState{};
-    PlannedGraphicsDraw draw;
-    GroupSources groups;
-    VernonRuntimeProviderObject encoder{};
-    // Required when `groups.transient` is updatable.
-    GraphicsGroupSink made;
-};
-
-// What the commands of one stream bound last. A stream renders to targets of one format set, so the variant changes
-// only with the pipeline, its state, or the vertex strides.
-struct GraphicsStream {
-    const void *pipeline{};
-    const VernonGraphicsState *graphicsState{};
-    std::vector<uint32_t> vertexStrides;
-    std::vector<uint32_t> nextVertexStrides;
-    // The vertex buffers of the command being encoded, by vertex binding.
-    std::vector<VernonRuntimeProviderResourceReference> vertexBuffers;
+// Indexed draws from records, which replace the command's one draw; see VernonRuntimeCoreStreamDrawInvocation. A
+// host stream leaves both resources zero.
+struct GraphicsDrawStream {
+    const VernonRuntimeProviderDrawRecord *hostRecords{};
+    const uint32_t *hostCounts{};
+    VernonRuntimeProviderResourceReference records{};
+    VernonRuntimeProviderResourceReference counts{};
+    uint32_t firstRecord{};
+    uint32_t maxRecords{};
+    uint32_t countIndex{};
 };
 
 using DescribeImageResource = VernonStatus (*)(void *userData, VernonRuntimeProviderResourceReference resource,
@@ -101,11 +79,6 @@ struct PlannedGraphicsState {
     VernonRasterizationState rasterization{};
     VernonDepthStencilState depthStencil{};
     std::vector<VernonColorBlendState> colorBlends;
-};
-
-struct PreparedGraphicsVariant {
-    GraphicsVariantKey key;
-    VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
 bool buildGraphicsDrawLayout(const StageBindingPlan &stagePlan, GraphicsDrawLayout &layout, std::string &error);
@@ -133,9 +106,6 @@ bool planGraphicsDrawValues(const GraphicsVertexRecords &records, const PlannedR
                             const VernonDrawCommand &draw, PlannedGraphicsDraw &plan, std::string &error);
 bool planGraphicsState(const VernonGraphicsState *graphicsState, size_t colorCount, bool hasDepth, bool hasStencil,
                        PlannedGraphicsState &state, std::string &error);
-VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
-                                   PreparedGraphicsVariant &prepared);
-void destroyGraphicsVariant(PreparedGraphicsVariant &prepared);
 
 } // namespace vernon::runtime
 

@@ -1,176 +1,74 @@
 #include "VernonRuntime.h"
-#include "runtime_rhi_test_utils.h"
-#include "vernon_test_support.h"
+#include "VernonSchedule.h"
+#include "schedule_test_support.h"
+
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
-#include <cstdio>
-#include <filesystem>
-#include <gtest/gtest.h>
-#include <iterator>
-#include <string>
 #include <vector>
 
 #ifndef VERNON_VULKAN_CUBE_MAP_BUNDLE
 #error VERNON_VULKAN_CUBE_MAP_BUNDLE must name the cooked CubeMap bundle
 #endif
 
-namespace {
-
-vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint32_t width, uint32_t height) {
-    return vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, width, height, 1,
-                                      VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-}
-
-VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
-    VernonProgramParameterView result{};
-    const VernonStringView view{name, std::char_traits<char>::length(name)};
-    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, view, &result), VERNON_STATUS_OK) << name;
-    return result;
-}
-
-void expectRuntimeOk(VernonRuntimeContext *runtime, VernonStatus status) {
-    if (status == VERNON_STATUS_OK)
-        return;
-    const VernonStringView error = vernonRuntimeGetLastError(runtime);
-    if (error.data)
-        std::fwrite(error.data, 1, error.size, stderr);
-    std::fputc('\n', stderr);
-    EXPECT_EQ(status, VERNON_STATUS_OK);
-}
-
-} // namespace
-
 TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
-    if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
-        GTEST_SKIP() << "Vulkan runtime backend is unavailable";
+    vernon::tests::HalTestDevice device;
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    const vernon::tests::BackendProbeResult probe = device.initialize(VERNON_RUNTIME_VULKAN, requirements);
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+    }
+    vernon::tests::ResolvedProgram program(device.runtime(), VERNON_VULKAN_CUBE_MAP_BUNDLE);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(device.runtime());
+    vernon::tests::LinkedProgram linked(device.runtime(), program.get());
+    ASSERT_TRUE(linked) << linked.error();
 
-    const std::filesystem::path manifestPath = VERNON_VULKAN_CUBE_MAP_BUNDLE;
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
-    VernonRuntimeContext *runtime = context.runtime;
-    ASSERT_TRUE(runtime);
-    VernonProgramBundle *loaded = vernon::tests::loadProgramBundle(runtime, manifestPath);
-    ASSERT_TRUE(loaded);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
-    const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
-    ASSERT_TRUE(pipeline) << (resolveError.data ? std::string(resolveError.data, resolveError.size) : std::string{});
+    const std::vector<float> positions{-1.0f, -1.0f, 1.0f, 3.0f, -1.0f, 1.0f, -1.0f, 3.0f, 1.0f};
+    const vernon::tests::DeviceTensor vertices(device, positions.data(), positions.size() * sizeof(float), {3, 3},
+                                               sizeof(float), {}, 0, VERNON_HAL_BUFFER_VERTEX);
+    vernon::tests::HalImage cube(device.get(), VERNON_TEXTURE_RGBA8_UNORM, 1, 1, VERNON_IMAGE_SAMPLED,
+                                 VERNON_IMAGE_ASPECT_COLOR, VERNON_TEXTURE_CUBE);
+    ASSERT_TRUE(cube);
+    constexpr uint8_t face[]{64, 200, 100, 255};
+    for (uint32_t layer = 0; layer < 6; ++layer)
+        ASSERT_EQ(
+            cube.write(face, VERNON_HAL_IMAGE_DATA_RGBA, VERNON_HAL_IMAGE_DATA_UINT8, VERNON_IMAGE_ASPECT_COLOR, layer),
+            VERNON_HAL_OK)
+            << vernon::tests::halError();
+    const vernon::tests::HalImage color(device.get(), VERNON_TEXTURE_RGBA8_UNORM, 32, 32,
+                                        VERNON_IMAGE_COLOR_ATTACHMENT);
+    const vernon::tests::HalImage bloom(device.get(), VERNON_TEXTURE_RGBA8_UNORM, 32, 32,
+                                        VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(color && bloom);
 
-    constexpr float positions[] = {
-        -1.0f, -1.0f, 1.0f, 3.0f, -1.0f, 1.0f, -1.0f, 3.0f, 1.0f,
-    };
-    auto vertices =
-        vernon::tests::createBuffer(context, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX, positions);
-    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    auto cube = vernon::tests::createImage(context, VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 1, 1,
-                                           VERNON_RHI_IMAGE_SAMPLED, 6);
-    ASSERT_NE(cube.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    constexpr std::array<uint8_t, 24> cubePixels = {
-        64, 200, 100, 255, 64, 200, 100, 255, 64, 200, 100, 255,
-        64, 200, 100, 255, 64, 200, 100, 255, 64, 200, 100, 255,
-    };
-    std::array<VernonRhiImageUploadDescriptor, 6> uploads{};
-    for (size_t index = 0; index < uploads.size(); ++index)
-        uploads[index] = {sizeof(VernonRhiImageUploadDescriptor),
-                          0,
-                          static_cast<uint32_t>(index),
-                          VERNON_RHI_IMAGE_ASPECT_COLOR,
-                          0,
-                          0,
-                          0,
-                          1,
-                          1,
-                          1,
-                          VERNON_RHI_IMAGE_DATA_RGBA,
-                          VERNON_RHI_IMAGE_DATA_UINT8,
-                          cubePixels.data() + index * 4};
-    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, cube.handle, uploads.data(), uploads.size()),
-              VERNON_RHI_STATUS_OK)
-        << vernon::test::text(vernonRhiDeviceGetLastError(context.device));
-    auto sampler = vernon::tests::createSampler(context);
-    ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    auto color = createTexture2D(context, 32, 32);
-    auto bloom = createTexture2D(context, 32, 32);
-    const auto cubeView =
-        vernon::tests::createImageView(context, cube, VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 6);
-    const auto colorView =
-        vernon::tests::createImageView(context, color, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    const auto bloomView =
-        vernon::tests::createImageView(context, bloom, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    ASSERT_NE(color.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    ASSERT_NE(bloom.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    constexpr uint64_t vertexShape[] = {3, 3};
-    constexpr int64_t vertexStrides[] = {3 * sizeof(float), sizeof(float)};
+    std::array<float, 16> identity{};
+    for (size_t index = 0; index < 4; ++index)
+        identity[index * 5] = 1.0f;
     constexpr uint64_t matrixShape[] = {4, 4};
     constexpr int64_t matrixStrides[] = {4 * sizeof(float), sizeof(float)};
-    constexpr std::array<float, 16> identity = {
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-    };
-    const VernonProgramParameterView positionParameter = parameter(pipeline, "aPos");
-    const VernonProgramParameterView cubeParameter = parameter(pipeline, "cubeMap");
-    const VernonProgramParameterView modelParameter = parameter(pipeline, "model");
-    const VernonProgramParameterView projectionParameter = parameter(pipeline, "projection");
-    const VernonProgramParameterView viewParameter = parameter(pipeline, "view");
+    for (const char *name : {"model", "projection", "view"})
+        linked.record().bind(name,
+                             vernon::tests::hostView(identity.data(), sizeof(identity), 2, matrixShape, matrixStrides));
+    linked.record().bind("aPos", vertices);
+    linked.record().bindImage("cubeMap", cube.reference());
 
-    std::array<VernonProgramArgument, 5> arguments{};
-    arguments[0].slot = positionParameter.slot;
-    arguments[0].kind = VERNON_PROGRAM_TENSOR;
-    arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-    arguments[0].tensor.resource = vertices.reference;
-    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-    arguments[0].tensor.access = VERNON_ACCESS_READ;
-    arguments[0].tensor.rank = 2;
-    arguments[0].tensor.shape = vertexShape;
-    arguments[0].tensor.byte_strides = vertexStrides;
-    arguments[0].tensor.byte_size = sizeof(positions);
-    arguments[1].slot = cubeParameter.slot;
-    arguments[1].kind = VERNON_PROGRAM_IMAGE;
-    arguments[1].image = {cubeView.reference};
-    for (size_t index = 2; index < arguments.size(); ++index) {
-        arguments[index].kind = VERNON_PROGRAM_TENSOR;
-        arguments[index].tensor.struct_size = sizeof(VernonTensorView);
-        arguments[index].tensor.storage = VERNON_TENSOR_HOST;
-        arguments[index].tensor.host_data = identity.data();
-        arguments[index].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-        arguments[index].tensor.access = VERNON_ACCESS_READ;
-        arguments[index].tensor.rank = 2;
-        arguments[index].tensor.shape = matrixShape;
-        arguments[index].tensor.byte_strides = matrixStrides;
-        arguments[index].tensor.byte_size = identity.size() * sizeof(float);
-    }
-    arguments[2].slot = modelParameter.slot;
-    arguments[3].slot = projectionParameter.slot;
-    arguments[4].slot = viewParameter.slot;
+    vernon::tests::PassControls pass(color.reference(), 32);
+    std::array<VernonColorAttachment, 2> attachments{pass.attachment, pass.attachment};
+    attachments[1].location = 1;
+    attachments[1].view = bloom.reference();
+    pass.renderPass.color_attachments = attachments.data();
+    pass.renderPass.color_attachment_count = static_cast<uint32_t>(attachments.size());
+    const VernonDrawCommand draw{sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
+    pass.writeTo(linked.record(), 0, &draw);
+    ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
 
-    const VernonColorAttachment attachments[] = {
-        {0, colorView.reference},
-        {1, bloomView.reference},
-    };
-    const vernon::tests::CanonicalGraphicsControls graphics(attachments, std::size(attachments), 3);
-    const VernonStatus invokeStatus =
-        vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics);
-    expectRuntimeOk(runtime, invokeStatus);
-    ASSERT_EQ(invokeStatus, VERNON_STATUS_OK);
-
-    std::vector<uint8_t> colorPixels(32 * 32 * 4);
-    std::vector<uint8_t> bloomPixels(32 * 32 * 4);
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = 32;
-    download.height = 32;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadImage(context.device, color.handle, &download, colorPixels.data(), colorPixels.size()),
-        VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadImage(context.device, bloom.handle, &download, bloomPixels.data(), bloomPixels.size()),
-        VERNON_RHI_STATUS_OK);
     const size_t center = (16 * 32 + 16) * 4;
+    const std::vector<uint8_t> colorPixels = color.rgba8();
+    const std::vector<uint8_t> bloomPixels = bloom.rgba8();
     EXPECT_NEAR(colorPixels[center], 64, 10);
     EXPECT_NEAR(colorPixels[center + 1], 200, 10);
     EXPECT_NEAR(colorPixels[center + 2], 100, 10);
@@ -179,17 +77,4 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     EXPECT_LT(bloomPixels[center + 1], 10);
     EXPECT_LT(bloomPixels[center + 2], 10);
     EXPECT_GT(bloomPixels[center + 3], 240);
-
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, bloomView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, colorView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, cubeView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, bloom.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, color.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, cube.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(loaded);
-    ASSERT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-    vernonRhiDestroyDevice(context.device);
 }

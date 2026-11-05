@@ -125,7 +125,7 @@ A storage binding:
 
 Storage texture operations therefore do not replace sampled texture
 operations. A storage binding cannot call `sample`. The same compatible image
-may be rebound as sampled in a later pass after the private Command DAG inserts
+may be rebound as sampled in a later pass after the linked schedule inserts
 the required synchronization. Simultaneously sampling and writing an
 overlapping subresource in one dispatch is rejected unless a future contract
 defines a portable, explicitly synchronized feedback model.
@@ -326,7 +326,7 @@ views, hazards and readback follow this document. Three rules differ:
 
 ## 8. Synchronization and hazards
 
-The private Command DAG tracks hazards by parent image identity plus overlapping
+A linked schedule tracks hazards by parent image identity plus overlapping
 subresource ranges. Views of disjoint mip or layer ranges may avoid false
 dependencies when the backend can express the required barriers. Overlapping
 uses preserve RAW, WAR, and WAW ordering.
@@ -352,8 +352,8 @@ The implementation must preserve these invariants:
 2. provider retain/release callbacks are mandatory;
 3. shader and attachment bindings accept image views only;
 4. descriptors are queried from retained resource records;
-5. the Command DAG retains every imported view and its parent and tracks hazards
-   by parent identity plus subresource overlap;
+5. a linked schedule tracks hazards by parent identity plus subresource
+   overlap;
 6. backend state tracking and barriers preserve per-mip and per-layer state,
    with aspect planes tracked separately where the native API supports it;
 7. no flattened compatibility records, implicit image-owned sampler field, or

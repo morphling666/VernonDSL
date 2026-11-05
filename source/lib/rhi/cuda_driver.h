@@ -17,9 +17,25 @@ using Module = struct ModuleOpaque *;
 using Function = struct FunctionOpaque *;
 using Stream = struct StreamOpaque *;
 using Event = struct EventOpaque *;
+using Graph = struct GraphOpaque *;
+using GraphExec = struct GraphExecOpaque *;
+using GraphNode = struct GraphNodeOpaque *;
 using Result = int;
 
+// CUDA_KERNEL_NODE_PARAMS_v2, whose prefix is the v1 layout that drivers before CUDA 12 read.
+struct KernelNodeParams {
+    Function function;
+    unsigned gridDimX, gridDimY, gridDimZ;
+    unsigned blockDimX, blockDimY, blockDimZ;
+    unsigned sharedMemBytes;
+    void **kernelParams;
+    void **extra;
+    void *kernel;
+    Context context;
+};
+
 constexpr Result kSuccess = 0;
+constexpr Result kErrorOutOfMemory = 2;
 constexpr Result kNotReady = 600;
 constexpr unsigned kEventDisableTiming = 0x2;
 
@@ -40,6 +56,7 @@ struct VERNON_RHI_CAPI Driver {
     using CopyHostToDeviceAsync = Result (*)(DevicePointer, const void *, size_t, Stream);
     using CopyDeviceToHostAsync = Result (*)(void *, DevicePointer, size_t, Stream);
     using CopyDeviceToDeviceAsync = Result (*)(DevicePointer, DevicePointer, size_t, Stream);
+    using MemsetD8Async = Result (*)(DevicePointer, unsigned char, size_t, Stream);
     using ModuleLoadData = Result (*)(Module *, const void *, unsigned, int *, void **);
     using ModuleGetFunction = Result (*)(Function *, Module, const char *);
     using ModuleUnload = Result (*)(Module);
@@ -54,8 +71,19 @@ struct VERNON_RHI_CAPI Driver {
     using EventElapsedTime = Result (*)(float *, Event, Event);
     using LaunchKernel = Result (*)(Function, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                     Stream, void **, void **);
-
+    using GraphCreate = Result (*)(Graph *, unsigned);
+    using GraphDestroy = Result (*)(Graph);
+    using GraphAddKernelNode = Result (*)(GraphNode *, Graph, const GraphNode *, size_t, const KernelNodeParams *);
+    using GraphInstantiate = Result (*)(GraphExec *, Graph, unsigned long long);
+    using GraphExecDestroy = Result (*)(GraphExec);
+    using GraphLaunch = Result (*)(GraphExec, Stream);
+    using GraphExecKernelNodeSetParams = Result (*)(GraphExec, GraphNode, const KernelNodeParams *);
     bool load();
+    // Graph entry points are optional; without them launches go to the stream one by one.
+    bool hasGraphs() const {
+        return graphCreate && graphDestroy && graphAddKernelNode && graphInstantiate && graphExecDestroy &&
+               graphLaunch && graphExecKernelNodeSetParams;
+    }
 
     platform::PlatformLibrary library;
     std::mutex mutex;
@@ -78,6 +106,7 @@ struct VERNON_RHI_CAPI Driver {
     CopyHostToDeviceAsync copyHostToDeviceAsync{};
     CopyDeviceToHostAsync copyDeviceToHostAsync{};
     CopyDeviceToDeviceAsync copyDeviceToDeviceAsync{};
+    MemsetD8Async memsetD8Async{};
     ModuleLoadData moduleLoadData{};
     ModuleGetFunction moduleGetFunction{};
     ModuleUnload moduleUnload{};
@@ -91,6 +120,13 @@ struct VERNON_RHI_CAPI Driver {
     EventSynchronize eventSynchronize{};
     EventElapsedTime eventElapsedTime{};
     LaunchKernel launchKernel{};
+    GraphCreate graphCreate{};
+    GraphDestroy graphDestroy{};
+    GraphAddKernelNode graphAddKernelNode{};
+    GraphInstantiate graphInstantiate{};
+    GraphExecDestroy graphExecDestroy{};
+    GraphLaunch graphLaunch{};
+    GraphExecKernelNodeSetParams graphExecKernelNodeSetParams{};
 };
 
 VERNON_RHI_CAPI Driver &driver();

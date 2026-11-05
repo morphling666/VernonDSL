@@ -1,6 +1,7 @@
 #include "runtime_dispatch.h"
 
 #include "backend_cpu.h"
+#include "prepared_binding_plan.h"
 
 #include <memory>
 #include <utility>
@@ -26,7 +27,6 @@ RuntimeResult<void> unregisterBackendStaticCpuEntries(const VernonStaticCpuEntry
 BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,
                                                        size_t artifactSize, const std::string &entry,
-                                                       VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots) {
     auto child = RuntimeChildLifecycle::reserve(context.owner);
     if (child.isErr())
@@ -40,12 +40,11 @@ BackendStageLoadResult loadBackendTypedComputePipeline(VernonRuntimeContext &con
     pipeline->readFootprints = reflection.readFootprints;
     pipeline->writeFootprints = reflection.writeFootprints;
     if (context.backend == VERNON_RUNTIME_CPU) {
-        CpuKernelState kernel;
-        kernel.entry = cpuEntry;
-        auto state = std::make_unique<CpuPipelineState>();
-        if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(reflection), *state))
-            return BackendStageLoadResult{vernon::err(BackendPipelineError::CpuPreparationFailed)};
-        installRuntimeBackendState(*pipeline, state.release());
+        PreparedComputeBindingPlan validated;
+        std::string diagnostic;
+        if (!buildPreparedComputeBindingPlan({}, reflection, VERNON_RUNTIME_CPU, validated, diagnostic))
+            return BackendStageLoadResult{vernon::err(
+                BackendPipelineFailure{BackendPipelineError::BackendResolutionFailed, std::move(diagnostic)})};
         if (pipeline->lifecycle.value().publish().isErr())
             return BackendStageLoadResult{vernon::err(BackendPipelineError::LifecycleUnavailable)};
         return BackendStageLoadResult{vernon::ok(std::move(pipeline))};

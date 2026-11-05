@@ -398,4 +398,8 @@ VernonCpuEntryPoint findCompiledCpuEntry(const CpuExecutionState *execution, std
     return findCpuEntry(execution, entry);
 }
 
+VernonCpuChunkEntryPoint findCompiledCpuChunkEntry(const CpuExecutionState *execution, std::string_view entry) {
+    return findCpuChunkEntry(execution, entry);
+}
+
 } // namespace vernon::compiler

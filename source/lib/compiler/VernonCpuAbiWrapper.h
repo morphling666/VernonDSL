@@ -43,10 +43,17 @@ struct CpuAbiWrapperMetadata {
     bool requiresTextureCallbacks;
     bool requiresPhases;
     std::string exportedWrapperSymbol;
+    // Where each TensorView's innermost stride sits in the packed arguments; a range whose strides are all 1 runs a
+    // copy of the lane loop that knows them, so its accesses are consecutive.
+    std::vector<CpuCallLanePacking> innermostStrides;
 };
 
 llvm::Error defineCpuTextureSampleHelper(llvm::Module &module);
+// Emits the entry's range wrapper and, when the kernel qualifies (VernonCpuChunk), its chunk entry.
 llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata &metadata);
+inline std::string cpuChunkEntrySymbol(const CpuAbiWrapperMetadata &metadata) {
+    return metadata.exportedWrapperSymbol + "_chunk";
+}
 inline constexpr const char *cpuStaticRegistrationSymbol = "vernonRuntimeRegisterStaticCpuEntries";
 inline constexpr const char *cpuStaticUnregistrationSymbol = "vernonRuntimeUnregisterStaticCpuEntries";
 

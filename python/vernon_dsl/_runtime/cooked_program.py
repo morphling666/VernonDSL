@@ -10,8 +10,7 @@ from typing import Any
 
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..types import Specialization, SpecializationAssignment, specialization_key
-from .binding import _dispatch_borrow_scope, _DispatchBorrowLease, _PersistentBindingTable, _raise_invocation_error
-from .sampler import SamplerState
+from .binding import _DispatchBorrowLease
 from .session import (
     _execution_context,
     _invocation_context,
@@ -19,8 +18,15 @@ from .session import (
     _SessionArtifactCache,
     _use_invocation_context,
 )
-from .tensor import TensorStorage, TensorView
-from .texture import _TextureResource
+
+
+@dataclass(frozen=True)
+class _CookedInvocation:
+    """The boundary values of one cooked Program call, as the linked schedule helpers read a Program invocation."""
+
+    inputs: Mapping[str, Any]
+    input_annotations: Mapping[str, Any] = field(default_factory=dict)
+    graphics_controls: Mapping[int, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,9 @@ class _CookedProgramPullback:
     cotangent_groups: tuple[DerivativeGroup, ...]
     carrier_shape: tuple[int, ...]
     context: _InvocationContext
+    # A linked pullback's residuals point into the memory of its forward call's inputs, which a later write leaves to
+    # the pullback.
+    preserved: Any = None
 
     def __call__(self, cotangent: Any = None) -> dict[str, Any]:
         with _use_invocation_context(self.context):
@@ -69,7 +78,27 @@ class _CookedProgramPullback:
 @dataclass
 class _LoadedCookedProgram:
     native: Any
-    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable)
+    # The executable linked as a schedule and as a VJP by its first call. An executable that does not link raises the
+    # linker's ValueError on every call.
+    _schedule: Any = None
+    _vjp: Any = None
+
+    def linked_schedule(self, state: Any) -> Any:
+        if self._schedule is None:
+            self._schedule = state.native._ProgramSchedule(self.native)
+        return self._schedule
+
+    def linked_vjp(self, state: Any) -> Any:
+        if self._vjp is None:
+            self._vjp = state.native._ProgramVjp(self.native)
+        return self._vjp
+
+
+def _cooked_invocation(native: Any, bindings: Mapping[str, Any]) -> tuple[_CookedInvocation, dict[str, Any]]:
+    slots = tuple(slot for slot in native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"})
+    inputs = {slot["path"]: bindings[slot["path"]] for slot in slots if slot["role"] == "input"}
+    targets = {slot["path"]: bindings[slot["path"]] for slot in slots if slot["role"] == "output"}
+    return _CookedInvocation(inputs), targets
 
 
 @dataclass(eq=False)
@@ -150,34 +179,10 @@ class CookedProgram:
         slots = tuple(slot for slot in native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"})
         if set(parameters) != {slot["slot"] for slot in slots}:
             raise RuntimeError("cooked Program parameters do not match compiler-emitted ProgramABI")
-        access_names = {
-            state.native.ACCESS_READ: "read",
-            state.native.ACCESS_WRITE: "write",
-            state.native.ACCESS_READ_WRITE: "read_write",
-        }
-        resolved = [(parameters[slot["slot"]], bindings[slot["path"]]) for slot in slots]
-        borrows = [
-            (parameter.slot, value, access_names[parameter.access])
-            for parameter, value in resolved
-            if isinstance(value, (TensorStorage, TensorView, _TextureResource))
-        ]
-        with (
-            _dispatch_borrow_scope(borrows, context) as lease,
-            loaded.binding_cache.invocation(native, context) as native_invocation,
-        ):
-            builder = native_invocation.builder
-            for parameter, value in resolved:
-                if parameter.kind == state.native.PROGRAM_SAMPLER:
-                    if not isinstance(value, SamplerState):
-                        raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
-                    loaded.binding_cache.bind_sampler(builder, native, parameter, value)
-                else:
-                    loaded.binding_cache.bind_argument(builder, native, parameter, value)
-            outcome = native_invocation.execute()
-            lease.resolve(outcome)
-            if not outcome.ok:
-                _raise_invocation_error(outcome, "cooked Program forward failed", context)
-            native_invocation.commit()
+        from .program_autodiff import _call_program_schedule
+
+        invocation, targets = _cooked_invocation(native, bindings)
+        _call_program_schedule(loaded.linked_schedule(state), native, invocation, targets)
 
     def vjp(
         self,
@@ -213,37 +218,13 @@ class CookedProgram:
             grid_values = {}
         if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
             raise ValueError("autodiff bindings do not match Program parameters")
+        from .program_autodiff import _call_program_vjp
+        from .tensor import _owner_controls, _PreservedOwners
+
         context = _execution_context()
-        state = context.session
-        access_names = {
-            state.native.ACCESS_READ: "read",
-            state.native.ACCESS_WRITE: "write",
-            state.native.ACCESS_READ_WRITE: "read_write",
-        }
-        borrows = [
-            (parameter.slot, bindings[parameter.name], access_names[parameter.access])
-            for parameter in parameters
-            if parameter.name not in grid_values
-            if isinstance(bindings[parameter.name], (TensorStorage, TensorView, _TextureResource))
-        ]
-        lease = _DispatchBorrowLease(borrows, context)
-        try:
-            with loaded.binding_cache.invocation(native, context) as native_invocation:
-                builder = native_invocation.builder
-                for parameter in parameters:
-                    value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
-                    loaded.binding_cache.bind_argument(builder, native, parameter, value)
-                outcome, output, native_pullback = native.program_vjp_transaction(
-                    native_invocation,
-                    bindings,
-                    lease.resolve,
-                )
-                if not outcome.ok:
-                    _raise_invocation_error(outcome, "cooked Program autodiff forward failed", context)
-        except BaseException:
-            raise
-        finally:
-            lease.release()
+        invocation, targets = _cooked_invocation(native, {**bindings, **grid_values})
+        native_pullback = _call_program_vjp(loaded.linked_vjp(context.session), native, invocation, targets, bindings)
+        preserved = _PreservedOwners(_owner_controls(invocation.inputs.values()))
         groups = tuple(
             DerivativeGroup(str(role), str(path), tuple(str(leaf) for leaf in leaves))
             for role, path, leaves in native.derivative_groups
@@ -256,12 +237,13 @@ class CookedProgram:
             workgroup = tuple(getattr(native, "workgroup_size", (1, 1, 1)))
             extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
             carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
-        return output, _CookedProgramPullback(
+        return {}, _CookedProgramPullback(
             native_pullback,
             tuple(group for group in groups if group.role == "gradient"),
             tuple(group for group in groups if group.role == "cotangent"),
             carrier_shape,
             context,
+            preserved,
         )
 
 

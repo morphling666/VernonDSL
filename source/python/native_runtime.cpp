@@ -8,11 +8,11 @@ namespace {
 
 #if defined(VERNON_ENABLE_LIFECYCLE_TEST_HOOKS)
 std::atomic<uint64_t> destroyedRuntimes{};
-std::atomic<uint64_t> destroyedRhiDevices{};
+std::atomic<uint64_t> destroyedDevices{};
 std::atomic<uint64_t> destroyedOwnedContexts{};
 std::atomic<uint64_t> destructionSequence{};
 std::atomic<uint64_t> runtimeDestructionOrder{};
-std::atomic<uint64_t> rhiDeviceDestructionOrder{};
+std::atomic<uint64_t> deviceDestructionOrder{};
 std::atomic<uint64_t> ownedContextDestructionOrder{};
 #endif
 
@@ -28,11 +28,11 @@ void noteRuntimeDestroyed() noexcept {
 #endif
 }
 
-void noteRhiDeviceDestroyed() noexcept {
+void noteDeviceDestroyed() noexcept {
 #if defined(VERNON_ENABLE_LIFECYCLE_TEST_HOOKS)
-    destroyedRhiDevices.fetch_add(1, std::memory_order_relaxed);
-    rhiDeviceDestructionOrder.store(destructionSequence.fetch_add(1, std::memory_order_relaxed) + 1,
-                                    std::memory_order_relaxed);
+    destroyedDevices.fetch_add(1, std::memory_order_relaxed);
+    deviceDestructionOrder.store(destructionSequence.fetch_add(1, std::memory_order_relaxed) + 1,
+                                 std::memory_order_relaxed);
 #endif
 }
 
@@ -47,11 +47,11 @@ void noteOwnedContextDestroyed() noexcept {
 void resetLifecycleCounts() noexcept {
 #if defined(VERNON_ENABLE_LIFECYCLE_TEST_HOOKS)
     destroyedRuntimes.store(0, std::memory_order_relaxed);
-    destroyedRhiDevices.store(0, std::memory_order_relaxed);
+    destroyedDevices.store(0, std::memory_order_relaxed);
     destroyedOwnedContexts.store(0, std::memory_order_relaxed);
     destructionSequence.store(0, std::memory_order_relaxed);
     runtimeDestructionOrder.store(0, std::memory_order_relaxed);
-    rhiDeviceDestructionOrder.store(0, std::memory_order_relaxed);
+    deviceDestructionOrder.store(0, std::memory_order_relaxed);
     ownedContextDestructionOrder.store(0, std::memory_order_relaxed);
 #endif
 }
@@ -60,10 +60,10 @@ LifecycleCounts lifecycleCounts() noexcept {
 #if defined(VERNON_ENABLE_LIFECYCLE_TEST_HOOKS)
     return {
         destroyedRuntimes.load(std::memory_order_relaxed),
-        destroyedRhiDevices.load(std::memory_order_relaxed),
+        destroyedDevices.load(std::memory_order_relaxed),
         destroyedOwnedContexts.load(std::memory_order_relaxed),
         runtimeDestructionOrder.load(std::memory_order_relaxed),
-        rhiDeviceDestructionOrder.load(std::memory_order_relaxed),
+        deviceDestructionOrder.load(std::memory_order_relaxed),
         ownedContextDestructionOrder.load(std::memory_order_relaxed),
     };
 #else
@@ -85,32 +85,13 @@ PythonProgramExecutable::~PythonProgramExecutable() {
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-RhiHostState *runtimeRhiHost(const RuntimeState *runtime) { return runtime ? runtime->rhiHost.get() : nullptr; }
+bool runtimeOnDevice(const RuntimeState *runtime) { return runtime && runtime->device->backend != VERNON_RUNTIME_CPU; }
 
-std::unique_ptr<Runtime> createRhiRuntime(RhiHost &host) {
-    VernonRuntimeBackend backend;
-    switch (host.state->backend) {
-    case VERNON_RHI_BACKEND_CUDA:
-        backend = VERNON_RUNTIME_CUDA;
-        break;
-    case VERNON_RHI_BACKEND_VULKAN:
-        backend = VERNON_RUNTIME_VULKAN;
-        break;
-    case VERNON_RHI_BACKEND_DIRECTX12:
-        backend = VERNON_RUNTIME_DIRECTX12;
-        break;
-    case VERNON_RHI_BACKEND_METAL:
-        backend = VERNON_RUNTIME_METAL;
-        break;
-    case VERNON_RHI_BACKEND_OPENGL:
-        backend = VERNON_RUNTIME_OPENGL;
-        break;
-    case VERNON_RHI_BACKEND_OPENGL_ES:
-        backend = VERNON_RUNTIME_OPENGL_ES;
-        break;
+std::unique_ptr<Runtime> deviceRuntime(HalDevice &device) {
+    std::shared_ptr<RuntimeState> state = device.state->runtime.lock();
+    if (!state) {
+        state = std::make_shared<RuntimeState>(device.state);
+        device.state->runtime = state;
     }
-    RuntimeContextOwner runtime(vernonRuntimeCreateForRhiDevice(backend, host.state->device, nullptr));
-    if (!runtime)
-        throw std::runtime_error("cannot create Runtime for Vernon RHI device");
-    return std::make_unique<Runtime>(std::move(runtime), host.state);
+    return std::make_unique<Runtime>(std::move(state));
 }

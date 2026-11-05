@@ -340,8 +340,11 @@ RhiAdapterResult<void> failureResult(VkResult result, const char *operation) {
                : providerFailure(vernon::ProviderErrorCode::BackendFailure, operation, static_cast<uint64_t>(result));
 }
 
-uint32_t getCapabilities(void *) {
-    return VERNON_RUNTIME_PROVIDER_COMPUTE | VERNON_RUNTIME_PROVIDER_GRAPHICS | VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP;
+uint32_t getCapabilities(void *data) {
+    const auto &device = vulkanDevice(*static_cast<VernonRuntimeRhiAdapter *>(data));
+    return VERNON_RUNTIME_PROVIDER_COMPUTE | VERNON_RUNTIME_PROVIDER_GRAPHICS | VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP |
+           VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS |
+           (device.multiDrawIndirect ? VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS : 0u);
 }
 
 VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
@@ -1401,6 +1404,88 @@ struct VulkanPacketDecoder {
 
     RhiAdapterResult<void> draw(uint32_t, uint32_t indexResource, const VernonRuntimeProviderDrawPayload &draw,
                                 const vernon::rhi::OpenedRendering &) {
+        if (auto prepared = prepareDraw(draw.viewport, draw.scissor, draw.stencil_reference); !prepared)
+            return prepared;
+        auto &driver = rhi::vulkan::driver();
+        const VkCommandBuffer command = commands.command;
+        if (indexResource == UINT32_MAX) {
+            driver.cmdDraw(command, draw.vertex_count, draw.instance_count, 0, draw.first_instance);
+            return RhiAdapterResult<void>{vernon::ok()};
+        }
+        bindIndexBuffer(indexResource);
+        driver.cmdDrawIndexed(command, draw.vertex_count, draw.instance_count, draw.first_index, draw.base_vertex,
+                              draw.first_instance);
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    // A device stream is one indirect draw, counted when it has counts; a host stream's records are read now, one
+    // native draw each.
+    RhiAdapterResult<void> drawStream(uint32_t, uint32_t indexResource, uint32_t recordsResource,
+                                      uint32_t countsResource, const VernonRuntimeProviderStreamPayload &stream,
+                                      const vernon::rhi::OpenedRendering &) {
+        auto &driver = rhi::vulkan::driver();
+        const VkCommandBuffer command = commands.command;
+        if (recordsResource == UINT32_MAX) {
+            const auto address = [](const uint32_t *words) {
+                return static_cast<uintptr_t>(words[0] | (uint64_t{words[1]} << 32));
+            };
+            const auto *records =
+                reinterpret_cast<const VernonRuntimeProviderDrawRecord *>(address(stream.host_records)) +
+                stream.first_record;
+            const uint32_t count =
+                std::min(reinterpret_cast<const uint32_t *>(address(stream.host_counts))[stream.count_index],
+                         stream.max_records);
+            if (count == 0)
+                return RhiAdapterResult<void>{vernon::ok()};
+            if (auto prepared = prepareDraw(stream.viewport, stream.scissor, stream.stencil_reference); !prepared)
+                return prepared;
+            bindIndexBuffer(indexResource);
+            for (uint32_t index = 0; index < count; ++index)
+                if (records[index].index_count != 0 && records[index].instance_count != 0)
+                    driver.cmdDrawIndexed(command, records[index].index_count, records[index].instance_count,
+                                          records[index].first_index, records[index].base_vertex,
+                                          records[index].first_instance);
+            return RhiAdapterResult<void>{vernon::ok()};
+        }
+        const bool counted = countsResource != UINT32_MAX;
+        if (!vulkanDevice(adapter).multiDrawIndirect ||
+            (counted && (!driver.cmdDrawIndexedIndirectCount || !vulkanDevice(adapter).drawIndirectCount)))
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "vulkan_device_draw_streams_are_unsupported");
+        if (stream.max_records == 0)
+            return RhiAdapterResult<void>{vernon::ok()};
+        if (auto prepared = prepareDraw(stream.viewport, stream.scissor, stream.stencil_reference); !prepared)
+            return prepared;
+        bindIndexBuffer(indexResource);
+        const auto native = [&](uint32_t resource) {
+            return reinterpret_cast<rhi::vulkan::Buffer *>(batch.natives[resource])->buffer;
+        };
+        const uint64_t recordsOffset = batch.resources[recordsResource].offset +
+                                       uint64_t{stream.first_record} * sizeof(VernonRuntimeProviderDrawRecord);
+        if (!counted) {
+            driver.cmdDrawIndexedIndirect(command, native(recordsResource), recordsOffset, stream.max_records,
+                                          sizeof(VernonRuntimeProviderDrawRecord));
+            return RhiAdapterResult<void>{vernon::ok()};
+        }
+        driver.cmdDrawIndexedIndirectCount(command, native(recordsResource), recordsOffset, native(countsResource),
+                                           batch.resources[countsResource].offset + uint64_t{stream.count_index} * 4,
+                                           stream.max_records, sizeof(VernonRuntimeProviderDrawRecord));
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    void bindIndexBuffer(uint32_t indexResource) {
+        const VkBuffer indexBuffer = reinterpret_cast<rhi::vulkan::Buffer *>(batch.natives[indexResource])->buffer;
+        const uint64_t indexOffset = batch.resources[indexResource].offset;
+        if (commands.indexBuffer != indexBuffer || commands.indexBufferOffset != indexOffset) {
+            rhi::vulkan::driver().cmdBindIndexBuffer(commands.command, indexBuffer, indexOffset, VK_INDEX_TYPE_UINT32);
+            commands.indexBuffer = indexBuffer;
+            commands.indexBufferOffset = indexOffset;
+        }
+    }
+
+    // Flushes the groups and sets the dynamic state of the draws that follow.
+    RhiAdapterResult<void> prepareDraw(const uint32_t *viewportRect, const uint32_t *scissorRect,
+                                       uint32_t stencilReference) {
         if (!commands.pipeline || !commands.pipeline->graphics || !commands.rendering)
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
                                    "vulkan_adapter_received_an_invalid_draw_descriptor");
@@ -1410,7 +1495,7 @@ struct VulkanPacketDecoder {
             return checked;
         auto &driver = rhi::vulkan::driver();
         const VkCommandBuffer command = commands.command;
-        const std::array<uint32_t, 4> viewport{draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3]};
+        const std::array<uint32_t, 4> viewport{viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]};
         if (!commands.viewportValid || commands.viewport != viewport) {
             const VkViewport native{static_cast<float>(viewport[0]),
                                     static_cast<float>(viewport[1] + viewport[3]),
@@ -1422,7 +1507,7 @@ struct VulkanPacketDecoder {
             commands.viewport = viewport;
             commands.viewportValid = true;
         }
-        const std::array<uint32_t, 4> scissor{draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]};
+        const std::array<uint32_t, 4> scissor{scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]};
         if (!commands.scissorValid || commands.scissor != scissor) {
             const VkRect2D native{{static_cast<int32_t>(scissor[0]), static_cast<int32_t>(scissor[1])},
                                   {scissor[2], scissor[3]}};
@@ -1430,24 +1515,11 @@ struct VulkanPacketDecoder {
             commands.scissor = scissor;
             commands.scissorValid = true;
         }
-        if (!commands.stencilValid || commands.stencilReference != draw.stencil_reference) {
-            driver.cmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_AND_BACK, draw.stencil_reference);
-            commands.stencilReference = draw.stencil_reference;
+        if (!commands.stencilValid || commands.stencilReference != stencilReference) {
+            driver.cmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_AND_BACK, stencilReference);
+            commands.stencilReference = stencilReference;
             commands.stencilValid = true;
         }
-        if (indexResource == UINT32_MAX) {
-            driver.cmdDraw(command, draw.vertex_count, draw.instance_count, 0, draw.first_instance);
-            return RhiAdapterResult<void>{vernon::ok()};
-        }
-        const VkBuffer indexBuffer = reinterpret_cast<rhi::vulkan::Buffer *>(batch.natives[indexResource])->buffer;
-        const uint64_t indexOffset = batch.resources[indexResource].offset;
-        if (commands.indexBuffer != indexBuffer || commands.indexBufferOffset != indexOffset) {
-            driver.cmdBindIndexBuffer(command, indexBuffer, indexOffset, VK_INDEX_TYPE_UINT32);
-            commands.indexBuffer = indexBuffer;
-            commands.indexBufferOffset = indexOffset;
-        }
-        driver.cmdDrawIndexed(command, draw.vertex_count, draw.instance_count, draw.first_index, draw.base_vertex,
-                              draw.first_instance);
         return RhiAdapterResult<void>{vernon::ok()};
     }
 };

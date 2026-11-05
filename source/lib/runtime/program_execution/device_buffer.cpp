@@ -1,9 +1,7 @@
 #include "device_buffer.h"
 
-#include "failure_injection.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
-#include "submission_queue.h"
 
 #include <utility>
 
@@ -17,11 +15,8 @@ DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, size_t size) : context
     descriptor.usage =
         VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
     descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
-    if (!size || injectFailure(FailureBoundary::Allocation) ||
-        vernonRhiDeviceCreateBuffer(context.rhiDevice, &descriptor, &handle_) != VERNON_RHI_STATUS_OK)
+    if (!size || vernonRhiDeviceCreateBuffer(context.rhiDevice, &descriptor, &handle_) != VERNON_RHI_STATUS_OK)
         handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    else
-        TransientAllocationMeter::charge(context, size);
 }
 
 DeviceBuffer::DeviceBuffer(DeviceBuffer &&other) noexcept
@@ -46,59 +41,10 @@ bool DeviceBuffer::valid() const {
            vernonRhiDeviceIsBufferValid(context_->rhiDevice, handle_);
 }
 
-bool DeviceBuffer::upload(const void *source, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Transfer) &&
-           vernonRhiDeviceUploadBuffer(context_->rhiDevice, handle_, 0, source, size) == VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, const void *source, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Transfer) &&
-           vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, 0, source, size) ==
-               VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, size_t offset, const void *source, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Transfer) &&
-           vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, offset, source, size) ==
-               VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::upload(size_t offset, const void *source, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Transfer) &&
-           vernonRhiDeviceUploadBuffer(context_->rhiDevice, handle_, offset, source, size) == VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::uploadRanges(const std::vector<VernonRhiBufferUploadRange> &ranges) const {
-    return valid() && !injectFailure(FailureBoundary::Transfer) &&
-           vernonRhiDeviceUploadBufferRanges(context_->rhiDevice, handle_, ranges.data(), ranges.size()) ==
-               VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::download(void *destination, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Readback) &&
-           vernonRhiDeviceDownloadBuffer(context_->rhiDevice, handle_, 0, destination, size) == VERNON_RHI_STATUS_OK;
-}
-
-bool DeviceBuffer::download(size_t offset, void *destination, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Readback) &&
-           vernonRhiDeviceDownloadBuffer(context_->rhiDevice, handle_, offset, destination, size) ==
-               VERNON_RHI_STATUS_OK;
-}
-
 bool DeviceBuffer::reference(VernonRuntimeProviderResourceReference &output) const {
     if (!valid())
         return false;
     auto referenced = referenceBackendRhiBuffer(*context_, handle_, 0, size_);
-    if (referenced.isErr())
-        return false;
-    output = referenced.value();
-    return true;
-}
-
-bool DeviceBuffer::reference(size_t offset, size_t size, VernonRuntimeProviderResourceReference &output) const {
-    if (!valid() || offset > size_ || size > size_ - offset)
-        return false;
-    auto referenced = referenceBackendRhiBuffer(*context_, handle_, offset, size);
     if (referenced.isErr())
         return false;
     output = referenced.value();

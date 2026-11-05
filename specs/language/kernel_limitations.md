@@ -160,12 +160,14 @@ CUDA:
 - **Kernel code is within about 10% of numba-cuda's** with fused multiply-add
   off on both sides. The gaps are in the runtime around it: an 8M-element
   `axpy` is 22 times slower, and the nearest-segment search 1.5 times slower.
-- **Launches are synchronous.** The runtime waits for each submission to
-  complete, once for the kernel and again for each copy batch. Host work never
-  overlaps device work, and consecutive launches cannot queue.
-- **No device wait without a download.** `synchronize()` downloads
-  device-dirty ranges. Waiting for a launch without reading its output needs a
-  second, one-lane kernel whose output is read back.
+- **Program launches are synchronous.** A kernel call that runs as a
+  Program, as its first call on fresh data does, waits for each submission to
+  complete, once for the kernel and again for each copy batch. A linked call
+  (`runtime/architecture_v2.md`) returns once its launch is enqueued, and
+  `wait()` waits for it without a download.
+- **A kernel that records an autodiff tape does not link**, on the CPU or
+  CUDA, so its calls and its VJP's run as Programs. A backward kernel that
+  binds the tape only for its launch metadata links.
 - **Transfers copy on the host three to four times per direction.** A 64 MB
   download takes about 33 ms (2 GB/s); numba-cuda uploads 128 MB and downloads
   64 MB in 25 ms.

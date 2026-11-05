@@ -84,7 +84,7 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
 - [x] Generate a test-only `(fixture_id, target) -> manifest path` table.
 - [x] Ensure each target-specific artifact is built once and reused by all tests for that target.
 - [x] Remove grouped `VERNON_*_METAL_MANIFEST`, `VERNON_*_VULKAN_MANIFEST`, and equivalent path macros after consumers migrate.
-- [x] Parameterize `source/tests/runtime/runtime_module_program_gpu_c_api_test.cpp` as the reference suite.
+- [x] Parameterize `source/tests/runtime/runtime_module_program_schedule_test.cpp` as the reference suite.
 - [x] Run compute Module forward, TensorView chain, dynamic shape/grid reuse, and Module VJP on every applicable backend.
 - [x] Verify expected run and skip sets on the current platform.
 

@@ -14,7 +14,11 @@ enum { VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8, VERNON_RUNTIME_PROVIDER_MA
 typedef enum VernonRuntimeProviderCapabilityBits {
     VERNON_RUNTIME_PROVIDER_COMPUTE = 1u << 0,
     VERNON_RUNTIME_PROVIDER_GRAPHICS = 1u << 1,
-    VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP = 1u << 2
+    VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP = 1u << 2,
+    /* DRAW_INDEXED_STREAM reads its records and counts from buffer resources. */
+    VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS = 1u << 3,
+    /* DRAW_INDEXED_STREAM reads its records and counts from host memory while the batch is encoded. */
+    VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS = 1u << 4
 } VernonRuntimeProviderCapabilityBits;
 
 enum { VERNON_RUNTIME_PROVIDER_MAX_GROUPS = 8, VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS = 16 };
@@ -326,8 +330,43 @@ typedef enum VernonRuntimeProviderPacketOpcode {
     VERNON_RUNTIME_PROVIDER_PACKET_PUSH_DEBUG_GROUP = 9,
     VERNON_RUNTIME_PROVIDER_PACKET_POP_DEBUG_GROUP = 10,
     /* label byte count, then the label bytes in whole words */
-    VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER = 11
+    VERNON_RUNTIME_PROVIDER_PACKET_INSERT_DEBUG_MARKER = 11,
+    /*
+     * topology, resource of the 32-bit index buffer, resource of the records and resource of the counts, both
+     * UINT32_MAX for host streams and the counts UINT32_MAX for a device stream that draws all max_records records,
+     * then payload of a VernonRuntimeProviderStreamPayload
+     */
+    VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED_STREAM = 12
 } VernonRuntimeProviderPacketOpcode;
+
+/*
+ * One indexed draw of a stream, in the layout of VkDrawIndexedIndirectCommand and OpenGL's
+ * DrawElementsIndirectCommand.
+ */
+typedef struct VernonRuntimeProviderDrawRecord {
+    uint32_t index_count;
+    uint32_t instance_count;
+    uint32_t first_index;
+    int32_t base_vertex;
+    uint32_t first_instance;
+} VernonRuntimeProviderDrawRecord;
+
+/*
+ * The payload words of a stream draw: it draws the first min(count, max_records) records from first_record on, where
+ * count is the uint32_t at count_index of the counts. A host stream's records and counts are at the host addresses,
+ * low word first, which the provider reads during encode_packets; a device stream's are its resources and the host
+ * words are zero. Every record's indices lie in the index buffer, which the writer of the stream guarantees.
+ */
+typedef struct VernonRuntimeProviderStreamPayload {
+    uint32_t host_records[2];
+    uint32_t host_counts[2];
+    uint32_t first_record;
+    uint32_t max_records;
+    uint32_t count_index;
+    uint32_t viewport[4];
+    uint32_t scissor[4];
+    uint32_t stencil_reference;
+} VernonRuntimeProviderStreamPayload;
 
 /* The payload words of a draw; every member is one word. */
 typedef struct VernonRuntimeProviderDrawPayload {

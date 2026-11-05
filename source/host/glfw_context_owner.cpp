@@ -1,6 +1,10 @@
 #include "glfw_context_owner.h"
 
 #include <GLFW/glfw3.h>
+#if defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
 
 #include <climits>
 #include <cstddef>
@@ -114,6 +118,57 @@ void GlfwContextOwner::drawableSize(void *userData, uint32_t *width, uint32_t *h
                            &framebufferWidth, &framebufferHeight);
     *width = static_cast<uint32_t>(framebufferWidth);
     *height = static_cast<uint32_t>(framebufferHeight);
+}
+
+GlfwWindowOwner::GlfwWindowOwner(uint32_t width, uint32_t height) {
+    if (!width || !height || width > INT_MAX || height > INT_MAX)
+        throw std::invalid_argument("invalid window size");
+    std::lock_guard<std::mutex> lock(glfwMutex);
+    if (glfwOwnerCount == 0 && glfwInit() != GLFW_TRUE)
+        throw std::runtime_error(glfwError("GLFW initialization failed"));
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    GLFWwindow *window =
+        glfwCreateWindow(static_cast<int>(width), static_cast<int>(height), "VernonDSL", nullptr, nullptr);
+    glfwDefaultWindowHints();
+    if (!window) {
+        const std::string error = glfwError("GLFW window creation failed");
+        if (glfwOwnerCount == 0)
+            glfwTerminate();
+        throw std::runtime_error(error);
+    }
+    window_ = window;
+    ++glfwOwnerCount;
+}
+
+GlfwWindowOwner::~GlfwWindowOwner() {
+    std::lock_guard<std::mutex> lock(glfwMutex);
+    glfwDestroyWindow(static_cast<GLFWwindow *>(window_));
+    if (--glfwOwnerCount == 0)
+        glfwTerminate();
+}
+
+void *GlfwWindowOwner::win32Window() const noexcept {
+#if defined(_WIN32)
+    return glfwGetWin32Window(static_cast<GLFWwindow *>(window_));
+#else
+    return nullptr;
+#endif
+}
+
+void GlfwWindowOwner::resize(uint32_t width, uint32_t height) {
+    auto *window = static_cast<GLFWwindow *>(window_);
+    glfwSetWindowSize(window, static_cast<int>(width), static_cast<int>(height));
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        int current = 0;
+        int currentHeight = 0;
+        glfwGetFramebufferSize(window, &current, &currentHeight);
+        if (current == static_cast<int>(width) && currentHeight == static_cast<int>(height))
+            return;
+        glfwPollEvents();
+    }
 }
 
 } // namespace vernon::host

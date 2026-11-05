@@ -115,6 +115,11 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
         LOAD(drawElementsInstanced, "glDrawElementsInstanced");
         driver.drawElementsInstancedBaseVertex = reinterpret_cast<decltype(driver.drawElementsInstancedBaseVertex)>(
             callbacks.get_proc_address(callbacks.user_data, "glDrawElementsInstancedBaseVertex"));
+        driver.drawElementsInstancedBaseVertexBaseInstance =
+            reinterpret_cast<decltype(driver.drawElementsInstancedBaseVertexBaseInstance)>(
+                callbacks.get_proc_address(callbacks.user_data, "glDrawElementsInstancedBaseVertexBaseInstance"));
+        driver.drawArraysInstancedBaseInstance = reinterpret_cast<decltype(driver.drawArraysInstancedBaseInstance)>(
+            callbacks.get_proc_address(callbacks.user_data, "glDrawArraysInstancedBaseInstance"));
         LOAD(getUniformLocation, "glGetUniformLocation");
         LOAD(getUniformBlockIndex, "glGetUniformBlockIndex");
         LOAD(uniformBlockBinding, "glUniformBlockBinding");
@@ -173,6 +178,20 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
             callbacks.get_proc_address(callbacks.user_data, "glDispatchCompute"));
         driver.memoryBarrier = reinterpret_cast<decltype(driver.memoryBarrier)>(
             callbacks.get_proc_address(callbacks.user_data, "glMemoryBarrier"));
+        const auto optional = [&](auto &pointer, const char *name) {
+            pointer = reinterpret_cast<std::remove_reference_t<decltype(pointer)>>(
+                callbacks.get_proc_address(callbacks.user_data, name));
+        };
+        optional(driver.bindVertexBuffer, "glBindVertexBuffer");
+        optional(driver.vertexAttribFormat, "glVertexAttribFormat");
+        optional(driver.vertexAttribIFormat, "glVertexAttribIFormat");
+        optional(driver.vertexAttribLFormat, "glVertexAttribLFormat");
+        optional(driver.vertexAttribBinding, "glVertexAttribBinding");
+        optional(driver.vertexBindingDivisor, "glVertexBindingDivisor");
+        driver.multiDrawElementsIndirect = reinterpret_cast<decltype(driver.multiDrawElementsIndirect)>(
+            callbacks.get_proc_address(callbacks.user_data, "glMultiDrawElementsIndirect"));
+        driver.multiDrawElementsIndirectCount = reinterpret_cast<decltype(driver.multiDrawElementsIndirectCount)>(
+            callbacks.get_proc_address(callbacks.user_data, "glMultiDrawElementsIndirectCount"));
         return true;
     } catch (...) {
         error = "external OpenGL context callback failed";

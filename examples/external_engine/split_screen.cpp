@@ -48,8 +48,7 @@ public:
             std::cerr << "failed to render the Mandelbulb panel\n";
             return false;
         }
-        if (!graphics_.presentSplit(cpu_->image(), cpu_->imageWidth(), cpu_->imageHeight(), mandelbulb_->image(),
-                                    mandelbulb_->imageWidth(), mandelbulb_->imageHeight())) {
+        if (!graphics_.presentSplit(cpu_->view(), mandelbulb_->view())) {
             std::cerr << "failed to present the split-screen frame\n";
             return false;
         }

@@ -78,8 +78,9 @@ function(vernon_add_python_bindings package_directory source_directory)
         "${source_directory}/python/native_module.cpp"
         "${source_directory}/python/native_program.cpp"
         "${source_directory}/python/native_program_autodiff.cpp"
-        "${source_directory}/python/native_rhi.cpp"
-        "${source_directory}/python/native_runtime.cpp")
+        "${source_directory}/python/native_hal.cpp"
+        "${source_directory}/python/native_runtime.cpp"
+        "${source_directory}/python/native_schedule.cpp")
     if(NOT SKBUILD)
         _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
     endif()

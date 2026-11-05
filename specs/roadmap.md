@@ -12,7 +12,7 @@ Completed milestones and migrations belong in release notes and Git history.
 - Complete every gate in [`../RELEASE_READINESS.md`](../RELEASE_READINESS.md)
   on the exact release commit.
 - Add deterministic and malformed-input fuzzing for source, Program,
-  ArtifactSystem, reflection, TensorView, and Command DAG boundaries.
+  ArtifactSystem, reflection, TensorView, and linked-schedule boundaries.
 
 ## 2. Language v4
 
@@ -100,6 +100,10 @@ through the public Program lifecycle rather than embedding Python or exposing
 private Runtime scheduling objects.
 
 ## 8. Performance policy
+
+The runtime architecture is
+[`runtime/architecture_v2.md`](runtime/architecture_v2.md); the performance
+design and its phases are [`performance.md`](performance.md).
 
 - Optimize only from reproducible reports stored outside `specs/`.
 - Keep correctness, failure transaction, determinism, and memory-budget gates

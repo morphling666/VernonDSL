@@ -15,10 +15,10 @@ is tracked in
   lower to Program.
 - Standalone executables are one-node Programs; Module differs only in node
   count.
-- C++ uses bundle → executable → instance → invocation → bind → execute →
-  commit or rollback.
-- VJP uses the same transaction lifecycle and transfers a reusable pullback
-  only after commit.
+- C uses bundle → executable → linked schedule → argument record → call →
+  wait for the point.
+- VJP links a forward and a backward schedule; a forward call returns
+  reusable residuals.
 - Public boundaries use stable slots and `VernonProgramArgument`.
 - Python pass descriptors and public ExecutionGraph authoring are not Program
   APIs.
@@ -88,30 +88,26 @@ Multi-node Program VJP must cover:
 Graphics derivative paths and unsupported opaque Resources must fail before
 execution.
 
-ProgramGraph node-local VJP tests must cover:
+ProgramGraph VJP tests must cover:
 
-- a graph executable exposes no composite derivative ABI or pullback;
-- one linked forward retains independently retrievable pullbacks for each
-  differentiated child only when retention is requested;
-- applying a consumer pullback and explicitly passing its gradient as the
-  producer cotangent matches the numeric chain rule;
-- retrieval from a primal child and duplicate retrieval fail deterministically;
-- graph connections never trigger reverse traversal or automatic accumulation;
-- transferred pullbacks outlive the graph invocation and remain reusable.
+- a linked VJP of a graph of differentiated children matches the numeric
+  chain rule;
+- a Value read by several nodes, or by a node and the caller, fails to link
+  instead of accumulating cotangents;
+- residuals outlive the forward call and remain reusable.
 
 ## 5. Binding and lifetime
 
-Persistent Program instances must verify:
+Linked schedules must verify:
 
-- all required slots are bound before invocation;
-- rebinding changes only the selected slot;
+- a call fails before submitting when an argument does not match its slot;
+- writing one slot of the record changes only that argument;
 - one conceptual read-write argument may satisfy reflected input and output
   boundaries through explicit same-name/slot mapping performed by canonical
   helpers;
 - in-flight resources outlive caller handles;
 - Runtime generation changes invalidate stale native bindings;
-- invocations do not share mutable scratch;
-- pullbacks retain immutable state and remain reusable.
+- residuals retain immutable state and remain reusable.
 
 ## 6. Layout and aggregate behavior
 

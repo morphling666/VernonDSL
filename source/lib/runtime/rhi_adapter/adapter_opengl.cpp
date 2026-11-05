@@ -22,7 +22,6 @@ namespace vernon::runtime::rhi_adapter {
 namespace {
 
 namespace gl = rhi::opengl;
-
 constexpr size_t kMaxGroups = VERNON_RUNTIME_PROVIDER_MAX_GROUPS;
 constexpr uint32_t kMaxVertexBindings = VERNON_RUNTIME_PROVIDER_MAX_VERTEX_BINDINGS;
 // Vertex attribute locations are tracked in a 64-bit enable mask.
@@ -47,6 +46,12 @@ struct OpenGLAdapterState {
     gl::Int storageOffsetAlignment{};
     // Every draw uses this vertex array, which no other OpenGL code binds, so its contents persist between commands.
     gl::Uint vertexArray{};
+    // Whether the device specifies attribute formats apart from vertex buffer bindings (OpenGL 4.3, OpenGL ES 3.1),
+    // which makes a vertex buffer change one call per binding.
+    bool separateFormats{};
+    // Whether separate formats specified the vertex array last. Attribute pointers bind buffers at the binding of
+    // each attribute's location, so a change of mode respecifies every attribute and binding.
+    bool vertexArraySeparate{};
     uint64_t vertexProgram{};
     std::array<VertexSource, kMaxVertexBindings> vertexSources{};
     uint64_t enabledAttributes{};
@@ -125,6 +130,10 @@ struct PreparedLayout {
     uint32_t vertexBindingMask{};
     uint64_t attributeMask{};
     std::vector<VertexAttribute> vertexAttributes;
+    // By vertex binding; zero for a per-vertex binding.
+    std::array<uint32_t, kMaxVertexBindings> bindingDivisors{};
+    // Whether the device's separate attribute formats can specify every attribute: their relative offsets are bounded.
+    bool separateFormats{};
 };
 
 struct NativeProgram {
@@ -134,9 +143,16 @@ struct NativeProgram {
     const PreparedLayout *layout{};
     // Per group index and entry; -1 for entries that are not named uniforms or that the program does not use.
     std::array<std::vector<gl::Int>, kMaxGroups> locations;
+    // Per group index and entry, 1 when the program reads the entry's context binding: an inactive uniform block,
+    // sampled image or sampler unit is left as the context holds it.
+    std::array<std::vector<uint8_t>, kMaxGroups> reads;
     // The serial of the group whose named uniforms the program holds at each group index. Uniform values are program
     // state that no other code changes, so they stay valid across commands.
     std::array<uint64_t, kMaxGroups> uniformGroups{};
+    // SPIRV-Cross adds the first instance to gl_InstanceID through this uniform when the driver lacks
+    // GL_ARB_shader_draw_parameters; -1 when the program reads gl_BaseInstanceARB or no instance index.
+    gl::Int baseInstanceLocation{-1};
+    uint32_t baseInstance{};
 
     ~NativeProgram() {
         if (device)
@@ -205,10 +221,16 @@ struct OpenGLCommands : RhiCommands {
     uint64_t appliedProgram{};
     uint64_t appliedPipeline{};
     std::array<uint64_t, kMaxGroups> appliedGroups{};
+    // Per group index, the entries of the applied group whose context bindings were applied, as programs read them.
+    std::array<std::vector<uint8_t>, kMaxGroups> appliedReads;
     // Per context binding namespace (each application before NamedUniform) and binding point, one more than the group
     // index whose value the point holds, or 0. Points are context state that every group index shares: a group applied
     // at one index takes its points from the other indices, whose groups apply again before their next use.
     std::array<std::vector<uint8_t>, static_cast<size_t>(EntryApplication::NamedUniform)> bindingOwners;
+    // Per context binding namespace and point, the slot whose object the point holds, so that a group binding what a
+    // point holds already leaves it alone. Names stand for objects here because every OpenGL call that could delete
+    // or create one between two applications invalidates the commands.
+    std::array<std::vector<GroupSlot>, static_cast<size_t>(EntryApplication::NamedUniform)> boundSlots;
     // The buffers bound at each vertex binding; their strides come from the pipeline.
     std::array<VertexSource, kMaxVertexBindings> vertexBuffers{};
     bool vertexArrayBound{};
@@ -226,14 +248,32 @@ struct OpenGLCommands : RhiCommands {
         appliedGroups.fill(0);
         for (std::vector<uint8_t> &owners : bindingOwners)
             owners.clear();
+        for (std::vector<GroupSlot> &slots : boundSlots)
+            slots.clear();
         vertexArrayBound = false;
         viewportValid = false;
         scissorValid = false;
     }
 };
 
-uint32_t getCapabilities(void *) {
-    return VERNON_RUNTIME_PROVIDER_COMPUTE | VERNON_RUNTIME_PROVIDER_GRAPHICS | VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP;
+bool openGLVersionAtLeast(const VernonRuntimeRhiAdapter &adapter, uint16_t major, uint16_t minor) {
+    const VernonOpenGLContextCallbacks &callbacks = openGLState(adapter).device->callbacks;
+    return adapter.rhiBackend == VERNON_RHI_BACKEND_OPENGL &&
+           (callbacks.api_version_major > major ||
+            (callbacks.api_version_major == major && callbacks.api_version_minor >= minor));
+}
+
+// Device streams are multi-draws, core in OpenGL 4.3; OpenGL ES has none.
+bool deviceDrawStreams(const VernonRuntimeRhiAdapter &adapter) {
+    return openGLVersionAtLeast(adapter, 4, 3) && openGLState(adapter).device->driver.multiDrawElementsIndirect;
+}
+
+uint32_t getCapabilities(void *data) {
+    return VERNON_RUNTIME_PROVIDER_COMPUTE | VERNON_RUNTIME_PROVIDER_GRAPHICS | VERNON_RUNTIME_PROVIDER_NATIVE_INTEROP |
+           VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS |
+           (deviceDrawStreams(*static_cast<const VernonRuntimeRhiAdapter *>(data))
+                ? VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS
+                : 0u);
 }
 
 uint32_t blendFactor(uint32_t value) {
@@ -500,7 +540,7 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
         std::min(maximumLocations > 0 ? static_cast<uint32_t>(maximumLocations) : 0u, kMaxTrackedVertexLocations);
     try {
         layout->vertexAttributes.reserve(descriptor->vertex_attribute_count);
-        std::array<uint32_t, kMaxVertexBindings> divisors{};
+        std::array<uint32_t, kMaxVertexBindings> &divisors = layout->bindingDivisors;
         for (size_t index = 0; index < descriptor->vertex_binding_count; ++index) {
             const VernonRuntimeProviderVertexBinding &binding = descriptor->vertex_bindings[index];
             divisors[binding.binding] = binding.divisor;
@@ -516,6 +556,16 @@ RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProvid
                                        attribute.location, attribute.binding);
             layout->attributeMask |= uint64_t{1} << attribute.location;
             layout->vertexAttributes.push_back({attribute, divisors[attribute.binding]});
+        }
+        const OpenGLAdapterState &state = openGLState(adapter);
+        layout->separateFormats = state.separateFormats;
+        if (state.separateFormats && !layout->vertexAttributes.empty()) {
+            gl::Int maximumOffset = 0;
+            device.driver.getIntegerv(gl::kMaxVertexAttribRelativeOffset, &maximumOffset);
+            for (const VertexAttribute &attribute : layout->vertexAttributes)
+                if (attribute.layout.relative_offset > static_cast<uint32_t>(std::max(maximumOffset, 0)) ||
+                    (attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_F64 && !device.driver.vertexAttribLFormat))
+                    layout->separateFormats = false;
         }
     } catch (const std::bad_alloc &) {
         return providerFailure(vernon::ProviderErrorCode::BackendFailure,
@@ -537,16 +587,21 @@ std::optional<gl::Enum> storageImageFormat(VernonRhiFormat format) {
 RhiAdapterResult<void> linkProgramInterface(OpenGLAdapterState &state, NativeProgram &native, bool compute) {
     auto &driver = state.device->driver;
     const PreparedLayout &layout = *native.layout;
+    for (uint32_t group = 0; group < layout.groupCount; ++group)
+        native.reads[group].assign(layout.groups[group]->entries.size(), 1);
     // A block left unassigned silently reads binding point 0, so every active block must have a planned binding.
     std::vector<gl::Uint> assignedBlocks;
     for (uint32_t group = 0; group < layout.groupCount; ++group)
-        for (const GroupLayout::Entry &entry : layout.groups[group]->entries) {
+        for (size_t index = 0; index < layout.groups[group]->entries.size(); ++index) {
+            const GroupLayout::Entry &entry = layout.groups[group]->entries[index];
             if (entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
                 continue;
             const std::string blockName = ::vernon::runtime::openGLUniformBlockName(entry.layout.binding);
             const gl::Uint block = driver.getUniformBlockIndex(native.program, blockName.c_str());
-            if (block == gl::kInvalidIndex)
+            if (block == gl::kInvalidIndex) {
+                native.reads[group][index] = 0;
                 continue;
+            }
             driver.uniformBlockBinding(native.program, block, entry.layout.binding);
             if (std::find(assignedBlocks.begin(), assignedBlocks.end(), block) == assignedBlocks.end())
                 assignedBlocks.push_back(block);
@@ -562,6 +617,9 @@ RhiAdapterResult<void> linkProgramInterface(OpenGLAdapterState &state, NativePro
         return RhiAdapterResult<void>{vernon::ok()};
     driver.useProgram(native.program);
     ++state.epoch;
+    native.baseInstanceLocation = driver.getUniformLocation(native.program, "SPIRV_Cross_BaseInstance");
+    // A separate sampler serves the texture unit of its binding, which only active sampled images read.
+    std::vector<uint32_t> sampledUnits;
     for (uint32_t group = 0; group < layout.groupCount; ++group) {
         const auto &entries = layout.groups[group]->entries;
         native.locations[group].assign(entries.size(), -1);
@@ -571,13 +629,24 @@ RhiAdapterResult<void> linkProgramInterface(OpenGLAdapterState &state, NativePro
                 entry.application != EntryApplication::SampledImage)
                 continue;
             const gl::Int location = driver.getUniformLocation(native.program, entry.name.c_str());
-            if (location < 0)
+            if (location < 0) {
+                native.reads[group][index] = 0;
                 continue;
-            if (entry.application == EntryApplication::SampledImage)
+            }
+            if (entry.application == EntryApplication::SampledImage) {
                 driver.uniform1i(location, static_cast<gl::Int>(entry.layout.binding));
-            else
+                sampledUnits.push_back(entry.layout.binding);
+            } else {
                 native.locations[group][index] = location;
+            }
         }
+    }
+    for (uint32_t group = 0; group < layout.groupCount; ++group) {
+        const auto &entries = layout.groups[group]->entries;
+        for (size_t index = 0; index < entries.size(); ++index)
+            if (entries[index].application == EntryApplication::Sampler)
+                native.reads[group][index] = std::find(sampledUnits.begin(), sampledUnits.end(),
+                                                       entries[index].layout.binding) != sampledUnits.end();
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
@@ -954,9 +1023,34 @@ void bindIndexedBuffer(gl::Driver &driver, gl::Enum target, const GroupSlot &slo
                                static_cast<gl::SizePtr>(slot.range));
 }
 
-// Context bindings serve every program, so they apply whether or not the bound program reads them.
-void applyGroupBindings(gl::Driver &driver, OpenGLCommands &commands, uint32_t index, const OpenGLGroup &group) {
-    for (const GroupSlot &slot : group.slots) {
+// Whether binding `slot` leaves its context binding point as `held` left it.
+bool sameBinding(const GroupSlot &held, const GroupSlot &slot) {
+    if (held.name != slot.name)
+        return false;
+    switch (slot.application) {
+    case EntryApplication::UniformBuffer:
+    case EntryApplication::StorageBuffer:
+        return held.offset == slot.offset && (slot.offset == 0 || held.range == slot.range);
+    case EntryApplication::SampledImage:
+        return held.textureTarget == slot.textureTarget;
+    case EntryApplication::Sampler:
+        return true;
+    case EntryApplication::StorageImage:
+        return held.layered == slot.layered && held.imageAccess == slot.imageAccess &&
+               held.imageFormat == slot.imageFormat;
+    case EntryApplication::NamedUniform:
+        break;
+    }
+    return false;
+}
+
+// Applies the context bindings of the group's entries that `reads` marks.
+void applyGroupBindings(gl::Driver &driver, OpenGLCommands &commands, uint32_t index, const OpenGLGroup &group,
+                        const std::vector<uint8_t> &reads) {
+    for (size_t entry = 0; entry < group.slots.size(); ++entry) {
+        const GroupSlot &slot = group.slots[entry];
+        if (!reads[entry])
+            continue;
         if (slot.application < EntryApplication::NamedUniform) {
             std::vector<uint8_t> &owners = commands.bindingOwners[static_cast<size_t>(slot.application)];
             if (owners.size() <= slot.binding)
@@ -965,6 +1059,13 @@ void applyGroupBindings(gl::Driver &driver, OpenGLCommands &commands, uint32_t i
             if (owner != 0 && owner != index + 1)
                 commands.appliedGroups[owner - 1] = 0;
             owners[slot.binding] = static_cast<uint8_t>(index + 1);
+            std::vector<GroupSlot> &bound = commands.boundSlots[static_cast<size_t>(slot.application)];
+            if (bound.size() <= slot.binding)
+                bound.resize(slot.binding + 1);
+            GroupSlot &held = bound[slot.binding];
+            if (held.name != 0 && sameBinding(held, slot))
+                continue;
+            held = slot;
         }
         switch (slot.application) {
         case EntryApplication::UniformBuffer:
@@ -1050,8 +1151,19 @@ RhiAdapterResult<void> applyProgramAndGroups(OpenGLAdapterState &state, OpenGLCo
         if (!group)
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "opengl_command_group_is_unbound",
                                    index);
-        if (commands.appliedGroups[index] != group->serial) {
-            applyGroupBindings(driver, commands, index, *group);
+        const std::vector<uint8_t> &reads = native.reads[index];
+        std::vector<uint8_t> &applied = commands.appliedReads[index];
+        const bool same = commands.appliedGroups[index] == group->serial;
+        bool covered = same;
+        for (size_t entry = 0; covered && entry < reads.size(); ++entry)
+            covered = !reads[entry] || applied[entry];
+        if (!covered) {
+            applyGroupBindings(driver, commands, index, *group, reads);
+            if (same)
+                for (size_t entry = 0; entry < reads.size(); ++entry)
+                    applied[entry] |= reads[entry];
+            else
+                applied = reads;
             commands.appliedGroups[index] = group->serial;
         }
         if (native.uniformGroups[index] == group->serial)
@@ -1145,23 +1257,86 @@ void applyFixedFunctionState(gl::Driver &driver, const PreparedPipeline &pipelin
 }
 
 // The adapter's vertex array keeps the attributes of the program and vertex sources that last specified them.
-void applyVertexAttributes(OpenGLAdapterState &state, const OpenGLCommands &commands) {
+// `firstInstance` moves each per-instance binding of divisor d forward by firstInstance / d records, which emulates a
+// first instance on draws without a base instance.
+void applyVertexAttributes(OpenGLAdapterState &state, const OpenGLCommands &commands, uint32_t firstInstance = 0) {
     const PreparedPipeline &pipeline = *commands.pipeline;
     const PreparedLayout &layout = *pipeline.layout;
+    // A zero stride packs a binding's attributes tightly for attribute pointers only.
+    bool separate = layout.separateFormats;
+    for (uint32_t binding = 0; separate && binding < kMaxVertexBindings; ++binding)
+        separate = (layout.vertexBindingMask & (1u << binding)) == 0 || pipeline.vertexStrides[binding] != 0;
+    if (state.vertexArraySeparate != separate) {
+        state.vertexArraySeparate = separate;
+        state.vertexProgram = 0;
+        state.vertexSources.fill({});
+    }
     const bool programChanged = state.vertexProgram != pipeline.native->serial;
-    uint32_t changed = programChanged ? layout.vertexBindingMask : 0;
+    // Separate formats keep the buffers of the bindings across format changes.
+    uint32_t changed = programChanged && !separate ? layout.vertexBindingMask : 0;
+    std::array<uint64_t, kMaxVertexBindings> offsets{};
     for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding) {
         if ((layout.vertexBindingMask & (1u << binding)) == 0)
             continue;
         const VertexSource &bound = commands.vertexBuffers[binding];
         const VertexSource &applied = state.vertexSources[binding];
-        if (applied.key != bound.key || applied.offset != bound.offset ||
+        offsets[binding] = bound.offset;
+        if (layout.bindingDivisors[binding])
+            offsets[binding] +=
+                uint64_t{firstInstance / layout.bindingDivisors[binding]} * pipeline.vertexStrides[binding];
+        if (applied.key != bound.key || applied.offset != offsets[binding] ||
             applied.stride != pipeline.vertexStrides[binding])
             changed |= 1u << binding;
     }
-    if (!changed)
+    if (!changed && !(separate && programChanged))
         return;
     auto &driver = state.device->driver;
+    const auto record = [&] {
+        for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
+            if ((changed & (1u << binding)) != 0) {
+                state.vertexSources[binding] = commands.vertexBuffers[binding];
+                state.vertexSources[binding].offset = offsets[binding];
+                state.vertexSources[binding].stride = pipeline.vertexStrides[binding];
+            }
+    };
+    if (separate) {
+        if (programChanged) {
+            uint64_t disabled = state.enabledAttributes & ~layout.attributeMask;
+            for (gl::Uint location = 0; disabled; ++location, disabled >>= 1)
+                if (disabled & 1)
+                    driver.disableVertexAttribArray(location);
+            for (const VertexAttribute &attribute : layout.vertexAttributes) {
+                const uint32_t location = attribute.layout.location;
+                if ((state.enabledAttributes & (uint64_t{1} << location)) == 0)
+                    driver.enableVertexAttribArray(location);
+                const auto components = static_cast<gl::Int>(attribute.layout.component_count);
+                const uint32_t dtype = attribute.layout.dtype;
+                if (dtype == VERNON_RUNTIME_PROVIDER_I32 || dtype == VERNON_RUNTIME_PROVIDER_U32)
+                    driver.vertexAttribIFormat(location, components,
+                                               dtype == VERNON_RUNTIME_PROVIDER_I32 ? gl::kInt : gl::kUnsignedInt,
+                                               attribute.layout.relative_offset);
+                else if (dtype == VERNON_RUNTIME_PROVIDER_F64)
+                    driver.vertexAttribLFormat(location, components, gl::kDouble, attribute.layout.relative_offset);
+                else
+                    driver.vertexAttribFormat(location, components,
+                                              dtype == VERNON_RUNTIME_PROVIDER_F16 ? gl::kHalfFloat : gl::kFloat, 0,
+                                              attribute.layout.relative_offset);
+                driver.vertexAttribBinding(location, attribute.layout.binding);
+            }
+            for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
+                if ((layout.vertexBindingMask & (1u << binding)) != 0)
+                    driver.vertexBindingDivisor(binding, layout.bindingDivisors[binding]);
+            state.enabledAttributes = layout.attributeMask;
+            state.vertexProgram = pipeline.native->serial;
+        }
+        for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
+            if ((changed & (1u << binding)) != 0)
+                driver.bindVertexBuffer(binding, commands.vertexBuffers[binding].name,
+                                        static_cast<gl::IntPtr>(offsets[binding]),
+                                        static_cast<gl::Size>(pipeline.vertexStrides[binding]));
+        record();
+        return;
+    }
     uint64_t disabled = state.enabledAttributes & ~layout.attributeMask;
     for (gl::Uint location = 0; disabled; ++location, disabled >>= 1)
         if (disabled & 1)
@@ -1174,8 +1349,8 @@ void applyVertexAttributes(OpenGLAdapterState &state, const OpenGLCommands &comm
         driver.bindBuffer(gl::kArrayBuffer, source.name);
         if ((state.enabledAttributes & (uint64_t{1} << location)) == 0)
             driver.enableVertexAttribArray(location);
-        const auto pointer =
-            reinterpret_cast<const void *>(static_cast<uintptr_t>(source.offset + attribute.layout.relative_offset));
+        const auto pointer = reinterpret_cast<const void *>(
+            static_cast<uintptr_t>(offsets[attribute.layout.binding] + attribute.layout.relative_offset));
         const auto stride = static_cast<gl::Size>(pipeline.vertexStrides[attribute.layout.binding]);
         if (attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_I32 ||
             attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_U32)
@@ -1193,11 +1368,7 @@ void applyVertexAttributes(OpenGLAdapterState &state, const OpenGLCommands &comm
     }
     state.enabledAttributes = layout.attributeMask;
     state.vertexProgram = pipeline.native->serial;
-    for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
-        if ((changed & (1u << binding)) != 0) {
-            state.vertexSources[binding] = commands.vertexBuffers[binding];
-            state.vertexSources[binding].stride = pipeline.vertexStrides[binding];
-        }
+    record();
 }
 
 struct OpenGLPacketDecoder {
@@ -1259,40 +1430,123 @@ struct OpenGLPacketDecoder {
 
     RhiAdapterResult<void> draw(uint32_t topologyIndex, uint32_t indexResource,
                                 const VernonRuntimeProviderDrawPayload &draw, const vernon::rhi::OpenedRendering &) {
+        if (auto prepared = prepareDraw(topologyIndex, draw.viewport, draw.scissor, draw.stencil_reference); !prepared)
+            return prepared;
+        return issueDraw(topologyIndex, indexResource, draw.vertex_count, draw.instance_count, draw.first_index,
+                         draw.base_vertex, draw.first_instance);
+    }
+
+    // A host stream's records become one native draw each; a device stream is one multi-draw.
+    RhiAdapterResult<void> drawStream(uint32_t topologyIndex, uint32_t indexResource, uint32_t recordsResource,
+                                      uint32_t countsResource, const VernonRuntimeProviderStreamPayload &stream,
+                                      const vernon::rhi::OpenedRendering &) {
+        if (recordsResource != UINT32_MAX)
+            return drawDeviceStream(topologyIndex, indexResource, recordsResource, countsResource, stream);
+        const auto address = [](const uint32_t *words) {
+            return static_cast<uintptr_t>(words[0] | (uint64_t{words[1]} << 32));
+        };
+        const auto *records = reinterpret_cast<const VernonRuntimeProviderDrawRecord *>(address(stream.host_records));
+        const auto *counts = reinterpret_cast<const uint32_t *>(address(stream.host_counts));
+        const uint32_t count = std::min(counts[stream.count_index], stream.max_records);
+        // Streams whose records draw nothing leave the context alone, so a table that keeps an entry for every batch
+        // costs only its drawn entries.
+        bool prepared = false;
+        for (uint32_t index = 0; index < count; ++index) {
+            const VernonRuntimeProviderDrawRecord &record = records[stream.first_record + index];
+            if (record.index_count == 0 || record.instance_count == 0)
+                continue;
+            if (!prepared) {
+                if (auto state = prepareDraw(topologyIndex, stream.viewport, stream.scissor, stream.stencil_reference);
+                    !state)
+                    return state;
+                prepared = true;
+            }
+            if (auto issued = issueDraw(topologyIndex, indexResource, record.index_count, record.instance_count,
+                                        record.first_index, record.base_vertex, record.first_instance);
+                !issued)
+                return issued;
+        }
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    // The records are DrawElementsIndirectCommands, whose base instance offsets the per-instance attributes. One
+    // uniform cannot give each draw its base instance, so a program that emulates gl_BaseInstance through
+    // SPIRV_Cross_BaseInstance cannot draw a device stream; nor can an index binding with an offset, since the
+    // records' first indices count from the start of the bound buffer.
+    RhiAdapterResult<void> drawDeviceStream(uint32_t topologyIndex, uint32_t indexResource, uint32_t recordsResource,
+                                            uint32_t countsResource, const VernonRuntimeProviderStreamPayload &stream) {
+        auto &driver = state.device->driver;
+        const bool counted = countsResource != UINT32_MAX;
+        if (!deviceDrawStreams(adapter) ||
+            (counted && (!openGLVersionAtLeast(adapter, 4, 6) || !driver.multiDrawElementsIndirectCount)))
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "opengl_device_draw_streams_are_unsupported");
+        if (stream.max_records == 0)
+            return RhiAdapterResult<void>{vernon::ok()};
+        if (auto prepared = prepareDraw(topologyIndex, stream.viewport, stream.scissor, stream.stencil_reference);
+            !prepared)
+            return prepared;
+        if (commands.pipeline->native->baseInstanceLocation >= 0)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "opengl_device_draw_streams_need_native_base_instances");
+        const VernonRuntimeProviderResourceReference &indexBuffer = batch.resources[indexResource];
+        if (indexBuffer.offset != 0)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                   "opengl_device_draw_streams_need_an_index_binding_at_offset_zero");
+        applyVertexAttributes(state, commands, 0);
+        if (state.indexBufferKey != indexBuffer.resource.value) {
+            driver.bindBuffer(gl::kElementArrayBuffer, static_cast<gl::Uint>(batch.natives[indexResource]));
+            state.indexBufferKey = indexBuffer.resource.value;
+        }
+        driver.bindBuffer(gl::kDrawIndirectBuffer, static_cast<gl::Uint>(batch.natives[recordsResource]));
+        constexpr gl::Enum topologies[]{gl::kTriangles, gl::kLines, gl::kPoints};
+        const auto *records = reinterpret_cast<const void *>(
+            static_cast<uintptr_t>(batch.resources[recordsResource].offset +
+                                   uint64_t{stream.first_record} * sizeof(VernonRuntimeProviderDrawRecord)));
+        constexpr auto stride = static_cast<gl::Size>(sizeof(VernonRuntimeProviderDrawRecord));
+        if (!counted) {
+            driver.multiDrawElementsIndirect(topologies[topologyIndex], gl::kUnsignedInt, records,
+                                             static_cast<gl::Size>(stream.max_records), stride);
+            return RhiAdapterResult<void>{vernon::ok()};
+        }
+        driver.bindBuffer(gl::kParameterBuffer, static_cast<gl::Uint>(batch.natives[countsResource]));
+        driver.multiDrawElementsIndirectCount(
+            topologies[topologyIndex], gl::kUnsignedInt, records,
+            static_cast<gl::IntPtr>(batch.resources[countsResource].offset + uint64_t{stream.count_index} * 4),
+            static_cast<gl::Size>(stream.max_records), stride);
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    // Applies the program, groups, fixed-function and dynamic state of the draws that follow.
+    RhiAdapterResult<void> prepareDraw(uint32_t topologyIndex, const uint32_t *viewportRect,
+                                       const uint32_t *scissorRect, uint32_t stencilReference) {
         if (!commands.pipeline || commands.pipeline->compute || !commands.rendering || topologyIndex > 2)
             return providerFailure(vernon::ProviderErrorCode::InvalidArgument,
                                    "opengl_adapter_received_an_invalid_draw");
-        // gl_InstanceID excludes the base instance, so a nonzero first instance would change `instance_index`.
-        if (draw.first_instance != 0)
-            return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_first_instance_is_unsupported");
         auto &driver = state.device->driver;
-        const bool indexed = indexResource != UINT32_MAX;
-        if (indexed && draw.base_vertex != 0 && !driver.drawElementsInstancedBaseVertex)
-            return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_base_vertex_is_unsupported");
         if (auto applied = applyProgramAndGroups(state, commands); !applied)
             return applied;
         PreparedPipeline &pipeline = *commands.pipeline;
         if (commands.appliedPipeline != pipeline.serial) {
-            applyFixedFunctionState(driver, pipeline, draw.stencil_reference);
+            applyFixedFunctionState(driver, pipeline, stencilReference);
             commands.appliedPipeline = pipeline.serial;
-            commands.stencilReference = draw.stencil_reference;
-        } else if (pipeline.depthStencil.stencil_test && commands.stencilReference != draw.stencil_reference) {
-            applyStencilFunction(driver, pipeline, draw.stencil_reference);
-            commands.stencilReference = draw.stencil_reference;
+            commands.stencilReference = stencilReference;
+        } else if (pipeline.depthStencil.stencil_test && commands.stencilReference != stencilReference) {
+            applyStencilFunction(driver, pipeline, stencilReference);
+            commands.stencilReference = stencilReference;
         }
         if (!commands.vertexArrayBound) {
             driver.bindVertexArray(state.vertexArray);
             commands.vertexArrayBound = true;
         }
-        applyVertexAttributes(state, commands);
-        const std::array<uint32_t, 4> viewport{draw.viewport[0], draw.viewport[1], draw.viewport[2], draw.viewport[3]};
+        const std::array<uint32_t, 4> viewport{viewportRect[0], viewportRect[1], viewportRect[2], viewportRect[3]};
         if (!commands.viewportValid || commands.viewport != viewport) {
             driver.viewport(static_cast<gl::Int>(viewport[0]), static_cast<gl::Int>(viewport[1]),
                             static_cast<gl::Size>(viewport[2]), static_cast<gl::Size>(viewport[3]));
             commands.viewport = viewport;
             commands.viewportValid = true;
         }
-        const std::array<uint32_t, 4> scissor{draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]};
+        const std::array<uint32_t, 4> scissor{scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]};
         if (!commands.scissorValid || commands.scissor != scissor) {
             driver.enable(gl::kScissorTest);
             driver.scissor(static_cast<gl::Int>(scissor[0]), static_cast<gl::Int>(scissor[1]),
@@ -1300,9 +1554,42 @@ struct OpenGLPacketDecoder {
             commands.scissor = scissor;
             commands.scissorValid = true;
         }
+        return RhiAdapterResult<void>{vernon::ok()};
+    }
+
+    // One draw after prepareDraw. gl_InstanceID excludes the base instance, so a first instance reaches
+    // `instance_index` through gl_BaseInstanceARB, which only base-instance draws set, or through the program's
+    // SPIRV_Cross_BaseInstance uniform; per-instance attributes start at it through the base instance or, without
+    // base-instance draws, through offset attribute pointers.
+    RhiAdapterResult<void> issueDraw(uint32_t topologyIndex, uint32_t indexResource, uint32_t vertexCount,
+                                     uint32_t instanceCount, uint32_t firstIndex, int32_t baseVertex,
+                                     uint32_t firstInstance) {
+        auto &driver = state.device->driver;
+        PreparedPipeline &pipeline = *commands.pipeline;
+        const bool indexed = indexResource != UINT32_MAX;
+        if (indexed && baseVertex != 0 && !driver.drawElementsInstancedBaseVertex)
+            return providerFailure(vernon::ProviderErrorCode::Unsupported, "opengl_draw_base_vertex_is_unsupported");
+        const bool baseInstanceDraw =
+            firstInstance != 0 && (indexed ? driver.drawElementsInstancedBaseVertexBaseInstance != nullptr
+                                           : driver.drawArraysInstancedBaseInstance != nullptr);
+        if (firstInstance != 0 && !baseInstanceDraw) {
+            // An attribute of divisor d reads record (first + i) / d, which an offset reaches only when d divides
+            // first.
+            for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
+                if (pipeline.layout->bindingDivisors[binding] > 1 &&
+                    firstInstance % pipeline.layout->bindingDivisors[binding] != 0)
+                    return providerFailure(vernon::ProviderErrorCode::Unsupported,
+                                           "opengl_first_instance_is_not_a_multiple_of_the_divisor", binding);
+        }
+        applyVertexAttributes(state, commands, baseInstanceDraw ? 0 : firstInstance);
+        NativeProgram &native = *pipeline.native;
+        if (native.baseInstanceLocation >= 0 && native.baseInstance != firstInstance) {
+            driver.uniform1i(native.baseInstanceLocation, static_cast<gl::Int>(firstInstance));
+            native.baseInstance = firstInstance;
+        }
         constexpr gl::Enum topologies[]{gl::kTriangles, gl::kLines, gl::kPoints};
         const gl::Enum topology = topologies[topologyIndex];
-        const auto instances = static_cast<gl::Size>(draw.instance_count);
+        const auto instances = static_cast<gl::Size>(instanceCount);
         if (indexed) {
             const VernonRuntimeProviderResourceReference &indexBuffer = batch.resources[indexResource];
             if (state.indexBufferKey != indexBuffer.resource.value) {
@@ -1310,17 +1597,24 @@ struct OpenGLPacketDecoder {
                 state.indexBufferKey = indexBuffer.resource.value;
             }
             const auto *indices = reinterpret_cast<const void *>(
-                static_cast<uintptr_t>(indexBuffer.offset + uint64_t{draw.first_index} * sizeof(uint32_t)));
-            const auto count = static_cast<gl::Size>(draw.vertex_count);
-            if (draw.base_vertex != 0)
+                static_cast<uintptr_t>(indexBuffer.offset + uint64_t{firstIndex} * sizeof(uint32_t)));
+            const auto count = static_cast<gl::Size>(vertexCount);
+            if (baseInstanceDraw)
+                driver.drawElementsInstancedBaseVertexBaseInstance(topology, count, gl::kUnsignedInt, indices,
+                                                                   instances, static_cast<gl::Int>(baseVertex),
+                                                                   firstInstance);
+            else if (baseVertex != 0)
                 driver.drawElementsInstancedBaseVertex(topology, count, gl::kUnsignedInt, indices, instances,
-                                                       static_cast<gl::Int>(draw.base_vertex));
+                                                       static_cast<gl::Int>(baseVertex));
             else
                 driver.drawElementsInstanced(topology, count, gl::kUnsignedInt, indices, instances);
-        } else if (draw.instance_count == 1) {
-            driver.drawArrays(topology, 0, static_cast<gl::Size>(draw.vertex_count));
+        } else if (baseInstanceDraw) {
+            driver.drawArraysInstancedBaseInstance(topology, 0, static_cast<gl::Size>(vertexCount), instances,
+                                                   firstInstance);
+        } else if (instanceCount == 1) {
+            driver.drawArrays(topology, 0, static_cast<gl::Size>(vertexCount));
         } else {
-            driver.drawArraysInstanced(topology, 0, static_cast<gl::Size>(draw.vertex_count), instances);
+            driver.drawArraysInstanced(topology, 0, static_cast<gl::Size>(vertexCount), instances);
         }
         return RhiAdapterResult<void>{vernon::ok()};
     }
@@ -1459,6 +1753,13 @@ VernonRuntimeRhiAdapter *createOpenGLRhiAdapter(VernonRhiDevice device, VernonRh
     if (!state || !adapter)
         return nullptr;
     state->device = deviceState;
+    const VernonOpenGLContextCallbacks &callbacks = deviceState->callbacks;
+    const auto [major, minor] = backend == VERNON_RHI_BACKEND_OPENGL ? std::pair{4, 3} : std::pair{3, 1};
+    const rhi::opengl::Driver &driver = deviceState->driver;
+    state->separateFormats = (callbacks.api_version_major > major ||
+                              (callbacks.api_version_major == major && callbacks.api_version_minor >= minor)) &&
+                             driver.bindVertexBuffer && driver.vertexAttribFormat && driver.vertexAttribIFormat &&
+                             driver.vertexAttribBinding && driver.vertexBindingDivisor;
     adapter->rhiBackend = backend;
     if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
         return nullptr;

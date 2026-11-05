@@ -12,6 +12,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vernon::rhi::cuda {
@@ -76,6 +77,18 @@ struct VERNON_RHI_CAPI DeviceState {
     mutable std::atomic<size_t> allocations{};
 
 private:
+    // `cuMemFree` waits for the whole device, so freed allocations are kept by rounded size and handed to the next
+    // allocation of that size. Reuse is safe without an event: all of this device's work runs on `stream` in order,
+    // and synchronous copies on the legacy stream wait for it, so work issued after the reuse follows the work that
+    // read the memory before it was freed.
+    void releaseCachedAllocations() const;
+
+    mutable std::mutex cacheMutex;
+    // The rounded size of each live allocation `allocate` made.
+    mutable std::unordered_map<DevicePointer, size_t> allocationSizes;
+    mutable std::unordered_map<size_t, std::vector<DevicePointer>> cachedAllocations;
+    mutable size_t cachedBytes{};
+
     PinnedBlock *acquirePinned(size_t size, Result &status);
     void releasePinned(PinnedBlock &block);
     // Keeps `block` in use until the stream work enqueued so far completes.

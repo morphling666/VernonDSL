@@ -3,9 +3,6 @@
 
 #include "VernonRuntime.h"
 
-#include <memory>
-#include <vector>
-
 namespace vernon::runtime::program_execution {
 
 class DeviceBuffer {
@@ -19,15 +16,7 @@ public:
     ~DeviceBuffer();
 
     bool valid() const;
-    bool upload(const void *source, size_t size) const;
-    bool upload(VernonRhiCommandEncoder encoder, const void *source, size_t size) const;
-    bool upload(VernonRhiCommandEncoder encoder, size_t offset, const void *source, size_t size) const;
-    bool upload(size_t offset, const void *source, size_t size) const;
-    bool uploadRanges(const std::vector<VernonRhiBufferUploadRange> &ranges) const;
-    bool download(void *destination, size_t size) const;
-    bool download(size_t offset, void *destination, size_t size) const;
     bool reference(VernonRuntimeProviderResourceReference &output) const;
-    bool reference(size_t offset, size_t size, VernonRuntimeProviderResourceReference &output) const;
     size_t size() const { return size_; }
     VernonRhiBuffer handle() const { return handle_; }
 

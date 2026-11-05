@@ -23,6 +23,8 @@ struct CpuLaneCoordinates {
 CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRange &range, size_t localLinear) noexcept;
 
 using CpuRangeCallback = std::function<VernonStatus(VernonCpuRange &)>;
+// Runs every lane of workgroups [begin, end), in workgroup-linear order.
+using CpuGroupSpanCallback = std::function<VernonStatus(size_t begin, size_t end)>;
 
 enum class CpuSchedulerExecutionPolicy {
     WorkerPool,
@@ -47,10 +49,16 @@ public:
 
     VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3],
                           const CpuRangeCallback &callback) noexcept;
+    // Runs on at most `runnerLimit` threads, the calling thread alone when it is one.
+    VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3], size_t runnerLimit,
+                          const CpuRangeCallback &callback) noexcept;
     VernonStatus dispatchInline(const uint32_t grid[3], const uint32_t workgroup[3],
                                 const CpuRangeCallback &callback) noexcept;
     VernonStatus dispatchGroupInline(const uint32_t grid[3], const uint32_t workgroup[3], size_t groupLinear,
                                      const CpuRangeCallback &callback) noexcept;
+    // Spans of whole workgroups for kernels with no barriers or workgroup helpers, on at most `runnerLimit` threads.
+    VernonStatus dispatchGroupSpans(size_t groupCount, size_t runnerLimit,
+                                    const CpuGroupSpanCallback &callback) noexcept;
     const std::string &lastDiagnostic() const noexcept;
 
 private:

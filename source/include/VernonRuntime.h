@@ -25,10 +25,6 @@ typedef struct VernonRuntimeContext VernonRuntimeContext;
 typedef struct VernonProgramBundle VernonProgramBundle;
 typedef struct VernonProgramGraph VernonProgramGraph;
 typedef struct VernonProgramExecutable VernonProgramExecutable;
-typedef struct VernonPullback VernonPullback;
-typedef struct VernonSubmission VernonSubmission;
-typedef struct VernonProgramInstance VernonProgramInstance;
-typedef struct VernonProgramInvocation VernonProgramInvocation;
 
 typedef enum VernonRuntimeOperationStatus {
     VERNON_RUNTIME_OPERATION_OK = 0,
@@ -41,13 +37,6 @@ typedef enum VernonRuntimeOperationStatus {
     VERNON_RUNTIME_OPERATION_LIFECYCLE_FAILURE = 7,
     VERNON_RUNTIME_OPERATION_INTERNAL_FAILURE = 8
 } VernonRuntimeOperationStatus;
-
-/* FAILED: the device did not complete the work, so every boundary the submission writes is INDETERMINATE. */
-typedef enum VernonSubmissionState {
-    VERNON_SUBMISSION_PENDING = 0,
-    VERNON_SUBMISSION_SUCCEEDED = 1,
-    VERNON_SUBMISSION_FAILED = 2
-} VernonSubmissionState;
 
 typedef enum VernonRuntimeBackend {
     VERNON_RUNTIME_CPU = 0,
@@ -70,36 +59,13 @@ typedef struct VernonRuntimeCapabilities {
     VernonStringView diagnostic;
 } VernonRuntimeCapabilities;
 
-/* Bounds on Runtime's own resources (specs/runtime/pipelined_submission.md section 7). An Execute or Stage
- * submission that would exceed either, or the RHI device's max_in_flight_submissions, first waits for the oldest
- * pending submission; zero selects a provisional default. */
 typedef struct VernonRuntimeCreateOptions {
     uint32_t struct_size;
     /* Selects the device of a backend Runtime creates; zero for a context over a caller's RHI device. */
     uint32_t device_index;
-    /* Bytes of Runtime-allocated per-submission storage across pending submissions. */
-    uint64_t transient_budget_bytes;
-    /* Submissions queued without a wait and not yet retired. */
-    uint32_t max_pending_submissions;
     /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[3];
+    uint32_t reserved[4];
 } VernonRuntimeCreateOptions;
-
-typedef struct VernonSubmissionTelemetry {
-    uint32_t struct_size;
-    /* Submissions queued without a wait and not yet retired, as of the last admission, their storage, and the RHI
-     * submissions they hold against the device's max_in_flight_submissions. */
-    uint32_t pending_submissions;
-    uint64_t pending_transient_bytes;
-    uint64_t pending_rhi_submissions;
-    /* Implicit waits for the oldest pending submission, by the bound that required them. */
-    uint64_t pending_limit_waits;
-    uint64_t pending_limit_wait_nanoseconds;
-    uint64_t transient_budget_waits;
-    uint64_t transient_budget_wait_nanoseconds;
-    uint64_t device_quota_waits;
-    uint64_t device_quota_wait_nanoseconds;
-} VernonSubmissionTelemetry;
 
 typedef struct VernonLaunchSize {
     uint32_t x;
@@ -116,8 +82,6 @@ VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(Vernon
                                                                           VernonRhiDevice device,
                                                                           const VernonRuntimeCreateOptions *options);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeContextGetSubmissionTelemetry(VernonRuntimeContext *context,
-                                                                            VernonSubmissionTelemetry *output);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
 
 /*
@@ -497,27 +461,12 @@ typedef struct VernonProgramArgument {
     };
 } VernonProgramArgument;
 
-typedef struct VernonProgramBindingToken {
-    uint32_t struct_size;
-    const void *data;
-    size_t size;
-} VernonProgramBindingToken;
-
 typedef struct VernonProgramResourceLease {
     uint32_t struct_size;
     void *object;
     void (*retain)(void *object);
     void (*release)(void *object);
 } VernonProgramResourceLease;
-
-typedef struct VernonProgramBindingTelemetry {
-    uint32_t struct_size;
-    uint64_t prepare_count;
-    uint64_t reuse_count;
-    uint64_t rollback_count;
-    uint64_t upload_bytes;
-    uint64_t upload_ranges;
-} VernonProgramBindingTelemetry;
 
 typedef struct VernonProgramParameterView {
     uint32_t slot;
@@ -588,98 +537,12 @@ typedef struct VernonAdDerivativeGroupView {
     uint32_t reserved[4];
 } VernonAdDerivativeGroupView;
 
-#define VERNON_PULLBACK_APPLY_OPTIONS_VERSION 1
-
-typedef struct VernonPullbackApplyOptions {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    uint64_t maximum_temporary_bytes;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
-} VernonPullbackApplyOptions;
-
-/* An asynchronous Execute reports SUBMITTED; its submission's completion outcome replaces it with a completed
- * state. */
-/* SUBMITTED is reported only by an ASYNCHRONOUS Execute: the work is queued, and the outcome of its submission
- * (vernonSubmissionGetMutationOutcome) replaces every SUBMITTED state with the completion state. */
-typedef enum VernonInvocationSubmissionState {
-    VERNON_INVOCATION_NOT_SUBMITTED = 0,
-    VERNON_INVOCATION_COMPLETED = 1,
-    VERNON_INVOCATION_INDETERMINATE = 2,
-    VERNON_INVOCATION_SUBMITTED = 3
-} VernonInvocationSubmissionState;
-
-typedef enum VernonBoundaryMutationState {
-    VERNON_BOUNDARY_MUTATION_UNCHANGED = 0,
-    VERNON_BOUNDARY_MUTATION_COMMITTED = 1,
-    VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED = 2,
-    VERNON_BOUNDARY_MUTATION_INDETERMINATE = 3,
-    VERNON_BOUNDARY_MUTATION_SUBMITTED = 4
-} VernonBoundaryMutationState;
-
-typedef enum VernonMutationBoundaryKind {
-    VERNON_MUTATION_PROGRAM_BOUNDARY = 0,
-    VERNON_MUTATION_RENDER_PASS_CONTROL = 1
-} VernonMutationBoundaryKind;
-
-typedef struct VernonBoundaryMutation {
-    VernonMutationBoundaryKind kind;
-    uint32_t slot;
-    VernonBoundaryMutationState state;
-} VernonBoundaryMutation;
-
-typedef struct VernonInvocationMutationOutcome {
-    uint32_t struct_size;
-    VernonInvocationSubmissionState submission;
-    VernonBoundaryMutation *mutations;
-    size_t mutation_capacity;
-    size_t mutation_count;
-    uint32_t reserved[4];
-} VernonInvocationMutationOutcome;
-
-#define VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION 1
-
-typedef struct VernonProgramAutodiffInvocationOptions {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    uint8_t has_checkpoint_memory_budget;
-    uint8_t reserved_bytes[7];
-    uint64_t checkpoint_memory_budget;
-    VernonStringView checkpoint_policy;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
-} VernonProgramAutodiffInvocationOptions;
-
-/* specs/runtime/pipelined_submission.md. WAIT returns from Execute after the work completed and reports the
- * completion outcome. ASYNCHRONOUS returns after submission and reports SUBMITTED; the outcome of completion is
- * read from the invocation's submission. A plan that cannot complete asynchronously fails Execute before
- * submission with PROGRAM_SUBMISSION_REQUIRES_WAIT. */
-typedef enum VernonCompletionMode {
-    VERNON_COMPLETION_WAIT = 0,
-    VERNON_COMPLETION_ASYNCHRONOUS = 1
-} VernonCompletionMode;
-
-#define VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION 1
-
-typedef struct VernonProgramInvocationOptions {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    VernonCompletionMode completion_mode;
-    /* 1 to measure the device time of each scope Execute runs (vernonSubmissionGetScopeTimings), otherwise 0. */
-    uint32_t timings;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[3];
-} VernonProgramInvocationOptions;
-
 /* specs/runtime/gpu_profiling.md section 3. A scope is one native render scope, holding `node_count` fused graphics
- * Nodes from `first_node`, or one compute Node. Begin and end count from the first scope's begin in the same
- * `device_submission`, the index of the device submission among those the Execute made; clocks of different device
- * submissions are unrelated. */
+ * nodes from `first_node`, or one compute node. Begin and end count from the begin of the call's first scope. */
 typedef struct VernonScopeTiming {
-    VernonProgramNodeId first_node;
+    uint32_t first_node;
     uint32_t node_count;
-    uint32_t device_submission;
-    uint32_t reserved;
+    uint32_t reserved[2];
     uint64_t begin_nanoseconds;
     uint64_t end_nanoseconds;
 } VernonScopeTiming;
@@ -751,7 +614,6 @@ VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeResolveProgramResu
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetMutationCapacity(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramParameterView *parameter);
 /*
@@ -783,7 +645,7 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetImageConstrain
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(
     const VernonProgramExecutable *pipeline, VernonStringView parameter_name,
     VernonProgramImageConstraintView *constraint);
-/* The control slots a graphics node reads its per-invocation controls from.
+/* The control slots a graphics node reads its per-call controls from.
  *
  * A Program assigns each control its own slot when it is compiled, so a caller cannot assume any particular number
  * and must ask before binding. `node` is the graph node id the controls belong to. */
@@ -798,41 +660,6 @@ typedef struct VernonProgramGraphicsControlsView {
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetGraphicsNodeCount(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramGraphicsControlsView *output);
-VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus
-vernonRuntimeProgramInstanceCreateResult(VernonProgramExecutable *pipeline, VernonProgramInstance **output);
-VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
-VERNON_RUNTIME_CAPI VernonProgramInvocation *
-vernonRuntimeProgramInstanceBeginInvocation(VernonProgramInstance *instance);
-VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus
-vernonRuntimeProgramInstanceBeginInvocationResult(VernonProgramInstance *instance, VernonProgramInvocation **output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationSetAutodiffOptions(
-    VernonProgramInvocation *invocation, const VernonProgramAutodiffInvocationOptions *options);
-/* Valid before Execute. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationSetOptions(
-    VernonProgramInvocation *invocation, const VernonProgramInvocationOptions *options);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationTryReuse(VernonProgramInvocation *invocation,
-                                                                        uint32_t slot,
-                                                                        const VernonProgramBindingToken *token,
-                                                                        uint64_t upload_bytes, uint64_t upload_ranges,
-                                                                        uint8_t *reused);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocation,
-                                                                    const VernonProgramBindingToken *token,
-                                                                    const VernonProgramArgument *argument,
-                                                                    const VernonProgramResourceLease *lease,
-                                                                    uint64_t upload_bytes, uint64_t upload_ranges);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRenderPass(
-    VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
-    const VernonRenderPass *render_pass, const VernonProgramResourceLease *leases, size_t lease_count);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDrawCommand(VernonProgramInvocation *invocation,
-                                                                               uint32_t control_slot,
-                                                                               const VernonProgramBindingToken *token,
-                                                                               const VernonDrawCommand *draw,
-                                                                               const VernonProgramResourceLease *lease);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDynamicState(
-    VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
-    const VernonDynamicState *dynamic_state);
-
 /*
  * Recorded draws (specs/program/recorded_draws.md). A pipeline draws inside graphics Node `node` of `executable`;
  * `source` is a resolved one-node graphics Program on the same context that conforms to the Node. A null `source`
@@ -848,9 +675,9 @@ vernonRuntimeGraphicsPipelineCreate(VernonProgramExecutable *executable, VernonP
 VERNON_RUNTIME_CAPI void vernonRuntimeGraphicsPipelineDestroy(VernonGraphicsPipeline *pipeline);
 
 /* `argument->slot` is the slot of a per-draw parameter of the pipeline's Program, found through
- * vernonRuntimeProgramExecutableFindParameter on that Program (`executable` for pipeline 0, otherwise `source`).
- * Validation equals vernonRuntimeProgramInvocationBind, except that the argument must not need a Runtime upload. A
- * host Tensor's bytes are copied when bound; device resources stay borrowed. */
+ * vernonRuntimeProgramExecutableFindParameter on that Program (`executable` for pipeline 0, otherwise `source`). The
+ * argument must match the parameter's boundary contract and must not need a Runtime upload. A host Tensor's bytes are
+ * copied when bound; device resources stay borrowed. */
 VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeBindingSetCreate(VernonGraphicsPipeline *pipeline,
                                                                                VernonBindingSet **output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeBindingSetBind(VernonBindingSet *set,
@@ -866,114 +693,12 @@ typedef enum VernonGraphicsCommandKind {
     VERNON_GRAPHICS_COMMAND_SET_SCISSOR = 3,
     VERNON_GRAPHICS_COMMAND_SET_STENCIL_REFERENCE = 4,
     VERNON_GRAPHICS_COMMAND_DRAW = 5,
-    /* Debug groups and markers name the draws between them in capture tools and have no effect on rendering. Pushes
-     * and pops balance within one recording, which otherwise fails at Execute with PROGRAM_RECORDING_INVALID. */
+    /* Debug groups and markers name the draws between them in capture tools and have no effect on rendering. */
     VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP = 6,
     VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP = 7,
     VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER = 8
 } VernonGraphicsCommandKind;
 
-typedef struct VernonGraphicsCommand {
-    VernonGraphicsCommandKind kind;
-    union {
-        /* Null binds pipeline 0. */
-        const VernonGraphicsPipeline *pipeline;
-        const VernonBindingSet *binding_set;
-        /* x, y, width, height. */
-        uint32_t rect[4];
-        uint32_t stencil_reference;
-        /* Same meaning and validation as vernonRuntimeProgramInvocationBindDrawCommand; copied on record. */
-        VernonDrawCommand draw;
-        /* UTF-8, copied on record. */
-        VernonStringView label;
-    };
-} VernonGraphicsCommand;
-
-/*
- * A recording (specs/runtime/stored_plans.md section 4) holds the commands of graphics Node `node`, whose draw control
- * must be an invocation control, for Program instance `instance`. It persists across invocations: an invocation that
- * binds it draws its current commands. Validation runs at the first Execute after an edit and is kept until the next
- * edit. A recording is externally synchronized: it is not edited while an Execute of an invocation bound to it runs.
- * Executes already submitted keep what they drew, so editing or destroying a recording never waits for them.
- */
-typedef struct VernonGraphicsRecording VernonGraphicsRecording;
-
-VERNON_RUNTIME_CAPI VernonRuntimeOperationStatus vernonRuntimeGraphicsRecordingCreate(VernonProgramInstance *instance,
-                                                                                      VernonProgramNodeId node,
-                                                                                      VernonGraphicsRecording **output);
-VERNON_RUNTIME_CAPI void vernonRuntimeGraphicsRecordingDestroy(VernonGraphicsRecording *recording);
-/* Removes every command and lease. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingReset(VernonGraphicsRecording *recording);
-/* Appends commands; `leases` keep index buffers alive until the recording is reset or destroyed and every Execute
- * that drew them completes. Nothing is appended when any command is invalid. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingAppend(VernonGraphicsRecording *recording,
-                                                                      const VernonGraphicsCommand *commands,
-                                                                      size_t command_count,
-                                                                      const VernonProgramResourceLease *leases,
-                                                                      size_t lease_count);
-/* Replaces command `index` with `command` of the same kind, which must be a viewport, scissor, stencil reference or
- * draw. A draw keeps whether it is indexed and its index buffer; only its counts, offsets and first elements change. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeGraphicsRecordingSetCommand(VernonGraphicsRecording *recording,
-                                                                          size_t index,
-                                                                          const VernonGraphicsCommand *command);
-/* Makes the invocation's Execute draw the recording in its graphics Node. The recording must belong to the
- * invocation's instance; binding another recording of the same Node replaces it. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRecording(VernonProgramInvocation *invocation,
-                                                                             VernonGraphicsRecording *recording);
-
-typedef struct VernonProgramGraphicsNodeTelemetry {
-    uint32_t struct_size;
-    uint64_t render_scopes;
-    uint64_t pipeline_binds;
-    uint64_t set_binds;
-    /* The draws of at least one instance. */
-    uint64_t draws;
-} VernonProgramGraphicsNodeTelemetry;
-
-/* Counts of the invocation's last Execute for graphics Node `node`. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationGetGraphicsTelemetry(
-    const VernonProgramInvocation *invocation, VernonProgramNodeId node, VernonProgramGraphicsNodeTelemetry *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invocation,
-                                                                       uint8_t retain_pullback,
-                                                                       VernonInvocationMutationOutcome *outcome);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationCommit(VernonProgramInvocation *invocation,
-                                                                      VernonPullback **output_pullback);
-/* Hands out the submission of an Execute that submitted work, in either completion mode, once and before the
- * invocation is destroyed. The submission may outlive the invocation. Destroying an invocation whose submission
- * was not taken waits for it. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationTakeSubmission(VernonProgramInvocation *invocation,
-                                                                              VernonSubmission **output);
-/*
- * For a ProgramGraph, commit returns no composite pullback. Retrieve each
- * differentiated child's pullback exactly once after commit. The returned
- * pullback owns its retained state and may outlive the invocation.
- */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationGetNodePullback(VernonProgramInvocation *invocation,
-                                                                               VernonProgramNodeId node,
-                                                                               VernonPullback **output_pullback);
-VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation);
-VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationDestroy(VernonProgramInvocation *invocation);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInstanceGetTelemetry(const VernonProgramInstance *instance,
-                                                                          VernonProgramBindingTelemetry *output);
-/* A submission is used by one thread at a time. A state query that reports completion retires the submission's
- * work, so its later queries and its completion outcome agree with it. */
-VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetState(const VernonSubmission *submission,
-                                                          VernonSubmissionState *output);
-/* Blocks until the work completes. A failed submission returns its failure status and sets the context's
- * diagnostic; waiting again returns the same status. */
-VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submission);
-/* The completion outcome of the Execute that produced the submission; VERNON_STATUS_NOT_READY while it is
- * pending. `outcome` follows the storage rules of vernonRuntimeProgramInvocationExecute. */
-VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetMutationOutcome(const VernonSubmission *submission,
-                                                                    VernonInvocationMutationOutcome *outcome);
-/* The timed scopes of the Execute that produced the submission, in execution order; none when it did not request
- * `timings`. Null `scopes` queries `count`; a smaller `capacity` than `count` is INVALID_ARGUMENT. NOT_READY while
- * the submission is pending, INTERNAL_ERROR once it failed, UNSUPPORTED_TARGET when the device could not time its
- * scopes. */
-VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetScopeTimings(const VernonSubmission *submission,
-                                                                 VernonScopeTiming *scopes, size_t capacity,
-                                                                 size_t *count);
-VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetBoundaryCount(const VernonProgramExecutable *pipeline,
                                                                           VernonProgramBoundaryRole boundary);
@@ -993,16 +718,6 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGr
     const VernonProgramExecutable *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(
     const VernonProgramExecutable *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
-VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback,
-                                                                       const VernonProgramArgument *arguments,
-                                                                       size_t argument_count,
-                                                                       const VernonPullbackApplyOptions *options,
-                                                                       VernonInvocationMutationOutcome *outcome);
-VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApply(VernonPullback *pullback,
-                                                            const VernonProgramArgument *arguments,
-                                                            size_t argument_count,
-                                                            VernonInvocationMutationOutcome *outcome);
-VERNON_RUNTIME_CAPI void vernonProgramPullbackDestroy(VernonPullback *pullback);
 
 #ifdef __cplusplus
 }

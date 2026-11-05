@@ -1279,15 +1279,24 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             }
             return constructComposite(location, *resultType, leaves, builder);
         }
+        if (name == "min" || name == "max" || name == "clamp") {
+            // GL.FMin, GL.FMax and GL.FClamp leave NaN operands undefined; these selects match the CPU and CUDA
+            // lowering, where a NaN or an equal operand selects the second operand.
+            auto pick = [&](bool minimum, Value lhs, Value rhs) -> Value {
+                Value picked = minimum ? spirv::FOrdLessThanOp::create(builder, location, lhs, rhs).getResult()
+                                       : spirv::FOrdGreaterThanOp::create(builder, location, lhs, rhs).getResult();
+                return spirv::SelectOp::create(builder, location, *resultType, picked, lhs, rhs).getResult();
+            };
+            if (name == "clamp")
+                return pick(true, pick(false, operands[0], operands[1]), operands[2]);
+            return pick(name == "min", operands[0], operands[1]);
+        }
         StringRef operationName = llvm::StringSwitch<StringRef>(name)
                                       .Case("dot", "spirv.Dot")
                                       .Case("cross", "spirv.GL.Cross")
                                       .Case("normalize", "spirv.GL.Normalize")
                                       .Case("reflect", "spirv.GL.Reflect")
-                                      .Case("min", "spirv.GL.FMin")
-                                      .Case("max", "spirv.GL.FMax")
                                       .Case("pow", "spirv.GL.Pow")
-                                      .Case("clamp", "spirv.GL.FClamp")
                                       .Default("");
         if (operationName.empty())
             return failure();

@@ -80,7 +80,7 @@ mode, since it is not a driver round trip.
   `GL_QUERY_RESULT` no longer waits. Vulkan, D3D12 and Metal already pool
   their query storage per encoder; they reuse it the same way.
 
-Scope timings stay opt-in through `ProgramInvocationOptions::timings`
+Scope timings stay opt-in per schedule through `vernonScheduleSetTimings`
 (`gpu_profiling.md` section 3).
 
 ## 4. Labels

@@ -807,7 +807,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
 
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
-    def test_program_instance_retains_native_attachment_owner(self, backend: BackendRow) -> None:
+    def test_graphics_calls_do_not_accumulate_attachment_references(self, backend: BackendRow) -> None:
         texture = vd.Texture.zeros(shape=(16, 16))
         render_pass = vd.render_pass(
             vd.RenderTarget.from_attachments(colors={0: texture}),
@@ -825,18 +825,24 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             return handle
 
         module = ManagedGraphics()
-        with patch.object(view_type, "_resident_view", capture_view):
+
+        def draw() -> None:
             module(
                 self._triangle_vertices(),
                 render_pass,
                 vd.draw(vertex_count=3),
                 vd.dynamic_state(viewport=(0, 0, 16, 16)),
             )
+
+        with patch.object(view_type, "_resident_view", capture_view):
+            draw()
         native_view = captured[0]
-        retained_references = sys.getrefcount(native_view)
-        del module
         gc.collect()
-        self.assertEqual(sys.getrefcount(native_view), retained_references - 1)
+        references = sys.getrefcount(native_view)
+        for _ in range(3):
+            draw()
+        gc.collect()
+        self.assertEqual(sys.getrefcount(native_view), references)
 
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
     def test_program_reuses_across_attachment_extents_and_dynamic_states(self, backend: BackendRow) -> None:

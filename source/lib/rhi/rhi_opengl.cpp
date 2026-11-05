@@ -2,6 +2,7 @@
 #include "block_pool.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
+#include "opengl_access.h"
 #include "opengl_backend.h"
 #include "public_c_boundary.h"
 #include "staging_pool.h"
@@ -140,6 +141,14 @@ struct OpenGLDevice {
     // Guarded by `mutex`. GL orders the `glBufferSubData` that refills a released block after the commands that read
     // it.
     vernon::rhi::BlockPool<TransientChunk> persistentBlocks;
+    // Guarded by `mutex`. The surface whose present last set the swap interval, and the interval. Setting it costs
+    // about 0.7 ms on WGL even when unchanged. Surfaces may share a context, and the interval belongs to the context
+    // on some platforms and to the window on others, so it is kept only while one surface presents in a row.
+    VernonRhiSurface intervalSurface{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    int32_t interval{-1};
+    // Guarded by `mutex`. The present blit's read framebuffer, made by the first present and kept, since
+    // `glGenFramebuffers` waits for a threaded driver to catch up. Every surface presents with the device's context.
+    Uint presentFramebuffer{};
 };
 
 using OpenGLDeviceRegistry = vernon::rhi::DeviceRegistry<OpenGLDevice, kMaximumOpenGLDevices>;
@@ -311,6 +320,8 @@ vernon::Result<void, vernon::RhiError> teardownSurface(void *context, SurfaceLif
 vernon::Result<void, vernon::RhiError> teardownDevice(OpenGLDevice &device) noexcept {
     std::lock_guard<std::mutex> guard(device.mutex);
     device.state.makeCurrent();
+    if (device.presentFramebuffer)
+        device.state.driver.deleteFramebuffers(1, &device.presentFramebuffer);
     device.state.destroyAttachmentFramebuffers();
     device.state.destroyDepthStencilCopyObjects();
     for (TransientArena &transient : device.transients)
@@ -1535,9 +1546,9 @@ Result<CommandSubmission, RhiError> submitCommands(VernonRhiDevice handle, uint6
         if (state.state.driver.memoryBarrier)
             state.state.driver.memoryBarrier(
                 vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
-                vernon::rhi::opengl::kShaderImageAccessBarrierBit | vernon::rhi::opengl::kTextureFetchBarrierBit |
-                vernon::rhi::opengl::kTextureUpdateBarrierBit | vernon::rhi::opengl::kFramebufferBarrierBit |
-                vernon::rhi::opengl::kBufferUpdateBarrierBit);
+                vernon::rhi::opengl::kCommandBarrierBit | vernon::rhi::opengl::kShaderImageAccessBarrierBit |
+                vernon::rhi::opengl::kTextureFetchBarrierBit | vernon::rhi::opengl::kTextureUpdateBarrierBit |
+                vernon::rhi::opengl::kFramebufferBarrierBit | vernon::rhi::opengl::kBufferUpdateBarrierBit);
         else
             state.state.driver.finish();
     }
@@ -1651,7 +1662,7 @@ Result<void, RhiError> recordBarriers(VernonRhiDevice handle, uint64_t encoderKe
                 if (state == VERNON_RHI_STATE_SHADER_READ)
                     bits |= vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kUniformBarrierBit |
                             vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
-                            vernon::rhi::opengl::kElementArrayBarrierBit;
+                            vernon::rhi::opengl::kElementArrayBarrierBit | vernon::rhi::opengl::kCommandBarrierBit;
                 else if (state == VERNON_RHI_STATE_SHADER_WRITE)
                     bits |= vernon::rhi::opengl::kShaderStorageBarrierBit;
                 else if (state == VERNON_RHI_STATE_TRANSFER_SOURCE || state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
@@ -1879,14 +1890,10 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
     if (auto scopeError = beginErrorScope(state, "copy image"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     Uint copyFramebuffers[2]{};
-    Int previousReadFramebuffer = 0;
-    Int previousDrawFramebuffer = 0;
     if (framebufferCopy) {
         if (!state.state.driver.blitFramebuffer)
             return Result<void, RhiError>{
                 err(RhiError{RhiErrorCode::Unsupported, {"recordImageCopy_opengl", native, 0}})};
-        state.state.driver.getIntegerv(gl::kReadFramebufferBinding, &previousReadFramebuffer);
-        state.state.driver.getIntegerv(gl::kDrawFramebufferBinding, &previousDrawFramebuffer);
         state.state.driver.genFramebuffers(2, copyFramebuffers);
         if (!copyFramebuffers[0] || !copyFramebuffers[1]) {
             if (copyFramebuffers[0] || copyFramebuffers[1])
@@ -1899,8 +1906,7 @@ Result<void, RhiError> recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_
     const auto releaseCopyFramebuffers = [&] {
         if (!framebufferCopy)
             return;
-        state.state.driver.bindFramebuffer(gl::kReadFramebuffer, static_cast<Uint>(previousReadFramebuffer));
-        state.state.driver.bindFramebuffer(gl::kDrawFramebuffer, static_cast<Uint>(previousDrawFramebuffer));
+        state.state.driver.bindFramebuffer(gl::kFramebuffer, 0);
         state.state.driver.deleteFramebuffers(2, copyFramebuffers);
     };
     for (size_t index = 0; index < regionCount; ++index) {
@@ -2558,14 +2564,11 @@ Result<void, RhiError> blitToWindow(OpenGLDevice &state, const ImageSlot &image,
     auto &driver = state.state.driver;
     if (auto scopeError = beginErrorScope(state, "present surface"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
-    Uint framebuffer{};
-    driver.genFramebuffers(1, &framebuffer);
+    Uint &framebuffer = state.presentFramebuffer;
+    if (!framebuffer)
+        driver.genFramebuffers(1, &framebuffer);
     if (!framebuffer)
         return Result<void, RhiError>{err(RhiError{RhiErrorCode::ResourceExhausted, {"present_opengl_surface", 0, 0}})};
-    Int previousReadFramebuffer = 0;
-    Int previousDrawFramebuffer = 0;
-    driver.getIntegerv(gl::kReadFramebufferBinding, &previousReadFramebuffer);
-    driver.getIntegerv(gl::kDrawFramebufferBinding, &previousDrawFramebuffer);
     prepareOpenGLBlits(state.state);
     driver.bindFramebuffer(gl::kReadFramebuffer, framebuffer);
     driver.framebufferTexture2D(gl::kReadFramebuffer, gl::kColorAttachment0, gl::kTexture2D, image.image.name, 0);
@@ -2574,9 +2577,7 @@ Result<void, RhiError> blitToWindow(OpenGLDevice &state, const ImageSlot &image,
     const Int right = static_cast<Int>(width);
     const Int top = static_cast<Int>(height);
     driver.blitFramebuffer(0, 0, right, top, 0, top, right, 0, gl::kColorBufferBit, gl::kNearest);
-    driver.bindFramebuffer(gl::kReadFramebuffer, static_cast<Uint>(previousReadFramebuffer));
-    driver.bindFramebuffer(gl::kDrawFramebuffer, static_cast<Uint>(previousDrawFramebuffer));
-    driver.deleteFramebuffers(1, &framebuffer);
+    driver.bindFramebuffer(gl::kFramebuffer, 0);
     if (auto scopeError = endErrorScope(state, "present surface"))
         return Result<void, RhiError>{err(std::move(*scopeError))};
     return Result<void, RhiError>{ok()};
@@ -2601,7 +2602,13 @@ Result<void, RhiError> presentSurface(VernonRhiDevice handle, VernonRhiSurface s
     const VernonOpenGLSurfaceCallbacks &callbacks = slot->callbacks;
     std::lock_guard<std::mutex> guard(state.mutex);
     callbacks.make_current(callbacks.user_data);
-    callbacks.swap_interval(callbacks.user_data, slot->configuration.present_mode == VERNON_RHI_PRESENT_FIFO ? 1 : 0);
+    const int32_t interval = slot->configuration.present_mode == VERNON_RHI_PRESENT_FIFO ? 1 : 0;
+    if (state.intervalSurface.index != surface.index || state.intervalSurface.generation != surface.generation ||
+        state.interval != interval) {
+        callbacks.swap_interval(callbacks.user_data, interval);
+        state.intervalSurface = surface;
+        state.interval = interval;
+    }
     auto blitted = blitToWindow(state, *indexedSlot(state.images, presented.image.index), slot->configuration.width,
                                 slot->configuration.height);
     if (blitted.isOk())
@@ -2720,4 +2727,56 @@ void vernon::rhi::raiseOpenGLError(VernonRhiDevice handle) {
     std::lock_guard<std::mutex> guard(state.mutex);
     state.state.makeCurrent();
     state.state.driver.enable(0);
+}
+
+vernon::Result<gl::DeviceAccess, vernon::RhiError> vernon::rhi::opengl::deviceAccess(VernonRhiDevice handle) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return vernon::Result<DeviceAccess, vernon::RhiError>{vernon::err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    return vernon::Result<DeviceAccess, vernon::RhiError>{vernon::ok(DeviceAccess{&state.state, &state.mutex})};
+}
+
+vernon::Result<gl::Uint, vernon::RhiError> vernon::rhi::opengl::scopeFramebuffer(VernonRhiDevice handle,
+                                                                                 const RenderingScope &scope) noexcept {
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return vernon::Result<Uint, vernon::RhiError>{vernon::err(std::move(device).error())};
+    OpenGLDevice &state = device.value().device();
+    std::array<const ImageViewSlot *, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorViews{};
+    FramebufferAttachments attachments{};
+    uint32_t colorSlots = 0;
+    for (size_t index = 0; index < scope.colorCount; ++index) {
+        const uint32_t location = scope.colors[index].location;
+        colorViews[location] = imageViewSlot(state, scope.colors[index].view);
+        if (!colorViews[location])
+            return vernon::Result<Uint, vernon::RhiError>{
+                vernon::err(vernon::rhi::invalidArgument("scope_framebuffer_color", location))};
+        attachments.colors[location] = imageViewName(*colorViews[location]);
+        colorSlots = std::max(colorSlots, location + 1);
+    }
+    const ImageViewSlot *depthView = scope.hasDepth ? imageViewSlot(state, scope.depth.view) : nullptr;
+    if (scope.hasDepth && !depthView)
+        return vernon::Result<Uint, vernon::RhiError>{vernon::err(vernon::rhi::invalidArgument("scope_framebuffer"))};
+    if (depthView) {
+        attachments.depth = imageViewName(*depthView);
+        attachments.stencil = scope.depth.stencil;
+    }
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (!state.state.makeCurrent())
+        return vernon::Result<Uint, vernon::RhiError>{
+            vernon::err(vernon::rhi::backendFailure("scope_framebuffer_make_current"))};
+    ++state.state.drawStateGeneration;
+    try {
+        return bindAttachmentFramebuffer(state, attachments, colorViews, colorSlots, depthView);
+    } catch (const std::bad_alloc &) {
+        return vernon::Result<Uint, vernon::RhiError>{
+            vernon::err(vernon::RhiError{vernon::RhiErrorCode::ResourceExhausted, {"scope_framebuffer", 0, 0}})};
+    }
+}
+
+bool vernon::rhi::opengl::renderAreaCovers(VernonRhiDevice handle, uint64_t view,
+                                           const RenderingScope &scope) noexcept {
+    auto device = lookupDevice(handle);
+    return device.isOk() && renderAreaCoversOpenGLView(device.value().device(), view, scope);
 }

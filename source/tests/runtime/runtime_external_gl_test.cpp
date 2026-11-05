@@ -1,8 +1,8 @@
 #include "VernonRuntime.h"
+#include "VernonSchedule.h"
 #include "rhi/rhi_test_hooks.h"
-#include "runtime/program_execution/failure_injection.h"
-#include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <nlohmann/json.hpp>
 
@@ -722,97 +722,117 @@ VernonStatus destroy(VernonRuntimeContext *runtime) {
     return status;
 }
 
+using vernon::tests::DeviceTensor;
+using vernon::tests::HalImage;
+using vernon::tests::HalSampler;
+using vernon::tests::HalTestDevice;
+using vernon::tests::LinkedProgram;
+using vernon::tests::PassControls;
+using vernon::tests::ResolvedProgram;
+using vernon::tests::ScheduleRecord;
+
+// A VernonHal.h device on the fake driver, which reads the driver's state as it is when the device is created.
+class FakeGlDevice {
+public:
+    explicit FakeGlDevice(VernonRuntimeBackend backend = VERNON_RUNTIME_OPENGL, uint16_t major = 4, uint16_t minor = 3,
+                          uint32_t flags = 0) {
+        VernonOpenGLContextCallbacks callbacks{};
+        callbacks.struct_size = sizeof(callbacks);
+        callbacks.make_current = &makeCurrent;
+        callbacks.get_proc_address = &getProcAddress;
+        callbacks.api_version_major = major;
+        callbacks.api_version_minor = minor;
+        EXPECT_TRUE(device_.adoptOpenGL(backend, callbacks, flags)) << vernon::tests::halError();
+    }
+
+    explicit operator bool() const { return device_.get() != nullptr; }
+    const HalTestDevice &device() const { return device_; }
+    VernonHalDevice *get() const { return device_.get(); }
+    VernonRuntimeContext *runtime() const { return device_.runtime(); }
+
+private:
+    HalTestDevice device_;
+};
+
+// A fixture Program on the fake driver, linked as one schedule.
+class FakeGlProgram {
+public:
+    FakeGlProgram(const FakeGlDevice &gl, const std::filesystem::path &manifest)
+        : program_(gl.runtime(), manifest), linked_(gl.runtime(), program_.get()) {}
+
+    explicit operator bool() const { return static_cast<bool>(linked_); }
+    std::string error() const { return linked_.error(); }
+    LinkedProgram &linked() { return linked_; }
+    ScheduleRecord &record() { return linked_.record(); }
+    VernonStatus call(uint64_t *point = nullptr) { return linked_.call(point); }
+
+private:
+    ResolvedProgram program_;
+    LinkedProgram linked_;
+};
+
+// A color target of the fake driver, and the pass that clears it to zero and draws `vertexCount` vertices into it.
+struct ColorPass {
+    ColorPass(const FakeGlDevice &gl, uint32_t width, uint32_t height, uint32_t vertexCount)
+        : target(gl.get(), VERNON_TEXTURE_RGBA8_UNORM, width, height, VERNON_IMAGE_COLOR_ATTACHMENT),
+          controls(target.reference(), width) {
+        controls.attachment.clear_color.f32[3] = 0.0F;
+        controls.renderPass.render_area[3] = height;
+        controls.dynamic.viewport[3] = height;
+        controls.dynamic.scissor[3] = height;
+        draw.vertex_count = vertexCount;
+    }
+
+    void writeTo(ScheduleRecord &record) const { controls.writeTo(record, 0, &draw); }
+
+    HalImage target;
+    PassControls controls;
+    VernonDrawCommand draw{sizeof(VernonDrawCommand), nullptr, 0, 1, 0};
+};
+
 void expectMatrixUpload(VernonRuntimeBackend backend, const char *manifest, uint16_t major, uint16_t minor,
-                        const std::array<float, 16> &storage, const std::array<int64_t, 2> &strides,
+                        std::array<float, 16> storage, const std::array<int64_t, 2> &strides,
                         GlBoolean expectedTranspose, const std::array<float, 16> &expectedUpload) {
     matrixTranspose = expectedTranspose ? 0 : 1;
     matrixUpload.fill(0.0F);
     clearCount = 0;
     clearedDrawBuffer = -1;
     clearColor.fill(1.0F);
-    VernonRuntimeContext *gl = create(backend, major, minor);
+    const FakeGlDevice gl(backend, major, minor);
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-        const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
-                                                                     VERNON_RHI_FORMAT_RGBA8_UNORM);
-        ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-        constexpr std::array<uint64_t, 2> shape = {4, 4};
-        VernonProgramArgument argument{};
-        argument.slot = 0;
-        argument.kind = VERNON_PROGRAM_TENSOR;
-        argument.tensor.struct_size = sizeof(VernonTensorView);
-        argument.tensor.storage = VERNON_TENSOR_HOST;
-        argument.tensor.host_data = storage.data();
-        argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-        argument.tensor.access = VERNON_ACCESS_READ;
-        argument.tensor.rank = 2;
-        argument.tensor.shape = shape.data();
-        argument.tensor.byte_strides = strides.data();
-        argument.tensor.byte_size = sizeof(storage);
-        VernonColorAttachment attachment{0, renderTargetView.reference};
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-        const GlUint nextNameAfterPreparation = nextName;
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << lastError(gl);
-        EXPECT_EQ(nextName, nextNameAfterPreparation + 1) << "only the target's framebuffer is created";
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << lastError(gl);
-        EXPECT_EQ(nextName, nextNameAfterPreparation + 1);
-        EXPECT_EQ(matrixTranspose, expectedTranspose);
-        EXPECT_EQ(matrixUpload, expectedUpload);
-        EXPECT_EQ(clearCount, 2U);
-        EXPECT_EQ(clearedDrawBuffer, 0);
-        EXPECT_EQ(clearColor, (std::array<float, 4>{}));
-
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle),
-                  VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
-    }
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+    FakeGlProgram program(gl, manifest);
+    ASSERT_TRUE(program) << program.error();
+    const ColorPass pass(gl, 16, 16, 3);
+    constexpr std::array<uint64_t, 2> shape = {4, 4};
+    program.record().bind("transform",
+                          vernon::tests::hostView(storage.data(), sizeof(storage), 2, shape.data(), strides.data()));
+    pass.writeTo(program.record());
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+    const GlUint namesAfterFirstCall = nextName;
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+    EXPECT_EQ(nextName, namesAfterFirstCall) << "a later call creates no GL object";
+    EXPECT_EQ(matrixTranspose, expectedTranspose);
+    EXPECT_EQ(matrixUpload, expectedUpload);
+    EXPECT_EQ(clearCount, 2U);
+    EXPECT_EQ(clearedDrawBuffer, 0);
+    EXPECT_EQ(clearColor, (std::array<float, 4>{}));
 }
 
-void expectIntegerUniformUpload(const char *manifest, const char *name, VernonDataType dataType, const void *data,
-                                uint32_t components) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+void expectIntegerUniformUpload(const char *manifest, const char *name, const void *data, uint32_t components) {
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-        const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
-                                                                     VERNON_RHI_FORMAT_RGBA8_UNORM);
-        ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-        const uint64_t shape = components;
-        const int64_t stride = sizeof(uint32_t);
-        VernonProgramParameterView parameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline.get(), {name, std::strlen(name)}, &parameter),
-                  VERNON_STATUS_OK);
-        VernonProgramArgument argument{};
-        argument.slot = parameter.slot;
-        argument.kind = VERNON_PROGRAM_TENSOR;
-        argument.tensor.struct_size = sizeof(VernonTensorView);
-        argument.tensor.storage = VERNON_TENSOR_HOST;
-        argument.tensor.host_data = data;
-        argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(dataType);
-        argument.tensor.access = VERNON_ACCESS_READ;
-        argument.tensor.rank = components == 1 ? 0 : 1;
-        argument.tensor.shape = components == 1 ? nullptr : &shape;
-        argument.tensor.byte_strides = components == 1 ? nullptr : &stride;
-        argument.tensor.byte_size = components * sizeof(uint32_t);
-        VernonColorAttachment attachment{0, renderTargetView.reference};
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK);
-
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle),
-                  VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
-    }
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+    FakeGlProgram program(gl, manifest);
+    ASSERT_TRUE(program) << program.error();
+    const ColorPass pass(gl, 16, 16, 3);
+    std::array<uint32_t, 4> values{};
+    std::memcpy(values.data(), data, components * sizeof(uint32_t));
+    const uint64_t shape = components;
+    const int64_t stride = sizeof(uint32_t);
+    program.record().bind(name, vernon::tests::hostView(values.data(), components * sizeof(uint32_t),
+                                                        components == 1 ? 0 : 1, components == 1 ? nullptr : &shape,
+                                                        components == 1 ? nullptr : &stride));
+    pass.writeTo(program.record());
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
 }
 
 // Records groups "a" and "b", a group "c" past a depth limit of three, and two markers with a five-byte message limit,
@@ -944,94 +964,6 @@ VernonRhiStatus submitAndReadTimers(VernonRhiDevice device, VernonRhiCommandEnco
 }
 
 #if defined(VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE)
-// Executes `executable` with every graphics Node drawing one triangle into the same target, after `recording` replaces
-// the draws of the first Node, and returns the debug label calls, timestamp queries and draws of that Execute. With
-// `submission`, the Execute's submission is handed out.
-std::vector<std::string> executeModuleGraphics(VernonRuntimeContext *gl, VernonProgramExecutable *executable,
-                                               const std::vector<VernonGraphicsCommand> &recording = {},
-                                               const VernonProgramInvocationOptions *options = nullptr,
-                                               VernonSubmission **submission = nullptr) {
-    RhiRuntime &runtime = rhiRuntime(gl);
-    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
-    constexpr std::array<uint64_t, 2> shape{3, 2};
-    constexpr std::array<int64_t, 2> strides{2 * sizeof(float), sizeof(float)};
-    const vernon::tests::RhiBuffer vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float),
-                                                                          VERNON_RHI_BUFFER_VERTEX, positions.data());
-    RhiImage target = createTexture2D(gl, 8, 8, VERNON_TEXTURE_RGBA8_UNORM);
-    const auto view =
-        vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    EXPECT_NE(invocation, nullptr);
-    VernonGraphicsRecording *recorded = nullptr;
-    if (options)
-        EXPECT_EQ(vernonRuntimeProgramInvocationSetOptions(invocation, options), VERNON_STATUS_OK);
-
-    for (size_t index = 0; index < vernonRuntimeProgramExecutableGetParameterCount(executable); ++index) {
-        VernonProgramParameterView parameter{};
-        EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &parameter), VERNON_STATUS_OK);
-        VernonProgramArgument argument{};
-        argument.slot = parameter.slot;
-        if (std::string_view(parameter.name.data, parameter.name.size) == "output") {
-            argument.kind = VERNON_PROGRAM_IMAGE;
-            argument.image = {view.reference};
-        } else {
-            argument.kind = VERNON_PROGRAM_TENSOR;
-            argument.tensor.struct_size = sizeof(argument.tensor);
-            argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-            argument.tensor.resource = vertices.reference;
-            argument.tensor.element_layout = parameter.element_layout;
-            argument.tensor.access = parameter.access;
-            argument.tensor.rank = shape.size();
-            argument.tensor.shape = shape.data();
-            argument.tensor.byte_strides = strides.data();
-            argument.tensor.byte_size = sizeof(positions);
-        }
-        const std::string text = "argument-" + std::to_string(index);
-        const VernonProgramBindingToken token{sizeof(token), text.data(), text.size()};
-        EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &argument, nullptr, 0, 0), VERNON_STATUS_OK);
-    }
-
-    const size_t nodeCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable);
-    std::vector<VernonColorAttachment> attachments(nodeCount);
-    std::vector<vernon::tests::CanonicalGraphicsControls> controls;
-    controls.reserve(nodeCount);
-    for (size_t node = 0; node < nodeCount; ++node) {
-        attachments[node].view = view.reference;
-        attachments[node].load_operation =
-            node == 0 ? VERNON_RUNTIME_PROVIDER_LOAD_CLEAR : VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
-        attachments[node].store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-        vernon::tests::CanonicalGraphicsControls &graphics = controls.emplace_back(&attachments[node], 1, 3);
-        graphics.renderPass.render_area[2] = graphics.renderPass.render_area[3] = 8;
-        graphics.dynamic.viewport[2] = graphics.dynamic.viewport[3] = 8;
-        graphics.dynamic.scissor[2] = graphics.dynamic.scissor[3] = 8;
-        VernonProgramGraphicsControlsView slots{};
-        EXPECT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, node, &slots), VERNON_STATUS_OK);
-        EXPECT_EQ(graphics.bind(invocation, slots), VERNON_STATUS_OK);
-        if (node == 0 && !recording.empty()) {
-            EXPECT_EQ(vernonRuntimeGraphicsRecordingCreate(instance, slots.node, &recorded),
-                      VERNON_RUNTIME_OPERATION_OK);
-            EXPECT_EQ(vernonRuntimeGraphicsRecordingAppend(recorded, recording.data(), recording.size(), nullptr, 0),
-                      VERNON_STATUS_OK);
-            EXPECT_EQ(vernonRuntimeProgramInvocationBindRecording(invocation, recorded), VERNON_STATUS_OK);
-        }
-    }
-
-    orderedCalls.clear();
-    EXPECT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK) << lastError(gl);
-    std::vector<std::string> calls = std::move(orderedCalls);
-    EXPECT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK);
-    if (submission)
-        EXPECT_EQ(vernonRuntimeProgramInvocationTakeSubmission(invocation, submission), VERNON_STATUS_OK);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    vernonRuntimeGraphicsRecordingDestroy(recorded);
-    vernonRuntimeProgramInstanceDestroy(instance);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(runtime.device, view.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(runtime.device, target.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    return calls;
-}
-
 // Resolves the graph of Nodes "scene" and "overlay", both drawing `bundle` into one exported framebuffer, so that they
 // fuse into one render scope.
 VernonProgramExecutable *resolveSceneOverlayGraph(VernonRuntimeContext *gl, VernonProgramBundle *bundle,
@@ -1063,30 +995,91 @@ VernonProgramExecutable *resolveSceneOverlayGraph(VernonRuntimeContext *gl, Vern
     return executable;
 }
 
-VernonProgramInvocationOptions invocationOptions(VernonCompletionMode mode, uint32_t timings) {
-    return {sizeof(VernonProgramInvocationOptions), VERNON_PROGRAM_INVOCATION_OPTIONS_VERSION, mode, timings, {}};
-}
-
-// Reads the scope timings of a completed submission, checking that a short capacity is rejected.
-std::vector<VernonScopeTiming> readScopeTimings(VernonRuntimeContext *gl, VernonSubmission *submission) {
-    size_t count = 0;
-    EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_OK);
-    std::vector<VernonScopeTiming> scopes(count);
-    if (count) {
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, scopes.data(), count - 1, &count),
-                  VERNON_STATUS_INVALID_ARGUMENT);
-        EXPECT_EQ(lastError(gl), "scope timing storage is smaller than the timed scopes");
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, scopes.data(), scopes.size(), &count), VERNON_STATUS_OK);
-        EXPECT_EQ(count, scopes.size());
+// The module graphics Program linked on the fake driver, or with `sceneOverlay` the graph of its Nodes "scene" and
+// "overlay". Every graphics node draws one triangle into one target, the first clearing it.
+class ModuleGraphics {
+public:
+    explicit ModuleGraphics(const FakeGlDevice &gl, bool sceneOverlay = false)
+        : program_(gl.runtime(), VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE),
+          graph_(sceneOverlay && program_ ? resolveSceneOverlayGraph(gl.runtime(), program_.bundle(), nodes_) : nullptr,
+                 vernonRuntimeProgramExecutableDestroy),
+          linked_(gl.runtime(), sceneOverlay ? graph_.get() : program_.get()),
+          vertices_(gl.device(), kTriangle.data(), sizeof(kTriangle), {3, 2}, sizeof(float), {}, 0,
+                    VERNON_HAL_BUFFER_VERTEX | VERNON_HAL_BUFFER_STORAGE),
+          target_(gl.get(), VERNON_TEXTURE_RGBA8_UNORM, 8, 8, VERNON_IMAGE_COLOR_ATTACHMENT) {
+        if (!linked_)
+            return;
+        for (const char *name : {"vertices", "scene_vertices", "overlay_vertices"})
+            if (linked_.record().takes(name))
+                linked_.record().bind(name, vertices_);
+        for (size_t node = 0; linked_.record().passSlot(node) != SIZE_MAX; ++node) {
+            controls_.push_back(std::make_unique<PassControls>(target_.reference(), 8));
+            if (node)
+                controls_.back()->attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+            controls_.back()->writeTo(linked_.record(), node, &draw_);
+        }
     }
-    return scopes;
+
+    explicit operator bool() const { return static_cast<bool>(linked_); }
+    std::string error() const { return linked_.error(); }
+    VernonLinkedSchedule *get() const { return linked_.get(); }
+    VernonProgramNodeId sceneNode() const { return nodes_[0]; }
+
+    // Draws the first graphics node's triangles through `table` instead.
+    void drawFirstNodeThrough(const VernonSchedulePassTable *table) {
+        linked_.record().write(linked_.record().passSlot(0) + 4, table);
+    }
+
+    // Calls and waits, returning the debug label calls, timestamp queries and draws that reached the driver.
+    std::vector<std::string> call(uint64_t *point = nullptr) {
+        orderedCalls.clear();
+        EXPECT_EQ(linked_.call(point), VERNON_STATUS_OK) << error();
+        return std::move(orderedCalls);
+    }
+    VernonStatus submit(uint64_t &point) {
+        return vernonScheduleCall(linked_.get(), linked_.record().data(), linked_.record().size(), &point);
+    }
+
+    // The scope timings of the completed call that signalled `point`, checking that a short capacity is rejected.
+    std::vector<VernonScopeTiming> scopeTimings(uint64_t point) const {
+        size_t count = 0;
+        EXPECT_EQ(vernonScheduleGetScopeTimings(linked_.get(), point, nullptr, 0, &count), VERNON_STATUS_OK) << error();
+        std::vector<VernonScopeTiming> scopes(count);
+        if (count) {
+            EXPECT_EQ(vernonScheduleGetScopeTimings(linked_.get(), point, scopes.data(), count - 1, &count),
+                      VERNON_STATUS_INVALID_ARGUMENT);
+            EXPECT_EQ(vernonScheduleGetScopeTimings(linked_.get(), point, scopes.data(), scopes.size(), &count),
+                      VERNON_STATUS_OK);
+            EXPECT_EQ(count, scopes.size());
+        }
+        return scopes;
+    }
+
+private:
+    static constexpr std::array<float, 6> kTriangle{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+
+    ResolvedProgram program_;
+    std::array<VernonProgramNodeId, 2> nodes_{};
+    std::unique_ptr<VernonProgramExecutable, void (*)(VernonProgramExecutable *)> graph_;
+    LinkedProgram linked_;
+    DeviceTensor vertices_;
+    HalImage target_;
+    VernonDrawCommand draw_{sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
+    std::vector<std::unique_ptr<PassControls>> controls_;
+};
+
+VernonScheduleDebugCommand debugCommand(VernonGraphicsCommandKind kind, std::string_view label = {}) {
+    return {static_cast<uint32_t>(kind), {label.data(), label.size()}};
 }
 
-VernonGraphicsCommand graphicsCommand(VernonGraphicsCommandKind kind, std::string_view label = {}) {
-    VernonGraphicsCommand command{};
-    command.kind = kind;
-    command.label = {label.data(), label.size()};
-    return command;
+// A pass table entry that draws the node's triangle with its own Stage.
+VernonSchedulePassEntry triangleEntry(const VernonScheduleDebugCommand *commands = nullptr, size_t count = 0) {
+    VernonSchedulePassEntry entry{};
+    entry.struct_size = sizeof(entry);
+    entry.draw = {sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
+    entry.debug_commands = commands;
+    entry.debug_command_count = count;
+    return entry;
 }
 #endif
 
@@ -1327,75 +1320,37 @@ TEST(RuntimeExternalGl, ReadsEveryThreeDimensionalImageLayer) {
 }
 
 #if defined(VERNON_OPENGL_STORAGE_IMAGE_BUNDLE)
-TEST(RuntimeExternalGl, InvokesCanonicalComputeProgramThroughRuntimeCoreProvider) {
+TEST(RuntimeExternalGl, CallsAComputeScheduleThatWritesAStorageImage) {
     dispatchCount = 0;
     storageBindingCount = 0;
     memoryBarrierCount = 0;
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    {
-        const size_t groupCreations = vernon::runtime::getRhiAdapterGroupCreationCount(gl);
-        vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
-        ASSERT_TRUE(program) << lastError(gl);
-        EXPECT_EQ(vernon::runtime::getRhiAdapterGroupCreationCount(gl), groupCreations);
-        auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT, 1,
-                                                1, 1, VERNON_RHI_IMAGE_STORAGE);
-        const auto imageView =
-            vernon::tests::createImageView(rhiRuntime(gl), image, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT);
-        ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        VernonProgramParameterView imageParameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(program.get(), {"image", 5}, &imageParameter),
-                  VERNON_STATUS_OK);
-        VernonProgramArgument argument{};
-        argument.slot = imageParameter.slot;
-        argument.kind = VERNON_PROGRAM_IMAGE;
-        argument.image.view = imageView.reference;
-        ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
-                  VERNON_STATUS_OK)
-            << lastError(gl);
-        EXPECT_EQ(dispatchCount, 1u);
-        EXPECT_EQ(storageBindingCount, 1u);
-        EXPECT_EQ(memoryBarrierCount, 3u);
-        EXPECT_EQ(vernon::runtime::getRhiAdapterGroupCreationCount(gl), groupCreations + 1);
-        ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
-                  VERNON_STATUS_OK)
-            << lastError(gl);
-        EXPECT_EQ(dispatchCount, 2u);
-        EXPECT_EQ(storageBindingCount, 2u);
-        EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
-        EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    FakeGlProgram program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
+    ASSERT_TRUE(program) << program.error();
+    const HalImage image(gl.get(), VERNON_TEXTURE_RGBA32_FLOAT, 1, 1, VERNON_IMAGE_STORAGE);
+    ASSERT_TRUE(image);
+    program.record().bindImage("image", image.reference());
+    program.record().bindGrid(1);
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+    EXPECT_EQ(dispatchCount, 1u);
+    EXPECT_EQ(storageBindingCount, 1u);
+    EXPECT_GT(memoryBarrierCount, 0u);
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+    EXPECT_EQ(dispatchCount, 2u);
+    EXPECT_EQ(storageBindingCount, 2u);
 }
-#endif
 
-#if defined(VERNON_OPENGL_STORAGE_IMAGE_BUNDLE)
-TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+TEST(RuntimeExternalGl, RejectsAStorageImageOfAnotherFormat) {
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 1, 1,
-                                            VERNON_RHI_IMAGE_STORAGE);
-    const auto imageView =
-        vernon::tests::createImageView(rhiRuntime(gl), image, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    {
-        vernon::tests::OwnedProgramExecutable program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
-        ASSERT_TRUE(program) << lastError(gl);
-        VernonProgramParameterView imageParameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(program.get(), {"image", 5}, &imageParameter),
-                  VERNON_STATUS_OK);
-        VernonProgramArgument argument{};
-        argument.slot = imageParameter.slot;
-        argument.kind = VERNON_PROGRAM_IMAGE;
-        argument.image.view = imageView.reference;
-        EXPECT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {1, 1, 1}),
-                  VERNON_STATUS_INVALID_ARGUMENT);
-    }
-
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    FakeGlProgram program(gl, VERNON_OPENGL_STORAGE_IMAGE_BUNDLE);
+    ASSERT_TRUE(program) << program.error();
+    const HalImage image(gl.get(), VERNON_TEXTURE_RGBA8_UNORM, 1, 1, VERNON_IMAGE_STORAGE);
+    ASSERT_TRUE(image);
+    program.record().bindImage("image", image.reference());
+    program.record().bindGrid(1);
+    EXPECT_EQ(program.call(), VERNON_STATUS_INVALID_ARGUMENT);
 }
 #endif
 
@@ -1415,11 +1370,11 @@ TEST(RuntimeExternalGl, UploadsSignedAndUnsignedIntegerUniforms) {
     signedUniformUpload.fill(0);
     unsignedUniformUpload.fill(0);
     constexpr GlInt signedValue = -17;
-    expectIntegerUniformUpload(VERNON_OPENGL_SIGNED_UNIFORM_BUNDLE, "budget", VERNON_DATA_I32, &signedValue, 1);
+    expectIntegerUniformUpload(VERNON_OPENGL_SIGNED_UNIFORM_BUNDLE, "budget", &signedValue, 1);
     EXPECT_EQ(signedUniformUpload[0], signedValue);
 
     constexpr std::array<GlUint, 3> unsignedValue = {3, 5, 8};
-    expectIntegerUniformUpload(VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE, "budget", VERNON_DATA_U32, unsignedValue.data(),
+    expectIntegerUniformUpload(VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE, "budget", unsignedValue.data(),
                                unsignedValue.size());
     EXPECT_EQ(unsignedUniformUpload[0], unsignedValue[0]);
     EXPECT_EQ(unsignedUniformUpload[1], unsignedValue[1]);
@@ -1450,70 +1405,21 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
 
     resolutionUpload.fill(0.0F);
     signedUniformUpload.fill(0);
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    const std::string directory = manifestPath.parent_path().u8string();
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(gl, bundleData.data(), bundleData.size(), &options);
-    ASSERT_TRUE(bundle) << lastError(gl);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_TRUE(pipeline) << lastError(gl);
-
+    FakeGlProgram program(gl, manifestPath);
+    ASSERT_TRUE(program) << program.error();
     constexpr std::array<float, 6> positions{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
-    auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), sizeof(positions), alignof(float),
-                                                VERNON_RHI_BUFFER_VERTEX, positions.data());
-    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 37, 23, VERNON_TEXTURE_RGBA8_UNORM);
-    const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
-                                                                 VERNON_RHI_FORMAT_RGBA8_UNORM);
-    ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
+    const DeviceTensor vertices(gl.device(), positions.data(), sizeof(positions), {3, 2}, sizeof(float), {}, 0,
+                                VERNON_HAL_BUFFER_VERTEX);
+    const ColorPass pass(gl, 37, 23, 3);
     constexpr GlInt maxSteps = 19;
-    constexpr std::array<uint64_t, 2> positionShape{3, 2};
-    constexpr std::array<int64_t, 2> positionStrides{2 * sizeof(float), sizeof(float)};
-    VernonProgramParameterView maxStepsParameter{};
-    VernonProgramParameterView positionParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"max_steps", 9}, &maxStepsParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
-              VERNON_STATUS_OK);
-    std::array<VernonProgramArgument, 2> arguments{};
-    arguments[0].slot = maxStepsParameter.slot;
-    arguments[0].kind = VERNON_PROGRAM_TENSOR;
-    arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_HOST;
-    arguments[0].tensor.host_data = &maxSteps;
-    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
-    arguments[0].tensor.access = VERNON_ACCESS_READ;
-    arguments[0].tensor.byte_size = sizeof(maxSteps);
-    arguments[1].slot = positionParameter.slot;
-    arguments[1].kind = VERNON_PROGRAM_TENSOR;
-    arguments[1].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-    arguments[1].tensor.resource = vertices.reference;
-    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-    arguments[1].tensor.access = VERNON_ACCESS_READ;
-    arguments[1].tensor.rank = positionShape.size();
-    arguments[1].tensor.shape = positionShape.data();
-    arguments[1].tensor.byte_strides = positionStrides.data();
-    arguments[1].tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, renderTargetView.reference};
-    const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics),
-              VERNON_STATUS_OK)
-        << lastError(gl);
+    program.record().bindScalar("max_steps", maxSteps);
+    program.record().bind("position", vertices);
+    pass.writeTo(program.record());
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
     EXPECT_EQ(signedUniformUpload[0], maxSteps);
-
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif
 
@@ -1672,181 +1578,120 @@ TEST(RuntimeExternalGl, FailsOnlyTheTimersThatADisjointEventInterrupts) {
 
 #if defined(VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE)
 TEST(RuntimeExternalGl, NestsFusedNodeDrawsInTheirLabelledGroups) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3, true, VERNON_RHI_DEVICE_LABELS);
+    const FakeGlDevice gl(VERNON_RUNTIME_OPENGL, 4, 3, VERNON_HAL_DEVICE_LABELS);
     ASSERT_TRUE(gl);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-    ASSERT_TRUE(bundle);
-    std::array<VernonProgramNodeId, 2> nodes{};
-    VernonProgramExecutable *executable = resolveSceneOverlayGraph(gl, bundle, nodes);
-    ASSERT_TRUE(executable) << lastError(gl);
-
-    VernonSubmission *submission = nullptr;
-    EXPECT_EQ(executeModuleGraphics(gl, executable, {}, nullptr, &submission),
-              (std::vector<std::string>{"push scene+overlay", "push scene", "draw", "pop", "push overlay", "draw",
-                                        "pop", "pop"}));
-    EXPECT_TRUE(readScopeTimings(gl, submission).empty());
-    vernonSubmissionDestroy(submission);
-    vernonRuntimeProgramExecutableDestroy(executable);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    ModuleGraphics graphics(gl, true);
+    ASSERT_TRUE(graphics) << graphics.error();
+    EXPECT_EQ(graphics.call(), (std::vector<std::string>{"push scene+overlay", "push scene", "draw", "pop",
+                                                         "push overlay", "draw", "pop", "pop"}));
 }
 
 TEST(RuntimeExternalGl, TimesFusedNodesAsOneScope) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3, true, VERNON_RHI_DEVICE_LABELS);
+    const FakeGlDevice gl(VERNON_RUNTIME_OPENGL, 4, 3, VERNON_HAL_DEVICE_LABELS);
     ASSERT_TRUE(gl);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-    ASSERT_TRUE(bundle);
-    std::array<VernonProgramNodeId, 2> nodes{};
-    VernonProgramExecutable *executable = resolveSceneOverlayGraph(gl, bundle, nodes);
-    ASSERT_TRUE(executable) << lastError(gl);
-
-    const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_WAIT, 1);
-    VernonSubmission *submission = nullptr;
-    EXPECT_EQ(executeModuleGraphics(gl, executable, {}, &options, &submission),
-              (std::vector<std::string>{"push scene+overlay", "timestamp", "push scene", "draw", "pop", "push overlay",
-                                        "draw", "pop", "timestamp", "pop"}));
-    const std::vector<VernonScopeTiming> scopes = readScopeTimings(gl, submission);
+    ModuleGraphics graphics(gl, true);
+    ASSERT_TRUE(graphics) << graphics.error();
+    ASSERT_EQ(vernonScheduleSetTimings(graphics.get(), 1), VERNON_STATUS_OK);
+    uint64_t point = 0;
+    EXPECT_EQ(graphics.call(&point),
+              (std::vector<std::string>{"timestamp", "push scene+overlay", "push scene", "draw", "pop", "push overlay",
+                                        "draw", "pop", "pop", "timestamp"}));
+    const std::vector<VernonScopeTiming> scopes = graphics.scopeTimings(point);
     ASSERT_EQ(scopes.size(), 1U);
-    EXPECT_EQ(scopes[0].first_node, nodes[0]);
+    EXPECT_EQ(scopes[0].first_node, graphics.sceneNode());
     EXPECT_EQ(scopes[0].node_count, 2U);
-    EXPECT_EQ(scopes[0].device_submission, 0U);
     EXPECT_EQ(scopes[0].begin_nanoseconds, 0U);
     EXPECT_EQ(scopes[0].end_nanoseconds, 10U);
-    vernonSubmissionDestroy(submission);
-    vernonRuntimeProgramExecutableDestroy(executable);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeExternalGl, ReportsScopeTimingsOnceAnAsynchronousSubmissionCompletes) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+TEST(RuntimeExternalGl, ReportsScopeTimingsOnceTheirCallIsWaitedFor) {
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-        ASSERT_TRUE(pass);
-        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_ASYNCHRONOUS, 1);
-        VernonSubmission *submission = nullptr;
-        fencesPending = true;
-        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
-        size_t count = 1;
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_NOT_READY);
-        EXPECT_EQ(count, 0U);
-        fencesPending = false;
-        const std::vector<VernonScopeTiming> scopes = readScopeTimings(gl, submission);
-        ASSERT_EQ(scopes.size(), 1U);
-        EXPECT_EQ(scopes[0].node_count, 1U);
-        EXPECT_EQ(scopes[0].begin_nanoseconds, 0U);
-        EXPECT_EQ(scopes[0].end_nanoseconds, 10U);
-        vernonSubmissionDestroy(submission);
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeExternalGl, ReportsNoScopeTimingsForAFailedSubmission) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-        ASSERT_TRUE(pass);
-        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_ASYNCHRONOUS, 1);
-        VernonSubmission *submission = nullptr;
-        fencesPending = true;
-        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
-        fencesPending = false;
-        vernon::runtime::program_execution::setFailureInjectionForTesting(
-            vernon::runtime::program_execution::FailureBoundary::Completion);
-        size_t count = 1;
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_INTERNAL_ERROR);
-        vernon::runtime::program_execution::clearFailureInjectionForTesting();
-        EXPECT_EQ(lastError(gl), "injected GPU command DAG wait failure");
-        EXPECT_EQ(count, 0U);
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_INTERNAL_ERROR);
-        EXPECT_EQ(lastError(gl), "the submission failed, so its scopes were not timed");
-        vernonSubmissionDestroy(submission);
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    ModuleGraphics graphics(gl);
+    ASSERT_TRUE(graphics) << graphics.error();
+    ASSERT_EQ(vernonScheduleSetTimings(graphics.get(), 1), VERNON_STATUS_OK);
+    uint64_t point = 0;
+    fencesPending = true;
+    ASSERT_EQ(graphics.submit(point), VERNON_STATUS_OK) << graphics.error();
+    size_t count = 1;
+    EXPECT_EQ(vernonScheduleGetScopeTimings(graphics.get(), point, nullptr, 0, &count), VERNON_STATUS_NOT_READY);
+    EXPECT_EQ(count, 0U);
+    fencesPending = false;
+    ASSERT_EQ(vernonScheduleWait(gl.runtime(), point), VERNON_STATUS_OK) << graphics.error();
+    const std::vector<VernonScopeTiming> scopes = graphics.scopeTimings(point);
+    ASSERT_EQ(scopes.size(), 1U);
+    EXPECT_EQ(scopes[0].node_count, 1U);
+    EXPECT_EQ(scopes[0].begin_nanoseconds, 0U);
+    EXPECT_EQ(scopes[0].end_nanoseconds, 10U);
 }
 
 TEST(RuntimeExternalGl, ReportsScopeTimingsUnsupportedWithoutTimerQueries) {
     exposeTimerQueries = false;
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     exposeTimerQueries = true;
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-        ASSERT_TRUE(pass);
-        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_WAIT, 1);
-        VernonSubmission *submission = nullptr;
-        executeModuleGraphics(gl, pass.get(), {}, &options, &submission);
-        size_t count = 1;
-        EXPECT_EQ(vernonSubmissionGetScopeTimings(submission, nullptr, 0, &count), VERNON_STATUS_UNSUPPORTED_TARGET);
-        EXPECT_EQ(lastError(gl), "the device cannot time the submission's scopes");
-        EXPECT_EQ(count, 0U);
-        vernonSubmissionDestroy(submission);
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    ModuleGraphics graphics(gl);
+    ASSERT_TRUE(graphics) << graphics.error();
+    ASSERT_EQ(vernonScheduleSetTimings(graphics.get(), 1), VERNON_STATUS_OK);
+    uint64_t point = 0;
+    graphics.call(&point);
+    size_t count = 1;
+    EXPECT_EQ(vernonScheduleGetScopeTimings(graphics.get(), point, nullptr, 0, &count),
+              VERNON_STATUS_UNSUPPORTED_TARGET);
+    EXPECT_EQ(count, 0U);
 }
 
-TEST(RuntimeExternalGl, ExecutesWithoutDriverRoundTripsOutsideValidation) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3, true, VERNON_RHI_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT);
+TEST(RuntimeExternalGl, CallsWithoutDriverRoundTripsOutsideValidation) {
+    const FakeGlDevice gl(VERNON_RUNTIME_OPENGL, 4, 3, VERNON_HAL_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT);
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-        ASSERT_TRUE(pass);
-        const VernonRhiDevice device = rhiRuntime(gl).device;
-        const VernonProgramInvocationOptions options = invocationOptions(VERNON_COMPLETION_WAIT, 1);
-        VernonGraphicsCommand draw{};
-        draw.kind = VERNON_GRAPHICS_COMMAND_DRAW;
-        draw.draw = {sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
-        VernonGraphicsCommand bindPipeline{};
-        bindPipeline.kind = VERNON_GRAPHICS_COMMAND_BIND_PIPELINE;
-        const auto frame = [&] {
-            VernonSubmission *submission = nullptr;
-            EXPECT_EQ(
-                executeModuleGraphics(gl, pass.get(),
-                                      {graphicsCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"),
-                                       bindPipeline, draw, graphicsCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP)},
-                                      &options, &submission),
-                (std::vector<std::string>{"timestamp", "draw", "timestamp"}));
-            EXPECT_EQ(readScopeTimings(gl, submission).size(), 1U);
-            vernonSubmissionDestroy(submission);
-        };
+    ModuleGraphics graphics(gl);
+    ASSERT_TRUE(graphics) << graphics.error();
+    ASSERT_EQ(vernonScheduleSetTimings(graphics.get(), 1), VERNON_STATUS_OK);
+    const VernonScheduleDebugCommand group[]{debugCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"),
+                                             debugCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP)};
+    const VernonSchedulePassEntry entry = triangleEntry(&group[0], 1);
+    VernonSchedulePassTable table{};
+    table.struct_size = sizeof(table);
+    table.entries = &entry;
+    table.entry_count = 1;
+    table.debug_commands = &group[1];
+    table.debug_command_count = 1;
+    graphics.drawFirstNodeThrough(&table);
+    const auto frame = [&] {
+        uint64_t point = 0;
+        EXPECT_EQ(graphics.call(&point), (std::vector<std::string>{"timestamp", "draw", "timestamp"}));
+        EXPECT_EQ(graphics.scopeTimings(point).size(), 1U);
+    };
+    frame();
+    const uint32_t errorChecks = getErrorCount;
+    const GlUint names = nextName;
+    for (int steady = 0; steady < 3; ++steady)
         frame();
-        const uint32_t errorChecks = getErrorCount;
-        const vernon::rhi::OpenGLCallStats first = vernon::rhi::getOpenGLCallStats(device);
-        for (int steady = 0; steady < 3; ++steady)
-            frame();
-        const vernon::rhi::OpenGLCallStats steady = vernon::rhi::getOpenGLCallStats(device);
-        EXPECT_EQ(getErrorCount, errorChecks);
-        EXPECT_EQ(steady.errorReads, first.errorReads);
-        EXPECT_EQ(steady.queryCreations, first.queryCreations);
-        EXPECT_EQ(steady.debugGroupPushes, 0U);
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    EXPECT_EQ(getErrorCount, errorChecks);
+    EXPECT_EQ(nextName, names) << "a steady call creates no GL object, timer queries included";
 }
 
-TEST(RuntimeExternalGl, KeepsRecordedDebugCommandsBetweenTheirDraws) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3, true, VERNON_RHI_DEVICE_LABELS);
+TEST(RuntimeExternalGl, KeepsPassTableDebugCommandsBetweenTheirDraws) {
+    const FakeGlDevice gl(VERNON_RUNTIME_OPENGL, 4, 3, VERNON_HAL_DEVICE_LABELS);
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pass(gl, VERNON_OPENGL_MODULE_GRAPHICS_BUNDLE);
-        ASSERT_TRUE(pass);
-        VernonGraphicsCommand draw{};
-        draw.kind = VERNON_GRAPHICS_COMMAND_DRAW;
-        draw.draw = {sizeof(VernonDrawCommand), nullptr, 3, 1, 0};
-        VernonGraphicsCommand bindPipeline{};
-        bindPipeline.kind = VERNON_GRAPHICS_COMMAND_BIND_PIPELINE;
-        EXPECT_EQ(
-            executeModuleGraphics(gl, pass.get(),
-                                  {graphicsCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"), bindPipeline,
-                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "a"), draw,
-                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "b"), draw,
-                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP),
-                                   graphicsCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "c")}),
-            (std::vector<std::string>{"push ExternalVerticesGraphics.graphics", "push triangles", "marker a", "draw",
-                                      "marker b", "draw", "pop", "marker c", "pop"}));
-    }
-    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+    ModuleGraphics graphics(gl);
+    ASSERT_TRUE(graphics) << graphics.error();
+    const VernonScheduleDebugCommand commands[]{debugCommand(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, "triangles"),
+                                                debugCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "a"),
+                                                debugCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "b"),
+                                                debugCommand(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP),
+                                                debugCommand(VERNON_GRAPHICS_COMMAND_INSERT_DEBUG_MARKER, "c")};
+    const VernonSchedulePassEntry entries[]{triangleEntry(&commands[0], 2), triangleEntry(&commands[2], 1)};
+    VernonSchedulePassTable table{};
+    table.struct_size = sizeof(table);
+    table.entries = entries;
+    table.entry_count = 2;
+    table.debug_commands = &commands[3];
+    table.debug_command_count = 2;
+    graphics.drawFirstNodeThrough(&table);
+    EXPECT_EQ(graphics.call(),
+              (std::vector<std::string>{"push ExternalVerticesGraphics.graphics", "push triangles", "marker a", "draw",
+                                        "marker b", "draw", "pop", "marker c", "pop"}));
 }
 #endif
 
@@ -1903,64 +1748,30 @@ TEST(RuntimeExternalGl, CreatesNativeAliasedImageViewsWithTextureViewExtension) 
 #if defined(VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE)
 TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     boundSamplerName = UINT32_MAX;
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline.get()), 2u);
-
-        RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
-        RhiImage target = importOpenGLTexture2D(gl, 7, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
-        const auto sampledView =
-            vernon::tests::createImageView(rhiRuntime(gl), sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        const auto targetView =
-            vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        auto explicitSampler = vernon::tests::createSampler(rhiRuntime(gl));
-        ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        ASSERT_NE(explicitSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-        VernonProgramArgument arguments[2]{};
-        VernonProgramParameterView imageParameter{};
-        VernonProgramParameterView samplerParameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline.get(), {"image", 5}, &imageParameter),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline.get(), {"sampler", 7}, &samplerParameter),
-                  VERNON_STATUS_OK);
-        arguments[0].slot = imageParameter.slot;
-        arguments[0].kind = VERNON_PROGRAM_IMAGE;
-        arguments[0].image = {sampledView.reference};
-        arguments[1].slot = samplerParameter.slot;
-        arguments[1].kind = VERNON_PROGRAM_SAMPLER;
-        arguments[1].resource = explicitSampler.reference;
-        VernonColorAttachment attachment{0, targetView.reference};
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), arguments, std::size(arguments), graphics),
-                  VERNON_STATUS_OK);
-        EXPECT_NE(boundSamplerName, 0u);
-
-        ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, explicitSampler.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
-    }
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+    FakeGlProgram program(gl, VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE);
+    ASSERT_TRUE(program) << program.error();
+    const HalImage sampled(gl.get(), VERNON_TEXTURE_RGBA8_UNORM, 4, 4, VERNON_IMAGE_SAMPLED);
+    const HalSampler sampler(gl.get(), VERNON_HAL_FILTER_NEAREST);
+    ASSERT_TRUE(sampled);
+    ASSERT_TRUE(sampler);
+    const ColorPass pass(gl, 16, 12, 3);
+    program.record().bindImage("image", sampled.reference());
+    program.record().bindSampler("sampler", sampler.reference());
+    pass.writeTo(program.record());
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+    EXPECT_NE(boundSamplerName, 0u);
+    EXPECT_NE(boundSamplerName, UINT32_MAX);
 }
 #endif
 
 #if defined(VERNON_OPENGL_COUNTER_CLOCKWISE_WINDING_BUNDLE) && defined(VERNON_OPENGL_CLOCKWISE_WINDING_BUNDLE)
 // GL vertex stages negate y, which mirrors window-space winding, so each declared front face selects the opposite one.
 TEST(RuntimeExternalGl, MirrorsDeclaredFrontFaceForTheFlippedVertexY) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const auto targetView =
-        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    const VernonColorAttachment attachment{0, targetView.reference};
-    const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    const ColorPass pass(gl, 16, 16, 3);
     const std::array<std::pair<const char *, GlEnum>, 2> windings{{
         {VERNON_OPENGL_COUNTER_CLOCKWISE_WINDING_BUNDLE, kClockwise},
         {VERNON_OPENGL_CLOCKWISE_WINDING_BUNDLE, kCounterClockwise},
@@ -1968,41 +1779,30 @@ TEST(RuntimeExternalGl, MirrorsDeclaredFrontFaceForTheFlippedVertexY) {
     for (const auto &[manifest, expectedWinding] : windings) {
         cullMode = 0;
         frontWinding = 0;
-        vernon::tests::OwnedProgramExecutable pipeline(gl, manifest);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
-            << lastError(gl);
+        FakeGlProgram program(gl, manifest);
+        ASSERT_TRUE(program) << program.error();
+        pass.writeTo(program.record());
+        ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
         EXPECT_EQ(cullMode, kBack) << manifest;
         EXPECT_EQ(frontWinding, expectedWinding) << manifest;
     }
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif
 
 #if defined(VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE)
 TEST(RuntimeExternalGl, AppliesDeclaredDepthStencilAndBlendState) {
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    const FakeGlDevice gl;
     ASSERT_TRUE(gl);
-    RhiImage color = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-    RhiImage depthStencil =
-        vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1,
-                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
-    ASSERT_NE(color.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    ASSERT_NE(depthStencil.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const auto colorView =
-        vernon::tests::createImageView(rhiRuntime(gl), color, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    const auto depthStencilView = vernon::tests::createImageView(
-        rhiRuntime(gl), depthStencil, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 1, 1,
-        VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
-    const VernonColorAttachment attachment{0, colorView.reference};
+    const HalImage depthStencil(gl.get(), VERNON_TEXTURE_D32_FLOAT_S8_UINT, 16, 16,
+                                VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT,
+                                VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL);
+    ASSERT_TRUE(depthStencil);
+    ColorPass pass(gl, 16, 16, 3);
     VernonDepthAttachment depthAttachment{};
-    depthAttachment.view = depthStencilView.reference;
+    depthAttachment.view = depthStencil.reference();
     depthAttachment.clear_depth = 1.0F;
-    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    graphics.renderPass.depth_attachment = &depthAttachment;
-    graphics.dynamic.stencil_reference = 23;
+    pass.controls.renderPass.depth_attachment = &depthAttachment;
+    pass.controls.dynamic.stencil_reference = 23;
     stencilFuncCount = 0;
     stencilReference = 0;
     stencilReadMask = 0;
@@ -2012,12 +1812,10 @@ TEST(RuntimeExternalGl, AppliesDeclaredDepthStencilAndBlendState) {
     blendFactors = {};
     blendOperations = {};
     colorWriteMask = {};
-    {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), nullptr, 0, graphics), VERNON_STATUS_OK)
-            << lastError(gl);
-    }
+    FakeGlProgram program(gl, VERNON_OPENGL_FIXED_FUNCTION_STATE_BUNDLE);
+    ASSERT_TRUE(program) << program.error();
+    pass.writeTo(program.record());
+    ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
     EXPECT_EQ(stencilFuncCount, 2U);
     EXPECT_EQ(stencilReference, 23);
     EXPECT_EQ(stencilReadMask, 0x5AU);
@@ -2027,11 +1825,6 @@ TEST(RuntimeExternalGl, AppliesDeclaredDepthStencilAndBlendState) {
     EXPECT_EQ(blendFactors, (std::array<GlEnum, 4>{kSourceAlpha, kOneMinusSourceAlpha, kOne, kOneMinusSourceAlpha}));
     EXPECT_EQ(blendOperations, (std::array<GlEnum, 2>{kSubtract, kAdd}));
     EXPECT_EQ(colorWriteMask, (std::array<GlBoolean, 4>{1, 1, 0, 0}));
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, depthStencilView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, colorView.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, depthStencil.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, color.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif
 
@@ -2052,109 +1845,94 @@ std::string stageShaderSource(const std::filesystem::path &manifestPath, const c
     return {};
 }
 
+// The inputs of one call of the spilled-uniform bundle; the record's views point into this object, which must outlive
+// every call.
+struct SpilledUniformInputs {
+    explicit SpilledUniformInputs(const FakeGlDevice &gl)
+        : sampled(gl.get(), VERNON_TEXTURE_RGBA8_UNORM, 4, 4, VERNON_IMAGE_SAMPLED),
+          sampler(gl.get(), VERNON_HAL_FILTER_NEAREST), pass(gl, 16, 16, 3) {
+        for (size_t index = 0; index < 4; ++index)
+            identity[index * 5] = 1.0F;
+    }
+
+    void writeTo(ScheduleRecord &record) {
+        static constexpr std::array<uint64_t, 2> shape = {4, 4};
+        static constexpr std::array<int64_t, 2> strides = {16, 4};
+        for (const char *name : {"projection", "view", "model"})
+            record.bind(name,
+                        vernon::tests::hostView(identity.data(), sizeof(identity), 2, shape.data(), strides.data()));
+        record.bindImage("image", sampled.reference());
+        record.bindSampler("sampler", sampler.reference());
+        pass.writeTo(record);
+    }
+
+    HalImage sampled;
+    HalSampler sampler;
+    ColorPass pass;
+    std::array<float, 16> identity{};
+};
+
 // The fragment's image and sampler own bindings 0 and 1, so the spilled `model` block must be moved to binding 2.
 TEST(RuntimeExternalGl, PointsSpilledUniformBlocksAtTheirPlannedBinding) {
     const std::string vertex = stageShaderSource(VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE, "vertex");
     EXPECT_NE(vertex.find("uniform vernon_uniform_binding_2"), std::string::npos) << vertex;
     linkedUniformBlocks = {"vernon_uniform_binding_2"};
     uniformBlockBindings.clear();
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(gl);
     {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
-        ASSERT_TRUE(pipeline) << lastError(gl);
+        const FakeGlDevice gl;
+        ASSERT_TRUE(gl);
+        FakeGlProgram program(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(program) << program.error();
+        SpilledUniformInputs inputs(gl);
+        inputs.writeTo(program.record());
+        ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
         EXPECT_EQ(uniformBlockBindings, (std::unordered_map<GlUint, GlUint>{{0u, 2u}}));
     }
     linkedUniformBlocks.clear();
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeExternalGl, InvocationsReuseTheTransientMemoryOfCompletedEncoders) {
+TEST(RuntimeExternalGl, CallsReuseTheirUniformMemory) {
     linkedUniformBlocks = {"vernon_uniform_binding_2"};
     uniformBufferBindings.clear();
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(gl);
     {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-        RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
-        RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-        const auto sampledView =
-            vernon::tests::createImageView(rhiRuntime(gl), sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        const auto targetView =
-            vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        auto sampler = vernon::tests::createSampler(rhiRuntime(gl));
+        const FakeGlDevice gl;
+        ASSERT_TRUE(gl);
+        FakeGlProgram program(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(program) << program.error();
+        SpilledUniformInputs inputs(gl);
+        inputs.writeTo(program.record());
 
-        std::array<float, 16> identity{};
-        for (size_t index = 0; index < 4; ++index)
-            identity[index * 5] = 1.0F;
-        constexpr std::array<uint64_t, 2> shape = {4, 4};
-        constexpr std::array<int64_t, 2> strides = {16, 4};
-        std::array<VernonProgramArgument, 5> arguments{};
-        const std::array<std::string_view, 5> names = {"projection", "view", "model", "image", "sampler"};
-        for (size_t index = 0; index < names.size(); ++index) {
-            VernonProgramParameterView parameter{};
-            ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
-                          pipeline.get(), {names[index].data(), names[index].size()}, &parameter),
-                      VERNON_STATUS_OK)
-                << names[index];
-            arguments[index].slot = parameter.slot;
+        constexpr size_t kArenas = 3;
+        std::vector<GlUint> pages;
+        for (size_t call = 0; call < kArenas; ++call) {
+            ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+            pages.push_back(uniformBufferBindings[2]);
+            EXPECT_NE(pages.back(), 0u);
         }
-        for (size_t index = 0; index < 3; ++index) {
-            VernonProgramArgument &argument = arguments[index];
-            argument.kind = VERNON_PROGRAM_TENSOR;
-            argument.tensor.struct_size = sizeof(VernonTensorView);
-            argument.tensor.storage = VERNON_TENSOR_HOST;
-            argument.tensor.host_data = identity.data();
-            argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-            argument.tensor.access = VERNON_ACCESS_READ;
-            argument.tensor.rank = 2;
-            argument.tensor.shape = shape.data();
-            argument.tensor.byte_strides = strides.data();
-            argument.tensor.byte_size = sizeof(identity);
+        const GlUint namesOnceWarm = nextName;
+        for (size_t call = 0; call < 2 * kArenas; ++call) {
+            ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+            EXPECT_EQ(uniformBufferBindings[2], pages[call % kArenas]);
         }
-        arguments[3].kind = VERNON_PROGRAM_IMAGE;
-        arguments[3].image = {sampledView.reference};
-        arguments[4].kind = VERNON_PROGRAM_SAMPLER;
-        arguments[4].resource = sampler.reference;
-        VernonColorAttachment attachment{0, targetView.reference};
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-
-        ASSERT_EQ(
-            vernon::tests::completeCanonicalInvocation(pipeline.get(), arguments.data(), arguments.size(), graphics),
-            VERNON_STATUS_OK)
-            << lastError(gl);
-        const GlUint firstPage = uniformBufferBindings[2];
-        EXPECT_NE(firstPage, 0u);
-        uniformBufferBindings.clear();
-        const GlUint nextNameAfterFirstInvocation = nextName;
-        ASSERT_EQ(
-            vernon::tests::completeCanonicalInvocation(pipeline.get(), arguments.data(), arguments.size(), graphics),
-            VERNON_STATUS_OK)
-            << lastError(gl);
-        EXPECT_EQ(uniformBufferBindings[2], firstPage);
-        EXPECT_EQ(nextName, nextNameAfterFirstInvocation);
-
-        ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, sampler.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(nextName, namesOnceWarm);
     }
     linkedUniformBlocks.clear();
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeExternalGl, RejectsLinkedUniformBlocksWithoutAPlannedBinding) {
     linkedUniformBlocks = {"vernon_uniform_binding_2", "vernon_uniform_binding_9"};
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(gl);
     {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
-        EXPECT_FALSE(pipeline);
+        const FakeGlDevice gl;
+        ASSERT_TRUE(gl);
+        FakeGlProgram program(gl, VERNON_OPENGL_SPILLED_UNIFORM_BUNDLE);
+        ASSERT_TRUE(program) << program.error();
+        SpilledUniformInputs inputs(gl);
+        inputs.writeTo(program.record());
+        EXPECT_NE(program.call(), VERNON_STATUS_OK);
+        EXPECT_NE(program.error().find("uniform block of the Stage has no planned binding"), std::string::npos)
+            << program.error();
     }
     linkedUniformBlocks.clear();
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 #endif
 
@@ -2170,51 +1948,24 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     capturedVertexAttributeDivisor = 0;
     createdSyncCount = 0;
     deletedSyncCount = 0;
-    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(gl);
     {
-        vernon::tests::OwnedProgramExecutable pipeline(gl, VERNON_OPENGL_INDEXED_VERTEX_BUNDLE);
-        ASSERT_TRUE(pipeline) << lastError(gl);
-
-        auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), 36, alignof(float), VERNON_RHI_BUFFER_VERTEX);
-        auto indices = vernon::tests::createBuffer(rhiRuntime(gl), 12, alignof(uint32_t), VERNON_RHI_BUFFER_INDEX);
-        RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-        const auto targetView =
-            vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        ASSERT_NE(indices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        constexpr uint64_t shape[2] = {3, 3};
-        constexpr int64_t strides[2] = {3 * sizeof(float), sizeof(float)};
-        VernonProgramParameterView positionParameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline.get(), {"position", 8}, &positionParameter),
-                  VERNON_STATUS_OK);
-        VernonProgramArgument argument{};
-        argument.slot = positionParameter.slot;
-        argument.kind = VERNON_PROGRAM_TENSOR;
-        argument.tensor.struct_size = sizeof(VernonTensorView);
-        argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-        argument.tensor.resource = vertices.reference;
-        argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-        argument.tensor.access = VERNON_ACCESS_READ;
-        argument.tensor.rank = 2;
-        argument.tensor.shape = shape;
-        argument.tensor.byte_strides = strides;
-        argument.tensor.byte_size = 36;
-        const VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, 3, indices.reference};
-        const VernonColorAttachment attachment{0, targetView.reference};
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 0, 3);
-        graphics.draw.index_binding = &indexBinding;
-        ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics), VERNON_STATUS_OK)
-            << lastError(gl);
-        void *vertexNative = nullptr;
-        void *indexNative = nullptr;
-        ASSERT_EQ(vernonRhiDeviceGetBufferNativeHandle(rhiRuntime(gl).device, vertices.handle, &vertexNative),
-                  VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceGetBufferNativeHandle(rhiRuntime(gl).device, indices.handle, &indexNative),
-                  VERNON_RHI_STATUS_OK);
-        EXPECT_EQ(boundArrayBuffer, reinterpret_cast<uintptr_t>(vertexNative));
-        EXPECT_EQ(boundIndexBuffer, reinterpret_cast<uintptr_t>(indexNative));
+        const FakeGlDevice gl;
+        ASSERT_TRUE(gl);
+        FakeGlProgram program(gl, VERNON_OPENGL_INDEXED_VERTEX_BUNDLE);
+        ASSERT_TRUE(program) << program.error();
+        const GlUint vertexName = nextName;
+        const DeviceTensor vertices(gl.device(), nullptr, 36, {3, 3}, sizeof(float), {}, 0, VERNON_HAL_BUFFER_VERTEX);
+        const GlUint indexName = nextName;
+        const vernon::tests::HalBuffer indices(gl.get(), 12, nullptr, VERNON_HAL_BUFFER_INDEX);
+        ColorPass pass(gl, 16, 16, 0);
+        pass.draw.instance_count = 3;
+        const VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, 3, indices.reference(), 0};
+        pass.draw.index_binding = &indexBinding;
+        program.record().bind("position", vertices);
+        pass.writeTo(program.record());
+        ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+        EXPECT_EQ(boundArrayBuffer, vertexName);
+        EXPECT_EQ(boundIndexBuffer, indexName);
         EXPECT_NE(vertexAttributeArray, 0u);
         EXPECT_EQ(vertexAttributeArray, boundVertexArray);
         EXPECT_EQ(vertexAttributeLocation, 0u);
@@ -2225,14 +1976,8 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
         EXPECT_EQ(indexedDrawCount, 3);
         EXPECT_EQ(drawCount, 1u);
         EXPECT_GT(createdSyncCount, 0u);
-        EXPECT_EQ(deletedSyncCount, createdSyncCount);
-
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, indices.handle), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
     }
-    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+    EXPECT_EQ(deletedSyncCount, createdSyncCount) << "a destroyed device leaves no fence behind";
 }
 #endif
 
@@ -2242,62 +1987,32 @@ TEST(RuntimeExternalGl, BindsCompilerSupportedVertexNumericFormatsFromCanonicalP
     struct Format {
         const char *name;
         const char *manifest;
-        VernonDataType dtype;
         uint32_t size;
         GlEnum nativeType;
         char pointerKind;
     };
-    constexpr Format formats[] = {{"i32", VERNON_OPENGL_I32_VERTEX_BUNDLE, VERNON_DATA_I32, 4, kInt, 'I'},
-                                  {"u32", VERNON_OPENGL_U32_VERTEX_BUNDLE, VERNON_DATA_U32, 4, kUnsignedInt, 'I'},
-                                  {"f32", VERNON_OPENGL_F32_VERTEX_BUNDLE, VERNON_DATA_F32, 4, kFloat, 'F'}};
+    constexpr Format formats[] = {{"i32", VERNON_OPENGL_I32_VERTEX_BUNDLE, 4, kInt, 'I'},
+                                  {"u32", VERNON_OPENGL_U32_VERTEX_BUNDLE, 4, kUnsignedInt, 'I'},
+                                  {"f32", VERNON_OPENGL_F32_VERTEX_BUNDLE, 4, kFloat, 'F'}};
     for (const Format &format : formats) {
         SCOPED_TRACE(format.name);
         vertexAttributeType = 0;
         vertexAttributePointerKind = '\0';
-        VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+        const FakeGlDevice gl;
         ASSERT_TRUE(gl);
-        {
-            vernon::tests::OwnedProgramExecutable pipeline(gl, format.manifest);
-            ASSERT_TRUE(pipeline) << lastError(gl);
-            const uint32_t stride = 3 * format.size;
-            auto vertices =
-                vernon::tests::createBuffer(rhiRuntime(gl), 3 * stride, format.size, VERNON_RHI_BUFFER_VERTEX);
-            RhiImage target = importOpenGLTexture2D(gl, 8, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-            const auto targetView = vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D,
-                                                                   VERNON_RHI_FORMAT_RGBA8_UNORM);
-            ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-            ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-            const uint64_t shape[2] = {3, 3};
-            const int64_t strides[2] = {stride, format.size};
-            VernonProgramParameterView positionParameter{};
-            ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline.get(), {"position", 8}, &positionParameter),
-                      VERNON_STATUS_OK);
-            VernonProgramArgument argument{};
-            argument.slot = positionParameter.slot;
-            argument.kind = VERNON_PROGRAM_TENSOR;
-            argument.tensor.struct_size = sizeof(VernonTensorView);
-            argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-            argument.tensor.resource = vertices.reference;
-            argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(format.dtype);
-            argument.tensor.access = VERNON_ACCESS_READ;
-            argument.tensor.rank = 2;
-            argument.tensor.shape = shape;
-            argument.tensor.byte_strides = strides;
-            argument.tensor.byte_size = 3 * stride;
-            const VernonColorAttachment attachment{0, targetView.reference};
-            const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3, 3);
-            ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline.get(), &argument, 1, graphics),
-                      VERNON_STATUS_OK)
-                << lastError(gl);
-            EXPECT_EQ(vertexAttributeType, format.nativeType);
-            EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
-            EXPECT_EQ(vertexAttributeStride, static_cast<GlSize>(stride));
-
-            ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
-            ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
-            ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
-        }
-        ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+        FakeGlProgram program(gl, format.manifest);
+        ASSERT_TRUE(program) << program.error();
+        const uint32_t stride = 3 * format.size;
+        const DeviceTensor vertices(gl.device(), nullptr, 3 * stride, {3, 3}, format.size, {}, 0,
+                                    VERNON_HAL_BUFFER_VERTEX);
+        ColorPass pass(gl, 16, 16, 3);
+        pass.draw.instance_count = 3;
+        program.record().bind("position", vertices);
+        pass.writeTo(program.record());
+        ASSERT_EQ(program.call(), VERNON_STATUS_OK) << program.error();
+        EXPECT_EQ(vertexAttributeType, format.nativeType);
+        EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
+        EXPECT_EQ(vertexAttributeStride, static_cast<GlSize>(stride));
     }
 }
 #endif

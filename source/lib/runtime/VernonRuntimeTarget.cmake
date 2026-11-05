@@ -178,6 +178,7 @@ function(vernon_add_runtime)
             VernonRHI
             PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_backend.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_driver.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_platform_surface.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_vulkan.cpp)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_ENABLE_BETA_EXTENSIONS=1
                                                      VK_NO_PROTOTYPES=1)
@@ -206,22 +207,6 @@ function(vernon_add_runtime)
         find_library(_vernon_metal_framework Metal REQUIRED)
         find_library(_vernon_foundation_framework Foundation REQUIRED)
         target_link_libraries(VernonRHI PRIVATE ${_vernon_metal_framework} ${_vernon_foundation_framework})
-    endif()
-
-    add_library(
-        VernonCommandGraph OBJECT
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_model.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_plan.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_checkpoint_planner.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_submission.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp)
-    set_target_properties(VernonCommandGraph PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(VernonCommandGraph PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
-                                                          $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonCommandGraph PRIVATE Vernon::RHI)
-    if(MSVC)
-        target_compile_options(VernonCommandGraph PRIVATE /EHsc)
     endif()
 
     add_library(VernonRuntimeCore STATIC ${_VERNON_RUNTIME_IMPL_DIR}/graphics_variant_key.cpp
@@ -261,7 +246,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graph_linker.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_instance.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/resolved_execution_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/shape_layout.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
@@ -320,46 +304,39 @@ function(vernon_add_runtime)
     set(_vernon_runtime_implementation_sources
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graphics_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_invocation_state.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_image_binding.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/materialized_node_frame.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_tensor_copy.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_transaction.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_executor.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/resolved_transfer_executor.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/submission_queue.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/submission_record.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/device_buffer.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/failure_injection.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/physical_buffer_view.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_image_binding.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_tensor_copy.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/derivative_groups.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_scratch.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/retained_pullback_state.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_boundary_binder.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_invocation_builder.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_residual_planner.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_shape_resolver.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_lifecycle.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_materializer.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_policy.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_telemetry.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_commands.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_replay.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_program_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/cpu_workgroup_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_groups.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_boundary_view.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/rhi_provider_pipeline.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_resolved_compute.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_directx12.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_dispatch.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/executor.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/fragment.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/linker.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/pass_fragment.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/pass_plan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/program_arguments.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/schedule/vjp_plan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/cpu/cpu_device.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/cpu/cpu_resources.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/cuda/cuda_device.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/cuda/cuda_resources.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/native_images.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/opengl/opengl_device.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/opengl/opengl_resources.cpp)
 
     add_library(VernonRuntimeImplementation OBJECT ${_vernon_runtime_implementation_sources})
     set_target_properties(VernonRuntimeImplementation PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -381,21 +358,20 @@ function(vernon_add_runtime)
     # The translation units that define the public C API; each target compiles them with its own export visibility.
     set(_vernon_runtime_api_sources
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/boundary.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/graphics_recording.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_executable.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_invocation.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_loading.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/capi/program_state.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/capi/stage_execution.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/host_containers.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/capi/schedule.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/host_containers.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../hal/capi.cpp)
 
     add_library(VernonRuntime ${VERNON_RUNTIME_LIBRARY_TYPE} ${_vernon_runtime_api_sources}
                               ${_VERNON_RUNTIME_IMPL_DIR}/runtime_python_bridge.cpp)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
     target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
-                                         $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
+                                         $<TARGET_OBJECTS:VernonRuntimeInternals>)
     add_library(Vernon::Runtime ALIAS VernonRuntime)
     set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
     if(VERNON_RUNTIME_PROFILE STREQUAL "web")
@@ -416,6 +392,9 @@ function(vernon_add_runtime)
     if(VERNON_ENABLE_VULKAN_RUNTIME)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_VULKAN_RUNTIME=1)
         target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_VULKAN_RUNTIME=1 VK_NO_PROTOTYPES=1)
+        target_sources(
+            VernonRuntimeImplementation PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../hal/vulkan/vulkan_device.cpp
+                                                ${_VERNON_RUNTIME_IMPL_DIR}/../hal/vulkan/vulkan_resources.cpp)
         target_link_libraries(VernonRuntimeImplementation PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
         target_link_libraries(VernonRuntime PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
@@ -460,9 +439,8 @@ function(vernon_add_runtime)
     if(BUILD_TESTING)
         target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_RUNTIME_TESTING=1)
         add_library(VernonRuntimeTestHost STATIC ${_vernon_runtime_api_sources})
-        target_sources(
-            VernonRuntimeTestHost PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
-                                          $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
+        target_sources(VernonRuntimeTestHost PRIVATE $<TARGET_OBJECTS:VernonRuntimeImplementation>
+                                                     $<TARGET_OBJECTS:VernonRuntimeInternals>)
         add_library(Vernon::RuntimeTesting ALIAS VernonRuntimeTestHost)
         target_compile_definitions(VernonRuntimeTestHost PUBLIC VERNON_RUNTIME_STATIC VERNON_RUNTIME_TESTING=1)
         target_include_directories(VernonRuntimeTestHost PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
@@ -485,6 +463,7 @@ function(vernon_add_runtime)
             target_link_libraries(VernonRuntimeTestHost PUBLIC d3d12 dxgi dxguid)
         endif()
         if(VERNON_ENABLE_VULKAN_RUNTIME)
+            target_compile_definitions(VernonRuntimeTestHost PRIVATE VERNON_HAS_VULKAN_RUNTIME=1)
             target_link_libraries(VernonRuntimeTestHost PUBLIC $<BUILD_INTERFACE:Vulkan::Headers>)
         endif()
     endif()
@@ -529,6 +508,8 @@ function(vernon_add_runtime)
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonTextureTypes.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonHal.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonSchedule.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h

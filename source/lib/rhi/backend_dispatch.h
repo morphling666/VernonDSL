@@ -392,6 +392,15 @@ inline Result<uint64_t, RhiError> retainResolvedCommandResource(VernonRhiDevice 
         return Result<uint64_t, RhiError>{err(std::move(retained).error())};
     return resolveCommandResource(device, key, kind, resource_key);
 }
+struct CommandResource {
+    ResourceKind kind{};
+    uint64_t key{};
+};
+// Retains `resources` through the encoder `key` and writes each one's native object to `natives`; a resource the
+// encoder resolved before costs one lookup.
+VERNON_RHI_CAPI Result<void, RhiError> retainResolvedCommandResources(VernonRhiDevice device, uint64_t key,
+                                                                      const CommandResource *resources, size_t count,
+                                                                      uint64_t *natives) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> deferCommandCleanup(VernonRhiDevice device, uint64_t key, void *context,
                                                            uint64_t object, void (*cleanup)(void *, uint64_t)) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> deferCommandRollback(VernonRhiDevice device, uint64_t key, void *context,

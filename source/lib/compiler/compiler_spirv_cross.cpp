@@ -460,6 +460,9 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     // to the last row. Negating y in the vertex stage also reverses winding, which the OpenGL
                     // adapter compensates by inverting the front face.
                     options.vertex.flip_vert_y = entry.execution_model == spv::ExecutionModelVertex;
+                    // Clip depth is [0, w] on every target, but GL clips to [-w, w]; the vertex stage remaps it, so
+                    // stored depth is clip z / w as elsewhere.
+                    options.vertex.fixup_clipspace = entry.execution_model == spv::ExecutionModelVertex;
                     compiler.set_common_options(options);
                     source = compiler.compile();
                     extension = options.es ? "gles" : "glsl";

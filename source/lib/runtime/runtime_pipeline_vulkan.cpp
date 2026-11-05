@@ -3,31 +3,11 @@
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "backend_vulkan.h"
 
+#include <cstring>
 #include <memory>
-#include <optional>
 #endif
 
 namespace vernon::runtime {
-
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-namespace {
-
-std::optional<uint32_t> vulkanAttachmentFormat(VernonTextureFormat format) {
-    switch (format) {
-#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
-                      vulkan, ...)                                                                                     \
-    case VERNON_TEXTURE_##NAME:                                                                                        \
-        return vulkan == VK_FORMAT_UNDEFINED ? std::nullopt : std::optional<uint32_t>(vulkan);
-#include "VernonFormats.def"
-    }
-    return std::nullopt;
-}
-
-constexpr RhiComputeTarget kVulkanCompute{"Vulkan", "spirv"};
-constexpr RhiGraphicsTarget kVulkanGraphics{"Vulkan", "spirv", vulkanAttachmentFormat, vulkanAttachmentFormat};
-
-} // namespace
-#endif
 
 BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline) {
@@ -36,53 +16,38 @@ BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, con
         VernonRuntimeContext &context = *inputs.context;
         auto state = std::make_unique<VulkanPipelineState>();
         if (!plan.compute.empty() &&
-            !prepareRhiComputePipeline(context, vulkanState(context).adapter, kVulkanCompute,
-                                       inputs.artifacts.at(plan.compute), plan, state->rhiCompute))
+            !prepareComputeBindingPlan(context, inputs.artifacts.at(plan.compute), plan, state->computePlan))
             return false;
         if (!plan.vertex.empty() &&
-            !prepareRhiGraphicsPipeline(context, vulkanState(context).adapter, kVulkanGraphics,
-                                        inputs.artifacts.at(plan.vertex), inputs.artifacts.at(plan.fragment), plan,
-                                        {VERNON_RUNTIME_VULKAN}, state->rhiGraphics))
+            !buildPreparedGraphicsBindingPlan(plan, {VERNON_RUNTIME_VULKAN}, state->graphicsPlan,
+                                              invocationDiagnostic(context)))
+            return false;
+        const auto code = [&](const std::string &name, VulkanShaderCode &output) {
+            if (name.empty())
+                return true;
+            const LoadedStageArtifact &artifact = inputs.artifacts.at(name);
+            if (artifact.binary.empty() || artifact.binary.size() % sizeof(uint32_t) != 0) {
+                invocationDiagnostic(context) = "Vulkan stage artifact is not SPIR-V words";
+                return false;
+            }
+            output.words.resize(artifact.binary.size() / sizeof(uint32_t));
+            std::memcpy(output.words.data(), artifact.binary.data(), artifact.binary.size());
+            output.entry = artifact.entry;
+            return true;
+        };
+        if (!code(plan.compute, state->compute) || !code(plan.vertex, state->vertex) ||
+            !code(plan.fragment, state->fragment))
             return false;
         installRuntimeBackendState(pipeline, state.release());
         return true;
 #else
+        (void)inputs;
+        (void)plan;
+        (void)pipeline;
         return false;
 #endif
     };
     return resolve() ? BackendPipelineResult{vernon::ok()} : backendPipelineResolutionFailure(inputs);
-}
-
-VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
-                                          const GraphicsCommand &command, GraphicsStream &stream) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    return invokeRhiGraphicsPipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanGraphics,
-                                     packets, command, stream,
-                                     runtimeBackendState<VulkanPipelineState>(pipeline).rhiGraphics);
-#else
-    (void)pipeline;
-    (void)command;
-    (void)stream;
-    (void)packets;
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
-}
-
-VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, VernonRuntimeCorePackets *packets,
-                                         GroupStore &transient, const PlannedComputeLaunch &launch,
-                                         const ArgumentOwner *owners) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    return invokeRhiComputePipeline(*pipeline.context, vulkanState(*pipeline.context).adapter, kVulkanCompute,
-                                    pipeline.bindingProjection, packets, transient, launch, owners,
-                                    runtimeBackendState<VulkanPipelineState>(pipeline).rhiCompute);
-#else
-    (void)pipeline;
-    (void)packets;
-    (void)transient;
-    (void)launch;
-    (void)owners;
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
 }
 
 } // namespace vernon::runtime

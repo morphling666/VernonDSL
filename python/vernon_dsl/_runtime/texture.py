@@ -10,7 +10,7 @@ from .._formats import TEXTURE_FORMATS, d32_float_s8_uint, rgba8_srgb, rgba8_uno
 from .._texture_format import TextureFormat
 from ..types import TypeExpr
 from .residency import _ImageRegion, _ResidencySet, _resource_transaction_scope, _ResourceControlBlock
-from .session import _invocation_context, _InvocationContext
+from .session import _invocation_context, _InvocationContext, cpu
 
 _ImageSubresource = tuple[str, int, int]
 
@@ -695,8 +695,8 @@ class Texture(_TextureResource):
         access: str = "read_write",
     ) -> Any:
         state = context.session
-        if state.rhi_host is None:
-            raise RuntimeError("Texture requires a GPU RHI host")
+        if state.arch == cpu:
+            raise RuntimeError("Texture requires a GPU Runtime session")
         reservation = None
         retry = False
         with self._control.lock:
@@ -811,7 +811,7 @@ class Texture(_TextureResource):
                     height, width = self.shape
                     depth = 1
                 native_format = getattr(state.native.TextureFormat, self._format._native_name)
-                texture = state.rhi_host.create_image(
+                texture = state.device.create_image(
                     width,
                     height,
                     native_format,
@@ -872,7 +872,7 @@ class Texture(_TextureResource):
                 self._control.release_io(reservation)
 
     def _device_claim_region(self, context: _InvocationContext, region: _ImageRegion, access: str) -> _ImageRegion:
-        if context.session.rhi_host is None:
+        if context.session.arch == cpu:
             return region
         residency = self._control.residencies.get(context.session)
         latest = self._control.residencies.latest()

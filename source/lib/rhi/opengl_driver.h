@@ -30,6 +30,8 @@ constexpr Enum kArrayBuffer = 0x8892;
 constexpr Enum kElementArrayBuffer = 0x8893;
 constexpr Enum kUniformBuffer = 0x8A11;
 constexpr Enum kShaderStorageBuffer = 0x90D2;
+constexpr Enum kDrawIndirectBuffer = 0x8F3F;
+constexpr Enum kParameterBuffer = 0x80EE;
 constexpr Enum kMaxUniformBufferBindings = 0x8A2F;
 constexpr Enum kMaxUniformBlockSize = 0x8A30;
 constexpr Enum kMaxComputeUniformBlocks = 0x91BB;
@@ -55,6 +57,7 @@ constexpr Enum kDouble = 0x140A;
 constexpr Enum kInt = 0x1404;
 constexpr Enum kUnsignedInt = 0x1405;
 constexpr Enum kMaxVertexAttribs = 0x8869;
+constexpr Enum kMaxVertexAttribRelativeOffset = 0x82D9;
 constexpr Enum kTexture2D = 0x0DE1;
 constexpr Enum kTexture3D = 0x806F;
 constexpr Enum kTextureCubeMap = 0x8513;
@@ -106,6 +109,7 @@ constexpr unsigned kShaderStorageBarrierBit = 0x00002000;
 constexpr unsigned kVertexAttribArrayBarrierBit = 0x00000001;
 constexpr unsigned kElementArrayBarrierBit = 0x00000002;
 constexpr unsigned kUniformBarrierBit = 0x00000004;
+constexpr unsigned kCommandBarrierBit = 0x00000040;
 constexpr unsigned kTextureFetchBarrierBit = 0x00000008;
 constexpr unsigned kShaderImageAccessBarrierBit = 0x00000020;
 constexpr unsigned kTextureUpdateBarrierBit = 0x00000100;
@@ -177,6 +181,14 @@ struct Driver {
     void(VERNON_GL_CALL *vertexAttribIPointer)(Uint, Int, Enum, Size, const void *){};
     void(VERNON_GL_CALL *vertexAttribLPointer)(Uint, Int, Enum, Size, const void *){};
     void(VERNON_GL_CALL *vertexAttribDivisor)(Uint, Uint){};
+    // Separate attribute formats, core in OpenGL 4.3 and OpenGL ES 3.1 (but for the L form); loaded whatever the
+    // version, so their users check it.
+    void(VERNON_GL_CALL *bindVertexBuffer)(Uint, Uint, IntPtr, Size){};
+    void(VERNON_GL_CALL *vertexAttribFormat)(Uint, Int, Enum, Boolean, Uint){};
+    void(VERNON_GL_CALL *vertexAttribIFormat)(Uint, Int, Enum, Uint){};
+    void(VERNON_GL_CALL *vertexAttribLFormat)(Uint, Int, Enum, Uint){};
+    void(VERNON_GL_CALL *vertexAttribBinding)(Uint, Uint){};
+    void(VERNON_GL_CALL *vertexBindingDivisor)(Uint, Uint){};
     void(VERNON_GL_CALL *genFramebuffers)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteFramebuffers)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindFramebuffer)(Enum, Uint){};
@@ -215,6 +227,10 @@ struct Driver {
     void(VERNON_GL_CALL *drawArraysInstanced)(Enum, Int, Size, Size){};
     void(VERNON_GL_CALL *drawElementsInstanced)(Enum, Size, Enum, const void *, Size){};
     void(VERNON_GL_CALL *drawElementsInstancedBaseVertex)(Enum, Size, Enum, const void *, Size, Int){};
+    // Null below OpenGL 4.2 and on OpenGL ES, which has them only as GL_EXT_base_instance.
+    void(VERNON_GL_CALL *drawElementsInstancedBaseVertexBaseInstance)(Enum, Size, Enum, const void *, Size, Int,
+                                                                      Uint){};
+    void(VERNON_GL_CALL *drawArraysInstancedBaseInstance)(Enum, Int, Size, Size, Uint){};
     Int(VERNON_GL_CALL *getUniformLocation)(Uint, const char *) {};
     Uint(VERNON_GL_CALL *getUniformBlockIndex)(Uint, const char *) {};
     void(VERNON_GL_CALL *uniformBlockBinding)(Uint, Uint, Uint){};
@@ -260,6 +276,9 @@ struct Driver {
     void(VERNON_GL_CALL *deleteSamplers)(Size, const Uint *){};
     void(VERNON_GL_CALL *samplerParameteri)(Uint, Enum, Int){};
     void(VERNON_GL_CALL *bindSampler)(Uint, Uint){};
+    // Loaded whatever the version, so their users check it: OpenGL 4.3, and 4.6 for the counted form.
+    void(VERNON_GL_CALL *multiDrawElementsIndirect)(Enum, Enum, const void *, Size, Size){};
+    void(VERNON_GL_CALL *multiDrawElementsIndirectCount)(Enum, Enum, const void *, IntPtr, Size, Size){};
     void(VERNON_GL_CALL *dispatchCompute)(Uint, Uint, Uint){};
     void(VERNON_GL_CALL *memoryBarrier)(unsigned){};
     void(VERNON_GL_CALL *finish)(){};

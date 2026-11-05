@@ -253,29 +253,32 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertFalse(hasattr(native, "Texture"))
         self.assertFalse(hasattr(native, "Sampler"))
 
-    @backend_matrix_test(BackendRequirements(rhi=True))
-    def test_standalone_rhi_buffer_owns_generational_resource(self, backend: BackendRow) -> None:
-        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
+    @backend_matrix_test(BackendRequirements())
+    def test_standalone_device_buffer_round_trips(self, backend: BackendRow) -> None:
+        device = native.HalDevice(getattr(native.RuntimeBackend, backend.runtime_backend))
+        self.assertEqual(device.backend, getattr(native.RuntimeBackend, backend.runtime_backend))
         source = struct.pack("4I", 1, 2, 3, 4)
-        buffer = host.create_buffer(len(source))
+        buffer = device.create_buffer(len(source))
         buffer.upload(source)
         self.assertEqual(buffer.download(), source)
-        runtime = host.create_runtime()
-        self.assertIsNotNone(runtime)
+        buffer.upload_ranges([(4, struct.pack("I", 9))])
+        self.assertEqual(buffer.download_ranges([(4, 8)]), [(4, struct.pack("I", 9))])
+        runtime = device.create_runtime()
+        self.assertTrue(dict(runtime.capabilities)["available"])
 
-    @backend_matrix_test(BackendRequirements(rhi=True, graphics=True))
-    def test_standalone_rhi_image_upload_and_download(self, backend: BackendRow) -> None:
-        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_standalone_device_image_upload_and_download(self, backend: BackendRow) -> None:
+        device = native.HalDevice(getattr(native.RuntimeBackend, backend.runtime_backend))
         source = bytes(range(16))
-        image = host.create_image(2, 2)
+        image = device.create_image(2, 2)
         image.upload(source)
         self.assertEqual(image.download(), source)
 
-    @backend_matrix_test(BackendRequirements(rhi=True, graphics=True))
-    def test_standalone_rhi_three_dimensional_image_round_trip(self, backend: BackendRow) -> None:
-        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_standalone_device_three_dimensional_image_round_trip(self, backend: BackendRow) -> None:
+        device = native.HalDevice(getattr(native.RuntimeBackend, backend.runtime_backend))
         source = bytes(range(2 * 3 * 4 * 4))
-        image = host.create_image(
+        image = device.create_image(
             4,
             3,
             native.TextureFormat.RGBA8_UNORM,

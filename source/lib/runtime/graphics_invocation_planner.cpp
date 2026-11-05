@@ -119,38 +119,6 @@ bool planGraphicsState(const VernonGraphicsState *graphicsState, size_t colorCou
     return true;
 }
 
-VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
-                                   PreparedGraphicsVariant &prepared) {
-    if (prepared.handle && graphicsVariantKeysEqual(prepared.key, key))
-        return VERNON_STATUS_OK;
-    VernonRuntimeCoreGraphicsCompatibility compatibility{};
-    compatibility.struct_size = sizeof(compatibility);
-    compatibility.topology = key.topology;
-    compatibility.color_formats = key.colorFormats.data();
-    compatibility.color_format_count = key.colorFormats.size();
-    compatibility.depth_stencil_format = key.depthStencilFormat;
-    compatibility.sample_count = key.sampleCount;
-    compatibility.vertex_strides = key.vertexStrides.data();
-    compatibility.vertex_stride_count = key.vertexStrides.size();
-    compatibility.rasterization = key.rasterization;
-    compatibility.depth_stencil = key.depthStencil;
-    compatibility.color_blends = key.colorBlends.data();
-    compatibility.color_blend_count = key.colorBlends.size();
-    VernonRuntimeCoreGraphicsVariant *replacement{};
-    const VernonStatus status = vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &replacement);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    vernonRuntimeCoreGraphicsVariantDestroy(prepared.handle);
-    prepared.key = key;
-    prepared.handle = replacement;
-    return VERNON_STATUS_OK;
-}
-
-void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
-    vernonRuntimeCoreGraphicsVariantDestroy(prepared.handle);
-    prepared = {};
-}
-
 bool planRenderTargets(const VernonRenderPass *source, DescribeImageResource describeImage, void *describeImageUserData,
                        PlannedRenderTargets &targets, std::string &error) {
     targets = {};
@@ -331,6 +299,12 @@ bool planGraphicsArgument(const StageBindingPlan &stagePlan, const GraphicsDrawL
         if (describeImage(describeImageUserData, argument.image.view, &description) != VERNON_STATUS_OK ||
             !providerImageDescriptionIsCanonical(description) || !(description.image.usage & VERNON_IMAGE_SAMPLED))
             return fail(error, "sampled image is stale or lacks sampled usage");
+        if (parameter.sampleResultClass != VERNON_IMAGE_SAMPLE_NONE &&
+            !vernon::formats::providesSampleResultClass(description.view.format, parameter.sampleResultClass))
+            return fail(error, ("graphics image argument '" + parameter.name + "' view format does not provide the " +
+                                std::string(vernon::formats::sampleResultClassName(parameter.sampleResultClass)) +
+                                " sample result class of its sampled Texture")
+                                   .c_str());
         planned.subresources = providerImageSubresources(description);
         return true;
     }

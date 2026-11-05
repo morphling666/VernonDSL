@@ -8,7 +8,12 @@ compute, VJP pullbacks and modules. Amends, once accepted,
 [`stored_plans.md`](stored_plans.md) sections 2, 3, 10 and 11.2 and
 [`binding_groups.md`](binding_groups.md). The Engine-side GPU scene (Vernon
 `specs/render/gpu_scene.md`) is a separate layer and not part of this
-document.
+document. [`architecture_v2.md`](architecture_v2.md) keeps this document's
+goal, payload classes, argument arena, native programs, bindless resources
+and capacity classes, and makes them the only execution path: the compiler
+emits a schedule fragment per Program, the runtime links a graph's
+fragments when its structure changes, and one recording per linked
+schedule, with grids and sizes as data, replaces stored plans and their segments (sections 4, 7 and 15 there).
 
 ## 1. Goal
 
@@ -27,7 +32,7 @@ UE5's RHI, bgfx, Diligent, NVRHI and wgpu are immediate-mode translators.
 The engine above them re-issues every command every frame, and the RHI
 rediscovers state: redundant-bind filtering, descriptor and PSO hashing,
 transition tracking, native translation. UE5's render graph recompiles
-every frame. Their cost is commands Ã— frames, because a general C++ engine
+every frame. Their cost is commands × frames, because a general C++ engine
 cannot promise that the next frame resembles this one. Eager deep-learning
 runtimes pay the same per kernel launch, which is why LLM serving falls
 back to CUDA Graphs.
@@ -215,10 +220,10 @@ stay in the groups that hold them today.
 
 ## 12. Submission
 
-- Executes of one frame or step accumulate and submit together, with
-  timeline semaphores rather than a fence per Execute.
-- Work the Command DAG shows independent of graphics may go to an async
-  compute queue, decided when the plan is built.
+- Calls of one frame or step accumulate and submit together, with
+  timeline points rather than a fence per call.
+- Work a linked schedule shows independent of graphics may go to an async
+  compute queue, decided when the schedule is linked.
 - Parallel encoding matters only for plan builds, since replay does not
   encode.
 
@@ -227,9 +232,12 @@ stay in the groups that hold them today.
 Comparisons are measured, not claimed:
 
 The Editor scenes are the regression benchmarks for every phase, measured
-with `--profile` and `--no-vsync`. Today they run on OpenGL, the
-compatibility tier; each phase that changes a high-tier adapter also runs
-them on that backend once the Editor runs there:
+with `--frame-stats` and `--no-vsync` (latest:
+[`reports/benchmarks/editor_scenes.md`](../../reports/benchmarks/editor_scenes.md),
+whose scenes are the Editor's `dog`, `bodies` and `planet` demos and its
+panels). They run on OpenGL, the compatibility tier; each phase that changes
+a high-tier adapter also runs them on that backend once the Editor runs
+there. The original scenes and their baselines:
 
 | Scene | Baseline (after the 2b revert) | Target |
 |---|---|---|
@@ -241,7 +249,7 @@ Comparisons with other runtimes:
 
 | Workload | Compared against | Target |
 |---|---|---|
-| 10000 draws, distinct materials, static | the same scene in UE 5.7 (render and RHI thread time in Unreal Insights) | Vulkan, D3D12 and Metal: Execute under 20 Âµs plus payload copy; OpenGL tape: under 30 ns per command plus driver time |
+| 10000 draws, distinct materials, static | the same scene in UE 5.7 (render and RHI thread time in Unreal Insights) | Vulkan, D3D12 and Metal: Execute under 20 µs plus payload copy; OpenGL tape: under 30 ns per command plus driver time |
 | a chain of 1000 compute kernels | `cuLaunchKernel` in a loop; a CUDA graph built by hand | within 10% of the hand-built graph |
 | small-model LLM decode, growing sequence | PyTorch with CUDA graphs; llama.cpp | tokens per second at least equal; no plan builds within a capacity class |
 | training step (forward + pullback + update) | PyTorch with CUDA graphs | CPU time per step independent of layer count |
@@ -289,7 +297,7 @@ and after.
 ## 16. Rejected alternatives
 
 - **Faster per-command translation** (the industry design): its cost still
-  scales with commands Ã— Executes.
+  scales with commands × Executes.
 - **Bind-time bytes per group** (step 2b, reverted): every bind refilled its
   values; boxes slowed from 4.9 to 5.8 ms.
 - **Dynamic offsets per group** (`stored_plans.md` section 3 as written):

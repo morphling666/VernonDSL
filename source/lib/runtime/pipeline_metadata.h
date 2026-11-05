@@ -21,6 +21,13 @@ struct PhysicalArgumentLayout {
     size_t alignment{1};
 };
 
+// `size` bytes of a value at `physicalOffset` of its physical bytes and `canonicalOffset` of its canonical ones.
+struct ValueByteCopy {
+    size_t physicalOffset{};
+    size_t canonicalOffset{};
+    size_t size{};
+};
+
 struct ReflectedArgument {
     std::string sourceName;
     std::string kind;
@@ -28,8 +35,15 @@ struct ReflectedArgument {
     std::string autodiffRole;
     // The access the compiled module declares, which selects native descriptor kinds and write hazards.
     std::string access;
+    // "invocation_linear" for a GPU backward kernel's cotangent carrier, whose leading axis is the dispatch's.
+    std::string autodiffCarrier;
     std::optional<VernonDataType> dtype;
     bool result{};
+    // A value argument whose physical bytes are its canonical value's bytes, such as one scalar or a Struct whose
+    // leaves keep their canonical offsets, so a linked schedule copies it whole.
+    bool canonicalBytes{};
+    // A CPU result's physical bytes as its canonical value's, which a linked schedule copies out of the results frame.
+    std::vector<ValueByteCopy> resultCopies;
     uint32_t index{UINT32_MAX};
     PhysicalArgumentLayout physical;
     size_t tensorBytes{};

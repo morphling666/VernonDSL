@@ -19,6 +19,14 @@
 
 namespace vernon::runtime {
 
+// What one prepared layout's value is a function of.
+struct SlotDependencies {
+    // Stage parameters, by index.
+    std::vector<uint32_t> parameters;
+    // Whether the value also depends on the command, beyond its parameters.
+    bool command{};
+};
+
 struct PreparedBindingSource {
     uint32_t argumentIndex{UINT32_MAX};
     uint64_t resourceOffset{};
@@ -139,8 +147,8 @@ bool bindComputeMetadataCarrier(const VernonRuntimeProviderBindingLayoutEntry &l
 bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &projection,
                                      const PlannedComputeLaunch &launch, size_t slot,
                                      VernonRuntimeProviderBindingValue &value, std::string &error);
-std::vector<PipelineGroups::SlotDependencies>
-preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared, const StageBindingPlan &stagePlan);
+std::vector<SlotDependencies> preparedComputeSlotDependencies(const PreparedComputeBindingPlan &prepared,
+                                                              const StageBindingPlan &stagePlan);
 
 bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
                                      OpenGLNativeUniformShape &result);
@@ -151,8 +159,7 @@ bool validatePreparedGraphicsBindingPlan(const PreparedGraphicsBindingPlan &plan
 bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
                                       size_t slot, VernonRuntimeProviderBindingValue &value,
                                       std::vector<uint8_t> &storage, std::string &error);
-std::vector<PipelineGroups::SlotDependencies>
-preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared);
+std::vector<SlotDependencies> preparedGraphicsSlotDependencies(const PreparedGraphicsBindingPlan &prepared);
 // The buffer and stride of vertex binding `binding`.
 bool preparedGraphicsVertexBuffer(const PreparedGraphicsBindingPlan &prepared, const GraphicsSlotInputs &inputs,
                                   size_t binding, VernonRuntimeProviderResourceReference &buffer, uint32_t &stride,

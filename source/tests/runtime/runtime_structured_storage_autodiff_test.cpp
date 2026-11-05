@@ -1,285 +1,56 @@
-#include "VernonRuntime.h"
-#include "runtime/autodiff/host_tape_allocator.h"
-#include "runtime/autodiff/host_tape_test_hooks.h"
-#include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
-#include <filesystem>
-#include <iterator>
-#include <memory>
-#include <string>
+#include <cstdint>
+#include <vector>
 
 namespace {
 
-std::string lastError(VernonRuntimeContext *context) {
-    const VernonStringView error = vernonRuntimeGetLastError(context);
-    return std::string(error.data, error.size);
-}
+using vernon::tests::HostTensor;
+using vernon::tests::LinkedVjp;
+using vernon::tests::ResolvedProgram;
 
+// values[index] = scale * source[index] in place, then loss = values[0] + values[index].
 TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStorageGradient) {
-    const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    {
+        const ResolvedProgram program(context, VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST);
+        ASSERT_TRUE(program) << vernon::tests::runtimeError(context);
+        LinkedVjp vjp(context, program.get());
+        ASSERT_TRUE(vjp) << vjp.error();
 
-    const uint64_t storageShape[]{1, 1, 1, 3};
-    float values[]{2.0f, 3.0f, 5.0f};
-    float source[]{7.0f, 6.0f, 9.0f};
-    int32_t index = 1;
-    float scale = 4.0f;
-    float loss{};
-    const uint64_t lossShape[]{1, 1, 1};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values,
-         sizeof(values),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"source", 6},
-         VERNON_DATA_F32,
-         source,
-         sizeof(source),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 3, lossShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, 5, {}};
-    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
-    inputValues[1].data = values;
-    VernonPullback *rejectedPullback = nullptr;
-    EXPECT_EQ(
-        vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &rejectedPullback),
-        VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(rejectedPullback, nullptr);
-    inputValues[1].data = source;
+        HostTensor<float> values({2.0f, 3.0f, 5.0f}, {1, 1, 1, 3});
+        HostTensor<float> source({7.0f, 6.0f, 9.0f}, {1, 1, 1, 3});
+        HostTensor<float> loss({0.0f}, {1, 1, 1});
+        vjp.forwardRecord().bind("values", values.view());
+        vjp.forwardRecord().bind("source", source.view());
+        vjp.forwardRecord().bindScalar("index", int32_t{1});
+        vjp.forwardRecord().bindScalar("scale", 4.0f);
+        vjp.forwardRecord().bind("loss", loss.view());
+        vjp.forwardRecord().bindGrid(1);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        EXPECT_FLOAT_EQ(loss.values[0], 26.0f);
+        EXPECT_EQ(values.values, (std::vector<float>{2.0f, 24.0f, 5.0f}));
 
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(loss, 26.0f);
-    EXPECT_FLOAT_EQ(values[0], 2.0f);
-    EXPECT_FLOAT_EQ(values[1], 24.0f);
-    EXPECT_FLOAT_EQ(values[2], 5.0f);
-    source[1] = 100.0f;
-
-    float scaleGradient{};
-    float sourceGradient[3]{};
-    float valuesGradient[3]{};
-    float seedValue = 1.0f;
-    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
-                                              {"loss", 4},
-                                              VERNON_DATA_F32,
-                                              &seedValue,
-                                              sizeof(seedValue),
-                                              3,
-                                              lossShape};
-    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
-    vernon::tests::DerivativeLeafFixture gradientValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"scale", 5},
-         VERNON_DATA_F32,
-         &scaleGradient,
-         sizeof(scaleGradient),
-         {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"source", 6},
-         VERNON_DATA_F32,
-         sourceGradient,
-         sizeof(sourceGradient),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         valuesGradient,
-         sizeof(valuesGradient),
-         4,
-         storageShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, 3, {}};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(scaleGradient, 6.0f);
-    EXPECT_FLOAT_EQ(sourceGradient[0], 0.0f);
-    EXPECT_FLOAT_EQ(sourceGradient[1], 4.0f);
-    EXPECT_FLOAT_EQ(sourceGradient[2], 0.0f);
-    EXPECT_FLOAT_EQ(valuesGradient[0], 1.0f);
-    EXPECT_FLOAT_EQ(valuesGradient[1], 0.0f);
-    EXPECT_FLOAT_EQ(valuesGradient[2], 0.0f);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
+        HostTensor<float> seed({1.0f}, {1, 1, 1});
+        HostTensor<float> scaleGradient({0.0f}, {});
+        HostTensor<float> sourceGradient({0.0f, 0.0f, 0.0f}, {1, 1, 1, 3});
+        HostTensor<float> valuesGradient({0.0f, 0.0f, 0.0f}, {1, 1, 1, 3});
+        vjp.backwardRecord().bind("loss", seed.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+        vjp.backwardRecord().bind("scale", scaleGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        vjp.backwardRecord().bind("source", sourceGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        vjp.backwardRecord().bind("values", valuesGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        ASSERT_TRUE(vjp.backwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+        EXPECT_FLOAT_EQ(scaleGradient.values[0], 6.0f);
+        EXPECT_EQ(sourceGradient.values, (std::vector<float>{0.0f, 4.0f, 0.0f}));
+        // The write replaced values[1], so only values[0] reaches the loss.
+        EXPECT_EQ(valuesGradient.values, (std::vector<float>{1.0f, 0.0f, 0.0f}));
+    }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
-
-TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersion) {
-    const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    const uint64_t storageShape[]{1, 1, 1, 3};
-    const uint64_t lossShape[]{1, 1, 1};
-    float values[]{2.0f, 3.0f, 5.0f};
-    float source[]{7.0f, 6.0f, 9.0f};
-    int32_t index = 1;
-    float scale = 4.0f;
-    float loss{};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values,
-         sizeof(values),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"source", 6},
-         VERNON_DATA_F32,
-         source,
-         sizeof(source),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 3, lossShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    ASSERT_FLOAT_EQ(loss, 26.0f);
-
-    source[1] = 100.0f;
-    float scaleGradient{};
-    float sourceGradient[3]{};
-    float valuesGradient[3]{};
-    float seedValue = 1.0f;
-    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
-                                              {"loss", 4},
-                                              VERNON_DATA_F32,
-                                              &seedValue,
-                                              sizeof(seedValue),
-                                              3,
-                                              lossShape};
-    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
-    vernon::tests::DerivativeLeafFixture gradientValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"scale", 5},
-         VERNON_DATA_F32,
-         &scaleGradient,
-         sizeof(scaleGradient),
-         {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"source", 6},
-         VERNON_DATA_F32,
-         sourceGradient,
-         sizeof(sourceGradient),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         valuesGradient,
-         sizeof(valuesGradient),
-         4,
-         storageShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, std::size(gradientValues), {}};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(scaleGradient, 6.0f);
-    EXPECT_FLOAT_EQ(source[1], 100.0f);
-
-    source[1] = -20.0f;
-    scaleGradient = 0.0f;
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(scaleGradient, 6.0f);
-    EXPECT_FLOAT_EQ(source[1], -20.0f);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-TEST(RuntimeStructuredStorageAutodiff, ZeroTapeBudgetRejectsForwardWithoutPublishing) {
-    const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(0, 0);
-    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, tapePolicy);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-
-    const uint64_t storageShape[]{2, 1, 1, 3};
-    const uint64_t lossShape[]{2, 1, 1};
-    float values[]{2.0f, 3.0f, 5.0f, 11.0f, 13.0f, 17.0f};
-    float source[]{7.0f, 6.0f, 9.0f, 19.0f, 23.0f, 29.0f};
-    int32_t index = 1;
-    float scale = 4.0f;
-    float loss[]{-17.0f, -31.0f};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"values", 6},
-         VERNON_DATA_F32,
-         values,
-         sizeof(values),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"source", 6},
-         VERNON_DATA_F32,
-         source,
-         sizeof(source),
-         4,
-         storageShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(vernon::tests::DerivativeLeafFixture), {"loss", 4}, VERNON_DATA_F32, loss, sizeof(loss), 3, lossShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
-    VernonPullback *pullback = nullptr;
-    EXPECT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(pullback, nullptr);
-    const std::string rejectionError = lastError(context);
-    EXPECT_EQ(rejectionError, "Program autodiff tape exceeds its memory budget");
-    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
-    EXPECT_FLOAT_EQ(loss[0], -17.0f);
-    EXPECT_FLOAT_EQ(loss[1], -31.0f);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-#endif
 
 } // namespace

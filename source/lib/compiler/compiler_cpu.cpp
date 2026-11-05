@@ -69,6 +69,7 @@ class CpuExecutionState {
 public:
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::map<std::string, VernonCpuEntryPoint, std::less<>> entries;
+    std::map<std::string, VernonCpuChunkEntryPoint, std::less<>> chunkEntries;
 };
 
 void CpuExecutionStateDeleter::operator()(CpuExecutionState *state) const { delete state; }
@@ -134,6 +135,7 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
             uint64_t size = 0;
             uint64_t alignment = 0;
             std::vector<vernon::CpuCallLanePacking> metadataLanes;
+            std::vector<vernon::CpuCallLanePacking> innermostStrides;
             if (metadataCarrier) {
                 auto dataLayout = module->getAttrOfType<mlir::StringAttr>("llvm.data_layout");
                 mlir::FailureOr<std::shared_ptr<const mlir::vernon::SemanticMetadataPlan>> semantic =
@@ -154,8 +156,20 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 }
                 size = (*physical)->getBlockSize();
                 alignment = (*physical)->getAbiAlignment();
-                for (const mlir::vernon::PhysicalMetadataMember &member : (*physical)->getMembers())
+                for (const mlir::vernon::PhysicalMetadataMember &member : (*physical)->getMembers()) {
                     metadataLanes.push_back({member.byteOffset, member.size});
+                    if (member.semanticOrdinal >= (*semantic)->getFields().size())
+                        continue;
+                    const mlir::vernon::MetadataFieldIdentity &field =
+                        (*semantic)->getFields()[member.semanticOrdinal].identity;
+                    if (field.kind != mlir::vernon::MetadataFieldKind::Stride || !field.dimension ||
+                        field.argumentIndex >= function.getNumArguments())
+                        continue;
+                    auto view =
+                        mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[field.argumentIndex]);
+                    if (view && *field.dimension + 1 == view.getShape().size())
+                        innermostStrides.push_back({member.byteOffset, member.size});
+                }
             } else if (valuePlan) {
                 size = valuePlan->layout.size;
                 alignment = valuePlan->layout.alignment;
@@ -201,6 +215,8 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                         std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
             } else if (metadataCarrier) {
                 packing.callLanes = std::move(metadataLanes);
+                for (const vernon::CpuCallLanePacking &stride : innermostStrides)
+                    metadata.innermostStrides.push_back({packing.offset + stride.offset, stride.size});
             } else if (packing.kind == vernon::CpuAbiArgumentKind::CanonicalValue) {
                 for (const mlir::vernon::CpuCallLane &lane : valuePlan->lanes) {
                     const mlir::vernon::ValueAbiLeaf &leaf = valuePlan->layout.leaves[lane.leafIndex];
@@ -311,9 +327,25 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         diagnostics = "CPU target '" + targetTriple + "' is unavailable: " + lookupError;
         return CpuCompileResult::CodegenFailure;
     }
+    // "native" is the CPU this process runs on, for objects the JIT loads here; an object meant to be stored names its
+    // processor, or targets the triple's baseline.
+    std::string processor = options.cpu;
+    std::string features = options.features;
+    if (processor == "native") {
+        if (!hostTarget) {
+            diagnostics = "the 'native' CPU processor requires the host target";
+            return CpuCompileResult::CodegenFailure;
+        }
+        processor = llvm::sys::getHostCPUName().str();
+        std::string hostFeatures;
+        for (const auto &feature : llvm::sys::getHostCPUFeatures())
+            hostFeatures += (hostFeatures.empty() ? "" : ",") + std::string(feature.getValue() ? "+" : "-") +
+                            feature.getKey().str();
+        features = features.empty() ? hostFeatures : hostFeatures + "," + features;
+    }
     llvm::TargetOptions targetOptions;
     std::unique_ptr<llvm::TargetMachine> objectTargetMachine(
-        target->createTargetMachine(parsedTriple, options.cpu, options.features, targetOptions, llvm::Reloc::PIC_));
+        target->createTargetMachine(parsedTriple, processor, features, targetOptions, llvm::Reloc::PIC_));
     if (!objectTargetMachine) {
         diagnostics = "failed to create TargetMachine for '" + targetTriple + "'";
         return CpuCompileResult::CodegenFailure;
@@ -471,6 +503,15 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
             }
             VernonCpuEntryPoint entryPoint = symbol->toPtr<VernonCpuEntryPoint>();
             nextExecution->entries.emplace(entry.internalFunctionSymbol, entryPoint);
+            const std::string chunkSymbol = vernon::cpuChunkEntrySymbol(entry);
+            if (!llvmModule->getFunction(chunkSymbol))
+                continue;
+            auto chunk = nextExecution->jit->lookup(chunkSymbol);
+            if (!chunk) {
+                diagnostics = llvm::toString(chunk.takeError());
+                return CpuCompileResult::CodegenFailure;
+            }
+            nextExecution->chunkEntries.emplace(entry.internalFunctionSymbol, chunk->toPtr<VernonCpuChunkEntryPoint>());
         }
     }
     artifacts.clear();
@@ -488,6 +529,13 @@ VernonCpuEntryPoint findCpuEntry(const CpuExecutionState *execution, std::string
         return nullptr;
     auto entry = execution->entries.find(name);
     return entry == execution->entries.end() ? nullptr : entry->second;
+}
+
+VernonCpuChunkEntryPoint findCpuChunkEntry(const CpuExecutionState *execution, std::string_view name) {
+    if (!execution)
+        return nullptr;
+    auto entry = execution->chunkEntries.find(name);
+    return entry == execution->chunkEntries.end() ? nullptr : entry->second;
 }
 
 } // namespace vernon::compiler

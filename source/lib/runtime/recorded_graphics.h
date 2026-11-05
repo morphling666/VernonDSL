@@ -44,7 +44,6 @@ struct PipelineEndpoint {
 inline constexpr const char *kPipelineConformance = "PROGRAM_PIPELINE_CONFORMANCE";
 inline constexpr const char *kRecordingInvalid = "PROGRAM_RECORDING_INVALID";
 inline constexpr const char *kBindingSetMismatch = "PROGRAM_BINDING_SET_MISMATCH";
-inline constexpr const char *kBindingSetHazard = "PROGRAM_BINDING_SET_HAZARD";
 inline constexpr const char *kPipelineCreationPhase = "pipeline_creation";
 inline constexpr const char *kInvocationEntryPhase = "invocation_entry";
 

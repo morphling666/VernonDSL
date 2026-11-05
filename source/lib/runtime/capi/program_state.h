@@ -2,32 +2,22 @@
 #define VERNON_RUNTIME_CAPI_PROGRAM_STATE_H
 
 #include "VernonRuntime.h"
-#include "runtime/autodiff/execution_workspace_pool.h"
-#include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/pipeline_groups.h"
 #include "runtime/program_execution/materialized_node_frame.h"
 #include "runtime/program_execution/program_invocation_state.h"
-#include "runtime/program_execution/submission_record.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/program_graph_linker.h"
 #include "runtime/program_graphics_executor.h"
-#include "runtime/program_instance.h"
-#include "runtime/program_invocation_context.h"
 #include "runtime/recorded_graphics.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_lifecycle.h"
 #include "runtime/runtime_state.h"
 #include "runtime/stage_binding_plan.h"
-#include "runtime/stored_graphics_scopes.h"
 
-#include <algorithm>
-#include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -61,26 +51,7 @@ struct RuntimeProgramBinding {
     }
 };
 
-struct RuntimeProgramControl {
-    enum Kind : uint32_t { RenderPass = 0, DrawCommand = 1, DynamicState = 2 };
-    Kind kind{RenderPass};
-    VernonRenderPass renderPass{};
-    VernonDrawCommand draw{};
-    VernonDynamicState dynamic{};
-    std::vector<VernonColorAttachment> colors;
-    std::optional<VernonDepthAttachment> depth;
-    std::optional<VernonIndexBinding> index;
-    std::vector<std::shared_ptr<void>> leases;
-
-    void refresh() {
-        renderPass.color_attachments = colors.empty() ? nullptr : colors.data();
-        renderPass.color_attachment_count = colors.size();
-        renderPass.depth_attachment = depth ? &*depth : nullptr;
-        draw.index_binding = index ? &*index : nullptr;
-    }
-};
-
-// Keeps an executable alive the way a Program instance does: its destroy fails while the lease exists.
+// Keeps an executable alive: its destroy fails while the lease exists.
 class RuntimeExecutableLease {
 public:
     using AcquireResult = vernon::Result<std::unique_ptr<RuntimeExecutableLease>, vernon::RuntimeError>;
@@ -146,7 +117,7 @@ struct RuntimeBindingSetEntry {
     std::shared_ptr<RuntimeProgramBinding> binding;
 };
 
-// A match's argument frame lowered for its pipeline's Stage once, then read by every invocation that draws with it.
+// A match's argument frame lowered for its pipeline's Stage once, then read by every pass that draws with it.
 struct RuntimeLoweredSetFrame {
     vernon::runtime::program_execution::MaterializedNodeFrame frame;
     // Per Stage parameter; meaningful for the parameters the match supplies.
@@ -165,10 +136,10 @@ struct RuntimeBindingSetMatch {
     std::vector<std::vector<uint32_t>> entryEndpoints;
     std::shared_ptr<const vernon::runtime::program_execution::ProgramInvocationState> values;
     // The groups whose values only this match decides; draws in flight share them.
-    mutable vernon::runtime::GroupStore groups{VERNON_RUNTIME_PROVIDER_GROUP_PERSISTENT};
+    mutable vernon::runtime::GroupStore groups;
     mutable std::mutex loweringMutex;
-    // Made by the first invocation that draws with the match; stays null for a frame that needs per-invocation
-    // copies or Runtime carriers, which every invocation lowers again.
+    // Made by the first pass that draws with the match; stays null for a frame that needs per-pass copies or Runtime
+    // carriers, which every pass lowers again.
     mutable std::shared_ptr<const RuntimeLoweredSetFrame> lowered;
 };
 
@@ -186,213 +157,9 @@ struct VernonBindingSet {
     std::shared_ptr<RuntimeBindingSetState> state;
 };
 
-struct RuntimeRecordedCommand {
-    VernonGraphicsCommandKind kind{};
-    std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
-    std::shared_ptr<RuntimeBindingSetState> set;
-    std::array<uint32_t, 4> rect{};
-    uint32_t stencilReference{};
-    std::shared_ptr<const RuntimeProgramControl> draw;
-    std::string label;
-};
-
-// Where one Stage parameter of a recorded draw takes its materialized argument from: the pass Node's own frame,
-// or the frame of a binding set prepared for the draw's pipeline.
-struct RecordedArgumentSource {
-    bool fromSet{};
-    size_t frame{};
-    size_t parameter{};
-};
-
-struct RecordedDraw {
-    std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
-    // Per Stage parameter; consecutive draws with no bind between them share one vector.
-    std::shared_ptr<const std::vector<RecordedArgumentSource>> arguments;
-};
-
 struct RecordedSetFrame {
     std::shared_ptr<const RuntimeBindingSetMatch> match;
     std::shared_ptr<const RuntimeGraphicsPipelineState> pipeline;
-};
-
-// A debug group push, pop or marker, encoded before draw `draw` of its pass, or after the last draw when `draw` is
-// the draw count.
-struct RecordedDebugCommand {
-    VernonGraphicsCommandKind kind{};
-    std::string label;
-    size_t draw{};
-};
-
-// What a validated recording draws with: everything except the values its viewport, scissor, stencil reference and
-// draw commands set, which RecordedDrawPayload holds. Immutable: every Execute that draws the recording until its next
-// edit other than SetCommand shares it, including submissions still in flight after the edit.
-struct RecordedGraphicsPass {
-    std::vector<RecordedSetFrame> frames;
-    std::vector<RecordedDraw> draws;
-    // The command of each draw.
-    std::vector<size_t> drawCommands;
-    // Balanced and in recording order.
-    std::vector<RecordedDebugCommand> debugCommands;
-    // What each Execute checks against the resources its Nodes write: each distinct set with the first command that
-    // binds it.
-    std::vector<std::pair<size_t, std::shared_ptr<RuntimeBindingSetState>>> sets;
-    // Each indexed draw's index buffer with its command; SetCommand cannot change it.
-    std::vector<std::pair<size_t, VernonRuntimeProviderResourceReference>> indexBuffers;
-    std::vector<std::shared_ptr<void>> leases;
-    // Every count except `render_scopes`, which Execute reports.
-    VernonProgramGraphicsNodeTelemetry telemetry{};
-};
-
-inline bool sameDynamicState(const VernonDynamicState &left, const VernonDynamicState &right) {
-    return std::equal(std::begin(left.viewport), std::end(left.viewport), std::begin(right.viewport)) &&
-           std::equal(std::begin(left.scissor), std::end(left.scissor), std::begin(right.scissor)) &&
-           left.stencil_reference == right.stencil_reference;
-}
-
-// The values of the draws of a validated recording, index-aligned with RecordedGraphicsPass::draws. Immutable like
-// the pass; SetCommand replaces it without replacing the pass.
-struct RecordedDrawPayload {
-    std::vector<std::shared_ptr<const RuntimeProgramControl>> draws;
-    // Consecutive draws with no dynamic-state command between them share one control.
-    std::vector<std::shared_ptr<const RuntimeProgramControl>> dynamics;
-    // The draws of at least one instance.
-    uint64_t drawn{};
-};
-
-// Resources the Nodes of one invocation write that callers can also reach.
-struct RecordedWrittenResources {
-    struct Buffer {
-        uint64_t identity{};
-        uint64_t resource{};
-        uint64_t begin{};
-        uint64_t end{};
-
-        bool operator==(const Buffer &other) const {
-            return identity == other.identity && resource == other.resource && begin == other.begin && end == other.end;
-        }
-    };
-    std::vector<Buffer> buffers;
-    std::vector<uint64_t> images;
-
-    // Saturates instead of wrapping, so an out-of-range view still overlaps what it would reach.
-    static Buffer range(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) {
-        const uint64_t begin = offset > UINT64_MAX - reference.offset ? UINT64_MAX : reference.offset + offset;
-        return {reference.identity, reference.resource.value, begin,
-                size > UINT64_MAX - begin ? UINT64_MAX : begin + size};
-    }
-
-    bool operator==(const RecordedWrittenResources &other) const {
-        return buffers == other.buffers && images == other.images;
-    }
-
-    bool overlapsBuffer(const VernonRuntimeProviderResourceReference &reference, uint64_t offset, uint64_t size) const {
-        const Buffer view = range(reference, offset, size);
-        return std::any_of(buffers.begin(), buffers.end(), [&](const Buffer &buffer) {
-            return buffer.identity == view.identity && buffer.resource == view.resource && view.begin < buffer.end &&
-                   buffer.begin < view.end;
-        });
-    }
-};
-
-struct RuntimeProgramInstanceState;
-
-struct RuntimeGraphicsRecordingState {
-    VernonRuntimeContext *context{};
-    std::weak_ptr<RuntimeProgramInstanceState> instance;
-    VernonProgramNodeId node{};
-    std::vector<RuntimeRecordedCommand> commands;
-    std::vector<std::shared_ptr<void>> leases;
-    // Cleared by every edit except SetCommand.
-    std::shared_ptr<const RecordedGraphicsPass> validated;
-    // Cleared by every edit except SetCommand of a draw, which adds the draw's command to `editedDraws` instead. It
-    // starts from the invocation's initial dynamic state, so it is valid only for invocations whose initial state
-    // equals `payloadDynamic`.
-    std::shared_ptr<const RecordedDrawPayload> payload;
-    VernonDynamicState payloadDynamic{};
-    // Commands of the draws replaced since `payload` was built; empty while `payload` is null.
-    std::vector<size_t> editedDraws;
-    // The pass and written resources last found free of hazards. Draw values cannot cause hazards.
-    std::shared_ptr<const RecordedGraphicsPass> hazardFreePass;
-    RecordedWrittenResources hazardFreeWritten;
-};
-
-struct VernonGraphicsRecording {
-    std::shared_ptr<RuntimeGraphicsRecordingState> state;
-};
-
-struct RecordedGraphicsNode {
-    std::shared_ptr<const RecordedGraphicsPass> pass;
-    std::shared_ptr<const RecordedDrawPayload> payload;
-    VernonProgramGraphicsNodeTelemetry telemetry{};
-};
-
-struct vernon::runtime::RecordedGraphicsPasses {
-    std::map<VernonProgramNodeId, RecordedGraphicsNode> nodes;
-};
-
-struct RuntimeProgramInstanceState {
-    RuntimeProgramInstanceState(VernonProgramExecutable &value, vernon::runtime::RuntimeChildLifecycle childLifecycle,
-                                vernon::OwnerRef invocationOwner)
-        : lifecycle(std::move(childLifecycle)), owner(std::move(invocationOwner)), pipeline(&value), bindings(&value),
-          workspaces(
-              std::make_shared<vernon::runtime::ad::ExecutionWorkspacePool>(value.programAutodiff.canonicalExecution)) {
-    }
-    ~RuntimeProgramInstanceState() noexcept {
-        if (!lifecycle.published())
-            return;
-        auto destruction = lifecycle.beginDestroy();
-        auto close = owner.beginClose();
-        if (destruction.isErr() || close.isErr())
-            vernon::resultContractViolation();
-        if (close.value().commit().isErr() || destruction.value().commit().isErr())
-            vernon::resultContractViolation();
-    }
-    vernon::runtime::RuntimeChildLifecycle lifecycle;
-    vernon::OwnerRef owner;
-    VernonProgramExecutable *pipeline;
-    vernon::runtime::program::ProgramInstance bindings;
-    vernon::runtime::InstanceGroups groups;
-    vernon::runtime::StoredGraphicsScopes storedGraphics;
-    const std::shared_ptr<vernon::runtime::ad::ExecutionWorkspacePool> workspaces;
-    // Measured on the instance's last Execute; admission charges the next one with them before it allocates. Before
-    // the first Execute one RHI submission is assumed.
-    std::atomic<uint64_t> submissionTransientBytes{};
-    std::atomic<uint32_t> submissionRhiSubmissions{1};
-};
-
-struct VernonProgramInstance {
-    explicit VernonProgramInstance(std::shared_ptr<RuntimeProgramInstanceState> value) noexcept
-        : state(std::move(value)) {}
-    std::shared_ptr<RuntimeProgramInstanceState> state;
-};
-
-struct VernonProgramInvocation {
-    VernonProgramInvocation(VernonProgramInstance &value, vernon::runtime::RuntimeChildLifecycle childLifecycle,
-                            std::unique_ptr<vernon::runtime::program::BindingTransaction> bindingTransaction) noexcept
-        : instance(value.state), lifecycle(std::move(childLifecycle)), transaction(std::move(bindingTransaction)) {}
-    ~VernonProgramInvocation() {
-        if (pendingPullback)
-            vernonProgramPullbackDestroy(pendingPullback);
-    }
-    std::shared_ptr<RuntimeProgramInstanceState> instance;
-    vernon::runtime::RuntimeChildLifecycle lifecycle;
-    std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
-    std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
-    std::map<VernonProgramNodeId, std::unique_ptr<vernon::runtime::ad::PullbackExecution>> nodePullbacks;
-    VernonPullback *pendingPullback{};
-    std::optional<uint64_t> checkpointMemoryBudget;
-    std::string checkpointPolicy;
-    std::shared_ptr<vernon::runtime::ad::CanonicalProgramExecutionWorkspace> executionWorkspace;
-    std::map<VernonProgramNodeId, std::shared_ptr<RuntimeGraphicsRecordingState>> recordings;
-    std::map<VernonProgramNodeId, VernonProgramGraphicsNodeTelemetry> graphicsTelemetry;
-    vernon::runtime::program_execution::CompletionMode completionMode{
-        vernon::runtime::program_execution::CompletionMode::Wait};
-    bool timings{};
-    // Produced by an Execute that submitted work, until it is taken.
-    std::unique_ptr<VernonSubmission> submission;
-    bool executed{};
-    bool finished{};
-    bool succeeded{};
 };
 
 struct RuntimeProgramGraphNode {
@@ -428,29 +195,14 @@ struct VernonProgramGraph {
 
 namespace vernon::runtime::capi {
 
-inline VernonRuntimeContext *instanceContext(const VernonProgramInstance *instance) {
-    return instance && instance->state && instance->state->pipeline ? instance->state->pipeline->context : nullptr;
-}
-
-inline VernonProgramExecutable *invocationExecutable(const VernonProgramInvocation *invocation) {
-    return invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
-}
-
-inline VernonRuntimeContext *invocationContext(const VernonProgramInvocation *invocation) {
-    VernonProgramExecutable *executable = invocationExecutable(invocation);
-    return executable ? executable->context : nullptr;
-}
-
 vernon::Result<std::shared_ptr<void>, vernon::RuntimeError>
 retainProgramResourceLease(const VernonProgramResourceLease &lease) noexcept;
 
 const program::Program *executableProgram(const VernonProgramExecutable &pipeline);
 size_t publicBoundaryCount(const program::Program &program);
-size_t mutationCapacity(const VernonProgramExecutable &pipeline);
 const program::BoundarySlot *publicBoundaryAt(const program::Program &program, size_t publicIndex);
 const program::BoundarySlot *parameterBoundaryAt(const VernonProgramExecutable &pipeline, size_t index);
 const program::BoundarySlot *findParameterBoundary(const VernonProgramExecutable &pipeline, VernonStringView name);
-uint64_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind);
 void buildExecutableBindingIndex(VernonProgramExecutable &pipeline);
 bool bindableParameterSlot(const VernonProgramExecutable &pipeline, uint32_t slot);
 const std::vector<uint32_t> *bindingAliasSlots(const VernonProgramExecutable &pipeline, uint32_t slot);
@@ -468,7 +220,6 @@ using ProgramBindingValueResult = vernon::Result<std::shared_ptr<RuntimeProgramB
 // `argument` must have passed programArgumentDiagnostic.
 ProgramBindingValueResult makeProgramBinding(const VernonProgramArgument &argument,
                                              const VernonProgramResourceLease *lease);
-std::shared_ptr<RuntimeProgramControl> makeDrawCommandControl(const VernonDrawCommand *draw);
 
 } // namespace vernon::runtime::capi
 

@@ -230,11 +230,11 @@ struct RhiPacketBatch : RhiRetainedObject {
     RhiPacketBatch() = default;
     ~RhiPacketBatch() override;
 
+    // A scope checked once when the batch is built; its clear values come from the payload.
     struct Rendering {
-        VernonRuntimeProviderRenderingDescriptor descriptor{};
-        std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colors{};
-        VernonRuntimeProviderDepthStencilAttachment depth{};
-        std::vector<VernonRuntimeProviderResourceReference> sampledImages;
+        // The attachment views and sampled images that `prepared` was checked against.
+        std::vector<vernon::rhi::RetainedRhiResourceLease> leases;
+        vernon::rhi::PreparedRendering prepared;
     };
 
     // The debug packets are dropped when the device does not emit labels.
@@ -264,12 +264,9 @@ RhiAdapterResult<void> createRhiPacketBatch(VernonRuntimeRhiAdapter &adapter,
                                             RhiPacketObjects objects, VernonRuntimeProviderObject *output) noexcept;
 void destroyRhiPacketBatch(void *, VernonRuntimeProviderObject batch);
 
-// The descriptor of a scope that BEGIN_RENDERING begins with the clear values at `clears`; `colors` and `depth`
-// receive its attachments.
-VernonRuntimeProviderRenderingDescriptor
-packetRendering(const RhiPacketBatch::Rendering &rendering, const uint32_t *clears,
-                std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> &colors,
-                VernonRuntimeProviderDepthStencilAttachment &depth) noexcept;
+// Begins the RHI scope of a BEGIN_RENDERING packet with the clear values at `clears`.
+RhiAdapterResult<void> beginBatchRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                           const RhiPacketBatch::Rendering &rendering, const uint32_t *clears) noexcept;
 RhiAdapterResult<void> recordPacketDebugCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                                 uint32_t opcode, const uint32_t *operands) noexcept;
 
@@ -288,6 +285,9 @@ RhiAdapterResult<void> finishRhiPacketBatch(VernonRuntimeRhiAdapter &adapter, Ve
  *   bindVertexBuffers(uint32_t first, const uint32_t *resources, size_t count)
  *   draw(uint32_t topology, uint32_t indexResource or UINT32_MAX, const VernonRuntimeProviderDrawPayload &,
  *        const vernon::rhi::OpenedRendering &)
+ *   drawStream(uint32_t topology, uint32_t indexResource, uint32_t recordsResource, uint32_t countsResource,
+ *              const VernonRuntimeProviderStreamPayload &, const vernon::rhi::OpenedRendering &), whose records and
+ *              counts resources are UINT32_MAX for a host stream
  *   dispatch(const uint32_t groupCount[3])
  * each returning RhiAdapterResult<void>.
  */
@@ -308,16 +308,13 @@ RhiAdapterResult<void> decodeRhiPackets(VernonRuntimeRhiAdapter &adapter, Vernon
     bool indexed = false;
     const auto decode = [&](uint32_t opcode, uint32_t count, const uint32_t *operands) -> RhiAdapterResult<void> {
         switch (opcode) {
-        case VERNON_RUNTIME_PROVIDER_PACKET_BEGIN_RENDERING: {
-            std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colors;
-            VernonRuntimeProviderDepthStencilAttachment depth;
-            const VernonRuntimeProviderRenderingDescriptor descriptor =
-                packetRendering(batch.renderings[operands[0]], payload + operands[1], colors, depth);
+        case VERNON_RUNTIME_PROVIDER_PACKET_BEGIN_RENDERING:
             open = false;
-            if (auto begun = beginEncoderRendering(adapter, encoder, descriptor); !begun)
+            if (auto begun =
+                    beginBatchRendering(adapter, encoder, batch.renderings[operands[0]], payload + operands[1]);
+                !begun)
                 return begun;
             return decoder.beginRendering();
-        }
         case VERNON_RUNTIME_PROVIDER_PACKET_END_RENDERING:
             if (auto ended = endEncoderRendering(adapter, encoder); !ended)
                 return ended;
@@ -346,6 +343,23 @@ RhiAdapterResult<void> decodeRhiPackets(VernonRuntimeRhiAdapter &adapter, Vernon
             indexed = drawIndexed;
             stencilReference = draw.stencil_reference;
             return decoder.draw(operands[0], indexed ? operands[1] : UINT32_MAX, draw, opened);
+        }
+        case VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED_STREAM: {
+            VernonRuntimeProviderStreamPayload stream;
+            std::memcpy(&stream, payload + operands[4], sizeof(stream));
+            if (!stream.max_records)
+                return RhiAdapterResult<void>{vernon::ok()};
+            if (!open) {
+                auto rendering = openCommandRendering(adapter, encoder);
+                if (!rendering)
+                    return RhiAdapterResult<void>{vernon::err(std::move(rendering).error())};
+                opened = rendering.value();
+                open = true;
+            }
+            drew = true;
+            indexed = true;
+            stencilReference = stream.stencil_reference;
+            return decoder.drawStream(operands[0], operands[1], operands[2], operands[3], stream, opened);
         }
         case VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH:
             return decoder.dispatch(payload + operands[0]);

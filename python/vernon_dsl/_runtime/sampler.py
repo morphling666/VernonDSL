@@ -4,7 +4,7 @@ import threading
 import weakref
 from typing import Any
 
-from .session import RuntimeSession, _InvocationContext
+from .session import RuntimeSession, _InvocationContext, cpu
 
 
 class SamplerState:
@@ -19,8 +19,8 @@ class SamplerState:
 
     def _resident_sampler(self, context: _InvocationContext) -> Any:
         state = context.session
-        if state.rhi_host is None:
-            raise RuntimeError("SamplerState requires an initialized GPU RHI runtime")
+        if state.arch == cpu:
+            raise RuntimeError("SamplerState requires a GPU Runtime session")
         with self._lock:
             resident = self._residencies.get(state)
             if resident is not None:
@@ -30,7 +30,7 @@ class SamplerState:
                 "clamp_to_edge": state.native.SamplerAddressMode.CLAMP_TO_EDGE,
                 "mirrored_repeat": state.native.SamplerAddressMode.MIRRORED_REPEAT,
             }[self._address]
-            resident = state.rhi_host.create_sampler(address)
+            resident = state.device.create_sampler(address)
             self._residencies[state] = resident
             return resident
 

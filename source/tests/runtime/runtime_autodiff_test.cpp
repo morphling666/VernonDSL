@@ -1,6 +1,4 @@
-#include "runtime/autodiff/host_effect_transaction.h"
 #include "runtime/autodiff/host_tape_allocator.h"
-#include "runtime/autodiff/runtime_autodiff_policy.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
@@ -76,41 +74,6 @@ TEST(RuntimeAutodiffTapeAllocator, HasFrozenImmutablePageLayout) {
     EXPECT_EQ(kHostTapeSnapshotRecordResidentBytes, 4 * sizeof(size_t));
     EXPECT_EQ(offsetof(detail::HostTapeSnapshotRegion, exitKind), 3 * sizeof(size_t));
     EXPECT_EQ(offsetof(detail::HostTapeSnapshotRecord, childCount), 3 * sizeof(size_t));
-}
-
-TEST(RuntimeAutodiffEffectTransaction, CommitsOrDiscardsExactlyOnce) {
-    float storage = 3.0f;
-    float output = -1.0f;
-    vernon::runtime::ad::HostEffectTransaction transaction(sizeof(output));
-    auto stagedStorageResult = transaction.stageStorage(&storage, sizeof(storage), true);
-    auto stagedOutputResult = transaction.stagedOutput();
-    ASSERT_TRUE(stagedStorageResult.isOk());
-    ASSERT_TRUE(stagedOutputResult.isOk());
-    auto *stagedStorage = reinterpret_cast<float *>(stagedStorageResult.value());
-    auto *stagedOutput = reinterpret_cast<float *>(stagedOutputResult.value());
-    ASSERT_NE(stagedStorage, nullptr);
-    ASSERT_NE(stagedOutput, nullptr);
-    *stagedStorage = 4.0f;
-    *stagedOutput = 9.0f;
-    EXPECT_TRUE(transaction.commit(&output).isOk());
-    EXPECT_FLOAT_EQ(storage, 4.0f);
-    EXPECT_FLOAT_EQ(output, 9.0f);
-    EXPECT_TRUE(transaction.stageStorage(&storage, sizeof(storage), true).isErr());
-    EXPECT_TRUE(transaction.commit(&output).isErr());
-
-    vernon::runtime::ad::HostEffectTransaction discarded(sizeof(output));
-    ASSERT_TRUE(discarded.stageStorage(&storage, sizeof(storage), true).isOk());
-    EXPECT_TRUE(discarded.discard());
-    EXPECT_TRUE(discarded.stagedOutput().isErr());
-    EXPECT_TRUE(discarded.commit(&output).isErr());
-}
-
-TEST(RuntimeAutodiffEffectTransaction, InvalidDestinationPreservesCapturingState) {
-    vernon::runtime::ad::HostEffectTransaction transaction(sizeof(float));
-    auto invalid = transaction.stageStorage(nullptr, sizeof(float), false);
-    ASSERT_TRUE(invalid.isErr());
-    EXPECT_EQ(invalid.error(), vernon::runtime::ad::HostEffectError::InvalidDestination);
-    EXPECT_TRUE(transaction.stagedOutput().isOk());
 }
 
 TEST(RuntimeAutodiffTapeAllocator, ReportsFactoryValidationAndOverflow) {
@@ -672,24 +635,6 @@ TEST(RuntimeAutodiffTapeAllocator, BackendNeutralReservationsChargeAndReleaseCon
     retained.reset();
     EXPECT_EQ(policy->usage().currentBytes, 0u);
     EXPECT_EQ(policy->usage().peakBytes, 64u);
-}
-
-TEST(RuntimeAutodiff, ParsesBackendNeutralPlanningPolicies) {
-    using namespace vernon::runtime::ad;
-    PlanningPolicy policy{};
-    EXPECT_TRUE(parsePlanningPolicy("min_memory", policy));
-    EXPECT_EQ(policy, PlanningPolicy::MinMemory);
-    EXPECT_TRUE(parsePlanningPolicy("balanced", policy));
-    EXPECT_EQ(policy, PlanningPolicy::Balanced);
-    EXPECT_TRUE(parsePlanningPolicy("min_runtime", policy));
-    EXPECT_EQ(policy, PlanningPolicy::MinRuntime);
-    EXPECT_FALSE(parsePlanningPolicy("heuristic", policy));
-}
-
-TEST(RuntimeAutodiff, AutodiffMemoryPolicyIsLazyForOrdinaryRuntimeContexts) {
-    auto context = VernonRuntimeContext::create();
-    ASSERT_TRUE(context.isOk());
-    EXPECT_EQ(context.value()->autodiffMemoryPolicy, nullptr);
 }
 
 TEST(RuntimeAutodiff, ReplacesStaleInvocationDiagnosticAtPublicBoundary) {

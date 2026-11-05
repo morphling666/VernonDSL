@@ -187,33 +187,6 @@ struct ResolvedAutodiffPlan {
     CheckpointPolicy checkpointPolicy{CheckpointPolicy::Retain};
 };
 
-enum class PublicationCommitMode {
-    CommitAfterSuccess,
-    InPlace,
-};
-
-struct ResolvedPublicationTransaction {
-    uint32_t slot{};
-    uint32_t value{};
-    ProgramOwnerId stagingOwner;
-    PublicationCommitMode mode{PublicationCommitMode::CommitAfterSuccess};
-};
-
-struct ResolvedPublicationPlan {
-    std::vector<ResolvedPublicationTransaction> transactions;
-};
-
-// The first plan member whose effect still needs a host wait after its device work, so the plan cannot complete
-// asynchronously (specs/runtime/pipelined_submission.md section 4): a commit-after-success publication or an autodiff
-// tape.
-struct ResolvedWaitRequirement {
-    std::string path;
-    std::string reason;
-
-    bool operator==(const ResolvedWaitRequirement &other) const { return path == other.path && reason == other.reason; }
-    bool operator!=(const ResolvedWaitRequirement &other) const { return !(*this == other); }
-};
-
 // Immutable canonical execution authority. Backend handles occur only through
 // reusable Stage references; every other record is logical Program planning.
 struct ResolvedExecutionPlan {
@@ -229,8 +202,6 @@ struct ResolvedExecutionPlan {
     ResolvedHazardPlan hazards;
     std::vector<ResolvedGraphicsScopeCandidate> graphicsScopeCandidates;
     ResolvedAutodiffPlan autodiff;
-    ResolvedPublicationPlan publications;
-    std::optional<ResolvedWaitRequirement> waitRequirement;
 
     const ResolvedNodePlan *node(GraphDirection graph, uint32_t nodeId) const;
     bool requiresDevice(GraphDirection graph, uint32_t value) const;

@@ -1,7 +1,7 @@
 #ifndef VERNON_EXTERNAL_ENGINE_DEMO_H
 #define VERNON_EXTERNAL_ENGINE_DEMO_H
 
-#include "VernonRHI.h"
+#include "VernonHal.h"
 
 #include <cstdint>
 #include <memory>
@@ -22,9 +22,8 @@ public:
     virtual ~ExternalEnginePanel() = default;
     virtual bool initialize(GraphicsHost *graphics, bool headless) = 0;
     virtual bool renderFrame(double elapsedSeconds, uint32_t panelWidth, uint32_t panelHeight) = 0;
-    virtual VernonRhiImage image() const = 0;
-    virtual uint32_t imageWidth() const = 0;
-    virtual uint32_t imageHeight() const = 0;
+    // A sampled view, on the graphics host's device, of the panel's latest frame.
+    virtual const VernonHalImageView *view() const = 0;
     virtual void shutdown() = 0;
 };
 

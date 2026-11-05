@@ -77,6 +77,13 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     const bool debugUtils = hasExtension(instanceExtensionProperties, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (debugUtils)
         instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    const bool surfaces = platformSurfaceExtension &&
+                          hasExtension(instanceExtensionProperties, VK_KHR_SURFACE_EXTENSION_NAME) &&
+                          hasExtension(instanceExtensionProperties, platformSurfaceExtension);
+    if (surfaces) {
+        instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        instanceExtensions.push_back(platformSurfaceExtension);
+    }
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &application;
     instanceInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
@@ -237,6 +244,10 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     imageCubeArray = features.features.imageCubeArray == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.imageCubeArray = features.features.imageCubeArray;
+    multiDrawIndirect =
+        features.features.multiDrawIndirect == VK_TRUE && features.features.drawIndirectFirstInstance == VK_TRUE;
+    enabledFeatures.multiDrawIndirect = multiDrawIndirect ? VK_TRUE : VK_FALSE;
+    enabledFeatures.drawIndirectFirstInstance = multiDrawIndirect ? VK_TRUE : VK_FALSE;
     deviceInfo.pEnabledFeatures = &enabledFeatures;
     std::vector<const char *> deviceExtensions;
     void *enabledFeatureChain = nullptr;
@@ -256,6 +267,13 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         if (!dynamicRenderingIsCore)
             deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     }
+    // The extension rather than Vulkan 1.2, which the 1.1 instance does not admit.
+    drawIndirectCount = hasExtension(extensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    if (drawIndirectCount)
+        deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    presentation = surfaces && hasExtension(extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (presentation)
+        deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     deviceInfo.pNext = enabledFeatureChain;
     deviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
@@ -269,6 +287,11 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         return false;
     }
     dynamicRendering = dynamicRendering && api.cmdBeginRendering && api.cmdEndRendering;
+    drawIndirectCount = drawIndirectCount && api.cmdDrawIndexedIndirectCount;
+    presentation = presentation && api.destroySurface && api.getPhysicalDeviceSurfaceSupport &&
+                   api.getPhysicalDeviceSurfaceCapabilities && api.getPhysicalDeviceSurfaceFormats &&
+                   api.getPhysicalDeviceSurfacePresentModes && api.createPlatformSurface && api.createSwapchain &&
+                   api.destroySwapchain && api.getSwapchainImages && api.acquireNextImage && api.queuePresent;
     api.getDeviceQueue(device, queueFamily, 0, &queue);
     api.getPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
     CommandFrame initialFrame;
@@ -385,7 +408,10 @@ void DeviceState::shutdown() {
     maxComputeWorkGroupInvocations = 0;
     descriptorBufferOffsetAlignment = 1;
     dynamicRendering = false;
+    drawIndirectCount = false;
+    multiDrawIndirect = false;
     shaderBufferFloat32AtomicAdd = false;
+    presentation = false;
     portabilityEnumeration = false;
     portabilitySubset = false;
     nativeObjectsBorrowed = false;
@@ -401,7 +427,7 @@ void DeviceState::shutdown() {
 bool DeviceState::synchronize(std::string &error) {
     if (nativeObjectsBorrowed)
         return true;
-    if (!device || !check(driver().deviceWaitIdle(device), "vkDeviceWaitIdle", error))
+    if (!flushUploads(error) || !device || !check(driver().deviceWaitIdle(device), "vkDeviceWaitIdle", error))
         return false;
     return retireCommandFrames(submittedSerial, error);
 }
@@ -488,19 +514,48 @@ VkImageLayout DeviceState::recordedImageLayout(VkCommandBuffer command, Image &o
     return owner.subresourceLayouts[subresource];
 }
 
-bool DeviceState::recordLayoutPrologue(CommandFrame &frame, bool &recorded, std::string &error) {
-    recorded = false;
-    std::vector<VkImageMemoryBarrier> barriers;
+bool DeviceState::movedToLayout(VkCommandBuffer command, Image &owner, const ImageSubresources &range,
+                                VkImageLayout layout) {
+    CommandFrame *frame = recordingFrame(command);
+    if (!frame)
+        return false;
+    const auto found = frame->imageLayouts.find(&owner);
+    if (found == frame->imageLayouts.end() || found->second.current.empty())
+        return false;
+    for (uint32_t layer = range.baseArrayLayer; layer < range.baseArrayLayer + range.arrayLayerCount; ++layer)
+        for (uint32_t mip = range.baseMipLevel; mip < range.baseMipLevel + range.mipLevelCount; ++mip) {
+            const size_t subresource = mip + size_t{layer} * owner.mipLevels;
+            if (subresource >= found->second.current.size() || found->second.current[subresource] != layout)
+                return false;
+        }
+    return true;
+}
+
+namespace {
+
+// The barriers that move each subresource `layouts` uses to the layout it begins in, from its layout after the
+// commands of `prior`, when given, or else as the image tracks it.
+bool layoutBarriers(const std::unordered_map<Image *, DeviceState::ImageLayoutUse> &layouts,
+                    const std::unordered_map<Image *, DeviceState::ImageLayoutUse> *prior,
+                    std::vector<VkImageMemoryBarrier> &barriers, std::string &error) {
     try {
-        for (const auto &[image, use] : frame.imageLayouts)
+        for (const auto &[image, use] : layouts) {
+            const DeviceState::ImageLayoutUse *before = nullptr;
+            if (prior)
+                if (const auto found = prior->find(image); found != prior->end())
+                    before = &found->second;
             for (size_t subresource = 0; subresource < use.initial.size(); ++subresource) {
                 const VkImageLayout layout = use.initial[subresource];
-                if (layout == kUnusedLayout || layout == image->subresourceLayouts[subresource])
+                VkImageLayout current = image->subresourceLayouts[subresource];
+                if (before && subresource < before->current.size() &&
+                    before->current[subresource] != DeviceState::kUnusedLayout)
+                    current = before->current[subresource];
+                if (layout == DeviceState::kUnusedLayout || layout == current)
                     continue;
                 VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
                 barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-                barrier.oldLayout = image->subresourceLayouts[subresource];
+                barrier.oldLayout = current;
                 barrier.newLayout = layout;
                 barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -510,10 +565,27 @@ bool DeviceState::recordLayoutPrologue(CommandFrame &frame, bool &recorded, std:
                                             static_cast<uint32_t>(subresource / image->mipLevels), 1};
                 barriers.push_back(barrier);
             }
+        }
     } catch (const std::bad_alloc &) {
         error = "Vulkan layout prologue ran out of memory";
         return false;
     }
+    return true;
+}
+
+} // namespace
+
+bool DeviceState::recordLayoutPrologue(CommandFrame &frame, bool &recorded, std::string &error) {
+    recorded = false;
+    std::vector<VkImageMemoryBarrier> barriers;
+    if (!layoutBarriers(frame.imageLayouts, nullptr, barriers, error) || !recordPrologue(frame, barriers, error))
+        return false;
+    recorded = !barriers.empty();
+    return true;
+}
+
+bool DeviceState::recordPrologue(CommandFrame &frame, const std::vector<VkImageMemoryBarrier> &barriers,
+                                 std::string &error) {
     if (barriers.empty())
         return true;
     Driver &api = driver();
@@ -533,14 +605,16 @@ bool DeviceState::recordLayoutPrologue(CommandFrame &frame, bool &recorded, std:
         return false;
     api.cmdPipelineBarrier(frame.prologue, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
                            nullptr, 0, nullptr, static_cast<uint32_t>(barriers.size()), barriers.data());
-    if (!check(api.endCommandBuffer(frame.prologue), "vkEndCommandBuffer", error))
-        return false;
-    recorded = true;
-    return true;
+    return check(api.endCommandBuffer(frame.prologue), "vkEndCommandBuffer", error);
 }
 
 void DeviceState::commitImageLayouts(CommandFrame &frame) {
-    for (auto &[image, use] : frame.imageLayouts) {
+    commitLayouts(frame.imageLayouts);
+    frame.imageLayouts.clear();
+}
+
+void DeviceState::commitLayouts(const std::unordered_map<Image *, ImageLayoutUse> &layouts) {
+    for (const auto &[image, use] : layouts) {
         for (size_t subresource = 0; subresource < use.current.size(); ++subresource)
             if (use.current[subresource] != kUnusedLayout)
                 image->subresourceLayouts[subresource] = use.current[subresource];
@@ -549,7 +623,6 @@ void DeviceState::commitImageLayouts(CommandFrame &frame) {
                         [shared](VkImageLayout layout) { return layout == shared; }))
             image->layout = shared;
     }
-    frame.imageLayouts.clear();
 }
 
 void DeviceState::retireFrameMemory(StagingArena<StagingChunk> &upload, StagingArena<StagingChunk> &readback,
@@ -620,10 +693,11 @@ bool DeviceState::beginCommands(VkCommandBuffer &command, std::string &error) {
     return true;
 }
 
-bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std::string &error) {
+bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std::string &error,
+                                 const SubmitSemaphores &semaphores) {
     serial = 0;
     if (nativeObjectsBorrowed) {
-        if (command != borrowedCommandBuffer)
+        if (command != borrowedCommandBuffer || semaphores.wait || semaphores.signal)
             return false;
         commitImageLayouts(borrowedCommandFrame);
         serial = ++borrowedSubmissions;
@@ -633,6 +707,10 @@ bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std:
         return true;
     }
     Driver &api = driver();
+    if (command != pendingUploads && !flushUploads(error)) {
+        abandonCommands(command);
+        return false;
+    }
     const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(command));
     if (found == recordingCommandFrames.end()) {
         error = "Vulkan command buffer does not belong to an active recording";
@@ -650,6 +728,15 @@ bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = prologue ? 2 : 1;
     submit.pCommandBuffers = prologue ? batch.data() : batch.data() + 1;
+    if (semaphores.wait) {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &semaphores.wait;
+        submit.pWaitDstStageMask = &semaphores.waitStage;
+    }
+    if (semaphores.signal) {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &semaphores.signal;
+    }
     if (!check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error)) {
         recycleCommandFrame(std::move(frame));
         return false;
@@ -659,6 +746,115 @@ bool DeviceState::submitCommands(VkCommandBuffer command, uint64_t &serial, std:
     serial = frame.serial;
     inFlightCommandFrames.push_back(std::move(frame));
     return true;
+}
+
+bool DeviceState::submitRecorded(VkCommandBuffer command, const std::unordered_map<Image *, ImageLayoutUse> &layouts,
+                                 uint64_t &serial, std::string &error) {
+    serial = 0;
+    if (nativeObjectsBorrowed) {
+        error = "a borrowed Vulkan device submits no recorded command buffers";
+        return false;
+    }
+    if (deviceLost) {
+        error = "Vulkan device was lost";
+        return false;
+    }
+    if (!retireCommandFrames(completedSerial, error))
+        return false;
+    if (inFlightCommandFrames.size() >= maxFramesInFlight &&
+        !waitForSerial(inFlightCommandFrames.front().serial, error))
+        return false;
+    Driver &api = driver();
+    // The pending uploads go in the same submission, ahead of `command`: their frame carries the fence, and the
+    // transitions to `layouts` follow the uploads in their command buffer. Without uploads a frame carries the prologue
+    // and the fence, and its own command buffer stays unused.
+    CommandFrame frame;
+    const bool uploads = pendingUploads != VK_NULL_HANDLE;
+    if (uploads) {
+        const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(pendingUploads));
+        if (found == recordingCommandFrames.end()) {
+            error = "Vulkan upload commands do not belong to an active recording";
+            return false;
+        }
+        frame = std::move(found->second);
+        recordingCommandFrames.erase(found);
+        pendingUploads = VK_NULL_HANDLE;
+    } else if (!availableCommandFrames.empty()) {
+        frame = std::move(availableCommandFrames.back());
+        availableCommandFrames.pop_back();
+    } else if (!createCommandFrame(frame, error)) {
+        return false;
+    }
+    std::vector<VkImageMemoryBarrier> barriers;
+    bool prologue = false;
+    bool recorded = layoutBarriers(layouts, uploads ? &frame.imageLayouts : nullptr, barriers, error);
+    if (recorded && uploads) {
+        if (!barriers.empty())
+            api.cmdPipelineBarrier(frame.command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                   static_cast<uint32_t>(barriers.size()), barriers.data());
+        recorded = check(api.endCommandBuffer(frame.command), "vkEndCommandBuffer", error) &&
+                   recordLayoutPrologue(frame, prologue, error);
+    } else if (recorded) {
+        recorded = check(api.resetFences(device, 1, &frame.fence), "vkResetFences", error) &&
+                   recordPrologue(frame, barriers, error);
+        prologue = !barriers.empty();
+    }
+    if (!recorded) {
+        recycleCommandFrame(std::move(frame));
+        return false;
+    }
+    std::array<VkCommandBuffer, 3> batch{};
+    uint32_t count = 0;
+    if (prologue)
+        batch[count++] = frame.prologue;
+    if (uploads)
+        batch[count++] = frame.command;
+    batch[count++] = command;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = count;
+    submit.pCommandBuffers = batch.data();
+    if (!check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error)) {
+        recycleCommandFrame(std::move(frame));
+        return false;
+    }
+    commitImageLayouts(frame);
+    commitLayouts(layouts);
+    frame.serial = ++submittedSerial;
+    serial = frame.serial;
+    inFlightCommandFrames.push_back(std::move(frame));
+    return true;
+}
+
+bool DeviceState::beginUploadCommands(VkCommandBuffer &command, std::string &error) {
+    if (nativeObjectsBorrowed || !pendingUploads) {
+        if (!beginCommands(command, error))
+            return false;
+        if (!nativeObjectsBorrowed)
+            pendingUploads = command;
+        return true;
+    }
+    command = pendingUploads;
+    VkMemoryBarrier order{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    order.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    order.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    driver().cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &order,
+                                0, nullptr, 0, nullptr);
+    return true;
+}
+
+bool DeviceState::endUploadCommands(VkCommandBuffer command, std::string &error) {
+    if (!nativeObjectsBorrowed)
+        return true;
+    uint64_t serial{};
+    return submitCommands(command, serial, error);
+}
+
+bool DeviceState::flushUploads(std::string &error) {
+    if (!pendingUploads)
+        return true;
+    uint64_t serial{};
+    return submitCommands(std::exchange(pendingUploads, VK_NULL_HANDLE), serial, error);
 }
 
 bool DeviceState::retireCommandFrames(uint64_t through, std::string &error) {
@@ -727,13 +923,16 @@ void DeviceState::abandonCommands(VkCommandBuffer command) {
     const auto found = recordingCommandFrames.find(reinterpret_cast<uintptr_t>(command));
     if (found == recordingCommandFrames.end())
         return;
+    if (command == pendingUploads)
+        pendingUploads = VK_NULL_HANDLE;
     (void)driver().resetCommandBuffer(command, 0);
     recycleCommandFrame(std::move(found->second));
     recordingCommandFrames.erase(found);
 }
 
 void DeviceState::destroyAfterSubmittedWork(DeferredDestruction destruction) {
-    destruction.serial = submittedSerial;
+    // Pending uploads may use the object; the next submission submits them.
+    destruction.serial = submittedSerial + (pendingUploads ? 1 : 0);
     if (destruction.serial <= completedSerial) {
         destroyNow(destruction);
         return;

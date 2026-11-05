@@ -922,11 +922,14 @@ public:
             Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
             if (!seed)
                 return primal.emitError("Storage objective has no cotangent");
-            if (buffer) {
-                AdAdjointAccumulateDenseOp::create(builder, primal.getLoc(), buffer, seed);
-            } else {
+            // A buffer holds only this invocation's change to the pre-state adjoint: every invocation stores its
+            // buffer, so a dense seed in each would be counted once per invocation. A store's or additive update's
+            // read of the post-state adjoint adds the seed instead, and the caller adds the cotangent to the gradient
+            // once (the Program VJP's in-place pass-through).
+            if (buffer)
+                bufferSeeds[{identity->id, leaf.abiLeafIndex}] = seed;
+            else
                 externalStorageCotangents[{identity->id, leaf.abiLeafIndex}] = seed;
-            }
             adjoints.erase({leaf.value, leaf.abiLeafIndex});
         }
         return success();
@@ -1260,6 +1263,15 @@ private:
                 valueGradient = createOperation(builder, store.getLoc(), AdAdjointTakeAndClearOp::getOperationName(),
                                                 operands, *valueType)
                                     ->getResult(0);
+                // The store kills the seed at this element too: the buffer keeps its negation, so the caller's
+                // cotangent plus every invocation's buffer leaves nothing of it in the pre-state gradient.
+                if (Value seed = bufferSeeds.lookup({effect->identity, leafIndex})) {
+                    Value element = LoadOp::create(builder, store.getLoc(), *valueType, seed, indices);
+                    valueGradient = arith::AddFOp::create(builder, store.getLoc(), valueGradient, element);
+                    SmallVector<Value> killed = {buffer, arith::NegFOp::create(builder, store.getLoc(), element)};
+                    llvm::append_range(killed, indices);
+                    createOperation(builder, store.getLoc(), AdAdjointScatterAddOp::getOperationName(), killed);
+                }
             } else if (Value cotangent = externalStorageCotangents.lookup({effect->identity, leafIndex})) {
                 valueGradient = LoadOp::create(builder, store.getLoc(), *valueType, cotangent, indices);
             } else if (analysis.isActive(store.getStorage(), leafIndex)) {
@@ -1299,6 +1311,10 @@ private:
                 postCotangent = createOperation(builder, operation.getLoc(), AdAdjointPeekOp::getOperationName(),
                                                 operands, *valueType)
                                     ->getResult(0);
+                if (Value seed = bufferSeeds.lookup({effect->identity, leafIndex}))
+                    postCotangent =
+                        arith::AddFOp::create(builder, operation.getLoc(), postCotangent,
+                                              LoadOp::create(builder, operation.getLoc(), *valueType, seed, indices));
             } else if (Value cotangent = externalStorageCotangents.lookup({effect->identity, leafIndex});
                        analysis.isActive(contribution, leafIndex) && cotangent) {
                 postCotangent = LoadOp::create(builder, operation.getLoc(), *valueType, cotangent, indices);
@@ -1775,6 +1791,8 @@ private:
     DenseMap<std::pair<unsigned, unsigned>, Value> storageAdjoints;
     DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageAdjoints;
     DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageCotangents;
+    // The output cotangent of a Storage whose pre-state adjoint is a buffer, which holds only changes to it.
+    DenseMap<std::pair<unsigned, unsigned>, Value> bufferSeeds;
 };
 
 SmallVector<BlockArgument> requiredPrimalArguments(const VernonAutodiffTapePlan &plan) {
@@ -1977,11 +1995,18 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
                                                            {profileTypes.cotangentDtypes[index]}, cotangentBase + index,
                                                            profileTypes.cotangents[index], "cotangent", leaf.rootPath));
     const unsigned gradientBase = cotangentBase + profileTypes.cotangents.size();
+    // A read_write TensorView is both an active result and a wrt leaf, so its cotangent and its gradient share a path;
+    // the gradient takes a distinct source name, since Program bindings name endpoints uniquely and match them by
+    // role and autodiff source.
+    llvm::StringSet<> cotangentPaths;
+    for (const AutodiffLeaf &leaf : analysis.getActiveResultLeaves())
+        cotangentPaths.insert(leaf.path);
     unsigned storageGradientIndex = 0;
     for (auto [index, leaf] : llvm::enumerate(analysis.getWrtLeaves()))
         if (isa<TensorViewType>(leaf.value.getType())) {
+            const std::string name = cotangentPaths.contains(leaf.path) ? "gradient." + leaf.path : leaf.path;
             backwardArgumentAttrs.push_back(makeInterfaceAttrs(
-                context, "input", leaf.path, {profileTypes.gradientDtypes[index]}, gradientBase + storageGradientIndex,
+                context, "input", name, {profileTypes.gradientDtypes[index]}, gradientBase + storageGradientIndex,
                 profileTypes.storageGradients[storageGradientIndex], "gradient", leaf.rootPath));
             ++storageGradientIndex;
         }

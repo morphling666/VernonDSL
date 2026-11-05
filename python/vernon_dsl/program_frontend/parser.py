@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
+import struct
 from collections.abc import Mapping
 from typing import Any
 
@@ -79,7 +81,14 @@ def _constant_attribute(value: Any) -> str:
     if isinstance(value, (int, np.integer)):
         return f"{int(value)} : i64"
     if isinstance(value, (float, np.floating)):
-        return f"{float(value):.17g} : f64"
+        number = float(value)
+        if not math.isfinite(number):
+            return f"0x{struct.unpack('<Q', struct.pack('<d', number))[0]:016X} : f64"
+        # An MLIR float literal needs a '.' before any exponent; repr round-trips the double.
+        mantissa, exponent, power = repr(number).partition("e")
+        if "." not in mantissa:
+            mantissa += ".0"
+        return f"{mantissa}{exponent}{power} : f64"
     raise TypeError(f"Program constant has unsupported type {type(value).__name__}")
 
 

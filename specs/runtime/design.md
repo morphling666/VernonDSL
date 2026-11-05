@@ -1,6 +1,10 @@
 # Runtime design
 
-Status: current Runtime, provider, RHI, and Program execution architecture.
+Status: current Runtime architecture. Programs run as linked schedules over
+the HAL ([`architecture_v2.md`](architecture_v2.md)). RuntimeCore and the RHI
+remain for Stage resolution and pipeline preparation until step 5 of
+`architecture_v2.md` section 16.3 removes them; the Python claims and
+residencies of section 1 remain until buffers have one home.
 
 Program semantics and deployment are defined by
 [`../program/architecture.md`](../program/architecture.md) and
@@ -12,18 +16,15 @@ Graphics-specific semantics are defined by
 
 Runtime execution is split into four layers:
 
-- **Runtime API** owns Program bundles, executables, instances, invocations,
-  pullbacks, validation diagnostics, and public resource references.
-- **RuntimeCore** owns manifest resolution, Stage binding plans, Program
-  invocation planning, provider-neutral caches, and publication policy.
-- **Runtime provider** owns physical resources, command construction,
-  submission, completion, barriers, and transient binding storage.
-- **VernonRHI** implements the built-in GPU provider over CUDA, Vulkan,
-  DirectX 12, Metal, OpenGL, and OpenGL ES.
-
-The CPU provider implements compute directly and does not link VernonRHI.
-Foreign engines may implement the provider SPI without depending on
-VernonRHI.
+- **Runtime API** owns Program bundles, executables, linked schedules and
+  VJPs, timeline points, validation diagnostics, and public resource
+  references.
+- **RuntimeCore** owns manifest resolution, Stage binding plans, pipeline
+  preparation, and provider-neutral caches.
+- **HAL** owns devices, resources, surfaces, recorded command buffers,
+  submission, and timeline points (`VernonHal.h`).
+- **VernonRHI** is the provider that RuntimeCore prepares pipelines through.
+  It still backs DirectX 12 and Metal, which have no HAL device yet.
 
 RuntimeCore stores opaque provider resource references. It does not own native
 textures, framebuffers, descriptor heaps, queues, command encoders, or fences.
@@ -34,9 +35,8 @@ textures, framebuffers, descriptor heaps, queues, command encoders, or fences.
 binding stores the Runtime and optional RHI host in one shared `RuntimeState`;
 an internally created OpenGL context is owned directly by that RHI host rather
 than by a Python helper. Destruction is ordered Runtime → RHI device → owned GL
-context. Runtime, executable, instance, invocation, and pullback wrappers
-retain the shared state directly; argument and graphics-control marshalling
-objects are owned by their invocation. Teardown therefore does not depend on
+context. Runtime, executable, schedule, VJP, argument-record, residual, and
+timeline wrappers retain the shared state directly. Teardown therefore does not depend on
 Python garbage-collection order or binding-layer parent/child keep-alive
 edges. Its
 `RuntimeConfiguration` is immutable and canonical: non-OpenGL backends have no
@@ -50,12 +50,12 @@ different configurations may probe concurrently. A candidate is fully
 constructed and capability-probed before a short registry critical section
 publishes it. Probe failure leaves the current default unchanged. Replacement
 retires the old default but does not invalidate its native objects; Runtime,
-RHI, executable, invocation, resource, and pullback owner leases determine
+RHI, executable, schedule, resource, and residual owner leases determine
 final teardown.
 
 `RuntimeSession` is also a context manager. Its selection uses `ContextVar`, so
 nested and concurrent scopes do not mutate the process default. Every public
-Program, Kernel, pipeline, cooked-asset, VJP, and pullback entry creates one
+Program, Kernel, pipeline, cooked-asset, and VJP entry creates one
 immutable invocation context for the complete operation. Binding transactions,
 resource claims, residency, compilation, and execution receive that context
 and never rediscover the process default.
@@ -82,7 +82,7 @@ device byte ranges; image coherence records exact aspect/mip/layer
 subresources. Tensor, RawBuffer, and Texture views cache only projections and
 never own independent authority, dirty, version, or residency state.
 
-An invocation locks all participating control blocks in stable owner order,
+A call locks all participating control blocks in stable owner order,
 validates every claim, publishes all claims atomically, and releases the locks
 before residency preparation, backend calls, or waits. Same-session reads and
 non-overlapping projected accesses may coexist. Cross-session overlap fails
@@ -99,20 +99,17 @@ residencies permit non-overlapping tickets to proceed independently. Publishing
 a ticket revalidates its exact dirty snapshot and preserves unrelated dirty
 ranges or subresources created concurrently.
 
-Every invocation returns one canonical mutation outcome. Its overall
-submission is `NotSubmitted`, `Completed`, or `Indeterminate`; each writable
-Program boundary or RenderPass control independently reports `Unchanged`,
-`Committed`, `InPlaceCommitted`, or `Indeterminate`. An asynchronous Execute
-reports `Submitted` for the invocation and for each boundary its queued work
-writes; the outcome of its submission, read once the submission completes,
-replaces each with the completion state
-([`pipelined_submission.md`](pipelined_submission.md) section 2). Commit-after-success
-destinations remain unchanged after planning, allocation, transfer, execution,
-readback, or pre-commit failure. Only an in-place boundary whose submitted work
-has unknown completion poisons its owner. Host reads and new device claims then
-fail until a complete authoritative host replacement recovers that owner.
-Python resolves this outcome while its write claims are still held and never
-infers mutation from an exception or aggregate success flag.
+A linked call writes in place (`architecture_v2.md` section 10). Its
+resource transaction resolves the call while its write claims are still
+held: `resolve_linked_call` publishes every claimed write and records the
+call's timeline point on each written residency, so a later host read waits
+for that point. A texture has no readback that waits for a point, so a call
+that writes one waits for it at once, and a failed wait poisons every owner
+the call writes. The general `resolve_mutations` takes one state per write:
+unchanged, committed, written in place, or indeterminate, which poisons the
+owner. Host reads and new device claims of a poisoned owner fail until a
+complete authoritative host replacement recovers it. Python never infers
+mutation from an exception or aggregate success flag.
 
 Fragmented host writes may conservatively expand their claim to a contiguous
 span, synchronize device-written gaps under that expanded claim, and issue one
@@ -123,20 +120,14 @@ aspect. A residency operation submits all selected ranges or subresources as
 one native batch; cube faces and depth/stencil planes are not widened in
 Python.
 
-Pullback construction retains only runtime-owned host bytes, device buffers,
-and tape carriers selected by the resolved residual plan. No Python resource
-claim survives the forward invocation. Pullback apply first prepares a typed
-cotangent/gradient boundary plan without residency work, admits every exact
-claim in stable owner order, then materializes and executes. Device and
-packed-host publication must both succeed before gradient write claims are
-released.
-
-If runtime tape validation requires a larger carrier, forward replay restores
-only the resolved graph inputs before executing again, using each input's
-authoritative host snapshot or retained device source. Intermediate Values are
-outputs of the replay and are never restored from host allocation bytes; this
-keeps retry semantics independent of uninitialized transient storage and
-allocator history.
+The pullback of a linked VJP call is its backward schedule over the
+residuals the forward returned. Residuals point into the memory of the
+call's inputs, so an input written while its pullback lives first leaves the
+memory the pullback reads to a snapshot, which the backward reads instead.
+No Python resource claim survives the forward call. A
+backward call claims its cotangents and gradients like any other call; one
+whose values do not pack natively, or that takes a carrier, runs through the
+general pullback wrapper over the same residuals.
 
 Mutable resources retain one residency per session identity, allowing
 authority to migrate without discarding live native owners. Samplers remain
@@ -151,43 +142,28 @@ manifest bytes
   -> VernonProgramBundle
   -> resolve typed specialization variant
   -> VernonProgramExecutable
-  -> VernonProgramInstance
-  -> VernonProgramInvocation
-  -> bind Values and controls
-  -> optional completion mode
-  -> execute
-  -> commit or rollback
-  -> optional VernonPullback
-  -> optional VernonSubmission (wait, state, completion outcome)
+  -> link: VernonLinkedSchedule or VernonScheduleVjp
+  -> write the argument record, starting from the record template
+  -> vernonScheduleCall (or VjpForward, VjpBackward) -> timeline point
+  -> vernonScheduleWait(point)
 ```
 
 `VernonProgramBundle` is immutable deployment data.
-`VernonProgramExecutable` owns one immutable `ResolvedExecutionPlan`.
-`VernonProgramInstance` owns one persistent binding state for both arguments
-and graphics controls. `VernonProgramInvocation` owns one transaction over
-that state, its immutable execution snapshot, concrete invocation descriptors,
-invocation-local autodiff options, and temporary physical state. Persistent
-state and frozen snapshots share immutable binding maps; dirty updates create a
-copy-on-write revision, while a clean invocation reuses its snapshot without a
-map clone. Execute never mutates a published binding or control payload and
-performs the resolved plan without publishing staged persistent bindings. A
-successful execute must be followed by commit; every failed or abandoned
-invocation must roll back. Commit is the only operation that publishes staged
-binding revisions and transfers a retained pullback. In both completion modes
-a submitting Execute hands out its `VernonSubmission` once, before the
-invocation is destroyed; the submission may outlive the invocation, and an
-invocation destroyed with its submission untaken waits for it.
+`VernonProgramExecutable` owns one immutable `ResolvedExecutionPlan`. Linking
+plans the executable once into a schedule (`architecture_v2.md` section 4):
+its slots, fields and the extents each slot must have describe the argument
+record, whose bytes hold every argument, control and grid of one call. A call
+writes nothing but that record. The caller checks its arguments against the
+slots; the call checks only extents and the grid, and returns a point on the
+device timeline once the work is submitted. Calls of one schedule run one at
+a time. Waiting for a point waits for every earlier submission of the device.
 
 Runtime has no pipeline-bundle compatibility loader, profile executor, direct
-Stage asset submit path, unbound Program execution path, temporary instance,
-node-local direct-binding path, or executable-owned mutable invocation state.
-A ProgramGraph invocation binds only the canonical exported parameters and
-resolved graphics-control slots of its executable; Runtime maps those
-parameters to physical alias slots through indexes precomputed at resolution.
-Control binding validates both slot and control kind. Resource-backed argument
-and graphics-control revisions retain caller-provided owner leases for as long
-as the persistent revision or a frozen invocation references them. An optimized
-single-node schedule remains a Program execution optimization.
+Stage asset submit path, unbound Program execution path, or per-call binding
+state. A schedule linked from a ProgramGraph takes only the exported
+parameters of its executable; linking maps them to the nodes' slots, which
+`vernonScheduleNodeSlot` and `vernonScheduleSlotBoundary` report. A
+single-kernel schedule is linked from a Stage directly.
 
 ## 3. Resolve boundary
 
@@ -197,11 +173,11 @@ Resolution has two explicit results:
    versions, controls, Stage contracts, boundaries, and derived dependencies.
 2. `ResolvedExecutionPlan` selects exact physical Stage implementations,
    endpoint projections, carriers, residency, transfers, hazards, backend
-   barriers, graphics scopes, publication transactions, and residual plans.
+   barriers, graphics scopes, and residual plans.
 
-Every execution path consumes the physical plan. Invocation code and backends
-do not rediscover policy from names, carrier shapes, resource aliases, or
-sentinel values.
+Linking consumes the physical plan. The linker and the HAL devices do not
+rediscover policy from names, carrier shapes, resource aliases, or sentinel
+values.
 
 The resolver validates, before loading target code:
 
@@ -225,10 +201,12 @@ Public boundary reflection assigns stable slots. Binding uses
 `VernonProgramArgument`; names are diagnostics and lookup conveniences, not
 transport identity.
 
-Program Values and Storages are canonical logical state. A
-`MaterializedNodeFrame` creates transient Stage-local arguments according to
-the resolved endpoint projections. It packs and unpacks physical aggregate
-carriers without changing canonical Value layout.
+Program Values and Storages are canonical logical state. Linking applies the
+resolved endpoint projections once: each node slot reads its argument's
+record bytes or an internal allocation of the schedule, packing and unpacking
+physical aggregate carriers without changing canonical Value layout. Recorded
+graphics draws still materialize their Stage-local arguments through a
+`MaterializedNodeFrame` until draws are data (`architecture_v2.md` section 11).
 
 TensorView bindings carry:
 
@@ -238,22 +216,21 @@ TensorView bindings carry:
 - signed byte strides;
 - byte offset and extent.
 
-Dynamic shape, stride, offset, byte length, and compute grid are invocation
-data. They are not artifact specialization inputs. Zero values are never used
+Dynamic shape, stride, offset, byte length, and compute grid are call data,
+written into the argument record. They are not artifact specialization inputs. Zero values are never used
 as “infer this later” sentinels.
 
 ## 5. Transfers and residency
 
-`ResolvedTransferExecutor` executes only transfers present in the resolved
-plan:
+A linked schedule executes only transfers present in the resolved plan:
 
 - host upload;
 - device-to-device buffer or image copy;
 - host readback;
 - provider-native transition.
 
-Transfer ordering participates in the same command dependency graph as Stage
-execution. Compatible intermediate Values remain device-resident. Runtime does
+Transfers are passes of the schedule, ordered with its Stage executions by
+the same hazards. Compatible intermediate Values remain device-resident. Runtime does
 not synchronously read a device result to host merely to feed a later device
 Node.
 
@@ -264,7 +241,7 @@ when their carrier is a uniform or storage buffer, because the provider
 places those bytes in a push constant, a native uniform, or a buffer it
 fills, such as its encoder's transient memory. Such a Value therefore needs host
 residency there, and a host argument gets no device copy. Only resource
-parameters require device residency. Materialization uses the same
+parameters require device residency. Linking uses the same
 predicate, so the plan never uploads a Value that the Stage then reads from
 the host.
 
@@ -273,186 +250,60 @@ shape product, and transfer range.
 
 ## 6. Publication
 
-`PublicationTransaction` implements Program boundary publication:
+A linked schedule writes every output in place and rolls nothing back
+(`architecture_v2.md` sections 9 and 10): a failed check writes nothing, and
+a failed submission poisons what it writes. The manifest's per-boundary
+`publication` (`commit_after_success` or `in_place`) is still emitted but
+not read; removing it changes the manifest version.
 
-- `commit_after_success` stages output and commits only after successful
-  completion;
-- `in_place` binds caller-visible storage directly.
-
-The compiler publishes an output in place when its borrowed Storage is written
+The compiler marks an output in place when its borrowed Storage is written
 only by render-pass attachments. Staging those attachments would cost every
-pass a per-invocation image, a full copy and a host wait before the copy,
-which keeps frames from pipelining
-([`pipelined_submission.md`](pipelined_submission.md) section 2). The price
-is that a failed pass leaves its attachments indeterminate, not unchanged.
-Outputs written by compute keep commit-after-success value semantics.
+pass a per-call image, a full copy and a host wait before the copy, which
+keeps frames from pipelining. The price is that a failed pass leaves its
+attachments indeterminate, not unchanged.
 
-An asynchronous invocation publishes only in place: its writes land in
-caller-visible storage in queue order, and its submission reports whether
-they completed. A commit-after-success boundary still needs a host-observed
-completion before its copy, so its plan requires `WAIT` until guarded
-deferred copies exist (`pipelined_submission.md` sections 3.2 and 4).
+## 7. Linked VJPs
 
-Rollback discards staged buffer/image publications. Device-resident
-publication uses provider copy commands. Host upload/download is used only
-when the resolved boundary residency requires host transport.
+`vernonScheduleLinkVjp` links a resolved Program's forward and backward
+graphs as two schedules (`architecture_v2.md` section 13). A forward call
+returns `VernonScheduleResiduals`, which own the Values the backward reads
+other than the forward arguments, and nothing else: no executable state,
+scratch or command buffer. The forward arguments the backward reads stay
+unchanged until it runs. A backward call takes the residuals plus a record of
+cotangents and gradient destinations, and overwrites the gradients. A
+composed ProgramGraph's backward runs its nodes' backward graphs in reverse,
+each node's input gradient feeding the cotangent of the output it reads.
+Residual and checkpoint
+selection is planned once over the resolved forward graph when the VJP is
+linked. Derivative leaf/group reflection is metadata, not another execution
+ABI.
 
-Invocation failure poisons only state whose contract cannot be restored.
-Reusable Program instances and pullbacks preserve their documented state after
-recoverable transactional failures.
+A linked VJP's GPU autodiff tape is sized optimistically and checked at the
+pullback (`architecture_v2.md` section 16.3): the forward never waits for the
+tape's status, the first backward call reads it, and an overflow reruns the
+forward with the reported stride into scratch outputs and a block of its own,
+until every lane fits, since a lane reports only what it needed when it stopped.
+Chosen over a wait in the forward because the backward waits for the forward
+anyway, so a step that fits its tape costs no stall; the VJP keeps the largest
+stride it has seen, so a step overflows at most once per growth.
 
-## 7. Pullbacks
+A linked VJP with a memory budget checkpoints at link time
+(`architecture_v2.md` section 16.2). Each forward call keeps the residuals of
+its last nodes that fit the budget. Its pullback reruns the prefix of forward
+nodes it did not keep, which always includes every node that records a tape.
+This was chosen over per-residual selection because one truncated forward
+schedule per prefix length is all the link adds, and the backward schedule
+stays the same.
 
-Forward-with-VJP returns a pullback that owns:
+## 8. Schedule execution
 
-- the immutable executable plan;
-- immutable retained Value and Storage snapshots;
-- retained provider resources and exact versions;
-- immutable tape;
-- replay and checkpoint descriptions.
-
-Mutable invocation scratch and command encoders are not retained inside the
-pullback. Each apply creates a fresh `ProgramInvocationState`, binds canonical
-cotangent and gradient slots, executes the backward plan, and transactionally
-publishes fresh gradients.
-
-Residual and checkpoint selection is Program-owned planning over the resolved
-forward graph. The shared internal DAG planner supplies a
-`ProgramResidualPlan`; it is not a differentiable CommandGraph execution API.
-
-Pullback application uses only `VernonProgramArgument` boundary bindings.
-Derivative leaf/group reflection is metadata, not another execution ABI.
-
-A ProgramGraph executable has no composite pullback or derivative ABI.
-Executing with pullback retention enabled prepares independent retained state
-for each differentiated child but exposes none of it before commit. Commit
-returns a null composite pullback. After commit and before destroying the
-invocation, the caller transfers each node's retained handle exactly once with
-`vernonRuntimeProgramInvocationGetNodePullback`. Applying that handle executes
-only the child Program's resolved backward plan in its original boundary-slot
-namespace. Runtime does not reverse ProgramGraph connections or accumulate
-cotangents between nodes. Executing with retention disabled performs
-primal-only graph execution and retains no node pullbacks.
-
-## 8. Private Command DAG
-
-The private Command DAG owns:
-
-- Value and resource hazards;
-- upload, device-copy, Stage execution, and readback ordering;
-- native barriers and resource transitions;
-- render-scope formation and fusion;
-- execution of resolved replay and checkpoint commands from the Program
-  residual plan;
-- submission, completion, and transient resource lifetime.
-
-It is not serialized as Program topology and is not a public Python authoring
-API. Runtime records and submits commands internally. Engine-owned execution
-graph embedding does not change Program binding semantics.
-
-Debug groups and timings ([`gpu_profiling.md`](gpu_profiling.md) sections 2
-and 3) are a property of DAG encoders, not commands: every encoder of a Node,
-including its transfers and barriers, shares the Node's scope (label, first
-Node, Node count), and submission opens one group, and with timings one timer
-just inside it, for each run of consecutive encoders sharing a scope. A scope
-is shared rather than copied because fusing a later Node extends its label
-(`a+b`) and Node count after the first member's encoders exist. The
-submission record keeps each device submission's scopes in timer order and
-reads their spans when it retires the completion, before destroying it. A
-graphics Node's transfers are
-planned apart and end the open render batch, which is appended before them;
-appending them straight into the plan would place them ahead of the earlier
-Node's draws that the open batch still holds. Label and timer order are tested
-through the native calls a fake OpenGL driver receives, not through an RHI trace,
-because a trace inside the RHI would cost every shipping draw a lock; the
-real backends are only checked to render the same pixels with labels.
-
-A plan is composed, never revalidated. Producers build fragments (nodes,
-encoders, bindings, initial accesses) freely, but only a validated plan is
-submitted, and it grows only by appending a fragment. An append checks the
-fragment against indices the plan keeps, then commits it or leaves the plan
-unchanged:
-
-- bindings and initial accesses are indexed by alias domain and kind;
-- node accesses are indexed by the same key, and each node has a bit set of
-  its ancestors.
-
-Accesses of different domains or kinds never overlap, so validation and the
-barrier pass compare only accesses within one domain. Composing and
-submitting therefore cost time linear in the plan's accesses, times the
-accesses of one domain. Revalidating the whole plan at every append, plus
-twice more at submission, took 1.4 ms of a 3.4 ms Execute (20 Nodes, 255
-draws). An appended fragment's roots follow the plan's last node, because
-Nodes are recorded in order. Compiled graphs and Program plans submit through
-the same validated plan and share one barrier pass.
-
-Every GPU step of one Execute, pullback apply, or Stage submission goes
-through one submission record: publication initialization and commit copies,
-graph flushes, tape-retry restores, and the immediate Stage encoder. The record
-owns each step's completion and the contexts that step retains until it
-completes. A blocking step is `submit` followed by `wait` on that same record,
-not a separate wait-and-execute path. Submit-time failure injection fires
-before the native submit and completion-time injection after a successful
-wait, so step states stay `NotSubmitted`, `Indeterminate`, or `Completed` with
-the same meaning on every path. Recording and submission stay in one call
-because devices without independent recording serialize both under one
-execution session; submit order must match record order. Destroying a public
-submission waits for its record before the context-child lease commits,
-because the context may destroy its device once that destruction commits.
-Device wait time is measured by the record, so control-plane telemetry
-reports it for every path that waits.
-
-An invocation in `VERNON_COMPLETION_ASYNCHRONOUS` mode leaves its steps
-`Submitted` and hands the record out through `TakeSubmission`; the record
-then also retains the invocation snapshot and the validated graphics
-recordings its commands read, so the host may edit those recordings at once. Until deferred effects exist (phase 2), asynchronous plans
-are those whose writes are all in place. Resolve records the first other
-effect as the plan's wait requirement: a commit-after-success publication,
-then an autodiff tape. Retaining a pullback also needs a wait, because the
-pullback is published from host-validated state. Execute rejects either with
-`PROGRAM_SUBMISSION_REQUIRES_WAIT` before it submits anything.
-
-The record also retains the invocation's execution workspace lease. A
-workspace returns to its instance's pool only when both the invocation and
-the record release it, because preparing a workspace for another invocation
-frees the storage that the pending commands read. Invocations of one instance
-running at the same time lease different workspaces.
-
-Each context admits submissions through one queue. The queue holds weak
-references to the records, oldest first, with the bytes each record charged.
-Before an asynchronous Execute or a Stage submission records anything,
-`admit` retires finished records. It then waits for the oldest record while
-the pending count is at `max_pending_submissions`, while the instance's
-estimate would push the pending bytes past `transient_budget_bytes`, or while
-it would push the RHI submissions the pending records hold past the device's
-`max_in_flight_submissions`. The estimate is the bytes and RHI submissions
-of the instance's previous Execute; a Stage submission is one RHI submission.
-The RHI rejects a submission over its limit instead of waiting, and frees a
-slot only when a completion is observed, so without this bound a slow GPU
-turns a within-bounds frame into a failed submission. Waiting for
-the oldest record first keeps retirement in submission order and never blocks
-on work submitted later. Settling a record releases what it retains, and that
-can call back into Runtime, so it runs outside the queue lock. The queue
-never keeps a record alive. Destroying a submission handle still waits for
-its record, so destroying a context or executable needs no drain. Telemetry
-reports the pending count and bytes, plus the wait counts and durations for
-each bound.
-
-Runtime-owned storage that one Execute creates is charged through a
-thread-local meter scoped to the executing context. The charges come from
-device buffers, invocation-owned images and publication staging images.
-Storage of another context, or created on another thread, is not charged.
-A phase-1 graphics frame charges only the device copies of host-memory
-Tensors its draws read: uniforms are bound at Bind time, and inline uniforms
-and descriptors live in RHI rings that retire by completion value. A frame
-whose inputs are all device resources charges 0 bytes, so only the
-pending-count bound limits it until plans own intermediate storage (phase 2).
-
-When an asynchronous submission fails, the record reports `Indeterminate`
-for every boundary it writes. That is all the poisoning phase 1 needs:
-asynchronous plans write only in-place, caller-owned storage, and no
-runtime-owned mutable instance storage exists. Asynchronous Python resource
-owners are phase 4.
+A linked schedule owns its hazards, barriers, render-scope formation and
+fusion, transfers, and the recorded command buffers of its passes; recording
+and the call path follow `architecture_v2.md` section 7. Its graph is not
+serialized as Program topology and is not a public Python authoring API.
+Debug groups and scope timings follow [`gpu_profiling.md`](gpu_profiling.md)
+sections 2 and 3: a timed scope is one render scope or one compute Node, and
+a fused scope's label joins its members' labels with `+`.
 
 ## 9. CPU execution
 
@@ -543,23 +394,19 @@ timeline support. Absence maps to `Unsupported`; failure after invoking a
 present callback is a typed `Result` error. Dispatch registration names each
 field explicitly and does not use positional null sentinels.
 
-Compute and graphics resolve and invoke are shared by every RuntimeCore
-provider backend (Vulkan, DirectX 12, Metal, OpenGL/ES, CUDA) in
-`rhi_provider_pipeline`. A backend supplies only a target: its diagnostic name
-and artifact kind, plus the attachment-format mapping for graphics and the
-value fill for compute. Whether the provider receives the artifact's binary or
-source follows from which one the Stage loader filled. Metal also supplies
-native binding resolvers that remap layouts to argument-buffer locations, and
-CUDA supplies its own value fill, since packed host values become host-storage
-buffers there. Each invocation binds one group per set under the owner rule
-of `binding_groups.md` section 6: a persistent group kept by its owner while
-its payload is unchanged, or a transient group of the encoder; resolve
-creates no groups. The shared pipeline objects own their provider
+Compute and graphics resolve are shared by every RuntimeCore provider backend
+(Vulkan, DirectX 12, Metal, OpenGL/ES, CUDA) in `rhi_provider_pipeline`. A
+backend supplies only a target: its diagnostic name and artifact kind.
+Whether the provider receives the artifact's binary or source follows from
+which one the Stage loader filled. Metal also supplies native binding
+resolvers that remap layouts to argument-buffer locations. Resolve prepares a
+Stage's binding plan and group layouts but creates no groups: the HAL device
+that runs a linked schedule makes them under the owner rule of
+`binding_groups.md` section 6. The shared pipeline objects own their provider
 handles and release them on destruction, so a resolve that fails halfway leaks
 nothing and backends need no teardown hook. Sharing keeps the backends from
 drifting: they report identical diagnostics, each including the provider's
-last error. CPU stays separate: it packs a call frame and dispatches through
-the CPU provider with push constants.
+last error.
 
 ### CUDA
 
@@ -709,6 +556,13 @@ coordinates then count rows from row 0, so `gl_FragCoord`, `glViewport` and
 `glClipControl(GL_UPPER_LEFT)` was rejected because it requires OpenGL 4.5,
 which macOS OpenGL 4.1 and OpenGL ES 3.1 lack.
 
+GL also clips depth to [-w, w] where the other targets clip to [0, w]. Every
+GL vertex stage therefore rewrites `gl_Position.z` to `2z - w` (SPIRV-Cross
+`fixup_clipspace`), so the window transform stores z / w as elsewhere. The
+same OpenGL 4.5 requirement rules out `glClipControl(GL_ZERO_TO_ONE)`; the
+remap gives up the precision of reversed depth on GL, which the [-1, 1]
+range lost anyway.
+
 Writes and clears to an `srgb` color attachment store encoded values on
 every backend. OpenGL ES always encodes, but desktop GL encodes only while
 `GL_FRAMEBUFFER_SRGB` is enabled, so the desktop adapter enables it from
@@ -748,7 +602,7 @@ Restoring host state after each draw was rejected because it would need a
 query of every state Runtime touches.
 
 The context owner outlives RHI and Runtime children. All GL allocation,
-transfer, deletion, and invocation operations first make the associated
+transfer, deletion, and dispatch operations first make the associated
 context current. A context is current on one thread at a time, so a GL device
 is bound to the thread that owns its context; other backends advertise
 concurrent submission instead. A submission inserts a fence sync, which
@@ -759,7 +613,7 @@ The spilled uniform bytes of a transient group go to its encoder's
 transient memory (`binding_groups.md` section 8) rather than a buffer per
 group, and those of a persistent group to a block of the device's persistent
 block pool, written once with the group. Every draw uses one vertex array per adapter, made
-when the first graphics pipeline is prepared, so invocations create no GL
+when the first graphics pipeline is prepared, so calls create no GL
 objects of their own.
 
 GL reports invalid transfers only through `glGetError`, leaving the
@@ -775,7 +629,7 @@ the texel's center through a nearest-mipmap-nearest sampler, which selects
 exactly that texel and level; stencil is read through
 `GL_DEPTH_STENCIL_TEXTURE_MODE`. Downloads map that buffer; the same copy is
 the OpenGL ES depth and stencil path of the image-to-buffer copy command that
-asynchronous readbacks need (`pipelined_submission.md` section 3.3). Dawn
+asynchronous readbacks need. Dawn
 does the same on OpenGL ES, where its `UseBlitForDepth32FloatTextureToBufferCopy`
 and `UseBlitForStencilTextureToBufferCopy` toggles replace those copies with
 compute blits. Declaring the downloads unsupported was
@@ -936,7 +790,7 @@ Render scopes:
   blits.
 - Program load checks every image storage and graphics attachment against
   those capabilities, so an unsupported target fails at load with
-  `PROGRAM_OPERATION_UNSUPPORTED` rather than at its first invocation. An
+  `PROGRAM_OPERATION_UNSUPPORTED` rather than at its first call. An
   attachment lists alternative formats, so one usable format suffices;
   blending an integer-only attachment reports `integer color targets cannot
   blend`.
@@ -964,15 +818,12 @@ resources, and completion objects remain alive until the provider reports
 completion.
 
 Destroying a public owner does not release a resource still retained by an
-in-flight invocation, submission, or pullback. A pending asynchronous
-submission therefore lets its caller release or rebind everything it bound
-as soon as Execute returns. Caller-owned RHI resources are not tracked as
+in-flight call or by residuals. Caller-owned RHI resources are not tracked as
 pending owners; caller writes to them are ordered by memory class instead.
 A host upload into `VERNON_RHI_MEMORY_DEVICE` is queue-ordered after every
 earlier submission on the device, without a CPU wait. A write into
 `VERNON_RHI_MEMORY_UPLOAD` or Metal shared memory is immediate, so the
-caller keeps one region per submission in flight
-(`pipelined_submission.md` section 5). Runtime generation changes invalidate
+caller keeps one region per call in flight. Runtime generation changes invalidate
 cached native handles.
 
 Each RHI device registry publishes an immutable lookup snapshot. Device-local
@@ -997,10 +848,8 @@ native submit rolls the encoder destruction attempt back.
 
 Each `RuntimeContext` has the same owner state machine and a separate local
 operation control. Bundles, ProgramGraphs, resolved Stages, Program
-executables, submissions, and retained pullbacks hold committed context-child
-leases. Executables own instance admission; instance state owns invocation
-admission and remains alive until its final invocation is destroyed. Context
-close therefore rejects live direct or transitive work without relying on raw
+executables, linked schedules and VJPs hold committed context-child leases.
+Context close therefore rejects live direct or transitive work without relying on raw
 pointer counts. Device-backed contexts and their RHI adapters each retain an
 explicit RHI device-child lease, so an attempted device destroy cannot
 invalidate adapter state. `vernonRhiDestroyDevice` then returns

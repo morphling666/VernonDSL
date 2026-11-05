@@ -109,6 +109,39 @@ uint64_t scalarByteSize(const std::string &dtype) {
     return size.isOk() ? size.value() : 0;
 }
 
+// Whether the binding's physical value is the canonical value's bytes: one scalar, or a transport of the canonical
+// size whose copy plan from the canonical value moves no byte.
+bool canonicalBytes(const vernon::runtime::ValueLayout &layout, const TargetBinding &binding) {
+    if (layout.leaves.size() == 1 && layout.leaves.front().scalarCount == 1)
+        return true;
+    if (!binding.transport || !binding.transport->targetAbi.root ||
+        binding.transport->targetAbi.root->size != layout.byteSize || binding.physical.size != layout.byteSize)
+        return false;
+    auto plan =
+        compileWholeValueCopyPlan(vernon::runtime::pipelineValueLayout(layout), *binding.transport->targetAbi.root);
+    return plan.isOk() && plan.value().byteSize == layout.byteSize &&
+           std::all_of(
+               plan.value().operations.begin(), plan.value().operations.end(),
+               [](const CopyOperation &operation) { return operation.sourceOffset == operation.destinationOffset; });
+}
+
+// A result's physical bytes as its canonical value's; empty when its target ABI has no whole-value copy plan.
+std::vector<ValueByteCopy> resultCopies(const vernon::runtime::ValueLayout &layout, const TargetBinding &binding) {
+    if (layout.leaves.size() == 1 && layout.leaves.front().scalarCount == 1)
+        return {{0, 0, binding.physical.size}};
+    if (!binding.transport || !binding.transport->targetAbi.root ||
+        binding.transport->targetAbi.root->size != binding.physical.size)
+        return {};
+    auto plan =
+        compileWholeValueCopyPlan(vernon::runtime::pipelineValueLayout(layout), *binding.transport->targetAbi.root);
+    if (plan.isErr() || plan.value().byteSize != layout.byteSize)
+        return {};
+    std::vector<ValueByteCopy> copies;
+    for (const CopyOperation &operation : plan.value().operations)
+        copies.push_back({operation.destinationOffset, operation.sourceOffset, operation.size});
+    return copies;
+}
+
 std::optional<program::ValueLayout> elementValueLayout(const Value &value, const ReflectedEndpoint &endpoint,
                                                        const EndpointAbiBinding &carrier) {
     if (!value.layout || value.layout->leaves.empty())
@@ -960,8 +993,10 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         MetadataCarrier carrier = found->second;
         for (MetadataFieldIdentity &field : carrier.fields) {
             std::optional<uint32_t> runtimeIndex;
+            // Results number from zero as arguments do, and carry no TensorView metadata.
             for (size_t index = 0; index < plan.bindings.size(); ++index)
                 if (plan.bindings[index].endpoint.module == "compute" &&
+                    plan.bindings[index].endpoint.interfaceKind != "result" &&
                     plan.bindings[index].endpoint.index == field.argument) {
                     if (runtimeIndex)
                         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/metadata_carrier/fields",
@@ -1001,11 +1036,19 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
             argument.kind = "scalar";
         argument.builtin = binding.builtin;
         argument.autodiffRole = binding.role;
+        if (binding.viewTransform && !binding.viewTransform->axes.empty() &&
+            binding.viewTransform->axes.front().source == ViewAxisSource::InvocationLinearCarrier)
+            argument.autodiffCarrier = "invocation_linear";
+        const vernon::runtime::ValueLayout &valueLayout =
+            binding.wholeValueLayout ? *binding.wholeValueLayout : binding.elementLayout;
+        argument.canonicalBytes = canonicalBytes(valueLayout, binding);
         if (!binding.elementLayout.leaves.empty())
             argument.dtype = pipelineDataType(binding.elementLayout.leaves.front().dtype);
         else if (binding.wholeValueLayout && !binding.wholeValueLayout->leaves.empty())
             argument.dtype = pipelineDataType(binding.wholeValueLayout->leaves.front().dtype);
         argument.result = binding.endpoint.interfaceKind == "result";
+        if (argument.result && plan.backend == VERNON_RUNTIME_CPU)
+            argument.resultCopies = resultCopies(valueLayout, binding);
         argument.physical = binding.physical;
         if (!argument.physical.alignment)
             argument.physical.alignment = 1;

@@ -35,61 +35,6 @@ bool checkAttachmentFormat(const program::GraphicsAttachmentSignature &signature
 
 } // namespace
 
-bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const program::Program &program,
-                                         const program::Graph &graph, const program::ResolvedExecutionPlan &resolved,
-                                         program_execution::ProgramInvocationState &invocation,
-                                         const ResolveProgramRenderPass &resolveRenderPass, std::string &error) {
-    const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
-    if (!direction)
-        return error = "resolved graphics graph has an invalid direction", false;
-    for (const program::Node &node : graph.nodes) {
-        if (program::executionKind(node) != program::ExecutionKind::Graphics)
-            continue;
-        const program::ResolvedNodePlan *nodePlan = resolved.node(*direction, node.id);
-        const auto *controls = nodePlan ? std::get_if<program::ResolvedGraphicsControls>(&nodePlan->controls) : nullptr;
-        if (!controls)
-            return error = "graphics Node has no resolved operation controls", false;
-        const program::GraphicsOperation &graphics = program::graphicsOperation(node);
-        const VernonRenderPass *renderPass = resolveRenderPass(controls->renderPassControl);
-        if (!renderPass)
-            return error = "managed graphics node has no bound RenderPass control", false;
-        if (renderPass->color_attachment_count != graphics.colorAttachments.size())
-            return error = "managed graphics fragment outputs must exactly match the color attachments", false;
-        const auto bind = [&](const program::ResolvedGraphicsAttachment &attachment) {
-            VernonRuntimeProviderResourceReference view{};
-            auto staging = invocation.externalStorage(attachment.storage);
-            if (staging && staging.value().get().kind == VERNON_PROGRAM_IMAGE) {
-                view = staging.value().get().image.view;
-            } else if (attachment.aspects & VERNON_IMAGE_ASPECT_COLOR) {
-                const auto signature = std::find_if(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
-                                                    [&](const program::GraphicsAttachmentSignature &candidate) {
-                                                        return candidate.location == attachment.location;
-                                                    });
-                if (signature == graphics.colorAttachments.end())
-                    return error = "resolved color control resource has no attachment signature", false;
-                const size_t index = static_cast<size_t>(signature - graphics.colorAttachments.begin());
-                view = renderPass->color_attachments[index].view;
-            } else {
-                if (!renderPass->depth_attachment)
-                    return error = "managed graphics node requires a depth-stencil attachment", false;
-                view = renderPass->depth_attachment->view;
-            }
-            auto bound = invocation.bindControlImageStorage(context, program, attachment.storage, view);
-            if (bound.isErr()) {
-                error = program_execution::programInvocationErrorMessage(bound.error());
-                return false;
-            }
-            return true;
-        };
-        for (const program::ResolvedGraphicsAttachment &attachment : controls->colorAttachments)
-            if (!bind(attachment))
-                return false;
-        if (controls->depthStencilAttachment && !bind(*controls->depthStencilAttachment))
-            return false;
-    }
-    return true;
-}
-
 bool checkProgramGraphicsAttachmentSignature(const program::GraphicsOperation &graphics,
                                              const PlannedRenderTargets &plan, std::string &error) {
     if (plan.attachmentFormats.size() != graphics.colorAttachments.size())

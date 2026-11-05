@@ -1,4 +1,5 @@
 #include "VernonFormats.hpp"
+#include "device_registry.h"
 #include "image_descriptor_validation.h"
 #include "public_c_boundary.h"
 #include "rhi_internal.h"
@@ -35,9 +36,21 @@ auto backends() {
 }
 
 const vernon::rhi::BackendDispatch *dispatch(VernonRhiDevice device) {
+    // The backend of the device this thread last dispatched to; asking each backend takes a registry lookup.
+    thread_local struct {
+        VernonRhiDevice device{};
+        uint64_t epoch{};
+        const vernon::rhi::BackendDispatch *backend{};
+    } last;
+    const uint64_t epoch = vernon::rhi::deviceRegistryEpoch().load(std::memory_order_seq_cst);
+    if (last.backend && last.epoch == epoch && last.device.index == device.index &&
+        last.device.generation == device.generation)
+        return last.backend;
     for (const auto *candidate : backends())
-        if (candidate->ownsDevice(device))
+        if (candidate->ownsDevice(device)) {
+            last = {device, epoch, candidate};
             return candidate;
+        }
     return nullptr;
 }
 

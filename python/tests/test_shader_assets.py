@@ -1349,9 +1349,24 @@ asset = vd.program_asset(id="module/square", program=Square())
                     }
                     deployed = build_program_manifest(plan, descriptors)
                     artifact_system = deployed["variants"][0]["artifact_system"]
-                    host = None
-                    if backend_row.rhi_backend is None:
-                        runtime = native.Runtime(native.RuntimeBackend.CPU)
+                    backend = getattr(native.RuntimeBackend, backend_row.runtime_backend)
+                    owned_context = target_name in {"opengl", "opengles"}
+                    if lifecycle_hooks:
+                        gc.collect()
+                        native._reset_lifecycle_test_counts()
+                    if owned_context:
+                        version = (4, 3) if target_name == "opengl" else (3, 1)
+                        try:
+                            host = native.HalDevice.create_owned_opengl(backend, *version)
+                        except RuntimeError as error:
+                            self.skipTest(str(error))
+                    else:
+                        host = native.HalDevice(backend)
+                    host_refcount = sys.getrefcount(host)
+                    runtime = host.create_runtime()
+                    self.assertEqual(sys.getrefcount(host), host_refcount)
+                    compiled_stages = []
+                    if target_name == "cpu":
                         compiled_stages = [
                             (stage.metadata["symbol"], stage.entry, result) for stage, result in retained
                         ]
@@ -1360,24 +1375,6 @@ asset = vd.program_asset(id="module/square", program=Square())
                         # runtime must not read the original object files.
                         for descriptor in descriptors.values():
                             (runtime_root / descriptor["path"]).unlink()
-                    else:
-                        backend = getattr(native.RhiBackend, backend_row.rhi_backend)
-                        owned_context = target_name in {"opengl", "opengles"}
-                        if lifecycle_hooks:
-                            gc.collect()
-                            native._reset_lifecycle_test_counts()
-                        if owned_context:
-                            version = (4, 3) if target_name == "opengl" else (3, 1)
-                            try:
-                                host = native.RhiHost.create_owned_opengl(backend, *version)
-                            except RuntimeError as error:
-                                self.skipTest(str(error))
-                        else:
-                            host = native.RhiHost(backend)
-                        host_refcount = sys.getrefcount(host)
-                        runtime = host.create_runtime()
-                        self.assertEqual(sys.getrefcount(host), host_refcount)
-                        compiled_stages = []
                     runtime_refcount = sys.getrefcount(runtime)
                     loaded = runtime.load_in_memory_program(
                         canonical_json(deployed).encode(),
@@ -1391,7 +1388,6 @@ asset = vd.program_asset(id="module/square", program=Square())
                     output_buffer = None
 
                     if target_name != "cpu":
-                        assert host is not None
                         source_buffer = host.create_buffer(source_array.nbytes)
                         output_buffer = host.create_buffer(output_array.nbytes)
                         source_buffer.upload(source_array.tobytes())
@@ -1405,39 +1401,21 @@ asset = vd.program_asset(id="module/square", program=Square())
                         source_buffer: object | None = source_buffer,
                         output_buffer: object | None = output_buffer,
                     ) -> np.ndarray:
-                        invocation = loaded.program_instance().begin_invocation()
-                        builder = invocation.builder
+                        schedule = native._ProgramSchedule(loaded)
+                        builder = schedule.builder()
                         if target_name == "cpu":
                             for parameter, array in zip(loaded.parameters, (source_array, output_array), strict=True):
-                                prepared = builder.prepare_host_tensor(parameter.slot, array)
-                                invocation.bind(
-                                    parameter.slot,
-                                    ("test", parameter.slot),
-                                    lambda prepared=prepared: prepared,
-                                )
+                                builder.argument(builder.prepare_host_tensor(parameter.slot, array))
                         else:
                             assert source_buffer is not None
                             assert output_buffer is not None
                             for parameter, buffer in zip(
-                                loaded.parameters,
-                                (source_buffer, output_buffer),
-                                strict=True,
+                                loaded.parameters, (source_buffer, output_buffer), strict=True
                             ):
-                                prepared = builder.prepare_rhi_tensor(
-                                    parameter.slot,
-                                    buffer,
-                                    parameter.access,
-                                    [1],
-                                    [4],
+                                builder.argument(
+                                    builder.prepare_device_tensor(parameter.slot, buffer, parameter.access, [1], [4])
                                 )
-                                invocation.bind(
-                                    parameter.slot,
-                                    ("test", parameter.slot),
-                                    lambda prepared=prepared: prepared,
-                                )
-                        outcome = invocation.execute()
-                        self.assertTrue(outcome.ok, outcome.error)
-                        invocation.commit()
+                        schedule.timeline.wait(schedule.call(builder, []))
                         if output_buffer is not None:
                             return np.frombuffer(output_buffer.download(), dtype=np.float32)
                         return output_array
@@ -1492,15 +1470,15 @@ asset = vd.program_asset(id="module/square", program=Square())
                     del runtime
                     host = None
                     gc.collect()
-                    if backend_row.rhi_backend is not None and lifecycle_hooks:
+                    if lifecycle_hooks:
                         self.assertEqual(
                             native._lifecycle_test_counts(),
                             {
                                 "runtimes": 0,
-                                "rhi_devices": 0,
+                                "devices": 0,
                                 "owned_contexts": 0,
                                 "runtime_order": 0,
-                                "rhi_device_order": 0,
+                                "device_order": 0,
                                 "owned_context_order": 0,
                             },
                         )
@@ -1511,15 +1489,15 @@ asset = vd.program_asset(id="module/square", program=Square())
                     np.testing.assert_array_equal(execute_loaded(), np.array([9.0], dtype=np.float32))
                     del execute_loaded, loaded, source_buffer, output_buffer
                     gc.collect()
-                    if backend_row.rhi_backend is not None and lifecycle_hooks:
+                    if lifecycle_hooks:
                         self.assertEqual(
                             native._lifecycle_test_counts(),
                             {
                                 "runtimes": 1,
-                                "rhi_devices": 1,
+                                "devices": 1,
                                 "owned_contexts": int(owned_context),
                                 "runtime_order": 1,
-                                "rhi_device_order": 2,
+                                "device_order": 2,
                                 "owned_context_order": 3 if owned_context else 0,
                             },
                         )
@@ -1730,7 +1708,7 @@ asset = vd.program_asset(
                         require_available(probe)
                     continue
                 capabilities = native.target_capabilities(getattr(native.Target, backend.compiler_target))
-                if backend.rhi_backend is not None and capabilities["graphics"]:
+                if backend.architecture != vd.cpu and capabilities["graphics"]:
                     name, asset_id, stages = "triangle_asset", "pipelines/triangle", {"vertex", "fragment"}
                 else:
                     name, asset_id, stages = "scale_asset", "pipelines/scale", {"compute"}
@@ -1746,7 +1724,7 @@ asset = vd.program_asset(
                 reflected_options = document["target"]["options"]
                 self.assertEqual(dict(make_target_options(target, reflected_options).options), reflected_options)
                 self.assertEqual({module["role"] for module in _deployed_modules(document)}, stages)
-                if backend.rhi_backend is None or not capabilities["graphics"]:
+                if backend.architecture == vd.cpu or not capabilities["graphics"]:
                     self.assertEqual(document["type"], "program")
                     program = document["variants"][0]["program"]
                     for index, slot in enumerate(program["abi"]["boundary_slots"]):
@@ -1758,7 +1736,7 @@ asset = vd.program_asset(
                         if boundary["role"] == "input"
                     }
                     self.assertEqual(boundaries["values"]["outer_shape"], [-1])
-                if backend.rhi_backend is not None and capabilities["graphics"]:
+                if backend.architecture != vd.cpu and capabilities["graphics"]:
                     self.assertEqual(document["type"], "program")
                     self.assertNotIn("stage_artifacts", document)
                     self.assertEqual(len(document["variants"]), 2)

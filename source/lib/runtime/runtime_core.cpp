@@ -191,7 +191,7 @@ struct PacketRendering {
     size_t firstSampledImage{};
 };
 
-enum class PayloadSiteKind : uint8_t { Draw, DrawIndexed, Dispatch, Clear };
+enum class PayloadSiteKind : uint8_t { Draw, DrawIndexed, Dispatch, Clear, HostStream, DeviceStream };
 
 // Payload words a command wrote, with the limits EncodePackets checks them against.
 struct PayloadSite {
@@ -201,6 +201,10 @@ struct PayloadSite {
     uint32_t limit{};
     // Clear: bit c is set when color attachment c has an integer format, whose clear values are raw bits.
     uint32_t integerColors{};
+    // DeviceStream: the capacities of the records buffer in records and of the counts buffer in counts, UINT32_MAX for
+    // a stream without counts.
+    uint32_t records{};
+    uint32_t counts{};
 };
 
 constexpr uint32_t packetHeader(VernonRuntimeProviderPacketOpcode opcode, size_t words) {
@@ -208,12 +212,14 @@ constexpr uint32_t packetHeader(VernonRuntimeProviderPacketOpcode opcode, size_t
 }
 
 constexpr size_t kDrawPayloadWords = sizeof(VernonRuntimeProviderDrawPayload) / sizeof(uint32_t);
+constexpr size_t kStreamPayloadWords = sizeof(VernonRuntimeProviderStreamPayload) / sizeof(uint32_t);
 constexpr size_t kMaxPacketWords = 0xffff;
 
 } // namespace
 
 struct VernonRuntimeCorePackets {
     VernonRuntimeDeviceProvider provider{};
+    uint32_t capabilities{};
     std::vector<uint32_t> words;
     std::vector<uint32_t> payload;
     std::vector<VernonRuntimeProviderObject> objects;
@@ -978,6 +984,10 @@ VernonStatus createPacketsImpl(const VernonRuntimeDeviceProvider *provider, Vern
     if (!packets)
         return VERNON_STATUS_INTERNAL_ERROR;
     packets->provider = *provider;
+    if (const VernonStatus status = providerValueBoundary(
+            packets->capabilities, [&] { return provider->get_capabilities(provider->user_data); });
+        status != VERNON_STATUS_OK)
+        return status;
     *output = packets.release();
     return VERNON_STATUS_OK;
 }
@@ -1261,6 +1271,108 @@ VernonStatus packetsDrawImpl(VernonRuntimeCorePackets *packets, const VernonRunt
     return VERNON_STATUS_OK;
 }
 
+template <typename Value> const Value *hostAddress(const uint32_t words[2]) {
+    return reinterpret_cast<const Value *>(static_cast<uintptr_t>(words[0] | (uint64_t{words[1]} << 32)));
+}
+
+template <typename Value> void splitHostAddress(const Value *pointer, uint32_t words[2]) {
+    const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pointer));
+    words[0] = static_cast<uint32_t>(address);
+    words[1] = static_cast<uint32_t>(address >> 32);
+}
+
+bool streamPayloadIsValid(const VernonRuntimeProviderStreamPayload &stream, bool host) {
+    const bool hostWords =
+        (stream.host_records[0] | stream.host_records[1] | stream.host_counts[0] | stream.host_counts[1]) != 0;
+    if (stream.stencil_reference > 0xff || hostWords != host)
+        return false;
+    return !host || (hostAddress<VernonRuntimeProviderDrawRecord>(stream.host_records) &&
+                     hostAddress<uint32_t>(stream.host_counts));
+}
+
+bool deviceStreamFits(const PayloadSite &site, const VernonRuntimeProviderStreamPayload &stream) {
+    return uint64_t{stream.first_record} + stream.max_records <= site.records && stream.count_index < site.counts;
+}
+
+// A host stream is read while its batch is encoded, so its records are checked then, which is O(drawn records).
+bool hostStreamIsValid(const VernonRuntimeProviderStreamPayload &stream, uint64_t indexCapacity) {
+    const uint32_t count = std::min(hostAddress<uint32_t>(stream.host_counts)[stream.count_index], stream.max_records);
+    const VernonRuntimeProviderDrawRecord *records =
+        hostAddress<VernonRuntimeProviderDrawRecord>(stream.host_records) + stream.first_record;
+    for (uint32_t record = 0; record < count; ++record)
+        if (uint64_t{records[record].first_index} + records[record].index_count > indexCapacity)
+            return false;
+    return true;
+}
+
+VernonStatus streamPayloadImpl(const VernonRuntimeCoreStreamDrawInvocation *invocation,
+                               VernonRuntimeProviderStreamPayload *payload) {
+    if (!invocation || !payload || invocation->struct_size < sizeof(VernonRuntimeCoreStreamDrawInvocation) ||
+        invocation->topology > 2 || !present(invocation->index_buffer.resource))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const bool host = !present(invocation->records.resource);
+    if ((host && present(invocation->counts.resource)) || host != (invocation->host_records != nullptr) ||
+        host != (invocation->host_counts != nullptr))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonRuntimeProviderStreamPayload stream{};
+    splitHostAddress(invocation->host_records, stream.host_records);
+    splitHostAddress(invocation->host_counts, stream.host_counts);
+    stream.first_record = invocation->first_record;
+    stream.max_records = invocation->max_records;
+    stream.count_index = invocation->count_index;
+    std::copy_n(invocation->viewport, 4, stream.viewport);
+    std::copy_n(invocation->scissor, 4, stream.scissor);
+    stream.stencil_reference = invocation->stencil_reference;
+    if (!streamPayloadIsValid(stream, host))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    *payload = stream;
+    return VERNON_STATUS_OK;
+}
+
+uint32_t clampedCapacity(uint64_t bytes, size_t element) {
+    return static_cast<uint32_t>(std::min<uint64_t>(bytes / element, UINT32_MAX));
+}
+
+VernonStatus packetsDrawStreamImpl(VernonRuntimeCorePackets *packets,
+                                   const VernonRuntimeCoreStreamDrawInvocation *invocation) {
+    if (!packets || !packets->rendering || !packets->pipeline ||
+        packets->pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !groupsAreComplete(*packets) ||
+        (packets->boundVertexBuffers & packets->pipeline->vertexBindings) != packets->pipeline->vertexBindings)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonRuntimeProviderStreamPayload stream{};
+    if (const VernonStatus status = streamPayloadImpl(invocation, &stream); status != VERNON_STATUS_OK)
+        return status;
+    const bool host = invocation->host_records != nullptr;
+    const uint32_t required =
+        host ? VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS : VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS;
+    if ((packets->capabilities & required) == 0)
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+    PayloadSite site{host ? PayloadSiteKind::HostStream : PayloadSiteKind::DeviceStream, 0,
+                     clampedCapacity(invocation->index_buffer.size, sizeof(uint32_t)), 0};
+    uint32_t records = UINT32_MAX;
+    uint32_t counts = UINT32_MAX;
+    if (!host) {
+        site.records = clampedCapacity(invocation->records.size, sizeof(VernonRuntimeProviderDrawRecord));
+        site.counts = present(invocation->counts.resource) ? clampedCapacity(invocation->counts.size, sizeof(uint32_t))
+                                                           : UINT32_MAX;
+        if (!deviceStreamFits(site, stream))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    uint32_t words[kStreamPayloadWords];
+    std::memcpy(words, &stream, sizeof(words));
+    site.payload = appendPayload(*packets, words, kStreamPayloadWords);
+    const uint32_t index = packetResource(*packets, invocation->index_buffer);
+    if (!host) {
+        records = packetResource(*packets, invocation->records);
+        if (present(invocation->counts.resource))
+            counts = packetResource(*packets, invocation->counts);
+    }
+    packets->sites.push_back(site);
+    packets->words.insert(packets->words.end(), {packetHeader(VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED_STREAM, 6),
+                                                 invocation->topology, index, records, counts, site.payload});
+    return VERNON_STATUS_OK;
+}
+
 VernonStatus packetsDebugImpl(VernonRuntimeCorePackets *packets, VernonRuntimeProviderPacketOpcode opcode,
                               VernonStringView label) {
     if (!packets || (label.size != 0 && !label.data))
@@ -1372,6 +1484,15 @@ bool payloadSiteIsValid(const PayloadSite &site, const uint32_t *payload) {
                         return false;
         const float depth = floatOf(words[site.limit * 4]);
         return std::isfinite(depth) && depth >= 0.0f && depth <= 1.0f && words[site.limit * 4 + 1] <= 0xff;
+    }
+    case PayloadSiteKind::HostStream:
+    case PayloadSiteKind::DeviceStream: {
+        VernonRuntimeProviderStreamPayload stream;
+        std::memcpy(&stream, words, sizeof(stream));
+        const bool host = site.kind == PayloadSiteKind::HostStream;
+        if (!streamPayloadIsValid(stream, host))
+            return false;
+        return host ? hostStreamIsValid(stream, site.limit) : deviceStreamFits(site, stream);
     }
     }
     return false;
@@ -1528,6 +1649,16 @@ extern "C" VernonStatus vernonRuntimeCorePacketsDraw(VernonRuntimeCorePackets *p
 extern "C" VernonStatus vernonRuntimeCoreDrawPayload(const VernonRuntimeCoreDrawInvocation *invocation,
                                                      VernonRuntimeProviderDrawPayload *payload) {
     return runtimeCoreBoundary([&] { return drawPayloadImpl(invocation, payload); });
+}
+
+extern "C" VernonStatus vernonRuntimeCorePacketsDrawStream(VernonRuntimeCorePackets *packets,
+                                                           const VernonRuntimeCoreStreamDrawInvocation *invocation) {
+    return runtimeCoreBoundary([&] { return packetsDrawStreamImpl(packets, invocation); });
+}
+
+extern "C" VernonStatus vernonRuntimeCoreStreamPayload(const VernonRuntimeCoreStreamDrawInvocation *invocation,
+                                                       VernonRuntimeProviderStreamPayload *payload) {
+    return runtimeCoreBoundary([&] { return streamPayloadImpl(invocation, payload); });
 }
 
 extern "C" VernonStatus vernonRuntimeCorePacketsPushDebugGroup(VernonRuntimeCorePackets *packets,

@@ -120,20 +120,10 @@ else:
         pass
 
 
-_MARKER: list = []
-
-
 def _dsl_wait(*outputs) -> None:
-    """Waits for the launch that wrote `outputs`; on CUDA, through `peek` of
-    the first, which must be f64."""
-    if not ON_GPU:
-        for output in outputs:
-            output.synchronize()
-        return
-    if not _MARKER:
-        _MARKER.append(vd.storage.zeros(dtype=vd.f64, shape=(1,)))
-    dk.peek(outputs[0], _MARKER[0], grid=(1, 1, 1))
-    _MARKER[0].synchronize()
+    """Waits for the launch that wrote `outputs`, without copying them to the host."""
+    for output in outputs:
+        output.wait()
 
 
 @dataclass

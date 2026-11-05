@@ -42,6 +42,26 @@ private:
     uint16_t minor_{};
 };
 
+// A hidden, undecorated window without a client API, for the surfaces of devices that present to native windows.
+class GlfwWindowOwner {
+public:
+    GlfwWindowOwner(uint32_t width, uint32_t height);
+    ~GlfwWindowOwner();
+
+    GlfwWindowOwner(const GlfwWindowOwner &) = delete;
+    GlfwWindowOwner &operator=(const GlfwWindowOwner &) = delete;
+    GlfwWindowOwner(GlfwWindowOwner &&) = delete;
+    GlfwWindowOwner &operator=(GlfwWindowOwner &&) = delete;
+
+    // The HWND on Windows; null elsewhere.
+    void *win32Window() const noexcept;
+    // Resizes the window's client area and waits until the window system reports the new size.
+    void resize(uint32_t width, uint32_t height);
+
+private:
+    void *window_{};
+};
+
 } // namespace vernon::host
 
 #endif

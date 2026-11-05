@@ -63,6 +63,49 @@ struct BackendTestRequirements {
     uint32_t windowHeight{1};
 };
 
+inline void setOpenGLComputeApiRequirement(BackendTestRequirements &requirements, VernonRuntimeBackend runtime) {
+    if (runtime == VERNON_RUNTIME_OPENGL) {
+        requirements.minimumApiMajor = 4;
+        requirements.minimumApiMinor = 3;
+    } else if (runtime == VERNON_RUNTIME_OPENGL_ES) {
+        requirements.minimumApiMajor = 3;
+        requirements.minimumApiMinor = 1;
+    }
+}
+
+inline BackendTestRequirements computeFixtureRequirements(VernonRuntimeBackend runtime) {
+    BackendTestRequirements requirements{};
+    requirements.compute = true;
+    requirements.storageBuffers = true;
+    setOpenGLComputeApiRequirement(requirements, runtime);
+    return requirements;
+}
+
+inline BackendTestRequirements programVjpFixtureRequirements(VernonRuntimeBackend runtime) {
+    BackendTestRequirements requirements = computeFixtureRequirements(runtime);
+    requirements.programVjp = true;
+    return requirements;
+}
+
+inline BackendTestRequirements graphicsImageCopyFixtureRequirements(VernonRuntimeBackend runtime) {
+    BackendTestRequirements requirements{};
+    requirements.graphics = true;
+    if (runtime == VERNON_RUNTIME_OPENGL) {
+        requirements.minimumApiMajor = 4;
+        requirements.minimumApiMinor = 3;
+    } else if (runtime == VERNON_RUNTIME_OPENGL_ES) {
+        requirements.minimumApiMajor = 3;
+        requirements.minimumApiMinor = 2;
+    }
+    return requirements;
+}
+
+inline BackendTestRequirements computeGraphicsFixtureRequirements(VernonRuntimeBackend runtime) {
+    BackendTestRequirements requirements = computeFixtureRequirements(runtime);
+    requirements.graphics = true;
+    return requirements;
+}
+
 enum class BackendProbeKind {
     Available,
     PlatformNotBuilt,

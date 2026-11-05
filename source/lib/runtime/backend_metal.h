@@ -4,7 +4,6 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "metal_runtime_capabilities.h"
-#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
 
 #include <cstdint>
@@ -29,11 +28,6 @@ inline MetalContextState &metalState(VernonRuntimeContext &context) {
 inline const MetalContextState &metalState(const VernonRuntimeContext &context) {
     return runtimeBackendState<MetalContextState>(context);
 }
-
-struct MetalPipelineState {
-    RhiComputePipeline rhiCompute;
-    RhiGraphicsPipeline rhiGraphics;
-};
 
 } // namespace vernon::runtime
 

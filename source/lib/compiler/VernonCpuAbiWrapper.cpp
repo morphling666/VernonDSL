@@ -332,6 +332,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         llvm::Value *rawPointer = builder.CreateIntToPtr(rawPointerBits, pointerType, "buffer");
         for (size_t leafIndex = 0; leafIndex < packing.tensorLeafElementSizes.size(); ++leafIndex) {
             llvm::Type *allocatedType = function->getArg(loweredIndex++)->getType();
+            // Every dispatch path rejects a written view that overlaps another argument (the language contract's
+            // writable-overlap rule), so a view's accesses never meet another's writes. The leaves of one view share a
+            // base, so only a single-leaf view is marked.
+            if (packing.tensorLeafElementSizes.size() == 1)
+                function->addParamAttr(static_cast<unsigned>(loweredIndex), llvm::Attribute::NoAlias);
             llvm::Type *alignedType = function->getArg(loweredIndex++)->getType();
             llvm::Type *offsetType = function->getArg(loweredIndex++)->getType();
             llvm::Type *sizeType = function->getArg(loweredIndex++)->getType();
@@ -418,6 +423,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.CreateRet(builder.getInt32(0));
     } else {
         llvm::CallInst *call = builder.CreateCall(function, argumentsToCall);
+        // Both range loops call the lane wrapper, so the entry has two call sites and the inliner's single-caller
+        // bonus no longer applies. The fast loop hoists and vectorizes only with the body inlined.
+        call->addFnAttr(llvm::Attribute::AlwaysInline);
         if (!metadata.resultCallLanes.empty()) {
             llvm::SmallVector<llvm::Value *> lanes;
             if (metadata.resultCallLanes.size() == 1) {
@@ -545,6 +553,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Value *groupValidationPointer = builder.CreateStructGEP(rangeType, rangePointer, 8);
     llvm::SmallVector<llvm::Value *, 3> validationWorkgroup;
     llvm::SmallVector<llvm::Value *, 3> validationGrid;
+    llvm::SmallVector<llvm::Value *, 3> validationGroup;
     llvm::Value *validDimensions = llvm::ConstantInt::getTrue(context);
     for (uint64_t dimension = 0; dimension < 3; ++dimension) {
         llvm::Value *index[] = {builder.getInt64(0), builder.getInt64(dimension)};
@@ -559,6 +568,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             i64);
         validationWorkgroup.push_back(workgroupDimension);
         validationGrid.push_back(gridDimension);
+        validationGroup.push_back(groupDimension);
         validDimensions =
             builder.CreateAnd(validDimensions, builder.CreateICmpNE(workgroupDimension, builder.getInt64(0)));
         validDimensions = builder.CreateAnd(validDimensions, builder.CreateICmpNE(gridDimension, builder.getInt64(0)));
@@ -611,10 +621,12 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                                                                        llvm::cast<llvm::PointerType>(pointerType)))),
                 builder.CreateICmpUGE(rangeResultsSize, builder.getInt64(metadata.resultsSize))));
 
+    // Entry-block allocas are static, so SROA and mem2reg can promote the packed record after inlining.
+    llvm::IRBuilder<> allocaBuilder(dispatchEntry, dispatchEntry->getFirstInsertionPt());
     auto *packedType = llvm::ArrayType::get(i8, std::max<uint64_t>(metadata.argumentsSize, 1));
-    llvm::AllocaInst *packed = builder.CreateAlloca(packedType, nullptr, "range_arguments");
+    llvm::AllocaInst *packed = allocaBuilder.CreateAlloca(packedType, nullptr, "range_arguments");
     packed->setAlignment(llvm::Align(16));
-    llvm::AllocaInst *laneInvocation = builder.CreateAlloca(invocationType, nullptr, "lane_invocation");
+    llvm::AllocaInst *laneInvocation = allocaBuilder.CreateAlloca(invocationType, nullptr, "lane_invocation");
     laneInvocation->setAlignment(module.getDataLayout().getABITypeAlign(invocationType));
     builder.CreateStore(packed, builder.CreateStructGEP(invocationType, laneInvocation, 0));
     builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.argumentsSize),
@@ -622,11 +634,405 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.resultsSize),
                         builder.CreateStructGEP(invocationType, laneInvocation, 3));
     builder.CreateStore(rangeTextures, builder.CreateStructGEP(invocationType, laneInvocation, 4));
-    builder.CreateCondBr(validRange, rangeLoop, rangeInvalid);
+    llvm::BasicBlock *rangeDispatch = llvm::BasicBlock::Create(context, "range_dispatch", wrapper);
+    builder.CreateCondBr(validRange, rangeDispatch, rangeInvalid);
+
+    auto copyArguments = [&](llvm::Value *target, llvm::Value *source, llvm::Value *sourceSize) {
+        if (!metadata.argumentsSize)
+            return;
+        builder.CreateMemSet(target, builder.getInt8(0), metadata.argumentsSize, llvm::MaybeAlign(16));
+        if (hostProvidedArgumentsSize(metadata)) {
+            llvm::Value *copySize =
+                builder.CreateSelect(builder.CreateICmpULT(sourceSize, builder.getInt64(metadata.argumentsSize)),
+                                     sourceSize, builder.getInt64(metadata.argumentsSize));
+            builder.CreateMemCpy(target, llvm::Align(16), source, llvm::Align(1), copySize);
+        }
+    };
+    auto storeBuiltins = [&](llvm::Value *packed, llvm::ArrayRef<llvm::Value *> global,
+                             llvm::ArrayRef<llvm::Value *> local, llvm::ArrayRef<llvm::Value *> group) {
+        for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
+            llvm::ArrayRef<llvm::Value *> coordinates = packing.builtin == "global_invocation_id"  ? global
+                                                        : packing.builtin == "local_invocation_id" ? local
+                                                        : packing.builtin == "workgroup_id"
+                                                            ? group
+                                                            : llvm::ArrayRef<llvm::Value *>();
+            if (coordinates.empty())
+                continue;
+            llvm::Value *target = builder.CreateGEP(i8, packed, builder.getInt64(packing.offset));
+            if (packing.size == sizeof(uint64_t)) {
+                llvm::StoreInst *store = builder.CreateStore(coordinates.front(), target);
+                store->setAlignment(llvm::Align(1));
+                continue;
+            }
+            for (size_t dimension = 0; dimension < 3 && (dimension + 1) * sizeof(uint32_t) <= packing.size;
+                 ++dimension) {
+                llvm::Value *component = builder.CreateTrunc(coordinates[dimension], i32);
+                llvm::StoreInst *store =
+                    builder.CreateStore(component, builder.CreateGEP(i8, target, builder.getInt64(dimension * 4)));
+                store->setAlignment(llvm::Align(1));
+            }
+        }
+    };
+
+    builder.SetInsertPoint(rangeDispatch);
+    if (metadata.requiresPhases) {
+        builder.CreateBr(rangeLoop);
+    } else {
+        // Without barriers no lane observes the range's progress fields while the range runs, so the fast loop keeps
+        // them in registers and publishes them once on exit. The lane helpers read `active_lane` during the call, so
+        // kernels that use them still store it per lane. The inner loop runs along one workgroup row with a linear
+        // induction variable, which keeps it free of divisions and vectorizable.
+        //
+        // The loop runs in its own function whose buffer pointers are `noalias` parameters, written into the packed
+        // record before the loop so the kernel's pointers derive from them. Inlining the kernel declares its own
+        // `noalias` scopes inside the loop, which cover one iteration only; these cover the whole range, which the
+        // vectorizer needs.
+        const bool storesActiveLane = module.getFunction(VERNON_CPU_LANE_ADDRESS_SYMBOL) != nullptr ||
+                                      module.getFunction(VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL) != nullptr;
+        llvm::SmallVector<const CpuAbiArgumentPacking *> exclusiveBuffers;
+        for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments)
+            if (packing.kind == CpuAbiArgumentKind::TensorView && packing.tensorLeafElementSizes.size() == 1)
+                exclusiveBuffers.push_back(&packing);
+        enum FastParameter : unsigned {
+            FastRange,
+            FastArguments,
+            FastArgumentsSize,
+            FastResults,
+            FastTextures,
+            FastLaneBegin,
+            FastLaneEnd,
+            FastWorkgroup,
+            FastGroup = FastWorkgroup + 3,
+            FastGridX = FastGroup + 3,
+            FastGridY,
+            FastGroupCount,
+            FastBuffers,
+        };
+        llvm::SmallVector<llvm::Type *> fastParameters{pointerType, pointerType, i64, pointerType, pointerType};
+        fastParameters.append(FastBuffers - FastLaneBegin, i64);
+        fastParameters.append(exclusiveBuffers.size(), pointerType);
+        llvm::Function *fast = llvm::Function::Create(llvm::FunctionType::get(i32, fastParameters, false),
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      metadata.exportedWrapperSymbol + ".range", module);
+        for (size_t index = 0; index < exclusiveBuffers.size(); ++index)
+            fast->addParamAttr(static_cast<unsigned>(FastBuffers + index), llvm::Attribute::NoAlias);
+
+        llvm::BasicBlock *fastCall = llvm::BasicBlock::Create(context, "fast_call", wrapper);
+        builder.CreateCondBr(hasLaneTables, rangeLoop, fastCall);
+        builder.SetInsertPoint(fastCall);
+        llvm::SmallVector<llvm::Value *> fastArguments{
+            rangePointer, rangeArguments, rangeArgumentsSize, rangeResults, rangeTextures, laneBegin, laneEnd};
+        fastArguments.append(validationWorkgroup.begin(), validationWorkgroup.end());
+        fastArguments.append(validationGroup.begin(), validationGroup.end());
+        fastArguments.append({validationGrid[0], validationGrid[1], builder.getInt64(1)});
+        auto appendExclusiveBuffers = [&](llvm::SmallVectorImpl<llvm::Value *> &target, llvm::Value *record) {
+            for (const CpuAbiArgumentPacking *packing : exclusiveBuffers) {
+                llvm::LoadInst *bits = builder.CreateLoad(
+                    sizeType, builder.CreateGEP(i8, record, builder.getInt64(packing->offset)), "exclusive_bits");
+                bits->setAlignment(llvm::Align(1));
+                target.push_back(builder.CreateIntToPtr(bits, pointerType, "exclusive_buffer"));
+            }
+        };
+        appendExclusiveBuffers(fastArguments, rangeArguments);
+        builder.CreateRet(builder.CreateCall(fast, fastArguments));
+
+        llvm::BasicBlock *fastSetup = llvm::BasicBlock::Create(context, "fast_setup", fast);
+        llvm::BasicBlock *fastRow = llvm::BasicBlock::Create(context, "fast_row", fast);
+        llvm::BasicBlock *fastLane = llvm::BasicBlock::Create(context, "fast_lane", fast);
+        llvm::BasicBlock *fastNext = llvm::BasicBlock::Create(context, "fast_next", fast);
+        llvm::BasicBlock *fastRowNext = llvm::BasicBlock::Create(context, "fast_row_next", fast);
+        llvm::BasicBlock *fastDone = llvm::BasicBlock::Create(context, "fast_done", fast);
+        llvm::BasicBlock *fastFailure = llvm::BasicBlock::Create(context, "fast_failure", fast);
+        builder.SetInsertPoint(fastSetup);
+        llvm::Value *fastRange = fast->getArg(FastRange);
+        llvm::Value *fastBegin = fast->getArg(FastLaneBegin);
+        llvm::Value *fastEnd = fast->getArg(FastLaneEnd);
+        llvm::Value *fastWorkgroup[] = {fast->getArg(FastWorkgroup), fast->getArg(FastWorkgroup + 1),
+                                        fast->getArg(FastWorkgroup + 2)};
+        llvm::Value *fastGroup[] = {fast->getArg(FastGroup), fast->getArg(FastGroup + 1), fast->getArg(FastGroup + 2)};
+        llvm::AllocaInst *fastPacked = builder.CreateAlloca(packedType, nullptr, "range_arguments");
+        fastPacked->setAlignment(llvm::Align(16));
+        llvm::AllocaInst *fastInvocation = builder.CreateAlloca(invocationType, nullptr, "lane_invocation");
+        fastInvocation->setAlignment(module.getDataLayout().getABITypeAlign(invocationType));
+        builder.CreateStore(fastPacked, builder.CreateStructGEP(invocationType, fastInvocation, 0));
+        builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.argumentsSize),
+                            builder.CreateStructGEP(invocationType, fastInvocation, 1));
+        builder.CreateStore(fast->getArg(FastResults), builder.CreateStructGEP(invocationType, fastInvocation, 2));
+        builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.resultsSize),
+                            builder.CreateStructGEP(invocationType, fastInvocation, 3));
+        builder.CreateStore(fast->getArg(FastTextures), builder.CreateStructGEP(invocationType, fastInvocation, 4));
+        copyArguments(fastPacked, fast->getArg(FastArguments), fast->getArg(FastArgumentsSize));
+        for (size_t index = 0; index < exclusiveBuffers.size(); ++index) {
+            llvm::StoreInst *store = builder.CreateStore(
+                builder.CreatePtrToInt(fast->getArg(static_cast<unsigned>(FastBuffers + index)), sizeType),
+                builder.CreateGEP(i8, fastPacked, builder.getInt64(exclusiveBuffers[index]->offset)));
+            store->setAlignment(llvm::Align(1));
+        }
+        llvm::Value *rowBeginX = builder.CreateURem(fastBegin, fastWorkgroup[0]);
+        llvm::Value *rowBeginY = builder.CreateURem(builder.CreateUDiv(fastBegin, fastWorkgroup[0]), fastWorkgroup[1]);
+        llvm::Value *rowBeginZ = builder.CreateUDiv(fastBegin, builder.CreateMul(fastWorkgroup[0], fastWorkgroup[1]));
+        llvm::BasicBlock *fastGroupHead = llvm::BasicBlock::Create(context, "fast_group", fast, fastRow);
+        llvm::BasicBlock *fastGroupNext = llvm::BasicBlock::Create(context, "fast_group_next", fast, fastDone);
+        builder.CreateBr(fastGroupHead);
+
+        // Groups advance in workgroup-linear order, x fastest, carrying into y and z.
+        builder.SetInsertPoint(fastGroupHead);
+        llvm::PHINode *groupIndex = builder.CreatePHI(i64, 2, "group_index");
+        llvm::PHINode *groupCoordinates[] = {builder.CreatePHI(i64, 2, "group_x"), builder.CreatePHI(i64, 2, "group_y"),
+                                             builder.CreatePHI(i64, 2, "group_z")};
+        groupIndex->addIncoming(builder.getInt64(0), fastSetup);
+        for (size_t dimension = 0; dimension < 3; ++dimension)
+            groupCoordinates[dimension]->addIncoming(fastGroup[dimension], fastSetup);
+        llvm::Value *currentGroup[] = {groupCoordinates[0], groupCoordinates[1], groupCoordinates[2]};
+        llvm::SmallVector<llvm::Value *, 3> groupBase;
+        for (size_t dimension = 0; dimension < 3; ++dimension)
+            groupBase.push_back(builder.CreateMul(currentGroup[dimension], fastWorkgroup[dimension]));
+        builder.CreateBr(fastRow);
+
+        builder.SetInsertPoint(fastRow);
+        llvm::PHINode *rowLane = builder.CreatePHI(i64, 2, "row_lane");
+        llvm::PHINode *rowX = builder.CreatePHI(i64, 2, "row_x");
+        llvm::PHINode *rowY = builder.CreatePHI(i64, 2, "row_y");
+        llvm::PHINode *rowZ = builder.CreatePHI(i64, 2, "row_z");
+        rowLane->addIncoming(fastBegin, fastGroupHead);
+        rowX->addIncoming(rowBeginX, fastGroupHead);
+        rowY->addIncoming(rowBeginY, fastGroupHead);
+        rowZ->addIncoming(rowBeginZ, fastGroupHead);
+        llvm::Value *rowLimit = builder.CreateAdd(rowLane, builder.CreateSub(fastWorkgroup[0], rowX));
+        llvm::Value *rowEnd = builder.CreateSelect(builder.CreateICmpULT(rowLimit, fastEnd), rowLimit, fastEnd);
+        llvm::Value *globalY = builder.CreateAdd(groupBase[1], rowY);
+        llvm::Value *globalZ = builder.CreateAdd(groupBase[2], rowZ);
+        llvm::Value *rowGlobalX = builder.CreateAdd(groupBase[0], rowX);
+        builder.CreateBr(fastLane);
+
+        builder.SetInsertPoint(fastLane);
+        llvm::PHINode *fastLaneIndex = builder.CreatePHI(i64, 2, "fast_lane_index");
+        fastLaneIndex->addIncoming(rowLane, fastRow);
+        if (storesActiveLane)
+            builder.CreateStore(builder.CreateZExtOrTrunc(fastLaneIndex, sizeType),
+                                builder.CreateStructGEP(rangeType, fastRange, 11));
+        llvm::Value *step = builder.CreateSub(fastLaneIndex, rowLane);
+        llvm::Value *fastLocal[] = {builder.CreateAdd(rowX, step), rowY, rowZ};
+        llvm::Value *fastGlobal[] = {builder.CreateAdd(rowGlobalX, step), globalY, globalZ};
+        storeBuiltins(fastPacked, fastGlobal, fastLocal, currentGroup);
+        llvm::CallInst *fastStatus = builder.CreateCall(laneWrapper, {fastInvocation});
+        builder.CreateCondBr(builder.CreateICmpEQ(fastStatus, builder.getInt32(0)), fastNext, fastFailure);
+
+        builder.SetInsertPoint(fastNext);
+        llvm::Value *fastNextLane = builder.CreateAdd(fastLaneIndex, builder.getInt64(1));
+        fastLaneIndex->addIncoming(fastNextLane, fastNext);
+        builder.CreateCondBr(builder.CreateICmpULT(fastNextLane, rowEnd), fastLane, fastRowNext);
+
+        builder.SetInsertPoint(fastRowNext);
+        llvm::Value *nextY = builder.CreateAdd(rowY, builder.getInt64(1));
+        llvm::Value *wrapsY = builder.CreateICmpEQ(nextY, fastWorkgroup[1]);
+        rowLane->addIncoming(rowEnd, fastRowNext);
+        rowX->addIncoming(builder.getInt64(0), fastRowNext);
+        rowY->addIncoming(builder.CreateSelect(wrapsY, builder.getInt64(0), nextY), fastRowNext);
+        rowZ->addIncoming(builder.CreateSelect(wrapsY, builder.CreateAdd(rowZ, builder.getInt64(1)), rowZ),
+                          fastRowNext);
+        builder.CreateCondBr(builder.CreateICmpULT(rowEnd, fastEnd), fastRow, fastGroupNext);
+
+        builder.SetInsertPoint(fastGroupNext);
+        llvm::Value *nextGroupIndex = builder.CreateAdd(groupIndex, builder.getInt64(1));
+        llvm::Value *nextGroupX = builder.CreateAdd(currentGroup[0], builder.getInt64(1));
+        llvm::Value *wrapsGroupX = builder.CreateICmpEQ(nextGroupX, fast->getArg(FastGridX));
+        llvm::Value *carriedGroupY =
+            builder.CreateSelect(wrapsGroupX, builder.CreateAdd(currentGroup[1], builder.getInt64(1)), currentGroup[1]);
+        llvm::Value *wrapsGroupY = builder.CreateICmpEQ(carriedGroupY, fast->getArg(FastGridY));
+        groupIndex->addIncoming(nextGroupIndex, fastGroupNext);
+        groupCoordinates[0]->addIncoming(builder.CreateSelect(wrapsGroupX, builder.getInt64(0), nextGroupX),
+                                         fastGroupNext);
+        groupCoordinates[1]->addIncoming(builder.CreateSelect(wrapsGroupY, builder.getInt64(0), carriedGroupY),
+                                         fastGroupNext);
+        groupCoordinates[2]->addIncoming(
+            builder.CreateSelect(wrapsGroupY, builder.CreateAdd(currentGroup[2], builder.getInt64(1)), currentGroup[2]),
+            fastGroupNext);
+        builder.CreateCondBr(builder.CreateICmpULT(nextGroupIndex, fast->getArg(FastGroupCount)), fastGroupHead,
+                             fastDone);
+
+        // A chunk has no range descriptor to publish to; a range runs one group.
+        auto publishProgress = [&](llvm::Value *lastLane, llvm::Value *finished) {
+            llvm::BasicBlock *publish = llvm::BasicBlock::Create(context, "publish", fast);
+            llvm::BasicBlock *published = llvm::BasicBlock::Create(context, "published", fast);
+            builder.CreateCondBr(builder.CreateIsNull(fastRange), published, publish);
+            builder.SetInsertPoint(publish);
+            builder.CreateStore(builder.CreateZExtOrTrunc(lastLane, sizeType),
+                                builder.CreateStructGEP(rangeType, fastRange, 11));
+            llvm::Value *completedAddress = builder.CreateStructGEP(rangeType, fastRange, 14);
+            llvm::Value *completed = builder.CreateLoad(sizeType, completedAddress);
+            builder.CreateStore(builder.CreateAdd(completed, builder.CreateZExtOrTrunc(finished, sizeType)),
+                                completedAddress);
+            builder.CreateBr(published);
+            builder.SetInsertPoint(published);
+        };
+        builder.SetInsertPoint(fastDone);
+        publishProgress(builder.CreateSub(fastEnd, builder.getInt64(1)), builder.CreateSub(fastEnd, fastBegin));
+        builder.CreateRet(builder.getInt32(0));
+
+        builder.SetInsertPoint(fastFailure);
+        publishProgress(fastLaneIndex, builder.CreateSub(fastLaneIndex, fastBegin));
+        builder.CreateRet(fastStatus);
+
+        // A view's stride is a runtime value, so the loop above addresses its elements with gathers and scatters.
+        // The copy below pins every innermost stride to 1 after the arguments are copied, which makes those
+        // accesses consecutive; both copies compute the same addresses whenever the copy runs.
+        llvm::SmallVector<CpuCallLanePacking> unitStrides;
+        const uint64_t hostSize = hostProvidedArgumentsSize(metadata);
+        for (const CpuCallLanePacking &stride : metadata.innermostStrides)
+            if (stride.offset + stride.size <= hostSize && (stride.size == 4 || stride.size == 8))
+                unitStrides.push_back(stride);
+        if (!unitStrides.empty()) {
+            llvm::ValueToValueMapTy cloned;
+            llvm::Function *unit = llvm::CloneFunction(fast, cloned);
+            unit->setName(metadata.exportedWrapperSymbol + ".range.unit");
+            builder.SetInsertPoint(llvm::cast<llvm::BasicBlock>(cloned[fastSetup])->getTerminator());
+            auto *unitPacked = llvm::cast<llvm::Value>(cloned[fastPacked]);
+            for (const CpuCallLanePacking &stride : unitStrides) {
+                llvm::StoreInst *store =
+                    builder.CreateStore(llvm::ConstantInt::get(builder.getIntNTy(8 * stride.size), 1),
+                                        builder.CreateGEP(i8, unitPacked, builder.getInt64(stride.offset)));
+                store->setAlignment(llvm::Align(1));
+            }
+
+            llvm::Function *select = llvm::Function::Create(fast->getFunctionType(), llvm::GlobalValue::InternalLinkage,
+                                                            metadata.exportedWrapperSymbol + ".range.select", module);
+            fast->replaceAllUsesWith(select);
+            llvm::BasicBlock *selectEntry = llvm::BasicBlock::Create(context, "entry", select);
+            llvm::BasicBlock *selectUnit = llvm::BasicBlock::Create(context, "unit_strides", select);
+            llvm::BasicBlock *selectGeneral = llvm::BasicBlock::Create(context, "general_strides", select);
+            builder.SetInsertPoint(selectEntry);
+            llvm::Value *allUnit = builder.getTrue();
+            for (const CpuCallLanePacking &stride : unitStrides) {
+                llvm::Type *strideType = builder.getIntNTy(8 * stride.size);
+                llvm::LoadInst *value = builder.CreateLoad(
+                    strideType, builder.CreateGEP(i8, select->getArg(FastArguments), builder.getInt64(stride.offset)));
+                value->setAlignment(llvm::Align(1));
+                allUnit =
+                    builder.CreateAnd(allUnit, builder.CreateICmpEQ(value, llvm::ConstantInt::get(strideType, 1)));
+            }
+            builder.CreateCondBr(allUnit, selectUnit, selectGeneral);
+            llvm::SmallVector<llvm::Value *> forwarded;
+            for (llvm::Argument &argument : select->args())
+                forwarded.push_back(&argument);
+            builder.SetInsertPoint(selectUnit);
+            builder.CreateRet(builder.CreateCall(unit, forwarded));
+            builder.SetInsertPoint(selectGeneral);
+            builder.CreateRet(builder.CreateCall(fast, forwarded));
+            // Inlined into the selector, the loops lose the `noalias` parameters that let them vectorize.
+            fast->addFnAttr(llvm::Attribute::NoInline);
+            unit->addFnAttr(llvm::Attribute::NoInline);
+            fast = select;
+        }
+
+        bool usesWorkgroupHelpers = false;
+        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_SYMBOL, VERNON_CPU_LANE_ADDRESS_SYMBOL,
+                                   VERNON_CPU_WORKGROUP_BARRIER_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_SYMBOL})
+            if (const llvm::Function *declared = module.getFunction(helper))
+                usesWorkgroupHelpers |= !declared->use_empty();
+        if (!usesWorkgroupHelpers && !metadata.resultsSize && !metadata.requiresTextureCallbacks) {
+            auto *chunkType =
+                llvm::StructType::get(context, {sizeType, pointerType, sizeType, llvm::ArrayType::get(i32, 3),
+                                                llvm::ArrayType::get(i32, 3), i64, i64});
+            const llvm::StructLayout *chunkLayout = module.getDataLayout().getStructLayout(chunkType);
+            if (pointerBits == sizeof(void *) * 8 &&
+                (chunkLayout->getSizeInBytes() != sizeof(VernonCpuChunk) ||
+                 chunkLayout->getElementOffset(3) != offsetof(VernonCpuChunk, grid) ||
+                 chunkLayout->getElementOffset(5) != offsetof(VernonCpuChunk, group_begin)))
+                return invalidAbi("CPU chunk descriptor layout does not match the host ABI");
+            llvm::Function *chunkEntry = llvm::Function::Create(wrapperType, llvm::GlobalValue::ExternalLinkage,
+                                                                cpuChunkEntrySymbol(metadata), module);
+            if (llvm::Triple(module.getTargetTriple()).isOSWindows())
+                chunkEntry->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+            else
+                chunkEntry->setVisibility(llvm::GlobalValue::DefaultVisibility);
+            llvm::BasicBlock *chunkBegin = llvm::BasicBlock::Create(context, "entry", chunkEntry);
+            llvm::BasicBlock *chunkSized = llvm::BasicBlock::Create(context, "chunk_sized", chunkEntry);
+            llvm::BasicBlock *chunkFields = llvm::BasicBlock::Create(context, "chunk_fields", chunkEntry);
+            llvm::BasicBlock *chunkRun = llvm::BasicBlock::Create(context, "chunk_run", chunkEntry);
+            llvm::BasicBlock *chunkInvalid = llvm::BasicBlock::Create(context, "chunk_invalid", chunkEntry);
+            llvm::Value *chunk = chunkEntry->getArg(0);
+            builder.SetInsertPoint(chunkBegin);
+            builder.CreateCondBr(builder.CreateIsNull(chunk), chunkInvalid, chunkSized);
+            builder.SetInsertPoint(chunkSized);
+            llvm::LoadInst *chunkSize = builder.CreateLoad(sizeType, builder.CreateStructGEP(chunkType, chunk, 0));
+            chunkSize->setAlignment(llvm::Align(1));
+            builder.CreateCondBr(
+                builder.CreateICmpEQ(chunkSize, llvm::ConstantInt::get(sizeType, chunkLayout->getSizeInBytes())),
+                chunkFields, chunkInvalid);
+
+            builder.SetInsertPoint(chunkFields);
+            llvm::LoadInst *chunkArguments =
+                builder.CreateLoad(pointerType, builder.CreateStructGEP(chunkType, chunk, 1));
+            chunkArguments->setAlignment(llvm::Align(1));
+            llvm::LoadInst *chunkArgumentsSizeValue =
+                builder.CreateLoad(sizeType, builder.CreateStructGEP(chunkType, chunk, 2));
+            chunkArgumentsSizeValue->setAlignment(llvm::Align(1));
+            llvm::Value *chunkArgumentsSize = builder.CreateZExtOrTrunc(chunkArgumentsSizeValue, i64);
+            llvm::SmallVector<llvm::Value *, 3> chunkGrid;
+            llvm::SmallVector<llvm::Value *, 3> chunkWorkgroup;
+            llvm::Value *chunkValid = llvm::ConstantInt::getTrue(context);
+            for (uint64_t dimension = 0; dimension < 3; ++dimension) {
+                llvm::Value *index[] = {builder.getInt64(0), builder.getInt64(dimension)};
+                llvm::LoadInst *grid =
+                    builder.CreateLoad(i32, builder.CreateGEP(llvm::ArrayType::get(i32, 3),
+                                                              builder.CreateStructGEP(chunkType, chunk, 3), index));
+                grid->setAlignment(llvm::Align(1));
+                llvm::LoadInst *workgroup =
+                    builder.CreateLoad(i32, builder.CreateGEP(llvm::ArrayType::get(i32, 3),
+                                                              builder.CreateStructGEP(chunkType, chunk, 4), index));
+                workgroup->setAlignment(llvm::Align(1));
+                chunkGrid.push_back(builder.CreateZExt(grid, i64));
+                chunkWorkgroup.push_back(builder.CreateZExt(workgroup, i64));
+                chunkValid = builder.CreateAnd(chunkValid, builder.CreateICmpNE(grid, builder.getInt32(0)));
+                chunkValid = builder.CreateAnd(chunkValid, builder.CreateICmpNE(workgroup, builder.getInt32(0)));
+            }
+            llvm::LoadInst *groupBegin = builder.CreateLoad(i64, builder.CreateStructGEP(chunkType, chunk, 5));
+            groupBegin->setAlignment(llvm::Align(1));
+            llvm::LoadInst *groupEnd = builder.CreateLoad(i64, builder.CreateStructGEP(chunkType, chunk, 6));
+            groupEnd->setAlignment(llvm::Align(1));
+            auto [chunkWorkgroupXY, chunkWorkgroupXYOverflow] = checkedMultiply(chunkWorkgroup[0], chunkWorkgroup[1]);
+            auto [chunkWorkgroupVolume, chunkWorkgroupVolumeOverflow] =
+                checkedMultiply(chunkWorkgroupXY, chunkWorkgroup[2]);
+            auto [chunkGlobalXY, chunkGlobalXYOverflow] = checkedMultiply(
+                builder.CreateMul(chunkGrid[0], chunkWorkgroup[0]), builder.CreateMul(chunkGrid[1], chunkWorkgroup[1]));
+            auto [chunkGlobalVolume, chunkGlobalVolumeOverflow] =
+                checkedMultiply(chunkGlobalXY, builder.CreateMul(chunkGrid[2], chunkWorkgroup[2]));
+            llvm::Value *gridXY = builder.CreateMul(chunkGrid[0], chunkGrid[1]);
+            auto [gridVolume, gridVolumeOverflow] = checkedMultiply(gridXY, chunkGrid[2]);
+            for (llvm::Value *overflow : {chunkWorkgroupXYOverflow, chunkWorkgroupVolumeOverflow, chunkGlobalXYOverflow,
+                                          chunkGlobalVolumeOverflow, gridVolumeOverflow})
+                chunkValid = builder.CreateAnd(chunkValid, builder.CreateNot(overflow));
+            chunkValid = builder.CreateAnd(chunkValid, builder.CreateICmpULT(groupBegin, groupEnd));
+            chunkValid = builder.CreateAnd(chunkValid, builder.CreateICmpULE(groupEnd, gridVolume));
+            if (const uint64_t hostSize = hostProvidedArgumentsSize(metadata); hostSize)
+                chunkValid = builder.CreateAnd(
+                    chunkValid,
+                    builder.CreateAnd(builder.CreateIsNotNull(chunkArguments),
+                                      builder.CreateICmpUGE(chunkArgumentsSize, builder.getInt64(hostSize))));
+            builder.CreateCondBr(chunkValid, chunkRun, chunkInvalid);
+
+            builder.SetInsertPoint(chunkRun);
+            llvm::Value *nullPointer = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType));
+            llvm::SmallVector<llvm::Value *> chunkCall{nullPointer,         chunkArguments, chunkArgumentsSize,
+                                                       nullPointer,         nullPointer,    builder.getInt64(0),
+                                                       chunkWorkgroupVolume};
+            chunkCall.append(chunkWorkgroup.begin(), chunkWorkgroup.end());
+            chunkCall.push_back(builder.CreateURem(groupBegin, chunkGrid[0]));
+            chunkCall.push_back(builder.CreateURem(builder.CreateUDiv(groupBegin, chunkGrid[0]), chunkGrid[1]));
+            chunkCall.push_back(builder.CreateUDiv(groupBegin, gridXY));
+            chunkCall.append({chunkGrid[0], chunkGrid[1], builder.CreateSub(groupEnd, groupBegin)});
+            appendExclusiveBuffers(chunkCall, chunkArguments);
+            builder.CreateRet(builder.CreateCall(fast, chunkCall));
+
+            builder.SetInsertPoint(chunkInvalid);
+            builder.CreateRet(builder.getInt32(1));
+        }
+    }
 
     builder.SetInsertPoint(rangeLoop);
     llvm::PHINode *lane = builder.CreatePHI(i64, 2, "lane");
-    lane->addIncoming(laneBegin, rangeFields);
+    lane->addIncoming(laneBegin, rangeDispatch);
     builder.CreateCondBr(builder.CreateICmpULT(lane, laneEnd), rangeCall, rangeDone);
 
     builder.SetInsertPoint(rangeCall);
@@ -700,38 +1106,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::BasicBlock *laneReady = llvm::BasicBlock::Create(context, "lane_ready", wrapper);
     builder.CreateCondBr(validLanePointers, laneReady, rangeInvalid);
     builder.SetInsertPoint(laneReady);
-    if (metadata.argumentsSize) {
-        builder.CreateMemSet(packed, builder.getInt8(0), metadata.argumentsSize, llvm::MaybeAlign(16));
-        if (hostProvidedArgumentsSize(metadata)) {
-            llvm::Value *copySize = builder.CreateSelect(
-                builder.CreateICmpULT(rangeArgumentsSize, builder.getInt64(metadata.argumentsSize)), rangeArgumentsSize,
-                builder.getInt64(metadata.argumentsSize));
-            builder.CreateMemCpy(packed, llvm::Align(16), selectedArguments, llvm::Align(1), copySize);
-        }
-    }
+    copyArguments(packed, selectedArguments, rangeArgumentsSize);
     builder.CreateStore(selectedResults, builder.CreateStructGEP(invocationType, laneInvocation, 2));
-
-    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
-        llvm::ArrayRef<llvm::Value *> coordinates =
-            packing.builtin == "global_invocation_id"  ? llvm::ArrayRef<llvm::Value *>(global)
-            : packing.builtin == "local_invocation_id" ? llvm::ArrayRef<llvm::Value *>(local)
-            : packing.builtin == "workgroup_id"        ? llvm::ArrayRef<llvm::Value *>(group)
-                                                       : llvm::ArrayRef<llvm::Value *>();
-        if (coordinates.empty())
-            continue;
-        llvm::Value *target = builder.CreateGEP(i8, packed, builder.getInt64(packing.offset));
-        if (packing.size == sizeof(uint64_t)) {
-            llvm::StoreInst *store = builder.CreateStore(coordinates.front(), target);
-            store->setAlignment(llvm::Align(1));
-            continue;
-        }
-        for (size_t dimension = 0; dimension < 3 && (dimension + 1) * sizeof(uint32_t) <= packing.size; ++dimension) {
-            llvm::Value *component = builder.CreateTrunc(coordinates[dimension], i32);
-            llvm::StoreInst *store =
-                builder.CreateStore(component, builder.CreateGEP(i8, target, builder.getInt64(dimension * 4)));
-            store->setAlignment(llvm::Align(1));
-        }
-    }
+    storeBuiltins(packed, global, local, group);
     llvm::CallInst *laneStatus = builder.CreateCall(laneWrapper, {laneInvocation});
     if (metadata.requiresPhases) {
         llvm::BasicBlock *phaseStatus = llvm::BasicBlock::Create(context, "phase_status", wrapper);
@@ -809,9 +1186,13 @@ llvm::Error emitCpuStaticRegistration(llvm::Module &module, const std::vector<Cp
         // helper modules, so one application may link several copies of an
         // object. The copies must fold instead of colliding; each copy's
         // constructor then registers the surviving definition.
-        wrapper->setLinkage(llvm::GlobalValue::WeakODRLinkage);
-        if (supportsComdat)
-            wrapper->setComdat(module.getOrInsertComdat(wrapper->getName()));
+        for (llvm::Function *folded : {wrapper, module.getFunction(cpuChunkEntrySymbol(entry))}) {
+            if (!folded || folded->isDeclaration())
+                continue;
+            folded->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+            if (supportsComdat)
+                folded->setComdat(module.getOrInsertComdat(folded->getName()));
+        }
         llvm::Constant *name = llvm::ConstantDataArray::getString(context, entry.exportedWrapperSymbol, false);
         auto *nameGlobal = new llvm::GlobalVariable(module, name->getType(), true, llvm::GlobalValue::PrivateLinkage,
                                                     name, "vernon.cpu.entry_name");

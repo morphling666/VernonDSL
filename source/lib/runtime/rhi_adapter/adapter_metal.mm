@@ -1380,6 +1380,12 @@ struct MetalPacketDecoder {
         return RhiAdapterResult<void>{vernon::ok()};
     }
 
+    RhiAdapterResult<void> drawStream(uint32_t, uint32_t, uint32_t, uint32_t,
+                                      const VernonRuntimeProviderStreamPayload &,
+                                      const vernon::rhi::OpenedRendering &) {
+        return providerFailure(vernon::ProviderErrorCode::Unsupported, "metal_draw_streams_are_unsupported");
+    }
+
     RhiAdapterResult<void> draw(uint32_t topology, uint32_t indexResource, const VernonRuntimeProviderDrawPayload &draw,
                                 const vernon::rhi::OpenedRendering &opened) {
         MTLPrimitiveType primitive{};

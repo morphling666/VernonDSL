@@ -4,7 +4,6 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "rhi/cuda_backend.h"
-#include "rhi_provider_pipeline.h"
 #include "runtime_state.h"
 
 struct VernonRuntimeRhiAdapter;
@@ -19,10 +18,6 @@ struct CudaContextState {
     uint32_t computeCapabilityMajor{};
     uint32_t computeCapabilityMinor{};
     uint32_t driverVersion{};
-};
-
-struct CudaPipelineState {
-    RhiComputePipeline rhiCompute;
 };
 
 inline CudaContextState &cudaState(VernonRuntimeContext &context) {

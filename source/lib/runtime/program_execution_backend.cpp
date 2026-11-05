@@ -5,7 +5,8 @@
 #include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
 #include "resolved_execution_plan.h"
-#include "runtime/autodiff/runtime_autodiff_internal.h"
+#include "runtime/autodiff/derivative_groups.h"
+#include "runtime/schedule/fragment.h"
 #include "runtime_dispatch.h"
 #include "runtime_state.h"
 #include "target_binding_plan.h"
@@ -33,6 +34,41 @@ bool reject(Diagnostic &diagnostic, std::string code, std::string path, std::str
 
 ProgramLoadError programLoadError(const Diagnostic &diagnostic) {
     return {diagnostic.code, diagnostic.path, diagnostic.message};
+}
+
+// A compute Stage's reflection numbers its arguments and metadata fields by the Node's target bindings; a schedule
+// fragment numbers them as the kernel does, by endpoint, which is how a Program node's bindings name them.
+vernon::Result<ReflectedEntry, std::string>
+kernelNumbered(const TargetBindingPlan &plan, const StageBindingPlan &stagePlan, ReflectedEntry reflection) {
+    using Numbered = vernon::Result<ReflectedEntry, std::string>;
+    if (reflection.arguments.size() != plan.bindings.size())
+        return Numbered{vernon::err(std::string("compute Stage reflection disagrees with its bindings"))};
+    // A result keeps its endpoint index, which numbers the kernel's results apart from its arguments.
+    std::vector<uint32_t> endpointOf(plan.bindings.size());
+    for (size_t index = 0; index < plan.bindings.size(); ++index)
+        endpointOf[index] = plan.bindings[index].endpoint.index;
+    if (plan.backend == VERNON_RUNTIME_CUDA) {
+        // The reflection names every binding a GPU carries in a storage buffer a tensor. A CUDA kernel takes a value
+        // use as kernel-parameter bytes, except a buffer value, which it takes by device pointer as the CUDA adapter
+        // binds it (prepared_binding_plan.cpp).
+        for (const vernon::runtime::Parameter &parameter : stagePlan.parameters)
+            for (const vernon::runtime::ParameterUse &use : parameter.uses) {
+                if (use.interfaceKind != "value" || use.index >= reflection.arguments.size())
+                    continue;
+                ReflectedArgument &argument = reflection.arguments[use.index];
+                if (argument.kind == "tensor" || argument.kind == "scalar")
+                    argument.kind = use.transport == "storage_buffer" && use.bufferValue ? "buffer value" : "scalar";
+            }
+    }
+    for (ReflectedArgument &argument : reflection.arguments)
+        argument.index = endpointOf[argument.index];
+    if (reflection.metadataCarrier)
+        for (MetadataFieldIdentity &field : reflection.metadataCarrier->fields)
+            if (field.argument < endpointOf.size())
+                field.argument = endpointOf[field.argument];
+    std::sort(reflection.arguments.begin(), reflection.arguments.end(),
+              [](const ReflectedArgument &left, const ReflectedArgument &right) { return left.index < right.index; });
+    return Numbered{vernon::ok(std::move(reflection))};
 }
 
 std::string physicalStageIdentity(const StageArtifact &stage) {
@@ -310,15 +346,32 @@ StageLoadResult loadComputeNodePipeline(VernonRuntimeContext &context, const Art
             return StageLoadResult{vernon::err(diagnostic)};
         }
     }
+    auto kernel = [&]() -> vernon::Result<vernon::schedule::Fragment, std::string> {
+        using Built = vernon::Result<vernon::schedule::Fragment, std::string>;
+        if (context.backend != VERNON_RUNTIME_CPU && context.backend != VERNON_RUNTIME_CUDA)
+            return Built{vernon::err(std::string())};
+        auto numbered = kernelNumbered(node.plan, stagePlan, reflection);
+        if (numbered.isErr())
+            return Built{vernon::err(std::move(numbered).error())};
+        if (context.backend == VERNON_RUNTIME_CPU)
+            return vernon::schedule::cpuKernelFragment(std::move(numbered).value(), entryName, cpuEntry);
+        return vernon::schedule::cudaKernelFragment(std::move(numbered).value(), entryName,
+                                                    std::string(moduleBytes.begin(), moduleBytes.end()));
+    }();
     auto pipeline = loadBackendTypedComputePipeline(context, std::move(stagePlan), std::move(reflection),
                                                     moduleBytes.empty() ? nullptr : moduleBytes.data(),
-                                                    moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
+                                                    moduleBytes.size(), entryName, node.plan.nativeSlots);
     if (pipeline.isErr()) {
         reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + stage.artifact,
                renderBackendPipelineError(pipeline.error()));
         return StageLoadResult{vernon::err(diagnostic)};
     }
-    return StageLoadResult{vernon::ok(std::move(pipeline).value())};
+    std::unique_ptr<VernonStageExecutable> loaded = std::move(pipeline).value();
+    if (kernel.isOk())
+        loaded->kernelFragment = std::make_shared<const vernon::schedule::Fragment>(std::move(kernel).value());
+    else
+        loaded->kernelFragmentError = std::move(kernel).error();
+    return StageLoadResult{vernon::ok(std::move(loaded))};
 }
 
 } // namespace
@@ -435,7 +488,7 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
         return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(child).value(),
                                                               std::move(instanceOwner).value(), std::move(plan));
-    if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {})) {
+    if (!vernon::runtime::ad::resolveDerivativeGroups(*pipeline)) {
         reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
                invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
                                                      : invocationDiagnostic(context));
@@ -467,3 +520,21 @@ std::string renderProgramLoadError(const ProgramLoadError &error) {
 }
 
 } // namespace vernon::runtime::program
+
+void vernon::runtime::destroyResolvedStage(VernonStageExecutable *stage) {
+    if (!stage)
+        return;
+    if (!stage->lifecycle)
+        vernon::resultContractViolation();
+    auto destruction = stage->lifecycle.value().beginDestroy();
+    if (destruction.isErr())
+        return;
+    if (destruction.value().commit().isErr())
+        vernon::resultContractViolation();
+    delete stage;
+}
+
+VernonStageExecutable::~VernonStageExecutable() {
+    if (backendState)
+        vernon::runtime::destroyBackendPipeline(*this);
+}

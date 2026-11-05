@@ -1,135 +1,69 @@
-#include "VernonRuntime.h"
-#include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <filesystem>
-#include <iterator>
-#include <string>
+#include <cstddef>
+#include <vector>
 
 namespace {
 
-std::string lastError(VernonRuntimeContext *context) {
-    const VernonStringView error = vernonRuntimeGetLastError(context);
-    return std::string(error.data, error.size);
-}
+using vernon::tests::HostTensor;
+using vernon::tests::LinkedVjp;
+using vernon::tests::ResolvedProgram;
 
+// Each lane of a 4-lane workgroup writes 2 * scale * the carrier of its next neighbour across a barrier.
 TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
-    const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST;
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    {
+        const ResolvedProgram program(context, VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST);
+        ASSERT_TRUE(program) << vernon::tests::runtimeError(context);
+        LinkedVjp vjp(context, program.get());
+        ASSERT_TRUE(vjp) << vjp.error();
 
-    constexpr size_t laneCount = 8;
-    float carriers[laneCount]{1.0f, 2.0f, 4.0f, 8.0f, 3.0f, 5.0f, 7.0f, 11.0f};
-    float scale = 1.5f;
-    float output[laneCount]{};
-    const uint64_t vectorShape[]{laneCount};
-    const uint64_t outputShape[]{1, 1, laneCount};
-    vernon::tests::DerivativeLeafFixture inputValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"carriers", 8},
-         VERNON_DATA_F32,
-         carriers,
-         sizeof(carriers),
-         1,
-         vectorShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"scale", 5},
-         VERNON_DATA_F32,
-         &scale,
-         sizeof(scale),
-         0,
-         nullptr},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"output", 6},
-         VERNON_DATA_F32,
-         output,
-         sizeof(output),
-         3,
-         outputShape},
-    };
-    vernon::tests::DerivativeLeafSetFixture inputs{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
-    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
-    EXPECT_GT(memory.logicalResidualBytes, 0u);
-    EXPECT_GT(memory.residentBytes, 0u);
-    EXPECT_GT(memory.allocatedBytes, 0u);
-    for (size_t lane = 0; lane < laneCount; ++lane) {
-        const size_t groupBase = lane / 4 * 4;
-        const size_t neighbor = groupBase + (lane + 1) % 4;
-        EXPECT_FLOAT_EQ(output[lane], carriers[neighbor] * scale * 2.0f);
+        constexpr size_t laneCount = 8;
+        constexpr float scale = 1.5f;
+        HostTensor<float> carriers({1.0f, 2.0f, 4.0f, 8.0f, 3.0f, 5.0f, 7.0f, 11.0f});
+        HostTensor<float> output(std::vector<float>(laneCount), {1, 1, laneCount});
+        vjp.forwardRecord().bind("carriers", carriers.view());
+        vjp.forwardRecord().bindScalar("scale", scale);
+        vjp.forwardRecord().bind("output", output.view());
+        vjp.forwardRecord().bindGrid(2);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        const VernonScheduleVjpPass tapes = vjp.passTotals();
+        EXPECT_GT(tapes.tape_logical_bytes, 0u);
+        EXPECT_GE(tapes.tape_resident_bytes, tapes.tape_logical_bytes);
+        EXPECT_GE(tapes.tape_allocated_bytes, tapes.tape_resident_bytes);
+        for (size_t lane = 0; lane < laneCount; ++lane) {
+            const size_t neighbor = lane / 4 * 4 + (lane + 1) % 4;
+            EXPECT_FLOAT_EQ(output.values[lane], carriers.values[neighbor] * scale * 2.0f);
+        }
+
+        HostTensor<float> seeds({1.0f, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f, 13.0f, 17.0f}, {1, 1, laneCount});
+        HostTensor<float> carrierGradients{std::vector<float>(laneCount)};
+        HostTensor<float> scaleGradient({0.0f}, {});
+        vjp.backwardRecord().bind("output", seeds.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+        vjp.backwardRecord().bind("carriers", carrierGradients.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        vjp.backwardRecord().bind("scale", scaleGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        ASSERT_TRUE(vjp.backwardRecord().unbound().empty());
+        float expectedScaleGradient = 0.0f;
+        for (size_t lane = 0; lane < laneCount; ++lane)
+            expectedScaleGradient += 2.0f * carriers.values[lane / 4 * 4 + (lane + 1) % 4] * seeds.values[lane];
+        // A second pullback of the same forward call replays the same tapes.
+        for (int pullback = 0; pullback < 2; ++pullback) {
+            SCOPED_TRACE(pullback);
+            std::fill(carrierGradients.values.begin(), carrierGradients.values.end(), 0.0f);
+            scaleGradient.values[0] = 0.0f;
+            ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+            for (size_t lane = 0; lane < laneCount; ++lane) {
+                const size_t consumer = lane / 4 * 4 + (lane + 3) % 4;
+                EXPECT_FLOAT_EQ(carrierGradients.values[lane], 2.0f * scale * seeds.values[consumer]);
+            }
+            EXPECT_FLOAT_EQ(scaleGradient.values[0], expectedScaleGradient);
+        }
     }
-
-    float seedValues[laneCount];
-    const float weights[laneCount]{1.0f, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f, 13.0f, 17.0f};
-    for (size_t lane = 0; lane < laneCount; ++lane)
-        seedValues[lane] = weights[lane];
-    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
-                                              {"output", 6},
-                                              VERNON_DATA_F32,
-                                              seedValues,
-                                              sizeof(seedValues),
-                                              3,
-                                              outputShape};
-    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
-    float carrierGradients[laneCount]{};
-    float scaleGradient{};
-    vernon::tests::DerivativeLeafFixture gradientValues[]{
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"carriers", 8},
-         VERNON_DATA_F32,
-         carrierGradients,
-         sizeof(carrierGradients),
-         1,
-         vectorShape},
-        {sizeof(vernon::tests::DerivativeLeafFixture),
-         {"scale", 5},
-         VERNON_DATA_F32,
-         &scaleGradient,
-         sizeof(scaleGradient),
-         0,
-         nullptr},
-    };
-    vernon::tests::DerivativeLeafSetFixture gradients{
-        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, std::size(gradientValues), {}};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-
-    float expectedScaleGradient = 0.0f;
-    for (size_t lane = 0; lane < laneCount; ++lane) {
-        const size_t groupBase = lane / 4 * 4;
-        const size_t consumer = groupBase + (lane + 3) % 4;
-        EXPECT_FLOAT_EQ(carrierGradients[lane], 2.0f * scale * weights[consumer]);
-        const size_t neighbor = groupBase + (lane + 1) % 4;
-        expectedScaleGradient += 2.0f * carriers[neighbor] * weights[lane];
-    }
-    EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
-    std::fill(std::begin(carrierGradients), std::end(carrierGradients), 0.0f);
-    scaleGradient = 0.0f;
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
-        << lastError(context);
-    for (size_t lane = 0; lane < laneCount; ++lane) {
-        const size_t groupBase = lane / 4 * 4;
-        const size_t consumer = groupBase + (lane + 3) % 4;
-        EXPECT_FLOAT_EQ(carrierGradients[lane], 2.0f * scale * weights[consumer]);
-    }
-    EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 

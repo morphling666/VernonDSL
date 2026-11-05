@@ -349,11 +349,13 @@ static_assert(VERNON_RUNTIME_PROVIDER_LOAD_CLEAR == static_cast<int>(VERNON_RHI_
 
 } // namespace
 
-RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                                             const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept {
+// The RHI scope of `descriptor`, whose sampled images `reads` receives.
+static RhiAdapterResult<vernon::rhi::RenderingScope>
+renderingScope(const VernonRuntimeRhiAdapter &adapter, const VernonRuntimeProviderRenderingDescriptor &descriptor,
+               std::vector<vernon::rhi::RenderingRead> &reads) noexcept {
+    using Scope = RhiAdapterResult<vernon::rhi::RenderingScope>;
     const auto invalid = [](const char *operation) {
-        return RhiAdapterResult<void>{
-            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {operation, 0, 0}})};
+        return Scope{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {operation, 0, 0}})};
     };
     if (descriptor.struct_size < sizeof(descriptor) ||
         descriptor.color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
@@ -361,18 +363,18 @@ RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, V
         (descriptor.sampled_image_count && !descriptor.sampled_images) || descriptor.render_area[0] > INT32_MAX ||
         descriptor.render_area[1] > INT32_MAX)
         return invalid("begin_rendering_descriptor");
-    std::vector<vernon::rhi::RenderingRead> reads;
     try {
+        reads.clear();
         reads.reserve(descriptor.sampled_image_count);
     } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
-                                                                        {"begin_rendering_sampled_images", 0, 0}})};
+        return Scope{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::ResourceExhausted,
+                                                       {"begin_rendering_sampled_images", 0, 0}})};
     }
     for (size_t index = 0; index < descriptor.sampled_image_count; ++index) {
         const VernonRuntimeProviderResourceReference image = descriptor.sampled_images[index];
         auto kind = resourceKind(adapter, image);
         if (!kind)
-            return RhiAdapterResult<void>{vernon::err(std::move(kind).error())};
+            return Scope{vernon::err(std::move(kind).error())};
         if (kind.value() != vernon::rhi::ResourceKind::Image && kind.value() != vernon::rhi::ResourceKind::ImageView)
             return invalid("rendering_sampled_image_is_not_an_image");
         reads.push_back({kind.value(), image.resource.value});
@@ -383,7 +385,7 @@ RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, V
         const auto &source = descriptor.color_attachments[index];
         auto view = attachmentView(adapter, source.view);
         if (!view)
-            return RhiAdapterResult<void>{vernon::err(std::move(view).error())};
+            return Scope{vernon::err(std::move(view).error())};
         auto &target = scope.colors[index];
         target.view = view.value();
         target.location = source.location;
@@ -395,7 +397,7 @@ RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, V
         const auto &source = *descriptor.depth_stencil_attachment;
         auto view = attachmentView(adapter, source.view);
         if (!view)
-            return RhiAdapterResult<void>{vernon::err(std::move(view).error())};
+            return Scope{vernon::err(std::move(view).error())};
         scope.depth.view = view.value();
         scope.depth.depthLoad = static_cast<VernonRhiLoadOperation>(source.depth_load_operation);
         scope.depth.depthStore = static_cast<VernonRhiStoreOperation>(source.depth_store_operation);
@@ -410,8 +412,37 @@ RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, V
     scope.width = descriptor.render_area[2];
     scope.height = descriptor.render_area[3];
     scope.layers = descriptor.layers;
+    return Scope{vernon::ok(scope)};
+}
+
+RhiAdapterResult<void> beginEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                             const VernonRuntimeProviderRenderingDescriptor &descriptor) noexcept {
+    std::vector<vernon::rhi::RenderingRead> reads;
+    auto scope = renderingScope(adapter, descriptor, reads);
+    if (!scope)
+        return RhiAdapterResult<void>{vernon::err(std::move(scope).error())};
     auto begun =
-        vernon::rhi::beginEncoderRendering(adapter.rhiDevice, encoder.value, scope, reads.data(), reads.size());
+        vernon::rhi::beginEncoderRendering(adapter.rhiDevice, encoder.value, scope.value(), reads.data(), reads.size());
+    if (!begun)
+        return RhiAdapterResult<void>{vernon::err(providerError(std::move(begun).error()))};
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+RhiAdapterResult<void> beginBatchRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                           const RhiPacketBatch::Rendering &rendering,
+                                           const uint32_t *clears) noexcept {
+    static_assert(sizeof(VernonClearColor) == 4 * sizeof(uint32_t));
+    vernon::rhi::RenderingScope scope;
+    scope.colorCount = rendering.prepared.scope.colorCount;
+    scope.hasDepth = rendering.prepared.scope.hasDepth;
+    for (size_t index = 0; index < scope.colorCount; ++index)
+        std::memcpy(&scope.colors[index].clear, clears + index * 4, sizeof(VernonClearColor));
+    if (scope.hasDepth) {
+        std::memcpy(&scope.depth.clearDepth, clears + scope.colorCount * 4, sizeof(float));
+        scope.depth.clearStencil = clears[scope.colorCount * 4 + 1];
+    }
+    auto begun =
+        vernon::rhi::beginPreparedEncoderRendering(adapter.rhiDevice, encoder.value, rendering.prepared, scope);
     if (!begun)
         return RhiAdapterResult<void>{vernon::err(providerError(std::move(begun).error()))};
     return RhiAdapterResult<void>{vernon::ok()};
@@ -592,6 +623,7 @@ namespace {
 enum class PacketObjectKind : uint8_t { Unused, Pipeline, Group };
 constexpr uint8_t kVertexBufferUse = 1;
 constexpr uint8_t kIndexBufferUse = 2;
+constexpr uint8_t kIndirectBufferUse = 4;
 
 RhiAdapterResult<void> invalidPackets(uint64_t value = 0) noexcept {
     return providerFailure(vernon::ProviderErrorCode::InvalidArgument, "rhi_packet_batch_is_invalid", value);
@@ -646,6 +678,14 @@ RhiAdapterResult<void> scanPacket(const VernonRuntimeProviderPacketBatchDescript
     case VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED:
         valid = operandCount == 3 && resource(operands[1], kIndexBufferUse) && payload(operands[2], kDrawWords);
         break;
+    case VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED_STREAM: {
+        const bool host = operandCount == 5 && operands[2] == UINT32_MAX && operands[3] == UINT32_MAX;
+        valid = operandCount == 5 && operands[0] <= 2 && resource(operands[1], kIndexBufferUse) &&
+                (host || (resource(operands[2], kIndirectBufferUse) &&
+                          (operands[3] == UINT32_MAX || resource(operands[3], kIndirectBufferUse)))) &&
+                payload(operands[4], sizeof(VernonRuntimeProviderStreamPayload) / sizeof(uint32_t));
+        break;
+    }
     case VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH:
         valid = operandCount == 1 && payload(operands[0], 3);
         break;
@@ -684,8 +724,9 @@ RhiAdapterResult<void> buildPacketBatch(VernonRuntimeRhiAdapter &adapter,
         if (auto scanned = scanPacket(descriptor, opcode, descriptor.packets + word + 1, count - 1, kinds, used);
             !scanned)
             return scanned;
-        batch.draws +=
-            opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW || opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED;
+        batch.draws += opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW ||
+                       opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED ||
+                       opcode == VERNON_RUNTIME_PROVIDER_PACKET_DRAW_INDEXED_STREAM;
         batch.dispatches += opcode == VERNON_RUNTIME_PROVIDER_PACKET_DISPATCH;
         if (labels.value() || !isDebugPacket(opcode))
             batch.packets.insert(batch.packets.end(), descriptor.packets + word, descriptor.packets + word + count);
@@ -746,15 +787,32 @@ RhiAdapterResult<void> buildPacketBatch(VernonRuntimeRhiAdapter &adapter,
     for (size_t index = 0; index < descriptor.rendering_count; ++index) {
         const VernonRuntimeProviderRenderingDescriptor &source = descriptor.renderings[index];
         RhiPacketBatch::Rendering &rendering = batch.renderings[index];
-        if (source.color_attachment_count > rendering.colors.size() ||
-            (source.color_attachment_count != 0 && !source.color_attachments) ||
-            (source.sampled_image_count != 0 && !source.sampled_images))
-            return invalidPackets(index);
-        rendering.descriptor = source;
-        std::copy_n(source.color_attachments, source.color_attachment_count, rendering.colors.begin());
-        if (source.depth_stencil_attachment)
-            rendering.depth = *source.depth_stencil_attachment;
-        rendering.sampledImages.assign(source.sampled_images, source.sampled_images + source.sampled_image_count);
+        std::vector<vernon::rhi::RenderingRead> reads;
+        auto scope = renderingScope(adapter, source, reads);
+        if (!scope)
+            return RhiAdapterResult<void>{vernon::err(std::move(scope).error())};
+        const auto retain = [&](vernon::rhi::ResourceKind kind, uint64_t key) {
+            auto retained = vernon::rhi::retainResource(adapter.rhiDevice, kind, key);
+            if (!retained)
+                return RhiAdapterResult<void>{vernon::err(providerError(std::move(retained).error()))};
+            rendering.leases.push_back(std::move(retained).value());
+            return RhiAdapterResult<void>{vernon::ok()};
+        };
+        rendering.leases.reserve(scope.value().colorCount + 1 + reads.size());
+        for (size_t color = 0; color < scope.value().colorCount; ++color)
+            if (auto retained = retain(vernon::rhi::ResourceKind::ImageView, scope.value().colors[color].view);
+                !retained)
+                return retained;
+        if (scope.value().hasDepth)
+            if (auto retained = retain(vernon::rhi::ResourceKind::ImageView, scope.value().depth.view); !retained)
+                return retained;
+        for (const vernon::rhi::RenderingRead &read : reads)
+            if (auto retained = retain(read.kind, read.key); !retained)
+                return retained;
+        auto prepared = vernon::rhi::prepareRendering(adapter.rhiDevice, scope.value(), reads.data(), reads.size());
+        if (!prepared)
+            return RhiAdapterResult<void>{vernon::err(providerError(std::move(prepared).error()))};
+        rendering.prepared = std::move(prepared).value();
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
@@ -784,27 +842,6 @@ RhiAdapterResult<void> createRhiPacketBatch(VernonRuntimeRhiAdapter &adapter,
 
 void destroyRhiPacketBatch(void *, VernonRuntimeProviderObject batch) {
     releaseRetainedObject(fromHandle<RhiPacketBatch>(batch));
-}
-
-VernonRuntimeProviderRenderingDescriptor
-packetRendering(const RhiPacketBatch::Rendering &rendering, const uint32_t *clears,
-                std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> &colors,
-                VernonRuntimeProviderDepthStencilAttachment &depth) noexcept {
-    VernonRuntimeProviderRenderingDescriptor descriptor = rendering.descriptor;
-    const size_t colorCount = descriptor.color_attachment_count;
-    for (size_t index = 0; index < colorCount; ++index) {
-        colors[index] = rendering.colors[index];
-        std::memcpy(colors[index].clear_color.u32, clears + index * 4, sizeof(colors[index].clear_color.u32));
-    }
-    descriptor.color_attachments = colors.data();
-    if (descriptor.depth_stencil_attachment) {
-        depth = rendering.depth;
-        std::memcpy(&depth.clear_depth, clears + colorCount * 4, sizeof(float));
-        depth.clear_stencil = clears[colorCount * 4 + 1];
-        descriptor.depth_stencil_attachment = &depth;
-    }
-    descriptor.sampled_images = rendering.sampledImages.data();
-    return descriptor;
 }
 
 RhiAdapterResult<void> recordPacketDebugCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,

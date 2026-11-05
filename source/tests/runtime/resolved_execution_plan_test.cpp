@@ -255,32 +255,6 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     EXPECT_EQ(fixture.plan.autodiff.residualValues, std::vector<uint32_t>({1}));
     ASSERT_EQ(fixture.plan.autodiff.replayNodes.size(), 1u);
     EXPECT_EQ(fixture.plan.autodiff.checkpointPolicy, CheckpointPolicy::Rematerialize);
-    ASSERT_EQ(fixture.plan.publications.transactions.size(), 2u);
-    EXPECT_EQ(fixture.plan.publications.transactions[0].mode, PublicationCommitMode::CommitAfterSuccess);
-    EXPECT_EQ(fixture.plan.publications.transactions[1].mode, PublicationCommitMode::InPlace);
-}
-
-TEST(ResolvedExecutionPlan, NamesTheFirstEffectThatNeedsACompletionWait) {
-    PlanFixture fixture;
-    Program &program = fixture.resolved->program;
-    Diagnostic diagnostic;
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
-    ASSERT_TRUE(fixture.plan.waitRequirement);
-    EXPECT_EQ(fixture.plan.waitRequirement->path, "/abi/boundary_slots/0/publication");
-
-    program.abi.boundarySlots.erase(program.abi.boundarySlots.begin());
-    program.abi.publication.targets.clear();
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
-    ASSERT_TRUE(fixture.plan.waitRequirement);
-    EXPECT_EQ(fixture.plan.waitRequirement->path, "/abi/tape_plans/0");
-
-    program.abi.tapePlans.clear();
-    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
-    EXPECT_FALSE(fixture.plan.waitRequirement);
-
-    fixture.plan.waitRequirement = ResolvedWaitRequirement{"/abi/tape_plans/0", "forged"};
-    EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
-    EXPECT_EQ(diagnostic.path, "/publications");
 }
 
 TEST(ResolvedExecutionPlan, GroupsAdjacentVersionContinuousGraphicsNodesIntoOneScope) {
@@ -374,29 +348,19 @@ TEST(ResolvedExecutionPlan, RejectsPhysicalReadWithoutDominatingProducer) {
     EXPECT_NE(diagnostic.message.find("dominating producer"), std::string::npos);
 }
 
-TEST(ResolvedExecutionPlan, RejectsMissingAliasBarrierAndPublicationStagingTarget) {
-    {
-        PlanFixture fixture;
-        Diagnostic diagnostic;
-        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
-        fixture.plan.hazards.edges.erase(
-            std::remove_if(fixture.plan.hazards.edges.begin(), fixture.plan.hazards.edges.end(),
-                           [](const ResolvedDependencyEdge &edge) {
-                               return edge.hazard == HazardKind::WriteAfterRead && edge.predecessor.node == 2 &&
-                                      edge.successor.node == 3;
-                           }),
-            fixture.plan.hazards.edges.end());
-        EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
-        EXPECT_NE(diagnostic.message.find("conflicting alias"), std::string::npos);
-    }
-    {
-        PlanFixture fixture;
-        fixture.resolved->program.abi.publication.targets.clear();
-        Diagnostic diagnostic;
-        ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
-        EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
-        EXPECT_NE(diagnostic.message.find("staging target"), std::string::npos);
-    }
+TEST(ResolvedExecutionPlan, RejectsMissingAliasBarrier) {
+    PlanFixture fixture;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic).isOk()) << diagnostic.message;
+    fixture.plan.hazards.edges.erase(std::remove_if(fixture.plan.hazards.edges.begin(),
+                                                    fixture.plan.hazards.edges.end(),
+                                                    [](const ResolvedDependencyEdge &edge) {
+                                                        return edge.hazard == HazardKind::WriteAfterRead &&
+                                                               edge.predecessor.node == 2 && edge.successor.node == 3;
+                                                    }),
+                                     fixture.plan.hazards.edges.end());
+    EXPECT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic).isErr());
+    EXPECT_NE(diagnostic.message.find("conflicting alias"), std::string::npos);
 }
 
 } // namespace

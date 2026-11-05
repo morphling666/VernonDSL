@@ -1317,7 +1317,7 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     if (!device)
         return invalidResult("upload_directx12_image", handle.index, handle.generation);
 
-    if (!uploads || uploadCount == 0)
+    if (!uploads && uploadCount != 0)
         return invalidResult("upload_directx12_image", uploadCount);
     auto operation = pinPublicResource<ImageResourceTag>(*device, device->images, image);
     if (operation.isErr())
@@ -1326,6 +1326,8 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned)
         return invalidResult("upload_directx12_image", image.index, image.generation);
+    if (uploadCount == 0)
+        return Result<void, RhiError>{ok()};
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
     if (!vernon::rhi::validImageShape(descriptor))
         return invalidResult("upload_directx12_image", image.index, image.generation);

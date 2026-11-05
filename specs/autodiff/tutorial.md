@@ -44,8 +44,8 @@ a reverse graph from host pass descriptors, and Python does not construct a
 second execution topology.
 
 At load time, Runtime resolves Program and ArtifactSystem into `ResolvedProgram`.
-The forward and backward graphs then lower to the private C++ Command DAG for
-hazard analysis, barriers, render-scope formation, and submission.
+The forward and backward graphs then link as two schedules, which own hazard
+analysis, barriers, render-scope formation, and submission.
 
 ## 3. Residuals and pullback lifetime
 
@@ -116,7 +116,7 @@ gradients = pullback(output_cotangent)
 ```
 
 It compiles through the same typed Stage and Program contracts and uses the
-same bundle → executable → instance → invocation lifecycle as Module VJP.
+same bundle → executable → linked VJP lifecycle as Module VJP.
 Endpoint semantics come from reflected Program boundaries rather than node
 count, names, or Storage ownership.
 

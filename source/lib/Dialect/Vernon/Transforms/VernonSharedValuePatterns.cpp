@@ -289,19 +289,23 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
             return success();
         }
         if (name == "min" || name == "max" || name == "pow" || name == "clamp") {
+            // min(a, b) is a < b ? a : b and max(a, b) is a > b ? a : b, as compiled host code computes them: a
+            // NaN or an equal operand selects b. x86 minsd/maxsd implement exactly this, while arith.minimumf
+            // needs NaN and signed-zero fixups around them.
+            auto pick = [&](arith::CmpFPredicate predicate, Value lhs, Value rhs) -> Value {
+                Value picked = arith::CmpFOp::create(rewriter, location, predicate, lhs, rhs);
+                return arith::SelectOp::create(rewriter, location, picked, lhs, rhs);
+            };
             Value result;
             if (name == "min")
-                result =
-                    arith::MinimumFOp::create(rewriter, location, adaptor.getOperands()[0], adaptor.getOperands()[1]);
+                result = pick(arith::CmpFPredicate::OLT, adaptor.getOperands()[0], adaptor.getOperands()[1]);
             else if (name == "max")
-                result =
-                    arith::MaximumFOp::create(rewriter, location, adaptor.getOperands()[0], adaptor.getOperands()[1]);
+                result = pick(arith::CmpFPredicate::OGT, adaptor.getOperands()[0], adaptor.getOperands()[1]);
             else if (name == "pow")
                 result = math::PowFOp::create(rewriter, location, adaptor.getOperands()[0], adaptor.getOperands()[1]);
             else {
-                Value maximum =
-                    arith::MaximumFOp::create(rewriter, location, adaptor.getOperands()[0], adaptor.getOperands()[1]);
-                result = arith::MinimumFOp::create(rewriter, location, maximum, adaptor.getOperands()[2]);
+                Value maximum = pick(arith::CmpFPredicate::OGT, adaptor.getOperands()[0], adaptor.getOperands()[1]);
+                result = pick(arith::CmpFPredicate::OLT, maximum, adaptor.getOperands()[2]);
             }
             rewriter.replaceOp(op, result);
             return success();

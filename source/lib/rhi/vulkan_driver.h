@@ -78,6 +78,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdBindPipeline cmdBindPipeline{};
     PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets{};
     PFN_vkCmdDispatch cmdDispatch{};
+    PFN_vkCmdDispatchIndirect cmdDispatchIndirect{};
     PFN_vkCreateImage createImage{};
     PFN_vkDestroyImage destroyImage{};
     PFN_vkGetImageMemoryRequirements getImageMemoryRequirements{};
@@ -108,15 +109,46 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer{};
     PFN_vkCmdDraw cmdDraw{};
     PFN_vkCmdDrawIndexed cmdDrawIndexed{};
+    PFN_vkCmdDrawIndexedIndirect cmdDrawIndexedIndirect{};
+    // Null unless the device enabled VK_KHR_draw_indirect_count.
+    PFN_vkCmdDrawIndexedIndirectCount cmdDrawIndexedIndirectCount{};
     PFN_vkCmdPushConstants cmdPushConstants{};
     PFN_vkCreateQueryPool createQueryPool{};
     PFN_vkDestroyQueryPool destroyQueryPool{};
     PFN_vkCmdResetQueryPool cmdResetQueryPool{};
     PFN_vkCmdWriteTimestamp cmdWriteTimestamp{};
     PFN_vkGetQueryPoolResults getQueryPoolResults{};
+    PFN_vkCreateSemaphore createSemaphore{};
+    PFN_vkDestroySemaphore destroySemaphore{};
+    // Null unless the instance enabled VK_KHR_surface.
+    PFN_vkDestroySurfaceKHR destroySurface{};
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR getPhysicalDeviceSurfaceSupport{};
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR getPhysicalDeviceSurfaceCapabilities{};
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR getPhysicalDeviceSurfaceFormats{};
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getPhysicalDeviceSurfacePresentModes{};
+    // The platform's surface constructor, such as vkCreateWin32SurfaceKHR; null unless the instance enabled
+    // `platformSurfaceExtension`. Its type needs the platform's headers, which only createPlatformSurface includes.
+    PFN_vkVoidFunction createPlatformSurface{};
+    // Null unless the device enabled VK_KHR_swapchain.
+    PFN_vkCreateSwapchainKHR createSwapchain{};
+    PFN_vkDestroySwapchainKHR destroySwapchain{};
+    PFN_vkGetSwapchainImagesKHR getSwapchainImages{};
+    PFN_vkAcquireNextImageKHR acquireNextImage{};
+    PFN_vkQueuePresentKHR queuePresent{};
 };
 
 VERNON_RHI_CAPI Driver &driver();
+
+// The instance extension that creates surfaces for the platform's windows, or null where the RHI presents none.
+#if defined(_WIN32)
+inline constexpr const char *platformSurfaceExtension = "VK_KHR_win32_surface";
+#else
+inline constexpr const char *platformSurfaceExtension = nullptr;
+#endif
+
+// Creates a surface for the platform window `descriptor` names, with the instance's platform surface extension.
+VERNON_RHI_CAPI bool createPlatformSurface(VkInstance instance, const VernonRhiSurfaceDescriptor &descriptor,
+                                           VkSurfaceKHR &surface, std::string &error);
 
 } // namespace vernon::rhi::vulkan
 

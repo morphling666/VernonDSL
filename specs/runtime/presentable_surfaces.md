@@ -154,8 +154,9 @@ VernonRhiStatus vernonRhiDeviceDestroySurface(VernonRhiDevice, VernonRhiSurface)
   minimized window has a zero extent; the host skips the window's frame
   until it resizes. A failed configure keeps the previous images.
 - Acquire may block until the swapchain returns an image, which is how
-  `FIFO` paces a frame. With `N` submissions in flight
-  (`pipelined_submission.md` section 14.3), `image_count` of at least
+  `FIFO` paces a frame. With `N` calls in flight, which the application
+  paces on their timeline points (`architecture_v2.md` section 8),
+  `image_count` of at least
   `N + 1` keeps acquire from waiting for the GPU as well.
 - Acquire and present return `SURFACE_OUT_OF_DATE` after a resize the
   swapchain can no longer serve. A failed acquire leaves no image acquired;

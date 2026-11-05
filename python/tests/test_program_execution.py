@@ -500,7 +500,7 @@ class ProgramExecutionTests(unittest.TestCase):
         )["source"]
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
 
-    def test_module_vjp_retains_signed_stride_view_layout(self) -> None:
+    def test_module_vjp_of_a_signed_stride_view_has_an_owner_shaped_gradient(self) -> None:
         case = case_by_id("LANG-PAIR-011/vjp-signed-stride-view")
         owner = vd.storage.from_numpy(np.array([10.0, 2.0, 20.0, 3.0], dtype=np.float32))
         source = owner.view(shape=(2,), strides=(-2,), offset=3, access="read")
@@ -669,19 +669,24 @@ class ProgramExecutionTests(unittest.TestCase):
 @expand_backend_matrix_tests
 class ProgramGpuExecutionTests(unittest.TestCase):
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
-    def test_failed_staged_execution_preserves_untouched_destination(self, backend: BackendRow) -> None:
+    def test_failed_device_write_poisons_its_destination_until_a_host_overwrite(self, backend: BackendRow) -> None:
         from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
 
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
 
-        _native._testing_set_program_failure("completion")
+        _native._testing_fail_schedule_waits(1)
         try:
+            program_increment(output, source, grid=(1, 1, 1))
             with self.assertRaisesRegex(RuntimeError, "wait failure"):
-                program_increment(output, source, grid=(1, 1, 1))
+                output.to_numpy()
         finally:
-            _native._testing_set_program_failure("")
-        np.testing.assert_array_equal(output.to_numpy(), np.array([0.0], dtype=np.float32))
+            _native._testing_fail_schedule_waits(0)
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            output.to_numpy()
+        np.testing.assert_array_equal(source.to_numpy(), np.array([2.0], dtype=np.float32))
+        output.copy_from_numpy(np.array([5.0], dtype=np.float32))
+        np.testing.assert_array_equal(output.to_numpy(), np.array([5.0], dtype=np.float32))
 
     @backend_matrix_test(
         BackendRequirements(
@@ -701,12 +706,12 @@ class ProgramGpuExecutionTests(unittest.TestCase):
             usage=("storage", "transfer_source", "transfer_destination"),
         )
         marker = vd.storage.from_numpy(np.array([7.0], dtype=np.float32))
-        _native._testing_set_program_failure("completion")
+        _native._testing_fail_schedule_waits(1)
         try:
             with self.assertRaisesRegex(RuntimeError, "wait failure"):
                 TextureRoundTrip()(image, marker)
         finally:
-            _native._testing_set_program_failure("")
+            _native._testing_fail_schedule_waits(0)
         with self.assertRaisesRegex(RuntimeError, "poisoned"):
             image.to_numpy()
         image.upload(np.zeros((2, 2, 2, 4), dtype=np.float32))
@@ -752,53 +757,40 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         np.testing.assert_array_equal(output.to_numpy(), np.arange(16, dtype=np.float32) + 1.0)
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
-    def test_gpu_module_reuses_unchanged_value_and_storage_bindings(self, backend: BackendRow) -> None:
+    def test_gpu_module_rereads_changed_values_and_storage(self, backend: BackendRow) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
         output = vd.storage.from_numpy(np.full(4, -1.0, dtype=np.float32))
         module = PersistentlyBoundIncrement()
 
         first = module(output, source, np.float32(2.0)).to_numpy().copy()
-        specialization = next(iter(module._program_cache._partition(vd.current_session()).snapshot.values()))
-        first_telemetry = dict(specialization.native_program.binding_telemetry)
         unchanged = module(output, source, np.float32(2.0)).to_numpy().copy()
-        unchanged_telemetry = dict(specialization.native_program.binding_telemetry)
         changed = module(output, source, np.float32(5.0)).to_numpy().copy()
-        changed_telemetry = dict(specialization.native_program.binding_telemetry)
         source.copy_from_numpy(np.arange(4, dtype=np.float32) + 10.0)
         dirty_storage = module(output, source, np.float32(5.0)).to_numpy().copy()
-        dirty_telemetry = dict(specialization.native_program.binding_telemetry)
-
         np.testing.assert_array_equal(first, np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(unchanged, np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(changed, np.arange(4, dtype=np.float32) + 5.0)
         np.testing.assert_array_equal(dirty_storage, np.arange(4, dtype=np.float32) + 15.0)
-        self.assertEqual(unchanged_telemetry["prepare_count"] - first_telemetry["prepare_count"], 0)
-        self.assertEqual(unchanged_telemetry["upload_bytes"] - first_telemetry["upload_bytes"], 0)
-        self.assertEqual(unchanged_telemetry["upload_ranges"] - first_telemetry["upload_ranges"], 0)
-        self.assertEqual(changed_telemetry["prepare_count"] - unchanged_telemetry["prepare_count"], 1)
-        self.assertEqual(changed_telemetry["upload_bytes"] - unchanged_telemetry["upload_bytes"], 4)
-        self.assertEqual(changed_telemetry["upload_ranges"] - unchanged_telemetry["upload_ranges"], 1)
-        self.assertEqual(dirty_telemetry["prepare_count"] - changed_telemetry["prepare_count"], 0)
-        self.assertEqual(
-            dirty_telemetry["upload_bytes"] - changed_telemetry["upload_bytes"],
-            source.to_numpy().nbytes,
-        )
-        self.assertEqual(dirty_telemetry["upload_ranges"] - changed_telemetry["upload_ranges"], 1)
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
-    def test_failed_vjp_forward_preserves_staged_destination(self, backend: BackendRow) -> None:
+    def test_failed_vjp_forward_poisons_its_output_until_a_host_overwrite(self, backend: BackendRow) -> None:
         from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
 
         source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         transformed = vd.ad.vjp(program_square, wrt=("source",), outputs=("output",))
-        _native._testing_set_program_failure("completion")
+        _native._testing_fail_schedule_waits(1)
         try:
+            transformed(source, output, grid=(1, 1, 1))
             with self.assertRaisesRegex(RuntimeError, "wait failure"):
-                transformed(source, output, grid=(1, 1, 1))
+                output.to_numpy()
         finally:
-            _native._testing_set_program_failure("")
-        np.testing.assert_array_equal(output.to_numpy(), np.zeros((1,), dtype=np.float32))
+            _native._testing_fail_schedule_waits(0)
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            output.to_numpy()
+        np.testing.assert_array_equal(source.to_numpy(), np.array([3.0], dtype=np.float32))
+        output.copy_from_numpy(np.array([5.0], dtype=np.float32))
+        np.testing.assert_array_equal(output.to_numpy(), np.array([5.0], dtype=np.float32))
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
     def test_failed_pullback_keeps_inputs_readable_and_can_retry(self, backend: BackendRow) -> None:
@@ -807,12 +799,13 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         _, pullback = vd.ad.vjp(program_square, wrt=("source",), outputs=("output",))(source, output, grid=(1, 1, 1))
-        _native._testing_set_program_failure("completion")
+        output.to_numpy()
+        _native._testing_fail_schedule_waits(1)
         try:
             with self.assertRaisesRegex(RuntimeError, "wait failure"):
-                pullback(None)
+                pullback(None)["source"].to_numpy()
         finally:
-            _native._testing_set_program_failure("")
+            _native._testing_fail_schedule_waits(0)
         np.testing.assert_array_equal(source.to_numpy(), np.array([3.0], dtype=np.float32))
         np.testing.assert_array_equal(
             pullback(None)["source"].to_numpy(),
@@ -838,7 +831,7 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
-    def test_gpu_pullback_releases_inputs_owned_by_native_snapshots(self, backend: BackendRow) -> None:
+    def test_gpu_pullback_ignores_writes_to_inputs_it_does_not_read(self, backend: BackendRow) -> None:
         unrelated = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
         _, pullback = vd.ad.vjp(
@@ -848,7 +841,6 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         )(unrelated, source)
 
         unrelated.copy_from_numpy(np.array([11.0], dtype=np.float32))
-        source.copy_from_numpy(np.array([13.0], dtype=np.float32))
         gradient = pullback({"square": np.ones((1,), dtype=np.float32)})["source"]
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([4.0], dtype=np.float32))
 

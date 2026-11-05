@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -32,8 +33,9 @@ struct WindowReader {
     void(VERNON_TEST_GL_CALL *readPixels)(int, int, int, int, unsigned, unsigned, void *){};
 };
 
-// The surface presents the device context's window, and reports a drawable size the test sets, so a resize needs no
-// window system. Every swap first reads the window's back buffer, which holds what present blitted.
+// On OpenGL the surface presents the device context's window, and reports a drawable size the test sets, so a resize
+// needs no window system. Every swap first reads the window's back buffer, which holds what present blitted. On
+// Vulkan it presents a hidden native window, which a resize resizes.
 class RhiSurface : public testing::TestWithParam<vernon::tests::BackendTestRow> {
 protected:
     void SetUp() override {
@@ -66,6 +68,11 @@ protected:
             };
             ASSERT_NO_FATAL_FAILURE(loadWindowReader(*runtime_.openglContext()));
         }
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE) && defined(_WIN32)
+        if (*GetParam().rhi == VERNON_RHI_BACKEND_VULKAN)
+            for (auto &window : nativeWindows_)
+                window = std::make_unique<vernon::host::GlfwWindowOwner>(kWidth, kHeight);
+#endif
     }
 
     VernonRhiDevice device() { return runtime_.context().device; }
@@ -74,14 +81,29 @@ protected:
         VernonRhiSurfaceDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.backend = backend;
-        descriptor.native.opengl = &callbacks_;
-        return vernonRhiDeviceCreateSurface(device(), &descriptor, &surface);
+        if (backend != VERNON_RHI_BACKEND_VULKAN)
+            descriptor.native.opengl = &callbacks_;
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        else if (presentsNativeWindow())
+            descriptor.native.win32_window = nativeWindows_[surfacesCreated_ % nativeWindows_.size()]->win32Window();
+#endif
+        const VernonRhiStatus status = vernonRhiDeviceCreateSurface(device(), &descriptor, &surface);
+        surfacesCreated_ += status == VERNON_RHI_STATUS_OK ? 1 : 0;
+        return status;
     }
 
-    // Surfaces exist only on OpenGL so far; every other backend must reject them.
+    bool presentsNativeWindow() const {
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        return nativeWindows_.front() != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    // A backend whose window this test cannot open must reject surfaces.
     bool createSurfaceOrExpectUnsupported(VernonRhiSurface &surface) {
         const VernonRhiStatus status = createSurface(surface, *GetParam().rhi);
-        if (!window_) {
+        if (!window_ && !presentsNativeWindow()) {
             EXPECT_EQ(status, VERNON_RHI_STATUS_UNSUPPORTED);
             return false;
         }
@@ -204,6 +226,15 @@ protected:
         return result;
     }
 
+    void resizeWindow(uint32_t width, uint32_t height) {
+        drawableWidth_ = width;
+        drawableHeight_ = height;
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        if (presentsNativeWindow())
+            nativeWindows_.front()->resize(width, height);
+#endif
+    }
+
     uint32_t drawableWidth_{kWidth};
     uint32_t drawableHeight_{kHeight};
     // The window's bottom-left kWidth x kHeight texels at the last swap, rows from the bottom of the window.
@@ -255,6 +286,12 @@ private:
     vernon::tests::BackendRuntimeOwner runtime_;
     std::optional<VernonOpenGLSurfaceCallbacks> window_;
     VernonOpenGLSurfaceCallbacks callbacks_{};
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+    // One swapchain may present a window, so each surface a test creates takes the next window; the first surface
+    // takes the first, which `resizeWindow` resizes.
+    std::array<std::unique_ptr<vernon::host::GlfwWindowOwner>, 2> nativeWindows_;
+#endif
+    size_t surfacesCreated_{};
 };
 
 TEST_P(RhiSurface, PresentsClearedImagesThatReadBackExactly) {
@@ -267,7 +304,11 @@ TEST_P(RhiSurface, PresentsClearedImagesThatReadBackExactly) {
     ASSERT_EQ(capabilities.format_count, 1u);
     EXPECT_EQ(capabilities.formats[0], VERNON_RHI_FORMAT_RGBA8_UNORM);
     EXPECT_EQ(capabilities.usage, VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE);
-    EXPECT_EQ(capabilities.present_modes, 0b111u);
+    // A native window supports the modes its driver lists, and FIFO always.
+    if (presentsNativeWindow())
+        EXPECT_NE(capabilities.present_modes & (1u << VERNON_RHI_PRESENT_FIFO), 0u);
+    else
+        EXPECT_EQ(capabilities.present_modes, 0b111u);
     EXPECT_EQ(capabilities.current_width, kWidth);
     EXPECT_EQ(capabilities.current_height, kHeight);
     const VernonRhiSurfaceConfiguration configured = configuration(2);
@@ -328,10 +369,13 @@ TEST_P(RhiSurface, PresentShowsTheImageTopRowAtTheTopOfTheWindow) {
 
     ASSERT_EQ(vernonRhiSurfacePresent(device(), surface), VERNON_RHI_STATUS_OK)
         << vernon::test::text(vernonRhiDeviceGetLastError(device()));
-    EXPECT_EQ(windowReadError_, 0u);
-    std::vector<uint8_t> windowRows = bottomRow;
-    windowRows.insert(windowRows.end(), topRow.begin(), topRow.end());
-    EXPECT_EQ(windowTexels_, windowRows);
+    // A native window's swapchain images cannot be read back.
+    if (!presentsNativeWindow()) {
+        EXPECT_EQ(windowReadError_, 0u);
+        std::vector<uint8_t> windowRows = bottomRow;
+        windowRows.insert(windowRows.end(), topRow.begin(), topRow.end());
+        EXPECT_EQ(windowTexels_, windowRows);
+    }
     EXPECT_EQ(vernonRhiDeviceDestroySurface(device(), surface), VERNON_RHI_STATUS_OK);
 }
 
@@ -452,7 +496,9 @@ TEST_P(RhiSurface, RejectsDescriptorsAndConfigurationsOutsideTheCapabilities) {
     if (!createSurfaceOrExpectUnsupported(surface))
         return;
     VernonRhiSurface mismatched{};
-    EXPECT_EQ(createSurface(mismatched, VERNON_RHI_BACKEND_VULKAN), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    const VernonRhiBackend other =
+        *GetParam().rhi == VERNON_RHI_BACKEND_VULKAN ? VERNON_RHI_BACKEND_OPENGL : VERNON_RHI_BACKEND_VULKAN;
+    EXPECT_EQ(createSurface(mismatched, other), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 
     VernonRhiSurfaceConfiguration zeroExtent = configuration(1, 0, kHeight);
     EXPECT_EQ(vernonRhiSurfaceConfigure(device(), surface, &zeroExtent), VERNON_RHI_STATUS_INVALID_ARGUMENT);
@@ -487,8 +533,7 @@ TEST_P(RhiSurface, ReportsOutOfDateAfterAResizeUntilConfiguredAgain) {
     ASSERT_EQ(acquire(surface, image), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiSurfacePresent(device(), surface), VERNON_RHI_STATUS_OK);
 
-    drawableWidth_ = 2 * kWidth;
-    drawableHeight_ = 3 * kHeight;
+    resizeWindow(2 * kWidth, 3 * kHeight);
     EXPECT_EQ(acquire(surface, image), VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE);
     EXPECT_EQ(vernonRhiSurfacePresent(device(), surface), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     VernonRhiSurfaceCapabilities capabilities{};

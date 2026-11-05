@@ -127,13 +127,27 @@ vernon_add_program_asset(
     "${_vernon_repository_root}/examples/shader_lib/fullscreen.py"
     MANIFEST_VARIABLE
     _vernon_graphics_manifest)
+vernon_add_program_asset(
+    vernon-external-engine-panel
+    SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/panel_pipeline.py:asset"
+    TARGET
+    ${_vernon_graphics_target}
+    OUTPUT_DIRECTORY
+    "${_vernon_cooked_root}/panel"
+    COOK_OPTIONS
+    ${_vernon_graphics_cook_options}
+    MANIFEST_VARIABLE
+    _vernon_panel_manifest)
 
 if(EMSCRIPTEN)
     set(_vernon_cpu_runtime_dir "/vernon-cpu-bundle")
     set(_vernon_graphics_runtime_dir "/vernon-graphics-bundle")
+    set(_vernon_panel_runtime_dir "/vernon-panel-bundle")
 else()
     set(_vernon_cpu_runtime_dir "${_vernon_cooked_root}/fractal")
     set(_vernon_graphics_runtime_dir "${_vernon_cooked_root}/mandelbulb")
+    set(_vernon_panel_runtime_dir "${_vernon_cooked_root}/panel")
 endif()
 set(_vernon_embedded_bundles "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_bundles.h")
 add_custom_command(
@@ -142,9 +156,11 @@ add_custom_command(
         "${CMAKE_COMMAND}" "-DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/embedded_bundles.h.in"
         "-DOUTPUT=${_vernon_embedded_bundles}" "-DCPU_MANIFEST=${_vernon_cpu_manifest}"
         "-DCPU_RUNTIME_DIR=${_vernon_cpu_runtime_dir}" "-DGRAPHICS_MANIFEST=${_vernon_graphics_manifest}"
-        "-DGRAPHICS_RUNTIME_DIR=${_vernon_graphics_runtime_dir}" -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_bundles.cmake"
+        "-DGRAPHICS_RUNTIME_DIR=${_vernon_graphics_runtime_dir}" "-DPANEL_MANIFEST=${_vernon_panel_manifest}"
+        "-DPANEL_RUNTIME_DIR=${_vernon_panel_runtime_dir}" -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_bundles.cmake"
     DEPENDS "${_vernon_cpu_manifest}"
             "${_vernon_graphics_manifest}"
+            "${_vernon_panel_manifest}"
             "${CMAKE_CURRENT_SOURCE_DIR}/embedded_bundles.h.in"
             "${CMAKE_CURRENT_SOURCE_DIR}/embed_bundles.cmake"
     COMMENT "Embedding cooked Program manifests"
@@ -162,9 +178,9 @@ target_include_directories(vernon-external-engine PRIVATE "${CMAKE_CURRENT_BINAR
 target_link_libraries(
     vernon-external-engine
     PRIVATE VernonRuntime
-            Vernon::RHI
             vernon-external-engine-fractal
-            vernon-external-engine-mandelbulb)
+            vernon-external-engine-mandelbulb
+            vernon-external-engine-panel)
 if(NOT EMSCRIPTEN)
     target_link_libraries(vernon-external-engine PRIVATE glfw)
 endif()
@@ -180,7 +196,8 @@ if(EMSCRIPTEN)
         "-sFULL_ES3=1"
         "-sUSE_GLFW=3"
         "--embed-file=${_vernon_cooked_root}/fractal@${_vernon_cpu_runtime_dir}"
-        "--embed-file=${_vernon_cooked_root}/mandelbulb@${_vernon_graphics_runtime_dir}")
+        "--embed-file=${_vernon_cooked_root}/mandelbulb@${_vernon_graphics_runtime_dir}"
+        "--embed-file=${_vernon_cooked_root}/panel@${_vernon_panel_runtime_dir}")
     add_custom_command(
         TARGET vernon-external-engine
         POST_BUILD

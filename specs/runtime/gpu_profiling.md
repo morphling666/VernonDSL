@@ -2,9 +2,7 @@
 
 Status: labels (section 2) and timings (section 3) implemented (Engine
 extension E8, profiling), and the engine uses them as section 5 describes;
-awaiting the `PROGRAM_VERSION` cut. Metal is unverified on hardware. Timings
-depend on [`pipelined_submission.md`](pipelined_submission.md) for timing
-readback. The
+awaiting the `PROGRAM_VERSION` cut. Metal is unverified on hardware. The
 cut amends the contracts listed in section 7.
 
 A renderer is profiled by pass and inspected by draw: a capture tool
@@ -22,7 +20,7 @@ Nodes and every backend, not only graphics.
 - **Labels only per Node.** Captures of a forward pass with hundreds of draws
   are unreadable without groups inside the pass, and adding recording
   commands later would change the recording format.
-- **Timestamps on every invocation by default.** Query writes and readback
+- **Timestamps on every call by default.** Query writes and readback
   cost GPU and CPU time; profiling is opt-in.
 - **Disabling scope fusion while profiling.** It would measure a different
   schedule from the one that ships.
@@ -107,32 +105,29 @@ ends, and Finish fails while a group is open.
 
 ## 3. Timings
 
-- `ProgramInvocationOptions` gains `timings`. When set, Execute measures the
-  device time of each timed scope.
+- `vernonScheduleSetTimings(schedule, enabled)` makes the schedule's later
+  calls measure the device time of each timed scope; timing is off by
+  default.
 - A timed scope is one native render scope or one compute Node, which is the
   finest unit every backend can time: tile GPUs sample counters only at
   render-scope boundaries (Metal `MTLCounterSamplingPointAtStageBoundary`).
-- `vernonSubmissionGetScopeTimings(submission, scopes, capacity, count)` fills
-  `VernonScopeTiming { first_node, node_count, device_submission,
-  begin_nanoseconds, end_nanoseconds }` in execution order. An unfused Node is
-  a scope with `node_count` 1; fused Nodes appear as one scope, and Node ids
-  are contiguous in execution order (`../program/execution_manifest.md`
-  section 10). The result describes the schedule that ran.
-- Begin and end are measured from the first scope's begin of the same
-  `device_submission`, the index of the device submission among those the
-  Execute made. A plain Execute makes one; an autodiff pullback replays and
-  retries its tape in further device submissions, whose scopes carry the Node
-  ids of the graph each ran. Clocks of different device submissions are not
-  related; calibrating them to the host clock is a later extension.
-- Timings are a completion fact, so they belong to the submission
-  (`pipelined_submission.md` section 2), not the invocation: the getter
-  returns `VERNON_STATUS_NOT_READY` while the submission is pending and stays
-  valid until the submission is destroyed. A failed submission reports
-  `VERNON_STATUS_INTERNAL_ERROR` instead of the scopes of the device
-  submissions that finished before the failure: like the RHI's timers, scope
-  timings describe only work that succeeded. A renderer with frames in flight
-  destroys each invocation after commit and reads frame `f - N` from the
-  submission it waits on.
+- `vernonScheduleGetScopeTimings(schedule, point, scopes, capacity, count)`
+  fills `VernonScopeTiming { first_node, node_count, begin_nanoseconds,
+  end_nanoseconds }` in execution order for the call that signalled `point`.
+  An unfused Node is a scope with `node_count` 1; fused Nodes appear as one
+  scope, and Node ids are contiguous in execution order
+  (`../program/execution_manifest.md` section 10). The result describes the
+  schedule that ran.
+- A call is one device submission, so begin and end are measured from the
+  begin of the call's first scope on one clock. Calibrating that clock to the
+  host clock is a later extension.
+- Timings are a completion fact, so they belong to the call's timeline point
+  (`architecture_v2.md` section 8): the getter returns
+  `VERNON_STATUS_NOT_READY` until a `vernonScheduleWait` for the point
+  returned, and a device keeps only its latest few calls' timings. A failed
+  call reports no scopes: like the RHI's timers, scope timings describe only
+  work that succeeded. A renderer with frames in flight reads frame `f - N`
+  from the point it waits on.
 - RHI: `vernonRhiCommandEncoderBeginTimer(encoder, &timer)` and
   `vernonRhiCommandEncoderEndTimer(encoder, timer)` bracket commands outside
   rendering scopes, and `vernonRhiCompletionGetTimers(completion, spans,
@@ -173,21 +168,26 @@ ends, and Finish fails while a group is open.
 - A backend without timing support (GL ES without
   `EXT_disjoint_timer_query`, Vulkan without timestamp bits, Metal without
   stage-boundary sampling) reports `VERNON_STATUS_UNSUPPORTED_TARGET` from the
-  getter; Execute never fails for lack of timing support. An Execute that did
-  not request `timings` reports no scopes.
+  getter; a call never fails for lack of timing support. A call made while
+  timing was off reports `VERNON_STATUS_UNSUPPORTED_TARGET` too.
+- The CPU device times each dispatch with the host steady clock. A timed CUDA
+  call launches on the
+  stream with an event pair around each dispatch rather than replaying its
+  CUDA graph, so its spans include the per-launch gaps the graph replay
+  avoids. Event record nodes in the graph would time the replay itself; they
+  wait until a profile needs that precision.
 
 ## 4. Telemetry
 
-`VernonProgramGraphicsNodeTelemetry` is unchanged: counts are CPU facts known
-at Execute; times are device facts known at completion and have their own
-getter.
+`vernonScheduleGetGraphicsTelemetry` reports the render scopes and draws of a
+schedule's last call: counts are CPU facts known when the call returns; times
+are device facts known at completion and have their own getter.
 
 ## 5. Engine use (non-normative)
 
 The FrameGraph labels its nodes `depth`, `forward` and `display`, groups
 forward draws by material instance, and reports the timed scopes of frame
-`f - 2`, the submission it waits on before recording frame `f`, in its
-telemetry.
+`f - 2`, the call it waits on before calling frame `f`, in its telemetry.
 
 ## 6. Acceptance
 
@@ -201,26 +201,24 @@ Labels, on every backend with graphics support and on CUDA for compute:
 
 Timings, on every backend:
 
-4. With `timings`, each scope reports `begin <= end`, and a scope that does
-   100 times the work of another reports a longer span.
-5. Without `timings`, Execute creates no queries or events.
+4. With timings enabled, each scope reports `begin <= end`, and a scope that
+   does 100 times the work of another reports a longer span.
+5. With timings disabled, a call creates no queries or events.
 6. Fused Nodes appear as one scope with `node_count` greater than 1.
-7. An asynchronous submission's scopes report `NOT_READY` until it completes
-   and remain readable after its invocation is destroyed.
+7. A call's scopes report `NOT_READY` until a wait for its point returns.
 
 ## 7. Contract changes on acceptance
 
-- [`design.md`](design.md): Execute emits debug groups and optional timings
-  (applied in section 8); the RHI functions of sections 2 and 3.
+- [`design.md`](design.md): schedule calls emit debug groups and optional
+  timings (applied in section 8); the RHI functions of sections 2 and 3.
 - [`../program/recorded_draws.md`](../program/recorded_draws.md): the
   recording gains the three debug commands and the balance rule (applied).
 - [`../program/execution_manifest.md`](../program/execution_manifest.md):
   `name` is also the debug label (applied).
-- `VernonRuntime.h` and `VernonRHI.h` (`PROGRAM_VERSION`): the label
-  functions, command kinds and `AddProgram` label are in place, as are the
-  `timings` option, which takes a reserved slot of
-  `VernonProgramInvocationOptions` so that its version stays 1,
-  `vernonSubmissionGetScopeTimings` and the RHI timer functions.
+- `VernonRuntime.h`, `VernonSchedule.h` and `VernonRHI.h`
+  (`PROGRAM_VERSION`): the label functions, command kinds and `AddProgram`
+  label are in place, as are `vernonScheduleSetTimings`,
+  `vernonScheduleGetScopeTimings` and the RHI timer functions.
 
 ## 8. Future work: deferred replay on GL and CUDA
 

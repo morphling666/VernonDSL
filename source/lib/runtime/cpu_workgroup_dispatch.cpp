@@ -21,6 +21,16 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace vernon::runtime {
 namespace {
 
@@ -30,6 +40,8 @@ constexpr size_t kImplementationMaxThreadBudget = 4096;
 constexpr uint64_t kPullbackAllocationSiteBit = uint64_t{1} << 63;
 
 thread_local std::string schedulerDiagnostic;
+// A pool worker's index in creation order; other threads have none.
+thread_local size_t workerOrdinal = std::numeric_limits<size_t>::max();
 
 bool checkedVolume(const uint32_t dimensions[3], size_t &volume) {
     volume = 1;
@@ -49,6 +61,13 @@ size_t environmentSize(const char *name, size_t fallback) noexcept {
     const char *end = value + std::strlen(value);
     const auto result = std::from_chars(value, end, parsed);
     return result.ec == std::errc{} && result.ptr == end && parsed ? parsed : fallback;
+}
+
+// Whether worker N runs only on logical processor N (Windows only), and span dispatches give it the same region of
+// groups every time, so repeated dispatches over the same data find it in that processor's caches.
+bool pinWorkers() noexcept {
+    static const bool pinned = environmentSize("VERNON_CPU_PIN_WORKERS", 0) != 0;
+    return pinned;
 }
 
 struct SharedAllocation {
@@ -442,6 +461,19 @@ protected:
         return true;
     }
 
+    bool recordFailure(VernonStatus failureStatus, std::string diagnostic) noexcept {
+        int expected = VERNON_STATUS_OK;
+        if (!status_.compare_exchange_strong(expected, failureStatus, std::memory_order_acq_rel,
+                                             std::memory_order_relaxed))
+            return false;
+        try {
+            std::lock_guard lock(diagnosticMutex_);
+            diagnostic_ = std::move(diagnostic);
+        } catch (...) {
+        }
+        return true;
+    }
+
 private:
     void completeTask() noexcept {
         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -684,6 +716,81 @@ private:
     std::atomic<size_t> nextRunnerOrdinal_{};
 };
 
+// Runners claim spans of whole workgroups until none remain, so uneven groups balance; a claim is an eighth of a
+// runner's even share, which bounds both the claims and the imbalance.
+// Threads claim spans of groups as they finish the last, since kernels whose cost varies per lane leave a static
+// partition unbalanced. A span is about an eighth of a runner's share, which bounds the tail. With pinned workers the
+// groups are split into one contiguous region per runner: worker N claims spans of region N first and then of the
+// others, so a dispatch over the same data runs most of each region on the processor that ran it last time.
+class GroupSpanJob final : public CompletedJob {
+public:
+    GroupSpanJob(size_t runners, size_t groupCount, const CpuGroupSpanCallback &callback, bool affine)
+        : CompletedJob(runners), groupCount_(groupCount), claimSize_(std::max<size_t>(1, groupCount / (runners * 8))),
+          callback_(callback), regions_(affine ? runners : 0),
+          cursors_(affine ? new std::atomic<size_t>[runners] : nullptr) {
+        for (size_t region = 0; region < regions_; ++region)
+            cursors_[region].store(regionBegin(region), std::memory_order_relaxed);
+    }
+
+    void run() noexcept override {
+        CompletionScope completion(*this);
+        if (regions_) {
+            const size_t owned = workerOrdinal < regions_ ? workerOrdinal : 0;
+            for (size_t step = 0; step < regions_ && status() == VERNON_STATUS_OK; ++step) {
+                const size_t region = (owned + step) % regions_;
+                const size_t end = regionBegin(region + 1);
+                while (status() == VERNON_STATUS_OK) {
+                    const size_t begin = cursors_[region].fetch_add(claimSize_, std::memory_order_relaxed);
+                    if (begin >= end)
+                        break;
+                    if (!runSpan(begin, std::min(begin + claimSize_, end)))
+                        return;
+                }
+            }
+            return;
+        }
+        while (status() == VERNON_STATUS_OK) {
+            const size_t begin = nextClaim_.fetch_add(claimSize_, std::memory_order_relaxed);
+            if (begin >= groupCount_)
+                return;
+            if (!runSpan(begin, std::min(begin + claimSize_, groupCount_)))
+                return;
+        }
+    }
+
+private:
+    bool runSpan(size_t begin, size_t end) noexcept {
+        {
+            VernonStatus spanStatus = VERNON_STATUS_INTERNAL_ERROR;
+            try {
+                spanStatus = callback_(begin, end);
+            } catch (...) {
+            }
+            if (spanStatus != VERNON_STATUS_OK) {
+                try {
+                    recordFailure(spanStatus, "CPU workgroups [" + std::to_string(begin) + ", " + std::to_string(end) +
+                                                  ") failed (status " + std::to_string(spanStatus) + ")");
+                } catch (...) {
+                    recordFailure(spanStatus, std::string());
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t groupCount_{};
+    size_t claimSize_{};
+    const CpuGroupSpanCallback &callback_;
+    std::atomic<size_t> nextClaim_{};
+    size_t regions_{};
+    std::unique_ptr<std::atomic<size_t>[]> cursors_;
+
+    size_t regionBegin(size_t region) const noexcept {
+        return groupCount_ / regions_ * region + std::min(region, groupCount_ % regions_);
+    }
+};
+
 } // namespace
 
 class CpuWorkgroupScheduler::Impl {
@@ -725,7 +832,8 @@ public:
 
     VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3], const CpuRangeCallback &callback,
                           bool forceCallingThread, size_t groupBegin = 0,
-                          size_t requestedGroupCount = std::numeric_limits<size_t>::max()) noexcept {
+                          size_t requestedGroupCount = std::numeric_limits<size_t>::max(),
+                          size_t runnerLimit = std::numeric_limits<size_t>::max()) noexcept {
         try {
             schedulerDiagnostic.clear();
             if (activeWorkgroup)
@@ -761,15 +869,17 @@ public:
                     schedulerDiagnostic = job->diagnostic();
                 return job->status();
             }
-            const size_t runners =
+            const size_t runners = std::min(
+                std::max<size_t>(runnerLimit, 1),
                 forceCallingThread || config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread
                     ? 1
                     : std::min(config_.threadBudget, groupCount > std::numeric_limits<size_t>::max() / workgroupVolume
                                                          ? config_.threadBudget
-                                                         : groupCount * workgroupVolume);
+                                                         : groupCount * workgroupVolume));
             auto job =
                 std::make_shared<RangeJob>(runners, groupBegin, groupCount, workgroupVolume, grid, workgroup, callback);
-            if (forceCallingThread || config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
+            if (runners == 1 || forceCallingThread ||
+                config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
                 job->run();
             } else {
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
@@ -797,6 +907,46 @@ public:
         }
     }
 
+    VernonStatus dispatchGroupSpans(size_t groupCount, size_t runnerLimit,
+                                    const CpuGroupSpanCallback &callback) noexcept {
+        try {
+            schedulerDiagnostic.clear();
+            if (activeWorkgroup)
+                return fail("nested CPU workgroup dispatch is unsupported", VERNON_STATUS_INVALID_ARGUMENT);
+            if (!groupCount || !callback)
+                return fail("CPU workgroup span dispatch arguments are incomplete", VERNON_STATUS_INVALID_ARGUMENT);
+            const size_t runners = config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread
+                                       ? 1
+                                       : std::min({std::max<size_t>(runnerLimit, 1), config_.threadBudget, groupCount});
+            auto job = std::make_shared<GroupSpanJob>(runners, groupCount, callback, pinWorkers());
+            if (runners == 1) {
+                job->run();
+            } else {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+                return fail("worker-pool scheduling is unavailable in the web Runtime",
+                            VERNON_STATUS_UNSUPPORTED_TARGET);
+#else
+                // Unpinned, the calling thread is one of the runners, so it claims spans instead of sleeping until
+                // they end. Pinned, every region belongs to a worker that stays on its processor, and the calling
+                // thread, which may move, only waits.
+                const size_t queued = pinWorkers() ? runners : runners - 1;
+                if (!ensureWorkers(queued) || !enqueue(job, queued))
+                    return VERNON_STATUS_INTERNAL_ERROR;
+                if (!pinWorkers())
+                    job->run();
+                job->wait();
+#endif
+            }
+            if (job->status() != VERNON_STATUS_OK)
+                schedulerDiagnostic = job->diagnostic();
+            return job->status();
+        } catch (const std::bad_alloc &) {
+            return fail("CPU workgroup scheduler ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        } catch (...) {
+            return fail("CPU workgroup scheduler failed with an unknown exception", VERNON_STATUS_INTERNAL_ERROR);
+        }
+    }
+
     const std::string &lastDiagnostic() const noexcept { return schedulerDiagnostic; }
 
 private:
@@ -812,7 +962,16 @@ private:
         try {
             workers_.reserve(required);
             while (workers_.size() < required)
-                workers_.emplace_back([this] { workerLoop(); });
+                workers_.emplace_back([this, ordinal = workers_.size()] {
+                    workerOrdinal = ordinal;
+#if defined(_WIN32)
+                    // A hint (SetThreadIdealProcessor) still lets workers drift between core complexes, which loses
+                    // most of the cache reuse that pinning buys.
+                    if (pinWorkers() && ordinal < 64)
+                        SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << ordinal);
+#endif
+                    workerLoop();
+                });
             return true;
         } catch (const std::system_error &exception) {
             fail(std::string("cannot create CPU scheduler worker: ") + exception.what(), VERNON_STATUS_INTERNAL_ERROR);
@@ -945,6 +1104,12 @@ VernonStatus CpuWorkgroupScheduler::dispatch(const uint32_t grid[3], const uint3
     return impl_->dispatch(grid, workgroup, callback, false);
 }
 
+VernonStatus CpuWorkgroupScheduler::dispatch(const uint32_t grid[3], const uint32_t workgroup[3], size_t runnerLimit,
+                                             const CpuRangeCallback &callback) noexcept {
+    return impl_->dispatch(grid, workgroup, callback, runnerLimit <= 1, 0, std::numeric_limits<size_t>::max(),
+                           runnerLimit);
+}
+
 VernonStatus CpuWorkgroupScheduler::dispatchInline(const uint32_t grid[3], const uint32_t workgroup[3],
                                                    const CpuRangeCallback &callback) noexcept {
     return impl_->dispatch(grid, workgroup, callback, true);
@@ -953,6 +1118,11 @@ VernonStatus CpuWorkgroupScheduler::dispatchInline(const uint32_t grid[3], const
 VernonStatus CpuWorkgroupScheduler::dispatchGroupInline(const uint32_t grid[3], const uint32_t workgroup[3],
                                                         size_t groupLinear, const CpuRangeCallback &callback) noexcept {
     return impl_->dispatch(grid, workgroup, callback, true, groupLinear, 1);
+}
+
+VernonStatus CpuWorkgroupScheduler::dispatchGroupSpans(size_t groupCount, size_t runnerLimit,
+                                                       const CpuGroupSpanCallback &callback) noexcept {
+    return impl_->dispatchGroupSpans(groupCount, runnerLimit, callback);
 }
 
 const std::string &CpuWorkgroupScheduler::lastDiagnostic() const noexcept { return impl_->lastDiagnostic(); }

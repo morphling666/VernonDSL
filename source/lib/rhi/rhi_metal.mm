@@ -691,13 +691,15 @@ Result<void, RhiError> uploadImage(VernonRhiDevice handle, VernonRhiImage image,
     auto anchor = lookupMetalDevice(handle);
     if (anchor.isErr())
         return Result<void, RhiError>{err(std::move(anchor).error())};
-    if (!uploads || uploadCount == 0)
+    if (!uploads && uploadCount != 0)
         return Result<void, RhiError>{
             err(RhiError{RhiErrorCode::InvalidArgument, {"upload_metal_image", uploadCount, 0}})};
     MetalDevice &device = anchor.value().device();
     auto pinned = pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "upload_image");
     if (pinned.isErr())
         return Result<void, RhiError>{err(std::move(pinned).error())};
+    if (uploadCount == 0)
+        return Result<void, RhiError>{ok()};
     MetalImagePayload &payload = *pinned.value().first;
     std::lock_guard<std::mutex> guard(device.mutex);
     for (size_t index = 0; index < uploadCount; ++index) {

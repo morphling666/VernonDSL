@@ -59,6 +59,32 @@ typedef struct VernonRuntimeCoreDrawInvocation {
     uint32_t stencil_reference;
 } VernonRuntimeCoreDrawInvocation;
 
+/*
+ * A stream of indexed draws; see VernonRuntimeProviderStreamPayload. A device stream names buffer resources of
+ * records and, optionally, counts and needs VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS; without counts it draws all
+ * max_records records, which is the same draw since writers zero the records past their count. A host stream leaves
+ * both resources zero,
+ * points at host memory that stays valid and unchanged while the batch is encoded, and needs
+ * VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS. Core checks a host stream's records against the index buffer when the
+ * batch is encoded; a device stream's writer guarantees them.
+ */
+typedef struct VernonRuntimeCoreStreamDrawInvocation {
+    uint32_t struct_size;
+    uint32_t topology;
+    /* The whole 32-bit index buffer every record indexes. */
+    VernonRuntimeProviderResourceReference index_buffer;
+    VernonRuntimeProviderResourceReference records;
+    VernonRuntimeProviderResourceReference counts;
+    const VernonRuntimeProviderDrawRecord *host_records;
+    const uint32_t *host_counts;
+    uint32_t first_record;
+    uint32_t max_records;
+    uint32_t count_index;
+    uint32_t viewport[4];
+    uint32_t scissor[4];
+    uint32_t stencil_reference;
+} VernonRuntimeCoreStreamDrawInvocation;
+
 typedef struct VernonRuntimeCorePipelineDescriptor {
     uint32_t struct_size;
     VernonRuntimeProviderPipelineKind kind;
@@ -177,6 +203,15 @@ VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePacketsDraw(VernonRuntime
  */
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreDrawPayload(const VernonRuntimeCoreDrawInvocation *invocation,
                                                                    VernonRuntimeProviderDrawPayload *payload);
+/* Records the stream draw as PacketsDraw records a draw. */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePacketsDrawStream(
+    VernonRuntimeCorePackets *packets, const VernonRuntimeCoreStreamDrawInvocation *invocation);
+/*
+ * The payload words a stream draw of `invocation` writes, which patch a stored batch's payload like
+ * vernonRuntimeCoreDrawPayload; the stream's resources stay the recorded ones.
+ */
+VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreStreamPayload(
+    const VernonRuntimeCoreStreamDrawInvocation *invocation, VernonRuntimeProviderStreamPayload *payload);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePacketsPushDebugGroup(VernonRuntimeCorePackets *packets,
                                                                              VernonStringView label);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCorePacketsPopDebugGroup(VernonRuntimeCorePackets *packets);

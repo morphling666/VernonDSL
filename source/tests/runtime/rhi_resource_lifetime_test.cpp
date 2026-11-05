@@ -3,7 +3,6 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_runtime_owner.h"
 #include "backend_test_matrix.h"
-#include "execution_graph/command_graph.h"
 #include "rhi/rhi_internal.h"
 #include "vernon_test_support.h"
 
@@ -214,45 +213,6 @@ TEST_P(RhiResourceLifetime, DeviceUploadsAreOrderedBetweenUnwaitedSubmissions) {
         EXPECT_EQ(copied[frame], frame * 7 + 1) << "frame " << frame;
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, source), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, destination), VERNON_RHI_STATUS_OK);
-}
-
-TEST_P(RhiResourceLifetime, CommandGraphDestroysOwnedBuffersButNotImportedBuffers) {
-    const VernonRhiDevice device = this->device();
-
-    VernonRhiBufferDescriptor bufferDescriptor{};
-    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
-    bufferDescriptor.size = 64;
-    bufferDescriptor.usage = VERNON_RHI_BUFFER_STORAGE;
-    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
-
-    VernonRhiBuffer imported{};
-    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &imported), VERNON_RHI_STATUS_OK);
-    {
-        vernon::execution::CommandGraph graph(device);
-        const vernon::execution::GraphBuffer first = graph.importBuffer(imported);
-        const vernon::execution::GraphBuffer second = graph.importBuffer(imported);
-        EXPECT_EQ(first.id, second.id);
-    }
-    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, imported), 1u);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, imported), VERNON_RHI_STATUS_OK);
-
-    VernonRhiBuffer owned{};
-    {
-        vernon::execution::CommandGraph graph(device);
-        vernon::execution::GraphBuffer graphBuffer;
-        ASSERT_EQ(graph.createBuffer(bufferDescriptor, graphBuffer), VERNON_RHI_STATUS_OK);
-        owned = graphBuffer.handle;
-        const vernon::execution::GraphBuffer duplicate = graph.importBuffer(owned);
-        EXPECT_EQ(graphBuffer.id, duplicate.id);
-        EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 1u);
-    }
-    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 0u);
-
-    VernonRhiBuffer recycled{};
-    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(recycled.index, owned.index);
-    EXPECT_NE(recycled.generation, owned.generation);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
 }
 
 TEST_P(RhiResourceLifetime, RecordsIndependentCommandEncoders) {
@@ -822,59 +782,6 @@ TEST_P(RhiResourceLifetime, RuntimeContextAndAdapterRetainTheirRhiDevice) {
     EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
 }
 
-TEST_P(RhiResourceLifetime, CommandGraphRetainsImportedImageViewAndParent) {
-    const VernonRhiDevice device = this->device();
-    const vernon::tests::BackendProbeResult probe = graphicsProbe();
-    if (!probe.available()) {
-        if (probe.skippable())
-            GTEST_SKIP() << probe.reason;
-        FAIL() << probe.reason;
-        return;
-    }
-
-    VernonRhiImageDescriptor imageDescriptor{};
-    imageDescriptor.struct_size = sizeof(imageDescriptor);
-    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
-    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
-    imageDescriptor.width = imageDescriptor.height = 4;
-    imageDescriptor.depth = 1;
-    imageDescriptor.mip_levels = 1;
-    imageDescriptor.array_layers = 1;
-    imageDescriptor.sample_count = 1;
-    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
-    VernonRhiImage image{};
-    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
-
-    VernonRhiImageViewDescriptor viewDescriptor{};
-    viewDescriptor.struct_size = sizeof(viewDescriptor);
-    viewDescriptor.image = image;
-    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
-    viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
-    viewDescriptor.mip_level_count = 1;
-    viewDescriptor.array_layer_count = 1;
-    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    VernonRhiImageView view{};
-    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
-
-    VernonRhiImage replacement{};
-    {
-        vernon::execution::CommandGraph graph(device);
-        const vernon::execution::GraphImage imported = graph.importImage(image, view);
-        ASSERT_NE(imported.id, UINT32_MAX);
-        ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
-        ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
-        EXPECT_NE(replacement.index, image.index);
-    }
-
-    VernonRhiImage recycled{};
-    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(recycled.index, image.index);
-    EXPECT_NE(recycled.generation, image.generation);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacement), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
-}
-
 TEST_P(RhiResourceLifetime, FormatCapabilitiesNarrowTheTableBaseline) {
     const VernonRhiDevice device = this->device();
     const bool images = GetParam().runtime != VERNON_RUNTIME_CUDA;
@@ -1230,7 +1137,10 @@ TEST_P(RhiResourceLifetime, CreateImageRejectsDescriptorsOfEveryBackendAlike) {
     VernonRhiImage image{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &valid, &image), VERNON_RHI_STATUS_OK)
         << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    EXPECT_EQ(vernonRhiDeviceUploadImage(device, image, nullptr, 0), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_NE(vernonRhiDeviceUploadImage(device, image, nullptr, 0), VERNON_RHI_STATUS_OK);
 
     const std::array<std::pair<const char *, void (*)(VernonRhiImageDescriptor &)>, 8> invalid{{
         {"struct size", [](VernonRhiImageDescriptor &image) { image.struct_size = 0; }},

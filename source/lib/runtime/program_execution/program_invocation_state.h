@@ -146,8 +146,6 @@ private:
         VernonRhiImageView view{};
     };
 
-    friend class ResolvedTransferExecutor;
-
     void destroyOwnedImages() noexcept;
     void rebindDescriptor(uint32_t value);
 

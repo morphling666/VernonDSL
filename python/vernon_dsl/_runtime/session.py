@@ -52,7 +52,7 @@ class RuntimeConfiguration:
 @dataclass(frozen=True)
 class _RuntimeSessionState:
     native_runtime: Any
-    rhi_host: Any | None
+    device: Any
     identity: int
 
 
@@ -193,6 +193,11 @@ class _SessionArtifactCache:
         validator: Callable[[Any], bool] | None = None,
     ) -> Any:
         return self._partition(session).get_or_create(key, factory, validator or _accept_cached)
+
+    def lookup(self, session: RuntimeSession, key: Any) -> Any:
+        """The artifact `get_or_create` would return without a factory, or None while it is absent or in flight."""
+        partition = self._entries.get(session)
+        return None if partition is None else partition.snapshot.get(key)
 
     def clear(self) -> None:
         with self._lock:
@@ -375,19 +380,16 @@ def _construct_state(configuration: RuntimeConfiguration) -> _RuntimeSessionStat
     arch = configuration.arch
     backend_name = _backend_name(arch)
     backend = getattr(_native.RuntimeBackend, backend_name)
-    uses_rhi = arch != cpu
-    if uses_rhi and (not hasattr(_native, "RhiHost") or not hasattr(_native, "RhiBackend")):
-        raise RuntimeUnavailableError(f"{arch.name} requires Vernon RHI support in vernon_dsl._native")
+    if not hasattr(_native, "HalDevice"):
+        raise RuntimeUnavailableError(f"{arch.name} requires Vernon HAL support in vernon_dsl._native")
 
-    rhi_host = None
     if arch in _OPENGL_ARCHITECTURES:
         version = configuration.api_version
         assert version is not None
-        rhi_backend = getattr(_native.RhiBackend, backend_name)
         external = configuration._external_context
         if external is not None:
-            rhi_host = _native.RhiHost.create_external_opengl(
-                rhi_backend,
+            device = _native.HalDevice.create_external_opengl(
+                backend,
                 external.user_data,
                 external.make_current,
                 external.get_proc_address,
@@ -395,24 +397,21 @@ def _construct_state(configuration: RuntimeConfiguration) -> _RuntimeSessionStat
             )
         else:
             try:
-                rhi_host = _native.RhiHost.create_owned_opengl(rhi_backend, *version)
+                device = _native.HalDevice.create_owned_opengl(backend, *version)
             except RuntimeError as error:
                 raise RuntimeUnavailableError(
                     f"{arch.name} {version[0]}.{version[1]} context is unavailable"
                 ) from error
-        native_runtime = rhi_host.create_runtime()
-    elif arch == cpu:
-        native_runtime = _native.Runtime(backend)
     else:
-        if not _native.runtime_available(backend):
+        if arch != cpu and not _native.runtime_available(backend):
             raise RuntimeUnavailableError(f"{arch.name} loader or a usable device is unavailable")
-        rhi_host = _native.RhiHost(getattr(_native.RhiBackend, backend_name))
-        native_runtime = rhi_host.create_runtime()
+        device = _native.HalDevice(backend)
+    native_runtime = device.create_runtime()
 
     capabilities = dict(native_runtime.capabilities)
     if not capabilities.get("available", False):
         raise RuntimeUnavailableError(f"{arch.name} runtime probe reported unavailable capabilities")
-    return _RuntimeSessionState(native_runtime, rhi_host, next(_session_identities))
+    return _RuntimeSessionState(native_runtime, device, next(_session_identities))
 
 
 class RuntimeSession:
@@ -460,8 +459,8 @@ class RuntimeSession:
         return self._state.native_runtime
 
     @property
-    def rhi_host(self) -> Any | None:
-        return self._state.rhi_host
+    def device(self) -> Any:
+        return self._state.device
 
     @property
     def identity(self) -> int:
@@ -509,6 +508,15 @@ def _session_state() -> RuntimeSession:
     if selected is None:
         raise RuntimeError("VernonDSL Runtime is not initialized; call vd.init() or enter a RuntimeSession scope")
     return selected
+
+
+def _interactive_target_options(state: RuntimeSession) -> dict[str, Any]:
+    """Target options for code this process compiles and runs: on the CPU, for the CPU it runs on."""
+    if state.arch == cpu:
+        return {"processor": "native"}
+    if state.arch in {opengl, opengles}:
+        return {"version": state.interactive_glsl_version}
+    return {}
 
 
 @contextmanager

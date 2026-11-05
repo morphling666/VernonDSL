@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import tempfile
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -16,18 +15,21 @@ from .._program_assets.compile_orchestration import (
 from ..bundle import build_program_manifest, build_program_plan, canonical_json, make_target_options
 from ..storage import TensorStorage, TensorView
 from .autodiff import _program_derivative_groups
-from .binding import _DispatchBorrowLease, _PersistentBindingTable, _raise_invocation_error
+from .binding import (
+    _argument_preparation,
+    _DispatchBorrowLease,
+    _sampler_preparation,
+)
 from .sampler import SamplerState
 from .session import (
     _execution_context,
+    _interactive_target_options,
     _InvocationContext,
     _session_state,
     _use_invocation_context,
     cpu,
-    opengl,
-    opengles,
 )
-from .tensor import RawBuffer
+from .tensor import RawBuffer, _owner_controls, _PreservedOwners
 from .texture import _TextureResource
 
 
@@ -36,6 +38,12 @@ class _ProgramDeployment:
     directory: tempfile.TemporaryDirectory[str]
     manifest: bytes
     compiled_stages: list[tuple[str, str, Any]]
+    # (entry, reflection JSON, artifact) of each GPU Stage, which a linked schedule loads by itself.
+    device_stages: list[tuple[str, str, bytes]] = field(default_factory=list)
+    # The variant's Program JSON and, per logical Stage, (name, entry, CPU program, GPU reflection JSON, GPU artifact),
+    # from which the Program links as a schedule (specs/runtime/architecture_v2.md section 16.1).
+    program_json: str = ""
+    linked_stages: list[tuple[str, str, Any, str | None, bytes | None]] = field(default_factory=list)
 
     def load(self) -> Any:
         state = _session_state()
@@ -46,12 +54,8 @@ class _ProgramDeployment:
         )
 
 
-def _bind_program_graphics_controls(
-    native_invocation: Any,
-    cache: _PersistentBindingTable,
-    invocation: Any,
-    context: Any,
-) -> None:
+def _configure_graphics_control(builder: Any, invocation: Any, node_id: int, context: Any) -> None:
+    """Writes the attachments, draw and dynamic state of graphics node `node_id` into a control builder."""
     from ..render import ColorBlendState, LoadOperation, StoreOperation, lines, points, triangles
 
     state = context.session
@@ -64,87 +68,72 @@ def _bind_program_graphics_controls(
         StoreOperation.PRESERVE: state.native.ATTACHMENT_STORE,
         StoreOperation.DISCARD: state.native.ATTACHMENT_DONT_CARE,
     }
-    operations = {operation.id: operation for operation in invocation.graph.operations}
-    for node_id, controls in invocation.graphics_controls.items():
-        operation = operations[node_id]
-        render_slot, render_pass = controls["render_pass"]
-        draw_slot, draw = controls["draw"]
-        dynamic_slot, dynamic = controls["dynamic_state"]
-        builder = native_invocation.control_builder()
-        colors = tuple(render_pass.target._color_attachments())
-        color_operations = dict(render_pass.colors)
-        for location, texture in colors:
-            attachment = color_operations[location]
-            component = int if texture.format.integer else float
-            clear_value = (
-                [component(value) for value in attachment.clear_value]
-                if attachment.load is LoadOperation.CLEAR
-                else [component(0)] * 4
-            )
-            builder.rhi_color_attachment(
-                location,
-                texture._resident_view(context),
-                load_values[attachment.load],
-                store_values[attachment.store],
-                clear_value,
-            )
-        depth_texture = render_pass.target._depth_attachment()
-        if depth_texture is not None:
-            if render_pass.depth is None:
-                raise ValueError("depth attachment operations are required for a depth RenderTarget")
-            attachment = render_pass.depth
-            clear_depth = float(attachment.clear_value) if attachment.load is LoadOperation.CLEAR else 1.0
-            builder.rhi_depth_attachment(
-                depth_texture._resident_view(context),
-                load_values[attachment.load],
-                store_values[attachment.store],
-                clear_depth,
-            )
-        if draw is not None and draw.index_buffer is not None:
-            index_view = draw.index_buffer.view
-            builder.rhi_index_binding(
-                index_view._resident_buffer(context),
-                draw.index_buffer.count,
-                index_view.layout.byte_offset,
-            )
-        topology = {
-            triangles: state.native.TOPOLOGY_TRIANGLE_LIST,
-            lines: state.native.TOPOLOGY_LINE_LIST,
-            points: state.native.TOPOLOGY_POINT_LIST,
-        }[operation.pipeline._topology]
-        builder.topology(topology)
-        builder.counts(
-            0 if draw is None or draw.vertex_count is None else draw.vertex_count,
-            1 if draw is None else draw.instance_count,
+    operation = next(operation for operation in invocation.graph.operations if operation.id == node_id)
+    controls = invocation.graphics_controls[node_id]
+    render_pass = controls["render_pass"][1]
+    draw = controls["draw"][1]
+    dynamic = controls["dynamic_state"][1]
+    colors = tuple(render_pass.target._color_attachments())
+    color_operations = dict(render_pass.colors)
+    for location, texture in colors:
+        attachment = color_operations[location]
+        component = int if texture.format.integer else float
+        clear_value = (
+            [component(value) for value in attachment.clear_value]
+            if attachment.load is LoadOperation.CLEAR
+            else [component(0)] * 4
         )
-        if render_pass.render_area is not None:
-            builder.viewport(*render_pass.render_area)
-            builder.scissor(*render_pass.render_area)
-        if dynamic is not None:
-            if dynamic.viewport is not None:
-                builder.viewport(*dynamic.viewport)
-            if dynamic.scissor is not None:
-                builder.scissor(*dynamic.scissor)
-            builder.stencil_reference(dynamic.stencil_reference)
-        configured_blends = dict(operation.pipeline._graphics_state.color_blends)
-        graphics_state = replace(
-            operation.pipeline._graphics_state,
-            color_blends=tuple(
-                (location, configured_blends.get(location, ColorBlendState())) for location, _ in colors
-            ),
+        builder.color_attachment(
+            location,
+            texture._resident_view(context),
+            load_values[attachment.load],
+            store_values[attachment.store],
+            clear_value,
         )
-        builder.graphics_state(graphics_state)
-        render_token = (
-            "render-pass",
-            node_id,
-            repr(render_pass).encode(),
-            *(id(texture._resident_view(context)) for _, texture in colors),
+    depth_texture = render_pass.target._depth_attachment()
+    if depth_texture is not None:
+        if render_pass.depth is None:
+            raise ValueError("depth attachment operations are required for a depth RenderTarget")
+        attachment = render_pass.depth
+        clear_depth = float(attachment.clear_value) if attachment.load is LoadOperation.CLEAR else 1.0
+        builder.depth_attachment(
+            depth_texture._resident_view(context),
+            load_values[attachment.load],
+            store_values[attachment.store],
+            clear_depth,
         )
-        draw_token = ("draw-command", node_id, repr(draw).encode())
-        dynamic_token = ("dynamic-state", node_id, repr(dynamic).encode())
-        cache.bind_render_pass_control(render_slot, render_token, builder)
-        cache.bind_draw_command_control(draw_slot, draw_token, builder)
-        cache.bind_dynamic_state_control(dynamic_slot, dynamic_token, builder)
+    if draw is not None and draw.index_buffer is not None:
+        index_view = draw.index_buffer.view
+        builder.index_binding(
+            index_view._resident_buffer(context),
+            draw.index_buffer.count,
+            index_view.layout.byte_offset,
+        )
+    topology = {
+        triangles: state.native.TOPOLOGY_TRIANGLE_LIST,
+        lines: state.native.TOPOLOGY_LINE_LIST,
+        points: state.native.TOPOLOGY_POINT_LIST,
+    }[operation.pipeline._topology]
+    builder.topology(topology)
+    builder.counts(
+        0 if draw is None or draw.vertex_count is None else draw.vertex_count,
+        1 if draw is None else draw.instance_count,
+    )
+    if render_pass.render_area is not None:
+        builder.viewport(*render_pass.render_area)
+        builder.scissor(*render_pass.render_area)
+    if dynamic is not None:
+        if dynamic.viewport is not None:
+            builder.viewport(*dynamic.viewport)
+        if dynamic.scissor is not None:
+            builder.scissor(*dynamic.scissor)
+        builder.stencil_reference(dynamic.stencil_reference)
+    configured_blends = dict(operation.pipeline._graphics_state.color_blends)
+    graphics_state = replace(
+        operation.pipeline._graphics_state,
+        color_blends=tuple((location, configured_blends.get(location, ColorBlendState())) for location, _ in colors),
+    )
+    builder.graphics_state(graphics_state)
 
 
 def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
@@ -156,15 +145,11 @@ def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
     return projection
 
 
-@contextmanager
-def _bound_program_invocation(
-    executable: Any,
-    cache: _PersistentBindingTable,
-    invocation: Any,
-    targets: Mapping[str, Any],
-) -> Iterator[tuple[Any, Any, _DispatchBorrowLease, list[Any]]]:
-    context = _execution_context()
-    state = context.session
+def _program_boundary_values(
+    executable: Any, invocation: Any, targets: Mapping[str, Any], state: Any
+) -> tuple[list[tuple[Any, Mapping[str, Any], str, Any]], list[tuple[Any, Any, str]]]:
+    """Each parameter of the executable with its boundary slot, path and value, and the resource borrows of a call:
+    each resource argument with its declared access, and the attachments and index buffers its graphics nodes use."""
     parameters = tuple(executable.parameters)
     parameters_by_slot = {parameter.slot: parameter for parameter in parameters}
     if len(parameters_by_slot) != len(parameters):
@@ -214,26 +199,68 @@ def _bound_program_invocation(
         draw = controls["draw"][1]
         if draw is not None and draw.index_buffer is not None:
             borrows.append(("index_buffer", draw.index_buffer.view, "read"))
+    return resolved, borrows
+
+
+def _bind_schedule_arguments(builder: Any, context: Any, invocation: Any, resolved: Any) -> None:
+    for parameter, slot, path, value in resolved:
+        if parameter.kind == context.session.native.PROGRAM_SAMPLER:
+            if not isinstance(value, SamplerState):
+                raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
+            preparation = _sampler_preparation(builder, context, parameter, value)
+        else:
+            preparation = _argument_preparation(
+                builder,
+                context,
+                parameter,
+                value,
+                host_value=slot.get("category") == "value",
+                annotation=invocation.input_annotations.get(path),
+            )
+        builder.argument(preparation())
+
+
+def _call_program_vjp(
+    vjp: Any, executable: Any, invocation: Any, targets: Mapping[str, Any], bindings: Mapping[str, Any]
+) -> Any:
+    """Runs the forward call of the executable's linked VJP and returns its native pullback."""
+    context = _execution_context()
+    resolved, borrows = _program_boundary_values(executable, invocation, targets, context.session)
     lease = _DispatchBorrowLease(borrows, context)
     try:
-        with cache.invocation(executable, context) as native_invocation:
-            builder = native_invocation.builder
-            for parameter, slot, path, value in resolved:
-                if parameter.kind == state.native.PROGRAM_SAMPLER:
-                    if not isinstance(value, SamplerState):
-                        raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
-                    cache.bind_sampler(builder, executable, parameter, value)
-                else:
-                    cache.bind_argument(
-                        builder,
-                        executable,
-                        parameter,
-                        value,
-                        host_value=slot.get("category") == "value",
-                        annotation=invocation.input_annotations.get(path),
-                    )
-            _bind_program_graphics_controls(native_invocation, cache, invocation, context)
-            yield builder, native_invocation, lease, resolved
+        builder = vjp.builder()
+        _bind_schedule_arguments(builder, context, invocation, resolved)
+        try:
+            pullback, point = vjp.forward(builder, dict(bindings))
+        except BaseException:
+            lease.resolve_mutations({})
+            raise
+        lease.resolve_linked_call(vjp.timeline, point)
+        return pullback
+    finally:
+        lease.release()
+
+
+def _call_program_schedule(schedule: Any, executable: Any, invocation: Any, targets: Mapping[str, Any]) -> None:
+    """Runs one call of the executable's linked schedule. A write the call makes is published as its accesses
+    declare, once the call is submitted."""
+    context = _execution_context()
+    resolved, borrows = _program_boundary_values(executable, invocation, targets, context.session)
+    lease = _DispatchBorrowLease(borrows, context)
+    try:
+        builder = schedule.builder()
+        _bind_schedule_arguments(builder, context, invocation, resolved)
+        passes = []
+        for node_id in invocation.graphics_controls:
+            control = schedule.builder()
+            _configure_graphics_control(control, invocation, node_id, context)
+            passes.append(control)
+        try:
+            point = schedule.call(builder, passes)
+        except BaseException:
+            lease.resolve_mutations({})
+            raise
+        lease.resolve_linked_call(schedule.timeline, point)
     finally:
         lease.release()
 
@@ -255,6 +282,8 @@ class ProgramNativePullback:
         self._signature = signature
         self._inputs = dict(inputs)
         self._context = context
+        # The residuals point into the memory of the forward call's inputs, which a later write leaves to the pullback.
+        self._preserved = _PreservedOwners(_owner_controls(inputs.values()))
         self._storage_gradients = {
             path for path, value in inputs.items() if isinstance(value, (TensorStorage, TensorView))
         }
@@ -367,14 +396,30 @@ class ProgramAutodiffSpecialization:
     template: Any
     deployment: _ProgramDeployment
     executable: Any
-    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+    # The executable's forward and backward graphs linked as a VJP per checkpoint memory budget and policy. An
+    # executable that does not link raises the linker's ValueError on every call.
+    _vjps: dict[tuple[int | None, str], Any] = field(default_factory=dict, init=False, repr=False)
+    _vjp_executable: Any = field(default=None, init=False, repr=False)
 
     def _loaded_executable(self) -> Any:
         return self.executable
 
-    @property
-    def binding_telemetry(self) -> Mapping[str, int]:
-        return self.binding_cache.telemetry
+    def _linked_vjp(self, executable: Any, budget: int | None = None, policy: str = "") -> Any:
+        if self._vjp_executable is not executable:
+            self._vjp_executable = executable
+            self._vjps.clear()
+        key = (budget, policy)
+        if key not in self._vjps:
+            state = _session_state()
+            self._vjps[key] = state.native._ProgramVjp(
+                executable,
+                checkpoint_memory_budget=budget,
+                checkpoint_policy=policy,
+                storage_type=TensorStorage,
+                view_type=TensorView,
+                residency_key=None if state.arch == cpu else state.identity,
+            )
+        return self._vjps[key]
 
     def invoke(
         self,
@@ -398,35 +443,15 @@ class ProgramAutodiffSpecialization:
         targets = flatten_program_outputs(invocation.outputs)
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
-        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
-            _,
-            native_invocation,
-            lease,
-            _,
-        ):
-            outcome, native_outputs, native_pullback = executable.program_vjp_transaction(
-                native_invocation,
-                program_bindings,
-                lease.resolve,
-                checkpoint_memory_budget=checkpoint_memory_budget,
-                checkpoint_policy=checkpoint_policy,
-            )
-            if not outcome.ok:
-                _raise_invocation_error(outcome, "Program autodiff forward failed", context)
-        derivative_groups = _program_derivative_groups(executable)
+        vjp = self._linked_vjp(executable, checkpoint_memory_budget, checkpoint_policy)
+        native_pullback = _call_program_vjp(vjp, executable, invocation, targets, program_bindings)
         pullback = ProgramNativePullback(
             native_pullback,
             signature,
             invocation.inputs,
-            derivative_groups,
+            _program_derivative_groups(executable),
             context,
         )
-        expected_output_leaves = {row["path"] for row in signature["outputs"]}
-        if native_outputs and set(native_outputs) != expected_output_leaves:
-            raise RuntimeError(
-                "Program outputs do not match compiler ABI: "
-                f"expected={sorted(expected_output_leaves)}, actual={sorted(native_outputs)}"
-            )
         return invocation.outputs, pullback
 
 
@@ -435,41 +460,33 @@ class ProgramSpecialization:
     template: Any
     deployment: _ProgramDeployment
     executable: Any
-    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+    # The executable's forward graph linked as a schedule. An executable that does not link raises the linker's
+    # ValueError on every call.
+    _schedule: Any = field(default=None, init=False, repr=False)
+    _schedule_executable: Any = field(default=None, init=False, repr=False)
 
     def _loaded_executable(self) -> Any:
         return self.executable
 
-    @property
-    def binding_telemetry(self) -> Mapping[str, int]:
-        return self.binding_cache.telemetry
+    def _linked_schedule(self, executable: Any) -> Any:
+        if self._schedule_executable is not executable:
+            self._schedule = _session_state().native._ProgramSchedule(executable)
+            self._schedule_executable = executable
+        return self._schedule
 
     def invoke(self, invocation: Any) -> Any:
         from ..program import flatten_program_outputs
 
         executable = self._loaded_executable()
         targets = flatten_program_outputs(invocation.outputs)
-        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
-            _,
-            native_invocation,
-            lease,
-            _,
-        ):
-            outcome = native_invocation.execute()
-            lease.resolve(outcome)
-            if not outcome.ok:
-                _raise_invocation_error(outcome, "Program invocation failed", _execution_context())
-            native_invocation.commit()
+        _call_program_schedule(self._linked_schedule(executable), executable, invocation, targets)
         return invocation.outputs
 
 
 def _compile_program(parsed: Any) -> _ProgramDeployment:
     state = _session_state()
     native = state.native
-    target = make_target_options(
-        state.arch.name,
-        {"version": state.interactive_glsl_version} if state.arch in {opengl, opengles} else {},
-    )
+    target = make_target_options(state.arch.name, _interactive_target_options(state))
     compiler = native.Compiler()
     retained_programs: list[tuple[Any, Any]] = []
     reflected_target, variant = _compile_program_variant(
@@ -500,10 +517,33 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
         for stage in plan.compiled_stages
     }
     manifest = build_program_manifest(plan, descriptors)
+    compiled_by_id = {stage.id: stage for stage in plan.compiled_stages}
+    results_by_id = {stage.id: result for stage, result in retained_programs}
+    linked_stages: list[tuple[str, str, Any, str | None, bytes | None]] = []
+    for logical, implementation in plan.variants[0].stage_implementations.items():
+        stage = compiled_by_id[implementation]
+        if stage.stage != "compute":
+            linked_stages = []
+            break
+        if state.arch == cpu:
+            linked_stages.append((logical, stage.entry, results_by_id.get(implementation), None, None))
+        else:
+            linked_stages.append(
+                (logical, stage.entry, None, canonical_json(dict(stage.reflection)), stage.artifact.data)
+            )
     return _ProgramDeployment(
         directory,
         canonical_json(manifest).encode(),
         [(stage.metadata["symbol"], stage.entry, result) for stage, result in retained_programs],
+        []
+        if state.arch == cpu
+        else [
+            (stage.entry, canonical_json(dict(stage.reflection)), stage.artifact.data)
+            for stage in plan.compiled_stages
+            if stage.stage == "compute"
+        ],
+        canonical_json(dict(plan.variants[0].program)),
+        linked_stages,
     )
 
 

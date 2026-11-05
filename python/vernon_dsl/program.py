@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import inspect
-from collections.abc import Mapping
+from collections import ChainMap
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, get_args
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast, get_args
+
+import numpy as np
 
 from ._formats import TEXTURE_FORMATS_BY_NAME
-from ._runtime.tensor import TensorStorage, TensorView
+from ._runtime.tensor import (
+    TensorStorage,
+    TensorView,
+    _adopt_device_buffer,
+    _ensure_device_residency,
+    _owner_controls,
+    _PreservedOwners,
+)
 from .operation_graph import (
     AttachmentProjection,
     GraphAttachmentOutput,
@@ -695,8 +707,6 @@ class ProgramInvocation:
 
     @property
     def graphics_controls(self) -> Mapping[int, Mapping[str, tuple[int, Any]]]:
-        from types import MappingProxyType
-
         controls = {}
         for operation in self.graph.operations:
             control_slots = getattr(operation, "control_slots", None)
@@ -727,6 +737,11 @@ class ModuleVjpExpression:
 
         with _invocation_context():
             return execute_module_vjp(self, arguments, keywords)
+
+    def bind(self, *, gradients: Mapping[str, Any] | None = None, **values: Any) -> BoundModuleVjp:
+        """This VJP with the `forward()` inputs `values` bound once, and the gradients of those in `wrt` written into
+        `gradients`, or into Storages `bind` allocates (specs/language/contract.md section 8)."""
+        return BoundModuleVjp(self, values, gradients)
 
 
 def _capture_module(module: Any, parameter_types: Mapping[str, Any]) -> tuple[ProgramCapture, Any]:
@@ -1286,11 +1301,38 @@ class _AllocationSpec:
             if not isinstance(owner, (TensorStorage, TensorView)):
                 raise TypeError("Module relative allocation source must be TensorStorage or TensorView")
             shape = tuple(owner.shape)
+        return self.create_shaped(shape)
+
+    def shape_of(self, inputs: Mapping[str, Any], shapes: list[tuple[int, ...] | None]) -> tuple[int, ...] | None:
+        """The allocation's shape given the shapes of the allocations before it, without allocating; None when it is
+        not known before the Program runs."""
+        if self.initializer == "from_values":
+            return None
+        if self.like_source == "input":
+            owner = inputs.get(self.like_key) if isinstance(self.like_key, str) else None
+            if not isinstance(owner, (TensorStorage, TensorView)):
+                return None
+            return tuple(owner.shape)
+        if self.like_source is not None:
+            return shapes[self.like_key] if isinstance(self.like_key, int) else None
+        if any(not isinstance(extent, int) for extent in self.shape):
+            return None
+        return cast(tuple[int, ...], self.shape)
+
+    def create_shaped(self, shape: tuple[Any, ...]) -> TensorStorage:
+        if self.initializer == "from_values":
+            return TensorStorage.from_values(self.values, dtype=self.dtype)
         if any(not isinstance(extent, int) for extent in shape):
             raise RuntimeError("dynamic Module allocation requires an input-relative shape")
-        if self.initializer in {"zeros", "zeros_like"}:
-            return TensorStorage.zeros(dtype=self.dtype, shape=shape)
-        return TensorStorage.empty(dtype=self.dtype, shape=shape)
+        numpy_dtype, layout = self._storage_dtype
+        allocate = np.zeros if self.initializer in {"zeros", "zeros_like"} else np.empty
+        return TensorStorage._adopt(
+            allocate(shape, dtype=numpy_dtype), self.dtype if layout is not None else None, layout
+        )
+
+    @functools.cached_property
+    def _storage_dtype(self) -> tuple[np.dtype[Any], Any]:
+        return TensorStorage._storage_dtype(self.dtype)
 
 
 @dataclass(frozen=True)
@@ -1356,6 +1398,34 @@ class _TreeRecipe:
             return cls(**{name: member.resolve(inputs, allocations) for name, member in fields})
         raise RuntimeError(f"unknown Program output recipe {self.kind!r}")
 
+    def allocation_indices(self) -> Iterator[int]:
+        """The indices of the allocations the outputs publish."""
+        if self.kind == "leaf":
+            if self.value.source == "allocation":
+                yield self.value.key
+            return
+        members = self.value[1] if self.kind in {"dataclass", "params"} else self.value
+        for member in members:
+            yield from (member[1] if self.kind in {"mapping", "dataclass", "params"} else member).allocation_indices()
+
+
+class _ProgramLink:
+    """A Module specialization linked as a schedule (specs/runtime/architecture_v2.md section 16.1): the schedule, the
+    boundary slots' paths and directions in ABI order, and which allocations are outputs, which the call creates; the
+    others are the schedule's transients."""
+
+    __slots__ = ("attempted", "device_state", "outputs", "schedule", "slots", "zeroed")
+
+    def __init__(self) -> None:
+        self.attempted = False
+        self.schedule: Any = None
+        self.slots: tuple[tuple[str, bool], ...] = ()
+        self.outputs: frozenset[int] = frozenset()
+        # The outputs that start as zeros, which the schedule zeroes rather than the call uploading them.
+        self.zeroed: frozenset[int] = frozenset()
+        # The session of a GPU schedule, in which each call's fresh outputs get their device buffers.
+        self.device_state: Any = None
+
 
 @dataclass(frozen=True)
 class _PrimalSpecialization:
@@ -1366,21 +1436,159 @@ class _PrimalSpecialization:
     allocations: tuple[_AllocationSpec, ...]
     outputs: _TreeRecipe
     native_program: Any
+    link: _ProgramLink = dataclasses.field(default_factory=_ProgramLink)
 
     def invoke(self, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
-        inputs = _bind_program_inputs(self.definition, arguments, keywords)
+        return self.invoke_inputs(_bind_program_inputs(self.definition, arguments, keywords))
+
+    def invoke_inputs(self, inputs: dict[str, Any]) -> Any:
+        if not self.link.attempted:
+            self._link()
+        if self.link.schedule is not None:
+            linked = self._call_linked(inputs)
+            if linked is not None:
+                return linked[0]
         allocation_list: list[TensorStorage] = []
         for spec in self.allocations:
             allocation_list.append(spec.create(inputs, tuple(allocation_list)))
         allocations = tuple(allocation_list)
         outputs = self.outputs.resolve(inputs, allocations)
-        return self.native_program.invoke(
+        result = self.native_program.invoke(
             dataclasses.replace(
                 self.invocation,
                 inputs=dict(inputs),
                 outputs=outputs,
             )
         )
+        return result
+
+    def _call_linked(self, inputs: Mapping[str, Any]) -> tuple[Any] | None:
+        """Runs the linked schedule, creating only the allocations the outputs publish; None when an argument is
+        outside what the schedule packs, and the Program then runs instead."""
+        link = self.link
+        allocations = _create_linked_allocations(self.allocations, inputs, link.outputs, link.zeroed, link.device_state)
+        if allocations is None:
+            return None
+        outputs = self.outputs.resolve(inputs, tuple(allocations))
+        published = flatten_program_outputs(outputs)
+        state = link.device_state
+        arguments = []
+        for path, is_input in link.slots:
+            source = inputs if is_input else published
+            if path not in source:
+                return None
+            value = source[path]
+            # An input only the host holds is uploaded here rather than by a Program call.
+            if (
+                state is not None
+                and is_input
+                and isinstance(value, (TensorStorage, TensorView))
+                and not _ensure_device_residency(value, state)
+            ):
+                return None
+            arguments.append(value)
+        return (outputs,) if link.schedule.call(tuple(arguments), None) else None
+
+    def _link(self) -> None:
+        from ._runtime.session import _session_state, cpu
+
+        link = self.link
+        link.attempted = True
+        state = _session_state()
+        linked = _linked_program(state, getattr(self.native_program, "deployment", None))
+        if linked is None:
+            return
+        program, graphs = linked
+        graph = graphs.get("forward")
+        if graph is None:
+            return
+        allocated = [row["storage"] for row in graph["inputs"] if row["tag"] == "allocation"]
+        if len(allocated) != len(self.allocations):
+            return
+        slots = _graph_slots(program, "forward")
+        published = {row.get("storage_id") for row in slots if row["direction"] == "output"}
+        outputs = frozenset(index for index, storage in enumerate(allocated) if storage in published)
+        zeroed = _zeroed_transients(self.allocations, allocated, outputs)
+        if zeroed is None:
+            return
+        schedule = _link_graph(state, self.native_program.deployment, graph, zeroed[0], [])
+        if schedule is None:
+            return
+        link.slots = tuple((row["path"], row["direction"] == "input") for row in slots)
+        link.outputs = outputs
+        link.zeroed = zeroed[1]
+        link.device_state = None if state.arch == cpu else state
+        link.schedule = schedule
+
+
+def _linked_program(state: Any, deployment: Any) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """A deployment's variant `program` JSON and its graphs by name, when its session can link schedules and every
+    Stage is a compute kernel; None otherwise."""
+    import json
+
+    from ._runtime.session import cpu, cuda
+
+    if state.arch not in {cpu, cuda} or deployment is None or not deployment.linked_stages:
+        return None
+    program = json.loads(deployment.program_json)
+    return program, {graph["name"]: graph for graph in program["graphs"]}
+
+
+def _graph_slots(program: Mapping[str, Any], graph: str) -> list[dict[str, Any]]:
+    """The ABI boundary slots of one graph that are schedule slots, in ABI order, which is the order of its schedule's
+    first slots. An output that publishes the Storage of an input view is that input's slot, so it has none."""
+    values = program["values"]
+    inputs: set[int] = set()
+    slots = []
+    for row in program["abi"]["boundary_slots"]:
+        if values[row["value"]]["origin"].get("graph") != graph:
+            continue
+        storage = row.get("storage_id")
+        if row["direction"] == "output" and storage in inputs:
+            continue
+        if row["direction"] == "input" and storage is not None:
+            inputs.add(storage)
+        slots.append(row)
+    return slots
+
+
+def _zeroed_transients(
+    allocations: tuple[_AllocationSpec, ...], allocated: list[int], exported: frozenset[int]
+) -> tuple[list[int], frozenset[int]] | None:
+    """The Storages of the allocations a schedule zeroes, and which of the `exported` allocations, those a call
+    creates, are among them, so a call does not upload their zeros; None when a transient starts from values, which a
+    schedule does not upload."""
+    zeroed = []
+    created = []
+    for index, spec in enumerate(allocations):
+        if spec.initializer == "from_values" and index not in exported:
+            return None
+        if spec.initializer in {"zeros", "zeros_like"}:
+            zeroed.append(allocated[index])
+            if index in exported:
+                created.append(index)
+    return zeroed, frozenset(created)
+
+
+def _link_graph(state: Any, deployment: Any, graph: Mapping[str, Any], zeroed: list[int], exposed: list[int]) -> Any:
+    """One graph linked as a schedule with the Stages its nodes run, or None when it uses what schedules do not link."""
+    from ._runtime.session import cpu
+
+    used = {node["stage"] for node in graph["nodes"]}
+    try:
+        return state.native._ScheduleKernel.link_program(
+            state.native_runtime,
+            deployment.program_json,
+            graph["name"],
+            [stage for stage in deployment.linked_stages if stage[0] in used],
+            zeroed,
+            exposed,
+            TensorStorage,
+            TensorView,
+            residency_key=None if state.arch == cpu else state.identity,
+        )
+    except (RuntimeError, ValueError):
+        return None
 
 
 def _capture_recipes(
@@ -1508,6 +1716,492 @@ def _primal_specialization(
     )
 
 
+class _VjpLink:
+    """A Module VJP's linked VJP (specs/runtime/architecture_v2.md section 16.3) and how a call passes it Python values.
+    The forward slots are the forward boundary's, each `(is_input, path)`; the backward slots are the cotangents and
+    gradients, each `(role, path)`. The backward call reads the forward call's arguments and residuals itself."""
+
+    __slots__ = ("attempted", "backward_slots", "created", "device_state", "forward_slots", "seeds", "vjp", "zeroed")
+
+    def __init__(self) -> None:
+        self.attempted = False
+        self.vjp: Any = None
+        self.forward_slots: tuple[tuple[bool, str], ...] = ()
+        self.backward_slots: tuple[tuple[str, str], ...] = ()
+        # The allocations a call creates, its outputs; the others are the schedule's transients.
+        self.created: frozenset[int] = frozenset()
+        # The created allocations that start as zeros. The schedule zeroes its owned Storages, so a call does not
+        # upload their zeros.
+        self.zeroed: frozenset[int] = frozenset()
+        self.device_state: Any = None
+        # The ones each omitted cotangent seeds, per output path, shape and element type; no call writes them.
+        self.seeds: dict[tuple[Any, ...], TensorStorage] = {}
+
+
+class _LinkedPullback:
+    """The pullback of a linked Module VJP call: the backward schedule over the call's residuals. The residuals point
+    into the memory of the call's inputs, which a later write leaves to the pullback. A backward call whose values do
+    not pack natively, or that takes a carrier, runs as the general pullback over the same residuals."""
+
+    def __init__(
+        self,
+        specialization: _VjpSpecialization,
+        inputs: Mapping[str, Any],
+        published: Mapping[str, Any],
+        call: Any,
+    ) -> None:
+        self._specialization = specialization
+        self._inputs = inputs
+        self._published = published
+        self._call = call
+        self._preserved = _PreservedOwners(_owner_controls(inputs.values()))
+        from ._runtime.session import _execution_context
+
+        # The general pullback runs in the forward call's context, which is no longer active when it is built.
+        self._context = _execution_context()
+        self._general: Any = None
+
+    # The residuals' tape telemetry, which the general pullback over them reports.
+    _TELEMETRY = frozenset(
+        {
+            "allocated_tape_bytes",
+            "checkpoint_plan",
+            "estimated_tape_bytes",
+            "logical_residual_bytes",
+            "pass_telemetry",
+            "peak_runtime_managed_bytes",
+            "peak_temporary_bytes",
+            "recomputation_factor",
+            "resident_tape_bytes",
+            "tape_context_limit_bytes",
+        }
+    )
+
+    def __getattr__(self, name: str) -> Any:
+        if name in _LinkedPullback._TELEMETRY:
+            return getattr(self._general_pullback(), name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __call__(self, cotangents: Any = None) -> dict[str, Any]:
+        return self.apply_with_carrier(cotangents, ())
+
+    def apply_with_carrier(self, cotangents: Any, carrier_shape: tuple[int, ...]) -> dict[str, Any]:
+        if not carrier_shape:
+            link = self._specialization.link
+            arguments, gradients = _backward_arguments(
+                link, link.backward_slots, self._inputs, self._published, cotangents
+            )
+            if arguments is not None:
+                try:
+                    if self._call.backward(arguments):
+                        return gradients
+                except ValueError:
+                    pass
+        return self._general_pullback().apply_with_carrier(cotangents, carrier_shape)
+
+    def _general_pullback(self) -> Any:
+        if self._general is None:
+            from ._runtime.autodiff import _program_derivative_groups
+            from ._runtime.program_autodiff import ProgramNativePullback
+
+            executable = self._specialization.executable
+            self._general = ProgramNativePullback(
+                self._call.pullback({**self._inputs, **self._published}),
+                executable.program_ad_signature,
+                self._inputs,
+                _program_derivative_groups(executable),
+                self._context,
+            )
+        return self._general
+
+
+def _backward_arguments(
+    link: _VjpLink,
+    slots: tuple[tuple[str, str], ...],
+    inputs: Mapping[str, Any],
+    published: Mapping[str, Any],
+    cotangents: Any,
+) -> tuple[tuple[Any, ...] | None, dict[str, TensorStorage]]:
+    """The values of a backward call's `slots` and the gradients it writes, owner-shaped (language contract section
+    8); None for the values when an input's gradient has no Storage the call can write natively."""
+    # No cotangent slot is bound, so `slots` holds every one.
+    by_path = _cotangents_by_path(slots, cotangents)
+    state = link.device_state
+    arguments: list[Any] = []
+    gradients: dict[str, TensorStorage] = {}
+    owners: dict[int, TensorStorage] = {}
+    for role, key in slots:
+        if role == "cotangent":
+            value = _seeded_cotangent(link, key, published[key], by_path[key])
+            if state is not None and not _ensure_device_residency(value, state):
+                raise RuntimeError("a linked Module pullback argument is held by another session's device")
+        else:
+            owned = _owner_gradient(inputs[key], state, owners)
+            if owned is None:
+                return None, gradients
+            gradients[key], value = owned
+        arguments.append(value)
+    return tuple(arguments), gradients
+
+
+def _seeded_cotangent(link: _VjpLink, path: str, output: Any, supplied: Any) -> Any:
+    """The cotangent of `output`; an omitted one seeds ones, one per shape, as the backward graph only reads it."""
+    if supplied is not None:
+        return _cotangent_storage(output, supplied)
+    key = (path, tuple(output.shape), str(output.dtype))
+    seed = link.seeds.get(key)
+    if seed is None:
+        seed = link.seeds[key] = _cotangent_storage(output, None)
+    return seed
+
+
+def _owner_gradient(primal: Any, state: Any, owners: dict[int, TensorStorage]) -> tuple[TensorStorage, Any] | None:
+    """A differentiated input's gradient Storage, owner-shaped and shared by the views of one owner in `owners`, and
+    what the backward call writes it through: the Storage, or for a view a view of it laid out as the primal. None
+    for an owner that is no TensorStorage of scalars."""
+    owner = primal._owner if isinstance(primal, TensorView) else primal
+    if not isinstance(owner, TensorStorage) or owner.dtype.fields is not None:
+        return None
+    gradient = owners.get(id(owner))
+    if gradient is None:
+        gradient = TensorStorage._adopt(np.zeros(tuple(owner.shape), dtype=owner.dtype))
+        # The backward schedule zeroes the gradient where the view lies, so only a view's has its zeros uploaded.
+        if state is not None and not _adopt_device_buffer(
+            gradient, state, upload=isinstance(primal, TensorView), fresh=True
+        ):
+            raise RuntimeError("a linked Module pullback could not allocate a device gradient")
+        owners[id(owner)] = gradient
+    if not isinstance(primal, TensorView):
+        return gradient, gradient
+    return gradient, TensorView(gradient, primal.shape, primal._strides, primal._offset, "read_write")
+
+
+def _cotangents_by_path(backward_slots: tuple[tuple[str, Any], ...], cotangents: Any) -> Mapping[str, Any]:
+    """A pullback's cotangents as one per output path; an omitted one is None, which seeds ones."""
+    paths = tuple(key for kind, key in backward_slots if kind == "cotangent")
+    if cotangents is None:
+        if len(paths) != 1:
+            raise ValueError("implicit Program cotangent requires exactly one output")
+        return {paths[0]: None}
+    if not isinstance(cotangents, Mapping):
+        if len(paths) != 1:
+            raise TypeError("Program pullback requires a cotangent mapping for multiple outputs")
+        return {paths[0]: cotangents}
+    if set(cotangents) != set(paths):
+        raise ValueError("Program pullback requires exactly one cotangent per output")
+    return cotangents
+
+
+def _cotangent_storage(output: Any, supplied: Any) -> Any:
+    if isinstance(supplied, (TensorStorage, TensorView)):
+        return supplied
+    array = (
+        np.ones(tuple(output.shape), dtype=output.dtype)
+        if supplied is None
+        else np.ascontiguousarray(np.asarray(supplied, dtype=output.dtype))
+    )
+    return TensorStorage.from_numpy(array.reshape(tuple(output.shape)))
+
+
+class BoundModuleVjp:
+    """A Module VJP with some `forward()` inputs bound once (specs/language/contract.md section 8). A call passes the
+    other parameters in order; its pullback writes the bound inputs' gradients into the bound gradient Storages and
+    returns those.
+
+    Once a call has linked, calls take `_BoundVjpCall`, which binds both schedules' bound slots natively, so a step's
+    Python work does not grow with the number of bound inputs. Any other call runs the VJP with every input and copies
+    the gradients into the bound Storages."""
+
+    def __init__(self, expression: ModuleVjpExpression, values: Mapping[str, Any], gradients: Mapping[str, Any] | None):
+        definition = type(expression.module)._module_definition
+        plan = definition.fast_leaves()
+        if plan is None:
+            raise TypeError("step.bind requires every forward() parameter to be positional and DSL-annotated")
+        names = plan[0]
+        unknown = sorted(set(values) - set(names))
+        if unknown:
+            raise TypeError(f"step.bind names no forward() parameter {', '.join(unknown)}")
+        if not values:
+            raise TypeError("step.bind binds at least one forward() input")
+        supplied = dict(gradients or {})
+        stray = sorted(name for name in supplied if name not in values or name not in expression.wrt)
+        if stray:
+            raise ValueError(f"step.bind gradients name no bound input in wrt: {', '.join(stray)}")
+        owners = {id(value.owner if isinstance(value, TensorView) else value) for value in values.values()}
+        bound_gradients: dict[str, TensorStorage] = {}
+        for name in expression.wrt:
+            if name not in values:
+                continue
+            primal = values[name]
+            if not isinstance(primal, (TensorStorage, TensorView)):
+                raise TypeError(f"step.bind gradient of {name!r} needs a TensorStorage or TensorView input")
+            # A view's gradient is shaped as its owner (language contract section 8).
+            shaped = primal.owner if isinstance(primal, TensorView) else primal
+            gradient = supplied.get(name)
+            if gradient is None:
+                gradient = TensorStorage.from_numpy(np.zeros(tuple(shaped.shape), dtype=shaped.dtype))
+            elif not isinstance(gradient, TensorStorage):
+                raise TypeError(f"step.bind gradient of {name!r} must be a TensorStorage")
+            elif tuple(gradient.shape) != tuple(shaped.shape) or gradient.dtype != shaped.dtype:
+                raise ValueError(
+                    f"step.bind gradient of {name!r} must have the shape and element type of its input's Storage"
+                )
+            elif id(gradient) in owners:
+                raise ValueError(f"step.bind gradient of {name!r} aliases a bound input")
+            bound_gradients[name] = gradient
+        self._expression = expression
+        self._names = names
+        self._bound = dict(values)
+        self._unbound = tuple(name for name in names if name not in values)
+        self.gradients: Mapping[str, TensorStorage] = MappingProxyType(bound_gradients)
+        self._fast: _BoundVjpCall | None = None
+
+    def __call__(self, *arguments: Any) -> tuple[Any, Any]:
+        from ._runtime.session import _invocation_context, _session_state
+        from .module import _configuration_epoch
+
+        if len(arguments) != len(self._unbound):
+            raise TypeError(f"a bound VJP takes {len(self._unbound)} forward() argument(s) positionally")
+        with _invocation_context():
+            fast = self._fast
+            if fast is not None and fast.epoch == _configuration_epoch[0] and fast.session is _session_state():
+                result = fast.call(arguments)
+                if result is not None:
+                    return result
+            return self._call_unbound(arguments)
+
+    def _call_unbound(self, arguments: tuple[Any, ...]) -> tuple[Any, Any]:
+        passed = dict(zip(self._unbound, arguments, strict=True))
+        full = tuple(self._bound[name] if name in self._bound else passed[name] for name in self._names)
+        outputs, pullback = execute_module_vjp(self._expression, full, {})
+        self._fast = _BoundVjpCall.create(self, full)
+        return outputs, _CopyingPullback(pullback, self.gradients)
+
+
+class _CopyingPullback:
+    """The pullback of a bound VJP call that ran unbound; it copies the bound inputs' gradients into their Storages."""
+
+    def __init__(self, pullback: Any, gradients: Mapping[str, TensorStorage]) -> None:
+        self._pullback = pullback
+        self._gradients = gradients
+
+    def __call__(self, cotangents: Any = None) -> Mapping[str, Any]:
+        computed = self._pullback(cotangents)
+        for name, destination in self._gradients.items():
+            destination[...] = computed[name].to_numpy()
+        if len(computed) == len(self._gradients):
+            return self._gradients
+        return {**computed, **self._gradients}
+
+
+class _BoundVjpCall:
+    """The linked calls of a bound VJP: the forward and backward slots its bound inputs and gradients hold, bound once
+    natively, and, per shape of the unbound tensor arguments, the allocations a call creates."""
+
+    def __init__(
+        self,
+        bound: BoundModuleVjp,
+        specialization: _VjpSpecialization,
+        forward: Any,
+        backward: Any,
+        forward_slots: tuple[tuple[bool, str], ...],
+        backward_slots: tuple[tuple[str, str], ...],
+        epoch: int,
+        session: Any,
+    ) -> None:
+        self.bound = bound
+        self.specialization = specialization
+        self.link = specialization.link
+        self.forward = forward
+        self.backward = backward
+        # The unbound slots of each record, in order, as `_VjpLink`'s.
+        self.forward_slots = forward_slots
+        self.backward_slots = backward_slots
+        self.epoch = epoch
+        self.session = session
+        self.gradients = bound.gradients
+        self.names = bound._unbound
+        self.bound_inputs = MappingProxyType(bound._bound)
+        self.bound_controls = _owner_controls(bound._bound.values())
+        self.template: tuple[Any, ...] = (None,) * len(specialization.allocations)
+        self.plans: dict[tuple[Any, ...], tuple[tuple[int, _AllocationSpec, tuple[int, ...], bool], ...]] = {}
+
+    @classmethod
+    def create(cls, bound: BoundModuleVjp, full: tuple[Any, ...]) -> _BoundVjpCall | None:
+        """The linked calls once `full` has linked the VJP's specialization; None while it has not or cannot."""
+        from ._runtime.session import _session_state
+        from .module import _configuration_epoch
+
+        expression = bound._expression
+        module = expression.module
+        if isinstance(getattr(module, "checkpoint_memory_budget", None), int):
+            return None
+        variant = ("vjp", expression.wrt, expression.outputs, expression.planning_policy)
+        key = module._fast_primal_key(full, variant)
+        session = _session_state()
+        specialization = None if key is None else module._program_cache.lookup(session, key)
+        if not isinstance(specialization, _VjpSpecialization):
+            return None
+        link = specialization.link
+        if link.vjp is None:
+            return None
+        values = bound._bound
+        forward_held = {(True, name): value for name, value in values.items()}
+        backward_held = {}
+        for name, gradient in bound.gradients.items():
+            primal = values[name]
+            backward_held[("gradient", name)] = (
+                TensorView(gradient, primal.shape, primal._strides, primal._offset, "read_write")
+                if isinstance(primal, TensorView)
+                else gradient
+            )
+
+        def bind(backward: bool, slots: tuple[Any, ...], held: Mapping[Any, Any]) -> tuple[Any, tuple[Any, ...]]:
+            positions = [index for index, slot in enumerate(slots) if slot in held]
+            bound_slots = link.vjp.bind(backward, positions, tuple(held[slots[index]] for index in positions))
+            return bound_slots, tuple(slot for slot in slots if slot not in held)
+
+        forward, forward_slots = bind(False, link.forward_slots, forward_held)
+        backward, backward_slots = bind(True, link.backward_slots, backward_held)
+        return cls(
+            bound,
+            specialization,
+            forward,
+            backward,
+            forward_slots,
+            backward_slots,
+            _configuration_epoch[0],
+            session,
+        )
+
+    def _plan(self, inputs: Mapping[str, Any]) -> tuple[tuple[int, _AllocationSpec, tuple[int, ...], bool], ...] | None:
+        link = self.link
+        shapes: list[tuple[int, ...] | None] = []
+        plan = []
+        for index, spec in enumerate(self.specialization.allocations):
+            shape = spec.shape_of(inputs, shapes)
+            shapes.append(shape)
+            if index not in link.created:
+                continue
+            if shape is None:
+                return None
+            plan.append(
+                (index, spec, shape, index not in link.zeroed and spec.initializer not in {"empty", "empty_like"})
+            )
+        return tuple(plan)
+
+    def call(self, arguments: tuple[Any, ...]) -> tuple[Any, _BoundPullback] | None:
+        inputs = dict(zip(self.names, arguments, strict=True))
+        key = tuple(getattr(argument, "shape", None) for argument in arguments)
+        plan = self.plans.get(key)
+        if plan is None:
+            plan = self._plan(ChainMap(inputs, self.bound_inputs))
+            if plan is None:
+                return None
+            self.plans[key] = plan
+        state = self.link.device_state
+        allocations = list(self.template)
+        for index, spec, shape, upload in plan:
+            allocation = spec.create_shaped(shape)
+            if state is not None and not _adopt_device_buffer(allocation, state, upload=upload, fresh=True):
+                return None
+            allocations[index] = allocation
+        outputs = self.specialization.outputs.resolve(ChainMap(inputs, self.bound_inputs), tuple(allocations))
+        published = flatten_program_outputs(outputs)
+        passed: list[Any] = []
+        for is_input, key in self.forward_slots:
+            source = inputs if is_input else published
+            if key not in source:
+                return None
+            value = source[key]
+            if (
+                state is not None
+                and is_input
+                and isinstance(value, (TensorStorage, TensorView))
+                and not _ensure_device_residency(value, state)
+            ):
+                return None
+            passed.append(value)
+        arguments_tuple = tuple(passed)
+        vjp = self.link.vjp
+        result = vjp.call(arguments_tuple, self.forward)
+        if result is None and self.refresh():
+            result = vjp.call(arguments_tuple, self.forward)
+        if result is None:
+            return None
+        return outputs, _BoundPullback(self, inputs, published, result)
+
+    def refresh(self) -> bool:
+        """Makes every bound buffer current on the device, as a call that found one stale needs; False on the CPU,
+        where a stale bound buffer cannot become current here."""
+        state = self.link.device_state
+        if state is None:
+            return False
+        for value in (*self.bound_inputs.values(), *self.gradients.values()):
+            if isinstance(value, (TensorStorage, TensorView)) and not _ensure_device_residency(value, state):
+                return False
+        return True
+
+
+class _BoundPullback:
+    """The pullback of a linked bound VJP call, which writes the bound inputs' gradients into their bound Storages. Its
+    residuals point into the memory of the forward call's inputs, bound or not, which a later write leaves to it."""
+
+    def __init__(self, call: _BoundVjpCall, inputs: Mapping[str, Any], published: Mapping[str, Any], result: Any):
+        self._call = call
+        self._inputs = inputs
+        self._published = published
+        self._result = result
+        self._preserved = _PreservedOwners(call.bound_controls + _owner_controls(inputs.values()))
+
+    def __call__(self, cotangents: Any = None) -> Mapping[str, Any]:
+        call = self._call
+        arguments, gradients = _backward_arguments(
+            call.link, call.backward_slots, self._inputs, self._published, cotangents
+        )
+        called = arguments is not None and self._result.backward(arguments, call.backward)
+        if not called and arguments is not None and call.refresh():
+            called = self._result.backward(arguments, call.backward)
+        if not called:
+            raise ValueError("Program pullback cotangents do not match the outputs of the forward call")
+        if not gradients:
+            return call.gradients
+        gradients.update(call.gradients)
+        return gradients
+
+
+def _create_linked_allocations(
+    allocations: tuple[_AllocationSpec, ...],
+    inputs: Mapping[str, Any],
+    created: frozenset[int],
+    zeroed: frozenset[int],
+    device_state: Any,
+) -> list[Any] | None:
+    """The allocations a linked call creates, by index, with None for the schedule's transients; on a GPU each gets a
+    device buffer, whose contents are not uploaded when the allocation starts empty or the schedule zeroes it. None
+    when a shape is not known before the Program runs."""
+    shapes: list[tuple[int, ...] | None] = []
+    result: list[Any] = []
+    for index, spec in enumerate(allocations):
+        shape = spec.shape_of(inputs, shapes)
+        shapes.append(shape)
+        if index not in created:
+            result.append(None)
+            continue
+        if shape is None and spec.initializer != "from_values":
+            return None
+        allocation = spec.create_shaped(shape or ())
+        if device_state is not None and not _adopt_device_buffer(
+            allocation,
+            device_state,
+            upload=index not in zeroed and spec.initializer not in {"empty", "empty_like"},
+            fresh=True,
+        ):
+            return None
+        result.append(allocation)
+    return result
+
+
 @dataclass(frozen=True)
 class _VjpSpecialization:
     compiled: Any
@@ -1515,6 +2209,7 @@ class _VjpSpecialization:
     definition: ModuleDefinition
     allocations: tuple[_AllocationSpec, ...]
     outputs: _TreeRecipe
+    link: _VjpLink = dataclasses.field(default_factory=_VjpLink)
 
     @property
     def template(self) -> ProgramTemplate:
@@ -1533,6 +2228,78 @@ class _VjpSpecialization:
         checkpoint_policy: str,
     ) -> tuple[Any, Any]:
         inputs = _bind_program_inputs(self.definition, arguments, keywords)
+        # A memory budget links the Program's VJP checkpointed, and its pullback reports the checkpoint plan.
+        planned = checkpoint_memory_budget is not None or bool(checkpoint_policy)
+        if not self.link.attempted and not planned:
+            self._link()
+        if self.link.vjp is not None and not planned:
+            linked = self._call_linked(inputs)
+            if linked is not None:
+                return linked
+        return self._invoke_program(inputs, checkpoint_memory_budget, checkpoint_policy)
+
+    def invoke_fast(self, arguments: tuple[Any, ...]) -> tuple[Any, _LinkedPullback] | None:
+        """The linked call for positional arguments that bind one to one to forward()'s parameters; None when the
+        call takes the Program path."""
+        if self.link.vjp is None:
+            return None
+        return self._call_linked(dict(zip(self.definition.fast_leaves()[0], arguments, strict=True)))
+
+    def _call_linked(self, inputs: Mapping[str, Any]) -> tuple[Any, _LinkedPullback] | None:
+        link = self.link
+        allocations = _create_linked_allocations(self.allocations, inputs, link.created, link.zeroed, link.device_state)
+        if allocations is None:
+            return None
+        outputs = self.outputs.resolve(inputs, tuple(allocations))
+        published = flatten_program_outputs(outputs)
+        state = link.device_state
+        arguments = []
+        for is_input, key in link.forward_slots:
+            source = inputs if is_input else published
+            if key not in source:
+                return None
+            value = source[key]
+            # An input only the host holds, such as a fresh batch, is uploaded here rather than by a Program call; the
+            # call's fresh outputs already have their device buffers.
+            if (
+                state is not None
+                and is_input
+                and isinstance(value, (TensorStorage, TensorView))
+                and not _ensure_device_residency(value, state)
+            ):
+                return None
+            arguments.append(value)
+        call = link.vjp.call(tuple(arguments))
+        if call is None:
+            return None
+        return outputs, _LinkedPullback(self, inputs, published, call)
+
+    def _link(self) -> None:
+        from ._runtime.session import _session_state, cpu
+
+        link = self.link
+        link.attempted = True
+        compiled = self.compiled
+        vjp = compiled._linked_vjp(compiled.executable)
+        if vjp is None or not vjp.calls:
+            return
+        backward_slots = tuple((role, path) for role, path in vjp.backward_slots)
+        parameters = set(self.definition.signature.parameters)
+        if any("." in path or (role == "gradient" and path not in parameters) for role, path in backward_slots):
+            return
+        state = _session_state()
+        link.forward_slots = tuple((is_input, path) for path, is_input in vjp.forward_slots)
+        link.backward_slots = backward_slots
+        link.created = frozenset(self.outputs.allocation_indices())
+        link.zeroed = frozenset(
+            index for index in link.created if self.allocations[index].initializer in {"zeros", "zeros_like"}
+        )
+        link.device_state = None if state.arch == cpu else state
+        link.vjp = vjp
+
+    def _invoke_program(
+        self, inputs: dict[str, Any], checkpoint_memory_budget: int | None, checkpoint_policy: str
+    ) -> tuple[Any, Any]:
         allocation_list: list[TensorStorage] = []
         for spec in self.allocations:
             allocation_list.append(spec.create(inputs, tuple(allocation_list)))
@@ -1574,9 +2341,15 @@ def _resolve_module_program_controls(
 def execute_module_primal(module: Any, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
     from ._runtime.session import _session_state
 
+    runtime_state = _session_state()
+    key = None if keywords else module._fast_primal_key(arguments)
+    if key is not None:
+        cached = module._program_cache.lookup(runtime_state, key)
+        if cached is not None:
+            names = type(module)._module_definition.fast_leaves()[0]
+            return cached.invoke_inputs(dict(zip(names, arguments, strict=True)))
     arguments, keywords = _resolve_module_program_controls(module, arguments, keywords)
     key = module._program_specialization_key(arguments, keywords, variant="primal")
-    runtime_state = _session_state()
 
     def compile_primal() -> _PrimalSpecialization:
         capture, outputs = _capture_module(
@@ -1638,25 +2411,24 @@ def execute_module_vjp(
     from ._runtime.session import _session_state
 
     module = expression.module
-    key = module._program_specialization_key(
-        arguments,
-        keywords,
-        variant=(
-            "vjp",
-            expression.wrt,
-            expression.outputs,
-            expression.planning_policy,
-        ),
-    )
+    variant = ("vjp", expression.wrt, expression.outputs, expression.planning_policy)
     runtime_state = _session_state()
+    budget = getattr(module, "checkpoint_memory_budget", None)
+    if not isinstance(budget, int):
+        budget = None
+    key = None if keywords or budget is not None else module._fast_primal_key(arguments, variant)
+    if key is not None:
+        cached = module._program_cache.lookup(runtime_state, key)
+        if cached is not None:
+            linked = cached.invoke_fast(arguments)
+            if linked is not None:
+                return linked
+    key = module._program_specialization_key(arguments, keywords, variant=variant)
     specialization = module._program_cache.get_or_create(
         runtime_state,
         key,
         lambda: _compile_module_vjp_specialization(expression, arguments, keywords),
     )
-    budget = getattr(module, "checkpoint_memory_budget", None)
-    if not isinstance(budget, int):
-        budget = None
     return specialization.invoke(
         arguments,
         keywords,

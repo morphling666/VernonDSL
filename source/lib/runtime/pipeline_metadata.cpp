@@ -261,6 +261,12 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             argument.sourceName = value.value("vernon.source_name", "");
             argument.kind = value["kind"].get<std::string>();
             argument.autodiffRole = value.value("vernon.autodiff_role", value.value("role", ""));
+            argument.access = value.value("access", "");
+            argument.autodiffCarrier = value.value("vernon.autodiff_carrier", "");
+            if (const auto layout = value.find("value_layout"); layout != value.end() && layout->is_object())
+                if (const auto leaves = layout->find("leaves"); leaves != layout->end() && leaves->is_array())
+                    argument.canonicalBytes =
+                        leaves->size() == 1 && (*leaves)[0].value("scalar_count", uint64_t{0}) == 1;
             argument.dtype =
                 pipelineDataType(value.value("vernon.dtype", value.value("dtype", value.value("type", ""))));
             if (value.contains("index")) {

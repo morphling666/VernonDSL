@@ -483,6 +483,11 @@ struct CudaPacketDecoder {
                                 const vernon::rhi::OpenedRendering &) {
         return graphics();
     }
+    RhiAdapterResult<void> drawStream(uint32_t, uint32_t, uint32_t, uint32_t,
+                                      const VernonRuntimeProviderStreamPayload &,
+                                      const vernon::rhi::OpenedRendering &) {
+        return graphics();
+    }
 
     RhiAdapterResult<void> bindPipeline(RhiRetainedObject &object) {
         auto &pipeline = static_cast<PreparedPipeline &>(object);

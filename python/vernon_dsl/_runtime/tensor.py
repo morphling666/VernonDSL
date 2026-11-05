@@ -4,7 +4,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Annotated, Any, get_args, get_origin
-from weakref import WeakValueDictionary
+from weakref import WeakValueDictionary, ref
 
 import numpy as np
 
@@ -23,7 +23,7 @@ from ..host_values import (
 )
 from ..language.slicing import runtime_key
 from ..types import Tensor, TypeExpr, _Scalar
-from .residency import _BufferRegion, _ResourceControlBlock, _scoped_host_access
+from .residency import _BufferRegion, _ResidencySet, _ResourceControlBlock, _scoped_host_access
 from .session import _InvocationContext, cpu
 
 _ACCESS_MODES = frozenset({"read", "write", "read_write"})
@@ -243,7 +243,62 @@ def _buffer_bytes(owner: Any) -> np.ndarray:
     return owner._array.reshape(-1).view(np.uint8)
 
 
+def _adopt_device_buffer(owner: Any, state: Any, *, upload: bool, fresh: bool = False) -> bool:
+    """Gives an owner no Runtime has seen a residency in `state` that holds its current version, so a linked call can
+    write it on the device. With `upload` the device buffer starts as the host bytes; without, its contents are
+    undefined, as an `empty` owner's are. A `fresh` owner was just created by the caller, so no other thread can
+    reach it and it needs no lock. False for an empty owner, which has no device buffer."""
+    nbytes = owner._array.nbytes
+    if not nbytes:
+        return False
+    handle = state.device.create_buffer(nbytes)
+    if upload:
+        handle.upload_ranges([(0, bytes(_buffer_bytes(owner)))])
+    control = owner._control
+    if fresh:
+        control.residencies.replace(state, handle, version=control.version)
+        control.coherence.dirty_ranges.clear()
+        return True
+    with control.lock:
+        control.residencies.replace(state, handle, version=control.version)
+        control.coherence.dirty_ranges.clear()
+    return True
+
+
+def _ensure_device_residency(value: Any, state: Any) -> bool:
+    """Makes `state` hold the current version of a TensorStorage's or TensorView's owner, uploading the host bytes when
+    only the host holds it. False when another session's device holds a write the host has not seen, which only a
+    Program invocation migrates."""
+    owner = value._owner if isinstance(value, TensorView) else value
+    control = owner._control
+    with control.lock:
+        residency = control.residencies.get(state)
+        if residency is not None and residency.version == control.version:
+            return True
+        if control.coherence.device_dirty:
+            return False
+    return _adopt_device_buffer(owner, state, upload=True)
+
+
+def _wait_buffer(owner: Any) -> None:
+    # Only the latest residency can hold a write the host has not seen; an older one was superseded by a write that
+    # migrated from it, which waited for it.
+    with owner._control.lock:
+        residency = owner._control.residencies.latest()
+        if residency is None or residency.timeline is None or not owner._control.coherence.device_dirty:
+            return
+        timeline, point = residency.timeline, residency.write_point
+    try:
+        timeline.wait(point)
+    except RuntimeError:
+        # A write that failed on the device left the buffer undefined (specs/runtime/architecture_v2.md section 9).
+        with owner._control.lock:
+            owner._control.poison()
+        raise
+
+
 def _synchronize_buffer(owner: Any, region: _BufferRegion) -> None:
+    _wait_buffer(owner)
     control = owner._control
     reservation = None
     with control.lock:
@@ -279,8 +334,8 @@ def _materialize_buffer(
     access: str,
 ) -> Any:
     state = context.session
-    if state.rhi_host is None:
-        raise RuntimeError("device buffer residency requires a GPU RHI host")
+    if state.arch == cpu:
+        raise RuntimeError("device buffer residency requires a GPU Runtime session")
     control = owner._control
     reservation = None
     retry = False
@@ -343,7 +398,7 @@ def _materialize_buffer(
                 merged[begin : begin + len(data)] = data
             host_bytes = bytes(merged)
         if target_handle is None:
-            target_handle = state.rhi_host.create_buffer(owner._array.nbytes)
+            target_handle = state.device.create_buffer(owner._array.nbytes)
         uploads = [(begin, host_bytes[begin:end]) for begin, end in upload_ranges]
         if uploads:
             target_handle.upload_ranges(uploads)
@@ -390,6 +445,83 @@ def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[
     return _coalesced_byte_ranges(ranges)
 
 
+def _move_preserved_memory(owner: TensorStorage | RawBuffer) -> None:
+    """Before a write to an owner live pullbacks read, leaves its memory, host array and residencies, to a snapshot
+    owner each of them holds and moves the owner to a copy, which the write then changes. A pullback's residuals point
+    into the memory it read, so the memory must stay with the snapshot rather than the copy. The caller holds the
+    owner's lock."""
+    control = owner._control
+    references = control.__dict__.pop("preserved", None) or ()
+    holders = [holder for holder in (reference() for reference in references) if holder is not None]
+    if not holders:
+        return
+    _synchronize_buffer(owner, owner._region)
+    snapshot = object.__new__(type(owner))
+    snapshot.__dict__.update(owner.__dict__)
+    if isinstance(snapshot, TensorStorage):
+        snapshot._full_views = None
+    snapshot._control = _ResourceControlBlock(control.coherence)
+    snapshot._control.residencies = control.residencies
+    snapshot._control.version = control.version
+    snapshot._control.host_version = control.host_version
+    owner._array = owner._array.copy()
+    control.residencies = _ResidencySet()
+    control.coherence = _BufferCoherence(_DirtyRangeSet(owner._array.nbytes, dirty=True))
+    for holder in holders:
+        holder.snapshots[control.owner_id] = snapshot
+
+
+class _PreservedOwners:
+    """The owners a pullback reads, as of its forward call: an owner written while the pullback lives leaves the memory
+    it read to a snapshot here, which `resolve` passes in its place."""
+
+    # Registering takes no lock: each step is one atomic dict or list operation, and a write that races the
+    # registration races the forward call the pullback was made by anyway. A list emptied by `forget` stays, as
+    # removing it could drop a reference appended meanwhile; an empty list preserves nothing. A control listed twice
+    # holds the reference twice and loses both.
+    def __init__(self, controls: tuple[_ResourceControlBlock, ...]) -> None:
+        self.snapshots: dict[int, TensorStorage | RawBuffer] = {}
+
+        def forget(reference: Any) -> None:
+            for control in controls:
+                preserved = control.__dict__.get("preserved")
+                if preserved:
+                    try:
+                        preserved.remove(reference)
+                    except ValueError:
+                        pass
+
+        reference = ref(self, forget)
+        for control in controls:
+            control.__dict__.setdefault("preserved", []).append(reference)
+
+    def resolve(self, value: Any) -> Any:
+        if not self.snapshots or not isinstance(value, (TensorStorage, RawBuffer, TensorView)):
+            return value
+        owner = value._owner if isinstance(value, TensorView) else value
+        snapshot = self.snapshots.get(owner._control.owner_id)
+        if snapshot is None:
+            return value
+        if not isinstance(value, TensorView):
+            return snapshot
+        view = object.__new__(TensorView)
+        view.__dict__.update(value.__dict__)
+        view._owner = snapshot
+        return view
+
+
+def _owner_controls(values: Any) -> tuple[_ResourceControlBlock, ...]:
+    """The control blocks of the tensor owners among `values`, each once."""
+    controls: dict[int, _ResourceControlBlock] = {}
+    for value in values:
+        if isinstance(value, TensorView):
+            value = value._owner
+        elif not isinstance(value, TensorStorage):
+            continue
+        controls[value._control.owner_id] = value._control
+    return tuple(controls.values())
+
+
 class TensorStorage:
     """Host owner of a dense row-major allocation with one canonical element layout."""
 
@@ -412,13 +544,33 @@ class TensorStorage:
         self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
         self._control = _ResourceControlBlock(_BufferCoherence(_DirtyRangeSet(array.nbytes, dirty=True)))
         self._region = _BufferRegion(((0, array.nbytes),))
-        self._full_views: WeakValueDictionary[str, TensorView] = WeakValueDictionary()
+        # Created by the first `_full_view`, since most owners never take one.
+        self._full_views: WeakValueDictionary[str, TensorView] | None = None
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
         if not isinstance(arguments, tuple):
             arguments = (arguments,)
         return TypeExpr(cls.__name__, arguments)
+
+    @classmethod
+    def _adopt(
+        cls,
+        array: np.ndarray,
+        element_type: Any | None = None,
+        element_layout: HostAbiLayout | TangentLayout | None = None,
+    ) -> TensorStorage:
+        """An owner of an array the runtime allocated itself, contiguous and of a dtype `__init__` accepts for this
+        element type, without checking either again."""
+        storage = cls.__new__(cls)
+        storage._array = array
+        storage._element_type = element_type
+        storage._element_layout = element_layout
+        storage._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
+        storage._control = _ResourceControlBlock(_BufferCoherence(_DirtyRangeSet(array.nbytes, dirty=True)))
+        storage._region = _BufferRegion(((0, array.nbytes),))
+        storage._full_views = None
+        return storage
 
     @staticmethod
     def _dtype(dtype: _Scalar) -> np.dtype[Any]:
@@ -682,10 +834,13 @@ class TensorStorage:
 
     def _full_view(self, access: str) -> TensorView:
         access = _checked_access(access)
-        view = self._full_views.get(access)
+        views = self._full_views
+        if views is None:
+            views = self._full_views = WeakValueDictionary()
+        view = views.get(access)
         if view is None:
             view = self.view(access=access)
-            self._full_views[access] = view
+            views[access] = view
         return view
 
     def swizzle(self, components: str) -> TensorView:
@@ -1022,11 +1177,18 @@ class TensorStorage:
     def synchronize(self, region: _BufferRegion | None = None) -> None:
         _synchronize_buffer(self, self._region if region is None else region)
 
+    def wait(self) -> None:
+        """Blocks until every device write submitted to this storage has completed, without copying it to the host."""
+        _wait_buffer(self)
+
     def _detach_host_array(self) -> None:
         """Moves the elements into an array of the storage's own, before the memory its array views is freed."""
 
         self.synchronize()
         self._array = self._array.copy()
+
+    def _preserve_before_write(self) -> None:
+        _move_preserved_memory(self)
 
     def _device_claim_region(self, context: _InvocationContext, region: _BufferRegion, access: str) -> _BufferRegion:
         if context.session.arch == cpu:
@@ -1161,6 +1323,13 @@ class RawBuffer:
 
     def synchronize(self, region: _BufferRegion | None = None) -> None:
         _synchronize_buffer(self, self._region if region is None else region)
+
+    def wait(self) -> None:
+        """Blocks until every device write submitted to this buffer has completed, without copying it to the host."""
+        _wait_buffer(self)
+
+    def _preserve_before_write(self) -> None:
+        _move_preserved_memory(self)
 
     def _prepare_partial_host_write(self, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
         coherence = self._control.coherence
@@ -1348,6 +1517,10 @@ class TensorView:
         )
         result._components = self._components
         return result
+
+    def wait(self) -> None:
+        """Blocks until every device write submitted to the view's owner has completed, without copying it."""
+        self.owner.wait()
 
     @_scoped_host_access("read")
     def to_numpy(self) -> np.ndarray:

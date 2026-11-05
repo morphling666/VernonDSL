@@ -2,13 +2,15 @@
 
 [Run the live WebAssembly demo](https://morphling666.github.io/VernonDSL/)
 
-This C++ engine embeds two cooked bundles and displays them in one DPI-aware
-GLFW window or WebGL canvas. The left panel runs `examples/fractal.py` through
-one persistent CPU Program instance; the right panel runs one persistent
-graphics Program instance. Every frame begins a fresh canonical Program
-invocation and binds its current Values and graphics controls. Presentation is
-a separate host/RHI operation, and the shared frame loop composites both
-images with aspect-preserving blits.
+This C++ engine embeds three cooked bundles and displays two panels in one
+DPI-aware GLFW window or WebGL canvas. Each Program is linked once as a
+schedule on a HAL device (`VernonHal.h`, `VernonSchedule.h`); a frame
+rewrites the arguments that change and calls it. The left panel runs
+`examples/fractal.py` on a CPU device and uploads its pixels to an image on the
+OpenGL device; the right panel draws the Mandelbulb Program into its own image
+there. The `panel_pipeline.py` compositor then samples each panel image into
+its aspect-fit half of the window surface's acquired image, which the surface
+presents.
 
 Python and nanobind are used only by the host-side cooking step. Browser builds
 perform no filesystem or dynamic-library access.
@@ -27,7 +29,7 @@ python -m pip install path/to/vernon_lang-*.whl
 For cross-compilation, install the wheel for the build host; its portable
 Runtime source payload is compiled for the target toolchain.
 
-The build cooks both Programs from their DSL sources with
+The build cooks the three Programs from their DSL sources with
 `vernon_add_program_asset`, which the wheel's Runtime CMake project provides.
 Linking the CPU asset target links the cooked objects whole-archive; each
 object registers its entries from a static constructor, so the engine needs no
@@ -44,7 +46,7 @@ ctest --test-dir split-desktop-build -C Release --output-on-failure
 
 The same CMake project and C++ sources build on Windows, macOS, and Linux.
 `ctest` runs the common CPU Program path headlessly; the interactive executable
-adds the GLFW/OpenGL presentation path.
+adds the OpenGL device and its window surface.
 
 ## WebAssembly split screen
 

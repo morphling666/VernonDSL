@@ -1378,7 +1378,8 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
     EXPECT_EQ(graphs.at(0).at("direction"), "forward");
     EXPECT_EQ(graphs.at(1).at("direction"), "backward");
     const nlohmann::json &requests = reflection.at("kernel_compile_requests");
-    ASSERT_EQ(requests.size(), 8u);
+    // The fan-in add writes a zeroed allocation of the backward graph, which is the public gradient without a copy.
+    ASSERT_EQ(requests.size(), 7u);
     EXPECT_TRUE(std::any_of(requests.begin(), requests.end(), [](const nlohmann::json &request) {
         return request.at("implementation_hint") == "vernon.builtin.add";
     }));
@@ -1390,14 +1391,14 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
         const auto hint = request.at("implementation_hint").get<std::string>();
         return hint.size() >= 4 && hint.compare(hint.size() - 4, 4, ".vjp") == 0;
     }));
-    EXPECT_EQ(reflection.at("program_plan").at("values").size(), 19u);
+    EXPECT_EQ(reflection.at("program_plan").at("values").size(), 17u);
     const nlohmann::json &signature = reflection.at("program_plan").at("signature");
     EXPECT_EQ(signature.at("inputs"), nlohmann::json::array({{{"value", 0}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("outputs"),
               nlohmann::json::array({{{"value", 1}, {"path", "left"}}, {{"value", 3}, {"path", "right"}}}));
     EXPECT_EQ(signature.at("cotangents"),
               nlohmann::json::array({{{"value", 5}, {"path", "left"}}, {{"value", 6}, {"path", "right"}}}));
-    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 18}, {"path", "source"}}}));
+    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 16}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("captures"), nlohmann::json::array({0, 1, 2, 3, 4}));
 
     vernonCompileResultDestroy(planned);

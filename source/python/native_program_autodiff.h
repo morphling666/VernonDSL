@@ -67,112 +67,54 @@ PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *executable, const 
 std::string programInputName(const nb::dict &inputs, const std::string &leafPath);
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
+// The backward call of one linked VJP forward call (vernonScheduleVjpBackward over that call's residuals). A linked
+// pullback binds cotangents and gradients by their derivative boundary slots.
+struct LinkedBackward {
+    virtual ~LinkedBackward() = default;
+    // Runs the backward schedule and returns the point its submission signals.
+    virtual uint64_t call(const ProgramInvocationBuilder &arguments) = 0;
+    virtual void wait(uint64_t point) const = 0;
+    virtual const nb::object &timeline() const = 0;
+    virtual uint64_t residualBytes() const = 0;
+    // A checkpointed call's checkpoint plan, or None.
+    virtual nb::object checkpointPlan() const = 0;
+    // One plus the forward nodes the pullback runs again per forward node.
+    virtual double recomputationFactor() const = 0;
+    // A dict of pass telemetry per forward node.
+    virtual nb::list passTelemetry() const = 0;
+    // The device a GPU call stages host arrays on, since its schedule reads only device buffers.
+    virtual std::shared_ptr<HalDeviceState> device() const = 0;
+};
+
+// The pullback of one linked VJP forward call.
 struct PythonPullback {
     PythonPullback(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
-                   VernonProgramExecutable *executable, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
-                   std::vector<PythonAdMetadata> cotangents, nb::object executableOwner, nb::dict bindings)
-        : owner(std::move(owner)), runtime(runtime), executable(executable), handle(handle),
+                   VernonProgramExecutable *executable, std::shared_ptr<LinkedBackward> linked,
+                   std::vector<PythonAdMetadata> gradients, std::vector<PythonAdMetadata> cotangents,
+                   nb::object executableOwner, nb::dict bindings)
+        : owner(std::move(owner)), runtime(runtime), executable(executable), linked(std::move(linked)),
           gradients(std::move(gradients)), cotangents(std::move(cotangents)),
           executableOwner(std::move(executableOwner)), bindings(std::move(bindings)) {}
-    ~PythonPullback() { vernonProgramPullbackDestroy(handle); }
 
     nb::dict applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
                           const nb::object &cotangentGroups, const nb::object &carrierShape, const nb::object &context,
-                          const nb::callable &admit) {
-        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, context, admit,
-                                       nullptr);
-    }
-    nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
-                                     const nb::object &cotangentGroups, const nb::object &carrierShape,
-                                     const nb::object &context, const nb::callable &admit,
-                                     const VernonPullbackApplyOptions *options);
-    size_t logicalResidualBytes() const { return memoryUsage().logical_residual_bytes; }
-    size_t residentBytes() const { return memoryUsage().resident_bytes; }
-    size_t allocatedBytes() const { return memoryUsage().allocated_bytes; }
-    size_t retainedAllocationBytes() const { return memoryUsage().retained_allocation_bytes; }
-    size_t peakTemporaryBytes() const { return memoryUsage().peak_temporary_bytes; }
-    uint64_t submissionCount() const { return controlPlaneUsage().submissions; }
-    uint64_t waitCount() const { return controlPlaneUsage().waits; }
-    uint64_t readbackCount() const { return controlPlaneUsage().readbacks; }
-    uint64_t atomicPublicationCount() const { return controlPlaneUsage().atomic_publications; }
-    uint64_t temporaryAllocationTrafficBytes() const { return controlPlaneUsage().temporary_allocation_bytes; }
-    uint64_t deviceWaitNanoseconds() const { return controlPlaneUsage().device_wait_nanoseconds; }
+                          const nb::callable &admit);
+    // The residuals are all a linked pullback's tape, resident from its forward call.
+    size_t logicalResidualBytes() const { return linked->residualBytes(); }
+    size_t residentBytes() const { return linked->residualBytes(); }
+    size_t allocatedBytes() const { return linked->residualBytes(); }
+    size_t peakTemporaryBytes() const { return 0; }
     size_t tapeContextLimitBytes() const { return vernonRuntimePrivateGetAutodiffHostTapeContextLimit(runtime); }
-    uint64_t peakRuntimeManagedBytes() const { return vernonRuntimePrivateGetAutodiffPeakRuntimeManagedBytes(handle); }
-    nb::object checkpointPlan() const {
-        nb::object result = nb::none();
-        const VernonStatus status = vernonRuntimePrivateVisitAutodiffCheckpointPlan(
-            handle,
-            [](void *userData, const VernonRuntimePrivateAutodiffCheckpointPlan *plan) {
-                if (!plan->present)
-                    return;
-                nb::dict value;
-                value["peak_bytes"] = plan->peak_bytes;
-                value["memory_budget"] = plan->memory_budget;
-                value["logical_residual_bytes"] = plan->logical_residual_bytes;
-                value["retained_allocation_bytes"] = plan->retained_allocation_bytes;
-                value["initial_state_bytes"] = plan->initial_state_bytes;
-                value["restoration_bytes"] = plan->restoration_bytes;
-                value["transaction_bytes"] = plan->transaction_bytes;
-                value["persistent_checkpoint_bytes"] = plan->persistent_checkpoint_bytes;
-                value["backward_value_bytes"] = plan->backward_value_bytes;
-                value["replay_cost"] = plan->replay_cost;
-                value["recomputation_cost"] = plan->recomputation_cost;
-                value["selected_policy"] = nativeStringView(plan->selected_policy);
-                *static_cast<nb::object *>(userData) = std::move(value);
-            },
-            &result);
-        if (status != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query pullback checkpoint plan");
-        return result;
-    }
-    nb::list passTelemetry() const {
-        nb::list result;
-        const VernonStatus status = vernonRuntimePrivateVisitAutodiffPassTelemetry(
-            handle,
-            [](void *userData, const VernonRuntimePrivateAutodiffPassTelemetry *item) {
-                nb::dict telemetry;
-                telemetry["schedule_offset"] = item->schedule_offset;
-                telemetry["pass_name"] = nativeStringView(item->pass_name);
-                telemetry["residual_source_kind"] = nativeStringView(item->residual_source_kind);
-                telemetry["control_history_kind"] = nativeStringView(item->control_history_kind);
-                telemetry["estimated_tape_bytes"] = item->estimated_tape_bytes;
-                telemetry["logical_residual_bytes"] = item->logical_residual_bytes;
-                telemetry["resident_tape_bytes"] = item->resident_tape_bytes;
-                telemetry["allocated_tape_bytes"] = item->allocated_tape_bytes;
-                telemetry["retained_allocation_bytes"] = item->retained_allocation_bytes;
-                telemetry["peak_temporary_tape_bytes"] = item->peak_temporary_tape_bytes;
-                telemetry["checkpoint_bytes"] = item->checkpoint_bytes;
-                telemetry["active_operation_count"] = item->active_operation_count;
-                telemetry["recomputation_cost"] = item->recomputation_cost;
-                static_cast<nb::list *>(userData)->append(std::move(telemetry));
-            },
-            &result);
-        if (status != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query pullback pass telemetry");
-        return result;
-    }
+    uint64_t peakRuntimeManagedBytes() const { return linked->residualBytes(); }
+    double recomputationFactor() const { return linked->recomputationFactor(); }
+    nb::object checkpointPlan() const { return linked->checkpointPlan(); }
+    nb::list passTelemetry() const { return linked->passTelemetry(); }
     const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
 private:
-    VernonRuntimePrivateAutodiffMemoryUsage memoryUsage() const {
-        VernonRuntimePrivateAutodiffMemoryUsage result{};
-        result.struct_size = sizeof(result);
-        if (vernonRuntimePrivateGetAutodiffMemoryUsage(handle, &result) != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query pullback memory usage");
-        return result;
-    }
-    VernonRuntimePrivateAutodiffControlPlaneUsage controlPlaneUsage() const {
-        VernonRuntimePrivateAutodiffControlPlaneUsage result{};
-        result.struct_size = sizeof(result);
-        if (vernonRuntimePrivateGetAutodiffControlPlaneUsage(handle, &result) != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query pullback control-plane usage");
-        return result;
-    }
-
-    nb::dict applyImpl(const nb::object &cotangent, const nb::object &context, const nb::callable &admit,
-                       const VernonPullbackApplyOptions *options = nullptr) {
+    nb::dict applyImpl(const nb::object &cotangent, const nb::object &context, const nb::callable &admit) {
         ProgramInvocationBuilder builder(owner, runtime, executable);
+        const bool onDevice = runtimeOnDevice(owner.get());
         nb::dict result;
         std::unordered_map<PyObject *, nb::object> gradientsByOwner;
         for (const PythonAdMetadata &gradient : gradients) {
@@ -314,16 +256,54 @@ private:
                 packedPublications.push_back(std::move(publication));
             return packed;
         };
+        struct StagedHostArray {
+            nb::object array;
+            std::unique_ptr<HalBuffer> buffer;
+            bool written{};
+        };
+        std::vector<StagedHostArray> staged;
+        const auto stageHostArray = [&](const ProgramParameterMetadata &parameter, const nb::object &source,
+                                        VernonValueAccess access) {
+            nb::object numpy = nb::module_::import_("numpy");
+            nb::object array = numpy.attr("asarray")(pythonAdArraySource(source));
+            nb::object contiguous = numpy.attr("ascontiguousarray")(array);
+            if (parameter.elementLeaves.size() == 1 && parameter.elementLeaves[0].scalar_count == 1 &&
+                contiguous.attr("dtype").attr("fields").is_none() &&
+                ProgramInvocationBuilder::numpyDataType(contiguous) !=
+                    static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
+                throw std::invalid_argument("host derivative dtype does not match executable reflection");
+            const std::vector<uint64_t> arrayShape = nb::cast<std::vector<uint64_t>>(contiguous.attr("shape"));
+            const size_t rank = parameter.shape.size();
+            if (arrayShape.size() < rank)
+                throw std::invalid_argument("host derivative rank is smaller than its boundary's");
+            std::vector<uint64_t> shape(arrayShape.begin(), arrayShape.begin() + static_cast<std::ptrdiff_t>(rank));
+            std::vector<int64_t> strides(rank);
+            uint64_t elements = 1;
+            for (size_t dimension = rank; dimension-- > 0;) {
+                strides[dimension] = static_cast<int64_t>(elements * parameter.elementByteSize);
+                elements *= shape[dimension];
+            }
+            const size_t bytes = nb::cast<size_t>(contiguous.attr("nbytes"));
+            if (bytes != elements * parameter.elementByteSize)
+                throw std::invalid_argument("host derivative bytes do not match its boundary's elements");
+            auto buffer = std::make_unique<HalBuffer>(linked->device(), std::max<size_t>(bytes, 16));
+            if (bytes)
+                buffer->upload(nb::cast<nb::bytes>(contiguous.attr("tobytes")()), 0);
+            builder.ownedArgument(
+                builder.prepareDeviceTensor(nb::int_(parameter.slot), buffer.get(), access, shape, strides, 0));
+            staged.push_back({std::move(array), std::move(buffer), access != VERNON_ACCESS_READ});
+        };
         const auto addBoundary = [&](const ProgramParameterMetadata &parameter, const nb::object &source,
                                      VernonValueAccess access) {
             if (parameter.kind != VERNON_PROGRAM_TENSOR)
                 throw std::invalid_argument("Program derivative boundary must be a Tensor");
-            if (nb::hasattr(source, "_resident_buffer") && nb::hasattr(source, "layout") &&
-                vernonRuntimePrivateGetAutodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+            if (onDevice && !nb::hasattr(source, "_resident_buffer"))
+                return stageHostArray(parameter, source, access);
+            if (nb::hasattr(source, "_resident_buffer") && nb::hasattr(source, "layout") && onDevice) {
                 nb::object bufferObject = source.attr("_resident_buffer")(context);
-                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+                auto *buffer = nb::cast<HalBuffer *>(bufferObject);
                 nb::object layout = source.attr("layout");
-                builder.ownedArgument(builder.prepareRhiTensor(
+                builder.ownedArgument(builder.prepareDeviceTensor(
                     nb::int_(parameter.slot), buffer, access, nb::cast<std::vector<uint64_t>>(source.attr("shape")),
                     nb::cast<std::vector<int64_t>>(layout.attr("byte_strides")),
                     nb::cast<size_t>(layout.attr("byte_offset"))));
@@ -382,8 +362,7 @@ private:
                 if (!sharedGradient)
                     gradientSources.push_back(source.ptr());
             }
-            bool directDevice =
-                vernonRuntimePrivateGetAutodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX;
+            bool directDevice = onDevice;
             nb::object bufferObject = nb::none();
             nb::tuple boundaryLayout;
             if (nb::hasattr(binding, "_gradient_boundary_layout") && directDevice) {
@@ -416,8 +395,8 @@ private:
                 source = destination;
             }
             if (directDevice && !boundaryLayout.is_none()) {
-                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
-                builder.ownedArgument(builder.prepareRhiTensor(
+                auto *buffer = nb::cast<HalBuffer *>(bufferObject);
+                builder.ownedArgument(builder.prepareDeviceTensor(
                     nb::int_(parameter.slot), buffer, access, nb::cast<std::vector<uint64_t>>(boundaryLayout[0]),
                     nb::cast<std::vector<int64_t>>(boundaryLayout[1]), nb::cast<size_t>(boundaryLayout[2])));
                 return;
@@ -526,6 +505,21 @@ private:
                 }
             }
         } deviceAccessLeaseGuard{deviceAccessLease};
+        const auto publishPacked = [&]() {
+            nb::object numpy = nb::module_::import_("numpy");
+            for (PackedPublication &publication : packedPublications) {
+                nb::object packedBytes = publication.bytes.attr("reshape")(-1, publication.elementByteSize);
+                for (auto &[destination, offset, bytes] : publication.destinations) {
+                    nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
+                        nb::slice(nb::none(), nb::none(), nb::none()), nb::slice(offset, offset + bytes, size_t{1})));
+                    nb::object typed = region.attr("copy")()
+                                           .attr("reshape")(-1)
+                                           .attr("view")(destination.attr("dtype"))
+                                           .attr("reshape")(destination.attr("shape"));
+                    numpy.attr("add")(destination, typed, nb::arg("out") = destination);
+                }
+            }
+        };
         for (const ProgramParameterMetadata &parameter : cotangentBoundaries) {
             nb::str path(parameter.name.c_str());
             if (!supplied.contains(path))
@@ -545,67 +539,36 @@ private:
                 source = packBoundary(parameter, result, true);
             addDerivativeBoundary(parameter, source, VERNON_ACCESS_WRITE, VERNON_AD_DERIVATIVE_GRADIENT);
         }
-        std::vector<VernonProgramArgument> arguments;
-        builder.collectArguments(arguments);
-        const VernonPullbackApplyOptions defaultOptions{sizeof(VernonPullbackApplyOptions),
-                                                        VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
-                                                        std::numeric_limits<uint64_t>::max(),
-                                                        {}};
-        PythonInvocationOutcome outcome;
-        outcome.mutations.resize(vernonRuntimeProgramExecutableGetParameterCount(executable));
-        VernonInvocationMutationOutcome nativeOutcome{sizeof(VernonInvocationMutationOutcome),
-                                                      VERNON_INVOCATION_NOT_SUBMITTED,
-                                                      outcome.mutations.data(),
-                                                      outcome.mutations.size(),
-                                                      0,
-                                                      {}};
-        const VernonStatus status = vernonProgramPullbackApplyWithOptions(
-            handle, arguments.data(), arguments.size(), options ? options : &defaultOptions, &nativeOutcome);
-        outcome.status = status;
-        outcome.submission = nativeOutcome.submission;
-        outcome.mutations.resize(nativeOutcome.mutation_count);
-        if (status != VERNON_STATUS_OK)
-            outcome.error = nativeStringView(vernonRuntimeGetLastError(runtime));
-        if (status != VERNON_STATUS_OK) {
-            if (!deviceAccessLease.is_none()) {
-                deviceAccessLease.attr("resolve")(nb::cast(outcome));
-                deviceAccessLease.attr("release")();
-            }
-            throw std::runtime_error("pullback application failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
-        }
-        nb::object numpy = nb::module_::import_("numpy");
+        uint64_t point = 0;
         try {
-            for (PackedPublication &publication : packedPublications) {
-                nb::object packedBytes = publication.bytes.attr("reshape")(-1, publication.elementByteSize);
-                for (auto &[destination, offset, bytes] : publication.destinations) {
-                    nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
-                        nb::slice(nb::none(), nb::none(), nb::none()), nb::slice(offset, offset + bytes, size_t{1})));
-                    nb::object typed = region.attr("copy")()
-                                           .attr("reshape")(-1)
-                                           .attr("view")(destination.attr("dtype"))
-                                           .attr("reshape")(destination.attr("shape"));
-                    numpy.attr("add")(destination, typed, nb::arg("out") = destination);
-                }
-            }
-            if (!deviceAccessLease.is_none()) {
-                deviceAccessLease.attr("resolve")(nb::cast(outcome));
-                deviceAccessLease.attr("release")();
-            }
+            point = linked->call(builder);
         } catch (...) {
-            if (!deviceAccessLease.is_none()) {
-                deviceAccessLease.attr("resolve")(nb::cast(outcome));
-                deviceAccessLease.attr("release")();
-            }
+            if (!deviceAccessLease.is_none())
+                deviceAccessLease.attr("resolve_mutations")(nb::dict());
             throw;
         }
+        if (!deviceAccessLease.is_none())
+            deviceAccessLease.attr("resolve_linked_call")(linked->timeline(), point);
+        if (!staged.empty() || !packedPublications.empty())
+            linked->wait(point);
+        nb::object numpy = nb::module_::import_("numpy");
+        for (StagedHostArray &host : staged) {
+            if (!host.written)
+                continue;
+            nb::object bytes = nb::cast(host.buffer->download())
+                                   .attr("__getitem__")(nb::slice(nb::int_(0), host.array.attr("nbytes"), nb::none()));
+            numpy.attr("copyto")(
+                host.array,
+                numpy.attr("frombuffer")(bytes, host.array.attr("dtype")).attr("reshape")(host.array.attr("shape")));
+        }
+        publishPacked();
         return result;
     }
 
     std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
-    VernonPullback *handle{};
+    std::shared_ptr<LinkedBackward> linked;
     std::vector<PythonAdMetadata> gradients;
     std::vector<PythonAdMetadata> cotangents;
     nb::object executableOwner;
@@ -672,12 +635,9 @@ struct PythonProgramExecutable {
         return result;
     }
 
-    nb::tuple programVjpTransaction(PythonProgramInvocationAdapter &invocation, const nb::dict &programBindings,
-                                    nb::object executableOwner, const nb::callable &publishOutcome,
-                                    const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
-        if (!vernonRuntimeProgramExecutableHasProgramAutodiff(executable))
-            throw std::runtime_error("executable has no Program autodiff signature");
-        invocation.setAutodiffOptions(checkpointMemoryBudget, checkpointPolicy);
+    // The gradient and cotangent leaves of a call binding `programBindings`, with their instantiated shapes.
+    std::pair<std::vector<PythonAdMetadata>, std::vector<PythonAdMetadata>>
+    derivativeLeaves(const nb::dict &programBindings) const {
         const auto declaredDerivativePath = [&](VernonAdDerivativeRole role, const std::string &leafPath) {
             const size_t count = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(executable);
             for (size_t groupIndex = 0; groupIndex < count; ++groupIndex) {
@@ -766,7 +726,6 @@ struct PythonProgramExecutable {
             }
             return result;
         };
-        nb::dict outputs;
         std::vector<PythonAdMetadata> cotangents =
             reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_AD_DERIVATIVE_COTANGENT);
         const auto instantiateBoundMetadata = [&](PythonAdMetadata &leaf) {
@@ -788,16 +747,7 @@ struct PythonProgramExecutable {
                 programInputName(programBindings, declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path));
             instantiateBoundMetadata(leaf);
         }
-        PythonInvocationOutcome outcome = invocation.execute(true);
-        publishOutcome(outcome);
-        if (!outcome.ok())
-            return nb::make_tuple(std::move(outcome), outputs, nb::none());
-        std::unique_ptr<VernonPullback, decltype(&vernonProgramPullbackDestroy)> pullbackOwner(
-            invocation.commitPullback(), &vernonProgramPullbackDestroy);
-        return nb::make_tuple(std::move(outcome), outputs,
-                              std::make_unique<PythonPullback>(owner, runtime, executable, pullbackOwner.release(),
-                                                               std::move(gradients), std::move(cotangents),
-                                                               std::move(executableOwner), nb::dict(programBindings)));
+        return {std::move(gradients), std::move(cotangents)};
     }
 
     nb::list derivativeGroups() const {

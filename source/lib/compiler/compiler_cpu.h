@@ -19,5 +19,6 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
                             const VernonCpuRuntimeHelpers *runtimeHelpers, CpuExecutionStatePtr &execution);
 
 VernonCpuEntryPoint findCpuEntry(const CpuExecutionState *execution, std::string_view name);
+VernonCpuChunkEntryPoint findCpuChunkEntry(const CpuExecutionState *execution, std::string_view name);
 
 } // namespace vernon::compiler

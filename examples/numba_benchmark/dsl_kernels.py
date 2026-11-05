@@ -1,6 +1,6 @@
 """VernonDSL kernels of the numba comparison, launched on CPU or CUDA.
 
-Each kernel but `peek` has a twin of the same name in `numba_kernels.py` and
+Each kernel has a twin of the same name in `numba_kernels.py` and
 `numba_cuda_kernels.py` doing the same arithmetic in the same order.
 """
 
@@ -31,19 +31,6 @@ def axpy(
     i = gid[0]
     if i < count:
         out[i] = a * x[i] + y[i]
-
-
-@vd.kernel(workgroup_size=(WORKGROUP, 1, 1))
-def peek(
-    source: vd.TensorView[vd.f64, (vd.dyn,), vd.read],
-    sink: vd.TensorView[vd.f64, (vd.dyn,), vd.write],
-    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
-) -> None:
-    """Copies `source[0]`: reading it back waits for the kernel that wrote
-    `source`, without downloading all of it."""
-    i = gid[0]
-    if i < 1:
-        sink[i] = source[i]
 
 
 @vd.func

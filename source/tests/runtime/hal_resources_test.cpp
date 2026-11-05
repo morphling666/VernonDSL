@@ -1,0 +1,416 @@
+#include "VernonHal.h"
+#include "backend_test_matrix.h"
+
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+#include "glfw_context_owner.h"
+#endif
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using vernon::tests::BackendTestRow;
+
+constexpr uint32_t kWidth = 4;
+constexpr uint32_t kHeight = 4;
+
+std::string lastError() {
+    const VernonStringView error = vernonHalGetLastError();
+    return error.data ? std::string(error.data, error.size) : std::string();
+}
+
+bool opengl(VernonRuntimeBackend backend) {
+    return backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES;
+}
+
+// Every backend row's device, created through VernonHal.h; an OpenGL device adopts a hidden window's context, which
+// is also the window its surface presents. A GPU device the machine lacks skips the test, the CPU device never does.
+class HalResources : public testing::TestWithParam<BackendTestRow> {
+protected:
+    void SetUp() override {
+        const VernonRuntimeBackend backend = GetParam().runtime;
+        VernonHalDeviceDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.backend = backend;
+        if (opengl(backend)) {
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+            const bool desktop = backend == VERNON_RUNTIME_OPENGL;
+            try {
+                context_ = std::make_unique<vernon::host::GlfwContextOwner>(
+                    desktop ? vernon::host::GlfwContextApi::OpenGL : vernon::host::GlfwContextApi::OpenGLES,
+                    desktop ? 4 : 3, desktop ? 1 : 0, kWidth, kHeight);
+            } catch (const std::runtime_error &error) {
+                GTEST_SKIP() << GetParam().name << " context is unavailable: " << error.what();
+            }
+            callbacks_ = context_->callbacks();
+            descriptor.opengl = &callbacks_;
+#else
+            GTEST_SKIP() << "the GLFW context owner is not built";
+#endif
+        }
+        const VernonHalStatus status = vernonHalCreateDevice(&descriptor, &device_);
+        if (backend == VERNON_RUNTIME_CPU)
+            ASSERT_EQ(status, VERNON_HAL_OK) << lastError();
+        else if (status != VERNON_HAL_OK)
+            GTEST_SKIP() << GetParam().name << " device is unavailable: " << lastError();
+        ASSERT_NE(vernonHalDeviceGetRuntime(device_), nullptr);
+        EXPECT_EQ(vernonHalDeviceGetBackend(device_), backend);
+    }
+
+    void TearDown() override {
+        if (device_)
+            EXPECT_EQ(vernonHalDestroyDevice(device_), VERNON_HAL_OK) << lastError();
+    }
+
+    VernonHalBuffer *createBuffer(uint64_t size) {
+        VernonHalBufferDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.size = size;
+        descriptor.usage = VERNON_HAL_BUFFER_STORAGE;
+        descriptor.memory = VERNON_HAL_MEMORY_DEVICE;
+        VernonHalBuffer *buffer = nullptr;
+        EXPECT_EQ(vernonHalCreateBuffer(device_, &descriptor, &buffer), VERNON_HAL_OK) << lastError();
+        return buffer;
+    }
+
+    // An RGBA8 2D image of `mips` levels; null, after checking the device reports so, on a device without images.
+    VernonHalImage *createImage(uint32_t mips) {
+        VernonImageDescriptor descriptor{};
+        descriptor.dimension = VERNON_TEXTURE_2D;
+        descriptor.extent = {kWidth, kHeight, 1};
+        descriptor.format = VERNON_TEXTURE_RGBA8_UNORM;
+        descriptor.mip_level_count = mips;
+        descriptor.array_layer_count = 1;
+        descriptor.sample_count = 1;
+        descriptor.usage = VERNON_IMAGE_SAMPLED | VERNON_IMAGE_TRANSFER_SOURCE | VERNON_IMAGE_TRANSFER_DESTINATION;
+        VernonHalImage *image = nullptr;
+        const VernonHalStatus status = vernonHalCreateImage(device_, &descriptor, &image);
+        if (GetParam().runtime == VERNON_RUNTIME_CUDA) {
+            EXPECT_NE(status, VERNON_HAL_OK);
+            return nullptr;
+        }
+        EXPECT_EQ(status, VERNON_HAL_OK) << lastError();
+        return image;
+    }
+
+    static VernonHalImageRegion region(uint32_t mip) {
+        VernonHalImageRegion result{};
+        result.mip_level = mip;
+        result.aspect = VERNON_IMAGE_ASPECT_COLOR;
+        result.width = std::max(1u, kWidth >> mip);
+        result.height = std::max(1u, kHeight >> mip);
+        result.depth = 1;
+        result.data_format = VERNON_HAL_IMAGE_DATA_RGBA;
+        result.data_type = VERNON_HAL_IMAGE_DATA_UINT8;
+        return result;
+    }
+
+    VernonHalDevice *device_{};
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+    std::unique_ptr<vernon::host::GlfwContextOwner> context_;
+    VernonOpenGLContextCallbacks callbacks_{};
+#endif
+};
+
+TEST_P(HalResources, BufferWritesReadBack) {
+    VernonHalBuffer *buffer = createBuffer(1024);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(vernonHalBufferGetSize(buffer), 1024u);
+    std::vector<uint8_t> first(256), second(256);
+    for (size_t index = 0; index < first.size(); ++index) {
+        first[index] = static_cast<uint8_t>(index);
+        second[index] = static_cast<uint8_t>(255 - index);
+    }
+    const std::array<VernonHalBufferWrite, 2> writes{{{0, first.data(), first.size()}, {512, second.data(), 256}}};
+    ASSERT_EQ(vernonHalBufferWrite(buffer, writes.data(), writes.size()), VERNON_HAL_OK) << lastError();
+    std::vector<uint8_t> readFirst(256), readSecond(256);
+    const std::array<VernonHalBufferRead, 2> reads{{{0, readFirst.data(), 256}, {512, readSecond.data(), 256}}};
+    ASSERT_EQ(vernonHalBufferRead(buffer, reads.data(), reads.size()), VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(readFirst, first);
+    EXPECT_EQ(readSecond, second);
+    vernonHalDestroyBuffer(buffer);
+}
+
+TEST_P(HalResources, BuffersHaveAnAddressOnlyWhereKernelsTakeOne) {
+    VernonHalBuffer *buffer = createBuffer(256);
+    ASSERT_NE(buffer, nullptr);
+    void *address = reinterpret_cast<void *>(uintptr_t{1});
+    const VernonHalStatus status = vernonHalBufferGetAddress(buffer, &address);
+    const VernonRuntimeBackend backend = GetParam().runtime;
+    if (backend == VERNON_RUNTIME_CPU || backend == VERNON_RUNTIME_CUDA) {
+        ASSERT_EQ(status, VERNON_HAL_OK) << lastError();
+        EXPECT_NE(address, nullptr);
+        void *again = nullptr;
+        ASSERT_EQ(vernonHalBufferGetAddress(buffer, &again), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(again, address);
+    } else {
+        EXPECT_EQ(status, VERNON_HAL_UNSUPPORTED);
+        EXPECT_EQ(address, nullptr);
+    }
+    if (backend == VERNON_RUNTIME_CPU) {
+        const std::array<uint8_t, 4> bytes{1, 2, 3, 4};
+        const VernonHalBufferWrite write{8, bytes.data(), bytes.size()};
+        ASSERT_EQ(vernonHalBufferWrite(buffer, &write, 1), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(std::memcmp(static_cast<uint8_t *>(address) + 8, bytes.data(), bytes.size()), 0);
+    }
+    EXPECT_EQ(vernonHalBufferGetAddress(nullptr, &address), VERNON_HAL_INVALID_ARGUMENT);
+    vernonHalDestroyBuffer(buffer);
+}
+
+TEST_P(HalResources, RejectsTransfersOutsideTheBuffer) {
+    VernonHalBuffer *buffer = createBuffer(256);
+    ASSERT_NE(buffer, nullptr);
+    std::vector<uint8_t> bytes(64);
+    const VernonHalBufferWrite past{224, bytes.data(), 64};
+    EXPECT_EQ(vernonHalBufferWrite(buffer, &past, 1), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_FALSE(lastError().empty());
+    const VernonHalBufferRead wrapping{UINT64_MAX - 8, bytes.data(), 64};
+    EXPECT_EQ(vernonHalBufferRead(buffer, &wrapping, 1), VERNON_HAL_INVALID_ARGUMENT);
+    const VernonHalBufferRead nowhere{0, nullptr, 64};
+    EXPECT_EQ(vernonHalBufferRead(buffer, &nowhere, 1), VERNON_HAL_INVALID_ARGUMENT);
+    VernonHalBufferDescriptor empty{};
+    empty.struct_size = sizeof(empty);
+    VernonHalBuffer *none = nullptr;
+    EXPECT_EQ(vernonHalCreateBuffer(device_, &empty, &none), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_EQ(none, nullptr);
+    vernonHalDestroyBuffer(buffer);
+}
+
+TEST_P(HalResources, ImageLevelsWriteAndReadBack) {
+    VernonHalImage *image = createImage(2);
+    if (!image)
+        return;
+    std::vector<uint8_t> base(kWidth * kHeight * 4), level(4 * 4);
+    for (size_t index = 0; index < base.size(); ++index)
+        base[index] = static_cast<uint8_t>(index * 3);
+    for (size_t index = 0; index < level.size(); ++index)
+        level[index] = static_cast<uint8_t>(200 - index);
+    const std::array<VernonHalImageWrite, 2> writes{{{region(0), base.data()}, {region(1), level.data()}}};
+    ASSERT_EQ(vernonHalImageWrite(image, writes.data(), writes.size()), VERNON_HAL_OK) << lastError();
+    std::vector<uint8_t> readBase(base.size()), readLevel(level.size());
+    const std::array<VernonHalImageRead, 2> reads{
+        {{region(0), readBase.data(), readBase.size()}, {region(1), readLevel.data(), readLevel.size()}}};
+    ASSERT_EQ(vernonHalImageRead(image, reads.data(), reads.size()), VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(readBase, base);
+    EXPECT_EQ(readLevel, level);
+
+    VernonHalImageRegion outside = region(0);
+    outside.offset_x = 1;
+    const VernonHalImageWrite past{outside, base.data()};
+    EXPECT_EQ(vernonHalImageWrite(image, &past, 1), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, MipmapsFillTheLowerLevels) {
+    VernonHalImage *image = createImage(3);
+    if (!image)
+        return;
+    std::vector<uint8_t> base(kWidth * kHeight * 4);
+    for (size_t index = 0; index < base.size(); index += 4) {
+        base[index] = 64;
+        base[index + 1] = 128;
+        base[index + 2] = 192;
+        base[index + 3] = 255;
+    }
+    const VernonHalImageWrite write{region(0), base.data()};
+    ASSERT_EQ(vernonHalImageWrite(image, &write, 1), VERNON_HAL_OK) << lastError();
+    const VernonHalStatus generated = vernonHalImageGenerateMipmaps(image);
+    if (GetParam().runtime == VERNON_RUNTIME_CPU) {
+        EXPECT_EQ(generated, VERNON_HAL_UNSUPPORTED);
+    } else {
+        ASSERT_EQ(generated, VERNON_HAL_OK) << lastError();
+        std::array<uint8_t, 4> last{};
+        const VernonHalImageRead read{region(2), last.data(), last.size()};
+        ASSERT_EQ(vernonHalImageRead(image, &read, 1), VERNON_HAL_OK) << lastError();
+        for (size_t channel = 0; channel < last.size(); ++channel)
+            EXPECT_NEAR(last[channel], base[channel], 1) << "channel " << channel;
+    }
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, ViewsKeepTheirImage) {
+    VernonHalImage *image = createImage(2);
+    if (!image)
+        return;
+    VernonImageViewDescriptor descriptor{};
+    descriptor.dimension = VERNON_TEXTURE_2D;
+    descriptor.format = VERNON_TEXTURE_RGBA8_SRGB;
+    descriptor.subresources = {1, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR};
+    // OpenGL ES 3.0 has no texture views, so an ES view covers its whole image in the image's format.
+    if (GetParam().runtime == VERNON_RUNTIME_OPENGL_ES) {
+        descriptor.format = VERNON_TEXTURE_RGBA8_UNORM;
+        descriptor.subresources = {0, 2, 0, 1, VERNON_IMAGE_ASPECT_COLOR};
+    }
+    VernonHalImageView *view = nullptr;
+    ASSERT_EQ(vernonHalCreateImageView(image, &descriptor, &view), VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(vernonHalImageViewGetImage(view), image);
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_INVALID_ARGUMENT);
+
+    VernonImageViewDescriptor outside = descriptor;
+    outside.subresources.base_mip_level = 2;
+    VernonHalImageView *none = nullptr;
+    EXPECT_EQ(vernonHalCreateImageView(image, &outside, &none), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_EQ(none, nullptr);
+
+    EXPECT_EQ(vernonHalDestroyImageView(view), VERNON_HAL_OK);
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, ADeviceWithObjectsIsNotDestroyed) {
+    VernonHalBuffer *buffer = createBuffer(64);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(vernonHalDestroyDevice(device_), VERNON_HAL_INVALID_ARGUMENT);
+    vernonHalDestroyBuffer(buffer);
+}
+
+TEST_P(HalResources, SamplersCheckTheirDescriptor) {
+    VernonHalSamplerDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.min_filter = VERNON_HAL_FILTER_LINEAR;
+    descriptor.mag_filter = VERNON_HAL_FILTER_LINEAR;
+    descriptor.mip_filter = VERNON_HAL_FILTER_LINEAR;
+    descriptor.address_u = VERNON_HAL_ADDRESS_CLAMP_TO_EDGE;
+    descriptor.address_v = VERNON_HAL_ADDRESS_REPEAT;
+    descriptor.address_w = VERNON_HAL_ADDRESS_MIRRORED_REPEAT;
+    descriptor.max_anisotropy = 1.0f;
+    VernonHalSampler *sampler = nullptr;
+    const VernonHalStatus status = vernonHalCreateSampler(device_, &descriptor, &sampler);
+    if (GetParam().runtime == VERNON_RUNTIME_CUDA) {
+        EXPECT_NE(status, VERNON_HAL_OK);
+        return;
+    }
+    ASSERT_EQ(status, VERNON_HAL_OK) << lastError();
+    vernonHalDestroySampler(sampler);
+    descriptor.max_anisotropy = 20.0f;
+    VernonHalSampler *none = nullptr;
+    EXPECT_EQ(vernonHalCreateSampler(device_, &descriptor, &none), VERNON_HAL_INVALID_ARGUMENT) << lastError();
+    EXPECT_EQ(none, nullptr);
+}
+
+TEST_P(HalResources, ResourcesAreReferencedForScheduleArguments) {
+    VernonHalBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = 256;
+    descriptor.usage = VERNON_HAL_BUFFER_STORAGE;
+    VernonHalBuffer *buffer = nullptr;
+    ASSERT_EQ(vernonHalCreateBuffer(device_, &descriptor, &buffer), VERNON_HAL_OK) << lastError();
+    VernonRuntimeProviderResourceReference reference{};
+    const VernonHalStatus referenced = vernonHalReferenceBuffer(buffer, 64, 128, &reference);
+    if (GetParam().runtime == VERNON_RUNTIME_CPU) {
+        EXPECT_EQ(referenced, VERNON_HAL_UNSUPPORTED);
+    } else {
+        ASSERT_EQ(referenced, VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(reference.offset, 64u);
+        EXPECT_EQ(reference.size, 128u);
+    }
+    EXPECT_EQ(vernonHalReferenceBuffer(buffer, 192, 128, &reference), VERNON_HAL_INVALID_ARGUMENT);
+    vernonHalDestroyBuffer(buffer);
+
+    VernonHalImage *image = createImage(1);
+    if (!image)
+        return;
+    VernonImageViewDescriptor view_descriptor{};
+    view_descriptor.dimension = VERNON_TEXTURE_2D;
+    view_descriptor.format = VERNON_TEXTURE_RGBA8_UNORM;
+    view_descriptor.subresources = {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR};
+    VernonHalImageView *view = nullptr;
+    ASSERT_EQ(vernonHalCreateImageView(image, &view_descriptor, &view), VERNON_HAL_OK) << lastError();
+    const VernonHalStatus viewed = vernonHalReferenceImageView(view, &reference);
+    EXPECT_EQ(viewed, GetParam().runtime == VERNON_RUNTIME_CPU ? VERNON_HAL_UNSUPPORTED : VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(vernonHalDestroyImageView(view), VERNON_HAL_OK);
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, FormatCapabilitiesNarrowTheBaseline) {
+    uint32_t capabilities = 0;
+    ASSERT_EQ(vernonHalDeviceGetFormatCapabilities(device_, VERNON_TEXTURE_RGBA8_UNORM, &capabilities), VERNON_HAL_OK)
+        << lastError();
+    if (GetParam().runtime == VERNON_RUNTIME_CUDA)
+        EXPECT_EQ(capabilities, 0u);
+    else
+        EXPECT_NE(capabilities & VERNON_HAL_FORMAT_COPYABLE, 0u);
+    if (GetParam().runtime == VERNON_RUNTIME_CPU)
+        EXPECT_EQ(capabilities & VERNON_HAL_FORMAT_RENDERABLE, 0u);
+}
+
+TEST_P(HalResources, ASurfacePresentsOneAcquiredImageAtATime) {
+    VernonHalSurfaceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    bool presents = false;
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+    VernonOpenGLSurfaceCallbacks window{};
+    std::unique_ptr<vernon::host::GlfwWindowOwner> native;
+    if (context_) {
+        window = context_->surfaceCallbacks();
+        descriptor.native.opengl = &window;
+        presents = true;
+    }
+#if defined(_WIN32)
+    if (GetParam().runtime == VERNON_RUNTIME_VULKAN) {
+        native = std::make_unique<vernon::host::GlfwWindowOwner>(kWidth, kHeight);
+        descriptor.native.win32_window = native->win32Window();
+        presents = true;
+    }
+#endif
+#endif
+    VernonHalSurface *surface = nullptr;
+    const VernonHalStatus created = vernonHalCreateSurface(device_, &descriptor, &surface);
+    if (!presents) {
+        EXPECT_EQ(created, VERNON_HAL_UNSUPPORTED);
+        return;
+    }
+    ASSERT_EQ(created, VERNON_HAL_OK) << lastError();
+    VernonHalSurfaceCapabilities capabilities{};
+    ASSERT_EQ(vernonHalSurfaceGetCapabilities(surface, &capabilities), VERNON_HAL_OK) << lastError();
+    ASSERT_GE(capabilities.format_count, 1u);
+    EXPECT_NE(capabilities.usage & VERNON_IMAGE_COLOR_ATTACHMENT, 0u);
+
+    VernonHalSurfaceImage image{};
+    EXPECT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_INVALID_ARGUMENT);
+    VernonHalSurfaceConfiguration configuration{};
+    configuration.struct_size = sizeof(configuration);
+    configuration.format = capabilities.formats[0];
+    configuration.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+    configuration.width = capabilities.current_width == UINT32_MAX ? kWidth : capabilities.current_width;
+    configuration.height = capabilities.current_height == UINT32_MAX ? kHeight : capabilities.current_height;
+    configuration.present_mode = VERNON_HAL_PRESENT_FIFO;
+    configuration.image_count = std::max(capabilities.min_image_count, 2u);
+    if (capabilities.max_image_count)
+        configuration.image_count = std::min(configuration.image_count, capabilities.max_image_count);
+    ASSERT_EQ(vernonHalSurfaceConfigure(surface, &configuration), VERNON_HAL_OK) << lastError();
+
+    for (int frame = 0; frame < 2; ++frame) {
+        ASSERT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_OK) << lastError();
+        ASSERT_NE(image.image, nullptr);
+        ASSERT_NE(image.view, nullptr);
+        EXPECT_EQ(vernonHalImageViewGetImage(image.view), image.image);
+        const VernonImageDescriptor *acquired = vernonHalImageGetDescriptor(image.image);
+        EXPECT_EQ(acquired->format, configuration.format);
+        EXPECT_EQ(acquired->extent.width, configuration.width);
+        VernonHalSurfaceImage second{};
+        EXPECT_EQ(vernonHalSurfaceAcquire(surface, &second), VERNON_HAL_INVALID_ARGUMENT);
+        EXPECT_EQ(vernonHalSurfaceConfigure(surface, &configuration), VERNON_HAL_INVALID_ARGUMENT);
+        EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_INVALID_ARGUMENT);
+        EXPECT_EQ(vernonHalDestroyImageView(image.view), VERNON_HAL_INVALID_ARGUMENT);
+        EXPECT_EQ(vernonHalDestroyImage(image.image), VERNON_HAL_INVALID_ARGUMENT);
+        ASSERT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << lastError();
+    }
+    EXPECT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, HalResources, testing::ValuesIn(vernon::tests::backendTestMatrix),
+                         [](const testing::TestParamInfo<BackendTestRow> &info) {
+                             return std::string(info.param.name);
+                         });
+
+} // namespace

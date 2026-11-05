@@ -1,29 +1,29 @@
-#include "VernonRuntime.h"
-#include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <filesystem>
-#include <iterator>
-#include <string>
+#include <memory>
 #include <string_view>
 
 namespace {
 
-std::string lastError(VernonRuntimeContext *context) {
-    const VernonStringView error = vernonRuntimeGetLastError(context);
-    return std::string(error.data, error.size);
-}
+using vernon::tests::HostTensor;
+using vernon::tests::LinkedVjp;
+using vernon::tests::ResolvedProgram;
+
+struct ContextDeleter {
+    void operator()(VernonRuntimeContext *context) const { EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK); }
+};
 
 TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjectivePullback) {
-    const std::filesystem::path manifestPath = VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST;
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    const std::unique_ptr<VernonRuntimeContext, ContextDeleter> owner(
+        vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr));
+    VernonRuntimeContext *context = owner.get();
     ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(context, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    const ResolvedProgram program(context, VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(context);
+    VernonProgramExecutable *pipeline = program.get();
 
     ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, VERNON_PROGRAM_BOUNDARY_OUTPUT), 1u);
     VernonProgramParameterView outputBoundary{};
@@ -99,90 +99,38 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     expectField(biasLeaf.path[0], "inner");
     expectField(biasLeaf.path[1], "bias");
 
-    const uint64_t tensorShape[]{2};
-    float value[]{2.0f, 3.0f};
     struct Parameters {
         float scale;
         float bias;
-    } parameters{4.0f, 1.0f};
-    float outputValues[2]{};
-    VernonProgramParameterView parametersParameter{};
-    VernonProgramParameterView outputParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"parameters", 10}, &parametersParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"output", 6}, &outputParameter), VERNON_STATUS_OK);
-    const int64_t tensorStrides[]{sizeof(float)};
-    auto argument = [&](const VernonProgramParameterView &parameter, void *data, size_t byteSize, uint32_t rank,
-                        const uint64_t *shape, const int64_t *strides) {
-        VernonProgramArgument result{};
-        result.slot = parameter.slot;
-        result.kind = VERNON_PROGRAM_TENSOR;
-        result.tensor.struct_size = sizeof(VernonTensorView);
-        result.tensor.storage = VERNON_TENSOR_HOST;
-        result.tensor.host_data = data;
-        result.tensor.element_layout = parameter.element_layout;
-        result.tensor.access = parameter.access;
-        result.tensor.rank = rank;
-        result.tensor.shape = shape;
-        result.tensor.byte_strides = strides;
-        result.tensor.byte_size = byteSize;
-        return result;
     };
-    VernonProgramArgument arguments[]{
-        argument(valueParameter, value, sizeof(value), 0, nullptr, nullptr),
-        argument(parametersParameter, &parameters, sizeof(parameters), 0, nullptr, nullptr),
-        argument(outputParameter, outputValues, sizeof(outputValues), 1, tensorShape, tensorStrides),
-    };
-    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {2, 1, 1},
-                                                                &rejectedPullback),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(rejectedPullback, nullptr);
-    EXPECT_NE(lastError(context).find("dispatch grid axis 0 must equal 1"), std::string::npos);
-    EXPECT_FLOAT_EQ(outputValues[0], 0.0f);
-    EXPECT_FLOAT_EQ(outputValues[1], 0.0f);
+    float value[]{2.0f, 3.0f};
+    Parameters parameters{4.0f, 1.0f};
+    HostTensor<float> output({0.0f, 0.0f});
+    LinkedVjp vjp(context, pipeline);
+    ASSERT_TRUE(vjp) << vjp.error();
+    vjp.forwardRecord().bind("value", vernon::tests::hostView(value, sizeof(value)));
+    vjp.forwardRecord().bind("parameters", vernon::tests::hostView(&parameters, sizeof(parameters)));
+    vjp.forwardRecord().bind("output", output.view());
+    vjp.forwardRecord().bindGrid(1);
+    ASSERT_TRUE(vjp.forwardRecord().unbound().empty()) << vjp.forwardRecord().unbound().front();
+    ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+    EXPECT_FLOAT_EQ(output.values[0], 9.0f);
+    EXPECT_FLOAT_EQ(output.values[1], 13.0f);
 
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {1, 1, 1},
-                                                                &pullback),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(outputValues[0], 9.0f);
-    EXPECT_FLOAT_EQ(outputValues[1], 13.0f);
-
-    float valueSeeds[]{5.0f, 7.0f};
-    VernonProgramParameterView cotangentParameter{};
-    VernonProgramParameterView parametersGradientParameter{};
-    VernonProgramParameterView valueGradientParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0,
-                                                               &cotangentParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, {"parameters", 10},
-                                                         &parametersGradientParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, {"value", 5},
-                                                         &valueGradientParameter),
-              VERNON_STATUS_OK);
+    HostTensor<float> seeds({5.0f, 7.0f});
     Parameters parametersGradient{};
     float valueGradient[2]{};
-    VernonProgramArgument derivativeArguments[]{
-        argument(cotangentParameter, valueSeeds, sizeof(valueSeeds), 1, tensorShape, tensorStrides),
-        argument(parametersGradientParameter, &parametersGradient, sizeof(parametersGradient), 0, nullptr, nullptr),
-        argument(valueGradientParameter, valueGradient, sizeof(valueGradient), 0, nullptr, nullptr),
-    };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments), nullptr),
-              VERNON_STATUS_OK)
-        << lastError(context);
+    vjp.backwardRecord().bind("output", seeds.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+    vjp.backwardRecord().bind("parameters", vernon::tests::hostView(&parametersGradient, sizeof(parametersGradient)),
+                              VERNON_PROGRAM_BOUNDARY_GRADIENT);
+    vjp.backwardRecord().bind("value", vernon::tests::hostView(valueGradient, sizeof(valueGradient)),
+                              VERNON_PROGRAM_BOUNDARY_GRADIENT);
+    ASSERT_TRUE(vjp.backwardRecord().unbound().empty());
+    ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
     EXPECT_FLOAT_EQ(parametersGradient.bias, 12.0f);
     EXPECT_FLOAT_EQ(parametersGradient.scale, 31.0f);
     EXPECT_FLOAT_EQ(valueGradient[0], 20.0f);
     EXPECT_FLOAT_EQ(valueGradient[1], 28.0f);
-
-    vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 } // namespace

@@ -1,333 +1,123 @@
-#include "VernonRuntime.h"
-#include "program_fixture_runtime_test.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
-#include "runtime_rhi_test_utils.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
-#include <iterator>
+#include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace {
 
-using vernon::tests::RhiImage;
-using vernon::tests::RhiImageView;
-using vernon::tests::RhiRuntime;
+using vernon::tests::DeviceTensor;
+using vernon::tests::HalImage;
+using vernon::tests::LinkedProgram;
+using vernon::tests::PassControls;
+using vernon::tests::ProgramFixtureManifest;
+using vernon::tests::ResolvedProgram;
 
-std::string lastError(VernonRuntimeContext *context) {
-    const VernonStringView error = vernonRuntimeGetLastError(context);
-    return std::string(error.data ? error.data : "", error.size);
+const std::vector<float> kTriangle{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+
+std::string testName(const testing::TestParamInfo<ProgramFixtureManifest> &info) {
+    return std::string(info.param.target);
 }
 
-std::string_view name(const VernonProgramParameterView &parameter) {
-    return {parameter.name.data, parameter.name.size};
+DeviceTensor vertices(const vernon::tests::HalTestDevice &device) {
+    return DeviceTensor(device, kTriangle.data(), kTriangle.size() * sizeof(float), {3, 2}, sizeof(float), {}, 0,
+                        VERNON_HAL_BUFFER_VERTEX | VERNON_HAL_BUFFER_STORAGE);
 }
 
-VernonProgramParameterView parameter(VernonProgramExecutable *executable, std::string_view parameterName) {
-    VernonProgramParameterView result{};
-    EXPECT_EQ(
-        vernonRuntimeProgramExecutableFindParameter(executable, {parameterName.data(), parameterName.size()}, &result),
-        VERNON_STATUS_OK);
-    return result;
-}
-
-VernonProgramBindingToken bindingToken(std::string_view value) {
-    return {sizeof(VernonProgramBindingToken), value.data(), value.size()};
-}
-
-VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter,
-                                     VernonRuntimeProviderResourceReference resource) {
-    static constexpr uint64_t shape[]{3, 2};
-    static constexpr int64_t strides[]{2 * sizeof(float), sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(argument.tensor);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-    argument.tensor.resource = resource;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = parameter.access;
-    argument.tensor.rank = std::size(shape);
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = 3 * 2 * sizeof(float);
-    return argument;
-}
-
-VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter, const uint32_t *value) {
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(argument.tensor);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = value;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = parameter.access;
-    argument.tensor.byte_size = sizeof(*value);
-    return argument;
-}
-
-void destroyTarget(RhiRuntime &runtime, RhiImageView &view, RhiImage &image) {
-    if (view.handle.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-        EXPECT_EQ(vernonRhiDeviceDestroyImageView(runtime.device, view.handle), VERNON_RHI_STATUS_OK);
-    if (image.handle.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-        EXPECT_EQ(vernonRhiDeviceDestroyImage(runtime.device, image.handle), VERNON_RHI_STATUS_OK);
-}
-
-void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &manifestPath, bool externalVertices) {
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable), 1u);
-
-    constexpr uint32_t extent = 32;
-    RhiImage target = vernon::tests::createImage(runtime, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, extent,
-                                                 extent, 1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    RhiImageView targetView =
-        vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
-    vernon::tests::RhiBuffer vertices;
-    if (externalVertices) {
-        vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX,
-                                               positions.data());
-        ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+// The module_graphics pass draws (255, 64, 0) over the opaque black clear; nothing else may appear.
+void expectTriangleCoverage(const std::vector<uint8_t> &pixels, size_t expectedRendered) {
+    size_t rendered = 0;
+    size_t cleared = 0;
+    size_t unexpected = 0;
+    for (size_t pixel = 0; pixel < pixels.size(); pixel += 4) {
+        if (pixels[pixel] == 255 && pixels[pixel + 1] == 64 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255)
+            ++rendered;
+        else if (pixels[pixel] == 0 && pixels[pixel + 1] == 0 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255)
+            ++cleared;
+        else
+            ++unexpected;
     }
+    EXPECT_EQ(rendered, expectedRendered);
+    EXPECT_EQ(cleared, pixels.size() / 4 - expectedRendered);
+    EXPECT_EQ(unexpected, 0u);
+}
 
-    constexpr std::array<uint32_t, 3> grid{3, 1, 1};
-    std::vector<VernonProgramArgument> arguments;
-    const size_t parameterCount = vernonRuntimeProgramExecutableGetParameterCount(executable);
-    arguments.reserve(parameterCount);
-    for (size_t index = 0; index < parameterCount; ++index) {
+void expectColorAttachmentOutput(VernonProgramExecutable *executable) {
+    for (size_t index = 0; index < vernonRuntimeProgramExecutableGetParameterCount(executable); ++index) {
         VernonProgramParameterView parameter{};
         ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &parameter), VERNON_STATUS_OK);
-        if (name(parameter) == "vertices") {
-            ASSERT_TRUE(externalVertices);
-            arguments.push_back(tensorArgument(parameter, vertices.reference));
+        if (std::string_view(parameter.name.data, parameter.name.size) != "output")
             continue;
-        }
-        if (name(parameter) == "output") {
-            VernonProgramImageConstraintView constraint{};
-            constraint.struct_size = sizeof(constraint);
-            ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint),
-                      VERNON_STATUS_OK);
-            EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_COLOR_ATTACHMENT);
-            EXPECT_EQ(constraint.sample_result_class, VERNON_IMAGE_SAMPLE_NONE);
-            VernonProgramArgument output{};
-            output.slot = parameter.slot;
-            output.kind = VERNON_PROGRAM_IMAGE;
-            output.image = {targetView.reference};
-            arguments.push_back(output);
-            continue;
-        }
-        bool matchedGrid = false;
-        for (size_t axis = 0; axis < grid.size(); ++axis) {
-            const std::string expected = "grid_" + std::string(1, "xyz"[axis]);
-            if (name(parameter) == expected) {
-                arguments.push_back(scalarArgument(parameter, &grid[axis]));
-                matchedGrid = true;
-                break;
-            }
-        }
-        ASSERT_TRUE(matchedGrid) << "unbound reflected boundary " << name(parameter);
-    }
-    if (externalVertices)
-        ASSERT_EQ(arguments.size(), 2u);
-    else
-        ASSERT_EQ(arguments.size(), 4u);
-
-    VernonColorAttachment attachment{};
-    attachment.location = 0;
-    attachment.view = targetView.reference;
-    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    attachment.clear_color.f32[3] = 1.0f;
-    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    graphics.renderPass.render_area[2] = extent;
-    graphics.renderPass.render_area[3] = extent;
-    graphics.dynamic.viewport[2] = extent;
-    graphics.dynamic.viewport[3] = extent;
-    graphics.dynamic.scissor[2] = extent;
-    graphics.dynamic.scissor[3] = extent;
-
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    ASSERT_NE(instance, nullptr);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    for (size_t index = 0; index < arguments.size(); ++index) {
-        const std::string tokenText = "module-argument-" + std::to_string(index);
-        const VernonProgramBindingToken token{sizeof(token), tokenText.data(), tokenText.size()};
-        ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &arguments[index], nullptr, 0, 0),
+        VernonProgramImageConstraintView constraint{};
+        constraint.struct_size = sizeof(constraint);
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint),
                   VERNON_STATUS_OK);
+        EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_COLOR_ATTACHMENT);
+        EXPECT_EQ(constraint.sample_result_class, VERNON_IMAGE_SAMPLE_NONE);
+        return;
     }
-    VernonProgramGraphicsControlsView controlSlots{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controlSlots), VERNON_STATUS_OK);
-    ASSERT_EQ(graphics.bind(invocation, controlSlots), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
-        << lastError(runtime.runtime);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
-        << lastError(runtime.runtime);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    vernonRuntimeProgramInstanceDestroy(instance);
-
-    std::vector<uint8_t> pixels(extent * extent * 4);
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = extent;
-    download.height = extent;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(runtime.device, target.handle, &download, pixels.data(), pixels.size()),
-              VERNON_RHI_STATUS_OK);
-    const size_t corner = 4;
-    size_t renderedPixels = 0;
-    size_t clearedPixels = 0;
-    size_t unexpectedPixels = 0;
-    for (size_t pixel = 0; pixel < pixels.size(); pixel += 4) {
-        const bool rendered =
-            pixels[pixel] == 255 && pixels[pixel + 1] == 64 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255;
-        const bool cleared =
-            pixels[pixel] == 0 && pixels[pixel + 1] == 0 && pixels[pixel + 2] == 0 && pixels[pixel + 3] == 255;
-        if (rendered)
-            ++renderedPixels;
-        else if (cleared)
-            ++clearedPixels;
-        else
-            ++unexpectedPixels;
-    }
-    constexpr size_t externalTriangleCoverage = 338;
-    constexpr size_t generatedTriangleCoverage = 192;
-    const size_t expectedRenderedPixels = externalVertices ? externalTriangleCoverage : generatedTriangleCoverage;
-    EXPECT_EQ(renderedPixels, expectedRenderedPixels);
-    EXPECT_EQ(clearedPixels, extent * extent - expectedRenderedPixels);
-    EXPECT_EQ(unexpectedPixels, 0u);
-    EXPECT_EQ(pixels[corner], 0);
-    EXPECT_EQ(pixels[corner + 1], 0);
-    EXPECT_EQ(pixels[corner + 2], 0);
-
-    if (vertices.handle.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-        EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    destroyTarget(runtime, targetView, target);
-    vernonRuntimeProgramExecutableDestroy(executable);
-    vernonRuntimeProgramBundleDestroy(bundle);
+    ADD_FAILURE() << "the Program has no output parameter";
 }
 
-void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    ASSERT_NE(instance, nullptr);
+class ModuleGraphicsProgram : public vernon::tests::HalProgramTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::graphicsImageCopyFixtureRequirements(GetParam().runtime);
+    }
+};
 
-    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
-    vernon::tests::RhiBuffer vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float),
-                                                                    VERNON_RHI_BUFFER_VERTEX, positions.data());
-    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonProgramParameterView verticesParameter{};
-    VernonProgramParameterView outputParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, {"vertices", 8}, &verticesParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, {"output", 6}, &outputParameter),
-              VERNON_STATUS_OK);
-    const VernonProgramArgument verticesArgument = tensorArgument(verticesParameter, vertices.reference);
-    VernonProgramGraphicsControlsView slots{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &slots), VERNON_STATUS_OK);
+TEST_P(ModuleGraphicsProgram, ExternalVerticesGraphicsModuleRendersPixels) {
+    const ResolvedProgram program(runtime(), GetParam().manifestPath);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsNodeCount(program.get()), 1u);
+    expectColorAttachmentOutput(program.get());
+
+    constexpr uint32_t extent = 32;
+    HalImage target(device_.get(), VERNON_TEXTURE_RGBA8_UNORM, extent, extent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(target);
+    const DeviceTensor triangle = vertices(device_);
+    LinkedProgram linked(runtime(), program.get());
+    ASSERT_TRUE(linked) << linked.error();
+    linked.record().bind("vertices", triangle);
+    ASSERT_TRUE(linked.record().unbound().empty());
+    const PassControls controls(target.reference(), extent);
+    controls.writeTo(linked.record());
+    ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+    expectTriangleCoverage(target.rgba8(), 338);
+}
+
+TEST_P(ModuleGraphicsProgram, ReusesOneScheduleAcrossExtentsAndDynamicStates) {
+    const ResolvedProgram program(runtime(), GetParam().manifestPath);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+    const DeviceTensor triangle = vertices(device_);
+    LinkedProgram linked(runtime(), program.get());
+    ASSERT_TRUE(linked) << linked.error();
+    linked.record().bind("vertices", triangle);
 
     constexpr std::array<std::array<uint32_t, 2>, 2> extents{{{24, 24}, {40, 20}}};
     constexpr std::array<uint32_t, 2> viewportWidths{24, 20};
-    int renderPassLeaseCount = 0;
-    const VernonProgramResourceLease renderPassLease{
-        sizeof(VernonProgramResourceLease),
-        &renderPassLeaseCount,
-        [](void *value) { ++*static_cast<int *>(value); },
-        [](void *value) { --*static_cast<int *>(value); },
-    };
     for (size_t iteration = 0; iteration < extents.size(); ++iteration) {
         const uint32_t width = extents[iteration][0];
         const uint32_t height = extents[iteration][1];
-        RhiImage target = vernon::tests::createImage(runtime, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, width,
-                                                     height, 1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-        ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        RhiImageView view =
-            vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-        ASSERT_NE(view.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-        VernonProgramArgument output{};
-        output.slot = outputParameter.slot;
-        output.kind = VERNON_PROGRAM_IMAGE;
-        output.image = {view.reference};
-        VernonColorAttachment attachment{};
-        attachment.location = 0;
-        attachment.view = view.reference;
-        attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-        attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-        attachment.clear_color.f32[3] = 1.0f;
-        vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-        graphics.renderPass.render_area[2] = width;
-        graphics.renderPass.render_area[3] = height;
-        graphics.dynamic.viewport[2] = viewportWidths[iteration];
-        graphics.dynamic.viewport[3] = height;
-        graphics.dynamic.scissor[2] = width;
-        graphics.dynamic.scissor[3] = height;
-        graphics.dynamic.stencil_reference = static_cast<uint32_t>(iteration + 3);
+        HalImage target(device_.get(), VERNON_TEXTURE_RGBA8_UNORM, width, height, VERNON_IMAGE_COLOR_ATTACHMENT);
+        ASSERT_TRUE(target);
+        PassControls controls(target.reference(), width);
+        controls.renderPass.render_area[3] = height;
+        controls.dynamic.viewport[2] = static_cast<float>(viewportWidths[iteration]);
+        controls.dynamic.viewport[3] = static_cast<float>(height);
+        controls.dynamic.scissor[3] = height;
+        controls.dynamic.stencil_reference = static_cast<uint32_t>(iteration + 3);
+        controls.writeTo(linked.record());
+        ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
 
-        VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-        ASSERT_NE(invocation, nullptr);
-        const VernonProgramBindingToken verticesToken{sizeof(verticesToken), "reuse-vertices", 14};
-        const std::string outputText = "reuse-output-" + std::to_string(iteration);
-        const VernonProgramBindingToken outputToken{sizeof(outputToken), outputText.data(), outputText.size()};
-        ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &verticesToken, &verticesArgument, nullptr, 0, 0),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &output, nullptr, 0, 0),
-                  VERNON_STATUS_OK);
-        const std::string renderText = "reuse-render-" + std::to_string(iteration);
-        const std::string dynamicText = "reuse-dynamic-" + std::to_string(iteration);
-        const VernonProgramBindingToken renderToken{sizeof(renderToken), renderText.data(), renderText.size()};
-        const VernonProgramBindingToken drawToken{sizeof(drawToken), "reuse-draw", 10};
-        const VernonProgramBindingToken dynamicToken{sizeof(dynamicToken), dynamicText.data(), dynamicText.size()};
-        ASSERT_EQ(vernonRuntimeProgramInvocationBindRenderPass(invocation, slots.draw_command_control, &renderToken,
-                                                               &graphics.renderPass, &renderPassLease, 1),
-                  VERNON_STATUS_INVALID_ARGUMENT);
-        EXPECT_EQ(renderPassLeaseCount, iteration == 0 ? 0 : 1);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBindRenderPass(invocation, slots.render_pass_control, &renderToken,
-                                                               &graphics.renderPass, &renderPassLease, 1),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBindDrawCommand(invocation, slots.draw_command_control, &drawToken,
-                                                                &graphics.draw, nullptr),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBindDynamicState(invocation, slots.dynamic_state_control, &dynamicToken,
-                                                                 &graphics.dynamic),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
-            << lastError(runtime.runtime);
-        ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
-            << lastError(runtime.runtime);
-        vernonRuntimeProgramInvocationDestroy(invocation);
-        EXPECT_EQ(renderPassLeaseCount, 1);
-
-        std::vector<uint8_t> pixels(width * height * 4);
-        VernonRhiImageDownloadDescriptor download{};
-        download.struct_size = sizeof(download);
-        download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-        download.width = width;
-        download.height = height;
-        download.depth = 1;
-        download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-        download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-        ASSERT_EQ(vernonRhiDeviceDownloadImage(runtime.device, target.handle, &download, pixels.data(), pixels.size()),
-                  VERNON_RHI_STATUS_OK);
+        const std::vector<uint8_t> pixels = target.rgba8();
         const size_t colored = (height / 2 * width + viewportWidths[iteration] / 2) * 4;
         EXPECT_GT(pixels[colored], 240);
         EXPECT_GT(pixels[colored + 1], 40);
@@ -337,46 +127,28 @@ void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, cons
             EXPECT_EQ(pixels[outsideViewport + 1], 0);
             EXPECT_EQ(pixels[outsideViewport + 2], 0);
         }
-        destroyTarget(runtime, view, target);
     }
-
-    VernonProgramBindingTelemetry telemetry{};
-    telemetry.struct_size = sizeof(telemetry);
-    ASSERT_EQ(vernonRuntimeProgramInstanceGetTelemetry(instance, &telemetry), VERNON_STATUS_OK);
-    EXPECT_EQ(telemetry.prepare_count, 8u);
-    EXPECT_EQ(telemetry.reuse_count, 2u);
-    vernonRuntimeProgramInstanceDestroy(instance);
-    EXPECT_EQ(renderPassLeaseCount, 0);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(executable);
-    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void expectProgramGraphFusion(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
-    VernonProgramBundle *bundle = vernon::tests::loadProgramBundle(runtime.runtime, manifestPath);
-    ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
-    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime.runtime);
+TEST_P(ModuleGraphicsProgram, ProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
+    const ResolvedProgram program(runtime(), GetParam().manifestPath);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime());
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId scene{};
     VernonProgramNodeId overlay{};
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &scene), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &overlay), VERNON_STATUS_OK);
-    VernonProgramNodeBindingToken sceneOutput{sizeof(VernonProgramNodeBindingToken)};
-    VernonProgramNodeBindingToken overlayOutput{sizeof(VernonProgramNodeBindingToken)};
-    VernonProgramNodeBindingToken sceneVertices{sizeof(VernonProgramNodeBindingToken)};
-    VernonProgramNodeBindingToken overlayVertices{sizeof(VernonProgramNodeBindingToken)};
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, scene, VERNON_PROGRAM_BOUNDARY_OUTPUT, {"output", 6},
-                                                    &sceneOutput),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, overlay, VERNON_PROGRAM_BOUNDARY_OUTPUT, {"output", 6},
-                                                    &overlayOutput),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, scene, VERNON_PROGRAM_BOUNDARY_INPUT, {"vertices", 8},
-                                                    &sceneVertices),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, overlay, VERNON_PROGRAM_BOUNDARY_INPUT, {"vertices", 8},
-                                                    &overlayVertices),
-              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, program.bundle(), nullptr, {}, &scene), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, program.bundle(), nullptr, {}, &overlay), VERNON_STATUS_OK);
+    const auto boundary = [&](VernonProgramNodeId node, VernonProgramBoundaryRole role, const char *name) {
+        VernonProgramNodeBindingToken token{sizeof(VernonProgramNodeBindingToken)};
+        EXPECT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, role, {name, std::strlen(name)}, &token),
+                  VERNON_STATUS_OK);
+        return token;
+    };
+    const VernonProgramNodeBindingToken sceneOutput = boundary(scene, VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+    const VernonProgramNodeBindingToken overlayOutput = boundary(overlay, VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+    const VernonProgramNodeBindingToken sceneVertices = boundary(scene, VERNON_PROGRAM_BOUNDARY_INPUT, "vertices");
+    const VernonProgramNodeBindingToken overlayVertices = boundary(overlay, VERNON_PROGRAM_BOUNDARY_INPUT, "vertices");
     VernonProgramGraphStorage framebuffer{sizeof(VernonProgramGraphStorage)};
     ASSERT_EQ(vernonRuntimeProgramGraphCreateStorage(graph, &sceneOutput, &framebuffer), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramGraphAppendStorage(graph, &framebuffer, &overlayOutput), VERNON_STATUS_OK);
@@ -384,134 +156,72 @@ void expectProgramGraphFusion(RhiRuntime &runtime, const std::filesystem::path &
     ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &sceneVertices, {"scene_vertices", 14}), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &overlayVertices, {"overlay_vertices", 16}),
               VERNON_STATUS_OK);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph);
-    ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
+    const std::unique_ptr<VernonProgramExecutable, decltype(&vernonRuntimeProgramExecutableDestroy)> executable(
+        vernonRuntimeResolveProgramGraph(graph), vernonRuntimeProgramExecutableDestroy);
+    vernonRuntimeProgramGraphDestroy(graph);
+    ASSERT_NE(executable, nullptr) << vernon::tests::runtimeError(runtime());
     ASSERT_EQ(executable->executionPlan->graphicsScopeCandidates.size(), 2u);
     EXPECT_EQ(executable->executionPlan->graphicsScopeCandidates[0].region,
               executable->executionPlan->graphicsScopeCandidates[1].region);
-    vernonRuntimeProgramGraphDestroy(graph);
-    graph = nullptr;
 
-    const VernonProgramParameterView outputParameter = parameter(executable, "output");
-    const VernonProgramParameterView sceneVerticesParameter = parameter(executable, "scene_vertices");
-    const VernonProgramParameterView overlayVerticesParameter = parameter(executable, "overlay_vertices");
-    VernonProgramGraphicsControlsView sceneControlSlots{};
-    VernonProgramGraphicsControlsView overlayControlSlots{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &sceneControlSlots),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 1, &overlayControlSlots),
-              VERNON_STATUS_OK);
-    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
-    vernon::tests::RhiBuffer vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float),
-                                                                    VERNON_RHI_BUFFER_VERTEX, positions.data());
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    ASSERT_NE(instance, nullptr);
-    RhiImage target = vernon::tests::createImage(runtime, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 1,
-                                                 VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-    RhiImageView targetView =
-        vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    VernonProgramArgument output{};
-    output.slot = outputParameter.slot;
-    output.kind = VERNON_PROGRAM_IMAGE;
-    output.image = {targetView.reference};
-    const VernonProgramArgument sceneVertexArgument = tensorArgument(sceneVerticesParameter, vertices.reference);
-    const VernonProgramArgument overlayVertexArgument = tensorArgument(overlayVerticesParameter, vertices.reference);
-    const VernonProgramBindingToken outputToken = bindingToken("graph-output");
-    const VernonProgramBindingToken sceneVerticesToken = bindingToken("scene-vertices");
-    const VernonProgramBindingToken overlayVerticesToken = bindingToken("overlay-vertices");
-    for (size_t invocationIndex = 0; invocationIndex < 2; ++invocationIndex) {
-        VernonColorAttachment sceneAttachment{};
-        sceneAttachment.location = 0;
-        sceneAttachment.view = targetView.reference;
-        sceneAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-        sceneAttachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-        VernonColorAttachment overlayAttachment = sceneAttachment;
-        overlayAttachment.load_operation =
-            invocationIndex == 0 ? VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE : VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-        vernon::tests::CanonicalGraphicsControls sceneControls(&sceneAttachment, 1, 0);
-        vernon::tests::CanonicalGraphicsControls overlayControls(&overlayAttachment, 1, 0);
-        for (vernon::tests::CanonicalGraphicsControls *controls : {&sceneControls, &overlayControls}) {
-            controls->renderPass.render_area[2] = 8;
-            controls->renderPass.render_area[3] = 8;
-            controls->dynamic.viewport[2] = 8;
-            controls->dynamic.viewport[3] = 8;
-            controls->dynamic.scissor[2] = 8;
-            controls->dynamic.scissor[3] = 8;
-        }
-        VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-        ASSERT_NE(invocation, nullptr);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &output, nullptr, 0, 0),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(
-            vernonRuntimeProgramInvocationBind(invocation, &sceneVerticesToken, &sceneVertexArgument, nullptr, 0, 0),
-            VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &overlayVerticesToken, &overlayVertexArgument, nullptr,
-                                                     0, 0),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(sceneControls.bind(invocation, sceneControlSlots), VERNON_STATUS_OK);
-        ASSERT_EQ(overlayControls.bind(invocation, overlayControlSlots), VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
-            << lastError(runtime.runtime);
-        ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
-            << lastError(runtime.runtime);
-        vernonRuntimeProgramInvocationDestroy(invocation);
+    constexpr uint32_t extent = 8;
+    HalImage target(device_.get(), VERNON_TEXTURE_RGBA8_UNORM, extent, extent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(target);
+    const DeviceTensor triangle = vertices(device_);
+    LinkedProgram linked(runtime(), executable.get());
+    ASSERT_TRUE(linked) << linked.error();
+    linked.record().bind("scene_vertices", triangle);
+    linked.record().bind("overlay_vertices", triangle);
+    ASSERT_TRUE(linked.record().unbound().empty());
+    // The overlay pass shares the scene's render scope while it preserves the framebuffer, and begins its own when it
+    // clears it.
+    for (const bool preserve : {true, false}) {
+        SCOPED_TRACE(preserve);
+        PassControls sceneControls(target.reference(), extent);
+        PassControls overlayControls(target.reference(), extent);
+        if (preserve)
+            overlayControls.attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+        sceneControls.writeTo(linked.record(), 0);
+        overlayControls.writeTo(linked.record(), 1);
+        ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+        const VernonScheduleGraphicsTelemetry telemetry = linked.telemetry();
+        EXPECT_EQ(telemetry.render_scopes, preserve ? 1u : 2u);
+        EXPECT_EQ(telemetry.draws, 2u);
     }
-    vernonRuntimeProgramInstanceDestroy(instance);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    destroyTarget(runtime, targetView, target);
-    vernonRuntimeProgramExecutableDestroy(executable);
-    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-const std::vector<vernon::tests::ProgramFixtureManifest> &moduleGraphicsBackendCases() {
-    static const auto cases = vernon::tests::programFixtureCases("module_graphics");
-    return cases;
-}
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, ModuleGraphicsProgram,
+                         testing::ValuesIn(vernon::tests::programFixtureCases("module_graphics")), testName);
 
-const std::vector<vernon::tests::ProgramFixtureManifest> &moduleMixedBackendCases() {
-    static const auto cases = vernon::tests::programFixtureCases("module_mixed");
-    return cases;
-}
-
-class RuntimeModuleGraphicsProgramMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
-protected:
-    vernon::tests::BackendTestRequirements requirements() const override {
-        return vernon::tests::graphicsImageCopyFixtureRequirements(GetParam().runtime);
-    }
-};
-
-TEST_P(RuntimeModuleGraphicsProgramMatrix, ReusesLoadedGraphicsModuleAcrossExtentsAndDynamicStates) {
-    reuseGraphicsProgramAcrossExtentsAndDynamicStates(runtime(), GetParam().manifestPath);
-}
-
-TEST_P(RuntimeModuleGraphicsProgramMatrix, ExternalVerticesGraphicsModuleRendersPixels) {
-    invokeAndExpectTriangle(runtime(), GetParam().manifestPath, true);
-}
-
-TEST_P(RuntimeModuleGraphicsProgramMatrix, ProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
-    expectProgramGraphFusion(runtime(), GetParam().manifestPath);
-}
-
-INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleGraphicsProgramMatrix,
-                         testing::ValuesIn(moduleGraphicsBackendCases()),
-                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
-                             return std::string(info.param.target);
-                         });
-
-class RuntimeModuleMixedProgramMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
+class ModuleMixedProgram : public vernon::tests::HalProgramTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
         return vernon::tests::computeGraphicsFixtureRequirements(GetParam().runtime);
     }
 };
 
-TEST_P(RuntimeModuleMixedProgramMatrix, ComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(runtime(), GetParam().manifestPath, false);
+TEST_P(ModuleMixedProgram, ComputeGeneratedVerticesReachGraphicsModule) {
+    const ResolvedProgram program(runtime(), GetParam().manifestPath);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsNodeCount(program.get()), 1u);
+    expectColorAttachmentOutput(program.get());
+
+    constexpr uint32_t extent = 32;
+    HalImage target(device_.get(), VERNON_TEXTURE_RGBA8_UNORM, extent, extent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(target);
+    LinkedProgram linked(runtime(), program.get());
+    ASSERT_TRUE(linked) << linked.error();
+    linked.record().bindScalar<uint32_t>("grid_x", 3);
+    linked.record().bindScalar<uint32_t>("grid_y", 1);
+    linked.record().bindScalar<uint32_t>("grid_z", 1);
+    ASSERT_TRUE(linked.record().unbound().empty());
+    const PassControls controls(target.reference(), extent);
+    controls.writeTo(linked.record());
+    ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+    expectTriangleCoverage(target.rgba8(), 192);
 }
 
-INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleMixedProgramMatrix, testing::ValuesIn(moduleMixedBackendCases()),
-                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
-                             return std::string(info.param.target);
-                         });
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, ModuleMixedProgram,
+                         testing::ValuesIn(vernon::tests::programFixtureCases("module_mixed")), testName);
 
 } // namespace

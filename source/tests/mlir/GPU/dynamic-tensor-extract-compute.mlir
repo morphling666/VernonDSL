@@ -1,7 +1,7 @@
 // RUN: %vernon-opt \
 // RUN:   --pass-pipeline='builtin.module(vernon-to-gpu{use-spirv-storage=true},gpu.module(vernon-lower-gpu-tensors{use-spirv-tuple-abi=true}),vernon-convert-gpu-to-spirv)' \
 // RUN:   %s | %FileCheck %s --check-prefix=SPIRV
-// RUN: %vernon-opt --pass-pipeline='builtin.module(vernon-to-gpu,gpu.module(vernon-lower-gpu-tensors))' %s \
+// RUN: %vernon-opt --pass-pipeline='builtin.module(vernon-to-gpu{unit-stride-versions=false},gpu.module(vernon-lower-gpu-tensors))' %s \
 // RUN:   | %FileCheck %s --check-prefix=CUDA
 //
 // A runtime index reads a register vector with a dynamic extract and a register array through one function-local copy

@@ -161,7 +161,7 @@ uint64_t estimateRematerializationCost(Operation *operation) {
 bool isRematerializableDialect(Operation *operation) {
     const StringRef dialect = operation->getName().getDialectNamespace();
     return dialect == "arith" || dialect == "index" || dialect == "tensor" ||
-           isa<TupleCreateOp, TupleGetOp, StructCreateOp, StructGetOp>(operation);
+           isa<TupleCreateOp, TupleGetOp, StructCreateOp, StructGetOp, GetShapeOp>(operation);
 }
 
 FailureOr<AdRematerializationRecipe> buildRematerializationRecipeImpl(Value value, func::FuncOp function,
@@ -611,6 +611,18 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     canReconstructIf = [&](scf::IfOp branch, const AvailableRoot &isAvailableRoot) {
         if (!canReconstructValue(branch.getCondition(), isAvailableRoot))
             return false;
+        // A branch with Storage effects is reversed under its recomputed predicate, which the reverse pass rebuilds
+        // only from pure operations of entry values (a bounds guard on gid and a shape); a predicate on loaded data
+        // keeps its tape record.
+        const bool effects = branch
+                                 .walk([&](Operation *operation) {
+                                     return analysis.isActive(operation) && analysis.getStorageEffect(operation)
+                                                ? WalkResult::interrupt()
+                                                : WalkResult::advance();
+                                 })
+                                 .wasInterrupted();
+        if (effects && failed(buildAutodiffRematerializationRecipe(branch.getCondition(), function, isAvailableRoot)))
+            return false;
         WalkResult result = branch.walk<WalkOrder::PreOrder>([&](Operation *operation) {
             if (operation == branch.getOperation())
                 return WalkResult::advance();
@@ -622,8 +634,8 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return canReconstructFor(nestedFor, isAvailableRoot) ? WalkResult::skip() : WalkResult::interrupt();
             if (isa<scf::WhileOp>(operation))
                 return analysis.isActive(operation) ? WalkResult::interrupt() : WalkResult::skip();
-            return canReconstructActiveOperation(operation, isAvailableRoot, true) ? WalkResult::advance()
-                                                                                   : WalkResult::interrupt();
+            return canReconstructActiveOperation(operation, isAvailableRoot, false) ? WalkResult::advance()
+                                                                                    : WalkResult::interrupt();
         });
         return !result.wasInterrupted();
     };

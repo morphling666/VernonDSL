@@ -1,6 +1,9 @@
 # Binding groups and command streams
 
-Status: proposed. One `COMPILER_CONTRACT_VERSION` and `PROGRAM_VERSION` cut.
+Status: superseded by [`architecture_v2.md`](architecture_v2.md): bindless
+handles in the argument arena replace groups, and bound groups remain only
+in the OpenGL tape (its section 15). Not to be implemented further. Was:
+proposed. One `COMPILER_CONTRACT_VERSION` and `PROGRAM_VERSION` cut.
 It replaces the per-command binding sets of the provider ABI for compute and
 graphics on every backend, completes the group partitions of
 [`../program/recorded_draws.md`](../program/recorded_draws.md) section 6, and
@@ -184,9 +187,7 @@ lives.
 | Source | Object | Made | Lifetime |
 |---|---|---|---|
 | Sealed binding set covering one group | persistent | at its first match with a pipeline, per distinct group layout | the set |
-| Program instance values of a Node's group | persistent | when a binding token of one of the group's parameters changes | the instance |
-| Values fixed for one invocation (pass values, resolution after `set_viewport`) | transient | at invocation encode | the command encoder |
-| Values of the keyed Nodes of a stored graphics scope that no binding set owns alone | updatable | when the scope is built; their bytes are written again when a replay changes them | the scope ([`stored_plans.md`](stored_plans.md) section 12) |
+| Arguments of a linked schedule's graphics node or pass-table entry | transient | at each call | the call's command stream |
 
 - A persistent group retains its resources once, when it is made. Binding it
   retains the group object for the command encoder; the RHI deduplicates per
@@ -200,9 +201,9 @@ lives.
   state, not through its group. A group that holds both per-draw and fixed
   endpoints fails pipeline conformance (`PROGRAM_PIPELINE_CONFORMANCE`),
   because no set could cover it; fixed endpoints belong in group 0.
-- Standalone invocations that rebind nothing reuse every persistent group,
-  so a post-processing Node invoked each frame with unchanged arguments makes
-  no group at all after its first frame.
+- Values that stay fixed across calls belong in a sealed binding set, whose
+  group is made once; a schedule's record carries only the arguments that
+  change, so a post-processing pass called each frame packs only those.
 
 ## 5. Command streams
 
@@ -478,8 +479,8 @@ completion (section 2 there).
 
 ## 9. Interaction with other contracts
 
-- Pipelined submission ([`pipelined_submission.md`](pipelined_submission.md)):
-  transient groups are charged to the transient budget of their encoder.
+- Linked schedules ([`architecture_v2.md`](architecture_v2.md) section 7):
+  the groups of schedule arguments are transient to the call (section 4).
 - Hazards stay static: groups hold only borrowed, read-only resources for
   recorded passes, and Node accesses still decide barriers.
 - Autodiff is unchanged: derivative Programs are ordinary Programs and

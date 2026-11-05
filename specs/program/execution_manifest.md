@@ -1800,11 +1800,8 @@ versions exported as final outputs, and non-linear Storage-version chains. It
 never guesses a connection from equal names or equal runtime resource handles.
 
 The linked forward Program enters the ordinary Resolve algorithm below.
-Differentiated children also resolve immutable node-local backward plans from
-their already loaded artifacts. This does not submit a child executable or
-create a nested publication transaction during graph forward. One globally
-resolved forward schedule remains the only primal execution path; node-local
-plans are used only by explicitly retrieved pullbacks.
+Graph forward submits no child executable: one globally resolved forward
+schedule is the only primal execution path.
 
 ## 16. Resolve
 
@@ -1840,56 +1837,32 @@ backend work.
 
 ## 17. Runtime
 
-Instance creation binds every parameter and creates owned instance Storage.
-Invocation entry binds arguments, creates owned invocation Storage, restores
-captured forward Values when applicable, evaluates control values, checks
-borrowed providers, and checks entry constraints before
-submitting work.
+Runtime runs a resolved Program as a linked schedule
+([`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) section 4).
+Linking creates the Program's owned Storage. A call writes its argument
+record, checks its arguments, evaluates control values and checks entry
+constraints before it submits work.
 
 Before instance creation, Runtime loads or performs the target-defined JIT for
 each authenticated CodeModule and resolves every declared entry point. A load,
 JIT, link, reflection, or entry-point failure rejects the resolved Program;
 Runtime does not try another format, module, symbol, artifact, or target.
 
-Runtime executes nodes in any schedule equivalent to the canonical DAG.
-L7 follows the resolved transfer, barrier, and synchronization plan. It MUST
-NOT rescan carriers or Storage aliases to derive new physical policy, and MUST
-NOT insert an unplanned device-to-host read while materializing a later Node.
+Runtime executes nodes in any schedule equivalent to the canonical DAG. The
+linked schedule fixes transfers, barriers and synchronization when it is
+linked; a call MUST NOT rescan carriers or Storage aliases to derive new
+physical policy, and MUST NOT insert an unplanned device-to-host read.
 
-Every `commit_after_success` change is transactional. Outputs, state updates,
-and transferred ownership become visible only after every submitted operation
-completes successfully and all postconditions pass. Failure:
+Outputs are written in place, without transactions
+([`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) section
+10): a call writes every output boundary, `commit_after_success` or
+`in_place`, directly into its argument or its owned Storage, and returns
+after submission. A call that fails its checks submits nothing and writes
+nothing. A failure the submission reports poisons every buffer the call
+writes; host access and later calls that read such a buffer fail until the
+host overwrites it. Nothing is rolled back.
 
-- publishes no output;
-- performs no ownership transfer;
-- preserves prior committed instance state;
-- invalidates uncommitted owned invocation resources;
-- retires submitted backend work before releasing referenced resources;
-- emits one stable diagnostic.
-
-A `commit_after_success` write to borrowed caller-visible Storage is
-transactional too. Runtime MUST execute it against a private shadow or retain
-sufficient original contents to restore the exact provider bytes/subresources
-before reporting failure. An explicitly declared `in_place` boundary may
-mutate the borrowed resource directly and does not promise rollback after
-submission; Runtime must never infer that mode from the resource being an RHI
-object. If backend failure makes committed instance Storage or ownership state
-unsafe, the Program instance enters terminal-failed state; every later
-instance bind, invocation, or pullback fails without backend execution.
-
-A borrowed output is valid only for its declared provider lifetime. A
-transferred owned output is removed from Program ownership at commit.
-
-An invocation completes in `WAIT` or `ASYNCHRONOUS` mode
-([`../runtime/pipelined_submission.md`](../runtime/pipelined_submission.md)).
-`ASYNCHRONOUS` Execute returns after submission; the transactional rules
-above then hold at the submission's completion instead of at Execute. Until
-deferred commit copies exist, an asynchronous plan writes only `in_place`
-boundaries: resolve records the plan's first `commit_after_success`
-boundary or autodiff tape as its wait requirement, and an asynchronous
-Execute of such a plan, or one retaining a pullback, fails before
-submission with `PROGRAM_SUBMISSION_REQUIRES_WAIT` naming it. Runtime never
-waits instead.
+A borrowed output is valid only for its declared provider lifetime.
 
 ## 18. Diagnostics
 
@@ -1958,7 +1931,6 @@ Required stable codes include:
 - `PROGRAM_REPLAY_INVALID`
 - `PROGRAM_DERIVATIVE_ABI`
 - `PROGRAM_TAPE_CONTRACT`
-- `PROGRAM_SUBMISSION_REQUIRES_WAIT`
 - `PROGRAM_RUNTIME_FAILURE`
 
 `PROGRAM_DEPENDENCY_MEMBER` is the parse error reserved for a serialized order,

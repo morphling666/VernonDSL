@@ -236,11 +236,8 @@ if(TARGET VernonRuntime)
         runtime/compute_launch_planner_test.cpp
         runtime/directx_command_state_test.cpp
         runtime/dirty_range_set_test.cpp
-        runtime/execution_command_model_test.cpp
-        runtime/execution_graph_test.cpp
-        runtime/execution_workspace_pool_test.cpp
         runtime/graphics_invocation_planner_test.cpp
-        runtime/program_instance_test.cpp
+        runtime/hal_resources_test.cpp
         runtime/program_manifest_test.cpp
         runtime/program_tensor_copy_test.cpp
         runtime/resolved_execution_plan_test.cpp
@@ -252,9 +249,9 @@ if(TARGET VernonRuntime)
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
         runtime/runtime_external_gl_test.cpp
+        runtime/schedule_test.cpp
         runtime/shape_layout_test.cpp
         runtime/stage_artifact_contract_test.cpp
-        runtime/submission_queue_test.cpp
         runtime/tensor_bridge_test.cpp
         runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
@@ -286,15 +283,11 @@ if(TARGET VernonRuntime)
         target_link_libraries(
             VernonCompilerRuntimeIntegrationTests
             PRIVATE GTest::gtest_main
-                    Vernon::Runtime
+                    Vernon::RuntimeTesting
                     Vernon::RHI
                     VernonDSLCompiler)
         vernon_enable_glfw_context_owner_for_test(VernonCompilerRuntimeIntegrationTests)
-        vernon_stage_target_files(
-            VernonCompilerRuntimeIntegrationTests
-            VernonRuntime
-            VernonRHI
-            VernonDSLCompiler)
+        vernon_stage_target_files(VernonCompilerRuntimeIntegrationTests VernonRHI VernonDSLCompiler)
         vernon_discover_gtests(VernonCompilerRuntimeIntegrationTests)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
@@ -683,29 +676,31 @@ if(TARGET VernonRuntime)
             vernon_stage_target_files(VernonGpuAutodiffTests VernonRHI)
             vernon_discover_gtests(VernonGpuAutodiffTests)
         endif()
+        add_executable(VernonModuleProgramScheduleTests runtime/runtime_module_program_schedule_test.cpp)
+        target_link_libraries(
+            VernonModuleProgramScheduleTests
+            PRIVATE GTest::gtest_main
+                    Vernon::RuntimeTesting
+                    Vernon::RHI
+                    nlohmann_json::nlohmann_json
+                    ${module_program_cpu_fixture_targets})
+        vernon_enable_glfw_context_owner_for_test(VernonModuleProgramScheduleTests)
+        target_include_directories(
+            VernonModuleProgramScheduleTests
+            PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                    "${VERNON_TEST_BINARY_ROOT}/generated")
+        target_compile_definitions(VernonModuleProgramScheduleTests
+                                   PRIVATE VERNON_MODULE_PROGRAM_CPU_FIXTURES_AVAILABLE=1)
         if(module_program_fixture_targets)
-            add_executable(VernonModuleProgramGpuRuntimeTests runtime/runtime_module_program_gpu_c_api_test.cpp)
-            target_link_libraries(
-                VernonModuleProgramGpuRuntimeTests
-                PRIVATE GTest::gtest_main
-                        Vernon::RuntimeTesting
-                        Vernon::RHI
-                        nlohmann_json::nlohmann_json)
-            vernon_enable_glfw_context_owner_for_test(VernonModuleProgramGpuRuntimeTests)
-            target_include_directories(
-                VernonModuleProgramGpuRuntimeTests
-                PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
-                        "${VERNON_TEST_BINARY_ROOT}/generated")
-            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_fixture_targets})
-            set_target_properties(VernonModuleProgramGpuRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                                                                "${CMAKE_BINARY_DIR}/source")
-            vernon_stage_target_files(VernonModuleProgramGpuRuntimeTests VernonRHI)
-            vernon_discover_gtests(VernonModuleProgramGpuRuntimeTests)
+            add_dependencies(VernonModuleProgramScheduleTests ${module_program_fixture_targets})
         endif()
+        set_target_properties(VernonModuleProgramScheduleTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                          "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonModuleProgramScheduleTests VernonRHI)
+        vernon_discover_gtests(VernonModuleProgramScheduleTests)
         if(module_graphics_fixture_targets)
-            add_executable(
-                VernonModuleGraphicsProgramRuntimeTests runtime/runtime_module_graphics_program_c_api_test.cpp
-                                                        runtime/runtime_recorded_graphics_c_api_test.cpp)
+            add_executable(VernonModuleGraphicsProgramRuntimeTests
+                           runtime/runtime_module_graphics_program_c_api_test.cpp runtime/schedule_graphics_test.cpp)
             target_link_libraries(
                 VernonModuleGraphicsProgramRuntimeTests
                 PRIVATE GTest::gtest_main
@@ -756,8 +751,8 @@ if(TARGET VernonRuntime)
                     ${structured_scalar_balanced_autodiff_fixture_target}
                     ${structured_dynamic_autodiff_fixture_target}
                     ${structured_f64_autodiff_fixture_target})
-        target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                               "${VERNON_TEST_ROOT}/support")
+        target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_TEST_ROOT}/support"
+                                                                               "${VERNON_TEST_BINARY_ROOT}/generated")
         target_compile_definitions(
             VernonStructuredScalarAutodiffTests
             PRIVATE
@@ -765,17 +760,16 @@ if(TARGET VernonRuntime)
                 VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST="${structured_scalar_balanced_autodiff_manifest}"
                 VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
                 VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
-        if(VERNON_HOST_TAPE_INSTRUMENTATION)
-            target_compile_definitions(VernonStructuredScalarAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
-        endif()
         set_target_properties(VernonStructuredScalarAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_discover_gtests(VernonStructuredScalarAutodiffTests)
 
         add_executable(VernonStructuredAggregateAutodiffTests runtime/runtime_structured_aggregate_autodiff_test.cpp)
-        target_link_libraries(VernonStructuredAggregateAutodiffTests
-                              PRIVATE GTest::gtest_main Vernon::Runtime ${structured_aggregate_autodiff_fixture_target})
-        target_include_directories(VernonStructuredAggregateAutodiffTests PRIVATE "${VERNON_TEST_ROOT}/support")
+        target_link_libraries(
+            VernonStructuredAggregateAutodiffTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting
+                                                           ${structured_aggregate_autodiff_fixture_target})
+        target_include_directories(VernonStructuredAggregateAutodiffTests
+                                   PRIVATE "${VERNON_TEST_ROOT}/support" "${VERNON_TEST_BINARY_ROOT}/generated")
         target_compile_definitions(
             VernonStructuredAggregateAutodiffTests
             PRIVATE VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST="${structured_aggregate_autodiff_manifest}")
@@ -791,11 +785,8 @@ if(TARGET VernonRuntime)
         target_compile_definitions(
             VernonStructuredStorageAutodiffTests
             PRIVATE VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST="${structured_storage_autodiff_manifest}")
-        if(VERNON_HOST_TAPE_INSTRUMENTATION)
-            target_compile_definitions(VernonStructuredStorageAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
-        endif()
-        target_include_directories(VernonStructuredStorageAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                                "${VERNON_TEST_ROOT}/support")
+        target_include_directories(VernonStructuredStorageAutodiffTests PRIVATE "${VERNON_TEST_ROOT}/support"
+                                                                                "${VERNON_TEST_BINARY_ROOT}/generated")
         set_target_properties(VernonStructuredStorageAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                               "${CMAKE_BINARY_DIR}/source")
         vernon_discover_gtests(VernonStructuredStorageAutodiffTests)
@@ -809,8 +800,8 @@ if(TARGET VernonRuntime)
             PRIVATE
                 VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST="${structured_storage_workgroup_autodiff_manifest}"
         )
-        target_include_directories(VernonRuntimeWorkgroupAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                               "${VERNON_TEST_ROOT}/support")
+        target_include_directories(VernonRuntimeWorkgroupAutodiffTests PRIVATE "${VERNON_TEST_ROOT}/support"
+                                                                               "${VERNON_TEST_BINARY_ROOT}/generated")
         set_target_properties(VernonRuntimeWorkgroupAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_discover_gtests(VernonRuntimeWorkgroupAutodiffTests)
@@ -910,34 +901,6 @@ if(TARGET VernonRuntime)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
         set_source_files_properties(runtime/runtime_metal_test.cpp PROPERTIES LANGUAGE OBJCXX)
         if(TARGET vernon-dsl-native AND Python_FOUND)
-            vernon_add_program_asset_test_bundle(
-                metal-compute-pipeline
-                metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
-                metal_compute_program_bundle
-                metal_compute_program_test_manifest)
-            vernon_add_program_asset_test_bundle(
-                metal-graphics-pipeline
-                metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
-                metal_graphics_program_bundle
-                metal_graphics_program_test_manifest)
-            vernon_add_program_asset_test_bundle(
-                metal-resolution-pipeline
-                metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
-                metal_resolution_program_bundle
-                metal_resolution_program_test_manifest)
-            target_compile_definitions(
-                VernonRuntimeTests
-                PRIVATE VERNON_METAL_COMPUTE_PROGRAM_BUNDLE="${metal_compute_program_test_manifest}"
-                        VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE="${metal_graphics_program_test_manifest}"
-                        VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE="${metal_resolution_program_test_manifest}")
-            add_dependencies(
-                VernonRuntimeTests
-                vernon-metal-compute-pipeline-test-bundle
-                vernon-metal-graphics-pipeline-test-bundle
-                vernon-metal-resolution-pipeline-test-bundle)
             add_test(
                 NAME vernon-metal-mandelbulb-showcase
                 COMMAND
@@ -982,50 +945,11 @@ if(TARGET VernonRuntime)
     endif()
 
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp
-                                                  rhi/directx12_native_interop_test.cpp)
+        target_sources(
+            VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp runtime/runtime_directx12_pipeline_test.cpp
+                                       rhi/directx12_native_interop_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
         target_compile_definitions(VernonRuntimeTests PRIVATE NOMINMAX)
-        if(TARGET vernon-dsl-native AND Python_FOUND)
-            vernon_add_program_asset_test_bundle(
-                directx-pipeline
-                directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_depth_asset"
-                directx_program_bundle
-                directx_program_test_manifest)
-            vernon_add_program_asset_test_bundle(
-                directx-compute-pipeline
-                directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
-                directx_compute_program_bundle
-                directx_compute_program_test_manifest)
-            vernon_add_program_asset_test_bundle(
-                directx-resolution-pipeline
-                directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
-                directx_resolution_program_bundle
-                directx_resolution_program_test_manifest)
-            vernon_add_program_asset_test_bundle(
-                directx-spilled-uniform
-                directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:spilled_uniform_color_asset"
-                directx_spilled_uniform_bundle
-                directx_spilled_uniform_test_manifest)
-            target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
-            target_compile_definitions(
-                VernonRuntimeTests
-                PRIVATE VERNON_DIRECTX_PROGRAM_BUNDLE="${directx_program_test_manifest}"
-                        VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE="${directx_compute_program_test_manifest}"
-                        VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE="${directx_resolution_program_test_manifest}"
-                        VERNON_DIRECTX_SPILLED_UNIFORM_BUNDLE="${directx_spilled_uniform_test_manifest}")
-            target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-            add_dependencies(
-                VernonRuntimeTests
-                vernon-directx-pipeline-test-bundle
-                vernon-directx-compute-pipeline-test-bundle
-                vernon-directx-resolution-pipeline-test-bundle
-                vernon-directx-spilled-uniform-test-bundle)
-        endif()
     endif()
 
     if(VERNON_ENABLE_VULKAN_RUNTIME

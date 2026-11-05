@@ -1,7 +1,10 @@
 # Stored execution plans
 
-Status: sections 4 and 12 implemented; section 11 in progress; sections 3
-and 5 to 10 proposed. Amends
+Status: superseded by [`architecture_v2.md`](architecture_v2.md), whose
+one recording per linked schedule replaces stored plans (its sections 7 and 15);
+this document describes the code until that migration removes it. Sections
+4 and 12 implemented; section 11 in progress; sections 3 and 5 to 10 will
+not be implemented. Amends
 `binding_groups.md` sections 4, 6 and 13 and the recording API of
 `../program/recorded_draws.md`. A stored plan holds resolved provider command
 packets (section 11) from its first implementation; there is no interim
@@ -178,8 +181,8 @@ publication transaction.
 **Submission slots.** Invocation-owned resources (owned images, device alias
 buffers, Runtime carriers, retained pullback storages) would be written by
 two submissions of one plan in flight. A stored plan therefore has one slot
-per submission it may have in flight, up to the instance's submission bound
-(`pipelined_submission.md` section 7). A slot owns its resources and the
+per submission it may have in flight, up to the instance's submission bound.
+A slot owns its resources and the
 persistent groups that reference them; commands name such resources by plan
 index and the replay resolves them through the slot. A slot is reused only
 after its previous submission retires, which `SubmissionQueue::admit`
@@ -352,13 +355,14 @@ operands its rendering table (attachments, load and store operations).
 | `BIND_VERTEX_BUFFERS` | first binding, count, resources | |
 | `DRAW` | topology | vertex and instance counts, first instance, viewport, scissor, stencil reference |
 | `DRAW_INDEXED` | topology, index resource | index and instance counts, first instance, base vertex, first index, viewport, scissor, stencil reference |
+| `DRAW_INDEXED_STREAM` | topology, index resource, records and counts resources (both none for a host stream) | host addresses of records and counts, first record, max records, count index, viewport, scissor, stencil reference |
 | `DISPATCH` | | grid |
 | `PUSH_DEBUG_GROUP`, `INSERT_DEBUG_MARKER` | label bytes | |
 | `POP_DEBUG_GROUP` | | |
 
-Indirect draws (`../program/indirect_draws.md`) add `DRAW_INDIRECT` and
-`DRAW_INDEXED_INDIRECT` with argument and count resources and offset and
-draw-count payload. Dynamic offsets (section 3) add payload to
+`DRAW_INDEXED_STREAM` is the draw stream of `architecture_v2.md` section
+16.2; it serves indirect draws (`../program/indirect_draws.md`) too.
+Dynamic offsets (section 3) add payload to
 `BIND_GROUP`. Barriers, copies and timer edges stay RHI commands recorded
 between batches.
 

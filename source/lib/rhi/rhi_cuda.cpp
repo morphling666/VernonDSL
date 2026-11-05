@@ -5,6 +5,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -49,6 +50,12 @@ struct CudaDevice {
     std::mutex mutex;
     std::mutex slotMutex;
     std::mutex creationMutex;
+    // Buffer creation is next fit: it searches from the slot after the last one it filled, and wraps to the start
+    // only while `freedBuffers` counts a slot to reuse, so creating a call's fresh buffers among thousands of live ones
+    // does not scan them all. A teardown counts its slot before the lifecycle recycles it, so a search may miss it and
+    // append; the count stays and a later search finds it. `bufferCursor` is guarded by `creationMutex`.
+    std::atomic<std::size_t> freedBuffers{0};
+    std::size_t bufferCursor{0};
 };
 
 constexpr uint32_t cudaDeviceBit = uint32_t{1} << 29;
@@ -135,6 +142,7 @@ vernon::Result<void, vernon::RhiError> teardownCudaBuffer(void *context, BufferH
         return vernon::Result<void, vernon::RhiError>{vernon::err(backendFailure(device, status, "cuMemFree"))};
     slot->pointer = 0;
     slot->descriptor = {};
+    device.freedBuffers.fetch_add(1, std::memory_order_relaxed);
     return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
@@ -235,19 +243,27 @@ Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const Ver
 
     std::lock_guard<std::mutex> creationGuard(device.creationMutex);
     CudaBufferSlot *slot = nullptr;
-    uint32_t index = 0;
-    for (;;) {
-        slot = findBufferSlot(device, index);
-        if (!slot)
-            break;
-        if (!slot->lifecycle.snapshot().occupied) {
-            std::lock_guard<std::mutex> nativeGuard(device.mutex);
-            if (!slot->pointer)
-                break;
-        }
-        ++index;
+    const std::size_t count = device.buffers.size();
+    const std::size_t start = device.bufferCursor <= count ? device.bufferCursor : 0;
+    const std::size_t searched = device.freedBuffers.load(std::memory_order_relaxed) ? count : count - start;
+    for (std::size_t step = 0; step < searched; ++step) {
+        const std::size_t index = (start + step) % count;
+        CudaBufferSlot *candidate = findBufferSlot(device, static_cast<uint32_t>(index));
+        if (candidate->lifecycle.snapshot().occupied)
+            continue;
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        if (candidate->pointer)
+            continue;
+        slot = candidate;
+        device.bufferCursor = index + 1;
+        std::size_t freed = device.freedBuffers.load(std::memory_order_relaxed);
+        while (freed && !device.freedBuffers.compare_exchange_weak(freed, freed - 1, std::memory_order_relaxed))
+            ;
+        break;
     }
     if (!slot) {
+        const auto index = static_cast<uint32_t>(count);
+        device.bufferCursor = count + 1;
         auto lifecycle = BufferLifecycle::create(index);
         if (lifecycle.isErr())
             return Result<VernonRhiBuffer, RhiError>{err(std::move(lifecycle).error())};
@@ -261,8 +277,10 @@ Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const Ver
     {
         std::lock_guard<std::mutex> nativeGuard(device.mutex);
         const auto status = device.state.allocate(slot->pointer, static_cast<size_t>(descriptor->size));
-        if (status != vernon::rhi::cuda::kSuccess)
+        if (status != vernon::rhi::cuda::kSuccess) {
+            device.freedBuffers.fetch_add(1, std::memory_order_relaxed);
             return Result<VernonRhiBuffer, RhiError>{err(backendFailure(device, status, "cuMemAlloc"))};
+        }
         slot->descriptor = *descriptor;
     }
 
@@ -274,6 +292,7 @@ Result<VernonRhiBuffer, RhiError> createBuffer(VernonRhiDevice handle, const Ver
             return Result<VernonRhiBuffer, RhiError>{err(backendFailure(device, status, "cuMemFree"))};
         slot->pointer = 0;
         slot->descriptor = {};
+        device.freedBuffers.fetch_add(1, std::memory_order_relaxed);
         return Result<VernonRhiBuffer, RhiError>{err(std::move(published).error())};
     }
     const BufferHandle buffer = published.value();

@@ -398,30 +398,6 @@ static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diag
                              vernon::program_plan::TapeCarrier::ReplaySegment) != tape.optionalCarriers.end();
         });
     plan.autodiff.checkpointPolicy = compiledReplay ? CheckpointPolicy::Rematerialize : CheckpointPolicy::Retain;
-
-    plan.publications = {};
-    for (const BoundarySlot &slot : program.abi.boundarySlots) {
-        if (slot.publication == BoundaryPublication::None)
-            continue;
-        const PublicationCommitMode mode = slot.publication == BoundaryPublication::CommitAfterSuccess
-                                               ? PublicationCommitMode::CommitAfterSuccess
-                                               : PublicationCommitMode::InPlace;
-        plan.publications.transactions.push_back({slot.id, slot.value, slot.aliasOwner, mode});
-    }
-
-    plan.waitRequirement.reset();
-    const auto commitAfterSuccess =
-        std::find_if(plan.publications.transactions.begin(), plan.publications.transactions.end(),
-                     [](const ResolvedPublicationTransaction &publication) {
-                         return publication.mode == PublicationCommitMode::CommitAfterSuccess;
-                     });
-    if (commitAfterSuccess != plan.publications.transactions.end())
-        plan.waitRequirement =
-            ResolvedWaitRequirement{"/abi/boundary_slots/" + std::to_string(commitAfterSuccess->slot) + "/publication",
-                                    "a commit-after-success boundary is published after a host wait"};
-    else if (!program.abi.tapePlans.empty())
-        plan.waitRequirement =
-            ResolvedWaitRequirement{"/abi/tape_plans/0", "an autodiff tape is validated on the host after its writer"};
     return true;
 }
 
@@ -446,8 +422,6 @@ static bool validateResolvedExecutionPlanImpl(const ResolvedExecutionPlan &plan,
     }
     if (plan.residency != expected.residency || plan.aliasDomains.size() != expected.aliasDomains.size())
         return reject(diagnostic, "/residency", "logical residency disagrees with resolved Node projections");
-    if (plan.waitRequirement != expected.waitRequirement)
-        return reject(diagnostic, "/publications", "completion wait requirement disagrees with the resolved plan");
     for (const ResolvedTransferEdge &required : expected.transfers.edges) {
         const auto found = std::find_if(
             plan.transfers.edges.begin(), plan.transfers.edges.end(), [&](const ResolvedTransferEdge &candidate) {
@@ -506,23 +480,6 @@ static bool validateResolvedExecutionPlanImpl(const ResolvedExecutionPlan &plan,
             edge.consumer.kind != TransferEndpointKind::Node || !plan.node(edge.consumer.graph, edge.consumer.id))
             return reject(diagnostic, "/transfers/" + std::to_string(index),
                           "transfer has an invalid endpoint or ordering");
-    }
-    for (const ResolvedPublicationTransaction &publication : plan.publications.transactions) {
-        if (publication.slot >= program.abi.boundarySlots.size() || publication.value >= program.values.size())
-            return reject(diagnostic, "/publications", "publication has no unique owner or staging policy");
-        const BoundarySlot &slot = program.abi.boundarySlots[publication.slot];
-        if (slot.aliasOwner.kind != publication.stagingOwner.kind || slot.aliasOwner.id != publication.stagingOwner.id)
-            return reject(diagnostic, "/publications", "publication staging owner disagrees with Program ABI");
-        const PublicationTarget *target = findPublicationTarget(program.abi, publication.slot);
-        if (publication.mode == PublicationCommitMode::CommitAfterSuccess) {
-            if (!target || target->value != publication.value ||
-                target->aliasOwner.kind != publication.stagingOwner.kind ||
-                target->aliasOwner.id != publication.stagingOwner.id)
-                return reject(diagnostic, "/publications",
-                              "commit-after-success publication has no unique staging target");
-        } else if (target) {
-            return reject(diagnostic, "/publications", "in-place publication cannot own staged commit state");
-        }
     }
     return true;
 }

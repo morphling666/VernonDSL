@@ -37,14 +37,12 @@ Program transform. Graphics entry tuples are not Program assets by themselves.
 - **Program bundle** is an immutable deployment description containing one
   Program and its variants.
 - **Program executable** owns one immutable `ResolvedExecutionPlan`.
-- **Program instance** owns persistent binding state.
-- **Program invocation** owns one concrete set of bindings and controls.
-- **Pullback** owns immutable retained forward state for reusable backward
-  applications.
+- **Linked schedule** is an executable planned once into recorded passes; a
+  call writes one argument record and returns a timeline point.
+- **Linked VJP** is a forward and a backward schedule; a forward call returns
+  the residuals its backward calls read.
 - **ProgramGraph** is an optional public pre-resolution composition builder.
   Its nodes are loaded Programs and it finalizes into one ordinary Program.
-- **Command DAG** is private runtime scheduling machinery, not a public
-  authoring or deployment model.
 
 `Pipeline` is reserved for the `vd.pipeline(...)` graphics authoring object or
 a native backend pipeline. It is not a deployment version axis or an
@@ -65,9 +63,8 @@ source kernel / vd.pipeline / initialized Module
   -> ResolvedProgram
   -> ResolvedExecutionPlan
   -> VernonProgramExecutable
-  -> ProgramInstance
-  -> ProgramInvocation
-  -> private Command DAG and backend
+  -> linked schedule or VJP
+  -> HAL device
 ```
 
 The boundaries are strict:
@@ -82,10 +79,9 @@ The boundaries are strict:
 6. Logical resolve validates Program topology, Value SSA, Storage versions,
    controls, and portable Stage contracts into `ResolvedProgram`.
 7. Physical resolve selects exact Stage implementations, carriers, transfers,
-   residency, hazards, publication transactions, and residual plans into
-   `ResolvedExecutionPlan`.
-8. Invocation binds runtime Values and controls and executes the resolved
-   plan.
+   residency, hazards, and residual plans into `ResolvedExecutionPlan`.
+8. Linking plans the resolved plan once into a schedule; each call writes its
+   Values and controls into one argument record.
 
 No lower layer reconstructs semantic information owned by a higher layer.
 Names, endpoint order, dtype guesses, zero sentinels, and runtime heuristics
@@ -178,31 +174,33 @@ The physical plan contains:
 - host/device carrier and residency decisions;
 - ordered upload, device-copy, and readback transfers;
 - resource hazards and command ordering;
-- publication transactions;
 - forward, backward, replay, checkpoint, and tape plans;
 - canonical public and derivative boundaries.
 
-Execution consumes this plan without re-deriving physical policy.
+Linking consumes this plan without re-deriving physical policy.
 
-The public C++ lifecycle is:
+The public C lifecycle is:
 
 ```text
-load bundle -> resolve executable -> create instance
-            -> begin invocation -> bind -> invoke
+load bundle -> resolve executable -> link schedule
+            -> write record -> call -> wait for the point
 ```
 
-The Runtime records and submits backend commands internally. External encoders
-are an optional private embedding concern and do not define another Program
-API.
+The Runtime records and submits backend commands internally
+([`../runtime/design.md`](../runtime/design.md) sections 2 and 8).
 
 ## 8. ProgramGraph composition
+
+[`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) section 4
+keeps this composition model but links the children's schedule fragments
+instead of finalizing one canonical Program and resolving it. Until its
+migration:
 
 `ProgramGraph` composes independently cooked Programs before physical resolve.
 It does not accept resolved executables, Stages, backend resources, command
 encoders, or callback passes, and it does not create another executable type.
 Finalization namespaces and links the child Programs into one canonical
-Program; the result follows the ordinary resolve, instance, invocation, and
-publication lifecycle.
+Program; the result follows the ordinary resolve and link lifecycle.
 
 Each graph node has an opaque identity and a local boundary/control namespace.
 Equal child boundary names never collide. Names enter the composite public ABI
@@ -220,10 +218,9 @@ compiler.
 Graph construction creates explicit graph Value handles from child outputs,
 connects those Values to child inputs, and creates explicit graph Storage
 handles whose appended child boundaries form ordered version chains. A graph
-Storage is invocation-bound once; node-local tokens in that chain resolve to
+Storage is bound once per call; node-local tokens in that chain resolve to
 the same composite boundary. Concrete tensors, image views, shapes, strides,
-offsets, controls, resources, and launch grids remain instance- or
-invocation-time bindings. In particular, two independently supplied native
+offsets, controls, resources, and launch grids remain call arguments. In particular, two independently supplied native
 image handles do not establish a compositional alias. Graphics Programs that
 share a framebuffer connect compatible attachment boundaries into one ordered
 symbolic graph Image Storage-version chain; this is storage composition, not a
@@ -231,44 +228,34 @@ producer-to-consumer Value edge.
 
 A child Program owns its semantic subgraph but never owns an independently
 submitted physical command graph. Global resolve derives one hazard, transfer,
-residency, publication, and static render-scope candidate regions for the
-composite Program. Invocation materializes fused or split native scopes only
-from the paths admitted by those candidates.
+residency, and static render-scope candidate regions for the composite
+Program. Linking forms fused or split native scopes only from the paths
+admitted by those candidates.
 
-ProgramGraph composition links only primal forward topology. A differentiated
-child additionally contributes node-local VJP metadata and a resolved backward
-plan, but no backward graph, derivative boundary, or accumulation operation is
-added to the composite Program. When node pullbacks are requested, one
-composite forward retains independent state for each differentiated node. The
-caller retrieves and applies those pullbacks by node identity using the child
-Program's boundary namespace. Graph connections have no implicit derivative
-meaning.
-
-Consequently, ProgramGraph has no whole-graph gradient. Cross-node reverse
-topology and cotangent fan-in belong in a Module transformed and cooked as one
-VJP Program; deployment-time scheduling never synthesizes them.
+ProgramGraph composition adds no backward graph, derivative boundary, or
+accumulation operation to the composite Program. A linked VJP of a graph of
+differentiated children runs the children's backward graphs in reverse, each
+child's input gradient feeding the cotangent of the output it reads
+([`../autodiff/contract.md`](../autodiff/contract.md) section 9). Cotangent
+fan-in belongs in a Module transformed and cooked as one VJP Program;
+deployment-time scheduling never synthesizes it.
 
 Standalone Program execution is the same model with an implicit one-node root
 composition.
 
 External engine objects may contain graph node handles and handle arbitrary
 events. The engine updates node-local bindings explicitly; Vernon does not own
-or call external polymorphic objects. Only the enclosing Program invocation
-submits work.
+or call external polymorphic objects. Only the call of the enclosing linked
+schedule submits work.
 
 ## 9. Publication
 
-Program outputs declare one publication mode:
-
-- `commit_after_success` stages externally visible results and commits them
-  only after successful execution;
-- `in_place` permits direct externally visible mutation and cannot promise
-  rollback of already executed writes.
-
-Publication is planned during physical resolution. A failed
-`commit_after_success` invocation rolls back staged publications. Image and
-buffer publication use device transfers when residency permits; synchronous
-host round-trips are not a publication strategy.
+Outputs are written in place, and value semantics come from fresh outputs and
+declared donation ([`../runtime/architecture_v2.md`](../runtime/architecture_v2.md)
+section 10). A failed check writes nothing; a failed submission poisons what
+it writes, and nothing is rolled back. The manifest's per-output
+`publication` mode is still emitted but not read
+([`../runtime/design.md`](../runtime/design.md) section 6).
 
 ## 10. Differentiated Programs
 
@@ -288,10 +275,9 @@ cotangent accumulation. Kernel VJP supplies differentiated compute Stage
 implementations and opaque tape ABI. Tape is one residual storage strategy,
 not another executable model.
 
-Forward returns a reusable pullback retaining immutable snapshots, tapes,
-resource versions, or replay/checkpoint descriptions selected by the resolved
-plan. Each pullback application creates fresh invocation scratch and fresh
-gradient publications.
+A forward call returns residuals: the Values, tapes, or checkpoint prefix the
+linked VJP selected. Each backward call over them writes its gradients in
+place and may be repeated with other cotangents.
 
 Graphics execution is currently primal-only. Capture rejects Program or Module
 VJP when graphics Nodes are present; path-selective pruning of unrelated
@@ -312,12 +298,12 @@ Node fields and ordinary Program Values:
 - independent shader resource bindings.
 
 Render state is static Stage specialization. Render pass, draw command, and
-dynamic state are invocation controls. Draw counts are explicit and are not
+dynamic state are call controls. Draw counts are explicit and are not
 inferred from vertex inputs.
 
 Image subresource versions and attachment continuity participate in the same
-resource-hazard model as compute. Native render-pass fusion is a private
-Command DAG optimization and must preserve attachment semantics.
+resource-hazard model as compute. Native render-pass fusion is a linking
+optimization and must preserve attachment semantics.
 
 Details are in [`graphics_execution.md`](graphics_execution.md).
 
@@ -339,7 +325,7 @@ Artifacts from unsupported Program versions are rejected, not normalized.
 
 - Every executable is a Program.
 - ProgramGraph composition finalizes into a Program before physical resolve.
-- Program, logical resolve, physical resolve, and Program invocation form the
+- Program, logical resolve, physical resolve, and a linked schedule form the
   only deployment path.
 - Node count and Stage kind never select another architecture.
 - Program semantic state is immutable after cooking.
@@ -347,11 +333,9 @@ Artifacts from unsupported Program versions are rejected, not normalized.
 - Program and Stage ABIs are connected only by explicit validated projections.
 - Compute and graphics share Program Value binding and resource transitions.
 - Unsupported mappings and derivative paths fail closed.
-- Primal invocation has no AD work unless the caller explicitly requests VJP.
-- ProgramGraph never exposes a composite pullback; differentiated children
-  expose only node-local pullbacks retained by that graph invocation.
-- Pullbacks are reusable and do not share mutable invocation scratch.
-- Publication, transfers, residency, and hazards are resolved plans rather
-  than execution-time guesses.
+- A primal call has no AD work unless the caller explicitly links a VJP.
+- Residuals are reusable: a backward call does not consume or mutate them.
+- Transfers, residency, and hazards are resolved plans rather than
+  execution-time guesses.
 - Legacy schemas, loaders, direct Stage asset execution, and compatibility
   normalization are not accepted.

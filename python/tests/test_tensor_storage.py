@@ -21,7 +21,6 @@ from language_contract_traceability import covers_case
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl._runtime.binding import (
     _DispatchBorrowLease,
-    _PersistentBindingTable,
 )
 from vernon_dsl._runtime.tensor import _logical_collection_shape
 from vernon_dsl.compiler import FrontendCompileRequest
@@ -30,7 +29,7 @@ from vernon_dsl.host_values import host_abi_layout
 
 _TEST_CONTEXT = SimpleNamespace(
     identity=0,
-    session=SimpleNamespace(arch=vd.cpu, native=native, rhi_host=None),
+    session=SimpleNamespace(arch=vd.cpu, native=native, device=None),
 )
 
 
@@ -53,68 +52,6 @@ class NestedRecord:
 
 @expand_backend_matrix_tests
 class TensorStorageRuntimeTests(unittest.TestCase):
-    def test_persistent_binding_table_requires_explicit_commit_for_typed_updates(self) -> None:
-        cache = _PersistentBindingTable()
-        instance = mock.Mock()
-        transaction = mock.Mock()
-        builder = mock.Mock()
-        pipeline = mock.Mock()
-        pipeline.program_instance.return_value = instance
-        instance.begin_invocation.return_value = transaction
-        transaction.builder = builder
-        builder.prepare_host_tensor.side_effect = lambda *_: object()
-        parameter = SimpleNamespace(
-            slot=0,
-            name="amount",
-            element_leaves=((native.DATA_F32, 1, 0),),
-            shape=(),
-        )
-
-        with cache.invocation(pipeline, _TEST_CONTEXT) as active:
-            self.assertIs(active, transaction)
-            cache.bind_argument(active.builder, pipeline, parameter, np.float32(2.0), binding_token=11)
-            active.commit()
-
-        pipeline.program_instance.assert_called_once_with()
-        instance.begin_invocation.assert_called_once_with()
-        transaction.bind.assert_called_once()
-        self.assertEqual(transaction.bind.call_args.args[:2], (0, ("execution-value", 11)))
-        transaction.commit.assert_called_once_with()
-        transaction.rollback.assert_not_called()
-
-    def test_persistent_binding_table_rolls_back_failed_invocation(self) -> None:
-        table = _PersistentBindingTable()
-        instance = mock.Mock()
-        transaction = mock.Mock()
-        pipeline = mock.Mock()
-        builder = mock.Mock()
-        pipeline.program_instance.return_value = instance
-        instance.begin_invocation.return_value = transaction
-        transaction.builder = builder
-
-        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-            with table.invocation(pipeline, _TEST_CONTEXT):
-                raise RuntimeError("dispatch failed")
-
-        transaction.rollback.assert_called_once_with()
-        transaction.commit.assert_not_called()
-
-    def test_persistent_binding_table_rejects_implicit_completion(self) -> None:
-        table = _PersistentBindingTable()
-        instance = mock.Mock()
-        transaction = mock.Mock()
-        pipeline = mock.Mock()
-        pipeline.program_instance.return_value = instance
-        instance.begin_invocation.return_value = transaction
-        transaction.finished = False
-
-        with self.assertRaisesRegex(RuntimeError, "without explicit commit or rollback"):
-            with table.invocation(pipeline, _TEST_CONTEXT):
-                pass
-
-        transaction.rollback.assert_called_once_with()
-        transaction.commit.assert_not_called()
-
     def test_nested_host_layout_uses_one_complete_native_plan(self) -> None:
         with mock.patch.object(native, "_plan_value_abi", wraps=native._plan_value_abi) as planner:
             layout = host_abi_layout(NestedRecord)
@@ -175,7 +112,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             (offset, len(data)) for offset, data in ranges
         )
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -202,7 +139,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             (begin, bytes(backing[begin:end])) for begin, end in ranges
         ]
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -234,7 +171,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             (begin, bytes(backing[begin:end])) for begin, end in ranges
         ]
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -283,7 +220,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             (begin, bytes(backing[begin:end])) for begin, end in ranges
         ]
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -313,7 +250,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             (begin, bytes(backing[begin:end])) for begin, end in ranges
         ]
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -348,7 +285,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
 
         native_buffer.download_ranges.side_effect = download_ranges
         state = mock.Mock()
-        state.rhi_host.create_buffer.return_value = native_buffer
+        state.device.create_buffer.return_value = native_buffer
         state.identity = 7
 
         storage._resident_buffer(_context(state))
@@ -589,19 +526,19 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             identity=41,
             arch=vd.metal,
             native=native,
-            rhi_host=SimpleNamespace(create_buffer=lambda _: native_buffer),
+            device=SimpleNamespace(create_buffer=lambda _: native_buffer),
         )
         context = _context(state)
         storage._resident_buffer(context)
 
         backing[:] = np.full((4,), 3.0, dtype=np.float32).tobytes()
         committed = _DispatchBorrowLease([(0, storage, "write")], context)
-        committed.resolve(SimpleNamespace(ok=True, mutations=[(0, 0, 1)]))
+        committed.resolve_mutations({0: 1})
         committed.release()
         np.testing.assert_array_equal(storage.to_numpy(), np.full((4,), 3.0, dtype=np.float32))
 
         failed = _DispatchBorrowLease([(0, storage, "write")], context)
-        failed.resolve(SimpleNamespace(ok=False, mutations=[(0, 0, 3)]))
+        failed.resolve_mutations({0: 3})
         failed.release()
         with self.assertRaisesRegex(RuntimeError, "poisoned"):
             storage.to_numpy()
@@ -624,7 +561,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 identity=index + 51,
                 arch=vd.metal,
                 native=native,
-                rhi_host=SimpleNamespace(create_buffer=lambda _, value=native_buffer: value),
+                device=SimpleNamespace(create_buffer=lambda _, value=native_buffer: value),
             )
             for index, native_buffer in enumerate(buffers)
         ]
@@ -633,7 +570,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         storage._resident_buffer(contexts[0])
         backings[0][:] = np.array([5.0, 9.0], dtype=np.float32).tobytes()
         lease = _DispatchBorrowLease([(0, storage, "write")], contexts[0])
-        lease.resolve(SimpleNamespace(ok=True, mutations=[(0, 0, 1)]))
+        lease.resolve_mutations({0: 1})
         lease.release()
         storage._resident_buffer(contexts[1])
         np.testing.assert_array_equal(
@@ -660,7 +597,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             return native_buffer
 
         state = SimpleNamespace(
-            identity=61, arch=vd.metal, native=native, rhi_host=SimpleNamespace(create_buffer=create_buffer)
+            identity=61, arch=vd.metal, native=native, device=SimpleNamespace(create_buffer=create_buffer)
         )
         context = _context(state)
 
@@ -700,7 +637,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             return native_buffer
 
         state = SimpleNamespace(
-            identity=62, arch=vd.metal, native=native, rhi_host=SimpleNamespace(create_buffer=create_buffer)
+            identity=62, arch=vd.metal, native=native, device=SimpleNamespace(create_buffer=create_buffer)
         )
         context = _context(state)
 
@@ -729,7 +666,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             identity=63,
             arch=vd.metal,
             native=native,
-            rhi_host=SimpleNamespace(create_buffer=lambda _: native_buffer),
+            device=SimpleNamespace(create_buffer=lambda _: native_buffer),
         )
         context = _context(state)
         storage._resident_buffer(context)
@@ -778,7 +715,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             identity=64,
             arch=vd.metal,
             native=native,
-            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+            device=SimpleNamespace(create_image=lambda *_: native_image),
         )
         context = _context(state)
         texture._resident_texture(context)
@@ -815,7 +752,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             identity=66,
             arch=vd.metal,
             native=native,
-            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+            device=SimpleNamespace(create_image=lambda *_: native_image),
         )
         context = _context(state)
         texture._resident_texture(context)
@@ -846,7 +783,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             identity=65,
             arch=vd.metal,
             native=native,
-            rhi_host=SimpleNamespace(create_image=lambda *_: native_image),
+            device=SimpleNamespace(create_image=lambda *_: native_image),
         )
         context = _context(state)
         texture._resident_texture(context)

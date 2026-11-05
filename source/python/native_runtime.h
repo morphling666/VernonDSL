@@ -11,15 +11,6 @@
 #include <mutex>
 #include <unordered_map>
 
-struct RuntimeContextDeleter {
-    void operator()(VernonRuntimeContext *handle) const noexcept {
-        if (handle) {
-            vernonRuntimeDestroy(handle);
-            vernon::python::testing::noteRuntimeDestroyed();
-        }
-    }
-};
-
 struct ProgramBundleDeleter {
     void operator()(VernonProgramBundle *bundle) const noexcept {
         if (bundle)
@@ -34,24 +25,15 @@ struct ProgramExecutableDeleter {
     }
 };
 
-using RuntimeContextOwner = std::unique_ptr<VernonRuntimeContext, RuntimeContextDeleter>;
 using ProgramBundleOwner = std::unique_ptr<VernonProgramBundle, ProgramBundleDeleter>;
 using ProgramExecutableOwner = std::unique_ptr<VernonProgramExecutable, ProgramExecutableDeleter>;
 
-inline RuntimeContextOwner createRuntimeContext(VernonRuntimeBackend backend) {
-    VernonRuntimeCreateOptions options{};
-    options.struct_size = sizeof(options);
-    RuntimeContextOwner handle(vernonRuntimeCreateWithOptions(backend, &options));
-    if (!handle)
-        throw std::runtime_error("requested runtime backend is unavailable");
-    return handle;
-}
-
+// The runtime of a HAL device, which the device owns.
 struct RuntimeState {
-    explicit RuntimeState(RuntimeContextOwner handle, std::shared_ptr<RhiHostState> rhiHost = {})
-        : rhiHost(std::move(rhiHost)), context(std::move(handle)) {}
+    explicit RuntimeState(std::shared_ptr<HalDeviceState> device)
+        : device(std::move(device)), context(this->device->runtimeContext()) {}
 
-    VernonRuntimeContext *handle() const noexcept { return context.get(); }
+    VernonRuntimeContext *handle() const noexcept { return context; }
 
     void releaseInternedCpuJit(const std::string &symbol, const std::shared_ptr<InternedCpuJit> &jit) {
         std::lock_guard<std::mutex> lock(internedCpuMutex);
@@ -63,16 +45,14 @@ struct RuntimeState {
             internedCpuEntries.erase(found);
     }
 
-    std::shared_ptr<RhiHostState> rhiHost;
-    RuntimeContextOwner context;
+    std::shared_ptr<HalDeviceState> device;
+    VernonRuntimeContext *context{};
     std::mutex internedCpuMutex;
     std::unordered_map<std::string, std::weak_ptr<InternedCpuJit>> internedCpuEntries;
 };
 
 struct Runtime {
-    explicit Runtime(RuntimeContextOwner handle, std::shared_ptr<RhiHostState> rhiHost = {})
-        : state(std::make_shared<RuntimeState>(std::move(handle), std::move(rhiHost))) {}
-    explicit Runtime(VernonRuntimeBackend backend) : Runtime(createRuntimeContext(backend)) {}
+    explicit Runtime(std::shared_ptr<RuntimeState> state) : state(std::move(state)) {}
 
     std::shared_ptr<InternedCpuJit> internCpuJit(const std::string &symbol, SharedCompileResult result,
                                                  VernonCpuEntryPoint entry) {
@@ -262,8 +242,7 @@ struct Runtime {
     std::shared_ptr<RuntimeState> state;
 };
 
-RhiHostState *runtimeRhiHost(const RuntimeState *runtime);
-
-std::unique_ptr<Runtime> createRhiRuntime(RhiHost &host);
+// The Runtime of the device's runtime; every call returns one sharing the same state.
+std::unique_ptr<Runtime> deviceRuntime(HalDevice &device);
 
 #endif

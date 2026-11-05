@@ -1,6 +1,5 @@
 #include "VernonRuntime.h"
 #include "runtime/capi/boundary.h"
-#include "runtime/program_execution/submission_queue.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
 #include "runtime/tensor_bridge.h"
@@ -56,15 +55,6 @@ vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError> crea
     return created;
 }
 
-vernon::runtime::program_execution::SubmissionBounds submissionBounds(const VernonRuntimeCreateOptions *options) {
-    constexpr vernon::runtime::program_execution::SubmissionBounds defaults =
-        vernon::runtime::program_execution::defaultSubmissionBounds;
-    if (!options)
-        return defaults;
-    return {options->transient_budget_bytes ? options->transient_budget_bytes : defaults.transientBudgetBytes,
-            options->max_pending_submissions ? options->max_pending_submissions : defaults.maxPendingSubmissions};
-}
-
 vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError>
 createRuntimeContextForBackend(VernonRuntimeBackend backend, const VernonRuntimeCreateOptions *options) {
     using Result = vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError>;
@@ -78,7 +68,6 @@ createRuntimeContextForBackend(VernonRuntimeBackend backend, const VernonRuntime
     auto initialized = initializeBackend(*created.value(), options ? options->device_index : 0);
     if (initialized.isErr())
         return Result{vernon::err(std::move(initialized).error())};
-    created.value()->submissions.configure(submissionBounds(options), created.value()->rhiDevice);
     return created;
 }
 
@@ -97,7 +86,6 @@ createRuntimeContextForRhiDevice(VernonRuntimeBackend backend, VernonRhiDevice d
     auto initialized = initializeBackendForRhiDevice(*created.value(), device);
     if (initialized.isErr())
         return Result{vernon::err(std::move(initialized).error())};
-    created.value()->submissions.configure(submissionBounds(options), created.value()->rhiDevice);
     return created;
 }
 
@@ -202,16 +190,6 @@ VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
             vernon::resultContractViolation();
         vernon::runtime::clearInvocationDiagnostic(*context);
         delete context;
-        return VERNON_STATUS_OK;
-    });
-}
-
-VernonStatus vernonRuntimeContextGetSubmissionTelemetry(VernonRuntimeContext *context,
-                                                        VernonSubmissionTelemetry *output) {
-    return runtimeStatusBoundary(context, [&] {
-        if (!context || !output || output->struct_size < sizeof(*output))
-            return fail(context, "invalid submission telemetry query");
-        *output = context->submissions.telemetry();
         return VERNON_STATUS_OK;
     });
 }

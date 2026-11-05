@@ -28,8 +28,12 @@ from ..types import (
     specialization_key,
 )
 from .session import (
+    _active_invocation,
     _ArtifactCache,
+    _interactive_target_options,
     _invocation_context,
+    _registry,
+    _scoped_session,
     _session_state,
     _SessionArtifactCache,
     cpu,
@@ -40,6 +44,7 @@ from .session import (
     opengles,
     vulkan,
 )
+from .source_epoch import source_epoch
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
 
@@ -67,6 +72,18 @@ class _DependencyTracked(Protocol):
     dependency_hashes: tuple[tuple[Path, str], ...]
 
 
+@dataclass(frozen=True)
+class _LinkedLaunch:
+    """The unspecialized kernel linked as a schedule (specs/runtime/architecture_v2.md) in one session.
+
+    It holds while the source epoch it was validated at is current.
+    """
+
+    session: int
+    epoch: int
+    schedule: Any
+
+
 class Kernel:
     """Device kernel: lower source to MLIR, specialize MLIR to a native artifact, bind tensors at launch."""
 
@@ -86,9 +103,13 @@ class Kernel:
         self._globals = function.__globals__
         self._frontend_cache = _ArtifactCache()
         self.compile_count = 0
+        self._linked: _LinkedLaunch | None = None
+        # (session, epoch) at which linking last failed, so unsupported kernels do not retry on every call.
+        self._unlinkable: tuple[int, int] | None = None
 
     @classmethod
     def clear_cache(cls) -> None:
+        source_epoch.bump()
         cls._cache.clear()
         from .autodiff import clear_vjp_cache
 
@@ -377,10 +398,7 @@ class Kernel:
             opengl: state.native.Target.OPENGL,
             opengles: state.native.Target.OPENGL_ES,
         }.get(state.arch)
-        options = make_target_options(
-            state.arch.name,
-            {"version": state.interactive_glsl_version} if state.arch in {opengl, opengles} else {},
-        )
+        options = make_target_options(state.arch.name, _interactive_target_options(state))
         return state, target, options
 
     def _lower(
@@ -580,12 +598,72 @@ class Kernel:
         actual.update({f"__grid_{axis}": value for axis, value in zip("xyz", grid, strict=True)})
         compiled.specialization.invoke(dataclasses.replace(compiled.invocation, inputs=actual, outputs=outputs))
 
+    def _link(self) -> None:
+        """Links the unspecialized kernel as a schedule on the CPU or CUDA, when each launch argument is a TensorView or
+        scalar."""
+        state = _session_state()
+        epoch = source_epoch.value
+        if state.arch not in {cpu, cuda} or self._unlinkable == (state.identity, epoch):
+            return
+        linked = self._linked
+        if linked is not None and linked.session == state.identity and linked.epoch == epoch:
+            return
+        lowered = self._lower(specialization_key(None))
+        epoch = source_epoch.watch((self._file, *(path for path, _ in self._dependency_hashes(lowered.frontend))))
+        compiled = self.specialize(None, lowered=lowered)
+        deployment = compiled.specialization.deployment
+        stages = deployment.compiled_stages if state.arch == cpu else deployment.device_stages
+        source_parameters = tuple(
+            argument.arg for argument in lowered.function.args.args if argument.arg not in lowered.builtins
+        )
+        typed = {parameter.name: parameter.type.kind for parameter in self._typed_entry(lowered).parameters}
+        kinds = [{"tensor_view": "buffer", "scalar": "scalar"}.get(typed[name]) for name in source_parameters]
+        schedule = None
+        if len(stages) == 1 and self._parameter_names(lowered) == source_parameters and None not in kinds:
+            try:
+                if state.arch == cpu:
+                    _, entry, program = stages[0]
+                    schedule = state.native._ScheduleKernel(
+                        state.native_runtime, program, entry, TensorStorage, TensorView
+                    )
+                else:
+                    entry, reflection, artifact = stages[0]
+                    schedule = state.native._ScheduleKernel(
+                        state.native_runtime,
+                        None,
+                        entry,
+                        TensorStorage,
+                        TensorView,
+                        reflection=reflection,
+                        artifact=artifact,
+                        residency_key=state.identity,
+                    )
+            except ValueError:
+                schedule = None
+        if schedule is None or list(schedule.slot_kinds) != kinds:
+            self._unlinkable = (state.identity, epoch)
+            return
+        self._linked = _LinkedLaunch(state.identity, epoch, schedule)
+
     def __call__(
         self,
         *arguments: Any,
         grid: tuple[object, object, object] | None = None,
         specializations: Mapping[Specialization, object] | None = None,
     ) -> None:
+        linked = self._linked
+        if (
+            linked is not None
+            and grid is not None
+            and specializations is None
+            and linked.epoch == source_epoch.value
+            and _active_invocation.get() is None
+        ):
+            session = _scoped_session.get()
+            if session is None:
+                session = _registry.default
+            if session is not None and session.identity == linked.session and linked.schedule.call(arguments, grid):
+                return None
         runtime_grid = None
         if grid is not None:
             if len(grid) != 3 or any(
@@ -595,6 +673,8 @@ class Kernel:
             runtime_grid = cast(tuple[int, int, int], grid)
         with _invocation_context():
             self._invoke(arguments, runtime_grid, specializations)
+            if runtime_grid is not None and specializations is None:
+                self._link()
 
 
 atexit.register(Kernel.clear_cache)

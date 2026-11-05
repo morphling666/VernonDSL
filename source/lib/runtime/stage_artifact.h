@@ -8,26 +8,12 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vernon::runtime {
-
-struct CpuNativeArtifact {
-    std::filesystem::path root;
-    std::filesystem::path relativeLibrary;
-    std::string format{"native_library"};
-    std::string entry;
-    std::string symbol;
-    std::string targetTriple;
-    std::string objectFormat;
-    uint64_t size{};
-    std::string sha256;
-    nlohmann::json reflection;
-    bool staticallyLinked{};
-};
 
 struct NativeResourceSlot {
     std::string entry;
@@ -49,7 +35,6 @@ struct LoadedStageArtifact {
     std::optional<ReflectedEntry> reflected;
     std::vector<NativeResourceSlot> nativeSlots;
     std::vector<uint8_t> binary;
-    std::optional<CpuNativeArtifact> cpuArtifact;
     uint32_t workgroup[3]{1, 1, 1};
     DispatchContract dispatchContract;
     std::vector<TensorViewWriteFootprint> readFootprints;
@@ -61,25 +46,15 @@ enum class StageArtifactError : uint8_t {
     InvalidContentHash,
     ContentHashMismatch,
     UnsupportedCpuTarget,
-    InvalidCpuArtifact,
-    InvalidCpuArtifactPath,
-    InvalidReflection,
-    InvalidBundleDirectory,
-    CpuArtifactIntegrityMismatch,
 };
 
 template <typename T> using StageArtifactResult = vernon::Result<T, StageArtifactError>;
 
-struct ResolvedCpuNativeArtifact {
-    std::filesystem::path libraryPath;
-    ReflectedEntry reflection;
-};
-
 StageArtifactResult<void> validateProgramBundleHash(const nlohmann::json &root, bool required);
 StageArtifactResult<void> validateCpuRuntimeRequirements(const std::string &targetTriple,
                                                          const std::string &objectFormat);
-StageArtifactResult<ResolvedCpuNativeArtifact> resolveCpuNativeArtifact(const CpuNativeArtifact &artifact);
-std::string renderStageArtifactError(StageArtifactError error, const CpuNativeArtifact *artifact = nullptr);
+// `cpuTarget` names the CPU target an UnsupportedCpuTarget artifact requires, as "triple / object format".
+std::string renderStageArtifactError(StageArtifactError error, std::string_view cpuTarget = {});
 
 } // namespace vernon::runtime
 

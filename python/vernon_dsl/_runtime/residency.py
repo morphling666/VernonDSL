@@ -14,6 +14,10 @@ class _Residency:
     session_identity: int
     handle: Any
     version: int = 0
+    # A linked call's write may still be running when the call returns: it sets the native timeline of its Runtime
+    # and the point its submission signalled. A Program's write has completed by the time it is published.
+    timeline: Any = None
+    write_point: int = 0
 
 
 class _ResidencySet:
@@ -84,10 +88,27 @@ class _IoReservation:
 class _ResourceControlBlock:
     """Owner-local admission, authority, version, and residency state."""
 
+    # Weak references to the pullbacks that read this owner's memory as of their forward call; None or empty when none
+    # does. A write admitted while one lives first moves the owner to a copy (`_preserve_before_write`); the native call
+    # path refuses to write such an owner, so every write passes that admission.
+    preserved: list[Any] | None = None
+
+    # The lock and condition are created on first use: most owners are a call's outputs and gradients, which no other
+    # thread ever sees. `dict.setdefault` is atomic, so threads racing to create them share the one that wins.
+    @property
+    def lock(self) -> Any:
+        lock = self.__dict__.get("_lock")
+        return lock if lock is not None else self.__dict__.setdefault("_lock", threading.RLock())
+
+    @property
+    def io_condition(self) -> threading.Condition:
+        condition = self.__dict__.get("_io_condition")
+        if condition is None:
+            condition = self.__dict__.setdefault("_io_condition", threading.Condition(self.lock))
+        return condition
+
     def __init__(self, coherence: Any) -> None:
         self.owner_id = next(_OWNER_IDS)
-        self.lock = threading.RLock()
-        self.io_condition = threading.Condition(self.lock)
         self._io_reservations: list[_IoReservation] = []
         self._claims: list[_AccessClaim] = []
         self.version = 1
@@ -199,6 +220,9 @@ class _ResourceTransaction:
         for owner in self._owners:
             owner._control.lock.acquire()
         try:
+            for _, owner, _, access in requests:
+                if access != "read" and owner._control.preserved:
+                    owner._preserve_before_write()
             requests = [
                 (
                     identifier,
@@ -234,12 +258,29 @@ class _ResourceTransaction:
             for owner in reversed(self._owners):
                 owner._control.lock.release()
 
-    def resolve(self, outcome: Any) -> None:
-        mutations: dict[Any, int] = {}
-        for kind, slot, state in outcome.mutations:
-            identifier: Any = int(slot) if int(kind) == 0 else ("render_pass", int(slot))
-            mutations[identifier] = int(state)
-        self.resolve_mutations(mutations)
+    def resolve_linked_call(self, timeline: Any, point: int) -> None:
+        """Publishes every write the transaction claimed, as a linked call that `point` on `timeline` completes. A
+        texture has no readback that waits for a point, so a call that writes one is waited for here."""
+        self.resolve_mutations({identifier: 1 for identifier, _, _ in self._write_requests})
+        session = self._context.session
+        written = {owner for _, owner, _ in self._write_requests}
+        if session.arch.name == "cpu" or not written:
+            return
+        if any(not hasattr(owner, "_resident_buffer") for owner in written):
+            try:
+                timeline.wait(point)
+            except RuntimeError:
+                for owner in written:
+                    with owner._control.lock:
+                        owner._control.poison()
+                raise
+            return
+        for owner in written:
+            with owner._control.lock:
+                residency = owner._control.residencies.get(session)
+                if residency is not None:
+                    residency.timeline = timeline
+                    residency.write_point = point
 
     def resolve_mutations(self, mutations: dict[Any, int]) -> None:
         if self._token is None:
@@ -313,6 +354,9 @@ def _scoped_host_access(access: str):
         @wraps(operation)
         def invoke(resource: Any, *args: Any, **kwargs: Any) -> Any:
             owner = getattr(resource, "owner", resource)
+            if access == "write" and owner._control.preserved:
+                with owner._control.lock:
+                    owner._preserve_before_write()
             region = (
                 resource._host_access_region(access) if hasattr(resource, "_host_access_region") else resource._region
             )

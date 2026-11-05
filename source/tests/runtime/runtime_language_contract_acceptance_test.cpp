@@ -1,15 +1,12 @@
 #include "VernonFormats.hpp"
 #include "acceptance_descriptor.h"
-#include "program_fixture_runtime_test.h"
-#include "sampled_texture_runtime_oracle.h"
-#include "vernon_test_support.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -19,7 +16,15 @@
 namespace {
 
 using vernon::tests::AcceptanceDescriptor;
+using vernon::tests::DeviceTensor;
+using vernon::tests::HalImage;
+using vernon::tests::HalSampler;
+using vernon::tests::HalTestDevice;
+using vernon::tests::LinkedProgram;
+using vernon::tests::LinkedVjp;
+using vernon::tests::PassControls;
 using vernon::tests::ProgramFixtureManifest;
+using vernon::tests::ResolvedProgram;
 
 #include "language_contract_acceptance_descriptors.inc"
 
@@ -40,25 +45,10 @@ const AcceptanceDescriptor &acceptanceFor(std::string_view fixtureId) {
     return *result;
 }
 
-vernon::tests::BackendTestRow backendFor(const ProgramFixtureManifest &fixture) {
-    for (const auto &backend : vernon::tests::backendTestMatrix)
-        if (backend.runtime == fixture.runtime)
-            return backend;
-    return {};
-}
-
 std::vector<ProgramFixtureManifest> acceptanceFixtures() {
     std::vector<ProgramFixtureManifest> fixtures;
     for (const ProgramFixtureManifest &fixture : vernon::tests::programFixtureManifestTable)
         if (isAcceptanceFixture(fixture.fixtureId))
-            fixtures.push_back(fixture);
-    return fixtures;
-}
-
-std::vector<ProgramFixtureManifest> acceptanceFixtures(bool cpu) {
-    std::vector<ProgramFixtureManifest> fixtures;
-    for (const ProgramFixtureManifest &fixture : acceptanceFixtures())
-        if ((fixture.runtime == VERNON_RUNTIME_CPU) == cpu)
             fixtures.push_back(fixture);
     return fixtures;
 }
@@ -76,7 +66,7 @@ vernon::tests::BackendTestRequirements requirementsFor(const ProgramFixtureManif
     requirements.programVjp = acceptance.programVjp;
     if (requirements.compute)
         vernon::tests::setOpenGLComputeApiRequirement(requirements, fixture.runtime);
-    // The oracle downloads depth and stencil, which OpenGL ES reads through a compute pass.
+    // The oracle reads depth and stencil back, which OpenGL ES does from 3.1.
     if (acceptance.oracle == "fragment_discard" && fixture.runtime == VERNON_RUNTIME_OPENGL_ES)
         vernon::tests::setOpenGLComputeApiRequirement(requirements, fixture.runtime);
     return requirements;
@@ -90,201 +80,72 @@ std::string testName(const testing::TestParamInfo<ProgramFixtureManifest> &info)
     return result;
 }
 
-bool skipDirectXWorkgroupAtomicContention(const ProgramFixtureManifest &fixture) {
-    const char *skip = std::getenv("VERNON_TEST_SKIP_DIRECTX_WORKGROUP_ATOMIC_CONTENTION");
-    return skip && std::strcmp(skip, "1") == 0 && fixture.runtime == VERNON_RUNTIME_DIRECTX12 &&
-           fixture.fixtureId == "floating_contention";
-}
-
-// The argument views `shape` and `strides`, so both must outlive the invocation that consumes it.
-VernonProgramArgument floatBufferArgument(const VernonProgramParameterView &parameter,
-                                          const vernon::tests::RhiBuffer &buffer, const uint64_t (&shape)[1],
-                                          const int64_t (&strides)[1]) {
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-    argument.tensor.resource = buffer.reference;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = parameter.access;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = shape[0] * sizeof(float);
-    return argument;
-}
-
-void runFloatBufferOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+void runFloatBufferOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
                           const AcceptanceDescriptor &acceptance) {
     const std::vector<float> expected(acceptance.expected, acceptance.expected + acceptance.expectedCount);
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
-                  executable, {acceptance.parameter.data(), acceptance.parameter.size()}, &parameter),
-              VERNON_STATUS_OK);
-
-    std::vector<float> initial(expected.size());
-    vernon::tests::RhiBuffer buffer = vernon::tests::createBuffer(
-        owned.context(), initial.size() * sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE, initial.data());
-    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const uint64_t shape[]{expected.size()};
-    const int64_t strides[]{sizeof(float)};
-    const VernonProgramArgument argument = floatBufferArgument(parameter, buffer, shape, strides);
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, &argument, 1, acceptance.grid),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadBuffer(owned.device(), buffer.handle, 0, initial.data(), initial.size() * sizeof(float)),
-        VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(initial, expected);
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), buffer.handle), VERNON_RHI_STATUS_OK);
+    const DeviceTensor buffer(device, std::vector<float>(expected.size()));
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    ASSERT_TRUE(schedule.record().bind(acceptance.parameter, buffer));
+    schedule.record().bindGrid(acceptance.grid.x, acceptance.grid.y, acceptance.grid.z);
+    ASSERT_TRUE(schedule.record().unbound().empty());
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    EXPECT_EQ(buffer.values<float>(), expected);
 }
 
-void runHostFloatBufferOracle(VernonProgramExecutable *executable, const AcceptanceDescriptor &acceptance) {
-    const std::vector<float> expected(acceptance.expected, acceptance.expected + acceptance.expectedCount);
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
-                  executable, {acceptance.parameter.data(), acceptance.parameter.size()}, &parameter),
-              VERNON_STATUS_OK);
-
-    std::vector<float> result(expected.size());
-    const uint64_t shape[]{expected.size()};
-    const int64_t strides[]{sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = result.data();
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = parameter.access;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = result.size() * sizeof(float);
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, &argument, 1, acceptance.grid),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(result, expected);
-}
-
-VernonProgramArgument hostTensorArgument(const VernonProgramParameterView &parameter, void *data, size_t byteSize,
-                                         uint32_t rank, const uint64_t *shape, const int64_t *strides,
-                                         size_t byteOffset = 0) {
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = data;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = parameter.access;
-    argument.tensor.rank = rank;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_offset = byteOffset;
-    argument.tensor.byte_size = byteSize;
-    return argument;
-}
-
-VernonStringView stringView(const char *value) { return {value, std::strlen(value)}; }
-
-void runSignedStrideVjpHostOracle(VernonProgramExecutable *executable, const AcceptanceDescriptor &acceptance) {
+void runSignedStrideVjpOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                              const AcceptanceDescriptor &acceptance) {
     ASSERT_EQ(acceptance.expectedCount, 5u);
-    VernonProgramParameterView sourceParameter{};
-    VernonProgramParameterView outputParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView("source"), &sourceParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView("output"), &outputParameter),
-              VERNON_STATUS_OK);
-    std::array<float, 4> source{10, 2, 20, 3};
-    std::array<float, 1> output{};
-    const uint64_t sourceShape[]{2};
-    const int64_t sourceStrides[]{-2 * static_cast<int64_t>(sizeof(float))};
-    const uint64_t outputShape[]{1};
-    const int64_t outputStrides[]{sizeof(float)};
-    const std::array arguments{
-        hostTensorArgument(sourceParameter, source.data(), sizeof(source), 1, sourceShape, sourceStrides,
-                           3 * sizeof(float)),
-        hostTensorArgument(outputParameter, output.data(), sizeof(output), 1, outputShape, outputStrides),
-    };
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, arguments.data(), arguments.size(),
-                                                                {1, 1, 1}, &pullback),
-              VERNON_STATUS_OK);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(output[0], static_cast<float>(acceptance.expected[0]));
+    LinkedVjp vjp(device.runtime(), executable);
+    ASSERT_TRUE(vjp) << vjp.error();
+    // The source view walks two of the four floats backwards from the last.
+    const std::vector<int64_t> reversed{-2 * static_cast<int64_t>(sizeof(float))};
+    const DeviceTensor source(device, std::vector<float>{10, 2, 20, 3}, {2}, reversed, 3 * sizeof(float));
+    const DeviceTensor output(device, std::vector<float>(1));
+    ASSERT_TRUE(vjp.forwardRecord().bind("source", source));
+    ASSERT_TRUE(vjp.forwardRecord().bind("output", output));
+    vjp.forwardRecord().bindGrid(1);
+    ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+    EXPECT_FLOAT_EQ(output.values<float>()[0], static_cast<float>(acceptance.expected[0]));
 
-    std::array<float, 1> cotangent{1};
-    std::array<float, 4> gradient{};
-    VernonProgramParameterView cotangentParameter{};
-    VernonProgramParameterView gradientParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(executable, VERNON_PROGRAM_BOUNDARY_COTANGENT,
-                                                         stringView("output"), &cotangentParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(executable, VERNON_PROGRAM_BOUNDARY_GRADIENT,
-                                                         stringView("source"), &gradientParameter),
-              VERNON_STATUS_OK);
-    const std::array derivativeArguments{
-        hostTensorArgument(cotangentParameter, cotangent.data(), sizeof(cotangent), 1, outputShape, outputStrides),
-        hostTensorArgument(gradientParameter, gradient.data(), sizeof(gradient), 1, sourceShape, sourceStrides,
-                           3 * sizeof(float)),
-    };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments.data(), derivativeArguments.size(), nullptr),
-              VERNON_STATUS_OK);
-    for (size_t index = 0; index < gradient.size(); ++index)
-        EXPECT_FLOAT_EQ(gradient[index], static_cast<float>(acceptance.expected[index + 1]));
-    vernonProgramPullbackDestroy(pullback);
+    const DeviceTensor cotangent(device, std::vector<float>{1});
+    const DeviceTensor gradient(device, std::vector<float>(4), {2}, reversed, 3 * sizeof(float));
+    ASSERT_TRUE(vjp.backwardRecord().bind("output", cotangent, VERNON_PROGRAM_BOUNDARY_COTANGENT));
+    ASSERT_TRUE(vjp.backwardRecord().bind("source", gradient, VERNON_PROGRAM_BOUNDARY_GRADIENT));
+    ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+    const std::vector<float> gradients = gradient.values<float>();
+    for (size_t index = 0; index < gradients.size(); ++index)
+        EXPECT_FLOAT_EQ(gradients[index], static_cast<float>(acceptance.expected[index + 1]));
 }
 
-void runFanOutVjpHostOracle(VernonProgramExecutable *executable, const AcceptanceDescriptor &acceptance) {
+void runFanOutVjpOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                        const AcceptanceDescriptor &acceptance) {
     ASSERT_EQ(acceptance.expectedCount, 3u);
-    std::array<float, 1> source{2};
-    std::array<float, 1> square{};
-    std::array<float, 1> cube{};
-    const uint64_t shape[]{1};
-    const int64_t strides[]{sizeof(float)};
-    std::array<VernonProgramArgument, 3> arguments{};
-    constexpr std::array names{"source", "square", "cube"};
-    const std::array<void *, 3> values{source.data(), square.data(), cube.data()};
-    for (size_t index = 0; index < arguments.size(); ++index) {
-        VernonProgramParameterView parameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView(names[index]), &parameter),
-                  VERNON_STATUS_OK);
-        arguments[index] = hostTensorArgument(parameter, values[index], sizeof(float), 1, shape, strides);
-    }
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, arguments.data(), arguments.size(),
-                                                                {1, 1, 1}, &pullback),
-              VERNON_STATUS_OK);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(square[0], static_cast<float>(acceptance.expected[0]));
-    EXPECT_FLOAT_EQ(cube[0], static_cast<float>(acceptance.expected[1]));
+    LinkedVjp vjp(device.runtime(), executable);
+    ASSERT_TRUE(vjp) << vjp.error();
+    const DeviceTensor source(device, std::vector<float>{2});
+    const DeviceTensor square(device, std::vector<float>(1));
+    const DeviceTensor cube(device, std::vector<float>(1));
+    ASSERT_TRUE(vjp.forwardRecord().bind("source", source));
+    ASSERT_TRUE(vjp.forwardRecord().bind("square", square));
+    ASSERT_TRUE(vjp.forwardRecord().bind("cube", cube));
+    vjp.forwardRecord().bindGrid(1);
+    ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+    EXPECT_FLOAT_EQ(square.values<float>()[0], static_cast<float>(acceptance.expected[0]));
+    EXPECT_FLOAT_EQ(cube.values<float>()[0], static_cast<float>(acceptance.expected[1]));
 
-    std::array<float, 1> squareCotangent{1};
-    std::array<float, 1> cubeCotangent{2};
-    std::array<float, 1> gradient{};
-    std::array<vernon::tests::DerivativeLeafFixture, 2> cotangentLeaves{{
-        {sizeof(vernon::tests::DerivativeLeafFixture), stringView("square"), VERNON_DATA_F32, squareCotangent.data(),
-         sizeof(float), 1, shape},
-        {sizeof(vernon::tests::DerivativeLeafFixture), stringView("cube"), VERNON_DATA_F32, cubeCotangent.data(),
-         sizeof(float), 1, shape},
-    }};
-    vernon::tests::DerivativeLeafFixture gradientLeaf{sizeof(vernon::tests::DerivativeLeafFixture),
-                                                      stringView("source"),
-                                                      VERNON_DATA_F32,
-                                                      gradient.data(),
-                                                      sizeof(float),
-                                                      1,
-                                                      shape};
-    const vernon::tests::DerivativeLeafSetFixture cotangents{sizeof(vernon::tests::DerivativeLeafSetFixture),
-                                                             cotangentLeaves.data(), cotangentLeaves.size()};
-    vernon::tests::DerivativeLeafSetFixture gradients{sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientLeaf,
-                                                      1};
-    ASSERT_EQ(vernon::tests::applyCanonicalPullback(executable, pullback, &cotangents, &gradients), VERNON_STATUS_OK);
-    EXPECT_FLOAT_EQ(gradient[0], static_cast<float>(acceptance.expected[2]));
-    vernonProgramPullbackDestroy(pullback);
+    const DeviceTensor squareCotangent(device, std::vector<float>{1});
+    const DeviceTensor cubeCotangent(device, std::vector<float>{2});
+    const DeviceTensor gradient(device, std::vector<float>(1));
+    ASSERT_TRUE(vjp.backwardRecord().bind("square", squareCotangent));
+    ASSERT_TRUE(vjp.backwardRecord().bind("cube", cubeCotangent));
+    ASSERT_TRUE(vjp.backwardRecord().bind("source", gradient));
+    ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+    EXPECT_FLOAT_EQ(gradient.values<float>()[0], static_cast<float>(acceptance.expected[2]));
 }
 
-void runStructuredViewHostOracle(VernonProgramExecutable *executable, const AcceptanceDescriptor &acceptance) {
+void runStructuredViewOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                             const AcceptanceDescriptor &acceptance) {
     ASSERT_EQ(acceptance.expectedCount, 4u);
     struct Pair {
         float left;
@@ -294,246 +155,152 @@ void runStructuredViewHostOracle(VernonProgramExecutable *executable, const Acce
         float value;
         int32_t index;
     };
-    std::array<float, 4> matrix{1, 2, 3, 4};
-    std::array<Pair, 2> pairs{{{1, 2}, {5, 7}}};
-    std::array<Payload, 1> payloads{{{3, 4}}};
-    std::array<float, 4> output{};
-    const uint64_t matrixShape[]{2, 2};
-    const int64_t matrixStrides[]{2 * sizeof(float), sizeof(float)};
-    const uint64_t pairsShape[]{2};
-    const int64_t pairsStrides[]{sizeof(Pair)};
-    const uint64_t payloadShape[]{1};
-    const int64_t payloadStrides[]{sizeof(Payload)};
-    const uint64_t outputShape[]{4};
-    const int64_t outputStrides[]{sizeof(float)};
-
-    std::array<VernonProgramArgument, 4> arguments{};
-    constexpr std::array names{"matrix", "pairs", "payloads", "output"};
-    for (size_t index = 0; index < arguments.size(); ++index) {
-        VernonProgramParameterView parameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView(names[index]), &parameter),
-                  VERNON_STATUS_OK);
-        if (index == 0)
-            arguments[index] =
-                hostTensorArgument(parameter, matrix.data(), sizeof(matrix), 2, matrixShape, matrixStrides);
-        else if (index == 1)
-            arguments[index] = hostTensorArgument(parameter, pairs.data(), sizeof(pairs), 1, pairsShape, pairsStrides);
-        else if (index == 2)
-            arguments[index] =
-                hostTensorArgument(parameter, payloads.data(), sizeof(payloads), 1, payloadShape, payloadStrides);
-        else
-            arguments[index] =
-                hostTensorArgument(parameter, output.data(), sizeof(output), 1, outputShape, outputStrides);
-    }
-    ASSERT_EQ(
-        vernon::tests::completeCanonicalComputeInvocation(executable, arguments.data(), arguments.size(), {1, 1, 1}),
-        VERNON_STATUS_OK);
-    for (size_t index = 0; index < output.size(); ++index)
-        EXPECT_FLOAT_EQ(output[index], static_cast<float>(acceptance.expected[index]));
-    EXPECT_FLOAT_EQ(pairs[0].left, 5);
-    EXPECT_FLOAT_EQ(pairs[0].right, 7);
-    EXPECT_FLOAT_EQ(payloads[0].value, 4);
-    EXPECT_EQ(payloads[0].index, 6);
+    const std::array<Pair, 2> pairValues{{{1, 2}, {5, 7}}};
+    const std::array<Payload, 1> payloadValues{{{3, 4}}};
+    const DeviceTensor matrix(device, std::vector<float>{1, 2, 3, 4}, {2, 2});
+    const DeviceTensor pairs(device, pairValues.data(), sizeof(pairValues), {2}, sizeof(Pair));
+    const DeviceTensor payloads(device, payloadValues.data(), sizeof(payloadValues), {1}, sizeof(Payload));
+    const DeviceTensor output(device, std::vector<float>(4));
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    ASSERT_TRUE(schedule.record().bind("matrix", matrix));
+    ASSERT_TRUE(schedule.record().bind("pairs", pairs));
+    ASSERT_TRUE(schedule.record().bind("payloads", payloads));
+    ASSERT_TRUE(schedule.record().bind("output", output));
+    schedule.record().bindGrid(1);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    const std::vector<float> values = output.values<float>();
+    for (size_t index = 0; index < values.size(); ++index)
+        EXPECT_FLOAT_EQ(values[index], static_cast<float>(acceptance.expected[index]));
+    std::array<Pair, 2> pairResult{};
+    pairs.buffer().read(pairResult.data(), sizeof(pairResult));
+    EXPECT_FLOAT_EQ(pairResult[0].left, 5);
+    EXPECT_FLOAT_EQ(pairResult[0].right, 7);
+    std::array<Payload, 1> payloadResult{};
+    payloads.buffer().read(payloadResult.data(), sizeof(payloadResult));
+    EXPECT_FLOAT_EQ(payloadResult[0].value, 4);
+    EXPECT_EQ(payloadResult[0].index, 6);
 }
 
-// `format` must transfer as 8-bit RGBA texels.
-void renderArgumentFreeTriangle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
-                                std::array<uint8_t, 4> &centerPixel,
-                                VernonRhiFormat format = VERNON_RHI_FORMAT_RGBA8_UNORM) {
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
-    constexpr uint32_t extent = 32;
-    vernon::tests::RhiImage target = vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, format, extent,
-                                                                extent, 1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImageView targetView =
-        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, format);
-    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+constexpr uint32_t kExtent = 32;
 
-    VernonColorAttachment attachment{};
-    attachment.location = 0;
-    attachment.view = targetView.reference;
-    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    attachment.clear_color.f32[3] = 1.0f;
-    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    graphics.renderPass.render_area[2] = extent;
-    graphics.renderPass.render_area[3] = extent;
-    graphics.dynamic.viewport[2] = extent;
-    graphics.dynamic.viewport[3] = extent;
-    graphics.dynamic.scissor[2] = extent;
-    graphics.dynamic.scissor[3] = extent;
-
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    ASSERT_NE(instance, nullptr);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    VernonProgramGraphicsControlsView controls{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls), VERNON_STATUS_OK);
-    ASSERT_EQ(graphics.bind(invocation, controls), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    vernonRuntimeProgramInstanceDestroy(instance);
-
-    std::vector<uint8_t> pixels(extent * extent * 4);
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = extent;
-    download.height = extent;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), target.handle, &download, pixels.data(), pixels.size()),
-              VERNON_RHI_STATUS_OK);
+std::array<uint8_t, 4> centerPixel(const std::vector<uint8_t> &pixels, uint32_t extent = kExtent) {
     const size_t center = (extent / 2 * extent + extent / 2) * 4;
-    std::copy_n(pixels.begin() + static_cast<std::ptrdiff_t>(center), centerPixel.size(), centerPixel.begin());
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), targetView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), target.handle), VERNON_RHI_STATUS_OK);
+    return {pixels[center], pixels[center + 1], pixels[center + 2], pixels[center + 3]};
 }
 
-void runGraphicsTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+// Draws the Program's three vertices into a clear opaque black target of `format`, read back as 8-bit RGBA.
+std::array<uint8_t, 4> renderArgumentFreeTriangle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                                                  VernonTextureFormat format = VERNON_TEXTURE_RGBA8_UNORM,
+                                                  uint32_t firstInstance = 0) {
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
+    const HalImage target(device.get(), format, kExtent, kExtent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    LinkedProgram schedule(device.runtime(), executable);
+    EXPECT_TRUE(schedule) << schedule.error();
+    if (!schedule || !target)
+        return {};
+    const PassControls controls(target.reference(), kExtent);
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    draw.first_instance = firstInstance;
+    controls.writeTo(schedule.record(), 0, &draw);
+    EXPECT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    return centerPixel(target.rgba8());
+}
+
+void runGraphicsTriangleOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
                                const AcceptanceDescriptor &acceptance) {
     ASSERT_EQ(acceptance.expectedCount, 4u);
-    std::array<uint8_t, 4> pixel{};
-    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, executable, pixel));
+    const std::array<uint8_t, 4> pixel = renderArgumentFreeTriangle(device, executable);
     for (size_t channel = 0; channel < pixel.size(); ++channel)
         EXPECT_NEAR(pixel[channel], acceptance.expected[channel], 1);
 }
 
+// The raw and generated contract vertices move every instance but instance 0 off the target, so a draw whose first
+// instance is 1 leaves the clear color wherever `instance_index` includes the first instance.
+void runFirstInstanceOracle(const HalTestDevice &device, VernonProgramExecutable *executable) {
+    EXPECT_EQ(renderArgumentFreeTriangle(device, executable, VERNON_TEXTURE_RGBA8_UNORM, 1),
+              (std::array<uint8_t, 4>{0, 0, 0, 255}));
+}
+
 // The asset covers the target with one triangle and discards fragments whose (x + y) parity is odd.
-void runFragmentDiscardOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+void runFragmentDiscardOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
                               const AcceptanceDescriptor &acceptance) {
     ASSERT_EQ(acceptance.expectedCount, 4u);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
-    constexpr uint32_t extent = 32;
     constexpr uint32_t stencilReference = 7;
-    vernon::tests::RhiImage target =
-        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, extent, extent,
-                                   1, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImageView targetView =
-        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImage depthImage =
-        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, extent,
-                                   extent, 1, VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
-    ASSERT_NE(depthImage.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImageView depthView = vernon::tests::createImageView(
-        owned.context(), depthImage, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 1, 1,
-        VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
-    ASSERT_NE(depthView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    const HalImage target(device.get(), VERNON_TEXTURE_RGBA8_UNORM, kExtent, kExtent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    const HalImage depthImage(device.get(), VERNON_TEXTURE_D32_FLOAT_S8_UINT, kExtent, kExtent,
+                              VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT,
+                              VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL);
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(depthImage);
 
-    VernonColorAttachment attachment{};
-    attachment.location = 0;
-    attachment.view = targetView.reference;
-    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    VernonDepthAttachment depthAttachment{};
-    depthAttachment.view = depthView.reference;
-    depthAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    depthAttachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    depthAttachment.clear_depth = 1.0f;
-    depthAttachment.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    depthAttachment.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    depthAttachment.clear_stencil = 0;
-    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    graphics.renderPass.depth_attachment = &depthAttachment;
-    graphics.renderPass.render_area[2] = extent;
-    graphics.renderPass.render_area[3] = extent;
-    graphics.dynamic.viewport[2] = extent;
-    graphics.dynamic.viewport[3] = extent;
-    graphics.dynamic.scissor[2] = extent;
-    graphics.dynamic.scissor[3] = extent;
-    graphics.dynamic.stencil_reference = stencilReference;
+    PassControls controls(target.reference(), kExtent);
+    controls.attachment.clear_color.f32[3] = 0.0f;
+    VernonDepthAttachment depth{};
+    depth.view = depthImage.reference();
+    depth.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depth.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    depth.clear_depth = 1.0f;
+    depth.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    depth.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    controls.renderPass.depth_attachment = &depth;
+    controls.dynamic.stencil_reference = stencilReference;
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    controls.writeTo(schedule.record(), 0, &draw);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
 
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-    ASSERT_NE(instance, nullptr);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    VernonProgramGraphicsControlsView controls{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls), VERNON_STATUS_OK);
-    ASSERT_EQ(graphics.bind(invocation, controls), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    vernonRuntimeProgramInstanceDestroy(instance);
-
-    std::vector<uint8_t> pixels(extent * extent * 4);
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = extent;
-    download.height = extent;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), target.handle, &download, pixels.data(), pixels.size()),
-              VERNON_RHI_STATUS_OK);
-    std::vector<float> depth(extent * extent);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), depthImage.handle, &download, depth.data(),
-                                           depth.size() * sizeof(float)),
-              VERNON_RHI_STATUS_OK)
-        << vernon::test::text(vernonRhiDeviceGetLastError(owned.device()));
-    std::vector<uint8_t> stencil(extent * extent);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_STENCIL;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_STENCIL;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadImage(owned.device(), depthImage.handle, &download, stencil.data(), stencil.size()),
-        VERNON_RHI_STATUS_OK)
-        << vernon::test::text(vernonRhiDeviceGetLastError(owned.device()));
-
+    const std::vector<uint8_t> pixels = target.rgba8();
+    const std::vector<float> depths = depthImage.read<float>(VERNON_HAL_IMAGE_DATA_DEPTH, VERNON_HAL_IMAGE_DATA_FLOAT32,
+                                                             sizeof(float), VERNON_IMAGE_ASPECT_DEPTH);
+    const std::vector<uint8_t> stencils = depthImage.read<uint8_t>(
+        VERNON_HAL_IMAGE_DATA_STENCIL, VERNON_HAL_IMAGE_DATA_UINT8, 1, VERNON_IMAGE_ASPECT_STENCIL);
     constexpr uint32_t keptParity = 0;
     size_t kept = 0;
-    for (uint32_t y = 0; y < extent; ++y) {
-        for (uint32_t x = 0; x < extent; ++x) {
+    for (uint32_t y = 0; y < kExtent; ++y) {
+        for (uint32_t x = 0; x < kExtent; ++x) {
             SCOPED_TRACE("pixel " + std::to_string(x) + "," + std::to_string(y));
-            const size_t index = static_cast<size_t>(y) * extent + x;
+            const size_t index = static_cast<size_t>(y) * kExtent + x;
             const uint8_t *pixel = pixels.data() + index * 4;
             if ((x + y) % 2 == keptParity) {
                 ++kept;
                 for (size_t channel = 0; channel < 4; ++channel)
                     ASSERT_NEAR(pixel[channel], acceptance.expected[channel], 1);
-                ASSERT_LT(depth[index], 1.0f);
-                ASSERT_EQ(stencil[index], stencilReference);
+                ASSERT_LT(depths[index], 1.0f);
+                ASSERT_EQ(stencils[index], stencilReference);
             } else {
                 for (size_t channel = 0; channel < 4; ++channel)
                     ASSERT_EQ(pixel[channel], 0);
-                ASSERT_EQ(depth[index], 1.0f);
-                ASSERT_EQ(stencil[index], 0);
+                ASSERT_EQ(depths[index], 1.0f);
+                ASSERT_EQ(stencils[index], 0);
             }
         }
     }
-    EXPECT_EQ(kept, extent * extent / 2);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), depthView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), depthImage.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), targetView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), target.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(kept, kExtent * kExtent / 2);
 }
 
-void renderSpecializedVariant(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+void renderSpecializedVariant(const HalTestDevice &device, const ProgramFixtureManifest &fixture,
                               const VernonProgramSpecialization &specialization, double expectedRed,
-                              VernonRhiFormat format = VERNON_RHI_FORMAT_RGBA8_UNORM) {
+                              VernonTextureFormat format = VERNON_TEXTURE_RGBA8_UNORM) {
     const VernonProgramVariantSelector selector{sizeof(VernonProgramVariantSelector), &specialization, 1, {}};
-    vernon::tests::OwnedProgramExecutable program(owned.runtime(), std::string(fixture.manifestPath), &selector);
-    ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    std::array<uint8_t, 4> pixel{};
-    ASSERT_NO_FATAL_FAILURE(renderArgumentFreeTriangle(owned, program.get(), pixel, format));
+    const ResolvedProgram program(device.runtime(), std::string(fixture.manifestPath), &selector);
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(device.runtime());
+    const std::array<uint8_t, 4> pixel = renderArgumentFreeTriangle(device, program.get(), format);
     EXPECT_NEAR(pixel[0], expectedRed, 1);
     EXPECT_LT(pixel[1], 10);
 }
 
 // `expected` holds (value, red channel) pairs; each value selects one cooked variant through the u32
 // specialization named by the descriptor.
-void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+void runSpecializationPixelsOracle(const HalTestDevice &device, const ProgramFixtureManifest &fixture,
                                    const AcceptanceDescriptor &acceptance) {
     ASSERT_FALSE(acceptance.specialization.empty());
     ASSERT_GT(acceptance.expectedCount, 0u);
@@ -547,13 +314,13 @@ void runSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const 
         specialization.kind = VERNON_PROGRAM_SPECIALIZATION_U32;
         specialization.value.u32_value = value;
         ASSERT_NO_FATAL_FAILURE(
-            renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index + 1]));
+            renderSpecializedVariant(device, fixture, specialization, acceptance.expected[index + 1]));
     }
 }
 
 // `variantValues[i]` is the type identity selecting one cooked variant through the type specialization
 // named by the descriptor, and `expected[i]` is the red channel that variant renders.
-void runTypeSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+void runTypeSpecializationPixelsOracle(const HalTestDevice &device, const ProgramFixtureManifest &fixture,
                                        const AcceptanceDescriptor &acceptance) {
     ASSERT_FALSE(acceptance.specialization.empty());
     ASSERT_GT(acceptance.variantValueCount, 0u);
@@ -566,13 +333,13 @@ void runTypeSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, co
         specialization.name = {acceptance.specialization.data(), acceptance.specialization.size()};
         specialization.kind = VERNON_PROGRAM_SPECIALIZATION_TYPE;
         specialization.value.type_value = {identity.data(), identity.size()};
-        ASSERT_NO_FATAL_FAILURE(renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index]));
+        ASSERT_NO_FATAL_FAILURE(renderSpecializedVariant(device, fixture, specialization, acceptance.expected[index]));
     }
 }
 
 // `variantValues[i]` names the color target format selecting one cooked variant through the format specialization
 // named by the descriptor; the variant renders into an image of that format, and `expected[i]` is its red channel.
-void runFormatSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, const ProgramFixtureManifest &fixture,
+void runFormatSpecializationPixelsOracle(const HalTestDevice &device, const ProgramFixtureManifest &fixture,
                                          const AcceptanceDescriptor &acceptance) {
     ASSERT_FALSE(acceptance.specialization.empty());
     ASSERT_GT(acceptance.variantValueCount, 0u);
@@ -588,271 +355,172 @@ void runFormatSpecializationPixelsOracle(vernon::tests::OwnedRhiRuntime &owned, 
         specialization.kind = VERNON_PROGRAM_SPECIALIZATION_FORMAT;
         specialization.value.format_value = format->texture;
         ASSERT_NO_FATAL_FAILURE(
-            renderSpecializedVariant(owned, fixture, specialization, acceptance.expected[index], format->rhi));
+            renderSpecializedVariant(device, fixture, specialization, acceptance.expected[index], format->texture));
     }
 }
 
-void runSampledTextureOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
-                             const AcceptanceDescriptor &acceptance) {
-    vernon::tests::runSampledTextureRuntimeOracle(owned, executable, acceptance.expected, acceptance.expectedCount);
+// The asset samples a one-texel red image across the target through its Image and Sampler parameters.
+void runSampledPixelOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                           const AcceptanceDescriptor &acceptance) {
+    constexpr uint8_t sampledPixel[]{255, 0, 0, 255};
+    HalImage sampled(device.get(), VERNON_TEXTURE_RGBA8_UNORM, 1, 1, VERNON_IMAGE_SAMPLED);
+    ASSERT_TRUE(sampled);
+    ASSERT_EQ(sampled.write(sampledPixel, VERNON_HAL_IMAGE_DATA_RGBA, VERNON_HAL_IMAGE_DATA_UINT8), VERNON_HAL_OK)
+        << vernon::tests::halError();
+    const HalSampler sampler(device.get(), VERNON_HAL_FILTER_NEAREST);
+    ASSERT_TRUE(sampler);
+    const HalImage target(device.get(), VERNON_TEXTURE_RGBA8_UNORM, kExtent, kExtent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(target);
+
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    for (size_t index = 0; index < vernonRuntimeProgramExecutableGetParameterCount(executable); ++index) {
+        VernonProgramParameterView parameter{};
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &parameter), VERNON_STATUS_OK);
+        const std::string_view name(parameter.name.data, parameter.name.size);
+        if (parameter.kind == VERNON_PROGRAM_IMAGE) {
+            VernonProgramImageConstraintView constraint{};
+            constraint.struct_size = sizeof(constraint);
+            ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(executable, index, &constraint),
+                      VERNON_STATUS_OK);
+            EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_SAMPLED);
+            EXPECT_EQ(constraint.sample_result_class, VERNON_IMAGE_SAMPLE_FLOAT);
+            ASSERT_TRUE(schedule.record().bindImage(name, sampled.reference()));
+        } else {
+            ASSERT_EQ(parameter.kind, VERNON_PROGRAM_SAMPLER);
+            ASSERT_TRUE(schedule.record().bindSampler(name, sampler.reference()));
+        }
+    }
+    const PassControls controls(target.reference(), kExtent);
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    controls.writeTo(schedule.record(), 0, &draw);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    const std::array<uint8_t, 4> actual = centerPixel(target.rgba8());
+    ASSERT_EQ(acceptance.expectedCount, actual.size());
+    for (size_t channel = 0; channel < actual.size(); ++channel)
+        EXPECT_NEAR(actual[channel], acceptance.expected[channel], 1);
 }
 
-void runStorageTextureOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
-                             const AcceptanceDescriptor &acceptance) {
-    vernon::tests::RhiImage image = vernon::tests::createImage(
-        owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT, 1, 1, 1, VERNON_RHI_IMAGE_STORAGE);
-    vernon::tests::RhiImageView view =
-        vernon::tests::createImageView(owned.context(), image, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA32_FLOAT);
-    ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    ASSERT_NE(view.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView("image"), &parameter),
-              VERNON_STATUS_OK);
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_IMAGE;
-    argument.image = {view.reference};
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, &argument, 1, {1, 1, 1}), VERNON_STATUS_OK);
-
-    std::array<float, 4> texel{};
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = 1;
-    download.height = 1;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), image.handle, &download, texel.data(), sizeof(texel)),
-              VERNON_RHI_STATUS_OK);
+void runStorageTexelOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                           const AcceptanceDescriptor &acceptance) {
+    const HalImage image(device.get(), VERNON_TEXTURE_RGBA32_FLOAT, 1, 1, VERNON_IMAGE_STORAGE);
+    ASSERT_TRUE(image);
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    ASSERT_TRUE(schedule.record().bindImage("image", image.reference()));
+    schedule.record().bindGrid(1);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    const std::vector<float> texel =
+        image.read<float>(VERNON_HAL_IMAGE_DATA_RGBA, VERNON_HAL_IMAGE_DATA_FLOAT32, 4 * sizeof(float));
     ASSERT_EQ(acceptance.expectedCount, texel.size());
     for (size_t channel = 0; channel < texel.size(); ++channel)
         EXPECT_FLOAT_EQ(texel[channel], static_cast<float>(acceptance.expected[channel]));
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), view.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), image.handle), VERNON_RHI_STATUS_OK);
 }
 
 // The asset samples a 4x1 texture halfway between neighbouring texel centers and at the right edge, so only linear
 // filtering with clamp-to-edge addressing from the bound Sampler yields `expected`.
-void runComputeSampledTexelsOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+void runComputeSampledTexelsOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
                                    const AcceptanceDescriptor &acceptance) {
     constexpr uint32_t extent = 4;
     constexpr std::array<uint8_t, extent * 4> texels{0, 0, 0, 255, 51, 0, 0, 255, 102, 0, 0, 255, 255, 0, 0, 255};
-    vernon::tests::RhiImage image = vernon::tests::createImage(
-        owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, extent, 1, 1, VERNON_RHI_IMAGE_SAMPLED);
-    ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonRhiImageUploadDescriptor upload{};
-    upload.struct_size = sizeof(upload);
-    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    upload.width = extent;
-    upload.height = 1;
-    upload.depth = 1;
-    upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    upload.data = texels.data();
-    ASSERT_EQ(vernonRhiDeviceUploadImage(owned.device(), image.handle, &upload, 1), VERNON_RHI_STATUS_OK);
-    vernon::tests::RhiImageView view =
-        vernon::tests::createImageView(owned.context(), image, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
-    vernon::tests::RhiSampler sampler = vernon::tests::createSampler(owned.context(), VERNON_RHI_FILTER_LINEAR);
-    ASSERT_NE(view.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-
-    std::vector<float> output(acceptance.expectedCount);
-    vernon::tests::RhiBuffer buffer = vernon::tests::createBuffer(
-        owned.context(), output.size() * sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE, output.data());
-    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const uint64_t shape[]{output.size()};
-    const int64_t strides[]{sizeof(float)};
-    VernonProgramParameterView outputParameter{};
-    VernonProgramParameterView imageParameter{};
-    VernonProgramParameterView samplerParameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
-                  executable, {acceptance.parameter.data(), acceptance.parameter.size()}, &outputParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView("image"), &imageParameter),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(executable, stringView("image_sampler"), &samplerParameter),
-              VERNON_STATUS_OK);
-    std::array<VernonProgramArgument, 3> arguments{floatBufferArgument(outputParameter, buffer, shape, strides)};
-    arguments[1].slot = imageParameter.slot;
-    arguments[1].kind = VERNON_PROGRAM_IMAGE;
-    arguments[1].image = {view.reference};
-    arguments[2].slot = samplerParameter.slot;
-    arguments[2].kind = VERNON_PROGRAM_SAMPLER;
-    arguments[2].resource = sampler.reference;
-    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(executable, arguments.data(), arguments.size(),
-                                                                acceptance.grid),
-              VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadBuffer(owned.device(), buffer.handle, 0, output.data(), output.size() * sizeof(float)),
-        VERNON_RHI_STATUS_OK);
-    for (size_t index = 0; index < output.size(); ++index)
-        EXPECT_NEAR(output[index], acceptance.expected[index], 2e-3) << "invocation " << index;
-
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), buffer.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroySampler(owned.device(), sampler.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), view.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), image.handle), VERNON_RHI_STATUS_OK);
+    HalImage image(device.get(), VERNON_TEXTURE_RGBA8_UNORM, extent, 1, VERNON_IMAGE_SAMPLED);
+    ASSERT_TRUE(image);
+    ASSERT_EQ(image.write(texels.data(), VERNON_HAL_IMAGE_DATA_RGBA, VERNON_HAL_IMAGE_DATA_UINT8), VERNON_HAL_OK)
+        << vernon::tests::halError();
+    const HalSampler sampler(device.get(), VERNON_HAL_FILTER_LINEAR);
+    ASSERT_TRUE(sampler);
+    const DeviceTensor output(device, std::vector<float>(acceptance.expectedCount));
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    ASSERT_TRUE(schedule.record().bind(acceptance.parameter, output));
+    ASSERT_TRUE(schedule.record().bindImage("image", image.reference()));
+    ASSERT_TRUE(schedule.record().bindSampler("image_sampler", sampler.reference()));
+    schedule.record().bindGrid(acceptance.grid.x, acceptance.grid.y, acceptance.grid.z);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    const std::vector<float> values = output.values<float>();
+    for (size_t index = 0; index < values.size(); ++index)
+        EXPECT_NEAR(values[index], acceptance.expected[index], 2e-3) << "invocation " << index;
 }
 
 // `expected` holds the 4x4 source texels in row order. The asset covers the target and writes, at each fragment, the
 // texel addressed by its window coordinates.
-void runTexelFetchOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgramExecutable *executable,
+void runTexelFetchOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
                          const AcceptanceDescriptor &acceptance) {
     constexpr uint32_t extent = 4;
     ASSERT_EQ(acceptance.expectedCount, extent * extent);
     std::vector<uint32_t> texels(acceptance.expectedCount);
     std::transform(acceptance.expected, acceptance.expected + acceptance.expectedCount, texels.begin(),
                    [](double value) { return static_cast<uint32_t>(value); });
-    vernon::tests::RhiImage source = vernon::tests::createImage(
-        owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_R32_UINT, extent, extent, 1, VERNON_RHI_IMAGE_SAMPLED);
-    ASSERT_NE(source.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonRhiImageUploadDescriptor upload{};
-    upload.struct_size = sizeof(upload);
-    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    upload.width = extent;
-    upload.height = extent;
-    upload.depth = 1;
-    upload.source_format = VERNON_RHI_IMAGE_DATA_RED;
-    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT32;
-    upload.data = texels.data();
-    ASSERT_EQ(vernonRhiDeviceUploadImage(owned.device(), source.handle, &upload, 1), VERNON_RHI_STATUS_OK);
-    vernon::tests::RhiImageView sourceView =
-        vernon::tests::createImageView(owned.context(), source, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_R32_UINT);
-    ASSERT_NE(sourceView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImage target =
-        vernon::tests::createImage(owned.context(), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_R32_UINT, extent, extent, 1,
-                                   VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
-    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    vernon::tests::RhiImageView targetView =
-        vernon::tests::createImageView(owned.context(), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_R32_UINT);
-    ASSERT_NE(targetView.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    HalImage source(device.get(), VERNON_TEXTURE_R32_UINT, extent, extent, VERNON_IMAGE_SAMPLED);
+    ASSERT_TRUE(source);
+    ASSERT_EQ(source.write(texels.data(), VERNON_HAL_IMAGE_DATA_RED, VERNON_HAL_IMAGE_DATA_UINT32), VERNON_HAL_OK)
+        << vernon::tests::halError();
+    const HalImage target(device.get(), VERNON_TEXTURE_R32_UINT, extent, extent, VERNON_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_TRUE(target);
 
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(
-                  executable, {acceptance.parameter.data(), acceptance.parameter.size()}, &parameter),
-              VERNON_STATUS_OK);
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_IMAGE;
-    argument.image = {sourceView.reference};
-    VernonColorAttachment attachment{};
-    attachment.location = 0;
-    attachment.view = targetView.reference;
-    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
-    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
-    graphics.renderPass.render_area[2] = extent;
-    graphics.renderPass.render_area[3] = extent;
-    graphics.dynamic.viewport[2] = extent;
-    graphics.dynamic.viewport[3] = extent;
-    graphics.dynamic.scissor[2] = extent;
-    graphics.dynamic.scissor[3] = extent;
-    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(executable, &argument, 1, graphics), VERNON_STATUS_OK)
-        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
-
-    std::vector<uint32_t> rendered(texels.size());
-    VernonRhiImageDownloadDescriptor download{};
-    download.struct_size = sizeof(download);
-    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
-    download.width = extent;
-    download.height = extent;
-    download.depth = 1;
-    download.destination_format = VERNON_RHI_IMAGE_DATA_RED;
-    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT32;
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(owned.device(), target.handle, &download, rendered.data(),
-                                           rendered.size() * sizeof(uint32_t)),
-              VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(rendered, texels);
-
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), targetView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), target.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(owned.device(), sourceView.handle), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(owned.device(), source.handle), VERNON_RHI_STATUS_OK);
+    LinkedProgram schedule(device.runtime(), executable);
+    ASSERT_TRUE(schedule) << schedule.error();
+    ASSERT_TRUE(schedule.record().bindImage(acceptance.parameter, source.reference()));
+    PassControls controls(target.reference(), extent);
+    controls.attachment.clear_color = {};
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    controls.writeTo(schedule.record(), 0, &draw);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
+    EXPECT_EQ(target.read<uint32_t>(VERNON_HAL_IMAGE_DATA_RED, VERNON_HAL_IMAGE_DATA_UINT32, sizeof(uint32_t)), texels);
 }
 
-class LanguageContractCpuAcceptance : public testing::TestWithParam<ProgramFixtureManifest> {};
-
-TEST_P(LanguageContractCpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAsset) {
-    const ProgramFixtureManifest fixture = GetParam();
-    const AcceptanceDescriptor &acceptance = acceptanceFor(fixture.fixtureId);
-    const vernon::tests::BackendTestRow backend = backendFor(fixture);
-    ASSERT_FALSE(backend.name.empty());
-    const vernon::tests::BackendTestRequirements requirements = requirementsFor(fixture);
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    const vernon::tests::BackendProbeResult runtimeProbe =
-        vernon::tests::probeRuntimeBackend(backend, requirements, context);
-    ASSERT_TRUE(runtimeProbe.available()) << runtimeProbe.reason;
-    {
-        vernon::tests::OwnedProgramExecutable program(context, std::string(fixture.manifestPath));
-        ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(context));
-        if (acceptance.oracle == "float_buffer")
-            runHostFloatBufferOracle(program.get(), acceptance);
-        else if (acceptance.oracle == "signed_stride_vjp")
-            runSignedStrideVjpHostOracle(program.get(), acceptance);
-        else if (acceptance.oracle == "fan_out_vjp")
-            runFanOutVjpHostOracle(program.get(), acceptance);
-        else if (acceptance.oracle == "structured_view")
-            runStructuredViewHostOracle(program.get(), acceptance);
-        else
-            FAIL() << "oracle '" << acceptance.oracle << "' has no CPU executor";
-    }
-    vernonRuntimeDestroy(context);
-}
-
-class LanguageContractGpuAcceptance : public vernon::tests::ProgramFixtureRuntimeTest {
+class LanguageContractAcceptance : public vernon::tests::HalProgramTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override { return requirementsFor(GetParam()); }
 };
 
-TEST_P(LanguageContractGpuAcceptance, LoadsResolvesAndExecutesCanonicalProgramAsset) {
+TEST_P(LanguageContractAcceptance, LoadsResolvesAndExecutesCanonicalProgramAsset) {
     const ProgramFixtureManifest fixture = GetParam();
-    if (skipDirectXWorkgroupAtomicContention(fixture))
-        GTEST_SKIP() << "GitHub-hosted Windows virtual graphics does not execute groupshared CAS correctly";
     const AcceptanceDescriptor &acceptance = acceptanceFor(fixture.fixtureId);
-    if (acceptance.oracle == "specialization_pixels") {
-        runSpecializationPixelsOracle(owned(), fixture, acceptance);
-        return;
+    if (acceptance.oracle == "specialization_pixels")
+        return runSpecializationPixelsOracle(device_, fixture, acceptance);
+    if (acceptance.oracle == "type_specialization_pixels")
+        return runTypeSpecializationPixelsOracle(device_, fixture, acceptance);
+    if (acceptance.oracle == "format_specialization_pixels")
+        return runFormatSpecializationPixelsOracle(device_, fixture, acceptance);
+    const ResolvedProgram program(runtime(), std::string(fixture.manifestPath));
+    ASSERT_TRUE(program) << vernon::tests::runtimeError(runtime());
+    if (acceptance.oracle == "float_buffer") {
+        runFloatBufferOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "graphics_triangle") {
+        runGraphicsTriangleOracle(device_, program.get(), acceptance);
+        const std::string_view id = fixture.fixtureId;
+        if (id.find("graphics_raw") != std::string_view::npos ||
+            id.find("graphics_generated") != std::string_view::npos)
+            runFirstInstanceOracle(device_, program.get());
+    } else if (acceptance.oracle == "fragment_discard") {
+        runFragmentDiscardOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "sampled_pixel") {
+        runSampledPixelOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "storage_texel") {
+        runStorageTexelOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "compute_sampled_texels") {
+        runComputeSampledTexelsOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "texel_fetch") {
+        runTexelFetchOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "signed_stride_vjp") {
+        runSignedStrideVjpOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "fan_out_vjp") {
+        runFanOutVjpOracle(device_, program.get(), acceptance);
+    } else if (acceptance.oracle == "structured_view") {
+        runStructuredViewOracle(device_, program.get(), acceptance);
+    } else {
+        FAIL() << "oracle '" << acceptance.oracle << "' has no executor";
     }
-    if (acceptance.oracle == "type_specialization_pixels") {
-        runTypeSpecializationPixelsOracle(owned(), fixture, acceptance);
-        return;
-    }
-    if (acceptance.oracle == "format_specialization_pixels") {
-        runFormatSpecializationPixelsOracle(owned(), fixture, acceptance);
-        return;
-    }
-    vernon::tests::OwnedProgramExecutable program(runtime().runtime, std::string(fixture.manifestPath));
-    ASSERT_TRUE(program) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(runtime().runtime));
-    if (acceptance.oracle == "float_buffer")
-        runFloatBufferOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "graphics_triangle")
-        runGraphicsTriangleOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "fragment_discard")
-        runFragmentDiscardOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "sampled_pixel")
-        runSampledTextureOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "storage_texel")
-        runStorageTextureOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "compute_sampled_texels")
-        runComputeSampledTexelsOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "texel_fetch")
-        runTexelFetchOracle(owned(), program.get(), acceptance);
-    else if (acceptance.oracle == "signed_stride_vjp")
-        runSignedStrideVjpHostOracle(program.get(), acceptance);
-    else if (acceptance.oracle == "fan_out_vjp")
-        runFanOutVjpHostOracle(program.get(), acceptance);
-    else if (acceptance.oracle == "structured_view")
-        runStructuredViewHostOracle(program.get(), acceptance);
-    else
-        FAIL() << "oracle '" << acceptance.oracle << "' has no GPU executor";
 }
 
-INSTANTIATE_TEST_SUITE_P(CanonicalMatrix, LanguageContractCpuAcceptance, testing::ValuesIn(acceptanceFixtures(true)),
-                         testName);
-INSTANTIATE_TEST_SUITE_P(CanonicalMatrix, LanguageContractGpuAcceptance, testing::ValuesIn(acceptanceFixtures(false)),
+INSTANTIATE_TEST_SUITE_P(CanonicalMatrix, LanguageContractAcceptance, testing::ValuesIn(acceptanceFixtures()),
                          testName);
 
 } // namespace

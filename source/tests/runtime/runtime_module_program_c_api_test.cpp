@@ -1,8 +1,8 @@
 #include "VernonRuntime.hpp"
 #include "program_fixture_manifest_table.h"
-#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/runtime_state.h"
 #include "runtime/runtime_test_hooks.h"
+#include "schedule_test_support.h"
 
 #include <gtest/gtest.h>
 
@@ -43,6 +43,10 @@ void operator delete[](void *memory, size_t) noexcept { std::free(memory); }
 
 namespace {
 
+using vernon::tests::LinkedProgram;
+using vernon::tests::LinkedVjp;
+using vernon::tests::ResolvedProgram;
+
 std::string lastError(VernonRuntimeContext *context) {
     const VernonStringView error = vernonRuntimeGetLastError(context);
     return std::string(error.data ? error.data : "", error.size);
@@ -55,70 +59,28 @@ VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const ch
     return result;
 }
 
-VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter, float &value) {
-    static const uint64_t shape[]{1};
-    static const int64_t strides[]{sizeof(float)};
-    VernonProgramArgument result{};
-    result.slot = parameter.slot;
-    result.kind = VERNON_PROGRAM_TENSOR;
-    result.tensor.struct_size = sizeof(VernonTensorView);
-    result.tensor.storage = VERNON_TENSOR_HOST;
-    result.tensor.host_data = &value;
-    result.tensor.element_layout = parameter.element_layout;
-    result.tensor.access = parameter.access;
-    result.tensor.rank = 1;
-    result.tensor.shape = shape;
-    result.tensor.byte_strides = strides;
-    result.tensor.byte_size = sizeof(value);
-    return result;
-}
+// Dense host floats a CPU schedule argument views; the view points at this object, which must outlive the call.
+struct HostFloats {
+    explicit HostFloats(std::vector<float> initial) : values(std::move(initial)), shape(values.size()) {}
+    HostFloats(const HostFloats &) = delete;
+    HostFloats &operator=(const HostFloats &) = delete;
 
-VernonProgramArgument tensorArrayArgument(const VernonProgramParameterView &parameter, float *values,
-                                          const uint64_t *shape) {
-    VernonProgramArgument result{};
-    result.slot = parameter.slot;
-    result.kind = VERNON_PROGRAM_TENSOR;
-    result.tensor.struct_size = sizeof(VernonTensorView);
-    result.tensor.storage = VERNON_TENSOR_HOST;
-    result.tensor.host_data = values;
-    result.tensor.element_layout = parameter.element_layout;
-    result.tensor.access = parameter.access;
-    result.tensor.rank = 1;
-    result.tensor.shape = shape;
-    static const int64_t stride = sizeof(float);
-    result.tensor.byte_strides = &stride;
-    result.tensor.byte_size = *shape * sizeof(float);
-    return result;
-}
+    VernonTensorView view() {
+        return vernon::tests::hostView(values.data(), values.size() * sizeof(float), 1, &shape, &stride);
+    }
 
-VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter, uint32_t &value) {
-    VernonProgramArgument result{};
-    result.slot = parameter.slot;
-    result.kind = VERNON_PROGRAM_TENSOR;
-    result.tensor.struct_size = sizeof(VernonTensorView);
-    result.tensor.storage = VERNON_TENSOR_HOST;
-    result.tensor.host_data = &value;
-    result.tensor.element_layout = parameter.element_layout;
-    result.tensor.access = parameter.access;
-    result.tensor.byte_size = sizeof(value);
-    return result;
-}
+    std::vector<float> values;
+    uint64_t shape;
+    int64_t stride{sizeof(float)};
+};
 
-VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter, float &value) {
-    VernonProgramArgument result{};
-    result.slot = parameter.slot;
-    result.kind = VERNON_PROGRAM_TENSOR;
-    result.tensor.struct_size = sizeof(VernonTensorView);
-    result.tensor.storage = VERNON_TENSOR_HOST;
-    result.tensor.host_data = &value;
-    result.tensor.element_layout = parameter.element_layout;
-    result.tensor.access = parameter.access;
-    result.tensor.byte_size = sizeof(value);
-    return result;
-}
-
-VernonProgramBindingToken bindingToken(const char *value) {
-    return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
+// The name of the executable's first output boundary, which republishes the output it writes.
+std::string publishedOutput(VernonProgramExecutable *executable) {
+    VernonProgramParameterView published{};
+    EXPECT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(executable, VERNON_PROGRAM_BOUNDARY_OUTPUT, 0, &published),
+        VERNON_STATUS_OK);
+    return std::string(published.name.data, published.name.size);
 }
 
 const vernon::tests::ProgramFixtureManifest &cpuFixture(std::string_view fixtureId) {
@@ -136,7 +98,10 @@ std::string fixtureManifest(std::string_view fixtureId) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-std::atomic<bool> throwOnLeaseRelease{};
+std::string readFile(const char *path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
 
 } // namespace
 
@@ -173,376 +138,112 @@ TEST(RuntimeModuleProgramCApi, ConcurrentFirstResolvePublishesOneContextMemoryPo
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeModuleProgramCApi, ForeignLeaseCallbacksHaveImmediateFailureBoundaries) {
-    const std::string manifest = fixtureManifest("module_program");
+TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6WithCheckpointPolicies) {
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
-    ASSERT_NE(instance, nullptr);
-    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
-    float source = 3.0f;
-    VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
-    const VernonProgramBindingToken token = bindingToken("throwing-lease");
+    {
+        const ResolvedProgram program(context, VERNON_MODULE_PROGRAM_MANIFEST);
+        ASSERT_TRUE(program) << lastError(context);
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(program.get()), 2u);
+        ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(program.get()), 1u);
+        ASSERT_EQ(parameter(program.get(), "source").kind, VERNON_PROGRAM_TENSOR);
+        ASSERT_EQ(parameter(program.get(), "output").kind, VERNON_PROGRAM_TENSOR);
 
-    struct LeaseState {
-        uint32_t retains{};
-        uint32_t releases{};
-    } failed;
-    const VernonProgramResourceLease throwingRetain{
-        sizeof(VernonProgramResourceLease),
-        &failed,
-        [](void *object) {
-            ++static_cast<LeaseState *>(object)->retains;
-            throw std::runtime_error("retain failed");
-        },
-        [](void *object) { ++static_cast<LeaseState *>(object)->releases; },
-    };
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &sourceArgument, &throwingRetain, 0, 0),
-              VERNON_STATUS_INTERNAL_ERROR);
-    EXPECT_EQ(lastError(context), "Program resource retain callback failed");
-    EXPECT_EQ(failed.retains, 1u);
-    EXPECT_EQ(failed.releases, 0u);
-    vernonRuntimeProgramInvocationRollback(invocation);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    EXPECT_EQ(failed.releases, 0u);
+        const auto differentiate = [&](LinkedVjp &vjp) {
+            HostFloats source({3.0f});
+            HostFloats output({0.0f});
+            HostFloats seed({1.0f});
+            HostFloats gradient({0.0f});
+            vjp.forwardRecord().bind("source", source.view());
+            vjp.forwardRecord().bind("output", output.view());
+            vjp.forwardRecord().bindGrid(1);
+            ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+            EXPECT_FLOAT_EQ(output.values[0], 9.0f);
+            vjp.backwardRecord().bind("output", seed.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+            vjp.backwardRecord().bind("source", gradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+            ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+            EXPECT_FLOAT_EQ(gradient.values[0], 6.0f);
+        };
+        LinkedVjp plain(context, program.get());
+        ASSERT_TRUE(plain) << plain.error();
+        differentiate(plain);
 
-    LeaseState retained;
-    const VernonProgramResourceLease throwingRelease{
-        sizeof(VernonProgramResourceLease),
-        &retained,
-        [](void *object) { ++static_cast<LeaseState *>(object)->retains; },
-        [](void *object) {
-            ++static_cast<LeaseState *>(object)->releases;
-            if (throwOnLeaseRelease.load(std::memory_order_relaxed))
-                throw std::runtime_error("release failed");
-        },
-    };
-    invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &sourceArgument, &throwingRelease, 0, 0),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(retained.retains, 1u);
-    throwOnLeaseRelease.store(true, std::memory_order_relaxed);
-    EXPECT_DEATH_IF_SUPPORTED(vernonRuntimeProgramInvocationRollback(invocation), "");
-    throwOnLeaseRelease.store(false, std::memory_order_relaxed);
-    vernonRuntimeProgramInvocationRollback(invocation);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    EXPECT_EQ(retained.releases, 1u);
-
-    vernonRuntimeProgramInstanceDestroy(instance);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
+        for (const auto &[policy, budget] : {std::pair{VERNON_SCHEDULE_CHECKPOINT_MIN_MEMORY, uint64_t{1} << 20},
+                                             std::pair{VERNON_SCHEDULE_CHECKPOINT_MIN_RUNTIME, uint64_t{2} << 20}}) {
+            SCOPED_TRACE(policy);
+            const VernonScheduleCheckpointOptions options{sizeof(VernonScheduleCheckpointOptions), budget, policy};
+            LinkedVjp checkpointed(context, program.get(), &options);
+            ASSERT_TRUE(checkpointed) << checkpointed.error();
+            differentiate(checkpointed);
+        }
+    }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublicLifecycle) {
-    const std::filesystem::path manifestPath = VERNON_MODULE_PROGRAM_MANIFEST;
-    std::ifstream input(manifestPath, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-
+TEST(RuntimeModuleProgramCApi, ComposedProgramGraphChainsItsNodesPullbacksWithoutCompositeAutodiff) {
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
-    ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
-
-    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
-    const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
-    ASSERT_EQ(sourceParameter.kind, VERNON_PROGRAM_TENSOR);
-    ASSERT_EQ(outputParameter.kind, VERNON_PROGRAM_TENSOR);
-
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
-    ASSERT_NE(instance, nullptr);
-    float source = 3.0f;
-    float output = 0.0f;
-    VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
-    VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-    const VernonProgramBindingToken sourceToken = bindingToken("source-main");
-    const VernonProgramBindingToken outputToken = bindingToken("output-main");
-    const VernonProgramBindingToken renderPassToken = bindingToken("render-pass-main");
-    const VernonProgramBindingToken dynamicStateToken = bindingToken("dynamic-state-main");
-    int controlLeaseCount = 0;
-    VernonProgramResourceLease controlLease{
-        sizeof(VernonProgramResourceLease),
-        &controlLeaseCount,
-        [](void *value) { ++*static_cast<int *>(value); },
-        [](void *value) { --*static_cast<int *>(value); },
-    };
-    VernonRenderPass renderPass{};
-    renderPass.struct_size = sizeof(renderPass);
-    VernonDynamicState dynamicState{};
-    dynamicState.struct_size = sizeof(dynamicState);
-    dynamicState.viewport[2] = 1;
-    dynamicState.viewport[3] = 1;
-
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(
-        vernonRuntimeProgramInvocationBindRenderPass(invocation, 0, &renderPassToken, &renderPass, &controlLease, 1),
-        VERNON_STATUS_INVALID_ARGUMENT);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBindDynamicState(invocation, 0, &dynamicStateToken, &dynamicState),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(controlLeaseCount, 0);
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 1, nullptr), VERNON_STATUS_OK) << lastError(context);
-    EXPECT_EQ(pullback, nullptr);
-    VernonProgramBindingTelemetry stagedTelemetry{};
-    stagedTelemetry.struct_size = sizeof(stagedTelemetry);
-    ASSERT_EQ(vernonRuntimeProgramInstanceGetTelemetry(instance, &stagedTelemetry), VERNON_STATUS_OK);
-    EXPECT_EQ(stagedTelemetry.prepare_count, 0u);
-    EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, 0, 0),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, &pullback), VERNON_STATUS_OK) << lastError(context);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(output, 9.0f);
-
-    float seedValue = 1.0f;
-    float gradientValue = 0.0f;
-    VernonProgramParameterView cotangent{};
-    VernonProgramParameterView gradient{};
-    ASSERT_EQ(
-        vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0, &cotangent),
-        VERNON_STATUS_OK);
-    ASSERT_EQ(
-        vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0, &gradient),
-        VERNON_STATUS_OK);
-    VernonProgramInvocation *privateBoundaryInvocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(privateBoundaryInvocation, nullptr);
-    const VernonProgramArgument privateBoundaryArgument = tensorArgument(cotangent, seedValue);
-    uint8_t reused = 1;
-    EXPECT_EQ(
-        vernonRuntimeProgramInvocationTryReuse(privateBoundaryInvocation, cotangent.slot, &sourceToken, 0, 0, &reused),
-        VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(reused, 0);
-    EXPECT_EQ(vernonRuntimeProgramInvocationBind(privateBoundaryInvocation, &sourceToken, &privateBoundaryArgument,
-                                                 nullptr, 0, 0),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    vernonRuntimeProgramInvocationRollback(privateBoundaryInvocation);
-    vernonRuntimeProgramInvocationDestroy(privateBoundaryInvocation);
-    VernonProgramArgument derivativeArguments[]{
-        tensorArgument(cotangent, seedValue),
-        tensorArgument(gradient, gradientValue),
-    };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments), nullptr),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(gradientValue, 6.0f);
-    vernonProgramPullbackDestroy(pullback);
-
-    VernonProgramInvocation *minimumMemory = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    VernonProgramInvocation *minimumRuntime = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(minimumMemory, nullptr);
-    ASSERT_NE(minimumRuntime, nullptr);
-    const auto configureCheckpointing = [](VernonProgramInvocation *configured, uint64_t budget,
-                                           std::string_view policy) {
-        VernonProgramAutodiffInvocationOptions options{};
-        options.struct_size = sizeof(options);
-        options.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
-        options.has_checkpoint_memory_budget = 1;
-        options.checkpoint_memory_budget = budget;
-        options.checkpoint_policy = {policy.data(), policy.size()};
-        return vernonRuntimeProgramInvocationSetAutodiffOptions(configured, &options);
-    };
-    VernonProgramAutodiffInvocationOptions invalidOptions{};
-    invalidOptions.struct_size = sizeof(invalidOptions);
-    invalidOptions.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
-    invalidOptions.reserved_bytes[0] = 1;
-    EXPECT_EQ(vernonRuntimeProgramInvocationSetAutodiffOptions(minimumMemory, &invalidOptions),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    invalidOptions.reserved_bytes[0] = 0;
-    invalidOptions.reserved[0] = 1;
-    EXPECT_EQ(vernonRuntimeProgramInvocationSetAutodiffOptions(minimumMemory, &invalidOptions),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    ASSERT_EQ(configureCheckpointing(minimumMemory, 1u << 20, "min_memory"), VERNON_STATUS_OK);
-    ASSERT_EQ(configureCheckpointing(minimumRuntime, 2u << 20, "min_runtime"), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(minimumMemory, 1, nullptr), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(minimumRuntime, 1, nullptr), VERNON_STATUS_OK);
-    VernonPullback *minimumMemoryPullback = nullptr;
-    VernonPullback *minimumRuntimePullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(minimumMemory, &minimumMemoryPullback), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(minimumRuntime, &minimumRuntimePullback), VERNON_STATUS_OK);
-    const auto minimumMemoryPlan = vernon::runtime::autodiffPullbackCheckpointPlan(minimumMemoryPullback);
-    const auto minimumRuntimePlan = vernon::runtime::autodiffPullbackCheckpointPlan(minimumRuntimePullback);
-    EXPECT_EQ(minimumMemoryPlan.memoryBudget, 1u << 20);
-    EXPECT_EQ(minimumMemoryPlan.selectedPolicy, "min_memory");
-    EXPECT_EQ(minimumRuntimePlan.memoryBudget, 2u << 20);
-    EXPECT_EQ(minimumRuntimePlan.selectedPolicy, "min_runtime");
-    vernonProgramPullbackDestroy(minimumMemoryPullback);
-    vernonProgramPullbackDestroy(minimumRuntimePullback);
-    vernonRuntimeProgramInvocationDestroy(minimumMemory);
-    vernonRuntimeProgramInvocationDestroy(minimumRuntime);
-
-    invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    EXPECT_FLOAT_EQ(output, 9.0f);
-
-    VernonProgramBindingTelemetry telemetry{};
-    telemetry.struct_size = sizeof(telemetry);
-    ASSERT_EQ(vernonRuntimeProgramInstanceGetTelemetry(instance, &telemetry), VERNON_STATUS_OK);
-    EXPECT_EQ(telemetry.prepare_count, 2u);
-    EXPECT_EQ(telemetry.reuse_count, 2u);
-    EXPECT_EQ(telemetry.upload_bytes, sizeof(source));
-    EXPECT_EQ(telemetry.upload_ranges, 1u);
-    EXPECT_EQ(controlLeaseCount, 0);
-
-    vernonRuntimeProgramInstanceDestroy(instance);
-    EXPECT_EQ(controlLeaseCount, 0);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(bundle);
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompositeAutodiff) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    VernonProgramBundle *bundle =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
-    ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, nullptr);
-    ASSERT_NE(standalone, nullptr) << lastError(context);
-
-    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(context);
-    ASSERT_NE(graph, nullptr);
-    VernonProgramNodeId firstNode = UINT32_MAX;
-    VernonProgramNodeId secondNode = UINT32_MAX;
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &firstNode), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, {}, &secondNode), VERNON_STATUS_OK);
-    VernonProgramNodeBindingToken firstSource{};
-    VernonProgramNodeBindingToken firstOutput{};
-    VernonProgramNodeBindingToken secondSource{};
-    VernonProgramNodeBindingToken secondOutput{};
-    firstSource.struct_size = sizeof(firstSource);
-    firstOutput.struct_size = sizeof(firstOutput);
-    secondSource.struct_size = sizeof(secondSource);
-    secondOutput.struct_size = sizeof(secondOutput);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, firstNode, VERNON_PROGRAM_BOUNDARY_INPUT,
-                                                    {"source", std::strlen("source")}, &firstSource),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, firstNode, VERNON_PROGRAM_BOUNDARY_OUTPUT,
-                                                    {"output", std::strlen("output")}, &firstOutput),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, secondNode, VERNON_PROGRAM_BOUNDARY_INPUT,
-                                                    {"source", std::strlen("source")}, &secondSource),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, secondNode, VERNON_PROGRAM_BOUNDARY_OUTPUT,
-                                                    {"output", std::strlen("output")}, &secondOutput),
-              VERNON_STATUS_OK);
-    VernonProgramGraphValue intermediate{sizeof(VernonProgramGraphValue)};
-    ASSERT_EQ(vernonRuntimeProgramGraphCreateValue(graph, &firstOutput, &intermediate), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphConnectValue(graph, &intermediate, &secondSource), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &firstSource, {"source", std::strlen("source")}),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &secondOutput, {"output", std::strlen("output")}),
-              VERNON_STATUS_OK);
-    VernonProgramExecutable *composite = vernonRuntimeResolveProgramGraph(graph);
-    ASSERT_NE(composite, nullptr) << lastError(context);
-    EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(composite), 0u);
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_COTANGENT), 0u);
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_GRADIENT), 0u);
-
-    float source = 3.0f;
-    float output = 0.0f;
-    VernonProgramArgument sourceArgument = tensorArgument(parameter(composite, "source"), source);
-    VernonProgramArgument outputArgument = tensorArgument(parameter(composite, "output"), output);
-    const VernonProgramBindingToken sourceToken = bindingToken("composite-source");
-    const VernonProgramBindingToken outputToken = bindingToken("composite-output");
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(composite);
-    ASSERT_NE(instance, nullptr);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    VernonPullback *compositePullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 1, nullptr), VERNON_STATUS_OK) << lastError(context);
-    EXPECT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, firstNode, &compositePullback),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    compositePullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, &compositePullback), VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_EQ(compositePullback, nullptr);
-    EXPECT_FLOAT_EQ(output, 81.0f);
-
-    VernonPullback *firstPullback = nullptr;
-    VernonPullback *secondPullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, firstNode, &firstPullback), VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, secondNode, &secondPullback), VERNON_STATUS_OK)
-        << lastError(context);
-    ASSERT_NE(firstPullback, nullptr);
-    ASSERT_NE(secondPullback, nullptr);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-
-    VernonProgramParameterView cotangent{};
-    VernonProgramParameterView gradient{};
-    ASSERT_EQ(
-        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0, &cotangent),
-        VERNON_STATUS_OK);
-    ASSERT_EQ(
-        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0, &gradient),
-        VERNON_STATUS_OK);
-    float seed = 1.0f;
-    float intermediateCotangent = 0.0f;
-    VernonProgramArgument secondDerivatives[]{
-        tensorArgument(cotangent, seed),
-        tensorArgument(gradient, intermediateCotangent),
-    };
-    ASSERT_EQ(vernonProgramPullbackApply(secondPullback, secondDerivatives, std::size(secondDerivatives), nullptr),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(intermediateCotangent, 18.0f);
-    float result = 0.0f;
-    VernonProgramArgument firstDerivatives[]{
-        tensorArgument(cotangent, intermediateCotangent),
-        tensorArgument(gradient, result),
-    };
-    ASSERT_EQ(vernonProgramPullbackApply(firstPullback, firstDerivatives, std::size(firstDerivatives), nullptr),
-              VERNON_STATUS_OK)
-        << lastError(context);
-    EXPECT_FLOAT_EQ(result, 108.0f);
-
-    vernonProgramPullbackDestroy(secondPullback);
-    vernonProgramPullbackDestroy(firstPullback);
-    vernonRuntimeProgramInstanceDestroy(instance);
-    vernonRuntimeProgramExecutableDestroy(composite);
-    vernonRuntimeProgramGraphDestroy(graph);
-    vernonRuntimeProgramExecutableDestroy(standalone);
-    vernonRuntimeProgramBundleDestroy(bundle);
+    {
+        const ResolvedProgram program(context, VERNON_MODULE_PROGRAM_MANIFEST);
+        ASSERT_TRUE(program) << lastError(context);
+        VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(context);
+        ASSERT_NE(graph, nullptr);
+        VernonProgramNodeId firstNode = UINT32_MAX;
+        VernonProgramNodeId secondNode = UINT32_MAX;
+        ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, program.bundle(), nullptr, {}, &firstNode),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, program.bundle(), nullptr, {}, &secondNode),
+                  VERNON_STATUS_OK);
+        const auto boundary = [&](VernonProgramNodeId node, VernonProgramBoundaryRole role, const char *name) {
+            VernonProgramNodeBindingToken token{sizeof(VernonProgramNodeBindingToken)};
+            EXPECT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, role, {name, std::strlen(name)}, &token),
+                      VERNON_STATUS_OK);
+            return token;
+        };
+        const VernonProgramNodeBindingToken firstSource = boundary(firstNode, VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const VernonProgramNodeBindingToken firstOutput = boundary(firstNode, VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        const VernonProgramNodeBindingToken secondSource =
+            boundary(secondNode, VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const VernonProgramNodeBindingToken secondOutput =
+            boundary(secondNode, VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        VernonProgramGraphValue intermediate{sizeof(VernonProgramGraphValue)};
+        ASSERT_EQ(vernonRuntimeProgramGraphCreateValue(graph, &firstOutput, &intermediate), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramGraphConnectValue(graph, &intermediate, &secondSource), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &firstSource, {"source", std::strlen("source")}),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &secondOutput, {"output", std::strlen("output")}),
+                  VERNON_STATUS_OK);
+        VernonProgramExecutable *composite = vernonRuntimeResolveProgramGraph(graph);
+        ASSERT_NE(composite, nullptr) << lastError(context);
+        EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(composite), 0u);
+        EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_COTANGENT), 0u);
+        EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_GRADIENT), 0u);
+        {
+            LinkedVjp vjp(context, composite);
+            ASSERT_TRUE(vjp) << vjp.error();
+            HostFloats source({3.0f});
+            HostFloats output({0.0f});
+            HostFloats seed({1.0f});
+            HostFloats gradient({0.0f});
+            vjp.forwardRecord().bind("source", source.view());
+            vjp.forwardRecord().bind("output", output.view());
+            vjp.forwardRecord().bindGrid(1);
+            ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+            EXPECT_FLOAT_EQ(output.values[0], 81.0f);
+            vjp.backwardRecord().bind("output", seed.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+            vjp.backwardRecord().bind("source", gradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+            ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+            EXPECT_FLOAT_EQ(gradient.values[0], 108.0f);
+        }
+        vernonRuntimeProgramExecutableDestroy(composite);
+        vernonRuntimeProgramGraphDestroy(graph);
+    }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_MODULE_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
@@ -578,38 +279,26 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
     vernonRuntimeProgramExecutableDestroy(second);
     EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
 
-    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
-    const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
-    float source = 5.0f;
-    float output = 0.0f;
-    VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
-    VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-    const VernonProgramBindingToken sourceToken = bindingToken("resolve-source-main");
-    const VernonProgramBindingToken outputToken = bindingToken("resolve-output-main");
+    {
+        LinkedProgram linked(context, pipeline);
+        ASSERT_TRUE(linked) << linked.error();
+        HostFloats source({5.0f});
+        HostFloats output({0.0f});
+        linked.record().bind("source", source.view());
+        linked.record().bind("output", output.view());
+        linked.record().bindGrid(1);
+        ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+        EXPECT_FLOAT_EQ(output.values[0], 25.0f);
+    }
 
-    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
-    ASSERT_NE(instance, nullptr);
-    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-    ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK) << lastError(context);
-    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    EXPECT_FLOAT_EQ(output, 25.0f);
-
-    vernonRuntimeProgramInstanceDestroy(instance);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCApi, RejectsLegacyEnvelopeBeforeArtifactIo) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    std::string manifest = readFile(VERNON_MODULE_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     const size_t typeField = manifest.find("\"type\"");
     ASSERT_NE(typeField, std::string::npos);
     const size_t type = manifest.find("\"program\"", typeField);
@@ -627,9 +316,8 @@ TEST(RuntimeModuleProgramCApi, RejectsLegacyEnvelopeBeforeArtifactIo) {
 class RuntimeProgramEnvelopeRejection : public testing::TestWithParam<const char *> {};
 
 TEST_P(RuntimeProgramEnvelopeRejection, RejectsEveryNonProgramTypeBeforeArtifactIo) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    std::string manifest = readFile(VERNON_MODULE_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     const size_t typeField = manifest.find("\"type\"");
     ASSERT_NE(typeField, std::string::npos);
     const size_t type = manifest.find("\"program\"", typeField);
@@ -652,59 +340,10 @@ INSTANTIATE_TEST_SUITE_P(RetiredAndUnknownTypes, RuntimeProgramEnvelopeRejection
                                          "program_manifest", "vernon_program", "native_program", "runtime_program",
                                          "programs", "PROGRAM", " program", "program ", "null", "true", "unknown"));
 
-TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    {
-        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
-        ASSERT_TRUE(assetResult);
-        auto asset = std::move(assetResult).value();
-        auto executableResult = asset.resolve();
-        ASSERT_TRUE(executableResult);
-        auto executable = std::move(executableResult).value();
-        const VernonProgramParameterView sourceParameter = parameter(executable.get(), "source");
-        const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        executable = {};
-
-        float source = 4.0f;
-        float output = 0.0f;
-        const VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
-        const VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
-        const VernonProgramBindingToken sourceToken = bindingToken("cpp-source-main");
-        const VernonProgramBindingToken outputToken = bindingToken("cpp-output-main");
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        ASSERT_TRUE(invocation.bind(sourceToken, sourceArgument, nullptr, sizeof(source), 1));
-        ASSERT_TRUE(invocation.bind(outputToken, outputArgument));
-        ASSERT_TRUE(invocation.execute(false));
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_FLOAT_EQ(output, 16.0f);
-        auto telemetryResult = instance.telemetry();
-        ASSERT_TRUE(telemetryResult);
-        const VernonProgramBindingTelemetry telemetry = telemetryResult.value();
-        EXPECT_EQ(telemetry.prepare_count, 2u);
-        EXPECT_EQ(telemetry.upload_bytes, sizeof(source));
-    }
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
 TEST(RuntimeModuleProgramCppApi, PreservesLoadAndResolveFailureIdentity) {
     static_assert(noexcept(vernon::runtime::ProgramAsset::load(nullptr, nullptr, 0)));
     static_assert(noexcept(std::declval<const vernon::runtime::ProgramAsset &>().resolve()));
     static_assert(noexcept(vernon::runtime::ProgramGraph::create(nullptr)));
-    static_assert(
-        noexcept(vernon::runtime::ProgramInstance::create(std::declval<const vernon::runtime::ProgramExecutable &>())));
-    static_assert(noexcept(std::declval<vernon::runtime::ProgramInstance &>().begin()));
     static_assert(noexcept(std::declval<vernon::runtime::ProgramVariant &>().set(std::string{}, uint32_t{})));
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -891,27 +530,15 @@ TEST(RuntimeModuleProgramCApi, AllocationFailurePublishesExactEmergencyDiagnosti
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeModuleProgramCppApi, ProgramGraphExecutesThroughCanonicalExportedBoundaries) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+TEST(RuntimeModuleProgramCppApi, ProgramGraphDifferentiatesThroughCanonicalExportedBoundaries) {
+    const std::string manifest = readFile(VERNON_MODULE_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
         auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
         ASSERT_TRUE(assetResult);
         auto asset = std::move(assetResult).value();
-        auto standaloneResult = asset.resolve();
-        ASSERT_TRUE(standaloneResult);
-        auto standalone = std::move(standaloneResult).value();
-        VernonProgramParameterView cotangent{};
-        VernonProgramParameterView gradient{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone.get(), VERNON_PROGRAM_BOUNDARY_COTANGENT,
-                                                                   0, &cotangent),
-                  VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone.get(), VERNON_PROGRAM_BOUNDARY_GRADIENT,
-                                                                   0, &gradient),
-                  VERNON_STATUS_OK);
         auto graphResult = vernon::runtime::ProgramGraph::create(context);
         ASSERT_TRUE(graphResult);
         auto graph = std::move(graphResult).value();
@@ -921,98 +548,53 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphExecutesThroughCanonicalExportedBou
         auto secondResult = graph.add(asset);
         ASSERT_TRUE(secondResult);
         const auto second = std::move(secondResult).value();
-        auto firstSourceResult = first.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
-        ASSERT_TRUE(firstSourceResult);
-        const auto firstSource = std::move(firstSourceResult).value();
-        auto firstOutputResult = first.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(firstOutputResult);
-        const auto firstOutput = std::move(firstOutputResult).value();
-        auto secondSourceResult = second.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
-        ASSERT_TRUE(secondSourceResult);
-        const auto secondSource = std::move(secondSourceResult).value();
-        auto secondOutputResult = second.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(secondOutputResult);
-        const auto secondOutput = std::move(secondOutputResult).value();
-        ASSERT_TRUE(graph.exportBoundary(firstSource, "first_source"));
-        ASSERT_TRUE(graph.exportBoundary(firstOutput, "first_output"));
-        ASSERT_TRUE(graph.exportBoundary(secondSource, "second_source"));
-        ASSERT_TRUE(graph.exportBoundary(secondOutput, "second_output"));
+        for (const auto &[node, prefix] : {std::pair{&first, "first"}, std::pair{&second, "second"}}) {
+            auto source = node->boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+            ASSERT_TRUE(source);
+            auto output = node->boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+            ASSERT_TRUE(output);
+            ASSERT_TRUE(graph.exportBoundary(source.value(), std::string(prefix) + "_source"));
+            ASSERT_TRUE(graph.exportBoundary(output.value(), std::string(prefix) + "_output"));
+        }
         auto executableResult = graph.compile();
         ASSERT_TRUE(executableResult);
         auto executable = std::move(executableResult).value();
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        float firstSourceValue = 2.0f;
-        float firstOutputValue = 0.0f;
-        float secondSourceValue = 3.0f;
-        float secondOutputValue = 0.0f;
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        ASSERT_TRUE(invocation.bind(bindingToken("first-source"),
-                                    tensorArgument(parameter(executable.get(), "first_source"), firstSourceValue)));
-        ASSERT_TRUE(invocation.bind(bindingToken("first-output"),
-                                    tensorArgument(parameter(executable.get(), "first_output"), firstOutputValue)));
-        ASSERT_TRUE(invocation.bind(bindingToken("second-source"),
-                                    tensorArgument(parameter(executable.get(), "second_source"), secondSourceValue)));
-        ASSERT_TRUE(invocation.bind(bindingToken("second-output"),
-                                    tensorArgument(parameter(executable.get(), "second_output"), secondOutputValue)));
-        ASSERT_TRUE(invocation.execute(true));
-        auto earlyPullback = invocation.pullback(first);
-        ASSERT_TRUE(earlyPullback.isErr());
-        EXPECT_EQ(earlyPullback.error().code, vernon::RuntimeErrorCode::InvalidArgument);
-        EXPECT_STREQ(earlyPullback.error().context.operation, "ProgramInvocation.pullback");
-        EXPECT_EQ(earlyPullback.error().context.value, 0u);
-        EXPECT_EQ(earlyPullback.error().context.detail, 0u);
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_FLOAT_EQ(firstOutputValue, 4.0f);
-        EXPECT_FLOAT_EQ(secondOutputValue, 9.0f);
-        auto otherGraphResult = vernon::runtime::ProgramGraph::create(context);
-        ASSERT_TRUE(otherGraphResult);
-        auto otherGraph = std::move(otherGraphResult).value();
-        auto foreignNodeResult = otherGraph.add(asset);
-        ASSERT_TRUE(foreignNodeResult);
-        const auto foreignNode = std::move(foreignNodeResult).value();
-        auto foreignPullback = invocation.pullback(foreignNode);
-        ASSERT_TRUE(foreignPullback.isErr());
-        EXPECT_EQ(foreignPullback.error().code, vernon::RuntimeErrorCode::InvalidArgument);
-        EXPECT_STREQ(foreignPullback.error().context.operation, "ProgramInvocation.pullback");
-        EXPECT_EQ(foreignPullback.error().context.value, 0u);
-        EXPECT_EQ(foreignPullback.error().context.detail, 0u);
-        auto firstPullbackResult = invocation.pullback(first);
-        ASSERT_TRUE(firstPullbackResult);
-        auto firstPullback = std::move(firstPullbackResult).value();
-        auto secondPullbackResult = invocation.pullback(second);
-        ASSERT_TRUE(secondPullbackResult);
-        auto secondPullback = std::move(secondPullbackResult).value();
-        float seed = 1.0f;
-        float firstGradient = 0.0f;
-        float secondGradient = 0.0f;
-        VernonProgramArgument firstDerivatives[]{
-            tensorArgument(cotangent, seed),
-            tensorArgument(gradient, firstGradient),
-        };
-        VernonProgramArgument secondDerivatives[]{
-            tensorArgument(cotangent, seed),
-            tensorArgument(gradient, secondGradient),
-        };
-        ASSERT_TRUE(firstPullback.apply(firstDerivatives, std::size(firstDerivatives)));
-        EXPECT_FLOAT_EQ(firstGradient, 4.0f);
-        EXPECT_FLOAT_EQ(secondGradient, 0.0f);
-        ASSERT_TRUE(secondPullback.apply(secondDerivatives, std::size(secondDerivatives)));
-        EXPECT_FLOAT_EQ(firstGradient, 4.0f);
-        EXPECT_FLOAT_EQ(secondGradient, 6.0f);
+
+        LinkedVjp vjp(context, executable.get());
+        ASSERT_TRUE(vjp) << vjp.error();
+        HostFloats firstSource({2.0f});
+        HostFloats firstOutput({0.0f});
+        HostFloats secondSource({3.0f});
+        HostFloats secondOutput({0.0f});
+        vjp.forwardRecord().bind("first_source", firstSource.view());
+        vjp.forwardRecord().bind("first_output", firstOutput.view());
+        vjp.forwardRecord().bind("second_source", secondSource.view());
+        vjp.forwardRecord().bind("second_output", secondOutput.view());
+        vjp.forwardRecord().bindGrid(1);
+        ASSERT_TRUE(vjp.forwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.forward(), VERNON_STATUS_OK) << vjp.error();
+        EXPECT_FLOAT_EQ(firstOutput.values[0], 4.0f);
+        EXPECT_FLOAT_EQ(secondOutput.values[0], 9.0f);
+
+        HostFloats firstSeed({1.0f});
+        HostFloats secondSeed({1.0f});
+        HostFloats firstGradient({0.0f});
+        HostFloats secondGradient({0.0f});
+        vjp.backwardRecord().bind("first_output", firstSeed.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+        vjp.backwardRecord().bind("second_output", secondSeed.view(), VERNON_PROGRAM_BOUNDARY_COTANGENT);
+        vjp.backwardRecord().bind("first_source", firstGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        vjp.backwardRecord().bind("second_source", secondGradient.view(), VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        ASSERT_TRUE(vjp.backwardRecord().unbound().empty());
+        ASSERT_EQ(vjp.backward(), VERNON_STATUS_OK) << vjp.error();
+        EXPECT_FLOAT_EQ(firstGradient.values[0], 4.0f);
+        EXPECT_FLOAT_EQ(secondGradient.values[0], 6.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes) {
-    std::ifstream input(VERNON_TYPED_SPECIALIZATION_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_TYPED_SPECIALIZATION_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
@@ -1045,98 +627,39 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
         auto fourNodeResult = graph.add(asset, four);
         ASSERT_TRUE(fourNodeResult);
         const auto fourNode = std::move(fourNodeResult).value();
-        auto oneBoundaryResult = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(oneBoundaryResult);
-        const auto oneBoundary = std::move(oneBoundaryResult).value();
-        auto fourBoundaryResult = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(fourBoundaryResult);
-        const auto fourBoundary = std::move(fourBoundaryResult).value();
-        auto oneGridXResult = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_x");
-        ASSERT_TRUE(oneGridXResult);
-        const auto oneGridX = std::move(oneGridXResult).value();
-        auto oneGridYResult = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_y");
-        ASSERT_TRUE(oneGridYResult);
-        const auto oneGridY = std::move(oneGridYResult).value();
-        auto oneGridZResult = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_z");
-        ASSERT_TRUE(oneGridZResult);
-        const auto oneGridZ = std::move(oneGridZResult).value();
-        auto fourGridXResult = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_x");
-        ASSERT_TRUE(fourGridXResult);
-        const auto fourGridX = std::move(fourGridXResult).value();
-        auto fourGridYResult = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_y");
-        ASSERT_TRUE(fourGridYResult);
-        const auto fourGridY = std::move(fourGridYResult).value();
-        auto fourGridZResult = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_z");
-        ASSERT_TRUE(fourGridZResult);
-        const auto fourGridZ = std::move(fourGridZResult).value();
-        ASSERT_TRUE(graph.exportBoundary(oneBoundary, "one_output"));
-        ASSERT_TRUE(graph.exportBoundary(fourBoundary, "four_output"));
-        ASSERT_TRUE(graph.exportBoundary(oneGridX, "one_grid_x"));
-        ASSERT_TRUE(graph.exportBoundary(oneGridY, "one_grid_y"));
-        ASSERT_TRUE(graph.exportBoundary(oneGridZ, "one_grid_z"));
-        ASSERT_TRUE(graph.exportBoundary(fourGridX, "four_grid_x"));
-        ASSERT_TRUE(graph.exportBoundary(fourGridY, "four_grid_y"));
-        ASSERT_TRUE(graph.exportBoundary(fourGridZ, "four_grid_z"));
+        for (const auto &[node, prefix] : {std::pair{&oneNode, "one"}, std::pair{&fourNode, "four"}}) {
+            auto output = node->boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+            ASSERT_TRUE(output);
+            ASSERT_TRUE(graph.exportBoundary(output.value(), std::string(prefix) + "_output"));
+            for (const char *axis : {"x", "y", "z"}) {
+                auto grid = node->boundary(VERNON_PROGRAM_BOUNDARY_INPUT, std::string("__grid_") + axis);
+                ASSERT_TRUE(grid);
+                ASSERT_TRUE(graph.exportBoundary(grid.value(), std::string(prefix) + "_grid_" + axis));
+            }
+        }
         auto graphExecutableResult = graph.compile();
         ASSERT_TRUE(graphExecutableResult);
         auto graphExecutable = std::move(graphExecutableResult).value();
-        auto instanceResult = vernon::runtime::ProgramInstance::create(graphExecutable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        float oneValues[1]{};
-        float fourValues[4]{};
-        const uint64_t oneShape[]{1};
-        const uint64_t fourShape[]{4};
-        uint32_t gridExtent = 1;
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        const size_t graphParameterCount = vernonRuntimeProgramExecutableGetParameterCount(graphExecutable.get());
-        const auto bindExport = [&](std::string_view exportName, const auto &makeArgument) {
-            size_t matches = 0;
-            for (size_t index = 0; index < graphParameterCount; ++index) {
-                VernonProgramParameterView reflected{};
-                ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(graphExecutable.get(), index, &reflected),
-                          VERNON_STATUS_OK);
-                if (std::string_view(reflected.name.data, reflected.name.size) != exportName)
-                    continue;
-                const std::string tokenText = std::string(exportName) + "-" + std::to_string(reflected.slot);
-                ASSERT_TRUE(invocation.bind({sizeof(VernonProgramBindingToken), tokenText.data(), tokenText.size()},
-                                            makeArgument(reflected)));
-                ++matches;
-            }
-            ASSERT_GT(matches, 0u);
-        };
-        bindExport("one_output", [&](const VernonProgramParameterView &reflected) {
-            return tensorArrayArgument(reflected, oneValues, oneShape);
-        });
-        bindExport("four_output", [&](const VernonProgramParameterView &reflected) {
-            return tensorArrayArgument(reflected, fourValues, fourShape);
-        });
+
+        LinkedProgram linked(context, graphExecutable.get());
+        ASSERT_TRUE(linked) << linked.error();
+        HostFloats oneValues{std::vector<float>(1)};
+        HostFloats fourValues{std::vector<float>(4)};
+        linked.record().bind("one_output", oneValues.view());
+        linked.record().bind("four_output", fourValues.view());
         for (const char *name : {"one_grid_x", "one_grid_y", "one_grid_z", "four_grid_x", "four_grid_y", "four_grid_z"})
-            bindExport(name, [&](const VernonProgramParameterView &reflected) {
-                return scalarArgument(reflected, gridExtent);
-            });
-        ASSERT_TRUE(invocation.execute(false));
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_FLOAT_EQ(oneValues[0], 1.0f);
-        EXPECT_FLOAT_EQ(fourValues[0], 4.0f);
-        auto pullbackResult = invocation.pullback(oneNode);
-        ASSERT_TRUE(pullbackResult.isErr());
-        EXPECT_EQ(pullbackResult.error().code, vernon::RuntimeErrorCode::InvalidArgument);
-        EXPECT_STREQ(pullbackResult.error().context.operation, "ProgramInvocation.pullback");
-        EXPECT_EQ(pullbackResult.error().context.value, 0u);
-        EXPECT_EQ(pullbackResult.error().context.detail, 0u);
+            linked.record().bindScalar<uint32_t>(name, 1);
+        ASSERT_TRUE(linked.record().unbound().empty());
+        ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+        EXPECT_FLOAT_EQ(oneValues.values[0], 1.0f);
+        EXPECT_FLOAT_EQ(fourValues.values[0], 4.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCppApi, ParamsLeavesBindAcrossTypedVariants) {
-    std::ifstream input(VERNON_PARAMS_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_PARAMS_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
@@ -1153,63 +676,36 @@ TEST(RuntimeModuleProgramCppApi, ParamsLeavesBindAcrossTypedVariants) {
             VernonProgramParameterView group{};
             EXPECT_NE(vernonRuntimeProgramExecutableFindParameter(executable.get(), {"terms", 5}, &group),
                       VERNON_STATUS_OK);
-            const VernonProgramParameterView gainParameter = parameter(executable.get(), "terms.gain");
-            const VernonProgramParameterView weightsParameter = parameter(executable.get(), "terms.lookup.weights");
             const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
             ASSERT_EQ(outputParameter.rank, 1u);
             EXPECT_EQ(outputParameter.static_shape[0], static_cast<int64_t>(extent));
-            VernonProgramParameterView publishedOutputParameter{};
-            ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT,
-                                                                       0, &publishedOutputParameter),
-                      VERNON_STATUS_OK);
-            std::array<VernonProgramParameterView, 3> gridParameters{
-                parameter(executable.get(), "__grid_x"),
-                parameter(executable.get(), "__grid_y"),
-                parameter(executable.get(), "__grid_z"),
-            };
-            auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-            ASSERT_TRUE(instanceResult);
-            auto instance = std::move(instanceResult).value();
-            std::vector<float> weights(extent);
+
+            LinkedProgram linked(context, executable.get());
+            ASSERT_TRUE(linked) << linked.error();
+            std::vector<float> weightValues(extent);
             for (uint32_t index = 0; index < extent; ++index)
-                weights[index] = static_cast<float>(index + 1);
-            std::vector<float> output(extent);
-            const uint64_t shape[]{extent};
-            float gain = 3.0f;
-            uint32_t gridX = extent;
-            uint32_t one = 1;
-            std::array<VernonProgramArgument, 7> arguments{
-                scalarArgument(gainParameter, gain),
-                tensorArrayArgument(weightsParameter, weights.data(), shape),
-                tensorArrayArgument(outputParameter, output.data(), shape),
-                tensorArrayArgument(publishedOutputParameter, output.data(), shape),
-                scalarArgument(gridParameters[0], gridX),
-                scalarArgument(gridParameters[1], one),
-                scalarArgument(gridParameters[2], one),
-            };
-            auto invocationResult = instance.begin();
-            ASSERT_TRUE(invocationResult);
-            auto invocation = std::move(invocationResult).value();
-            for (size_t index = 0; index < arguments.size(); ++index) {
-                const std::string text = "binding-group-" + std::to_string(extent) + "-" + std::to_string(index);
-                ASSERT_TRUE(
-                    invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
-            }
-            ASSERT_TRUE(invocation.execute(false));
-            auto commitResult = invocation.commit();
-            ASSERT_TRUE(commitResult);
-            EXPECT_FALSE(commitResult.value());
+                weightValues[index] = static_cast<float>(index + 1);
+            HostFloats weights(weightValues);
+            HostFloats output{std::vector<float>(extent)};
+            constexpr float gain = 3.0f;
+            linked.record().bindScalar("terms.gain", gain);
+            linked.record().bind("terms.lookup.weights", weights.view());
+            linked.record().bind("output", output.view());
+            if (const std::string published = publishedOutput(executable.get()); published != "output")
+                linked.record().bind(published, output.view());
+            linked.record().bindGrid(extent);
+            ASSERT_TRUE(linked.record().unbound().empty());
+            ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
             for (uint32_t index = 0; index < extent; ++index)
-                EXPECT_FLOAT_EQ(output[index], weights[index] * gain + static_cast<float>(extent));
+                EXPECT_FLOAT_EQ(output.values[index], weightValues[index] * gain + static_cast<float>(extent));
         }
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCppApi, TypeVariantsSelectParamsValuesByIdentity) {
-    std::ifstream input(VERNON_TYPE_SPECIALIZATION_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_TYPE_SPECIALIZATION_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
@@ -1244,55 +740,32 @@ TEST(RuntimeModuleProgramCppApi, TypeVariantsSelectParamsValuesByIdentity) {
                                        executable.get(), {"material.offset", 15}, &offsetParameter) == VERNON_STATUS_OK;
             ASSERT_EQ(hasOffset, material.glossy);
 
-            std::vector<VernonProgramArgument> arguments;
-            float gain = 3.0f;
-            float offset = 0.5f;
-            std::array<float, extent> weights{1.0f, 2.0f, 4.0f};
-            std::array<float, extent> output{};
-            const uint64_t shape[]{extent};
-            uint32_t gridX = extent;
-            uint32_t one = 1;
-            arguments.push_back(scalarArgument(parameter(executable.get(), "material.gain"), gain));
+            LinkedProgram linked(context, executable.get());
+            ASSERT_TRUE(linked) << linked.error();
+            constexpr float gain = 3.0f;
+            constexpr float offset = 0.5f;
+            HostFloats weights({1.0f, 2.0f, 4.0f});
+            HostFloats output{std::vector<float>(extent)};
+            linked.record().bindScalar("material.gain", gain);
             if (material.glossy)
-                arguments.push_back(scalarArgument(offsetParameter, offset));
-            arguments.push_back(
-                tensorArrayArgument(parameter(executable.get(), "material.lookup.weights"), weights.data(), shape));
-            arguments.push_back(tensorArrayArgument(parameter(executable.get(), "output"), output.data(), shape));
-            VernonProgramParameterView publishedOutputParameter{};
-            ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT,
-                                                                       0, &publishedOutputParameter),
-                      VERNON_STATUS_OK);
-            arguments.push_back(tensorArrayArgument(publishedOutputParameter, output.data(), shape));
-            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_x"), gridX));
-            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_y"), one));
-            arguments.push_back(scalarArgument(parameter(executable.get(), "__grid_z"), one));
-
-            auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-            ASSERT_TRUE(instanceResult);
-            auto instance = std::move(instanceResult).value();
-            auto invocationResult = instance.begin();
-            ASSERT_TRUE(invocationResult);
-            auto invocation = std::move(invocationResult).value();
-            for (size_t index = 0; index < arguments.size(); ++index) {
-                const std::string text = std::string(material.identity) + "-" + std::to_string(index);
-                ASSERT_TRUE(
-                    invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
-            }
-            ASSERT_TRUE(invocation.execute(false));
-            auto commitResult = invocation.commit();
-            ASSERT_TRUE(commitResult);
-            EXPECT_FALSE(commitResult.value());
+                linked.record().bindScalar("material.offset", offset);
+            linked.record().bind("material.lookup.weights", weights.view());
+            linked.record().bind("output", output.view());
+            if (const std::string published = publishedOutput(executable.get()); published != "output")
+                linked.record().bind(published, output.view());
+            linked.record().bindGrid(extent);
+            ASSERT_TRUE(linked.record().unbound().empty());
+            ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
             for (uint32_t index = 0; index < extent; ++index)
-                EXPECT_FLOAT_EQ(output[index], weights[index] * gain + (material.glossy ? offset : 0.0f));
+                EXPECT_FLOAT_EQ(output.values[index], weights.values[index] * gain + (material.glossy ? offset : 0.0f));
         }
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeModuleProgramCApi, TypeSpecializationSelectorRequiresAnIdentity) {
-    std::ifstream input(VERNON_TYPE_SPECIALIZATION_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_TYPE_SPECIALIZATION_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     VernonProgramBundle *bundle =
@@ -1321,9 +794,8 @@ TEST(RuntimeModuleProgramCApi, TypeSpecializationSelectorRequiresAnIdentity) {
 }
 
 TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
-    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
-    ASSERT_TRUE(input);
-    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string manifest = readFile(VERNON_MODULE_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
@@ -1339,252 +811,33 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
         auto consumerResult = graph.add(asset);
         ASSERT_TRUE(consumerResult);
         const auto consumer = std::move(consumerResult).value();
-        auto producerSourceResult = producer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
-        ASSERT_TRUE(producerSourceResult);
-        const auto producerSource = std::move(producerSourceResult).value();
-        auto producerOutputResult = producer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(producerOutputResult);
-        const auto producerOutput = std::move(producerOutputResult).value();
-        auto consumerSourceResult = consumer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
-        ASSERT_TRUE(consumerSourceResult);
-        const auto consumerSource = std::move(consumerSourceResult).value();
-        auto consumerOutputResult = consumer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
-        ASSERT_TRUE(consumerOutputResult);
-        const auto consumerOutput = std::move(consumerOutputResult).value();
-        auto valueResult = graph.createValue(producerOutput);
+        auto producerSource = producer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        ASSERT_TRUE(producerSource);
+        auto producerOutput = producer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        ASSERT_TRUE(producerOutput);
+        auto consumerSource = consumer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        ASSERT_TRUE(consumerSource);
+        auto consumerOutput = consumer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        ASSERT_TRUE(consumerOutput);
+        auto valueResult = graph.createValue(producerOutput.value());
         ASSERT_TRUE(valueResult);
-        ASSERT_TRUE(graph.connect(std::move(valueResult).value(), consumerSource));
-        ASSERT_TRUE(graph.exportBoundary(producerSource, "source"));
-        ASSERT_TRUE(graph.exportBoundary(consumerOutput, "output"));
+        ASSERT_TRUE(graph.connect(std::move(valueResult).value(), consumerSource.value()));
+        ASSERT_TRUE(graph.exportBoundary(producerSource.value(), "source"));
+        ASSERT_TRUE(graph.exportBoundary(consumerOutput.value(), "output"));
         auto executableResult = graph.compile();
         ASSERT_TRUE(executableResult);
         auto executable = std::move(executableResult).value();
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        float source = 2.0f;
-        float output = 0.0f;
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        ASSERT_TRUE(
-            invocation.bind(bindingToken("source"), tensorArgument(parameter(executable.get(), "source"), source)));
-        ASSERT_TRUE(
-            invocation.bind(bindingToken("output"), tensorArgument(parameter(executable.get(), "output"), output)));
-        ASSERT_TRUE(invocation.execute(false));
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_FLOAT_EQ(output, 16.0f);
-        auto pullbackResult = invocation.pullback(producer);
-        ASSERT_TRUE(pullbackResult.isErr());
-        EXPECT_EQ(pullbackResult.error().code, vernon::RuntimeErrorCode::InvalidArgument);
-        EXPECT_STREQ(pullbackResult.error().context.operation, "ProgramInvocation.pullback");
-        EXPECT_EQ(pullbackResult.error().context.value, 0u);
-        EXPECT_EQ(pullbackResult.error().context.detail, 0u);
-    }
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
 
-TEST(RuntimeModuleProgramCpuMatrix, ReusesOneStageAcrossDifferentNodeProjections) {
-    const std::string manifest = fixtureManifest("reused_stage");
-    ASSERT_FALSE(manifest.empty());
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    {
-        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
-        ASSERT_TRUE(assetResult);
-        auto asset = std::move(assetResult).value();
-        auto executableResult = asset.resolve();
-        ASSERT_TRUE(executableResult);
-        auto executable = std::move(executableResult).value();
-        std::array<float, 4> source{1, 2, 3, 4};
-        std::array<float, 4> output{};
-        const uint64_t shape[]{source.size()};
-        uint32_t gridX = 4;
-        uint32_t gridY = 1;
-        uint32_t gridZ = 1;
-        std::array<VernonProgramArgument, 5> arguments{
-            tensorArrayArgument(parameter(executable.get(), "source"), source.data(), shape),
-            tensorArrayArgument(parameter(executable.get(), "output"), output.data(), shape),
-            scalarArgument(parameter(executable.get(), "grid_x"), gridX),
-            scalarArgument(parameter(executable.get(), "grid_y"), gridY),
-            scalarArgument(parameter(executable.get(), "grid_z"), gridZ),
-        };
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        for (size_t index = 0; index < arguments.size(); ++index) {
-            const std::string text = "cpu-reused-stage-" + std::to_string(index);
-            ASSERT_TRUE(
-                invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
-        }
-        ASSERT_TRUE(invocation.execute(false));
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_EQ(output, (std::array<float, 4>{3, 4, 5, 6}));
-    }
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeModuleProgramCpuMatrix, ChainsDistinctComputeKernelsThroughTensorViews) {
-    const std::string manifest = fixtureManifest("tensor_view_chain");
-    ASSERT_FALSE(manifest.empty());
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    {
-        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
-        ASSERT_TRUE(assetResult);
-        auto asset = std::move(assetResult).value();
-        auto executableResult = asset.resolve();
-        ASSERT_TRUE(executableResult);
-        auto executable = std::move(executableResult).value();
-        float source = 3.0f;
-        float output = 0.0f;
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        auto invocationResult = instance.begin();
-        ASSERT_TRUE(invocationResult);
-        auto invocation = std::move(invocationResult).value();
-        ASSERT_TRUE(invocation.bind(bindingToken("cpu-tensor-chain-source"),
-                                    tensorArgument(parameter(executable.get(), "source"), source)));
-        ASSERT_TRUE(invocation.bind(bindingToken("cpu-tensor-chain-output"),
-                                    tensorArgument(parameter(executable.get(), "output"), output)));
-        ASSERT_TRUE(invocation.execute(false));
-        auto commitResult = invocation.commit();
-        ASSERT_TRUE(commitResult);
-        EXPECT_FALSE(commitResult.value());
-        EXPECT_FLOAT_EQ(output, 8.0f);
-    }
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeModuleProgramCpuMatrix, TimesEachComputeNodeOnTheHostClock) {
-    const std::string manifest = fixtureManifest("tensor_view_chain");
-    ASSERT_FALSE(manifest.empty());
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    {
-        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
-        ASSERT_TRUE(assetResult);
-        auto executableResult = assetResult.value().resolve();
-        ASSERT_TRUE(executableResult);
-        auto executable = std::move(executableResult).value();
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        for (const bool timings : {false, true}) {
-            float source = 3.0f;
-            float output = 0.0f;
-            auto invocationResult = instance.begin();
-            ASSERT_TRUE(invocationResult);
-            auto invocation = std::move(invocationResult).value();
-            ASSERT_TRUE(invocation.setOptions({VERNON_COMPLETION_WAIT, timings}));
-            ASSERT_TRUE(invocation.bind(bindingToken("cpu-timed-source"),
-                                        tensorArgument(parameter(executable.get(), "source"), source)));
-            ASSERT_TRUE(invocation.bind(bindingToken("cpu-timed-output"),
-                                        tensorArgument(parameter(executable.get(), "output"), output)));
-            ASSERT_TRUE(invocation.execute(false));
-            ASSERT_TRUE(invocation.commit());
-            auto submission = invocation.takeSubmission();
-            ASSERT_TRUE(submission);
-            auto scopes = submission.value().scopeTimings();
-            ASSERT_TRUE(scopes);
-            if (!timings) {
-                EXPECT_TRUE(scopes.value().empty());
-                continue;
-            }
-            ASSERT_EQ(scopes.value().size(), 2u);
-            EXPECT_EQ(scopes.value()[0].begin_nanoseconds, 0u);
-            for (size_t index = 0; index < scopes.value().size(); ++index) {
-                const VernonScopeTiming &scope = scopes.value()[index];
-                EXPECT_EQ(scope.first_node, index);
-                EXPECT_EQ(scope.node_count, 1u);
-                EXPECT_EQ(scope.device_submission, 0u);
-                EXPECT_LE(scope.begin_nanoseconds, scope.end_nanoseconds);
-                if (index)
-                    EXPECT_GE(scope.begin_nanoseconds, scopes.value()[index - 1].end_nanoseconds);
-            }
-        }
-    }
-    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
-}
-
-TEST(RuntimeModuleProgramCpuMatrix, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    const std::string manifest = fixtureManifest("dynamic_shape_grid");
-    ASSERT_FALSE(manifest.empty());
-    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(context, nullptr);
-    {
-        auto assetResult = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
-        ASSERT_TRUE(assetResult);
-        auto asset = std::move(assetResult).value();
-        auto executableResult = asset.resolve();
-        ASSERT_TRUE(executableResult);
-        auto executable = std::move(executableResult).value();
-        const VernonProgramParameterView sourceParameter = parameter(executable.get(), "source");
-        const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
-        VernonProgramParameterView publishedOutputParameter{};
-        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT, 0,
-                                                                   &publishedOutputParameter),
-                  VERNON_STATUS_OK);
-        const VernonProgramParameterView factorParameter = parameter(executable.get(), "factor");
-        std::array<VernonProgramParameterView, 3> gridParameters{
-            parameter(executable.get(), "__grid_x"),
-            parameter(executable.get(), "__grid_y"),
-            parameter(executable.get(), "__grid_z"),
-        };
-        auto instanceResult = vernon::runtime::ProgramInstance::create(executable);
-        ASSERT_TRUE(instanceResult);
-        auto instance = std::move(instanceResult).value();
-        constexpr std::array<size_t, 2> counts{3, 5};
-        constexpr std::array<float, 2> factors{2, 3};
-        uint32_t one = 1;
-        for (size_t iteration = 0; iteration < counts.size(); ++iteration) {
-            const size_t count = counts[iteration];
-            std::vector<float> source(count);
-            for (size_t index = 0; index < count; ++index)
-                source[index] = static_cast<float>(index + 1);
-            std::vector<float> output(count);
-            const uint64_t shape[]{count};
-            uint32_t gridX = static_cast<uint32_t>(count);
-            float factor = factors[iteration];
-            std::array<VernonProgramArgument, 7> arguments{
-                tensorArrayArgument(sourceParameter, source.data(), shape),
-                tensorArrayArgument(outputParameter, output.data(), shape),
-                tensorArrayArgument(publishedOutputParameter, output.data(), shape),
-                scalarArgument(factorParameter, factor),
-                scalarArgument(gridParameters[0], gridX),
-                scalarArgument(gridParameters[1], one),
-                scalarArgument(gridParameters[2], one),
-            };
-            auto invocationResult = instance.begin();
-            ASSERT_TRUE(invocationResult);
-            auto invocation = std::move(invocationResult).value();
-            for (size_t index = 0; index < arguments.size(); ++index) {
-                const std::string text = index >= 5
-                                             ? "cpu-dynamic-stable-" + std::to_string(index)
-                                             : "cpu-dynamic-" + std::to_string(iteration) + "-" + std::to_string(index);
-                ASSERT_TRUE(
-                    invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]));
-            }
-            ASSERT_TRUE(invocation.execute(false));
-            auto commitResult = invocation.commit();
-            ASSERT_TRUE(commitResult);
-            EXPECT_FALSE(commitResult.value());
-            for (size_t index = 0; index < count; ++index)
-                EXPECT_FLOAT_EQ(output[index], source[index] * factor);
-        }
-        auto telemetryResult = instance.telemetry();
-        ASSERT_TRUE(telemetryResult);
-        const VernonProgramBindingTelemetry telemetry = telemetryResult.value();
-        EXPECT_EQ(telemetry.prepare_count, 12u);
-        EXPECT_EQ(telemetry.reuse_count, 2u);
+        LinkedProgram linked(context, executable.get());
+        ASSERT_TRUE(linked) << linked.error();
+        HostFloats source({2.0f});
+        HostFloats output({0.0f});
+        linked.record().bind("source", source.view());
+        linked.record().bind("output", output.view());
+        linked.record().bindGrid(1);
+        ASSERT_TRUE(linked.record().unbound().empty());
+        ASSERT_EQ(linked.call(), VERNON_STATUS_OK) << linked.error();
+        EXPECT_FLOAT_EQ(output.values[0], 16.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

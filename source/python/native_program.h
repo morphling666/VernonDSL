@@ -4,7 +4,7 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
 #include "compiler_python_bridge.h"
-#include "native_rhi.h"
+#include "native_hal.h"
 #include "runtime/tensor_bridge.h"
 
 #include <nanobind/nanobind.h>
@@ -131,7 +131,8 @@ std::string specializeKernelHostConstants(const std::string &moduleText, const s
                                           const std::vector<std::string> &names, const nb::list &values);
 
 struct RuntimeState;
-RhiHostState *runtimeRhiHost(const RuntimeState *runtime);
+// Whether the runtime's device is a GPU, whose Tensors live in device buffers rather than host arrays.
+bool runtimeOnDevice(const RuntimeState *runtime);
 struct CompiledProgram;
 struct PythonProgramExecutable;
 struct ProgramInvocationBuilder;
@@ -234,6 +235,9 @@ struct ProgramParameterMetadata {
 
 ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &view);
 
+// The metadata of the parameter or boundary an invocation argument with `slot` binds.
+ProgramParameterMetadata slotParameterMetadata(VernonProgramExecutable *executable, uint32_t slot);
+
 struct PreparedProgramArgument {
     PreparedProgramArgument() = default;
     PreparedProgramArgument(const PreparedProgramArgument &other)
@@ -288,39 +292,7 @@ struct ProgramInvocationBuilder {
         }
         if (!nb::isinstance<nb::int_>(identifier))
             throw std::invalid_argument("executable parameter must be a name or slot");
-        const uint32_t slot = nb::cast<uint32_t>(identifier);
-        const VernonProgramBoundaryRole roles[] = {
-            VERNON_PROGRAM_BOUNDARY_INPUT,
-            VERNON_PROGRAM_BOUNDARY_OUTPUT,
-            VERNON_PROGRAM_BOUNDARY_COTANGENT,
-            VERNON_PROGRAM_BOUNDARY_GRADIENT,
-        };
-        for (VernonProgramBoundaryRole role : roles) {
-            const size_t boundaryCount = vernonRuntimeProgramExecutableGetBoundaryCount(executable, role);
-            for (size_t index = 0; index < boundaryCount; ++index)
-                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(executable, role, index, &view) ==
-                        VERNON_STATUS_OK &&
-                    view.slot == slot && view.kind != VERNON_PROGRAM_IMAGE)
-                    return parameterMetadata(view);
-        }
-        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(executable);
-        for (size_t index = 0; index < count; ++index) {
-            if (vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &view) == VERNON_STATUS_OK &&
-                view.slot == slot) {
-                ProgramParameterMetadata metadata = parameterMetadata(view);
-                if (view.kind == VERNON_PROGRAM_IMAGE) {
-                    VernonProgramImageConstraintView constraint{};
-                    constraint.struct_size = sizeof(constraint);
-                    if (vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
-                            executable, index, &constraint) != VERNON_STATUS_OK)
-                        throw std::runtime_error("cannot query executable image constraint");
-                    metadata.imageBindingRole = constraint.binding_role;
-                    metadata.storageImageFormat = constraint.storage_format;
-                }
-                return metadata;
-            }
-        }
-        throw std::invalid_argument("unknown executable parameter slot " + std::to_string(slot));
+        return slotParameterMetadata(executable, nb::cast<uint32_t>(identifier));
     }
 
     std::unique_ptr<PreparedProgramArgument> createArgument(const ProgramParameterMetadata &parameter,
@@ -347,6 +319,16 @@ struct ProgramInvocationBuilder {
         if (!slots.insert(prepared.value.slot).second)
             throw std::invalid_argument("executable parameter was already bound");
         arguments.push_back(&prepared);
+        return *this;
+    }
+
+    // An argument a prepare* call returned, which the builder holds for as long as it lives.
+    ProgramInvocationBuilder &argument(nb::object prepared) {
+        auto *value = nb::cast<PreparedProgramArgument *>(prepared);
+        if (!value)
+            throw std::invalid_argument("prepared argument is null");
+        preparedArgument(*value);
+        preparedOwners.push_back(std::move(prepared));
         return *this;
     }
 
@@ -446,11 +428,23 @@ struct ProgramInvocationBuilder {
         return prepared;
     }
 
-    std::unique_ptr<PreparedProgramArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
-                                                              uint32_t access, const std::vector<uint64_t> &shape,
-                                                              const std::vector<int64_t> &strides, size_t offset) {
+    // A resource of another device would be referenced on that device's runtime, so it is refused before.
+    void requireRuntimeDevice(VernonHalDevice *device, const char *resource) const {
+        if (vernonHalDeviceGetRuntime(device) != runtime)
+            throw std::invalid_argument(std::string(resource) + " belongs to another Runtime device");
+    }
+
+    static void requireReference(VernonHalStatus status, const char *resource) {
+        if (status != VERNON_HAL_OK)
+            throw std::invalid_argument(std::string("cannot reference the ") + resource + ": " + halError());
+    }
+
+    std::unique_ptr<PreparedProgramArgument> prepareDeviceTensor(const nb::object &identifier, HalBuffer *buffer,
+                                                                 uint32_t access, const std::vector<uint64_t> &shape,
+                                                                 const std::vector<int64_t> &strides, size_t offset) {
         if (!buffer || shape.size() != strides.size())
-            throw std::invalid_argument("RHI Tensor shape and strides must have equal rank");
+            throw std::invalid_argument("device Tensor shape and strides must have equal rank");
+        requireRuntimeDevice(buffer->host->device, "the device Tensor's buffer");
         const ProgramParameterMetadata parameter = resolveParameter(identifier);
         auto prepared = createArgument(parameter, VERNON_PROGRAM_TENSOR);
         PreparedProgramArgument &argument = *prepared;
@@ -459,9 +453,8 @@ struct ProgramInvocationBuilder {
         argument.strides = strides;
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
         argument.value.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-        if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, 0, buffer->size,
-                                            &argument.value.tensor.resource) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI buffer belongs to another Runtime device");
+        requireReference(vernonHalReferenceBuffer(buffer->handle, 0, buffer->size, &argument.value.tensor.resource),
+                         "buffer");
         argument.value.tensor.access = static_cast<VernonValueAccess>(access);
         argument.value.tensor.rank = static_cast<uint32_t>(shape.size());
         argument.value.tensor.shape = argument.shape.empty() ? nullptr : argument.shape.data();
@@ -470,57 +463,57 @@ struct ProgramInvocationBuilder {
         argument.value.tensor.byte_size = buffer->size;
         if (argument.value.tensor.access != VERNON_ACCESS_READ &&
             !vernon::runtime::tensorByteLayoutInjective(argument.value.tensor))
-            throw std::invalid_argument("writable RHI Tensor must have an internally injective layout");
+            throw std::invalid_argument("writable device Tensor must have an internally injective layout");
         return prepared;
     }
 
-    std::unique_ptr<PreparedProgramArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
+    std::unique_ptr<PreparedProgramArgument> prepareDeviceTexture(const nb::object &identifier, HalImageView *view) {
         const ProgramParameterMetadata parameter = resolveParameter(identifier);
         const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
-        const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE
+        const uint32_t requiredUsage = storage ? VERNON_IMAGE_STORAGE
                                        : parameter.imageBindingRole == VERNON_IMAGE_BINDING_COLOR_ATTACHMENT
-                                           ? VERNON_RHI_IMAGE_COLOR_ATTACHMENT
+                                           ? VERNON_IMAGE_COLOR_ATTACHMENT
                                        : parameter.imageBindingRole == VERNON_IMAGE_BINDING_DEPTH_STENCIL_ATTACHMENT
-                                           ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                                           : VERNON_RHI_IMAGE_SAMPLED;
+                                           ? VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                                           : VERNON_IMAGE_SAMPLED;
         if (!view || !(view->image->usage & requiredUsage))
-            throw std::invalid_argument("RHI texture usage does not match the executable parameter");
+            throw std::invalid_argument("device texture usage does not match the executable parameter");
         if (storage && view->format != parameter.storageImageFormat)
-            throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
+            throw std::invalid_argument("device texture format does not match the storage texture parameter");
+        requireRuntimeDevice(view->host->device, "the device texture");
         auto prepared = createArgument(parameter, VERNON_PROGRAM_IMAGE);
         PreparedProgramArgument &argument = *prepared;
         argument.owner = nb::cast(view, nb::rv_policy::reference);
-        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &argument.value.image.view) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI image view belongs to another Runtime device");
+        requireReference(vernonHalReferenceImageView(view->handle, &argument.value.image.view), "image view");
         return prepared;
     }
 
-    std::unique_ptr<PreparedProgramArgument> prepareRhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+    std::unique_ptr<PreparedProgramArgument> prepareDeviceSampler(const nb::object &identifier, HalSampler *sampler) {
         if (!sampler)
-            throw std::invalid_argument("RHI sampler is null");
+            throw std::invalid_argument("device sampler is null");
+        requireRuntimeDevice(sampler->host->device, "the device sampler");
         const ProgramParameterMetadata parameter = resolveParameter(identifier);
         auto prepared = createArgument(parameter, VERNON_PROGRAM_SAMPLER);
         PreparedProgramArgument &argument = *prepared;
         argument.owner = nb::cast(sampler, nb::rv_policy::reference);
-        if (vernonRuntimeReferenceRhiSampler(runtime, sampler->handle, &argument.value.resource) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI sampler belongs to another Runtime device");
+        requireReference(vernonHalReferenceSampler(sampler->handle, &argument.value.resource), "sampler");
         return prepared;
     }
 
-    ProgramInvocationBuilder &rhiColorAttachment(uint32_t location, const nb::object &viewObject,
-                                                 uint32_t loadOperation, uint32_t storeOperation,
-                                                 const nb::list &clearColor) {
-        auto *view = nb::cast<RhiImageView *>(viewObject);
+    ProgramInvocationBuilder &colorAttachment(uint32_t location, const nb::object &viewObject, uint32_t loadOperation,
+                                              uint32_t storeOperation, const nb::list &clearColor) {
+        auto *view = nb::cast<HalImageView *>(viewObject);
         if (!view)
-            throw std::invalid_argument("RHI color attachment is null");
+            throw std::invalid_argument("color attachment is null");
         const vernon::formats::Format *format = vernon::formats::find(view->format);
-        if (!format || vernon::formats::hasDepth(view->format) ||
-            !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT))
-            throw std::invalid_argument("RHI color attachment must be a color-attachment view with a color format");
-        if (loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
-            throw std::invalid_argument("RHI color attachment has an invalid load or store operation");
+        if (!format || vernon::formats::hasDepth(view->format) || !(view->image->usage & VERNON_IMAGE_COLOR_ATTACHMENT))
+            throw std::invalid_argument("color attachment must be a color-attachment view with a color format");
+        if (loadOperation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            storeOperation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
+            throw std::invalid_argument("color attachment has an invalid load or store operation");
         if (nb::len(clearColor) != 4)
-            throw std::invalid_argument("RHI color clear value must have four components");
+            throw std::invalid_argument("color clear value must have four components");
+        requireRuntimeDevice(view->host->device, "the color attachment");
         VernonColorAttachment attachment{};
         const vernon::formats::ComponentClass componentClass = format->componentClass;
         for (size_t index = 0; index < 4; ++index) {
@@ -532,8 +525,7 @@ struct ProgramInvocationBuilder {
                 attachment.clear_color.f32[index] = nb::cast<float>(clearColor[index]);
         }
         attachment.location = location;
-        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &attachment.view) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI color attachment belongs to another Runtime device");
+        requireReference(vernonHalReferenceImageView(view->handle, &attachment.view), "color attachment");
         attachment.load_operation = static_cast<VernonRuntimeProviderLoadOperation>(loadOperation);
         attachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         attachments.push_back(attachment);
@@ -541,22 +533,21 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
-    ProgramInvocationBuilder &rhiDepthAttachment(const nb::object &viewObject, uint32_t loadOperation,
-                                                 uint32_t storeOperation, float clearDepth) {
-        auto *view = nb::cast<RhiImageView *>(viewObject);
+    ProgramInvocationBuilder &depthAttachmentBinding(const nb::object &viewObject, uint32_t loadOperation,
+                                                     uint32_t storeOperation, float clearDepth) {
+        auto *view = nb::cast<HalImageView *>(viewObject);
         if (!view)
-            throw std::invalid_argument("RHI depth attachment is null");
-        if (!(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            !vernon::formats::hasDepth(view->format))
-            throw std::invalid_argument(
-                "RHI depth attachment must be a depth-stencil-attachment view with a depth format");
-        if (loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
-            throw std::invalid_argument("RHI depth attachment has an invalid load or store operation");
+            throw std::invalid_argument("depth attachment is null");
+        if (!(view->image->usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT) || !vernon::formats::hasDepth(view->format))
+            throw std::invalid_argument("depth attachment must be a depth-stencil-attachment view with a depth format");
+        if (loadOperation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            storeOperation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
+            throw std::invalid_argument("depth attachment has an invalid load or store operation");
         if (clearDepth < 0.0f || clearDepth > 1.0f)
-            throw std::invalid_argument("RHI depth clear value must be in [0, 1]");
+            throw std::invalid_argument("depth clear value must be in [0, 1]");
+        requireRuntimeDevice(view->host->device, "the depth attachment");
         depthAttachment = {};
-        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &depthAttachment.view) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI depth attachment belongs to another Runtime device");
+        requireReference(vernonHalReferenceImageView(view->handle, &depthAttachment.view), "depth attachment");
         depthAttachment.load_operation = static_cast<VernonRuntimeProviderLoadOperation>(loadOperation);
         depthAttachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         depthAttachment.clear_depth = clearDepth;
@@ -565,14 +556,14 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
-    ProgramInvocationBuilder &rhiIndexBinding(const nb::object &bufferObject, uint32_t count, size_t offset) {
-        auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+    ProgramInvocationBuilder &indexBinding(const nb::object &bufferObject, uint32_t count, size_t offset) {
+        auto *buffer = nb::cast<HalBuffer *>(bufferObject);
         if (!buffer || offset > buffer->size)
-            throw std::invalid_argument("RHI index buffer is null");
+            throw std::invalid_argument("index buffer is null or its offset is past its end");
+        requireRuntimeDevice(buffer->host->device, "the index buffer");
         index = {};
-        if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, offset, buffer->size - offset, &index.resource) !=
-            VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI index buffer belongs to another Runtime device");
+        requireReference(vernonHalReferenceBuffer(buffer->handle, offset, buffer->size - offset, &index.resource),
+                         "index buffer");
         index.type = VERNON_INDEX_U32;
         index.offset = offset;
         index.index_count = count;
@@ -703,6 +694,7 @@ struct ProgramInvocationBuilder {
     VernonProgramExecutable *executable{};
     std::vector<PreparedProgramArgument *> arguments;
     std::vector<std::unique_ptr<PreparedProgramArgument>> ownedArguments;
+    std::vector<nb::object> preparedOwners;
     std::unordered_set<uint32_t> slots;
     std::vector<VernonColorAttachment> attachments;
     std::vector<nb::object> renderResourceOwners;
@@ -723,267 +715,6 @@ struct ProgramInvocationBuilder {
     mutable VernonRenderPass renderPass{};
     mutable VernonDrawCommand drawCommand{};
     mutable VernonDynamicState dynamicState{};
-};
-
-inline void appendBindingTokenField(std::string &result, char tag, const char *data, size_t size) {
-    result += tag;
-    result += std::to_string(size);
-    result += ':';
-    result.append(data, size);
-}
-
-inline void appendCanonicalBindingToken(std::string &result, PyObject *value) {
-    if (PyTuple_Check(value)) {
-        const Py_ssize_t count = PyTuple_GET_SIZE(value);
-        result += 't';
-        result += std::to_string(count);
-        result += ':';
-        for (Py_ssize_t index = 0; index < count; ++index)
-            appendCanonicalBindingToken(result, PyTuple_GET_ITEM(value, index));
-        return;
-    }
-    if (PyBytes_Check(value)) {
-        char *data = nullptr;
-        Py_ssize_t size = 0;
-        if (PyBytes_AsStringAndSize(value, &data, &size) != 0)
-            throw nb::python_error();
-        appendBindingTokenField(result, 'b', data, static_cast<size_t>(size));
-        return;
-    }
-    if (PyUnicode_Check(value)) {
-        Py_ssize_t size = 0;
-        const char *data = PyUnicode_AsUTF8AndSize(value, &size);
-        if (!data)
-            throw nb::python_error();
-        appendBindingTokenField(result, 's', data, static_cast<size_t>(size));
-        return;
-    }
-    if (PyLong_Check(value)) {
-        nb::object text = nb::steal<nb::object>(PyObject_Str(value));
-        if (!text.is_valid())
-            throw nb::python_error();
-        Py_ssize_t size = 0;
-        const char *data = PyUnicode_AsUTF8AndSize(text.ptr(), &size);
-        if (!data)
-            throw nb::python_error();
-        appendBindingTokenField(result, 'i', data, static_cast<size_t>(size));
-        return;
-    }
-    throw std::invalid_argument("Program binding token must contain only tuple, string, integer, or bytes fields");
-}
-
-inline std::string canonicalBindingToken(const nb::object &value) {
-    std::string result;
-    appendCanonicalBindingToken(result, value.ptr());
-    return result;
-}
-
-inline void retainPythonProgramBinding(void *object) {
-    const PyGILState_STATE state = PyGILState_Ensure();
-    Py_INCREF(static_cast<PyObject *>(object));
-    PyGILState_Release(state);
-}
-
-inline void releasePythonProgramBinding(void *object) {
-    const PyGILState_STATE state = PyGILState_Ensure();
-    Py_DECREF(static_cast<PyObject *>(object));
-    PyGILState_Release(state);
-}
-
-struct PythonInvocationOutcome {
-    VernonStatus status{VERNON_STATUS_OK};
-    VernonInvocationSubmissionState submission{VERNON_INVOCATION_NOT_SUBMITTED};
-    std::vector<VernonBoundaryMutation> mutations;
-    std::string error;
-
-    bool ok() const { return status == VERNON_STATUS_OK; }
-    nb::list mutationList() const {
-        nb::list result;
-        for (const VernonBoundaryMutation &mutation : mutations)
-            result.append(nb::make_tuple(static_cast<uint32_t>(mutation.kind), mutation.slot,
-                                         static_cast<uint32_t>(mutation.state)));
-        return result;
-    }
-};
-
-// Nanobind owns only Python object conversion. Transactional binding state,
-// token comparison, snapshots, telemetry, and payload leases live in the
-// runtime ProgramInstance referenced by this adapter.
-struct PythonProgramInvocationAdapter {
-    PythonProgramInvocationAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
-                                   VernonProgramExecutable *executable, VernonProgramInstance *nativeInstance)
-        : builder(std::make_unique<ProgramInvocationBuilder>(std::move(owner), runtime, executable)),
-          nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
-        if (!nativeInvocation)
-            throw std::runtime_error("failed to begin native Program invocation");
-    }
-    PythonProgramInvocationAdapter(const PythonProgramInvocationAdapter &) = delete;
-    PythonProgramInvocationAdapter &operator=(const PythonProgramInvocationAdapter &) = delete;
-    ~PythonProgramInvocationAdapter() { vernonRuntimeProgramInvocationDestroy(nativeInvocation); }
-
-    ProgramInvocationBuilder &builderView() const { return *builder; }
-    ProgramInvocationBuilder &newControlBuilder() {
-        controlBuilders.push_back(
-            std::make_unique<ProgramInvocationBuilder>(builder->owner, builder->runtime, builder->executable));
-        return *controlBuilders.back();
-    }
-
-    void setAutodiffOptions(const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
-        VernonProgramAutodiffInvocationOptions options{};
-        options.struct_size = sizeof(options);
-        options.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
-        options.has_checkpoint_memory_budget = !checkpointMemoryBudget.is_none();
-        if (options.has_checkpoint_memory_budget)
-            options.checkpoint_memory_budget = nb::cast<uint64_t>(checkpointMemoryBudget);
-        options.checkpoint_policy = {checkpointPolicy.data(), checkpointPolicy.size()};
-        if (vernonRuntimeProgramInvocationSetAutodiffOptions(nativeInvocation, &options) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to set Program invocation autodiff options");
-    }
-
-    void bind(uint32_t slot, const nb::object &token, const nb::callable &prepare, uint64_t uploadBytes = 0,
-              uint64_t uploadRanges = 0, bool uploadPrecedesLookup = false) {
-        const std::string key = canonicalBindingToken(token);
-        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        uint8_t reused = 0;
-        const uint64_t reusedUploadBytes = uploadPrecedesLookup ? uploadBytes : 0;
-        const uint64_t reusedUploadRanges = uploadPrecedesLookup ? uploadRanges : 0;
-        if (vernonRuntimeProgramInvocationTryReuse(nativeInvocation, slot, &bindingToken, reusedUploadBytes,
-                                                   reusedUploadRanges, &reused) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to query native Program binding reuse");
-        if (reused)
-            return;
-        nb::object prepared = prepare();
-        auto *argument = nb::cast<PreparedProgramArgument *>(prepared);
-        if (!argument)
-            throw std::invalid_argument("binding prepare callback did not return a prepared argument");
-        builder->preparedArgument(*argument);
-        VernonProgramResourceLease lease{sizeof(lease), prepared.ptr(), retainPythonProgramBinding,
-                                         releasePythonProgramBinding};
-        if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, &lease, uploadBytes,
-                                               uploadRanges) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind native Program argument");
-    }
-
-    void bindRenderPass(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        if (!control.hasGraphicsState)
-            throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
-        control.refreshGraphicsControls();
-        const std::string key = canonicalBindingToken(token);
-        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        std::vector<VernonProgramResourceLease> leases;
-        leases.reserve(control.renderResourceOwners.size());
-        for (const nb::object &owner : control.renderResourceOwners)
-            leases.push_back({sizeof(VernonProgramResourceLease), owner.ptr(), retainPythonProgramBinding,
-                              releasePythonProgramBinding});
-        if (vernonRuntimeProgramInvocationBindRenderPass(nativeInvocation, slot, &bindingToken, &control.renderPass,
-                                                         leases.data(), leases.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind native Program RenderPass control");
-    }
-
-    void bindDrawCommand(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        if (!control.hasGraphicsState)
-            throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
-        control.refreshGraphicsControls();
-        const std::string key = canonicalBindingToken(token);
-        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        VernonProgramResourceLease lease{};
-        const VernonProgramResourceLease *leasePointer = nullptr;
-        if (control.drawResourceOwner.is_valid()) {
-            lease = {sizeof(lease), control.drawResourceOwner.ptr(), retainPythonProgramBinding,
-                     releasePythonProgramBinding};
-            leasePointer = &lease;
-        }
-        if (vernonRuntimeProgramInvocationBindDrawCommand(nativeInvocation, slot, &bindingToken, &control.drawCommand,
-                                                          leasePointer) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind native Program DrawCommand control");
-    }
-
-    void bindDynamicState(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        if (!control.hasGraphicsState)
-            throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
-        control.refreshGraphicsControls();
-        const std::string key = canonicalBindingToken(token);
-        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        if (vernonRuntimeProgramInvocationBindDynamicState(nativeInvocation, slot, &bindingToken,
-                                                           &control.dynamicState) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind native Program DynamicState control");
-    }
-
-    PythonInvocationOutcome execute(bool retainPullback) {
-        PythonInvocationOutcome result;
-        result.mutations.resize(vernonRuntimeProgramExecutableGetMutationCapacity(builder->executable));
-        VernonInvocationMutationOutcome outcome{sizeof(VernonInvocationMutationOutcome),
-                                                VERNON_INVOCATION_NOT_SUBMITTED,
-                                                result.mutations.data(),
-                                                result.mutations.size(),
-                                                0,
-                                                {}};
-        result.status = vernonRuntimeProgramInvocationExecute(nativeInvocation, retainPullback, &outcome);
-        result.submission = outcome.submission;
-        result.mutations.resize(outcome.mutation_count);
-        if (result.status != VERNON_STATUS_OK)
-            result.error = nativeStringView(vernonRuntimeGetLastError(builder->runtime));
-        return result;
-    }
-
-    void commit() {
-        if (vernonRuntimeProgramInvocationCommit(nativeInvocation, nullptr) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to commit native Program invocation");
-        finished = true;
-    }
-    VernonPullback *commitPullback() {
-        VernonPullback *pullback = nullptr;
-        if (vernonRuntimeProgramInvocationCommit(nativeInvocation, &pullback) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to commit native Program invocation");
-        finished = true;
-        return pullback;
-    }
-    void rollback() {
-        vernonRuntimeProgramInvocationRollback(nativeInvocation);
-        finished = true;
-    }
-    bool isFinished() const { return finished; }
-
-    std::unique_ptr<ProgramInvocationBuilder> builder;
-    std::vector<std::unique_ptr<ProgramInvocationBuilder>> controlBuilders;
-    VernonProgramInvocation *nativeInvocation{};
-    bool finished{};
-};
-
-struct PythonProgramInstanceAdapter {
-    PythonProgramInstanceAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
-                                 VernonProgramExecutable *executable)
-        : owner(std::move(owner)), runtime(runtime), executable(executable),
-          nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(executable)) {
-        if (!nativeInvocationInstance)
-            throw std::runtime_error("failed to create native Program instance");
-    }
-    PythonProgramInstanceAdapter(const PythonProgramInstanceAdapter &) = delete;
-    PythonProgramInstanceAdapter &operator=(const PythonProgramInstanceAdapter &) = delete;
-    ~PythonProgramInstanceAdapter() { vernonRuntimeProgramInstanceDestroy(nativeInvocationInstance); }
-
-    std::unique_ptr<PythonProgramInvocationAdapter> beginInvocation() {
-        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, executable, nativeInvocationInstance);
-    }
-
-    nb::dict telemetryView() const {
-        VernonProgramBindingTelemetry telemetry{};
-        telemetry.struct_size = sizeof(telemetry);
-        if (vernonRuntimeProgramInstanceGetTelemetry(nativeInvocationInstance, &telemetry) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to query native Program binding telemetry");
-        nb::dict result;
-        result["prepare_count"] = telemetry.prepare_count;
-        result["reuse_count"] = telemetry.reuse_count;
-        result["rollback_count"] = telemetry.rollback_count;
-        result["upload_bytes"] = telemetry.upload_bytes;
-        result["upload_ranges"] = telemetry.upload_ranges;
-        return result;
-    }
-
-    std::shared_ptr<RuntimeState> owner;
-    VernonRuntimeContext *runtime{};
-    VernonProgramExecutable *executable{};
-    VernonProgramInstance *nativeInvocationInstance{};
 };
 
 const char *numpyDtypeName(VernonDataType dtype);

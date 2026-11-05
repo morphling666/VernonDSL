@@ -4,6 +4,8 @@
 #include "VernonTextureTypes.h"
 #include "backend_dispatch.h"
 
+#include <vector>
+
 namespace vernon::rhi {
 
 VERNON_RHI_CAPI Result<VernonRhiDevice, RhiError> createDeviceImpl(const VernonRhiOwnedDeviceDescriptor *descriptor);
@@ -95,6 +97,23 @@ VERNON_RHI_CAPI Result<bool, RhiError> commandEncoderRendering(VernonRhiDevice d
 // images of the scope's draws, which the native scope makes readable when it opens.
 VERNON_RHI_CAPI Result<void, RhiError> beginEncoderRendering(VernonRhiDevice device, uint64_t key, RenderingScope scope,
                                                              const RenderingRead *reads, size_t readCount) noexcept;
+// A rendering scope checked against the descriptions of its attachments and reads, which never change for a key, so
+// it stays valid while its owner retains those resources. Its clear values are the begin's.
+struct PreparedRendering {
+    RenderingScope scope;
+    std::vector<RenderingRead> reads;
+    std::vector<uint64_t> attachmentImages;
+    // The images whose contents the scope reads: preserved attachments and sampled reads.
+    std::vector<uint64_t> readImages;
+};
+VERNON_RHI_CAPI Result<PreparedRendering, RhiError> prepareRendering(VernonRhiDevice device,
+                                                                     const RenderingScope &scope,
+                                                                     const RenderingRead *reads,
+                                                                     size_t readCount) noexcept;
+// Begins `prepared` on encoder `key` with the clear values of `clears`, whose attachments match `prepared.scope`.
+VERNON_RHI_CAPI Result<void, RhiError> beginPreparedEncoderRendering(VernonRhiDevice device, uint64_t key,
+                                                                     const PreparedRendering &prepared,
+                                                                     const RenderingScope &clears) noexcept;
 VERNON_RHI_CAPI Result<void, RhiError> endEncoderRendering(VernonRhiDevice device, uint64_t key) noexcept;
 // An acquired surface image's contents are undefined until a submitted command writes it: a rendering scope that
 // loads it with CLEAR or DISCARD, or a copy into it. Until then a rendering scope that preserves it, a read of it in a
@@ -106,6 +125,10 @@ VERNON_RHI_CAPI void releaseUndefinedImage(VernonRhiDevice device) noexcept;
 VERNON_RHI_CAPI void markImageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept;
 VERNON_RHI_CAPI void forgetUndefinedImage(VernonRhiDevice device, uint64_t imageKey) noexcept;
 VERNON_RHI_CAPI bool imageContentsUndefined(VernonRhiDevice device, uint64_t imageKey) noexcept;
+// The two above for a submission's images at once.
+VERNON_RHI_CAPI void forgetUndefinedImages(VernonRhiDevice device, const uint64_t *imageKeys, size_t count) noexcept;
+VERNON_RHI_CAPI bool anyImageContentsUndefined(VernonRhiDevice device, const uint64_t *imageKeys,
+                                               size_t count) noexcept;
 // Opens the native scope of the encoder's rendering scope unless it is open, and returns it. Draws open it before
 // recording; `EndRendering` opens a scope that no draw opened so that its load operations apply.
 VERNON_RHI_CAPI Result<OpenedRendering, RhiError> openCommandRendering(VernonRhiDevice device, uint64_t key) noexcept;

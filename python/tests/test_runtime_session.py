@@ -41,10 +41,9 @@ class RuntimeSessionTests(unittest.TestCase):
     @staticmethod
     def _state(configuration: vd.RuntimeConfiguration) -> runtime_session._RuntimeSessionState:
         runtime = SimpleNamespace(capabilities={"available": True}, configuration=configuration)
-        rhi_host = None if configuration.arch == vd.cpu else object()
         return runtime_session._RuntimeSessionState(
             runtime,
-            rhi_host,
+            object(),
             next(runtime_session._session_identities),
         )
 
