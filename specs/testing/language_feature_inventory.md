@@ -75,9 +75,11 @@ compile failure with the stated stable reason, never a runtime skip.
 
 ### `LANG-SCALAR-003` — arithmetic, comparisons, and true division
 
-- Valid: typed unary/binary arithmetic, one comparison, and `/` producing at
-  least `f32` for integer operands.
-- Invalid: incompatible operand types and chained comparisons.
+- Valid: typed unary/binary arithmetic, one comparison, `/` producing at
+  least `f32` for integer operands, floored `//` on integer and float
+  operands, and elementwise Tensor comparisons producing a bool Tensor.
+- Invalid: incompatible operand types, chained comparisons, and a bool Tensor
+  used as an `if`/`while`/`not`/`and`/`or`/conditional-expression condition.
 - Capabilities: compile `none`; runtime `compute`.
 - Layers: `F`, `I`, `C`, `R`.
 - Diagnostic/oracle: operand or chained-comparison reason; numeric comparison
@@ -566,6 +568,15 @@ For every generated-interface ID:
 - Layers: `F`, `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: argument/type reason; selected filtered mip value.
 
+### `LANG-TEXTURE-SAMPLE-BIAS` — explicit sampler, biased implicit LOD
+
+- Valid: `texture_sample_bias(texture, sampler, coordinates, bias)` only in
+  fragment.
+- Invalid: vertex/compute use, an implicit sampler, or a non-floating bias.
+- Capabilities: compile/runtime `graphics`, `texture_sampler`.
+- Layers: `F`, `I`, `C`, `A`, `R`.
+- Diagnostic/oracle: fragment-only/argument reason; filtered texel.
+
 ### `LANG-TEXTURE-SIZE` — texture dimensions
 
 - Valid: texture plus optional LOD in graphics stages, producing rank-two
@@ -661,8 +672,13 @@ For every generated-interface ID:
 
 - Valid: `sin`, `cos`, `acos`, `atan2`, `exp`, `log`, `sqrt`, `floor`, `abs`,
   `min`, `max`, `pow`, `clamp`, `dot`, `cross`, `norm`, `normalize`, and
-  `reflect` on their declared numeric scalar/Tensor regions.
-- Invalid: wrong arity, rank, shape, or non-numeric element type.
+  `reflect` on their declared numeric scalar/Tensor regions, including integer
+  `abs`, `min`, `max`, `clamp`, `dot`, and `cross`; `any`/`all` on bool
+  scalars and Tensors; `select(condition, a, b)` with a bool or bool Tensor
+  condition.
+- Invalid: wrong arity, rank, shape, or non-numeric element type; non-bool
+  `any`/`all` arguments; a `select` condition whose shape differs from its
+  values.
 - Capabilities: compile `none`; runtime `compute`.
 - Layers: `F`, `I`, `C`, `R`.
 - Diagnostic/oracle: intrinsic-specific type/shape reason; tolerance-based host

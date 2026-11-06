@@ -2405,6 +2405,8 @@ class _FunctionEmitter:
                 return self.value(f"call {llvm_type} {function}({llvm_type} {left}, {llvm_type} {right})")
             if operation == "mod":
                 return self.float_remainder(left, right, llvm_type)
+            if operation == "floordiv":
+                return self.float_floor_quotient(left, right, llvm_type)
             raise ValueError(f"unsupported float operation {operation}")
         if operation in {"add", "sub", "mul", "and", "or", "xor"}:
             return self.value(f"{operation} {llvm_type} {left}, {right}")
@@ -2457,6 +2459,32 @@ class _FunctionEmitter:
         zero = self.value(f"call {llvm_type} {copysign}({llvm_type} 0.0, {llvm_type} {right})")
         return self.value(f"select i1 {nonzero}, {llvm_type} {signed}, {llvm_type} {zero}")
 
+    def float_floor_quotient(self, left: str, right: str, llvm_type: str) -> str:
+        # numpy npy_divmod; see _floored_float_quotient in the device frontend. A zero divisor gives left / right.
+        quotient = self.value(f"fdiv {llvm_type} {left}, {right}")
+        remainder = self.value(f"frem {llvm_type} {left}, {right}")
+        difference = self.value(f"fsub {llvm_type} {left}, {remainder}")
+        exact = self.value(f"fdiv {llvm_type} {difference}, {right}")
+        nonzero = self.value(f"fcmp une {llvm_type} {remainder}, 0.0")
+        remainder_negative = self.value(f"fcmp olt {llvm_type} {remainder}, 0.0")
+        divisor_negative = self.value(f"fcmp olt {llvm_type} {right}, 0.0")
+        differ = self.value(f"xor i1 {remainder_negative}, {divisor_negative}")
+        shift = self.value(f"and i1 {nonzero}, {differ}")
+        lowered = self.value(f"fsub {llvm_type} {exact}, 1.0")
+        exact = self.value(f"select i1 {shift}, {llvm_type} {lowered}, {llvm_type} {exact}")
+        floor = self.module.intrinsic("floor", llvm_type)
+        floored = self.value(f"call {llvm_type} {floor}({llvm_type} {exact})")
+        fraction = self.value(f"fsub {llvm_type} {exact}, {floored}")
+        rounds_up = self.value(f"fcmp ogt {llvm_type} {fraction}, 0.5")
+        raised = self.value(f"fadd {llvm_type} {floored}, 1.0")
+        floored = self.value(f"select i1 {rounds_up}, {llvm_type} {raised}, {llvm_type} {floored}")
+        copysign = self.module.intrinsic("copysign", llvm_type, 2)
+        zero = self.value(f"call {llvm_type} {copysign}({llvm_type} 0.0, {llvm_type} {quotient})")
+        nonzero_quotient = self.value(f"fcmp une {llvm_type} {exact}, 0.0")
+        result = self.value(f"select i1 {nonzero_quotient}, {llvm_type} {floored}, {llvm_type} {zero}")
+        divisor_zero = self.value(f"fcmp oeq {llvm_type} {right}, 0.0")
+        return self.value(f"select i1 {divisor_zero}, {llvm_type} {quotient}, {llvm_type} {result}")
+
     def compare_scalar(self, operation: str, left: str, right: str, name: str) -> str:
         llvm_type = _LLVM_SCALARS[name]
         if _is_float(name):
@@ -2478,6 +2506,15 @@ class _FunctionEmitter:
         if common.kind in {"handle", "enum"}:
             width = self.module.memory_type(common)
             return self.value(f"icmp {'eq' if operation == 'eq' else 'ne'} {width} {left}, {right}")
+        if common.kind == "tensor":
+            scalar = element_of(common).name
+            items = [
+                self.compare_scalar(
+                    operation, self.extract(left, common, index), self.extract(right, common, index), scalar
+                )
+                for index in range(tensor_count(common))
+            ]
+            return self.build(self.info.expression_type(node), items)
         return self.compare_scalar(operation, left, right, common.name)
 
     # Calls.
@@ -2875,6 +2912,32 @@ class _FunctionEmitter:
         arguments = list(node.args)
         if isinstance(node.func, ast.Attribute) and name in {"norm", "normalize"} and not arguments:
             arguments = [node.func.value]
+        if name in {"any", "all"}:
+            value_type = info.expression_type(arguments[0])
+            value = self.typed(arguments[0], value_type)
+            if value_type.kind != "tensor":
+                return value
+            combined = self.extract(value, value_type, 0)
+            for index in range(1, tensor_count(value_type)):
+                item = self.extract(value, value_type, index)
+                combined = self.value(f"{'or' if name == 'any' else 'and'} i1 {combined}, {item}")
+            return combined
+        if name == "select":
+            condition_type = info.expression_type(arguments[0])
+            condition = self.typed(arguments[0], condition_type)
+            true_value, false_value = (self.typed(argument, result_type) for argument in arguments[1:])
+            llvm_type = _LLVM_SCALARS[element_of(result_type).name]
+            if result_type.kind != "tensor":
+                return self.value(f"select i1 {condition}, {llvm_type} {true_value}, {llvm_type} {false_value}")
+            items = []
+            for index in range(tensor_count(result_type)):
+                picked = (
+                    self.extract(condition, condition_type, index) if condition_type.kind == "tensor" else condition
+                )
+                when_true = self.extract(true_value, result_type, index)
+                when_false = self.extract(false_value, result_type, index)
+                items.append(self.value(f"select i1 {picked}, {llvm_type} {when_true}, {llvm_type} {when_false}"))
+            return self.build(result_type, items)
         if name in {"dot", "norm", "normalize", "cross"}:
             vector_type = info.expression_type(arguments[0])
             if len(arguments) == 2:

@@ -46,9 +46,16 @@ from .model import (
     TypedFunctionInstance,
     TypedStatement,
 )
-from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower_unary
+from .numeric_lowering import (
+    integer_extremum,
+    lower_binary,
+    lower_compare,
+    lower_constant,
+    lower_unary,
+    reduce_bool,
+)
 from .params import params_root
-from .resource_lowering import lower_texture_sample, lower_texture_size
+from .resource_lowering import lower_texture_sample, lower_texture_sample_bias, lower_texture_size
 from .storage_lowering import (
     lower_buffer_index,
     lower_shape_attribute,
@@ -1058,6 +1065,13 @@ class _FunctionEmitter:
             "sqrt": "math.sqrt",
             "abs": "math.absf",
         }
+        if name == "abs" and len(arguments) == 1 and arguments[0].type.is_integer:
+            if element_type(arguments[0].type).name == "u32":
+                return Value(arguments[0].name, typed_call.type)
+            # math.absi wraps abs(MIN) to MIN, as host code does.
+            result = self._fresh()
+            self._line(f"{result} = math.absi {arguments[0].name} : {arguments[0].type.mlir}")
+            return Value(result, typed_call.type)
         if name in math_operations:
             if len(arguments) != 1 or not arguments[0].type.is_float:
                 raise self.context.error(node, f"{name} requires one floating-point argument")
@@ -1104,16 +1118,16 @@ class _FunctionEmitter:
                 raise self.context.error(node, "dot requires two Tensor arguments")
             self._require_same_type(node, arguments[0].type, arguments[1].type)
             tensor = arguments[0].type
-            if tensor.kind != "tensor" or len(tensor.arguments) < 2 or not tensor.is_float:
-                raise self.context.error(node, "dot requires equal floating-point Tensors")
+            if tensor.kind != "tensor" or len(tensor.arguments) < 2 or not (tensor.is_float or tensor.is_integer):
+                raise self.context.error(node, "dot requires equal numeric Tensors")
             return self._intrinsic(node, name, arguments, typed_call.type)
         if name == "cross":
             if len(arguments) != 2:
                 raise self.context.error(node, "cross requires two vector arguments")
             self._require_same_type(node, arguments[0].type, arguments[1].type)
             vector = arguments[0].type
-            if vector.kind != "tensor" or len(vector.arguments) != 2 or not vector.is_float:
-                raise self.context.error(node, "cross requires floating-point vectors")
+            if vector.kind != "tensor" or len(vector.arguments) != 2 or not (vector.is_float or vector.is_integer):
+                raise self.context.error(node, "cross requires numeric vectors")
             if vector.arguments[1] != 3:
                 raise self.context.error(node, "cross requires three-component vectors")
             return self._intrinsic(node, name, arguments, typed_call.type)
@@ -1134,8 +1148,11 @@ class _FunctionEmitter:
                 self._coerce_numeric(source, argument, result_type)
                 for source, argument in zip(node.args, arguments, strict=True)
             ]
+            if arguments[0].type.is_integer and name != "pow":
+                return integer_extremum(self, name == "min", arguments[0], arguments[1])
             if not arguments[0].type.is_float:
-                raise self.context.error(node, f"{name} currently requires floating-point arguments")
+                kind = "floating-point" if name == "pow" else "numeric"
+                raise self.context.error(node, f"{name} requires {kind} arguments")
             return self._intrinsic(node, name, arguments, result_type)
         if name == "clamp":
             if len(arguments) != 3:
@@ -1145,7 +1162,35 @@ class _FunctionEmitter:
                 self._coerce_numeric(source, argument, result_type)
                 for source, argument in zip(node.args, arguments, strict=True)
             ]
+            if arguments[0].type.is_integer:
+                return integer_extremum(
+                    self, True, integer_extremum(self, False, arguments[0], arguments[1]), arguments[2]
+                )
             return self._intrinsic(node, name, arguments, result_type)
+        if name in {"any", "all"}:
+            if len(arguments) != 1:
+                raise self.context.error(node, f"{name} requires one bool or bool Tensor argument")
+            return reduce_bool(self, name == "any", arguments[0], self._constant_pool())
+        if name == "select":
+            if len(arguments) != 3:
+                raise self.context.error(node, "select requires a condition and two values")
+            result_type = typed_call.type
+            condition = arguments[0]
+            true_value, false_value = (
+                self._coerce_numeric(source, argument, result_type)
+                for source, argument in zip(node.args[1:], arguments[1:], strict=True)
+            )
+            types = result_type.mlir
+            if result_type.kind == "tensor":
+                # SPIR-V before 1.4 selects composites only with a condition per component, so a scalar condition
+                # is splat to the values' shape.
+                mask = DslType("tensor", "Tensor", (DslType("scalar", "bool"), *result_type.arguments[1:]))
+                if condition.type.kind != "tensor":
+                    condition = self._splat(node, condition, mask)
+                types = f"{mask.mlir}, {result_type.mlir}"
+            result = self._fresh()
+            self._line(f"{result} = arith.select {condition.name}, {true_value.name}, {false_value.name} : {types}")
+            return Value(result, result_type)
         if name == "matmul":
             if len(arguments) != 2:
                 raise self.context.error(node, "matmul requires two arguments")
@@ -1160,6 +1205,8 @@ class _FunctionEmitter:
             return self._intrinsic(node, name, coerced, result_type)
         if name == "texture_sample":
             return lower_texture_sample(self, node, arguments, typed_call.type)
+        if name == "texture_sample_bias":
+            return lower_texture_sample_bias(self, node, arguments, typed_call.type)
         if name == "texture_size":
             return lower_texture_size(self, node, arguments, typed_call.type)
         if name == "texture_load":

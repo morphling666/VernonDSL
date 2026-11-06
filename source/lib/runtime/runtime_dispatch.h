@@ -29,6 +29,12 @@ struct DeviceState;
 namespace vernon::hal::vulkan {
 struct DeviceState;
 } // namespace vernon::hal::vulkan
+namespace vernon::hal::d3d12 {
+struct DeviceState;
+} // namespace vernon::hal::d3d12
+namespace vernon::hal::metal {
+struct DeviceState;
+} // namespace vernon::hal::metal
 
 namespace vernon::runtime {
 
@@ -51,10 +57,14 @@ RuntimeResult<void> initializeOpenGLBackend(VernonRuntimeContext &context,
 // A Vulkan context runs on the device of `state`; its HAL device is created on first use.
 RuntimeResult<void> initializeVulkanBackend(VernonRuntimeContext &context,
                                             std::shared_ptr<hal::vulkan::DeviceState> state);
+// A DirectX 12 context runs on the device of `state`; its HAL device is created on first use.
+RuntimeResult<void> initializeDirectX12Backend(VernonRuntimeContext &context,
+                                               std::shared_ptr<hal::d3d12::DeviceState> state);
+// A Metal context runs on the device of `state`; its HAL device is created on first use.
+RuntimeResult<void> initializeMetalBackend(VernonRuntimeContext &context,
+                                           std::shared_ptr<hal::metal::DeviceState> state);
 void destroyBackend(VernonRuntimeContext &context);
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &capabilities);
-RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
-
 RuntimeResult<void> registerBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
 RuntimeResult<void> unregisterBackendStaticCpuEntries(const VernonStaticCpuEntry *entries, size_t count);
 using BackendStageLoadResult = vernon::Result<std::unique_ptr<VernonStageExecutable>, BackendPipelineFailure>;

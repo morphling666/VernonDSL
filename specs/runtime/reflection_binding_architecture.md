@@ -406,9 +406,9 @@ barriers, and native command recording.
 
 ### 7.4 DirectX 12
 
-DirectX 12 has no HAL device until phase 4 (`architecture_v2.md` section
-16). Its device maps the provider binding plan to root constants, constant
-buffers, SRV/UAV descriptors, vertex buffers, images, and samplers, and
+The DirectX 12 HAL device (`hal/d3d12/d3d12_device.cpp`) maps the provider
+binding plan to per-stage root constant buffer views, constant buffers,
+SRV/UAV descriptors, vertex buffers, images, and samplers, and
 consumes compiler-generated DXIL without running DXC. TensorView metadata
 uses one constant-buffer view; the compute root signature classifies that
 binding as CBV rather than UAV. Depth-only graphics pipelines are valid and
@@ -416,11 +416,13 @@ must produce a complete PSO even when there are no color attachments.
 
 ### 7.5 Metal
 
-Metal has no HAL device until phase 4. Its device resolves portable
-`(stage, kind, set, binding)` facts through `NativeResourceSlot` into Metal
-argument-buffer indices and member IDs. It maps Values to inline constants
-or reflected buffers, vertex inputs to Metal vertex buffer indices, and
-images/samplers to their native indices. TensorView metadata uses one
+`runtime_pipeline_metal.cpp` resolves portable `(stage, kind, set, binding)`
+facts through `NativeResourceSlot` into Metal argument-buffer indices and
+member IDs, per stage, because each stage's argument buffer holds only the
+members that stage reads; graphics layouts are therefore not merged across
+stages. It maps Values to inline constants at buffer 15 or reflected buffers,
+vertex inputs to Metal vertex buffer indices, and images/samplers to their
+argument-buffer members. TensorView metadata uses one
 constant-buffer binding carrying the portable 32-bit aggregate.
 
 ### 7.6 OpenGL and OpenGL ES

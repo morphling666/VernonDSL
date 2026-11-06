@@ -20,10 +20,16 @@ namespace vernon {
 template <template <typename> class Pattern, typename... Arguments>
 void addVernonElementwisePatterns(RewritePatternSet &patterns, Arguments &&...arguments) {
     patterns.add<Pattern<arith::AddFOp>, Pattern<arith::SubFOp>, Pattern<arith::MulFOp>, Pattern<arith::DivFOp>,
-                 Pattern<arith::AddIOp>, Pattern<arith::SubIOp>, Pattern<arith::MulIOp>, Pattern<arith::ExtFOp>,
-                 Pattern<arith::TruncFOp>, Pattern<math::AbsFOp>, Pattern<math::AcosOp>, Pattern<math::Atan2Op>,
-                 Pattern<math::CosOp>, Pattern<math::ExpOp>, Pattern<math::FloorOp>, Pattern<math::LogOp>,
-                 Pattern<math::SinOp>, Pattern<math::SqrtOp>>(std::forward<Arguments>(arguments)...);
+                 Pattern<arith::RemFOp>, Pattern<arith::AddIOp>, Pattern<arith::SubIOp>, Pattern<arith::MulIOp>,
+                 Pattern<arith::DivSIOp>, Pattern<arith::DivUIOp>, Pattern<arith::FloorDivSIOp>,
+                 Pattern<arith::RemSIOp>, Pattern<arith::RemUIOp>, Pattern<arith::AndIOp>, Pattern<arith::OrIOp>,
+                 Pattern<arith::XOrIOp>, Pattern<arith::ShLIOp>, Pattern<arith::ShRSIOp>, Pattern<arith::ShRUIOp>,
+                 Pattern<arith::CmpFOp>, Pattern<arith::CmpIOp>, Pattern<arith::SelectOp>, Pattern<arith::BitcastOp>,
+                 Pattern<arith::SIToFPOp>, Pattern<arith::UIToFPOp>, Pattern<arith::FPToSIOp>, Pattern<arith::FPToUIOp>,
+                 Pattern<arith::ExtFOp>, Pattern<arith::TruncFOp>, Pattern<math::AbsFOp>, Pattern<math::AbsIOp>,
+                 Pattern<math::AcosOp>, Pattern<math::Atan2Op>, Pattern<math::CosOp>, Pattern<math::ExpOp>,
+                 Pattern<math::FloorOp>, Pattern<math::LogOp>, Pattern<math::SinOp>, Pattern<math::SqrtOp>>(
+        std::forward<Arguments>(arguments)...);
 }
 
 // A missing element limit converts every non-empty static Tensor.

@@ -340,10 +340,7 @@ void bindNativeCompiler(nb::module_ &module) {
     module.def("runtime_capabilities", [](VernonRuntimeBackend backend) {
         return runtimeCapabilitiesDict(vernonRuntimeGetCapabilities(backend));
     });
-    // DirectX 12 and Metal have no HAL device, so no session runs on them.
-    module.def("runtime_available", [](VernonRuntimeBackend backend) {
-        return backend != VERNON_RUNTIME_DIRECTX12 && backend != VERNON_RUNTIME_METAL &&
-               vernonRuntimeGetCapabilities(backend).available != 0;
-    });
+    module.def("runtime_available",
+               [](VernonRuntimeBackend backend) { return vernonRuntimeGetCapabilities(backend).available != 0; });
     module.def("_testing_fail_schedule_waits", &vernonRuntimePrivateFailScheduleWaits, nb::arg("count"));
 }

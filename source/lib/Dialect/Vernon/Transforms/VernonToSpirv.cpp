@@ -72,9 +72,47 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
         tensor.getDimSize(1) <= 4) {
         auto columnType = mlir::VectorType::get({tensor.getShape()[0]}, elementType);
-        return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
+        if (isa<FloatType>(elementType))
+            return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
+        // SPIR-V matrices hold floats only. The ABI lays every small rank-2 Tensor out column-major, so an integer
+        // matrix is an array of its column vectors.
+        if (layout->root->byteStrides.size() != 2 ||
+            layout->root->byteStrides[1] > std::numeric_limits<unsigned>::max())
+            return failure();
+        return spirv::ArrayType::get(columnType, static_cast<unsigned>(tensor.getDimSize(1)),
+                                     static_cast<unsigned>(layout->root->byteStrides[1]));
     }
     return getRowMajorTensorArrayType(tensor, *layout, elementType);
+}
+
+/// The array of column vectors an integer Tensor of shape (2..4, 2..4) translates to, or null. Std140 interface
+/// carriers are also arrays of integer vectors, but of at least eight rank-three elements.
+spirv::ArrayType getIntegerMatrixType(Type type) {
+    auto array = dyn_cast<spirv::ArrayType>(type);
+    auto column = array ? dyn_cast<mlir::VectorType>(array.getElementType()) : mlir::VectorType{};
+    if (!column || !isa<IntegerType>(column.getElementType()) || array.getNumElements() < 2 ||
+        array.getNumElements() > 4)
+        return {};
+    return array;
+}
+
+struct MatrixShape {
+    mlir::VectorType column;
+    unsigned rows{};
+    unsigned columns{};
+};
+
+/// The shape of a matrix-shaped value: a SPIR-V float matrix or an integer matrix array.
+std::optional<MatrixShape> getMatrixShape(Type type) {
+    auto shape = [](Type columnType, unsigned columns) {
+        auto column = cast<mlir::VectorType>(columnType);
+        return MatrixShape{column, static_cast<unsigned>(column.getNumElements()), columns};
+    };
+    if (auto matrix = dyn_cast<spirv::MatrixType>(type))
+        return shape(matrix.getColumnType(), matrix.getNumColumns());
+    if (spirv::ArrayType array = getIntegerMatrixType(type))
+        return shape(array.getElementType(), array.getNumElements());
+    return std::nullopt;
 }
 
 FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, ModuleOp module) {
@@ -514,22 +552,20 @@ LogicalResult decorateVaryingInterpolation(spirv::GlobalVariableOp variable, Dic
 
 void flattenComposite(Location location, Value value, OpBuilder &builder, SmallVectorImpl<Value> &leaves) {
     Type type = value.getType();
+    if (std::optional<MatrixShape> shape = getMatrixShape(type)) {
+        for (unsigned row = 0; row < shape->rows; ++row)
+            for (unsigned column = 0; column < shape->columns; ++column)
+                leaves.push_back(spirv::CompositeExtractOp::create(
+                    builder, location, value,
+                    ArrayRef<int32_t>{static_cast<int32_t>(column), static_cast<int32_t>(row)}));
+        return;
+    }
     if (auto array = dyn_cast<spirv::ArrayType>(type)) {
         for (unsigned index = 0; index < array.getNumElements(); ++index) {
             Value element = spirv::CompositeExtractOp::create(builder, location, value,
                                                               ArrayRef<int32_t>{static_cast<int32_t>(index)});
             flattenComposite(location, element, builder, leaves);
         }
-        return;
-    }
-    if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
-        auto columnType = cast<mlir::VectorType>(matrix.getColumnType());
-        const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
-        for (unsigned row = 0; row < rows; ++row)
-            for (unsigned column = 0; column < matrix.getNumColumns(); ++column)
-                leaves.push_back(spirv::CompositeExtractOp::create(
-                    builder, location, value,
-                    ArrayRef<int32_t>{static_cast<int32_t>(column), static_cast<int32_t>(row)}));
         return;
     }
     if (auto vector = dyn_cast<mlir::VectorType>(type)) {
@@ -562,12 +598,9 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
         }
         return spirv::CompositeConstructOp::create(builder, location, type, elements).getResult();
     };
-    if (auto array = dyn_cast<spirv::ArrayType>(type))
-        return constructElements(array.getElementType(), array.getNumElements());
-    if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
-        auto columnType = cast<mlir::VectorType>(matrix.getColumnType());
-        const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
-        const unsigned columns = matrix.getNumColumns();
+    if (std::optional<MatrixShape> shape = getMatrixShape(type)) {
+        const unsigned rows = shape->rows;
+        const unsigned columns = shape->columns;
         if (cursor > leaves.size() || leaves.size() - cursor < rows * columns)
             return failure();
         SmallVector<Value> valueColumns;
@@ -575,11 +608,14 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
             SmallVector<Value> columnElements;
             for (unsigned row = 0; row < rows; ++row)
                 columnElements.push_back(leaves[cursor + row * columns + column]);
-            valueColumns.push_back(spirv::CompositeConstructOp::create(builder, location, columnType, columnElements));
+            valueColumns.push_back(
+                spirv::CompositeConstructOp::create(builder, location, shape->column, columnElements));
         }
         cursor += rows * columns;
-        return spirv::CompositeConstructOp::create(builder, location, matrix, valueColumns).getResult();
+        return spirv::CompositeConstructOp::create(builder, location, type, valueColumns).getResult();
     }
+    if (auto array = dyn_cast<spirv::ArrayType>(type))
+        return constructElements(array.getElementType(), array.getNumElements());
     if (auto vector = dyn_cast<mlir::VectorType>(type))
         return constructElements(vector.getElementType(), static_cast<unsigned>(vector.getNumElements()));
     if (auto structure = dyn_cast<spirv::StructType>(type)) {
@@ -642,11 +678,23 @@ Value extractStaticTensorElement(Location location, Value value, RankedTensorTyp
     if (sourceType.getRank() == 0)
         return value;
     SmallVector<int32_t> indices{static_cast<int32_t>(linearIndex)};
-    if (isa<spirv::MatrixType>(value.getType())) {
+    if (getMatrixShape(value.getType())) {
         const int64_t columns = sourceType.getDimSize(1);
         indices = {static_cast<int32_t>(linearIndex % columns), static_cast<int32_t>(linearIndex / columns)};
     }
     return spirv::CompositeExtractOp::create(builder, location, value, indices).getResult();
+}
+
+Value spirvMultiply(Location location, Value lhs, Value rhs, OpBuilder &builder) {
+    if (isa<FloatType>(getElementTypeOrSelf(lhs.getType())))
+        return spirv::FMulOp::create(builder, location, lhs, rhs).getResult();
+    return spirv::IMulOp::create(builder, location, lhs, rhs).getResult();
+}
+
+Value spirvAdd(Location location, Value lhs, Value rhs, OpBuilder &builder) {
+    if (isa<FloatType>(getElementTypeOrSelf(lhs.getType())))
+        return spirv::FAddOp::create(builder, location, lhs, rhs).getResult();
+    return spirv::IAddOp::create(builder, location, lhs, rhs).getResult();
 }
 
 /// Source graphics TensorView argument -> pointers to its storage-leaf buffers,
@@ -834,7 +882,7 @@ FailureOr<Value> lowerTensorExtract(tensor::ExtractOp extract, OpBuilder &builde
                                                spirv::StorageClass::Function, /*initializer=*/nullptr);
     spirv::StoreOp::create(builder, location, variable, input);
     SmallVector<Value> indices{linear};
-    if (isa<spirv::MatrixType>(input.getType())) {
+    if (getMatrixShape(input.getType())) {
         Value columns = indexConstant(sourceType.getDimSize(1));
         indices = {spirv::SRemOp::create(builder, location, linear, columns),
                    spirv::SDivOp::create(builder, location, linear, columns)};
@@ -1165,6 +1213,15 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                 return failure();
             return buildSpirvTextureSample(builder, location, *resultType, sampledImage, coordinates, lod);
         }
+        if (intrinsic.getName() == "texture_sample_bias") {
+            Value sampledImage = mapped(intrinsic.getOperand(0));
+            Value coordinates = mapped(intrinsic.getOperand(2));
+            Value bias = mapped(intrinsic.getOperand(3));
+            FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
+            if (!sampledImage || !coordinates || !bias || failed(resultType))
+                return failure();
+            return buildSpirvTextureSampleBias(builder, location, *resultType, sampledImage, coordinates, bias);
+        }
         if (intrinsic.getName() == "texture_load") {
             Value image = mapped(intrinsic.getOperand(0));
             Value coordinates = mapped(intrinsic.getOperand(1));
@@ -1256,15 +1313,17 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                     .getResult();
 
             FailureOr<StaticMatmulPlan> plan = getStaticMatmulPlan(leftType.getShape(), rightType.getShape());
-            if (failed(plan) || !isa<FloatType>(leftType.getElementType()))
+            if (failed(plan))
                 return failure();
             FailureOr<int64_t> resultCount = getStaticShapeElementCount(plan->resultShape);
             if (failed(resultCount))
                 return failure();
+            Type elementType = convertValueType(leftType.getElementType()).value_or(Type());
+            if (!elementType)
+                return failure();
             SmallVector<Value> leaves;
             for (int64_t resultIndex = 0; resultIndex < *resultCount; ++resultIndex) {
-                Value sum = spirv::ConstantOp::create(builder, location, leftType.getElementType(),
-                                                      builder.getFloatAttr(leftType.getElementType(), 0.0));
+                Value sum = spirv::ConstantOp::getZero(elementType, location, builder);
                 for (int64_t reduction = 0; reduction < plan->reduction; ++reduction) {
                     FailureOr<int64_t> leftIndex = getStaticMatmulLeftLinearIndex(*plan, resultIndex, reduction);
                     FailureOr<int64_t> rightIndex = getStaticMatmulRightLinearIndex(*plan, resultIndex, reduction);
@@ -1272,10 +1331,39 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                         return failure();
                     Value lhs = extractStaticTensorElement(location, operands[0], leftType, *leftIndex, builder);
                     Value rhs = extractStaticTensorElement(location, operands[1], rightType, *rightIndex, builder);
-                    Value product = spirv::FMulOp::create(builder, location, lhs, rhs);
-                    sum = spirv::FAddOp::create(builder, location, sum, product);
+                    sum = spirvAdd(location, sum, spirvMultiply(location, lhs, rhs, builder), builder);
                 }
                 leaves.push_back(sum);
+            }
+            return constructComposite(location, *resultType, leaves, builder);
+        }
+        auto elementsOf = [&](Value value, Value source) {
+            auto tensorType = cast<RankedTensorType>(source.getType());
+            SmallVector<Value> elements;
+            for (int64_t index = 0; index < tensorType.getNumElements(); ++index)
+                elements.push_back(extractStaticTensorElement(location, value, tensorType, index, builder));
+            return elements;
+        };
+        if (name == "dot" && !isa<FloatType>(getElementTypeOrSelf(operands[0].getType()))) {
+            SmallVector<Value> lhs = elementsOf(operands[0], intrinsic.getOperand(0));
+            SmallVector<Value> rhs = elementsOf(operands[1], intrinsic.getOperand(1));
+            Value sum = spirvMultiply(location, lhs[0], rhs[0], builder);
+            for (size_t index = 1; index < lhs.size(); ++index)
+                sum = spirvAdd(location, sum, spirvMultiply(location, lhs[index], rhs[index], builder), builder);
+            return sum;
+        }
+        if (name == "cross" && !isa<FloatType>(getElementTypeOrSelf(operands[0].getType()))) {
+            SmallVector<Value> lhs = elementsOf(operands[0], intrinsic.getOperand(0));
+            SmallVector<Value> rhs = elementsOf(operands[1], intrinsic.getOperand(1));
+            if (lhs.size() != 3 || rhs.size() != 3)
+                return failure();
+            SmallVector<Value> leaves;
+            for (int64_t index = 0; index < 3; ++index) {
+                const int64_t next = (index + 1) % 3;
+                const int64_t last = (index + 2) % 3;
+                leaves.push_back(spirv::ISubOp::create(builder, location,
+                                                       spirvMultiply(location, lhs[next], rhs[last], builder),
+                                                       spirvMultiply(location, lhs[last], rhs[next], builder)));
             }
             return constructComposite(location, *resultType, leaves, builder);
         }
@@ -1320,6 +1408,7 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                                       .Case(math::LogOp::getOperationName(), "spirv.GL.Log")
                                       .Case(math::SqrtOp::getOperationName(), "spirv.GL.Sqrt")
                                       .Case(math::AbsFOp::getOperationName(), "spirv.GL.FAbs")
+                                      .Case(math::AbsIOp::getOperationName(), "spirv.GL.SAbs")
                                       .Default("");
         if (!operationName.empty()) {
             OperationState state(location, operationName);
@@ -1359,6 +1448,22 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return spirv::FOrdGreaterThanOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpFPredicate::OGE:
             return spirv::FOrdGreaterThanEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::UEQ:
+            return spirv::FUnordEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::UNE:
+            return spirv::FUnordNotEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::ULT:
+            return spirv::FUnordLessThanOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::ULE:
+            return spirv::FUnordLessThanEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::UGT:
+            return spirv::FUnordGreaterThanOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::UGE:
+            return spirv::FUnordGreaterThanEqualOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::ORD:
+            return spirv::OrderedOp::create(builder, location, lhs, rhs).getResult();
+        case arith::CmpFPredicate::UNO:
+            return spirv::UnorderedOp::create(builder, location, lhs, rhs).getResult();
         default:
             return failure();
         }
@@ -1371,11 +1476,11 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return failure();
         switch (compare.getPredicate()) {
         case arith::CmpIPredicate::eq:
-            if (lhs.getType().isInteger(1))
+            if (getElementTypeOrSelf(lhs.getType()).isInteger(1))
                 return spirv::LogicalEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::IEqualOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpIPredicate::ne:
-            if (lhs.getType().isInteger(1))
+            if (getElementTypeOrSelf(lhs.getType()).isInteger(1))
                 return spirv::LogicalNotEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::INotEqualOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpIPredicate::slt:
@@ -1430,6 +1535,14 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             });
     }
 
+    if (auto bitcast = dyn_cast<arith::BitcastOp>(operation)) {
+        Value input = mapped(bitcast.getIn());
+        FailureOr<Type> resultType = convertValueType(bitcast.getType());
+        if (!input || failed(resultType))
+            return failure();
+        return spirv::BitcastOp::create(builder, location, *resultType, input).getResult();
+    }
+
     if (auto cast = dyn_cast<arith::IndexCastOp>(operation)) {
         Value input = mapped(cast.getIn());
         FailureOr<Type> resultType = convertValueType(cast.getType());
@@ -1477,18 +1590,27 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return lowerBinary([&](Value a, Value b) { return spirv::ISubOp::create(builder, location, a, b); });
         if (name == arith::MulIOp::getOperationName())
             return lowerBinary([&](Value a, Value b) { return spirv::IMulOp::create(builder, location, a, b); });
+        if (name == arith::ShLIOp::getOperationName())
+            return lowerBinary(
+                [&](Value a, Value b) { return spirv::ShiftLeftLogicalOp::create(builder, location, a, b); });
+        if (name == arith::ShRSIOp::getOperationName())
+            return lowerBinary(
+                [&](Value a, Value b) { return spirv::ShiftRightArithmeticOp::create(builder, location, a, b); });
+        if (name == arith::ShRUIOp::getOperationName())
+            return lowerBinary(
+                [&](Value a, Value b) { return spirv::ShiftRightLogicalOp::create(builder, location, a, b); });
         if (name == arith::AndIOp::getOperationName()) {
-            if (operation.getResult(0).getType().isInteger(1))
+            if (getElementTypeOrSelf(operation.getResult(0).getType()).isInteger(1))
                 return spirv::LogicalAndOp::create(builder, location, lhs, rhs).getResult();
             return spirv::BitwiseAndOp::create(builder, location, lhs, rhs).getResult();
         }
         if (name == arith::OrIOp::getOperationName()) {
-            if (operation.getResult(0).getType().isInteger(1))
+            if (getElementTypeOrSelf(operation.getResult(0).getType()).isInteger(1))
                 return spirv::LogicalOrOp::create(builder, location, lhs, rhs).getResult();
             return spirv::BitwiseOrOp::create(builder, location, lhs, rhs).getResult();
         }
         if (name == arith::XOrIOp::getOperationName()) {
-            if (operation.getResult(0).getType().isInteger(1))
+            if (getElementTypeOrSelf(operation.getResult(0).getType()).isInteger(1))
                 return spirv::LogicalNotEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::BitwiseXorOp::create(builder, location, lhs, rhs).getResult();
         }

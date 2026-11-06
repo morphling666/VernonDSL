@@ -366,7 +366,7 @@ mlir::FailureOr<SamplerTextures> analyzeSampledTextures(mlir::func::FuncOp funct
     std::map<unsigned, std::set<unsigned>> textureSamplers;
     bool invalid = false;
     function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
-        if (intrinsic.getName() != "texture_sample")
+        if (intrinsic.getName() != "texture_sample" && intrinsic.getName() != "texture_sample_bias")
             return;
         const ResourceOrigins &textureOrigins = provenance[intrinsic.getOperand(0)];
         const ResourceOrigins &samplerOrigins = provenance[intrinsic.getOperand(1)];

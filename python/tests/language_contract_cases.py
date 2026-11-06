@@ -675,6 +675,49 @@ def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
         capabilities=frozenset({"graphics", "texture_sampler"}),
     ),
     _invalid_source(
+        "LANG-TEXTURE-SAMPLE-BIAS",
+        "vertex",
+        "texture_sample_bias(texture, sampler, coordinates, bias)",
+        """
+from vernon_dsl import *
+@vertex
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample_bias(image, sampler, uv, -0.5)
+""",
+        "supported only in fragment shaders",
+        valid_regions=frozenset({"fragment"}),
+        invalid_regions=frozenset({"compute", "vertex", "func"}),
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-SAMPLE-BIAS",
+        "implicit-sampler",
+        "texture_sample_bias(texture, coordinates, bias)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample_bias(image, uv, -0.5)
+""",
+        "requires a sampled texture, sampler, coordinates, and bias",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
+        "LANG-TEXTURE-SAMPLE-BIAS",
+        "integer-bias",
+        "texture_sample_bias(texture, sampler, coordinates, integer_bias)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample_bias(image, sampler, uv, 1)
+""",
+        "floating-point scalar",
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _invalid_source(
         "LANG-TEXTURE-SIZE",
         "floating-lod",
         "texture_size(texture, floating_lod)",
@@ -992,6 +1035,20 @@ from vernon_dsl import *
 def main(image: Texture["2d", f32], sampler: Sampler,
          uv: Vector[f32, 2]) -> Vector[f32, 4]:
     return texture_sample(image, sampler, uv, 0.0)
+""",
+        valid_regions=frozenset({"fragment"}),
+        capabilities=frozenset({"graphics", "texture_sampler"}),
+    ),
+    _valid_source(
+        "LANG-TEXTURE-SAMPLE-BIAS",
+        "fragment",
+        "texture_sample_bias(texture, sampler, coordinates, bias)",
+        """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    return texture_sample_bias(image, sampler, uv, -0.5)
 """,
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
@@ -1797,6 +1854,37 @@ INFERENCE_STATEMENT_INVALID_CASES: Final = (
 
 INFERENCE_CALL_INVALID_CASES: Final = (
     _invalid_body(
+        "LANG-SCALAR-003",
+        "bool-tensor-condition",
+        "bool Tensor as an if condition",
+        "@fragment\ndef main(left: Vector[f32, 2], right: Vector[f32, 2]) -> f32:\n"
+        "    if left < right:\n        return 1.0\n    return 0.0\n",
+        "no single truth value",
+    ),
+    _invalid_body(
+        "LANG-SCALAR-003",
+        "chained-tensor-comparison",
+        "chained Tensor comparison",
+        "@fragment\ndef main(left: Vector[f32, 2], right: Vector[f32, 2]) -> f32:\n"
+        "    return select(left < right < left, left, right)[0]\n",
+        "Tensor comparisons cannot be chained",
+    ),
+    _invalid_body(
+        "LANG-MATH-001",
+        "any-non-bool",
+        "any of a float",
+        "@fragment\ndef main(value: f32) -> f32:\n    return 1.0 if any(value) else 0.0\n",
+        "requires one bool or bool Tensor argument",
+    ),
+    _invalid_body(
+        "LANG-MATH-001",
+        "select-shape",
+        "select with a mask of another shape",
+        "@fragment\ndef main(mask: Vector[f32, 3], value: Vector[f32, 2]) -> f32:\n"
+        "    return select(mask < 0.0, value, value)[0]\n",
+        "needs values of its shape",
+    ),
+    _invalid_body(
         "LANG-ENTRY-002",
         "helper-arity",
         "helper call arity",
@@ -2569,6 +2657,52 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         expected="arith.divf",
     ),
     _valid_source(
+        "LANG-SCALAR-003",
+        "float-floor-division",
+        "float floor division",
+        "from vernon_dsl import *\n@func\ndef main(value: f32, step: f32) -> f32:\n    return value // step\n",
+        valid_regions=frozenset({"func"}),
+        capabilities=frozenset(),
+        expected="math.floor",
+    ),
+    _valid_source(
+        "LANG-SCALAR-003",
+        "elementwise-comparison",
+        "Tensor comparison producing a bool Tensor",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def main(left: Vector[f32, 3], right: Vector[f32, 3]) -> Vector[f32, 3]:\n"
+        "    return select(left < right, left, right)\n",
+        valid_regions=frozenset({"func"}),
+        capabilities=frozenset(),
+        expected="tensor<3xi1>, tensor<3xf32>",
+    ),
+    _valid_source(
+        "LANG-MATH-001",
+        "integer-math",
+        "integer abs, min, max, clamp, dot, and cross",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def main(left: Vector[i32, 3], right: Vector[i32, 3]) -> i32:\n"
+        "    total = abs(min(left[0], right[0])) + max(left[1], 2) + clamp(left[2], -1, 1)\n"
+        "    return total + dot(left, right) + cross(left, right)[0]\n",
+        valid_regions=frozenset({"func"}),
+        capabilities=frozenset(),
+        expected="math.absi",
+    ),
+    _valid_source(
+        "LANG-MATH-001",
+        "bool-reductions",
+        "any and all of a bool Tensor",
+        "from vernon_dsl import *\n"
+        "@func\n"
+        "def main(left: Vector[f32, 3], right: Vector[f32, 3]) -> bool:\n"
+        "    return any(left < right) and not all(left == right)\n",
+        valid_regions=frozenset({"func"}),
+        capabilities=frozenset(),
+        expected="arith.ori",
+    ),
+    _valid_source(
         "LANG-TENSOR-003",
         "rectangular-constructors",
         "Tensor, Vector, and Matrix constructors",
@@ -3022,6 +3156,13 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
             }
         ),
         asset_reference="source/tests/fixtures/language_contract_texture_asset.py:explicit_asset",
+        requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SAMPLED_PIXEL, (255, 0, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_texture_bias",
+        contract_ids=frozenset({"LANG-TEXTURE-SAMPLE-BIAS"}),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:bias_asset",
         requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
         oracle=RuntimeOracle(RuntimeOracleKind.SAMPLED_PIXEL, (255, 0, 0, 255)),
     ),

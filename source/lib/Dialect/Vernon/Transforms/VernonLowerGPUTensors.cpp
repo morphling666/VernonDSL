@@ -182,9 +182,9 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
         } else {
             auto leftType = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
             auto rightType = dyn_cast<RankedTensorType>(op.getOperand(1).getType());
-            if (!leftType || !rightType || adaptor.getOperands().size() != 2 ||
-                !isa<FloatType>(leftType.getElementType()))
+            if (!leftType || !rightType || adaptor.getOperands().size() != 2)
                 return failure();
+            const bool floating = isa<FloatType>(leftType.getElementType());
             FailureOr<StaticMatmulPlan> plan = getStaticMatmulPlan(leftType.getShape(), rightType.getShape());
             if (failed(plan))
                 return rewriter.notifyMatchFailure(op, "invalid matmul shape");
@@ -193,7 +193,7 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
                 return failure();
             for (int64_t resultIndex = 0; resultIndex < *resultCount; ++resultIndex) {
                 Value sum = arith::ConstantOp::create(rewriter, location,
-                                                      rewriter.getFloatAttr(leftType.getElementType(), 0.0));
+                                                      cast<TypedAttr>(rewriter.getZeroAttr(leftType.getElementType())));
                 for (int64_t reduction = 0; reduction < plan->reduction; ++reduction) {
                     FailureOr<int64_t> leftIndex = getStaticMatmulLeftLinearIndex(*plan, resultIndex, reduction);
                     FailureOr<int64_t> rightIndex = getStaticMatmulRightLinearIndex(*plan, resultIndex, reduction);
@@ -203,8 +203,13 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
                         extractFlatTensorElement(location, adaptor.getOperands()[0], *leftIndex, useSpirv, rewriter);
                     Value rhs =
                         extractFlatTensorElement(location, adaptor.getOperands()[1], *rightIndex, useSpirv, rewriter);
-                    Value product = arith::MulFOp::create(rewriter, location, lhs, rhs);
-                    sum = arith::AddFOp::create(rewriter, location, sum, product);
+                    if (floating) {
+                        sum = arith::AddFOp::create(rewriter, location, sum,
+                                                    arith::MulFOp::create(rewriter, location, lhs, rhs));
+                    } else {
+                        sum = arith::AddIOp::create(rewriter, location, sum,
+                                                    arith::MulIOp::create(rewriter, location, lhs, rhs));
+                    }
                 }
                 elements.push_back(sum);
             }
@@ -221,7 +226,8 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
 
 // Texture intrinsics stay intrinsics until SPIR-V conversion; this pass only converts their value types.
 bool isGpuTextureIntrinsic(IntrinsicOp op) {
-    return op.getName() == "texture_load" || op.getName() == "texture_store" || op.getName() == "texture_sample";
+    return op.getName() == "texture_load" || op.getName() == "texture_store" || op.getName() == "texture_sample" ||
+           op.getName() == "texture_sample_bias";
 }
 
 struct GpuTextureIntrinsicTypePattern final : OpConversionPattern<IntrinsicOp> {

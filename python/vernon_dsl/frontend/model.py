@@ -296,7 +296,7 @@ class ResourceEffect:
     owner: str
     stages: frozenset[str]
     has_lod: bool
-    # "implicit" or "explicit" for texture_sample; None for operations that read no sampler.
+    # "implicit" or "explicit" for texture_sample and texture_sample_bias; None for operations that read no sampler.
     sampler_mode: str | None
 
 

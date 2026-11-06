@@ -2,7 +2,8 @@
 
 Status: labels (section 2) and timings (section 3) implemented (Engine
 extension E8, profiling), and the engine uses them as section 5 describes;
-awaiting the `PROGRAM_VERSION` cut. Metal is unverified on hardware. The
+awaiting the `PROGRAM_VERSION` cut. Metal records labels, is unverified on
+hardware, and reports no timings yet. The
 cut amends the contracts listed in section 7.
 
 A renderer is profiled by pass and inspected by draw: a capture tool
@@ -143,9 +144,9 @@ without debug groups drops them when it builds its recording.
   `GL_GPU_DISJOINT_EXT`); Vulkan timestamp query pools, reset on the command buffer
   before their first write, when the queue's `timestampValidBits` is not 0;
   CUDA `cuEventRecord`, read with `cuEventElapsedTime` from the first event,
-  whose half-microsecond resolution bounds the span. In phase 4, D3D12 uses
-  timestamp query heaps resolved with `ResolveQueryData` and
-  `GetTimestampFrequency`, and Metal an empty blit encoder per edge, sampled
+  whose half-microsecond resolution bounds the span. D3D12 uses timestamp
+  query heaps resolved with `ResolveQueryData` and `GetTimestampFrequency`;
+  Metal timings are to use an empty blit encoder per edge, sampled
   at its start into a timestamp counter sample buffer and scaled to
   nanoseconds with `sampleTimestamps` pairs; a GPU that drops the empty
   encoder reports an error sample, which fails the read.

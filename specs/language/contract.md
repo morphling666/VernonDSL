@@ -377,6 +377,9 @@ The supported texture operation regions are:
   valid in vertex and fragment stages;
 - `texture_sample(texture, sampler, coordinates, lod)` is valid in compute,
   vertex, and fragment stages;
+- `texture_sample_bias(texture, sampler, coordinates, bias)` adds a floating
+  Scalar `bias` to the level the implicit derivatives select and is
+  fragment-only;
 - `texture_size(texture[, lod])` is valid in vertex and fragment stages and
   requires an integer scalar LOD when present;
 - `texture_load` and `texture_store` operate on storage Textures with integer
@@ -861,6 +864,24 @@ or two equal operands such as `0.0` and `-0.0`, select the second operand, on
 every backend and in compiled host code. These are x86's `minsd`/`maxsd`; the
 IEEE 754-2019 `minimum`/`maximum`, which propagate NaN and order `-0.0` below
 `0.0`, cost several instructions more per call on x86 and are not used.
+On integers, `abs`, `min`, `max`, `clamp`, `dot`, `cross`, and `@` keep the
+integer type; signed `abs` of the minimum value wraps, as in numpy, and `min`/
+`max` compare signed or unsigned by the declared element type. Integer `**`
+is rejected.
+
+`//` floors on every numeric type. On floats it is numpy's `floor_divide`:
+the result is `floor` of the exact quotient, `-0.0` when that quotient is a
+negative zero, and `a / b` when `b` is zero. Shading-language `fmod` is NaN
+for an infinite divisor, so on the Vulkan, DirectX, and OpenGL backends `a // inf` is NaN where CPU, CUDA, and host code return `0.0` or
+`-1.0`; `%` behaves the same.
+
+Comparing two Tensors, or a Tensor and a scalar, is elementwise and yields a
+bool Tensor of the Tensor shape, as in numpy and WGSL. A bool Tensor has no
+single truth value: a condition must reduce it with `any(mask)` or
+`all(mask)`. `select(condition, a, b)` picks `a` where the condition is true
+and `b` elsewhere, in the argument order of `np.where` and HLSL; a scalar
+condition picks whole values and a bool Tensor condition picks elements of
+values with its shape.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented

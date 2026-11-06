@@ -1,4 +1,4 @@
-#include "hal/vulkan/staging_pool.h"
+#include "hal/staging_pool.h"
 
 #include <gtest/gtest.h>
 
@@ -12,8 +12,8 @@ struct FakeChunk {
     size_t capacity{};
 };
 
-using Pool = vernon::hal::vulkan::StagingPool<FakeChunk>;
-using Arena = vernon::hal::vulkan::StagingArena<FakeChunk>;
+using Pool = vernon::hal::StagingPool<FakeChunk>;
+using Arena = vernon::hal::StagingArena<FakeChunk>;
 
 class StagingPoolTest : public testing::Test {
 protected:

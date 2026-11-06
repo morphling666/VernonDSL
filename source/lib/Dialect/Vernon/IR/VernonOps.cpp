@@ -117,8 +117,8 @@ LogicalResult SwizzleOp::verify() {
 LogicalResult IntrinsicOp::verify() {
     if (getNameAttr().getValue().empty())
         return emitOpError("requires a non-empty intrinsic name");
-    if (getName() != "texture_sample" && getName() != "texture_size" && getName() != "texture_load" &&
-        getName() != "texture_store")
+    if (getName() != "texture_sample" && getName() != "texture_sample_bias" && getName() != "texture_size" &&
+        getName() != "texture_load" && getName() != "texture_store")
         return success();
 
     if (getNumOperands() == 0)
@@ -184,9 +184,15 @@ LogicalResult IntrinsicOp::verify() {
         return success();
     }
 
-    if (getNumOperands() < 3 || getNumOperands() > 4)
+    if (getName() == "texture_sample_bias") {
+        if (getNumOperands() != 4)
+            return emitOpError("texture_sample_bias requires texture, sampler, coordinates, and bias");
+        if (!isa<FloatType>(getOperand(3).getType()))
+            return emitOpError("texture_sample_bias operand #3 bias must be a floating-point scalar");
+    } else if (getNumOperands() < 3 || getNumOperands() > 4) {
         return emitOpError("texture_sample requires texture, sampler, coordinates, and optional "
                            "lod");
+    }
     if (!isa<SamplerType>(getOperand(1).getType()))
         return emitOpError("texture_sample operand #1 must be a Vernon sampler");
 

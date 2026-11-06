@@ -234,6 +234,22 @@ def main(image: Texture["2d", f32], sampler: Sampler,
         assert_verified_ir(self, output, fragment_case)
         self.assertIn('name = "texture_sample"', output)
 
+    @covers_case("LANG-TEXTURE-SAMPLE-BIAS/fragment", layers="FI")
+    @covers_case("LANG-TEXTURE-SAMPLE-BIAS/vertex", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-BIAS/implicit-sampler", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-BIAS/integer-bias", layers="F")
+    def test_biased_sampling_is_fragment_only_with_an_explicit_sampler(self) -> None:
+        fragment_case = case_by_id("LANG-TEXTURE-SAMPLE-BIAS/fragment")
+        output = compile_source(fragment_case.source, f"{fragment_case.name}.py")
+        assert_verified_ir(self, output, fragment_case)
+        self.assertIn('name = "texture_sample_bias"', output)
+        for case in (
+            case_by_id("LANG-TEXTURE-SAMPLE-BIAS/vertex"),
+            case_by_id("LANG-TEXTURE-SAMPLE-BIAS/implicit-sampler"),
+            case_by_id("LANG-TEXTURE-SAMPLE-BIAS/integer-bias"),
+        ):
+            assert_frontend_rejects(self, case)
+
     def test_implicit_sampler_binding_skips_declared_resources(self) -> None:
         source = """
 from vernon_dsl import *

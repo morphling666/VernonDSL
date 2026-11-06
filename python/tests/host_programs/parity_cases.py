@@ -130,6 +130,19 @@ EXACT_CASES = [
     ("sliced", (_GRID, 3), ("ok", "((6.0, 7.0), ((7.0, 6.0), (3.0, 2.0)), 169.0)", ())),
     ("sliced", (_GRID, -1), ("ok", "((6.0, 7.0), ((7.0, 6.0), (3.0, 2.0)), 169.0)", ())),
     ("sliced", (_GRID, -9), ("ok", "((4.0, 5.0), ((7.0, 6.0), (3.0, 2.0)), 110.0)", ())),
+    ("float_floor_division", (-7.5, 2.0), ("ok", "-4.0", ())),
+    ("float_floor_division", (7.5, -2.0), ("ok", "-4.0", ())),
+    ("float_floor_division", (7.5, 3.0), ("ok", "2.0", ())),
+    ("float_floor_division", (0.0, -1.0), ("ok", "-0.0", ())),
+    ("float_floor_division", (-0.25, 2.0), ("ok", "-1.0", ())),
+    ("float_floor_division", (1.0, 0.0), ("ok", "inf", ())),
+    ("float_floor_division", (0.0, 0.0), ("ok", "nan", ())),
+    ("float_floor_division", (3.0, INF), ("ok", "0.0", ())),
+    ("float_floor_division", (-3.0, INF), ("ok", "-1.0", ())),
+    ("float_floor_division", (NAN, 1.0), ("ok", "nan", ())),
+    ("vector_masks", ((1.0, 5.0, 3.0), (2.0, 4.0, 3.0)), ("ok", "((1.0, 4.0, 3.0), True, False, 1.0)", ())),
+    ("vector_masks", ((-1.0, 2.0, 3.0), (-1.0, 2.0, 3.0)), ("ok", "((-1.0, 2.0, 3.0), False, True, -1.0)", ())),
+    ("integer_vectors", ((1, 2, 3), (4, -5, 6)), ("ok", "(12, (27, 6, -13), (4, 2, 6))", ())),
 ]
 
 # libm results are only as portable as the platform's libm, so these are checked within a tolerance.

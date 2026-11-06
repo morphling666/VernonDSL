@@ -402,7 +402,11 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     bindDirectXRootConstants(compiler, entry.execution_model);
                     spirv_cross::CompilerHLSL::Options options;
                     options.shader_model = hlslShaderModel;
+                    options.support_nonzero_base_vertex_base_instance = true;
                     compiler.set_hlsl_options(options);
+                    compiler.set_hlsl_aux_buffer_binding(spirv_cross::HLSL_AUX_BINDING_BASE_VERTEX_INSTANCE,
+                                                         ::vernon::runtime::kDirectXDrawOffsetsRegister,
+                                                         ::vernon::runtime::kDirectXRootConstantRegisterSpace);
                     source = compiler.compile();
                     extension = "hlsl";
                 } else {

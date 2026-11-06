@@ -62,6 +62,10 @@ inline bool isNativeUniformShape(const uint64_t *shape, size_t rank, bool f32Ele
 inline constexpr uint32_t kDirectXRootConstantRegister = 0;
 inline constexpr uint32_t kDirectXRootConstantRegisterSpace = 0;
 
+// SV_VertexID and SV_InstanceID exclude a draw's base vertex and first instance, which Vulkan's indices include, so a
+// vertex stage reads them from two root constants the device sets per draw at this register of the same space.
+inline constexpr uint32_t kDirectXDrawOffsetsRegister = 1;
+
 // Descriptor set N uses register space N + 1, leaving space 0 to the root constants alone: otherwise the uniform block
 // planned at set 0 binding 0 would take b0 space0 as well.
 inline constexpr uint32_t kDirectXDescriptorSetRegisterSpaceOffset = kDirectXRootConstantRegisterSpace + 1;

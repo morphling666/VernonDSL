@@ -1,12 +1,12 @@
-#ifndef VERNON_HAL_VULKAN_STAGING_POOL_H
-#define VERNON_HAL_VULKAN_STAGING_POOL_H
+#ifndef VERNON_HAL_STAGING_POOL_H
+#define VERNON_HAL_STAGING_POOL_H
 
 #include <algorithm>
 #include <limits>
 #include <utility>
 #include <vector>
 
-namespace vernon::hal::vulkan {
+namespace vernon::hal {
 
 // The staging chunks one command frame bumps through. The frame holds them until its work completes.
 template <typename Chunk> struct StagingArena {
@@ -89,6 +89,6 @@ private:
     std::vector<Chunk> free_;
 };
 
-} // namespace vernon::hal::vulkan
+} // namespace vernon::hal
 
 #endif

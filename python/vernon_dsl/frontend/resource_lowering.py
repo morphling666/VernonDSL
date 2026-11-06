@@ -4,7 +4,7 @@ import ast
 from typing import Protocol
 
 from ..language.stage_registry import GRAPHICS_STAGES
-from ..shader_contracts import resource_stage_error, texture_sampling_contract
+from ..shader_contracts import resource_stage_error, texture_bias_sampling_contract, texture_sampling_contract
 from .interfaces import GeneratedInterfacePlan
 from .lowering_types import DslType, ModuleContext, Value
 from .texture_dimensions import SAMPLE_COORDINATE_RANK
@@ -80,6 +80,45 @@ def lower_texture_sample(
     if lod is not None:
         operands.append(lod)
     return emitter._intrinsic(node, "texture_sample", operands, result_type)
+
+
+def lower_texture_sample_bias(
+    emitter: ResourceEmitter,
+    node: ast.Call,
+    arguments: list[Value],
+    result_type: DslType,
+) -> Value:
+    if emitter.node.name in emitter.context.shared_functions:
+        raise emitter.context.error(
+            node,
+            f"shared function '{emitter.node.name}' uses device-only operation 'texture_sample_bias'",
+        )
+    sampling = texture_bias_sampling_contract(tuple(argument.type.kind for argument in arguments))
+    if sampling is None:
+        raise emitter.context.error(node, "texture_sample_bias requires texture, sampler, coordinates, and bias")
+    texture_source = node.args[0].id if isinstance(node.args[0], ast.Name) else None
+    planned_mode = emitter.interface_plan.texture_sampler_modes.get(texture_source) if texture_source else None
+    if planned_mode is not None and planned_mode != sampling.sampler_mode:
+        raise emitter.context.error(node, "texture sampling overload differs from its interface plan")
+    if emitter.stage is not None and emitter.stage not in sampling.stages:
+        raise emitter.context.error(node, resource_stage_error("texture_sample_bias", sampling.stages))
+    texture, sampler, coordinates, bias = arguments
+    if bias.type.kind != "scalar" or not bias.type.is_float:
+        raise emitter.context.error(node.args[3], "texture_sample_bias bias must be a floating-point scalar")
+    element = texture.type.arguments[1]
+    dimension = texture.type.arguments[0]
+    coordinate_rank = SAMPLE_COORDINATE_RANK[dimension]
+    if (
+        coordinates.type.kind != "tensor"
+        or coordinates.type.arguments != (element, coordinate_rank)
+        or not coordinates.type.is_float
+    ):
+        raise emitter.context.error(
+            node.args[2],
+            f"texture_sample_bias coordinates for a {dimension} texture "
+            f"must be a {coordinate_rank}-component floating-point vector",
+        )
+    return emitter._intrinsic(node, "texture_sample_bias", arguments, result_type)
 
 
 def lower_texture_size(

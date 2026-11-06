@@ -129,7 +129,9 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
         if (backend == VERNON_RUNTIME_CPU && result.available) {
             result.supports_compute = 1;
             result.supports_storage_buffers = 1;
-        } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN) && result.available) {
+        } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN ||
+                    backend == VERNON_RUNTIME_DIRECTX12 || backend == VERNON_RUNTIME_METAL) &&
+                   result.available) {
             result.supports_compute = result.available;
             result.supports_storage_buffers = result.available;
         } else if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {

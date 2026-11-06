@@ -146,7 +146,7 @@ protected:
             presents = true;
         }
 #if defined(_WIN32)
-        if (GetParam().runtime == VERNON_RUNTIME_VULKAN) {
+        if (GetParam().runtime == VERNON_RUNTIME_VULKAN || GetParam().runtime == VERNON_RUNTIME_DIRECTX12) {
             native_ = std::make_unique<vernon::host::GlfwWindowOwner>(kWidth, kHeight);
             descriptor.native.win32_window = native_->win32Window();
             presents = true;
@@ -157,6 +157,10 @@ protected:
         const VernonHalStatus created = vernonHalCreateSurface(device_, &descriptor, &surface);
         if (!presents) {
             EXPECT_EQ(created, VERNON_HAL_UNSUPPORTED);
+            return nullptr;
+        }
+        if (created == VERNON_HAL_UNSUPPORTED && GetParam().runtime == VERNON_RUNTIME_DIRECTX12) {
+            [] { GTEST_SKIP() << "DirectX 12 cannot present here: " << lastError(); }();
             return nullptr;
         }
         EXPECT_EQ(created, VERNON_HAL_OK) << lastError();
@@ -674,10 +678,11 @@ TEST_P(HalResources, ASurfaceImageIsReadOnlyOnceWritten) {
 #if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE) && defined(_WIN32)
 // Each surface presents its own window and keeps its own images, so one device presents both in turn.
 TEST_P(HalResources, TwoSurfacesPresentTheirOwnImages) {
-    if (GetParam().runtime != VERNON_RUNTIME_VULKAN)
-        GTEST_SKIP() << "only Vulkan surfaces present windows the test opens";
+    if (GetParam().runtime != VERNON_RUNTIME_VULKAN && GetParam().runtime != VERNON_RUNTIME_DIRECTX12)
+        GTEST_SKIP() << "only Vulkan and DirectX 12 surfaces present windows the test opens";
     VernonHalSurface *first = createSurface();
-    ASSERT_NE(first, nullptr);
+    if (!first)
+        return;
     const vernon::host::GlfwWindowOwner secondWindow(kWidth, kHeight);
     VernonHalSurfaceDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);

@@ -1765,6 +1765,11 @@ asset = vd.program_asset(
                 {"vertex", "fragment"},
             ),
             (
+                root / "python" / "tests" / "loop_struct_shader.py",
+                "layered_asset",
+                {"vertex", "fragment"},
+            ),
+            (
                 root / "python" / "tests" / "program_asset_fixture.py",
                 "scale_asset",
                 {"compute"},

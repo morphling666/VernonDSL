@@ -278,7 +278,7 @@ OpenGL 4.3 or `ARB_texture_view` is required for true shader-visible aliased
 views. A canonical identity view whose format, dimension, aspects, and complete
 subresource range equal its parent may resolve directly to the parent's texture
 object. Older OpenGL and OpenGL ES otherwise continue to support transfer-region
-slicing without claiming aliased image-view support. The phase 4 D3D12 device
+slicing without claiming aliased image-view support. The D3D12 device
 generates mips with a build-time compiled and embedded utility compute
 shader, so it adds no runtime shader compiler dependency.
 

@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::vernon {
@@ -119,8 +120,28 @@ SmallVector<Value> flattenConstructOperands(Location location, ValueRange operan
     return elements;
 }
 
+bool hasFloatElements(Value value) { return isa<FloatType>(getElementTypeOrSelf(value.getType())); }
+
+Value createMultiply(Location location, Value lhs, Value rhs, ConversionPatternRewriter &rewriter) {
+    if (hasFloatElements(lhs))
+        return arith::MulFOp::create(rewriter, location, lhs, rhs);
+    return arith::MulIOp::create(rewriter, location, lhs, rhs);
+}
+
+Value createAdd(Location location, Value lhs, Value rhs, ConversionPatternRewriter &rewriter) {
+    if (hasFloatElements(lhs))
+        return arith::AddFOp::create(rewriter, location, lhs, rhs);
+    return arith::AddIOp::create(rewriter, location, lhs, rhs);
+}
+
+Value createSubtract(Location location, Value lhs, Value rhs, ConversionPatternRewriter &rewriter) {
+    if (hasFloatElements(lhs))
+        return arith::SubFOp::create(rewriter, location, lhs, rhs);
+    return arith::SubIOp::create(rewriter, location, lhs, rhs);
+}
+
 Value createDot(Location location, Value lhs, Value rhs, ConversionPatternRewriter &rewriter) {
-    Value product = arith::MulFOp::create(rewriter, location, lhs, rhs);
+    Value product = createMultiply(location, lhs, rhs, rewriter);
     return vector::ReductionOp::create(rewriter, location, vector::CombiningKind::ADD, product);
 }
 
@@ -185,7 +206,7 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
                     resultIndex = *mapped;
                 }
                 Value element = vector::ExtractOp::create(rewriter, location, adaptor.getOperands()[0], sourceIndex);
-                sums[resultIndex] = arith::AddFOp::create(rewriter, location, sums[resultIndex], element);
+                sums[resultIndex] = createAdd(location, sums[resultIndex], element, rewriter);
             }
             Type convertedResult = getTypeConverter()->convertType(op.getResult().getType());
             if (auto resultVector = dyn_cast_if_present<VectorType>(convertedResult))
@@ -225,13 +246,13 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
             constexpr int64_t rhsSecond[] = {1, 2, 0};
             SmallVector<Value> elements;
             for (int64_t index = 0; index < 3; ++index) {
-                Value first = arith::MulFOp::create(
-                    rewriter, location, vector::ExtractOp::create(rewriter, location, lhs, lhsFirst[index]),
-                    vector::ExtractOp::create(rewriter, location, rhs, rhsFirst[index]));
-                Value second = arith::MulFOp::create(
-                    rewriter, location, vector::ExtractOp::create(rewriter, location, lhs, lhsSecond[index]),
-                    vector::ExtractOp::create(rewriter, location, rhs, rhsSecond[index]));
-                elements.push_back(arith::SubFOp::create(rewriter, location, first, second));
+                Value first =
+                    createMultiply(location, vector::ExtractOp::create(rewriter, location, lhs, lhsFirst[index]),
+                                   vector::ExtractOp::create(rewriter, location, rhs, rhsFirst[index]), rewriter);
+                Value second =
+                    createMultiply(location, vector::ExtractOp::create(rewriter, location, lhs, lhsSecond[index]),
+                                   vector::ExtractOp::create(rewriter, location, rhs, rhsSecond[index]), rewriter);
+                elements.push_back(createSubtract(location, first, second, rewriter));
             }
             rewriter.replaceOpWithNewOp<vector::FromElementsOp>(op, vectorType, elements);
             return success();
@@ -263,11 +284,9 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
             if (failed(plan) || failed(resultCount))
                 return rewriter.notifyMatchFailure(op, "invalid matmul shape");
             Type elementType = leftType.getElementType();
-            if (!isa<FloatType>(elementType))
-                return rewriter.notifyMatchFailure(op, "matmul currently requires floating-point elements");
             SmallVector<Value> elements;
             for (int64_t resultIndex = 0; resultIndex < *resultCount; ++resultIndex) {
-                Value sum = arith::ConstantOp::create(rewriter, location, rewriter.getFloatAttr(elementType, 0.0));
+                Value sum = arith::ConstantOp::create(rewriter, location, rewriter.getZeroAttr(elementType));
                 for (int64_t reduction = 0; reduction < plan->reduction; ++reduction) {
                     FailureOr<int64_t> leftIndex = getStaticMatmulLeftLinearIndex(*plan, resultIndex, reduction);
                     FailureOr<int64_t> rightIndex = getStaticMatmulRightLinearIndex(*plan, resultIndex, reduction);
@@ -275,8 +294,7 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
                         return rewriter.notifyMatchFailure(op, "invalid matmul index plan");
                     Value lhs = vector::ExtractOp::create(rewriter, location, adaptor.getOperands()[0], *leftIndex);
                     Value rhs = vector::ExtractOp::create(rewriter, location, adaptor.getOperands()[1], *rightIndex);
-                    Value product = arith::MulFOp::create(rewriter, location, lhs, rhs);
-                    sum = arith::AddFOp::create(rewriter, location, sum, product);
+                    sum = createAdd(location, sum, createMultiply(location, lhs, rhs, rewriter), rewriter);
                 }
                 elements.push_back(sum);
             }

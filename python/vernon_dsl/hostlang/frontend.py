@@ -52,6 +52,8 @@ _INTRINSICS = frozenset(
     {
         "abs",
         "acos",
+        "all",
+        "any",
         "atan2",
         "clamp",
         "cos",
@@ -65,6 +67,7 @@ _INTRINSICS = frozenset(
         "norm",
         "normalize",
         "pow",
+        "select",
         "sin",
         "sqrt",
     }
@@ -1345,8 +1348,6 @@ class _Validator:
         element = result.arguments[0] if result.kind == "tensor" else result
         if not isinstance(element, ConcreteType) or element.kind != "scalar" or element.name == "bool":
             raise self.error(node, f"arithmetic on {result.spelling} is not supported")
-        if isinstance(op, ast.FloorDiv) and element.is_float:
-            raise self.error(node, "floor division requires integer operands")
         if isinstance(op, _BITWISE) and element.is_float:
             raise self.error(node, f"{_OPERATOR_SPELLING[type(op)]} requires integer operands")
         if isinstance(op, ast.Pow) and not element.is_float:

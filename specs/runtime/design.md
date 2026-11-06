@@ -19,8 +19,7 @@ Runtime execution is split into two layers:
   and public resource references (`VernonRuntime.h`, `VernonSchedule.h`).
 - **HAL** owns devices, resources, surfaces, pipelines, recorded command
   buffers, submission, and timeline points (`VernonHal.h`). A HAL device
-  owns the runtime context its schedules link on. DirectX 12 and Metal have
-  no HAL device until phase 4 of `architecture_v2.md` section 16.
+  owns the runtime context its schedules link on.
 
 A schedule names resources by opaque references (`vernonHalReference*`). The
 Runtime API does not own native textures, framebuffers, descriptor heaps,
@@ -451,19 +450,22 @@ vertex stage, while the viewport is dynamic state the device already sets.
 
 ### DirectX 12
 
-DirectX 12 has no HAL device until phase 4 (`architecture_v2.md` section
-16), so `Runtime::initialize` rejects it. The compiler still cooks DXIL, and
-a deployment never invokes DXC; the rules below fix the artifacts the phase 4
+The DirectX 12 HAL device (`hal/d3d12/`) runs on Windows. The compiler cooks
+DXIL and a deployment never invokes DXC; the rules below fix the artifacts the
 device consumes.
 
 Inline uniforms lower to the same SPIR-V push-constant block as on Vulkan, in
 the `vulkan_push_constant` layout. SPIRV-Cross emits that block as an explicit
-`cbuffer` at b0 space0 with `packoffset` taken from the SPIR-V member offsets,
-and the root signature declares the same register as one 32-bit root-constant
-parameter per stage (`kDirectXRootConstantRegister` in
-`runtime/interface_names.h`). The device places each value at its running
-offset aligned to the reflected element alignment, the rule the SPIR-V
-lowering uses, so every byte offset is decided by the compiler-owned layout.
+`cbuffer` at b0 space0 with `packoffset` taken from the SPIR-V member offsets
+(`kDirectXRootConstantRegister` in `runtime/interface_names.h`). The device
+places each value at its running offset aligned to the reflected element
+alignment, sorted by entry argument order, the rule the SPIR-V lowering uses,
+so every byte offset is decided by the compiler-owned layout. The root
+signature binds that register as one root constant buffer view per graphics
+stage, pointing at 256-byte blocks a call composes in the recording's upload
+arena. Root constants were rejected: their values are recorded into the command
+list, so every value change would force a new recording, and two stages of
+values could exceed the 64-DWORD root signature budget.
 Loose HLSL globals were rejected: DXC packs them into an implicit `$Globals`
 buffer with its own packing rules and auto-assigns its register, so the
 runtime would have to mirror HLSL packing and the binding would depend on
@@ -481,7 +483,63 @@ layout from the std140 SPIR-V interface decorations, as on every other backend.
 Compute and graphics root signatures have the same descriptor tables: a
 CBV/SRV/UAV table and a sampler table, each in layout entry order. They
 differ only in inline values, which are read storage buffers in compute and
-root constants in graphics.
+per-stage root constant buffer views in graphics. A shader-visible sampler
+heap holds at most 2048 descriptors, so a recording shares sampler tables by
+content: binding sets that differ only in resources reuse one table rather
+than each writing its own, which a frame of a few hundred material draws would
+otherwise exhaust.
+
+SPIRV-Cross emits a struct or array value as an HLSL initializer list, which is
+valid only in a declaration. A value whose temporary it hoists out of the
+block that builds it (one read after a branch in a loop body) becomes an
+assignment from an initializer list, which DXC rejects; SPIRV-Cross has no
+fix upstream. The compiler therefore reads each member of a composite built
+from its members directly (`ForwardCompositeMembersPass` in
+`compiler_spirv.cpp`, before serialization), so a struct built only to be read,
+as a helper's returned struct is, never reaches SPIRV-Cross. Patching
+SPIRV-Cross was rejected because the patch would have to be carried across
+every upgrade. `python/tests/loop_struct_shader.py` reproduces the shape.
+
+Limit: a struct or array that stays a value still reaches SPIRV-Cross, so the
+DirectX target fails to cook when SPIRV-Cross hoists one. That is a struct
+carried from one loop iteration to the next, merged from the arms of a
+branch, stored to a function variable, or passed to a function that is not
+inlined, when it is read after a branch in the block that builds it. The
+failure is a DXC "expected expression" error at cook time, never wrong
+output, and the other targets are unaffected. A shader avoids it by carrying
+the struct's members as separate values. Splitting such structs into
+per-member values in the compiler, through loop-carried values and branch
+results, would remove the limit.
+
+`SV_VertexID` and `SV_InstanceID` exclude a draw's base vertex and first
+instance, which Vulkan's indices include. SPIRV-Cross
+(`support_nonzero_base_vertex_base_instance`) adds them from an auxiliary
+constant buffer at b1 space0 (`kDirectXDrawOffsetsRegister`), which the
+graphics root signature declares as two root constants {base vertex, first
+instance} the device sets before each draw. Indirect draws use a command
+signature that sets the same constants and then draws, over 28-byte arguments
+(the two offsets and `D3D12_DRAW_INDEXED_ARGUMENTS`): a host stream's records
+are expanded into the arena by the call, a device stream's by a built-in
+compute shader (`hal/d3d12/d3d12_draw_stream.hlsl`) into the recording's
+device-memory argument buffer before the render scope. Shader model 6.8's
+`SV_StartVertexLocation` would avoid the expansion but needs drivers the
+baseline does not require.
+
+Host-visible buffers are in custom heaps in memory pool L0 (write-combined for
+upload, write-back for readback) rather than the upload and readback heaps, whose buffers cannot be
+UAVs nor leave their one state; every buffer therefore begins each submission
+in `COMMON`, to which buffers decay, and reads its mapping once the fence
+passes. Raw buffer views start at 16-byte offsets
+(`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`). An image whose views reinterpret it is
+created in its family's typeless format, so 8-bit RGBA has UNORM and sRGB views
+and a sampled depth image has a color view. Depth-stencil transfers copy whole
+subresources, as D3D12 requires. Mipmap generation and draw-stream expansion
+are compute shaders compiled by DXC at build time and embedded; a build
+without DXC generates no mipmaps and draws no device streams. A render scope binds a null render target
+view at color locations without an attachment, so the others keep their
+locations. Sampler anisotropy above 1 selects the anisotropic filter.
+Presentation needs a window station with a visible desktop, which services and
+SSH sessions lack.
 
 A storage buffer whose layout access has no write is a raw SRV
 (`ByteAddressBuffer`, a `t` register); only written ones are raw UAVs. Reads
@@ -500,10 +558,39 @@ are `NonWritable` blocks too.
 
 ### Metal
 
-Metal has no HAL device until phase 4 (`architecture_v2.md` section 16), so
-`Runtime::initialize` rejects it. The compiler still cooks MSL with its MSL,
-OS, device feature, argument-buffer, and workgroup requirements, which the
-phase 4 device validates before it creates pipelines.
+The Metal HAL device (`source/lib/hal/metal`, Objective-C++ under ARC) needs
+macOS 12 or iOS 15 and Tier 2 argument buffers, and compiles the cooked MSL 2.4
+with fast math off, so floating-point results match the SPIR-V targets.
+
+- Bindings: set g is one argument buffer at `[[buffer(g)]]`, encoded per
+  binding slot through the function's own argument encoder
+  (`newArgumentEncoderWithBufferIndex:`), so member offsets are the
+  compiler's rather than a layout the device reconstructs. Each stage of a
+  graphics pipeline has its own encoders, because SPIRV-Cross lays out each
+  stage's argument buffer from the members that stage reads. Push constants
+  are `setBytes` at buffer 15, plain uniforms direct buffers from 8, and
+  vertex binding b is buffer 16 + b.
+- Residency: argument buffers reference resources indirectly, so every
+  dispatch calls `useResource` for what its sets reference, and every render
+  scope does once for the union of its draws, with the stages that read each
+  resource on macOS 13 and iOS 16.
+- Ordering: resources use Metal's automatic hazard tracking, so recorded
+  barriers encode nothing. A submit encodes a fresh `MTLCommandBuffer` from
+  the recorded command list, since Metal command buffers are single-use.
+- Render scopes clear whole attachments only, because a load action has no
+  region; a cleared scope over part of an attachment fails to record.
+  Pipeline variants are keyed by the scope's attachment formats, because a
+  pipeline whose formats differ from the pass is a Metal validation error.
+- Device draw streams: a counted stream expands through a built-in compute
+  kernel that zeroes the instance count of records past the count; an
+  uncounted stream draws each record indirectly from the record buffer,
+  whose 20-byte record is `MTLDrawIndexedPrimitivesIndirectArguments`.
+- Transfers: macOS copies and fills whole 4-byte words, so the device pads
+  uploads and readbacks to 4 bytes. Depth-stencil writes cover whole mip
+  levels.
+- Present copies the RGBA8 ring image into the layer's BGRA8 drawable with a
+  fullscreen-triangle render pass, because `CAMetalLayer` has no RGBA8 format.
+- The device reports no submission timings yet.
 
 ### OpenGL and OpenGL ES
 
@@ -716,9 +803,9 @@ Render scopes:
   that scope. A depth-only attachment uses
   DISCARD stencil operations, because a stencil load or store of a format
   without stencil is invalid on D3D12 and Vulkan.
-- The phase 4 Metal device checks pipeline attachment formats against the
-  scope at every draw, because a mismatch is a Metal validation error. Other
-  backends do not check this at draw time.
+- The Metal device keys each pipeline variant by the scope's attachment
+  formats, because a mismatch is a Metal validation error. Other backends do
+  not check this at draw time.
 - Format facts live in one public X-macro table,
   `source/include/VernonFormats.def`, read by the texture format enum, every
   backend mapping, layout and aspect checks, compiler storage checks and
@@ -749,7 +836,7 @@ Render scopes:
   component class, so integer clears are exact; Runtime rejects non-finite
   clear values only for non-integer formats, where the bits are floats.
   D3D12 `ClearRenderTargetView` takes floats, which cannot carry every 32-bit
-  integer, so the phase 4 D3D12 device creates integer color attachments with
+  integer, so the D3D12 device creates integer color attachments with
   unordered access and clears them with `ClearUnorderedAccessViewUint`
   (preferred over a clear draw, which needs a pipeline per format).
 - Every HAL backend checks the image and view descriptor rules that hold on

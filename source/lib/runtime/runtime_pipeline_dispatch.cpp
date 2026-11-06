@@ -16,6 +16,14 @@ BackendPipelineResult resolveBackendPipeline(BackendStageBuildInputs &inputs, co
         return resolveCudaPipeline(inputs, plan, pipeline);
     else if (inputs.context->backend == VERNON_RUNTIME_VULKAN)
         return resolveVulkanPipeline(inputs, plan, pipeline);
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (inputs.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return resolveDirectX12Pipeline(inputs, plan, pipeline);
+#endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    else if (inputs.context->backend == VERNON_RUNTIME_METAL)
+        return resolveMetalPipeline(inputs, plan, pipeline);
+#endif
     else if (isOpenGLBackend(inputs.context->backend))
         return resolveOpenGLPipeline(inputs, plan, pipeline);
     return BackendPipelineResult{vernon::err(BackendPipelineError::UnsupportedBackend)};

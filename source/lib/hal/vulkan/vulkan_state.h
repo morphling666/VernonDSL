@@ -4,7 +4,7 @@
 #include "VernonFormats.hpp"
 #include "VernonHal.h"
 #include "VernonResult.hpp"
-#include "hal/vulkan/staging_pool.h"
+#include "hal/staging_pool.h"
 #include "hal/vulkan/vulkan_driver.h"
 
 #include <deque>
@@ -187,8 +187,6 @@ struct DeviceState {
     uint32_t maxPushConstantsSize{};
     uint32_t maxVertexInputAttributes{};
     uint32_t apiVersion{};
-    uint32_t maxComputeWorkGroupInvocations{};
-    uint32_t maxComputeWorkGroupSize[3]{};
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
     bool drawIndirectCount{};

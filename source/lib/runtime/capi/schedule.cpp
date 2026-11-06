@@ -2,6 +2,12 @@
 
 #include "hal/cpu/cpu_device.h"
 #include "hal/cuda/cuda_device.h"
+#if VERNON_HAS_DIRECTX12_RUNTIME
+#include "hal/d3d12/d3d12_device.h"
+#endif
+#if VERNON_HAS_METAL_RUNTIME
+#include "hal/metal/metal_device.h"
+#endif
 #include "hal/native_buffers.h"
 #include "hal/opengl/opengl_device.h"
 #if VERNON_HAS_VULKAN_RUNTIME
@@ -214,8 +220,16 @@ std::shared_ptr<vernon::hal::Device> contextDevice(VernonRuntimeContext &context
 #endif
         if (!context.halDevice)
             error = "linked schedules do not run on a Vulkan device whose host owns the native objects";
+    } else if (context.backend == VERNON_RUNTIME_DIRECTX12) {
+#if VERNON_HAS_DIRECTX12_RUNTIME
+        context.halDevice = std::shared_ptr<vernon::hal::Device>(vernon::hal::createDirectX12Device(context).release());
+#endif
+    } else if (context.backend == VERNON_RUNTIME_METAL) {
+#if VERNON_HAS_METAL_RUNTIME
+        context.halDevice = std::shared_ptr<vernon::hal::Device>(vernon::hal::createMetalDevice(context).release());
+#endif
     } else {
-        error = "linked schedules run on the CPU, CUDA, Vulkan and OpenGL only yet";
+        error = "linked schedules do not run on this backend";
         return nullptr;
     }
     if (!context.halDevice && error.empty())

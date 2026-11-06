@@ -308,6 +308,50 @@ llvm::Type *floatEquivalent(llvm::Type *type) {
     return type->isHalfTy() ? floatType : nullptr;
 }
 
+llvm::Type *widenedType(llvm::Type *type) {
+    llvm::Type *wide = floatEquivalent(type);
+    return wide ? wide : type;
+}
+
+// Calls a half-typed math intrinsic (sin, sqrt, pow, vector.reduce.fadd, ...) on f32 operands and narrows the
+// result. f32 carries more than twice f16's precision, so the double rounding still gives the correctly rounded
+// result for the basic operations.
+void widenHalfIntrinsics(llvm::Module &module) {
+    llvm::SmallVector<llvm::IntrinsicInst *> intrinsics;
+    for (llvm::Function &function : module)
+        for (llvm::BasicBlock &block : function)
+            for (llvm::Instruction &instruction : block)
+                if (auto *intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(&instruction);
+                    intrinsic && instructionTouchesHalf(*intrinsic) &&
+                    !llvm::isa<llvm::ConstrainedFPIntrinsic>(intrinsic))
+                    intrinsics.push_back(intrinsic);
+    for (llvm::IntrinsicInst *intrinsic : intrinsics) {
+        llvm::FunctionType *original = intrinsic->getFunctionType();
+        llvm::SmallVector<llvm::Type *> parameters;
+        for (llvm::Type *parameter : original->params())
+            parameters.push_back(widenedType(parameter));
+        auto *wideFunction = llvm::FunctionType::get(widenedType(original->getReturnType()), parameters, false);
+        llvm::SmallVector<llvm::Type *> overloads;
+        if (!llvm::Intrinsic::getIntrinsicSignature(intrinsic->getIntrinsicID(), wideFunction, overloads))
+            continue;
+        llvm::IRBuilder<> builder(intrinsic);
+        if (llvm::isa<llvm::FPMathOperator>(intrinsic))
+            builder.setFastMathFlags(intrinsic->getFastMathFlags());
+        llvm::SmallVector<llvm::Value *> arguments;
+        for (llvm::Value *argument : intrinsic->args())
+            arguments.push_back(floatEquivalent(argument->getType())
+                                    ? builder.CreateFPExt(argument, floatEquivalent(argument->getType()))
+                                    : argument);
+        llvm::Function *declaration =
+            llvm::Intrinsic::getOrInsertDeclaration(&module, intrinsic->getIntrinsicID(), overloads);
+        llvm::Value *replacement = builder.CreateCall(declaration, arguments);
+        if (replacement->getType() != intrinsic->getType())
+            replacement = builder.CreateFPTrunc(replacement, intrinsic->getType());
+        intrinsic->replaceAllUsesWith(replacement);
+        intrinsic->eraseFromParent();
+    }
+}
+
 llvm::Value *lowerScalarConversion(llvm::IRBuilder<> &builder, llvm::Module &module, llvm::Value *value,
                                    llvm::Type *destinationType, HalfConversionHelpers &helpers) {
     llvm::Type *sourceType = value->getType();
@@ -324,6 +368,7 @@ llvm::Value *lowerScalarConversion(llvm::IRBuilder<> &builder, llvm::Module &mod
 llvm::Error lowerCpuHalfConversions(llvm::Module &module, const llvm::TargetMachine &targetMachine) {
     if (hasNativeHalfOperations(targetMachine))
         return llvm::Error::success();
+    widenHalfIntrinsics(module);
     if (llvm::Error error = validateSoftwareHalfOperations(module))
         return error;
 

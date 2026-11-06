@@ -8,7 +8,7 @@
 
 namespace vernon::runtime {
 
-enum class VertexAttributeBackend { OpenGL, Vulkan, DirectX12 };
+enum class VertexAttributeBackend { OpenGL, Vulkan, DirectX12, Metal };
 
 bool validateVertexAttributeCapability(VertexAttributeBackend backend,
                                        const VernonRuntimeProviderVertexAttribute &attribute, uint32_t maximumLocations,

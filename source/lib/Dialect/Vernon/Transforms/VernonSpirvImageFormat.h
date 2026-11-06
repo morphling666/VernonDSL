@@ -63,6 +63,14 @@ inline Value buildSpirvTextureSample(OpBuilder &builder, Location location, Type
                                                    imageOperands, ValueRange{lod});
 }
 
+// Implicit derivatives with the level they select offset by `bias` levels, so only fragment stages have it.
+inline Value buildSpirvTextureSampleBias(OpBuilder &builder, Location location, Type resultType, Value sampledImage,
+                                         Value coordinates, Value bias) {
+    auto imageOperands = spirv::ImageOperandsAttr::get(builder.getContext(), spirv::ImageOperands::Bias);
+    return spirv::ImageSampleImplicitLodOp::create(builder, location, resultType, sampledImage, coordinates,
+                                                   imageOperands, ValueRange{bias});
+}
+
 /* A storage image is read directly; a sampled one is fetched through the image of its combined image-sampler. The
  * fetch has no Lod operand, so it reads the base level: MLIR's verifier rejects a Lod on spirv.ImageFetch because the
  * op does not implement FetchOpInterface. */

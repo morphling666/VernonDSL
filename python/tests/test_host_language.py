@@ -713,14 +713,6 @@ def test_rebinding_an_extern_reloads_the_compiled_module() -> None:
         (
             """
             @vd.host(effects="pure")
-            def run(a: f32) -> f32:
-                return a // 2.0
-            """,
-            "floor division requires integer operands",
-        ),
-        (
-            """
-            @vd.host(effects="pure")
             def run(a) -> i32:
                 return 0
             """,

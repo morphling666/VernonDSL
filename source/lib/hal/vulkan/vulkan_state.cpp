@@ -177,11 +177,8 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
-    maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
     descriptorBufferOffsetAlignment = (std::max)(properties.limits.minUniformBufferOffsetAlignment,
                                                  properties.limits.minStorageBufferOffsetAlignment);
-    for (size_t index = 0; index < 3; ++index)
-        maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = queueFamily;
@@ -351,7 +348,6 @@ void DeviceState::shutdown() {
     maxPushConstantsSize = 0;
     maxVertexInputAttributes = 0;
     apiVersion = 0;
-    maxComputeWorkGroupInvocations = 0;
     descriptorBufferOffsetAlignment = 1;
     dynamicRendering = false;
     drawIndirectCount = false;
@@ -364,7 +360,6 @@ void DeviceState::shutdown() {
     cmdBeginDebugUtilsLabel = nullptr;
     cmdEndDebugUtilsLabel = nullptr;
     cmdInsertDebugUtilsLabel = nullptr;
-    std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
     memoryProperties = {};
 }
 

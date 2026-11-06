@@ -32,6 +32,7 @@ from ..shader_contracts import (
     GENERATED_INTERFACE_CONTRACTS,
     TypeContract,
     resource_stage_error,
+    texture_bias_sampling_contract,
     texture_sampling_contract,
 )
 from ..struct_methods import method_tables
@@ -807,7 +808,7 @@ class _Inference:
     ) -> tuple[ResourceEffect, ...]:
         effects: list[ResourceEffect] = []
         for expression in expressions:
-            if expression.operation not in {"texture_sample", "texture_size", "texture_load"}:
+            if expression.operation not in {"texture_sample", "texture_sample_bias", "texture_size", "texture_load"}:
                 continue
             call = expression.source
             if not isinstance(call, ast.Call) or not call.args or not isinstance(call.args[0], ast.Name):
@@ -829,7 +830,11 @@ class _Inference:
                 for argument in call.args[1:]:
                     parameter = parameters.get(argument.id) if isinstance(argument, ast.Name) else None
                     argument_kinds.append(parameter.type.kind if parameter is not None else "value")
-                sampling = texture_sampling_contract(argument_kinds)
+                sampling = (
+                    texture_bias_sampling_contract(argument_kinds)
+                    if expression.operation == "texture_sample_bias"
+                    else texture_sampling_contract(argument_kinds)
+                )
                 if sampling is None:
                     continue
                 stages = sampling.stages
@@ -903,6 +908,20 @@ class _Inference:
             if effect not in effects:
                 effects.append(effect)
         return tuple(effects)
+
+    def _reject_bool_tensor(self, node: ast.expr, value_type: InferenceType) -> None:
+        value_type = default_type(value_type)
+        if (
+            isinstance(value_type, ConcreteType)
+            and value_type.kind == "tensor"
+            and _element(value_type) == _scalar("bool")
+        ):
+            raise self.error(node, "a bool Tensor has no single truth value; reduce it with any() or all()")
+
+    def _require_bool(self, node: ast.expr, value_type: InferenceType, message: str) -> None:
+        self._reject_bool_tensor(node, value_type)
+        if default_type(value_type) != _scalar("bool"):
+            raise self.error(node, message)
 
     def _typed_operand_types(
         self,
@@ -1172,7 +1191,7 @@ class _Inference:
                 # The body runs exactly once, so its assignments stand after the block.
                 returns.extend(self._statements(statement.body, environment, loop_depth))
             elif isinstance(statement, ast.If):
-                self._expression(statement.test, environment)
+                self._reject_bool_tensor(statement.test, self._expression(statement.test, environment))
                 before = environment.copy()
                 then_environment = before.copy()
                 else_environment = before.copy()
@@ -1188,7 +1207,7 @@ class _Inference:
                     branch_merges.append(BranchMerge(name, default_type(merged)))
                 self.statement_merges[id(statement)] = tuple(branch_merges)
             elif isinstance(statement, ast.While):
-                self._expression(statement.test, environment)
+                self._reject_bool_tensor(statement.test, self._expression(statement.test, environment))
                 before = environment.copy()
                 loop_environment = before.copy()
                 loop_returns: list[InferenceType | None] = []
@@ -1471,23 +1490,19 @@ class _Inference:
         if isinstance(node, ast.UnaryOp):
             operand = self._expression(node.operand, environment)
             if isinstance(node.op, ast.Not):
-                boolean = _scalar("bool")
-                if default_type(operand) != boolean:
-                    raise self.error(node.operand, "not operand must be a bool Value")
-                return boolean
+                self._require_bool(node.operand, operand, "not operand must be a bool Value")
+                return _scalar("bool")
             return operand
         if isinstance(node, ast.BoolOp):
-            boolean = _scalar("bool")
             for value in node.values:
-                value_type = default_type(self._expression(value, environment))
-                if value_type != boolean:
-                    raise self.error(value, "and/or operands must be bool Values")
-            return boolean
+                self._require_bool(value, self._expression(value, environment), "and/or operands must be bool Values")
+            return _scalar("bool")
         if isinstance(node, ast.IfExp):
-            boolean = _scalar("bool")
-            condition = default_type(self._expression(node.test, environment))
-            if condition != boolean:
-                raise self.error(node.test, "conditional expression condition must be a bool Value")
+            self._require_bool(
+                node.test,
+                self._expression(node.test, environment),
+                "conditional expression condition must be a bool Value",
+            )
             then_type = self._expression(node.body, environment)
             else_type = self._expression(node.orelse, environment)
             result = _common(then_type, else_type)
@@ -1505,6 +1520,7 @@ class _Inference:
             return _scalar("bool")
         if isinstance(node, ast.Compare):
             left = self._expression(node.left, environment)
+            result = _scalar("bool")
             for value in node.comparators:
                 right = self._expression(value, environment)
                 common = _common(left, right)
@@ -1513,7 +1529,13 @@ class _Inference:
                 self._constrain_literal(node.left, common)
                 self._constrain_literal(value, common)
                 left = right
-            return _scalar("bool")
+                common = default_type(common)
+                # Tensors compare element by element, as in numpy, WGSL and HLSL.
+                if isinstance(common, ConcreteType) and common.kind == "tensor":
+                    if len(node.ops) != 1:
+                        raise self.error(node, "Tensor comparisons cannot be chained")
+                    result = ConcreteType("tensor", "Tensor", (_scalar("bool"), *common.arguments[1:]))
+            return result
         if isinstance(node, ast.Tuple):
             if not node.elts:
                 raise self.error(node, "Tuple values must contain at least one element")
@@ -2336,11 +2358,61 @@ class _Inference:
                     f"must be a {rank}-component floating-point vector",
                 )
             return ConcreteType("tensor", "Tensor", (element, 4))
+        if name == "texture_sample_bias":
+            if (
+                len(arguments) != 4
+                or not isinstance(arguments[0], ConcreteType)
+                or arguments[0].kind != "texture"
+                or arguments[0].arguments[3] != "sampled"
+                or not isinstance(arguments[1], ConcreteType)
+                or arguments[1].kind != "sampler"
+            ):
+                raise self.error(node, "texture_sample_bias requires a sampled texture, sampler, coordinates, and bias")
+            texture = arguments[0]
+            element = texture.arguments[1]
+            assert isinstance(element, ConcreteType)
+            if element.is_integer:
+                raise self.error(node.args[0], "integer textures are read with texture_load, not texture_sample_bias")
+            dimension = texture.arguments[0]
+            rank = SAMPLE_COORDINATE_RANK.get(str(dimension))
+            if rank is None or arguments[2] != ConcreteType("tensor", "Tensor", (element, rank)):
+                raise self.error(
+                    node.args[2],
+                    f"texture_sample_bias coordinates for a {dimension} texture "
+                    f"must be a {rank}-component floating-point vector",
+                )
+            bias = arguments[3]
+            if isinstance(bias, ConcreteType) and (bias.kind != "scalar" or not bias.is_float):
+                raise self.error(node.args[3], "texture_sample_bias bias must be a floating-point scalar")
+            return ConcreteType("tensor", "Tensor", (element, 4))
         if name == "texture_size":
             if not arguments or not isinstance(arguments[0], ConcreteType) or arguments[0].kind != "texture":
                 raise self.error(node, "texture_size requires a texture and optional lod")
             rank = SIZE_RANK[str(arguments[0].arguments[0])]
             return ConcreteType("tensor", "Tensor", (_scalar("u32"), rank))
+        if name in {"any", "all"}:
+            if len(arguments) != 1 or default_type(_element(arguments[0])) != _scalar("bool"):
+                raise self.error(node, f"{name} requires one bool or bool Tensor argument")
+            return _scalar("bool")
+        if name == "select":
+            if len(arguments) != 3:
+                raise self.error(node, "select requires a condition and two values")
+            condition = default_type(arguments[0])
+            if default_type(_element(condition)) != _scalar("bool"):
+                raise self.error(node.args[0], "select condition must be a bool or bool Tensor")
+            result = _common(arguments[1], arguments[2])
+            if result is None:
+                raise self.error(node, "select values have incompatible types")
+            result = default_type(result)
+            if isinstance(condition, ConcreteType) and condition.kind == "tensor":
+                shape = condition.arguments[1:]
+                if isinstance(result, ConcreteType) and result.kind == "scalar":
+                    result = ConcreteType("tensor", "Tensor", (result, *shape))
+                elif not isinstance(result, ConcreteType) or result.kind != "tensor" or result.arguments[1:] != shape:
+                    raise self.error(node, "select with a bool Tensor condition needs values of its shape")
+            self._constrain_literal(node.args[1], _element(result))
+            self._constrain_literal(node.args[2], _element(result))
+            return result
         if name in {
             "sin",
             "cos",

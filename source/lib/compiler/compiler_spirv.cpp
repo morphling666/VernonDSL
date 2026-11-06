@@ -225,6 +225,59 @@ struct AttachSpirvTargetPass
     bool requireF32AtomicAdd{};
 };
 
+// Reads members of a composite built from its members directly, so a struct or array built only to be read is never
+// materialized. HLSL needs this: SPIRV-Cross assigns an initializer list to a struct or array temporary it hoists out
+// of the block that builds it, and HLSL accepts an initializer list only in a declaration.
+struct ForwardCompositeMembersPass
+    : public mlir::PassWrapper<ForwardCompositeMembersPass, mlir::OperationPass<mlir::spirv::ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ForwardCompositeMembersPass)
+
+    void runOnOperation() override {
+        llvm::SmallVector<mlir::spirv::CompositeExtractOp> extracts;
+        getOperation().walk([&](mlir::spirv::CompositeExtractOp extract) { extracts.push_back(extract); });
+        llvm::SmallVector<mlir::Operation *> constructs;
+        llvm::DenseSet<mlir::Operation *> seen;
+        for (mlir::spirv::CompositeExtractOp extract : extracts) {
+            const llvm::SmallVector<int32_t> indices =
+                llvm::map_to_vector(extract.getIndices(), [](mlir::Attribute index) {
+                    return static_cast<int32_t>(mlir::cast<mlir::IntegerAttr>(index).getInt());
+                });
+            mlir::Value composite = extract.getComposite();
+            size_t consumed = 0;
+            // A vector construct may take vectors as constituents, so only one with a constituent per member is read
+            // through.
+            while (consumed < indices.size()) {
+                auto construct = composite.getDefiningOp<mlir::spirv::CompositeConstructOp>();
+                if (!construct || construct.getConstituents().size() !=
+                                      mlir::cast<mlir::spirv::CompositeType>(construct.getType()).getNumElements())
+                    break;
+                if (seen.insert(construct).second)
+                    constructs.push_back(construct);
+                composite = construct.getConstituents()[indices[consumed++]];
+            }
+            if (consumed == 0)
+                continue;
+            if (consumed < indices.size()) {
+                mlir::OpBuilder builder(extract);
+                composite = mlir::spirv::CompositeExtractOp::create(builder, extract.getLoc(), composite,
+                                                                    llvm::ArrayRef(indices).drop_front(consumed));
+            }
+            extract.replaceAllUsesWith(composite);
+            extract.erase();
+        }
+        // A construct whose members are constructs becomes unused only after the outer one is erased.
+        for (bool erased = true; erased;) {
+            erased = false;
+            for (mlir::Operation *&construct : constructs)
+                if (construct && construct->use_empty()) {
+                    construct->erase();
+                    construct = nullptr;
+                    erased = true;
+                }
+        }
+    }
+};
+
 // Must run after SPIRVUpdateVCE, which rewrites the triple from MLIR's type and op capability interfaces. Those
 // interfaces miss sampled arrayed cube images, and OpImageQuerySizeLod is only materialized after serialization.
 struct RequireImageCapabilitiesPass
@@ -320,11 +373,13 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
         passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
         passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerMulOverflowChecksPass());
         passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonExpandFloorCeilDivisionPass());
+        passManager.addNestedPass<mlir::func::FuncOp>(mlir::vernon::createVernonExpandFloorCeilDivisionPass());
         passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
         passManager.addPass(mlir::vernon::createVernonToSPIRVPass(
             target == VERNON_TARGET_VULKAN    ? mlir::vernon::SpirvInterfaceAbi::Vulkan
             : target == VERNON_TARGET_DIRECTX ? mlir::vernon::SpirvInterfaceAbi::DirectX
                                               : mlir::vernon::SpirvInterfaceAbi::NativeUniforms));
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<ForwardCompositeMembersPass>());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::vernon::createVernonDecorateNonWritableStoragePass());
         passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>(requireF32AtomicAdd));

@@ -1,5 +1,6 @@
 """Editor-visible declarations for compiler-recognized DSL intrinsics."""
 
+import builtins
 from typing import Any, overload
 
 import numpy as np
@@ -99,6 +100,28 @@ def matmul(left: Any, right: Any) -> Any:
     return np.matmul(left, right)
 
 
+def any(value: Any) -> Any:
+    """Whether any element of a bool or bool Tensor holds; other iterables keep Python's any()."""
+
+    if isinstance(value, (bool, np.bool_, np.ndarray)):
+        return bool(np.any(value))
+    return builtins.any(value)
+
+
+def all(value: Any) -> Any:
+    """Whether every element of a bool or bool Tensor holds; other iterables keep Python's all()."""
+
+    if isinstance(value, (bool, np.bool_, np.ndarray)):
+        return bool(np.all(value))
+    return builtins.all(value)
+
+
+def select(condition: Any, true_value: Any, false_value: Any) -> Any:
+    """`true_value` where `condition` holds, else `false_value`; element by element for a bool Tensor condition."""
+
+    return _like(np.where(condition, true_value, false_value), true_value, false_value)
+
+
 @overload
 def texture_sample(texture: Any, coordinates: Any) -> Any: ...
 
@@ -118,6 +141,12 @@ def texture_sample(texture: Any, sampler: Any, coordinates: Any, lod: Any) -> An
 def texture_sample(texture: Any, *arguments: Any) -> Any:
     del texture, arguments
     return _raise_device_only("texture_sample")
+
+
+def texture_sample_bias(texture: Any, sampler: Any, coordinates: Any, bias: Any) -> Any:
+    """Samples with implicit derivatives, offsetting the mip level they select by `bias` levels; fragment only."""
+    del texture, sampler, coordinates, bias
+    return _raise_device_only("texture_sample_bias")
 
 
 def texture_size(texture: Any, lod: Any | None = None) -> Any:

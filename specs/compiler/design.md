@@ -849,6 +849,14 @@ descriptor binding. The normal sampled-resource provenance analysis still
 associates it with the sampled texture binding, preserving the explicit
 sampler ABI and reflection model.
 
+`texture_sample_bias` is its own intrinsic rather than a flag on
+`texture_sample`, whose four-operand form already means an explicit LOD: a
+pass that knows only `texture_sample` then rejects the biased sample as an
+unknown operation instead of reading the bias as a level. It lowers to
+`OpImageSampleImplicitLod` with the `Bias` image operand, which SPIRV-Cross
+carries to every graphics target. A sampler bias would not serve: Metal,
+OpenGL ES and WebGPU samplers have no LOD bias state.
+
 `texture_size` is a native image query and never creates an external parameter.
 The pinned MLIR SPIR-V dialect lacks `OpImageQuerySizeLod`, so lowering emits a
 verified `spirv.Image` plus adjacent uniquely marked scalar/vector operations.
@@ -890,7 +898,40 @@ emits `arith.floordivsi` and signed `%` emits `a - (a // b) * b`; u32 keeps
 `fmod`, plus the divisor when the signs differ, and an exact zero takes the
 divisor's sign. The zero is built by masking the divisor's sign bit, since
 Vulkan and D3D12 compilers may fold `select(c, -0.0, +0.0)` to one constant.
-Float `//` stays unsupported. Division by zero and `SMIN // -1` are undefined.
+Float `//` follows numpy's `npy_divmod` rather than `floor(a / b)`, which is
+off by one when `a / b` rounds up to an integer: from `r = fmod(a, b)` it
+takes `(a - r) / b`, subtracts one when `r` is nonzero and its sign differs
+from `b`'s, and adds one to the floor when that quotient sits more than half
+above it, which absorbs the rounding error of the division.
+A zero result takes the sign of `a / b`, and a zero divisor returns `a / b`.
+The frontend emits it, so every backend and compiled host code share one
+expansion. Integer division by zero and `SMIN // -1` are undefined.
+
+## Integer and mask builtins
+
+MLIR integers are signless, so the frontend resolves signedness from the
+declared element type: integer `min`/`max`/`clamp` lower to
+`cmpi slt`/`ult` (`sgt`/`ugt`) plus `select`, a tie picking the second
+operand as float `min`/`max` do, and u32 `abs` is the identity. Integer
+`dot`, `cross`, and `@` stay intrinsics, and each backend picks integer or
+float multiply-add. SPIR-V matrices hold floats only; the value ABI lays every
+small rank-2 Tensor out column-major, so an integer matrix converts to an
+array of its column vectors with the column stride as `ArrayStride`.
+
+SPIR-V before 1.4 cannot `OpSelect` composites with a scalar condition, so
+`select` with a scalar condition and Tensor values splats the condition to a
+bool Tensor in the frontend. `any`/`all` lower to an `ori`/`andi` chain over
+extracted elements, which every backend handles without a reduction op.
+
+## Software half-precision and CUDA math
+
+The CPU target with software f16 widens half-typed LLVM intrinsics (`sin`,
+`exp`, `pow`, ...) to their f32 overloads with `fpext` operands and a
+`fptrunc` result, before validating that no half operation remains, because
+the CPU backend has no half libm. On CUDA, `llvm.cos` with `afn` lowers to
+the fast approximation for f32 only; f64 `cos` goes to libdevice, since NVPTX
+instruction selection crashes on an f64 `llvm.cos`. Vector `arith.remf` is
+unrolled into libdevice `fmod` calls per element.
 
 ## Shift semantics
 

@@ -164,6 +164,106 @@ function(vernon_add_runtime)
         target_link_libraries(VernonRuntimeImplementation PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
         target_link_libraries(VernonRuntime PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
+    if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_DIRECTX12_RUNTIME=1)
+        target_sources(
+            VernonRuntimeImplementation
+            PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_directx12.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../hal/d3d12/d3d12_device.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../hal/d3d12/d3d12_resources.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../hal/d3d12/d3d12_state.cpp)
+        target_link_libraries(VernonRuntimeImplementation PRIVATE d3d12 dxgi dxguid)
+        target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
+        # The mipmap box filters are compiled to DXIL at build time; without DXC, D3D12 images report mipmap generation
+        # as unsupported.
+        set(_vernon_dxc_hints)
+        if(VERNON_DXC_EXECUTABLE)
+            get_filename_component(_vernon_dxc_directory "${VERNON_DXC_EXECUTABLE}" DIRECTORY)
+            list(APPEND _vernon_dxc_hints "${_vernon_dxc_directory}")
+        endif()
+        file(
+            GLOB _vernon_windows_sdk_versions
+            LIST_DIRECTORIES TRUE
+            "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*")
+        list(
+            SORT _vernon_windows_sdk_versions
+            COMPARE NATURAL
+            ORDER DESCENDING)
+        foreach(_vernon_windows_sdk_version IN LISTS _vernon_windows_sdk_versions)
+            list(APPEND _vernon_dxc_hints "${_vernon_windows_sdk_version}/x64")
+        endforeach()
+        find_program(
+            VERNON_MIPMAP_DXC
+            NAMES dxc
+            HINTS ${_vernon_dxc_hints})
+        if(VERNON_MIPMAP_DXC)
+            set(_vernon_d3d12_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/d3d12_generated")
+            file(MAKE_DIRECTORY "${_vernon_d3d12_generated_dir}")
+            set(_vernon_mipmap_shader "${_VERNON_RUNTIME_IMPL_DIR}/../hal/d3d12/d3d12_mipmap.hlsl")
+            set(_vernon_mipmap_headers)
+            foreach(_vernon_mipmap_dimension IN ITEMS 2d 3d)
+                set(_vernon_mipmap_blob "${_vernon_d3d12_generated_dir}/d3d12_mipmap_${_vernon_mipmap_dimension}.bin")
+                set(_vernon_mipmap_header "${_vernon_d3d12_generated_dir}/d3d12_mipmap_${_vernon_mipmap_dimension}.h")
+                if(_vernon_mipmap_dimension STREQUAL "3d")
+                    set(_vernon_mipmap_volume 1)
+                else()
+                    set(_vernon_mipmap_volume 0)
+                endif()
+                add_custom_command(
+                    OUTPUT "${_vernon_mipmap_header}"
+                    COMMAND
+                        "${VERNON_MIPMAP_DXC}" -nologo -T cs_6_0 -E main -D VERNON_MIPMAP_3D=${_vernon_mipmap_volume}
+                        -Fo "${_vernon_mipmap_blob}" "${_vernon_mipmap_shader}"
+                    COMMAND
+                        "${CMAKE_COMMAND}" -DINPUT=${_vernon_mipmap_blob} -DOUTPUT=${_vernon_mipmap_header}
+                        -DSYMBOL=vernon_d3d12_mipmap_${_vernon_mipmap_dimension} -P
+                        "${VERNON_REPOSITORY_ROOT}/cmake/EmbedBinary.cmake"
+                    DEPENDS "${_vernon_mipmap_shader}" "${VERNON_REPOSITORY_ROOT}/cmake/EmbedBinary.cmake"
+                    VERBATIM)
+                list(APPEND _vernon_mipmap_headers "${_vernon_mipmap_header}")
+            endforeach()
+            set(_vernon_stream_shader "${_VERNON_RUNTIME_IMPL_DIR}/../hal/d3d12/d3d12_draw_stream.hlsl")
+            set(_vernon_stream_blob "${_vernon_d3d12_generated_dir}/d3d12_draw_stream.bin")
+            set(_vernon_stream_header "${_vernon_d3d12_generated_dir}/d3d12_draw_stream.h")
+            add_custom_command(
+                OUTPUT "${_vernon_stream_header}"
+                COMMAND "${VERNON_MIPMAP_DXC}" -nologo -T cs_6_0 -E main -Fo "${_vernon_stream_blob}"
+                        "${_vernon_stream_shader}"
+                COMMAND "${CMAKE_COMMAND}" -DINPUT=${_vernon_stream_blob} -DOUTPUT=${_vernon_stream_header}
+                        -DSYMBOL=vernon_d3d12_draw_stream -P "${VERNON_REPOSITORY_ROOT}/cmake/EmbedBinary.cmake"
+                DEPENDS "${_vernon_stream_shader}" "${VERNON_REPOSITORY_ROOT}/cmake/EmbedBinary.cmake"
+                VERBATIM)
+            list(APPEND _vernon_mipmap_headers "${_vernon_stream_header}")
+            target_sources(VernonRuntimeImplementation PRIVATE ${_vernon_mipmap_headers})
+            target_include_directories(VernonRuntimeImplementation PRIVATE "${_vernon_d3d12_generated_dir}")
+            target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_DIRECTX12_MIPMAPS=1
+                                                                           VERNON_DIRECTX12_DRAW_STREAMS=1)
+        else()
+            message(WARNING "DXC was not found; DirectX 12 images cannot generate mipmaps and DirectX 12 devices "
+                            "draw no device draw streams")
+        endif()
+    endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_METAL_RUNTIME=1)
+        target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HAS_METAL_RUNTIME=1)
+        set(_vernon_metal_sources
+            ${_VERNON_RUNTIME_IMPL_DIR}/../hal/metal/metal_device.mm
+            ${_VERNON_RUNTIME_IMPL_DIR}/../hal/metal/metal_resources.mm
+            ${_VERNON_RUNTIME_IMPL_DIR}/../hal/metal/metal_state.mm)
+        target_sources(VernonRuntimeImplementation PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
+                                                           ${_vernon_metal_sources})
+        # metal_native.h holds ARC-managed ids inside C++ objects and refuses to compile without ARC.
+        set_source_files_properties(${_vernon_metal_sources} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        set_target_properties(VernonRuntimeImplementation PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+        find_library(VERNON_METAL_FRAMEWORK Metal REQUIRED)
+        find_library(VERNON_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+        find_library(VERNON_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+        set(VERNON_METAL_FRAMEWORKS ${VERNON_METAL_FRAMEWORK} ${VERNON_QUARTZCORE_FRAMEWORK}
+                                    ${VERNON_FOUNDATION_FRAMEWORK})
+        target_link_libraries(VernonRuntimeImplementation PRIVATE ${VERNON_METAL_FRAMEWORKS})
+        target_link_libraries(VernonRuntime PRIVATE ${VERNON_METAL_FRAMEWORKS})
+    endif()
     target_include_directories(
         VernonRuntime
         PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
@@ -210,6 +310,14 @@ function(vernon_add_runtime)
         if(VERNON_ENABLE_VULKAN_RUNTIME)
             target_compile_definitions(VernonRuntimeTestHost PRIVATE VERNON_HAS_VULKAN_RUNTIME=1)
             target_link_libraries(VernonRuntimeTestHost PUBLIC $<BUILD_INTERFACE:Vulkan::Headers>)
+        endif()
+        if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+            target_compile_definitions(VernonRuntimeTestHost PRIVATE VERNON_HAS_DIRECTX12_RUNTIME=1)
+            target_link_libraries(VernonRuntimeTestHost PUBLIC d3d12 dxgi dxguid)
+        endif()
+        if(VERNON_ENABLE_METAL_RUNTIME)
+            target_compile_definitions(VernonRuntimeTestHost PRIVATE VERNON_HAS_METAL_RUNTIME=1)
+            target_link_libraries(VernonRuntimeTestHost PUBLIC ${VERNON_METAL_FRAMEWORKS})
         endif()
     endif()
     if(MSVC)

@@ -370,10 +370,14 @@ Every version or capability pair is exactly a two-element uint32 array.
 must agree with target kind. Backend-specific values and feature names are
 defined by the same compiler and Program contract pair; unknown or extra members are
 errors. Requirements are minimum execution requirements, not compilation
-options, and Runtime validates them before loading any code.
+options. Loading checks that they are well formed and that `features` equals
+the features the StageArtifacts' reflection derives; it does not compare them
+with device capabilities. A device that cannot run an artifact fails when its
+HAL device creates the pipeline, where the native compiler or pipeline
+creation rejects it.
 Workgroup size is StageArtifact compute reflection authority and is not
-duplicated in RuntimeRequirements; Runtime compares each reflected size and
-limit directly with device capabilities.
+duplicated in the requirements object; pipeline creation enforces the device's
+workgroup limits.
 
 The cooker derives each StageArtifact requirement object from that artifact's
 modules and reflection. For a variant, it then derives one aggregate from only

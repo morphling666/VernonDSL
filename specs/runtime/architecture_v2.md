@@ -765,8 +765,9 @@ index allows before publication.
   without base-instance draws it offsets each per-instance attribute pointer
   by `first / divisor` records, and a divisor that does not divide `first`
   is unsupported. Records with nonzero `first_instance` therefore draw on
-  every HAL backend; D3D12's `SV_InstanceID` lacks a base constant, which
-  its phase 4 device must supply.
+  every HAL backend. D3D12's `SV_VertexID` and `SV_InstanceID` lack both
+  offsets, which its device sets as root constants per draw and expands
+  into indirect arguments (`design.md`, DirectX 12).
 - **A compute Program links from its executable on the CPU and CUDA.** The
   fragment is built from the variant's `program` JSON and the Stage kernel
   fragments prepared at load, and every owned Invocation buffer Storage is
@@ -898,8 +899,8 @@ RuntimeCore and the Core device are deleted.
 
 - **Layout.** `source/lib/hal/` holds the interface (`hal.h`, moved from
   `runtime/schedule`) and a directory per backend: `cpu/`, `cuda/`,
-  `vulkan/`, `opengl/` (OpenGL 3.3 and 4.x, OpenGL ES 3.x), and in phase 4
-  `d3d12/`, `metal/` and `webgpu/`. The RHI backends' device, memory,
+  `vulkan/`, `opengl/` (OpenGL 3.3 and 4.x, OpenGL ES 3.x), `d3d12/`,
+  `metal/`, and in phase 4 `webgpu/`. The RHI backends' device, memory,
   staging, format and surface code moved there; their command encoders,
   registry and validation did not. The linker and executor stay in
   `runtime/schedule`.
@@ -1050,9 +1051,10 @@ RuntimeCore and the Core device are deleted.
     and contexts without texture views cannot make.
   - Vulkan samples isotropically, so anisotropy above 1 is unsupported
     there; OpenGL ignores it.
-- **DirectX 12 and Metal have no HAL device until phase 4.** Creating one
-  returns `VERNON_HAL_UNSUPPORTED`, and Python sessions report both
-  unavailable. Their compiler targets remain.
+- **Phase 4 devices.** The DirectX 12 device (`hal/d3d12/`) and the Metal
+  device (`hal/metal/`, Apple builds with `VERNON_ENABLE_METAL_RUNTIME`) run
+  compute and graphics from C++ and Python sessions; `runtime/design.md`
+  records each one's backend decisions.
 - **`VernonHal.h`** (`hal/capi.cpp`, `hal/resources.h`):
   - It is a C header exported by `VernonRuntime`. Images, views, formats,
     usage and aspects are the `VernonTextureTypes.h` types schedules

@@ -13,6 +13,8 @@ std::string_view backendName(VertexAttributeBackend backend) {
         return "Vulkan";
     case VertexAttributeBackend::DirectX12:
         return "D3D12";
+    case VertexAttributeBackend::Metal:
+        return "Metal";
     }
     return "unknown";
 }
@@ -55,6 +57,7 @@ bool validateVertexAttributeCapability(VertexAttributeBackend backend,
             reason = "dtype is not a numeric vertex format";
         else if (attribute.dtype == VERNON_RUNTIME_PROVIDER_F64 &&
                  (!supportsFloat64 || backend == VertexAttributeBackend::DirectX12 ||
+                  backend == VertexAttributeBackend::Metal ||
                   (backend == VertexAttributeBackend::Vulkan && attribute.component_count > 2)))
             reason = "f64 format is unsupported";
         else if (backend == VertexAttributeBackend::DirectX12 && attribute.dtype == VERNON_RUNTIME_PROVIDER_F16 &&

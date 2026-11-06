@@ -222,5 +222,20 @@ def wide_bits(a: u64, b: u64) -> Vector[u64, 2]:
 
 
 @vd.host(effects="pure")
+def float_floor_division(a: f32, b: f32) -> f32:
+    return a // b
+
+
+@vd.host(effects="pure")
+def vector_masks(a: Vector[f32, 3], b: Vector[f32, 3]) -> Tuple[Vector[f32, 3], bool, bool, f32]:
+    return Tuple(vd.select(a < b, a, b), vd.any(a < b), vd.all(a == b), vd.select(a[0] < 0.0, -1.0, 1.0))
+
+
+@vd.host(effects="pure")
+def integer_vectors(a: Vector[i32, 3], b: Vector[i32, 3]) -> Tuple[i32, Vector[i32, 3], Vector[i32, 3]]:
+    return Tuple(dot(a, b), cross(a, b), vd.select(a > b, a, b))
+
+
+@vd.host(effects="pure")
 def literal_widths() -> Tuple[u64, i64, u32]:
     return Tuple(u64(18446744073709551615), i64(-9223372036854775807) - i64(1), u32(4294967295))

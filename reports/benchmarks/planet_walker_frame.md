@@ -267,6 +267,80 @@ Standing is at or under part 2 on every device, and OpenGL 3.3 walking is
 higher (1.60 ms mean, 1.93 ms worst) and is left out; the two reruns span
 the 0.1 ms variance part 3 notes.
 
+### DirectX 12 device (section 16.3, phase 4)
+
+PlanetWalker runs on the DirectX 12 HAL device (`--device directx`). The
+compiler reads struct members through their construction before
+serialization, which changes the SPIR-V of every target. VernonDSL `364d8af`
+and Vernon `90254343`, both with uncommitted work. 1500 frames per run,
+excluding frames 0-299:
+
+| Device | Case | Runs | Frame | Host (mean of windows) | Host (worst window) |
+|---|---|---:|---:|---:|---:|
+| DirectX 12 | standing | 1 | 4.37-4.38 ms | 1.35 ms | 1.41 ms |
+| DirectX 12 | walking | 2 | 4.0-5.6 ms | 1.91-2.25 ms | 2.05-2.58 ms |
+| Vulkan | standing | 1 | 4.21-4.22 ms | 0.92 ms | 0.94 ms |
+| Vulkan | walking | 2 | 3.8-5.0 ms | 1.42-1.44 ms | 1.57-1.58 ms |
+| OpenGL 4.6 | standing | 1 | 4.18-4.20 ms | 0.54 ms | 0.58 ms |
+| OpenGL 4.6 | walking | 2 | 3.8-4.9 ms | 1.05-1.06 ms | 1.16-1.33 ms |
+
+Vulkan and OpenGL 4.6 match step 5 within the 0.1 ms variance part 3 notes.
+DirectX 12 spends about 0.43 ms more host time than Vulkan standing and
+0.5-0.8 ms more walking, so it misses the 1 ms standing gate and, in its
+first walking run, the 2 ms walking gate. The first walking run after the
+build is the higher one, as the first Vulkan walking runs were in parts 2
+and 5. No
+earlier DirectX measurement exists to compare against, and where the extra
+host time goes is not profiled yet.
+
+### Terrain selection by distance only
+
+Terrain selection no longer culls tiles against the view frustum (Vernon
+`specs/scene/design.md`, "Selection ignores the view direction").
+`--turn` walks in a tight circle at the full turn rate, so the follow camera
+swings behind the walker. Frame stats now also print each window's longest
+frame. DirectX 12, 1800 frames per run, excluding frames 0-299:
+
+| Case | Selection | Frame | Host (mean of windows) | Longest frame |
+|---|---|---:|---:|---:|
+| turning | frustum and distance | 6.6-8.2 ms | 3.58-4.87 ms | 132-175 ms |
+| turning | distance | 5.1-6.5 ms | 1.58-2.36 ms | 7-68 ms |
+| walking | frustum and distance | 4.0-5.2 ms | 1.68-2.11 ms | 34-94 ms |
+| walking | distance | 4.3-5.4 ms | 1.58-2.00 ms | 37-111 ms |
+| standing | frustum and distance | 4.37-4.41 ms | 1.35-1.42 ms | 4.9-5.9 ms |
+| standing | distance | 4.79-4.80 ms | 1.43-1.51 ms | 5.4-6.0 ms |
+
+Turning no longer rebuilds the tiles the view sweeps across, which halves
+its host time and its worst stalls. The tiles behind the camera cost about
+0.4 ms of device time standing (the retire wait rises from 3.0 to 3.3 ms).
+They are culled from the camera passes, so the likely cost is their casters
+in the shadow cascades; this is not profiled yet.
+The remaining stalls of 40-110 ms come from tiles crossing the 1 km
+selection radius, which still build synchronously, and the batch rebuild
+that follows.
+
+### Temporal antialiasing
+
+Scene viewports resolve every frame against a history (Vernon
+`specs/render/design.md`, "Temporal antialiasing"): one full-screen resolve
+and one history copy at the 1920x1080 frame, both before bloom. Standing,
+with distance-only selection, excluding frames 0-299:
+
+| Device | Frame without | Frame with | Host with |
+|---|---:|---:|---:|
+| DirectX 12 | 4.79-4.80 ms | 4.94-4.96 ms | 1.38-1.46 ms |
+| Vulkan | | 4.39-4.41 ms | 0.84-0.93 ms |
+| OpenGL 4.6 | | 4.52-4.53 ms | 0.60-0.66 ms |
+
+On DirectX 12 the two passes cost about 0.16 ms of device time and no host
+time. Vulkan and OpenGL were not measured with distance-only selection
+alone. Walking and turning on DirectX 12 match the distance-only runs within
+their variance: host 1.56-1.87 ms walking and 1.50-2.19 ms turning.
+
+With contrast-adaptive sharpening in the display pass and material textures
+sampled at a -0.5 mip bias, DirectX 12 standing measures 4.87-4.89 ms a frame
+and 1.36-1.43 ms host, within the variance of the run without them.
+
 ## Standing frame
 
 Measured once with temporary scope timers (since removed), which added

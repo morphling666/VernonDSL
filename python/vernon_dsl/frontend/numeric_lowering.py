@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 from typing import Protocol
 
 from .lowering_types import DslType, ModuleContext, Value, element_type
@@ -70,6 +71,8 @@ def lower_binary(emitter: NumericEmitter, node: ast.BinOp) -> Value:
         if floating:
             raise emitter.context.error(node, f"{_BITWISE[type(node.op)]} requires integer operands")
         return Value(_bitwise(emitter, node, left, right).name, result_type)
+    if isinstance(node.op, ast.FloorDiv) and floating:
+        return Value(_floored_float_quotient(emitter, node, left, right).name, result_type)
     if isinstance(node.op, ast.Mod) and not unsigned:
         if floating:
             return Value(_floored_float_remainder(emitter, node, left, right).name, result_type)
@@ -81,7 +84,7 @@ def lower_binary(emitter: NumericEmitter, node: ast.BinOp) -> Value:
         ast.Sub: "arith.subf" if floating else "arith.subi",
         ast.Mult: "arith.mulf" if floating else "arith.muli",
         ast.Div: "arith.divf" if floating else ("arith.divui" if unsigned else "arith.divsi"),
-        ast.FloorDiv: None if floating else ("arith.divui" if unsigned else "arith.floordivsi"),
+        ast.FloorDiv: "arith.divui" if unsigned else "arith.floordivsi",
         ast.Mod: "arith.remui",
     }
     operation = operations.get(type(node.op))
@@ -165,6 +168,68 @@ def _floored_float_remainder(emitter: NumericEmitter, node: ast.AST, left: Value
     shifted = _emit(emitter, "arith.addf", (remainder, right), value_type)
     adjusted = _select(emitter, shift, shifted, remainder)
     return _select(emitter, nonzero, adjusted, _zero_with_sign_of(emitter, right))
+
+
+def _floored_float_quotient(emitter: NumericEmitter, node: ast.AST, left: Value, right: Value) -> Value:
+    # numpy npy_divmod, which CPython float_floor_div matches except that a zero divisor gives left / right instead
+    # of raising: (left - fmod(left, right)) / right, less one when the remainder's sign differs from the divisor's,
+    # then floored, rounding up when the inexact division left it more than half below the next integer. A zero
+    # quotient takes the sign of left / right, built from its sign bit as in _floored_float_remainder.
+    value_type = left.type
+    mask = _mask_type(value_type)
+    zero = emitter._default_value(node, value_type)
+    one = _constant(emitter, 1.0, value_type)
+    quotient = _emit(emitter, "arith.divf", (left, right), value_type)
+    remainder = _emit(emitter, "arith.remf", (left, right), value_type)
+    exact = _emit(
+        emitter, "arith.divf", (_emit(emitter, "arith.subf", (left, remainder), value_type), right), value_type
+    )
+    nonzero = _emit(emitter, "arith.cmpf une,", (remainder, zero), value_type, mask)
+    remainder_negative = _emit(emitter, "arith.cmpf olt,", (remainder, zero), value_type, mask)
+    divisor_negative = _emit(emitter, "arith.cmpf olt,", (right, zero), value_type, mask)
+    signs_differ = _emit(emitter, "arith.xori", (remainder_negative, divisor_negative), mask)
+    shift = _emit(emitter, "arith.andi", (nonzero, signs_differ), mask)
+    exact = _select(emitter, shift, _emit(emitter, "arith.subf", (exact, one), value_type), exact)
+    floored = _emit(emitter, "math.floor", (exact,), value_type)
+    fraction = _emit(emitter, "arith.subf", (exact, floored), value_type)
+    rounds_up = _emit(emitter, "arith.cmpf ogt,", (fraction, _constant(emitter, 0.5, value_type)), value_type, mask)
+    floored = _select(emitter, rounds_up, _emit(emitter, "arith.addf", (floored, one), value_type), floored)
+    nonzero_quotient = _emit(emitter, "arith.cmpf une,", (exact, zero), value_type, mask)
+    result = _select(emitter, nonzero_quotient, floored, _zero_with_sign_of(emitter, quotient))
+    divisor_zero = _emit(emitter, "arith.cmpf oeq,", (right, zero), value_type, mask)
+    return _select(emitter, divisor_zero, quotient, result)
+
+
+def integer_extremum(emitter: NumericEmitter, minimum: bool, left: Value, right: Value) -> Value:
+    """Elementwise min or max of integers; a tie picks `right`, as host code does. MLIR integers are signless, so the
+    signedness comes from the DSL type."""
+
+    unsigned = element_type(left.type).name == "u32"
+    predicate = ("ult" if unsigned else "slt") if minimum else ("ugt" if unsigned else "sgt")
+    picked = _emit(emitter, f"arith.cmpi {predicate},", (left, right), left.type, _mask_type(left.type))
+    return _select(emitter, picked, left, right)
+
+
+def reduce_bool(emitter: NumericEmitter, any_true: bool, value: Value, constant) -> Value:
+    """any() or all() of a bool or a bool Tensor."""
+
+    boolean = DslType("scalar", "bool")
+    if value.type.kind != "tensor":
+        return Value(value.name, boolean)
+    extents = [int(extent) for extent in value.type.arguments[1:]]  # type: ignore[arg-type]
+    combined: Value | None = None
+    for coordinate in itertools.product(*(range(extent) for extent in extents)):
+        element = emitter._fresh()
+        indices = ", ".join(constant(index) for index in coordinate)
+        emitter._line(f"{element} = tensor.extract {value.name}[{indices}] : {value.type.mlir}")
+        item = Value(element, boolean)
+        combined = (
+            item
+            if combined is None
+            else _emit(emitter, "arith.ori" if any_true else "arith.andi", (combined, item), boolean)
+        )
+    assert combined is not None
+    return combined
 
 
 def _zero_with_sign_of(emitter: NumericEmitter, value: Value) -> Value:

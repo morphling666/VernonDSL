@@ -111,6 +111,7 @@ DEVICE_ONLY_OPERATION_NAMES = frozenset(
         FRAGMENT_DISCARD_OPERATION,
         "storage_barrier",
         "texture_sample",
+        "texture_sample_bias",
         "texture_load",
         "texture_store",
         "texture_size",
@@ -137,6 +138,13 @@ def texture_sampling_contract(argument_kinds: Sequence[str]) -> TextureSamplingC
     if len(argument_kinds) == 4 and argument_kinds[1] == "sampler":
         return TextureSamplingContract(True, True, _EXPLICIT_LOD_STAGES)
     return None
+
+
+def texture_bias_sampling_contract(argument_kinds: Sequence[str]) -> TextureSamplingContract | None:
+    """Classify texture_sample_bias, whose bias offsets the level implicit derivatives select."""
+    if len(argument_kinds) != 4 or argument_kinds[0] != "texture" or argument_kinds[1] != "sampler":
+        return None
+    return TextureSamplingContract(True, False, _FRAGMENT_ONLY)
 
 
 def resource_stage_error(operation: str, stages: frozenset[str], *, has_lod: bool = False) -> str:

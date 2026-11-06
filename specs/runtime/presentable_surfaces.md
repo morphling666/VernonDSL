@@ -1,8 +1,7 @@
 # Presentable surfaces
 
-Status: implemented on Vulkan (Windows), OpenGL and OpenGL ES. DirectX 12
-and Metal surfaces come with their HAL devices in phase 4
-(`architecture_v2.md` section 16).
+Status: implemented on Vulkan (Windows), DirectX 12, OpenGL and OpenGL ES.
+Metal is implemented and unverified on hardware.
 
 A presentable surface lets a linked schedule draw into an operating-system
 window. The HAL owns the surface and its images; the host owns the window
@@ -121,8 +120,8 @@ submission:
 |---|---|---|
 | Vulkan | `HWND` | acquire a swapchain image, blit the surface image into it, `vkQueuePresentKHR` |
 | OpenGL, OpenGL ES | `VernonOpenGLSurfaceCallbacks` | make the window current, blit with rows reversed, swap |
-| DirectX 12 (phase 4) | `HWND` | flip-discard `IDXGISwapChain3` on the device's direct queue |
-| Metal (phase 4) | `CAMetalLayer` | `nextDrawable`, `presentDrawable:` after the last submission |
+| DirectX 12 | `HWND` | flip-discard `IDXGISwapChain3` on the device's direct queue |
+| Metal | `CAMetalLayer` | `nextDrawable`, draw the surface image into it, `presentDrawable:` after the last submission |
 
 ### Vulkan
 
@@ -195,11 +194,12 @@ section 6.6.1): one declaration cooks a specialization per format, and the
 host selects the one matching the configured format. Cooking a separate
 asset per format was rejected because it duplicates the declaration.
 
-Metal's `CAMetalLayer` has no RGBA8, so the phase 4 Metal surface adds
-`bgra8_unorm` and `bgra8_srgb` rows to `VernonFormats.def` (renderable,
-blendable, filterable and copyable, host data format `BGRA`), with their
-view-compatibility classes and DirectX 12 typeless mapping, so each row is
-exercised by a surface test when it is added.
+Metal's `CAMetalLayer` has no RGBA8, so the Metal surface keeps RGBA8 ring
+images and present draws the presented image into the layer's BGRA8
+drawable with a fullscreen-triangle pass, which also converts to the
+drawable's encoding. Adding BGRA8 rows to `VernonFormats.def` was rejected:
+every schedule and cooked asset would then need a second variant per
+surface format for one backend's swapchain.
 
 ## 7. Runtime
 

@@ -275,7 +275,8 @@ if(SKBUILD)
         COMPONENT VernonWheel
         FILES_MATCHING
         PATTERN "*.cpp"
-        PATTERN "*.h")
+        PATTERN "*.h"
+        PATTERN "*.hlsl")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"
         DESTINATION vernon_dsl/runtime_src/lib/platform
@@ -287,6 +288,7 @@ if(SKBUILD)
         FILES "${_vernon_repository_root}/cmake/IncludeNlohmannJson.cmake"
               "${_vernon_repository_root}/cmake/IncludeVulkanHeaders.cmake"
               "${_vernon_repository_root}/cmake/IncludeNvtx.cmake"
+              "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake
         COMPONENT VernonWheel)
 endif()

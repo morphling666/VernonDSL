@@ -14,6 +14,14 @@
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "hal/vulkan/vulkan_state.h"
 #endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "hal/d3d12/d3d12_resources.h"
+#include "hal/d3d12/d3d12_state.h"
+#endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+#include "hal/metal/metal_resources.h"
+#include "hal/metal/metal_state.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -86,6 +94,64 @@ VernonHalStatus createVulkanDevice(const VernonHalDeviceDescriptor &descriptor, 
     (void)descriptor;
     (void)device;
     return report(VERNON_HAL_UNSUPPORTED, "VernonRuntime was built without Vulkan support");
+#endif
+}
+
+// A DirectX 12 device owns its D3D12 device through one state, which its resources, its runtime context and the HAL
+// device that the runtime creates on first use share. FORCE_SOFTWARE selects the WARP adapter.
+VernonHalStatus createDirectX12Device(const VernonHalDeviceDescriptor &descriptor, VernonHalDevice &device) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    auto state = std::make_shared<vernon::hal::d3d12::DeviceState>();
+    {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        std::string error;
+        if (!state->initialize(descriptor.device_index, descriptor.flags, error))
+            return report(VERNON_HAL_UNSUPPORTED, "cannot create the device: " + error);
+    }
+    device.resources = vernon::hal::createDirectX12Resources(state);
+    if (!device.resources)
+        return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
+    auto runtime =
+        vernon::runtime::createRuntimeContextForHal(VERNON_RUNTIME_DIRECTX12, [&](VernonRuntimeContext &context) {
+            return vernon::runtime::initializeDirectX12Backend(context, state);
+        });
+    if (runtime.isErr())
+        return report(VERNON_HAL_INTERNAL_ERROR, "cannot create the device's runtime");
+    device.runtime = std::move(runtime).value().release();
+    return VERNON_HAL_OK;
+#else
+    (void)descriptor;
+    (void)device;
+    return report(VERNON_HAL_UNSUPPORTED, "VernonRuntime was built without DirectX 12 support");
+#endif
+}
+
+// A Metal device owns its MTLDevice and command queue through one state, which its resources, its runtime context and
+// the HAL device that the runtime creates on first use share. Metal has no software device.
+VernonHalStatus createMetalDevice(const VernonHalDeviceDescriptor &descriptor, VernonHalDevice &device) {
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    auto state = std::make_shared<vernon::hal::metal::DeviceState>();
+    {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        std::string error;
+        if (!state->initialize(descriptor.device_index, descriptor.flags, error))
+            return report(VERNON_HAL_UNSUPPORTED, "cannot create the device: " + error);
+    }
+    device.resources = vernon::hal::createMetalResources(state);
+    if (!device.resources)
+        return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
+    auto runtime =
+        vernon::runtime::createRuntimeContextForHal(VERNON_RUNTIME_METAL, [&](VernonRuntimeContext &context) {
+            return vernon::runtime::initializeMetalBackend(context, state);
+        });
+    if (runtime.isErr())
+        return report(VERNON_HAL_INTERNAL_ERROR, "cannot create the device's runtime");
+    device.runtime = std::move(runtime).value().release();
+    return VERNON_HAL_OK;
+#else
+    (void)descriptor;
+    (void)device;
+    return report(VERNON_HAL_UNSUPPORTED, "VernonRuntime was built without Metal support");
 #endif
 }
 
@@ -191,8 +257,16 @@ VernonHalStatus vernonHalCreateDevice(const VernonHalDeviceDescriptor *descripto
                 return invalid("only an OpenGL device adopts a context");
             if (const VernonHalStatus status = createVulkanDevice(*descriptor, *device); status != VERNON_HAL_OK)
                 return status;
-        } else if (descriptor->backend == VERNON_RUNTIME_DIRECTX12 || descriptor->backend == VERNON_RUNTIME_METAL) {
-            return report(VERNON_HAL_UNSUPPORTED, "DirectX 12 and Metal have no HAL device yet");
+        } else if (descriptor->backend == VERNON_RUNTIME_DIRECTX12) {
+            if (descriptor->opengl)
+                return invalid("only an OpenGL device adopts a context");
+            if (const VernonHalStatus status = createDirectX12Device(*descriptor, *device); status != VERNON_HAL_OK)
+                return status;
+        } else if (descriptor->backend == VERNON_RUNTIME_METAL) {
+            if (descriptor->opengl)
+                return invalid("only an OpenGL device adopts a context");
+            if (const VernonHalStatus status = createMetalDevice(*descriptor, *device); status != VERNON_HAL_OK)
+                return status;
         } else {
             return invalid("the backend is unknown");
         }

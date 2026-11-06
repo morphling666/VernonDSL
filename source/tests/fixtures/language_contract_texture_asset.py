@@ -62,6 +62,14 @@ def explicit_fragment(
     return vd.texture_sample(fragment_image, fragment_sampler, vd.Vector([0.5, 0.5]))
 
 
+@vd.fragment
+def bias_fragment(
+    fragment_image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=2)],  # noqa: F722
+    fragment_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=3)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample_bias(fragment_image, fragment_sampler, vd.Vector([0.5, 0.5]), -0.5)
+
+
 @vd.vertex
 def covering_vertex(
     vertex_index: Annotated[vd.u32, vd.builtin("vertex_index")],
@@ -129,6 +137,15 @@ explicit_asset = vd.program_asset(
     program=vd.pipeline(
         triangle_vertex,
         explicit_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+)
+
+bias_asset = vd.program_asset(
+    id="runtime/language-contract-texture-bias",
+    program=vd.pipeline(
+        triangle_vertex,
+        bias_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
 )

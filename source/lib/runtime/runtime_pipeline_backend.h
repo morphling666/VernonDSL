@@ -30,6 +30,10 @@ BackendPipelineResult resolveCudaPipeline(BackendStageBuildInputs &inputs, const
                                           VernonStageExecutable &pipeline);
 BackendPipelineResult resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
+BackendPipelineResult resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                               VernonStageExecutable &pipeline);
+BackendPipelineResult resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                                           VernonStageExecutable &pipeline);
 BackendPipelineResult resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                                             VernonStageExecutable &pipeline);
 

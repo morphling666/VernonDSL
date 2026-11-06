@@ -207,24 +207,6 @@ struct RuntimeVersion {
     uint32_t minor{};
 };
 
-struct RuntimeRequirements {
-    std::string backend;
-    std::vector<std::string> features;
-    RuntimeVersion apiVersion;
-    RuntimeVersion shaderVersion;
-    RuntimeVersion minimumFeatureLevel;
-    RuntimeVersion rootSignatureVersion;
-    RuntimeVersion minimumComputeCapability;
-    uint32_t computeWorkgroupSize[3]{1, 1, 1};
-    uint32_t glslVersion{};
-    uint32_t addressSize{};
-    std::string targetTriple;
-    std::string objectFormat;
-    std::string profile;
-    std::string applePlatform;
-    RuntimeVersion minimumOsVersion;
-};
-
 struct StageBindingPlan {
     std::vector<Parameter> parameters;
     std::vector<Parameter> runtimeParameters;

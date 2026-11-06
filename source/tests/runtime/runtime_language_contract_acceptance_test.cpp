@@ -192,7 +192,8 @@ std::array<uint8_t, 4> centerPixel(const std::vector<uint8_t> &pixels, uint32_t 
 // Draws the Program's three vertices into a clear opaque black target of `format`, read back as 8-bit RGBA.
 std::array<uint8_t, 4> renderArgumentFreeTriangle(const HalTestDevice &device, VernonProgramExecutable *executable,
                                                   VernonTextureFormat format = VERNON_TEXTURE_RGBA8_UNORM,
-                                                  uint32_t firstInstance = 0) {
+                                                  uint32_t firstInstance = 0,
+                                                  const VernonIndexBinding *indexBinding = nullptr) {
     EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterCount(executable), 0u);
     const HalImage target(device.get(), format, kExtent, kExtent, VERNON_IMAGE_COLOR_ATTACHMENT);
     LinkedProgram schedule(device.runtime(), executable);
@@ -205,6 +206,7 @@ std::array<uint8_t, 4> renderArgumentFreeTriangle(const HalTestDevice &device, V
     draw.vertex_count = 3;
     draw.instance_count = 1;
     draw.first_instance = firstInstance;
+    draw.index_binding = indexBinding;
     controls.writeTo(schedule.record(), 0, &draw);
     EXPECT_EQ(schedule.call(), VERNON_STATUS_OK) << schedule.error();
     return centerPixel(target.rgba8());
@@ -223,6 +225,20 @@ void runGraphicsTriangleOracle(const HalTestDevice &device, VernonProgramExecuta
 void runFirstInstanceOracle(const HalTestDevice &device, VernonProgramExecutable *executable) {
     EXPECT_EQ(renderArgumentFreeTriangle(device, executable, VERNON_TEXTURE_RGBA8_UNORM, 1),
               (std::array<uint8_t, 4>{0, 0, 0, 255}));
+}
+
+// The contract vertices collapse every `vertex_index` from 2 up onto one point, so indices 3..5 drawn with base vertex
+// -3 cover the center only where `vertex_index` includes the base vertex.
+void runBaseVertexOracle(const HalTestDevice &device, VernonProgramExecutable *executable,
+                         const AcceptanceDescriptor &acceptance) {
+    const uint32_t indices[] = {3, 4, 5};
+    const vernon::tests::HalBuffer indexBuffer(device.get(), sizeof(indices), indices, VERNON_HAL_BUFFER_INDEX);
+    ASSERT_TRUE(indexBuffer);
+    const VernonIndexBinding binding{VERNON_INDEX_U32, 0, 3, indexBuffer.reference(), -3};
+    const std::array<uint8_t, 4> pixel =
+        renderArgumentFreeTriangle(device, executable, VERNON_TEXTURE_RGBA8_UNORM, 0, &binding);
+    for (size_t channel = 0; channel < pixel.size(); ++channel)
+        EXPECT_NEAR(pixel[channel], acceptance.expected[channel], 1);
 }
 
 // The asset covers the target with one triangle and discards fragments whose (x + y) parity is odd.
@@ -497,8 +513,10 @@ TEST_P(LanguageContractAcceptance, LoadsResolvesAndExecutesCanonicalProgramAsset
         runGraphicsTriangleOracle(device_, program.get(), acceptance);
         const std::string_view id = fixture.fixtureId;
         if (id.find("graphics_raw") != std::string_view::npos ||
-            id.find("graphics_generated") != std::string_view::npos)
+            id.find("graphics_generated") != std::string_view::npos) {
             runFirstInstanceOracle(device_, program.get());
+            runBaseVertexOracle(device_, program.get(), acceptance);
+        }
     } else if (acceptance.oracle == "fragment_discard") {
         runFragmentDiscardOracle(device_, program.get(), acceptance);
     } else if (acceptance.oracle == "sampled_pixel") {
