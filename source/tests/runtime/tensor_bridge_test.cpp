@@ -235,7 +235,7 @@ TEST(TensorBridgeTest, ProvesLargeInterleavedViewsDisjointWithoutEnumeration) {
     std::array<uint8_t, 1> identity{};
     VernonTensorView even{};
     even.struct_size = sizeof(VernonTensorView);
-    even.storage = VERNON_TENSOR_RHI_RESOURCE;
+    even.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     even.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     even.access = VERNON_ACCESS_WRITE;
     even.rank = 1;
@@ -274,7 +274,7 @@ TEST(TensorBridgeTest, ResolvesHostAndRhiPhysicalStorageRanges) {
     EXPECT_EQ(vernon::runtime::tensorViewsPhysicalOverlap(left, right),
               vernon::runtime::TensorPhysicalOverlap::Overlapping);
 
-    left.storage = VERNON_TENSOR_RHI_RESOURCE;
+    left.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     left.resource = {7, {11}, 100, allocation.size()};
     right = left;
     right.resource.offset = 104;

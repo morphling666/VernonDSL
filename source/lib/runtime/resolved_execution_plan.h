@@ -35,16 +35,6 @@ struct NodeKey {
     bool operator!=(const NodeKey &other) const { return !(*this == other); }
 };
 
-struct GraphValueKey {
-    GraphDirection graph{GraphDirection::Forward};
-    uint32_t value{};
-
-    bool operator<(const GraphValueKey &other) const {
-        return graph != other.graph ? graph < other.graph : value < other.value;
-    }
-    bool operator==(const GraphValueKey &other) const { return graph == other.graph && value == other.value; }
-};
-
 struct NodeEndpointProjection {
     uint32_t value{};
     std::optional<size_t> logicalLeaf;
@@ -80,144 +70,26 @@ struct ResolvedNodePlan {
     ResolvedOperationControls controls;
 };
 
-enum class ResidencyRequirement {
-    Host,
-    Device,
-};
-
-struct AliasDomainPlan {
-    uint32_t storage{};
-    std::vector<uint32_t> values;
-    std::map<GraphDirection, ResidencyRequirement> residency;
-};
-
-enum class TransferKind {
-    HostUpload,
-    DeviceCopy,
-    Readback,
-};
-
-enum class TransferEndpointKind {
-    Boundary,
-    Node,
-    Storage,
-};
-
-struct TransferEndpoint {
-    TransferEndpointKind kind{TransferEndpointKind::Storage};
-    GraphDirection graph{GraphDirection::Forward};
-    uint32_t id{};
-};
-
-struct ResolvedTransferEdge {
-    TransferKind kind{TransferKind::HostUpload};
-    TransferEndpoint producer;
-    TransferEndpoint consumer;
-    uint32_t value{};
-    std::optional<uint32_t> storage;
-    uint32_t order{};
-};
-
-struct ResolvedTransferPlan {
-    std::vector<ResolvedTransferEdge> edges;
-};
-
-enum class HazardKind {
-    Canonical,
-    ReadAfterWrite,
-    WriteAfterRead,
-    WriteAfterWrite,
-};
-
-enum class BarrierRequirement {
-    Execution,
-    Memory,
-    AttachmentTransition,
-};
-
-struct ResolvedDependencyEdge {
-    NodeKey predecessor;
-    NodeKey successor;
-    HazardKind hazard{HazardKind::Canonical};
-    BarrierRequirement barrier{BarrierRequirement::Execution};
-    std::optional<uint32_t> storage;
-};
-
-struct ResolvedHazardPlan {
-    std::vector<ResolvedDependencyEdge> edges;
-    std::map<NodeKey, std::vector<uint32_t>> predecessors;
-};
-
-enum class AttachmentTransition {
-    Preserve,
-    Initialize,
-    ReadWrite,
-};
-
-struct ResolvedAttachmentTransition {
-    uint32_t storage{};
-    uint32_t location{};
-    uint32_t aspects{};
-    AttachmentTransition transition{AttachmentTransition::Preserve};
-};
-
-struct ResolvedGraphicsScopeCandidate {
-    NodeKey node;
-    uint32_t region{};
-    std::vector<ResolvedAttachmentTransition> attachments;
-};
-
-struct ResolvedTapeRequirement {
-    uint32_t value{};
-    bool forwardProducer{};
-    bool backwardConsumer{};
-    std::vector<vernon::program_plan::TapeCarrier> requiredCarriers;
-    std::vector<vernon::program_plan::TapeCarrier> optionalCarriers;
-};
-
-enum class CheckpointPolicy {
-    Retain,
-    Rematerialize,
-};
-
-struct ResolvedAutodiffPlan {
-    std::vector<ResolvedTapeRequirement> tapes;
-    std::vector<uint32_t> residualValues;
-    std::vector<NodeKey> replayNodes;
-    CheckpointPolicy checkpointPolicy{CheckpointPolicy::Retain};
-};
-
-// Immutable canonical execution authority. Backend handles occur only through
-// reusable Stage references; every other record is logical Program planning.
+// The loaded Stage of every Node of a Program executable, which schedule fragments are built from. Nodes that run the
+// same physical Stage share it; a Node's projections say which Program Values its Stage parameters read.
 struct ResolvedExecutionPlan {
     std::shared_ptr<const ResolvedProgram> resolvedProgram;
     std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
     std::vector<shape::DeclaredShape> declaredValueShapes;
-    std::vector<std::optional<shape::ConcreteShape>> preparedValueShapes;
     std::vector<std::shared_ptr<VernonStageExecutable>> stageCache;
     std::map<NodeKey, ResolvedNodePlan> nodes;
-    std::map<uint32_t, AliasDomainPlan> aliasDomains;
-    std::map<GraphValueKey, ResidencyRequirement> residency;
-    ResolvedTransferPlan transfers;
-    ResolvedHazardPlan hazards;
-    std::vector<ResolvedGraphicsScopeCandidate> graphicsScopeCandidates;
-    ResolvedAutodiffPlan autodiff;
 
     const ResolvedNodePlan *node(GraphDirection graph, uint32_t nodeId) const;
-    bool requiresDevice(GraphDirection graph, uint32_t value) const;
-    const std::vector<uint32_t> &predecessors(GraphDirection graph, uint32_t nodeId) const;
 };
 
-enum class ExecutionPlanError : uint8_t {
-    PolicyResolutionFailed,
-    ValidationFailed,
-};
-
-using ExecutionPlanResult = vernon::Result<void, ExecutionPlanError>;
+using ExecutionPlanResult = vernon::Result<void, Diagnostic>;
 
 std::optional<GraphDirection> graphDirection(std::string_view direction);
-ExecutionPlanResult buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
-ExecutionPlanResult validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic &diagnostic);
+// Decodes the declared Value shapes and checks every Node against its Stage: one projection per Stage parameter, onto
+// an existing Value and leaf, with a static Stage shape that the Value admits and no other Stage contradicts; and a
+// Node binds another Node's result only after that Node in its graph, which is the order a schedule runs them in, or
+// through its graph's captures.
+ExecutionPlanResult completeResolvedExecutionPlan(ResolvedExecutionPlan &plan);
 
 } // namespace vernon::runtime::program
 

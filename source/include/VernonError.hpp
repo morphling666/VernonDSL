@@ -2,7 +2,6 @@
 #define VERNON_ERROR_HPP
 
 #include "VernonCommon.h"
-#include "VernonRHI.h"
 #include "VernonResult.hpp"
 
 #include <cstddef>
@@ -12,7 +11,6 @@ namespace vernon {
 
 enum class ErrorDomain : std::uint8_t {
     Lifecycle = 1,
-    Rhi = 2,
     Runtime = 3,
     ResourceAccess = 4,
     Arithmetic = 5,
@@ -44,29 +42,13 @@ struct LifecycleError {
     ErrorContext context{};
 };
 
-enum class RhiErrorCode : std::uint8_t {
-    InvalidArgument = 1,
-    Unsupported = 2,
-    ResourceExhausted = 3,
-    BackendFailure = 4,
-    LifecycleFailure = 5,
-    SynchronizationFailure = 6,
-    SurfaceOutOfDate = 7,
-    SurfaceLost = 8,
-};
-
-struct RhiError {
-    RhiErrorCode code{RhiErrorCode::BackendFailure};
-    ErrorContext context{};
-};
-
 enum class RuntimeErrorCode : std::uint8_t {
     InvalidArgument = 1,
     ParseFailure = 2,
     VerificationFailure = 3,
     Unsupported = 4,
     ResourceExhausted = 5,
-    RhiFailure = 6,
+    DeviceFailure = 6,
     LifecycleFailure = 7,
     InternalFailure = 8,
     NotReady = 9,
@@ -106,66 +88,15 @@ struct ProviderError {
 
 static_assert(std::is_trivially_copyable_v<ErrorContext>);
 static_assert(std::is_trivially_copyable_v<LifecycleError>);
-static_assert(std::is_trivially_copyable_v<RhiError>);
 static_assert(std::is_trivially_copyable_v<RuntimeError>);
 static_assert(std::is_trivially_copyable_v<ResourceAccessError>);
 static_assert(std::is_trivially_copyable_v<ProviderError>);
-
-[[nodiscard]] constexpr RhiError toRhiError(LifecycleError error) noexcept {
-    return {(error.code == LifecycleErrorCode::AdmissionSaturated || error.code == LifecycleErrorCode::AllocationFailed)
-                ? RhiErrorCode::ResourceExhausted
-                : RhiErrorCode::LifecycleFailure,
-            error.context};
-}
-
-[[nodiscard]] constexpr RhiError toRhiError(ArithmeticError error, ErrorContext context = {}) noexcept {
-    if (error == ArithmeticError::Saturated)
-        return {RhiErrorCode::ResourceExhausted, context};
-    return {RhiErrorCode::InvalidArgument, context};
-}
-
-[[nodiscard]] constexpr RhiError toRhiError(AllocationError, ErrorContext context = {}) noexcept {
-    return {RhiErrorCode::ResourceExhausted, context};
-}
-
-[[nodiscard]] constexpr RhiError toRhiError(ResourceAccessError error) noexcept {
-    switch (error.code) {
-    case ResourceAccessErrorCode::ResourceExhausted:
-        return {RhiErrorCode::ResourceExhausted, error.context};
-    case ResourceAccessErrorCode::LifecycleFailure:
-        return {RhiErrorCode::LifecycleFailure, error.context};
-    case ResourceAccessErrorCode::InvalidRegion:
-    case ResourceAccessErrorCode::ConflictingAccess:
-    case ResourceAccessErrorCode::UnknownAuthority:
-        return {RhiErrorCode::InvalidArgument, error.context};
-    }
-    return {RhiErrorCode::BackendFailure, error.context};
-}
 
 [[nodiscard]] constexpr RuntimeError toRuntimeError(LifecycleError error) noexcept {
     return {(error.code == LifecycleErrorCode::AdmissionSaturated || error.code == LifecycleErrorCode::AllocationFailed)
                 ? RuntimeErrorCode::ResourceExhausted
                 : RuntimeErrorCode::LifecycleFailure,
             error.context};
-}
-
-[[nodiscard]] constexpr RuntimeError toRuntimeError(RhiError error) noexcept {
-    switch (error.code) {
-    case RhiErrorCode::InvalidArgument:
-        return {RuntimeErrorCode::InvalidArgument, error.context};
-    case RhiErrorCode::Unsupported:
-        return {RuntimeErrorCode::Unsupported, error.context};
-    case RhiErrorCode::ResourceExhausted:
-        return {RuntimeErrorCode::ResourceExhausted, error.context};
-    case RhiErrorCode::LifecycleFailure:
-        return {RuntimeErrorCode::LifecycleFailure, error.context};
-    case RhiErrorCode::BackendFailure:
-    case RhiErrorCode::SynchronizationFailure:
-    case RhiErrorCode::SurfaceOutOfDate:
-    case RhiErrorCode::SurfaceLost:
-        return {RuntimeErrorCode::RhiFailure, error.context};
-    }
-    return {RuntimeErrorCode::InternalFailure, error.context};
 }
 
 [[nodiscard]] constexpr RuntimeError toRuntimeError(ResourceAccessError error) noexcept {
@@ -229,65 +160,6 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
     return {RuntimeErrorCode::InternalFailure, context};
 }
 
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(RhiError error) noexcept {
-    switch (error.code) {
-    case RhiErrorCode::InvalidArgument:
-    case RhiErrorCode::LifecycleFailure:
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    case RhiErrorCode::Unsupported:
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    case RhiErrorCode::ResourceExhausted:
-        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
-    case RhiErrorCode::BackendFailure:
-    case RhiErrorCode::SynchronizationFailure:
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    case RhiErrorCode::SurfaceOutOfDate:
-        return VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE;
-    case RhiErrorCode::SurfaceLost:
-        return VERNON_RHI_STATUS_SURFACE_LOST;
-    }
-    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(LifecycleError error) noexcept {
-    return toVernonRhiStatus(toRhiError(error));
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(ResourceAccessError error) noexcept {
-    return toVernonRhiStatus(toRhiError(error));
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(ArithmeticError error) noexcept {
-    return toVernonRhiStatus(toRhiError(error));
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(AllocationError error) noexcept {
-    return toVernonRhiStatus(toRhiError(error));
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(RuntimeError error) noexcept {
-    switch (error.code) {
-    case RuntimeErrorCode::InvalidArgument:
-    case RuntimeErrorCode::ParseFailure:
-    case RuntimeErrorCode::VerificationFailure:
-    case RuntimeErrorCode::LifecycleFailure:
-    case RuntimeErrorCode::NotReady:
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    case RuntimeErrorCode::Unsupported:
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    case RuntimeErrorCode::ResourceExhausted:
-        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
-    case RuntimeErrorCode::RhiFailure:
-    case RuntimeErrorCode::InternalFailure:
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-    return VERNON_RHI_STATUS_INTERNAL_ERROR;
-}
-
-[[nodiscard]] constexpr VernonRhiStatus toVernonRhiStatus(ProviderError error) noexcept {
-    return toVernonRhiStatus(toRuntimeError(error));
-}
-
 [[nodiscard]] constexpr VernonStatus toVernonStatus(RuntimeError error) noexcept {
     switch (error.code) {
     case RuntimeErrorCode::InvalidArgument:
@@ -301,7 +173,7 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
     case RuntimeErrorCode::NotReady:
         return VERNON_STATUS_NOT_READY;
     case RuntimeErrorCode::ResourceExhausted:
-    case RuntimeErrorCode::RhiFailure:
+    case RuntimeErrorCode::DeviceFailure:
     case RuntimeErrorCode::LifecycleFailure:
     case RuntimeErrorCode::InternalFailure:
         return VERNON_STATUS_INTERNAL_ERROR;
@@ -310,10 +182,6 @@ static_assert(std::is_trivially_copyable_v<ProviderError>);
 }
 
 [[nodiscard]] constexpr VernonStatus toVernonStatus(LifecycleError error) noexcept {
-    return toVernonStatus(toRuntimeError(error));
-}
-
-[[nodiscard]] constexpr VernonStatus toVernonStatus(RhiError error) noexcept {
     return toVernonStatus(toRuntimeError(error));
 }
 
@@ -341,10 +209,6 @@ struct ErrorView {
 
 [[nodiscard]] constexpr ErrorView errorView(LifecycleError error) noexcept {
     return {ErrorDomain::Lifecycle, static_cast<std::uint8_t>(error.code), error.context};
-}
-
-[[nodiscard]] constexpr ErrorView errorView(RhiError error) noexcept {
-    return {ErrorDomain::Rhi, static_cast<std::uint8_t>(error.code), error.context};
 }
 
 [[nodiscard]] constexpr ErrorView errorView(RuntimeError error) noexcept {

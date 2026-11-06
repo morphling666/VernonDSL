@@ -1,8 +1,7 @@
 #ifndef VERNON_HAL_NATIVE_IMAGES_H
 #define VERNON_HAL_NATIVE_IMAGES_H
 
-// The image views and samplers a HAL device creates itself, outside the RHI's registry, and the image rules every
-// backend checks.
+// The image views and samplers a HAL device creates, and the image rules every backend checks.
 
 #include "VernonHal.h"
 #include "VernonResult.hpp"
@@ -41,7 +40,7 @@ uint64_t nextImageSerial();
 bool describeNativeView(const VernonRuntimeProviderResourceReference &reference,
                         VernonRuntimeProviderImageDescription &description);
 
-// Surface images whose contents are undefined, from their acquire until a submitted pass writes them.
+// Surface images whose contents are undefined, from their acquire until a submitted pass or a host write writes them.
 void markUndefined(uint64_t image);
 void forgetUndefined(const uint64_t *images, size_t count);
 bool anyUndefined(const uint64_t *images, size_t count);

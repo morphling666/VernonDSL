@@ -12,8 +12,8 @@ completed migrations and superseded plans. Measurement output belongs in
 - `RELEASE_VERSION` identifies the package release;
 - `COMPILER_CONTRACT_VERSION` versions source semantics, compiler IR
   contracts, reflection, and Stage compilation;
-- `PROGRAM_VERSION` versions Program manifests, deployment artifacts, Runtime
-  and provider ABI, and RHI compatibility.
+- `PROGRAM_VERSION` versions Program manifests, deployment artifacts, and the
+  Runtime, schedule and HAL ABI.
 
 Current values are read from `versions.toml`. Before a release is published,
 the selected contract may replace an incomplete intermediate implementation
@@ -37,10 +37,12 @@ deployment contract axis.
 2. [`language/tensor_view.md`](language/tensor_view.md) defines Tensor,
    TensorStorage, TensorView, workgroup storage, indexing, and descriptor
    semantics in detail.
-3. [`program/execution_manifest.md`](program/execution_manifest.md) is the
+3. [`language/placement.md`](language/placement.md) defines `@vd.params`,
+   per-leaf placement, groups and by-value packing.
+4. [`program/execution_manifest.md`](program/execution_manifest.md) is the
    field-level Program JSON, artifact, resolve, ABI, and fail-closed validation
    contract.
-4. [`autodiff/contract.md`](autodiff/contract.md) defines compute Program VJP,
+5. [`autodiff/contract.md`](autodiff/contract.md) defines compute Program VJP,
    residuals, pullbacks, tangent layout, and deployment behavior.
 
 Normative field definitions must appear in one of these documents only.
@@ -61,10 +63,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
 4. [`compiler/invocation_index_ownership.md`](compiler/invocation_index_ownership.md)
    defines ordinary device-write injectivity and dispatch residuals.
 5. [`runtime/design.md`](runtime/design.md) defines Program execution,
-   RuntimeCore/provider/RHI ownership, transfers, publication, scheduling, and
-   backend behavior.
+   HAL device ownership, transfers, scheduling, and backend behavior.
 6. [`runtime/image_resources.md`](runtime/image_resources.md) defines current
-   image owner/view/provider/RHI behavior.
+   image, view and HAL image behavior.
 7. [`runtime/reflection_binding_architecture.md`](runtime/reflection_binding_architecture.md)
    records the current compiler-reflection-to-provider mapping, its
    cross-backend invariants, and the assessed `PreparedBindingPlan` end state.
@@ -110,8 +111,8 @@ Architecture and tutorials link to the contract instead of redefining fields.
   SIMT-to-SIMD CPU kernels, host-CPU targets, aliasing classes, exact
   floating point, fusion, 64-bit integers and the Vulkan high tier.
 - [`runtime/presentable_surfaces.md`](runtime/presentable_surfaces.md)
-  proposes RHI-owned swapchains for host windows, whose acquired images
-  Runtime binds as ordinary color targets.
+  defines HAL surfaces for host windows, whose acquired images schedules
+  bind as ordinary color targets.
 - [`runtime/gpu_profiling.md`](runtime/gpu_profiling.md) proposes per-Node
   and recorded debug groups and opt-in timed scopes.
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)

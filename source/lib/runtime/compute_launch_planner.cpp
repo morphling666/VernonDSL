@@ -1,7 +1,7 @@
 #include "compute_launch_planner.h"
 
 #include "pipeline_metadata.h"
-#include "program_execution/program_boundary_contract.h"
+#include "program_boundary_contract.h"
 #include "tensor_bridge.h"
 
 #include <algorithm>
@@ -55,7 +55,7 @@ bool metadataTensorValid(const VernonTensorView &tensor, uint32_t rank, int64_t 
     if (!valueLayoutValid(tensor.element_layout) || !tensor.element_layout.byte_size || tensor.rank != rank ||
         (rank && (!tensor.shape || !tensor.byte_strides)) || tensor.byte_offset % tensor.element_layout.byte_size ||
         tensor.byte_offset > tensor.byte_size || (tensor.storage == VERNON_TENSOR_HOST && !tensor.host_data) ||
-        (tensor.storage == VERNON_TENSOR_RHI_RESOURCE &&
+        (tensor.storage == VERNON_TENSOR_DEVICE_RESOURCE &&
          (tensor.resource.size == 0 || tensor.byte_size > tensor.resource.size))) {
         error = "TensorView metadata source has an invalid rank or element layout";
         return false;
@@ -205,11 +205,11 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const VernonStageIn
             }
             if (supplied.kind != VERNON_PROGRAM_TENSOR)
                 return fail(error, "compute argument kind is unsupported");
-            if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+            if (supplied.tensor.storage == VERNON_TENSOR_DEVICE_RESOURCE) {
                 if (!supplied.tensor.resource.identity || !supplied.tensor.resource.resource.value ||
                     supplied.tensor.resource.size == 0 || supplied.tensor.byte_offset > supplied.tensor.resource.size ||
                     supplied.tensor.byte_size > supplied.tensor.resource.size || !tensorFitsAllocation(supplied.tensor))
-                    return fail(error, "compute RHI Tensor view is invalid");
+                    return fail(error, "compute device Tensor view is invalid");
                 argument = ComputeTensorArgument{supplied.tensor.resource};
             } else {
                 if (use.interfaceKind == "storage") {
@@ -450,8 +450,7 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         const VernonValueAccess requiredAccess = parameter.access == "read"    ? VERNON_ACCESS_READ
                                                  : parameter.access == "write" ? VERNON_ACCESS_WRITE
                                                                                : VERNON_ACCESS_READ_WRITE;
-        const bool accessCompatible =
-            parameter.access.empty() || program_execution::valueAccessSatisfies(requiredAccess, tensor.access);
+        const bool accessCompatible = parameter.access.empty() || valueAccessSatisfies(requiredAccess, tensor.access);
         if (tensor.struct_size < sizeof(VernonTensorView)) {
             error = "pipeline Tensor argument '" + parameter.name + "' structure is incomplete";
             return false;
@@ -467,7 +466,7 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         }
         if (tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible)
             return fail(error, "pipeline Tensor argument access does not match reflection");
-        if (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
+        if (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE)
             return fail(error, "pipeline Tensor argument storage kind is invalid");
         if (!tensorFitsAllocation(tensor)) {
             auto requiredSpan = tensorRequiredSpan(tensor);

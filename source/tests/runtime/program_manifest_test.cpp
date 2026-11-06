@@ -1,13 +1,11 @@
 #include "VernonFormats.hpp"
 #include "runtime/content_hash.h"
-#include "runtime/program_execution/program_boundary_contract.h"
+#include "runtime/program_boundary_contract.h"
 #include "runtime/program_execution_backend.h"
 #include "runtime/program_execution_manifest.h"
-#include "runtime/program_graph_linker.h"
+#include "runtime/program_graph_composition.h"
 #include "runtime/runtime_pipeline_backend.h"
 #include "runtime/target_binding_plan.h"
-#include "runtime_rhi_test_utils.h"
-
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -16,7 +14,7 @@
 namespace {
 
 TEST(ProgramBoundaryContract, UsesOneAccessCapabilityLatticeForBindingAndExecution) {
-    using vernon::runtime::program_execution::valueAccessSatisfies;
+    using vernon::runtime::valueAccessSatisfies;
 
     EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_READ, VERNON_ACCESS_READ));
     EXPECT_FALSE(valueAccessSatisfies(VERNON_ACCESS_READ, VERNON_ACCESS_WRITE));
@@ -86,131 +84,130 @@ vernon::runtime::ProgramVariantDeployment graphStorageLinkFixture(bool output = 
     return deployment;
 }
 
-TEST(ProgramGraphLinker, KeepsNodeNamespacesAndInternalizesConnectedBoundaries) {
+TEST(ProgramGraphComposition, KeepsNodeNamespacesAndInternalizesConnectedBoundaries) {
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphLinkFixture(true);
     ProgramVariantDeployment consumer = graphLinkFixture(false);
-    const std::vector<ProgramGraphNodeSource> nodes{{3, "producer", "producer", "producer-hash", &producer, {}},
-                                                    {7, "consumer", "consumer", "consumer-hash", &consumer, {}}};
-    LinkedProgramDeployment linked;
+    ProgramVariantDeployment unconnected = graphLinkFixture(false);
+    const std::vector<ProgramGraphNodeSource> nodes{{3, "producer", "producer-hash", &producer},
+                                                    {7, "consumer", "consumer-hash", &consumer},
+                                                    {9, "unconnected", "unconnected-hash", &unconnected}};
+    ComposedProgramAbi composed;
     program::Diagnostic diagnostic;
-    ASSERT_TRUE(linkProgramGraph(nodes, {{{3, 0}, {7, 0}}}, {}, {{{3, 0}, "result"}}, linked, diagnostic))
+    ASSERT_TRUE(composeProgramGraph(nodes, {{{3, 0}, {7, 0}}}, {}, {{{3, 0}, "result"}}, composed, diagnostic))
         << diagnostic.message;
-    ASSERT_EQ(linked.deployment.program.values.size(), 1u);
-    ASSERT_EQ(linked.deployment.program.abi.boundarySlots.size(), 1u);
-    EXPECT_EQ(linked.deployment.program.abi.boundarySlots[0].path, "result");
-    EXPECT_EQ(linked.boundarySlots.at({3, 0}), 0u);
-    EXPECT_FALSE(linked.boundarySlots.count({7, 0}));
-    EXPECT_EQ(linked.id.rfind("program-graph:", 0), 0u);
-    ASSERT_EQ(linked.deployment.program.graphs.size(), 1u);
-    EXPECT_TRUE(linked.deployment.program.graphs[0].inputs.empty());
+    const std::vector<program::BoundarySlot> &slots = composed.program.abi.boundarySlots;
+    ASSERT_EQ(slots.size(), 2u);
+    EXPECT_EQ(slots[0].path, "result");
+    EXPECT_EQ(slots[1].path, "node/9/value");
+    EXPECT_NE(slots[0].value, slots[1].value);
+    EXPECT_EQ(composed.boundarySlots.at({3, 0}), 0u);
+    EXPECT_FALSE(composed.boundarySlots.count({7, 0}));
+    EXPECT_EQ(composed.id.rfind("program-graph:", 0), 0u);
+    EXPECT_TRUE(composed.program.graphs.empty());
 }
 
-TEST(ProgramGraphLinker, IdentityDoesNotDependOnConnectionInsertionOrder) {
+TEST(ProgramGraphComposition, IdentityDoesNotDependOnConnectionInsertionOrder) {
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphLinkFixture(true);
     ProgramVariantDeployment firstConsumer = graphLinkFixture(false);
     ProgramVariantDeployment secondConsumer = graphLinkFixture(false);
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer", "producer-hash", &producer, {}},
-                                                    {1, "first", "first", "first-hash", &firstConsumer, {}},
-                                                    {2, "second", "second", "second-hash", &secondConsumer, {}}};
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer},
+                                                    {1, "first", "first-hash", &firstConsumer},
+                                                    {2, "second", "second-hash", &secondConsumer}};
     const ProgramGraphConnection first{{0, 0}, {1, 0}};
     const ProgramGraphConnection second{{0, 0}, {2, 0}};
-    LinkedProgramDeployment linked;
-    LinkedProgramDeployment reordered;
+    ComposedProgramAbi composed;
+    ComposedProgramAbi reordered;
     program::Diagnostic diagnostic;
-    ASSERT_TRUE(linkProgramGraph(nodes, {first, second}, {}, {{{0, 0}, "result"}}, linked, diagnostic))
+    ASSERT_TRUE(composeProgramGraph(nodes, {first, second}, {}, {{{0, 0}, "result"}}, composed, diagnostic))
         << diagnostic.message;
-    ASSERT_TRUE(linkProgramGraph(nodes, {second, first}, {}, {{{0, 0}, "result"}}, reordered, diagnostic))
+    ASSERT_TRUE(composeProgramGraph(nodes, {second, first}, {}, {{{0, 0}, "result"}}, reordered, diagnostic))
         << diagnostic.message;
-    EXPECT_EQ(linked.id, reordered.id);
-    EXPECT_EQ(linked.deployment.program.values.size(), reordered.deployment.program.values.size());
-    EXPECT_EQ(linked.deployment.program.abi.boundarySlots.size(),
-              reordered.deployment.program.abi.boundarySlots.size());
+    EXPECT_EQ(composed.id, reordered.id);
+    EXPECT_EQ(composed.program.abi.boundarySlots.size(), reordered.program.abi.boundarySlots.size());
 }
 
-TEST(ProgramGraphLinker, RejectsIncompleteNodeIdentityAndAllowsNodeLocalSpecializations) {
+TEST(ProgramGraphComposition, RejectsIncompleteNodeIdentityAndAllowsNodeLocalSpecializations) {
     using namespace vernon::runtime;
     ProgramVariantDeployment first = graphLinkFixture(true);
     ProgramVariantDeployment second = graphLinkFixture(false);
     first.key = {{"mode", ProgramSpecializationKind::Bool, true}};
     second.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{2}}};
-    LinkedProgramDeployment linked;
+    ComposedProgramAbi composed;
     program::Diagnostic diagnostic;
-    EXPECT_FALSE(linkProgramGraph({{0, "first", "first", "", &first, {}}}, {}, {}, {}, linked, diagnostic));
+    EXPECT_FALSE(composeProgramGraph({{0, "first", "", &first}}, {}, {}, {}, composed, diagnostic));
     EXPECT_EQ(diagnostic.path, "/nodes/0");
-    EXPECT_TRUE(linkProgramGraph(
-        {{0, "first", "first", "first-hash", &first, {}}, {1, "second", "second", "second-hash", &second, {}}},
-        {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic))
+    EXPECT_TRUE(composeProgramGraph({{0, "first", "first-hash", &first}, {1, "second", "second-hash", &second}},
+                                    {{{0, 0}, {1, 0}}}, {}, {}, composed, diagnostic))
         << diagnostic.message;
 }
 
-TEST(ProgramGraphLinker, RejectsExportOfAnInternalizedDestination) {
+TEST(ProgramGraphComposition, RejectsExportOfAnInternalizedDestination) {
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphLinkFixture(true);
     ProgramVariantDeployment consumer = graphLinkFixture(false);
-    LinkedProgramDeployment linked;
+    ComposedProgramAbi composed;
     program::Diagnostic diagnostic;
-    EXPECT_FALSE(linkProgramGraph({{0, "producer", "producer", "producer-hash", &producer, {}},
-                                   {1, "consumer", "consumer", "consumer-hash", &consumer, {}}},
-                                  {{{0, 0}, {1, 0}}}, {}, {{{1, 0}, "internal"}}, linked, diagnostic));
+    EXPECT_FALSE(
+        composeProgramGraph({{0, "producer", "producer-hash", &producer}, {1, "consumer", "consumer-hash", &consumer}},
+                            {{{0, 0}, {1, 0}}}, {}, {{{1, 0}, "internal"}}, composed, diagnostic));
     EXPECT_EQ(diagnostic.path, "/exports/0");
 }
 
-TEST(ProgramGraphLinker, VariantBoundaryContractIncludesDirectionAccessLayoutAndPublication) {
-    using namespace vernon::runtime;
-    using namespace vernon::runtime::program;
-    ProgramVariantDeployment deployment = graphLinkFixture(true);
-    const BoundarySlot &boundary = deployment.program.abi.boundarySlots.front();
-    BoundarySlot candidate = boundary;
-    EXPECT_TRUE(sameProgramGraphBoundaryContract(boundary, candidate));
-    candidate.access = BoundaryAccess::Read;
-    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
-    candidate = boundary;
-    candidate.publication = BoundaryPublication::InPlace;
-    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
-    candidate = boundary;
-    candidate.layout = vernon::runtime::program::ValueLayout{};
-    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
-}
-
-TEST(ProgramGraphLinker, RejectsBranchedAndReversedStorageVersionChains) {
+TEST(ProgramGraphComposition, RejectsBranchedAndReversedStorageVersionChains) {
     using namespace vernon::runtime;
     ProgramVariantDeployment first = graphStorageLinkFixture();
     ProgramVariantDeployment second = graphStorageLinkFixture();
     ProgramVariantDeployment third = graphStorageLinkFixture();
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "first", "first", "first-hash", &first, {}},
-                                                    {1, "second", "second", "second-hash", &second, {}},
-                                                    {2, "third", "third", "third-hash", &third, {}}};
-    LinkedProgramDeployment linked;
+    const std::vector<ProgramGraphNodeSource> nodes{
+        {0, "first", "first-hash", &first}, {1, "second", "second-hash", &second}, {2, "third", "third-hash", &third}};
+    ComposedProgramAbi composed;
     program::Diagnostic diagnostic;
-    EXPECT_FALSE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}, true}, {{0, 0}, {2, 0}, true}}, {}, {}, linked, diagnostic));
+    EXPECT_FALSE(
+        composeProgramGraph(nodes, {{{0, 0}, {1, 0}, true}, {{0, 0}, {2, 0}, true}}, {}, {}, composed, diagnostic));
     EXPECT_EQ(diagnostic.path, "/connections/1");
-    EXPECT_FALSE(linkProgramGraph(nodes, {{{1, 0}, {0, 0}, true}}, {}, {}, linked, diagnostic));
+    EXPECT_FALSE(composeProgramGraph(nodes, {{{1, 0}, {0, 0}, true}}, {}, {}, composed, diagnostic));
     EXPECT_EQ(diagnostic.path, "/connections/0");
-    EXPECT_FALSE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}, true}}, {{0, 0}}, {}, linked, diagnostic));
+    EXPECT_FALSE(composeProgramGraph(nodes, {{{0, 0}, {1, 0}, true}}, {{0, 0}}, {}, composed, diagnostic));
     EXPECT_EQ(diagnostic.path, "/retained_boundaries/0");
 }
 
-TEST(ProgramGraphLinker, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
+TEST(ProgramGraphComposition, StorageChainVersionsShareTheFinalSlotAndStorage) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment first = graphStorageLinkFixture();
+    ProgramVariantDeployment second = graphStorageLinkFixture();
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "first", "first-hash", &first},
+                                                    {1, "second", "second-hash", &second}};
+    ComposedProgramAbi composed;
+    program::Diagnostic diagnostic;
+    ASSERT_TRUE(composeProgramGraph(nodes, {{{0, 0}, {1, 0}, true}}, {{1, 0}}, {}, composed, diagnostic))
+        << diagnostic.message;
+    ASSERT_EQ(composed.program.abi.boundarySlots.size(), 1u);
+    EXPECT_EQ(composed.boundarySlots.at({0, 0}), 0u);
+    EXPECT_EQ(composed.boundarySlots.at({1, 0}), 0u);
+    EXPECT_EQ(composed.program.abi.boundarySlots[0].aliasOwner.kind, program::ProgramOwnerKind::Storage);
+}
+
+TEST(ProgramGraphComposition, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphStorageLinkFixture();
     ProgramVariantDeployment consumer = graphStorageLinkFixture(false);
     producer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
     consumer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
-    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer", "producer-hash", &producer, {}},
-                                                    {1, "consumer", "consumer", "consumer-hash", &consumer, {}}};
-    LinkedProgramDeployment linked;
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer},
+                                                    {1, "consumer", "consumer-hash", &consumer}};
+    ComposedProgramAbi composed;
     program::Diagnostic diagnostic;
-    ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {{0, 0}}, {}, linked, diagnostic)) << diagnostic.message;
-    ASSERT_EQ(linked.deployment.program.abi.boundarySlots.size(), 1u);
-    EXPECT_EQ(linked.boundarySlots.at({0, 0}), 0u);
-    EXPECT_TRUE(linked.deployment.key.empty());
+    ASSERT_TRUE(composeProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {{0, 0}}, {}, composed, diagnostic))
+        << diagnostic.message;
+    ASSERT_EQ(composed.program.abi.boundarySlots.size(), 1u);
+    EXPECT_EQ(composed.boundarySlots.at({0, 0}), 0u);
 
-    LinkedProgramDeployment internalized;
-    ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {}, {}, internalized, diagnostic)) << diagnostic.message;
-    EXPECT_NE(linked.id, internalized.id);
-    EXPECT_TRUE(internalized.deployment.program.abi.boundarySlots.empty());
+    ComposedProgramAbi internalized;
+    ASSERT_TRUE(composeProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {}, {}, internalized, diagnostic)) << diagnostic.message;
+    EXPECT_NE(composed.id, internalized.id);
+    EXPECT_TRUE(internalized.program.abi.boundarySlots.empty());
 }
 
 TEST(ProgramSemanticType, StrictCanonicalRoundTripAndClassification) {
@@ -1082,7 +1079,7 @@ TEST(ProgramTargetFormats, RejectsTargetsTheDeviceCannotUseAsDeclared) {
     EXPECT_EQ(diagnostic.message, "integer color targets cannot blend");
 
     const auto withoutFloatBlending = [](const vernon::formats::Format &format) {
-        return format.dataType == VERNON_RHI_IMAGE_DATA_FLOAT32 ? format.baseline & ~VERNON_RHI_FORMAT_BLENDABLE
+        return format.dataType == VERNON_HAL_IMAGE_DATA_FLOAT32 ? format.baseline & ~VERNON_HAL_FORMAT_BLENDABLE
                                                                 : format.baseline;
     };
     EXPECT_FALSE(validate("r32_float", true, withoutFloatBlending, diagnostic));
@@ -1090,7 +1087,7 @@ TEST(ProgramTargetFormats, RejectsTargetsTheDeviceCannotUseAsDeclared) {
     EXPECT_EQ(diagnostic.message, "device cannot render and blend any format of this attachment");
 
     const auto unrenderable = [](const vernon::formats::Format &format) {
-        return format.baseline & ~VERNON_RHI_FORMAT_RENDERABLE;
+        return format.baseline & ~VERNON_HAL_FORMAT_RENDERABLE;
     };
     EXPECT_FALSE(validate("rgba8_unorm", false, unrenderable, diagnostic));
     EXPECT_EQ(diagnostic.code, "PROGRAM_OPERATION_UNSUPPORTED");

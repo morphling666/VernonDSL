@@ -32,13 +32,12 @@ bool prepareGraphicsVariantKey(const VernonGraphicsState &graphicsState, const P
 }
 
 bool prepareGraphicsDrawInvocation(const PlannedGraphicsDraw &plan, VernonPrimitiveTopology topology,
-                                   VernonRuntimeCoreDrawInvocation &draw, std::string &error) {
+                                   DrawInvocation &draw, std::string &error) {
     draw = {};
-    draw.struct_size = sizeof(draw);
-    draw.vertex_count = plan.vertexCount;
-    draw.instance_count = plan.instanceCount;
-    draw.first_instance = plan.firstInstance;
-    draw.stencil_reference = plan.stencilReference;
+    draw.vertexCount = plan.vertexCount;
+    draw.instanceCount = plan.instanceCount;
+    draw.firstInstance = plan.firstInstance;
+    draw.stencilReference = plan.stencilReference;
     std::copy(std::begin(plan.viewport), std::end(plan.viewport), draw.viewport);
     std::copy(std::begin(plan.scissor), std::end(plan.scissor), draw.scissor);
     draw.topology = topology;
@@ -53,11 +52,11 @@ bool prepareGraphicsDrawInvocation(const PlannedGraphicsDraw &plan, VernonPrimit
             error = "index binding offset is not a 32-bit index position";
             return false;
         }
-        draw.index_buffer = index.resource;
-        draw.first_index = static_cast<uint32_t>(index.offset / sizeof(uint32_t));
-        draw.index_count = index.index_count;
-        draw.index_type = index.type;
-        draw.base_vertex = index.base_vertex;
+        draw.indexBuffer = index.resource;
+        draw.firstIndex = static_cast<uint32_t>(index.offset / sizeof(uint32_t));
+        draw.indexCount = index.index_count;
+        draw.indexType = index.type;
+        draw.baseVertex = index.base_vertex;
     }
     return true;
 }

@@ -1,4 +1,4 @@
-#include "runtime/program_execution/program_tensor_copy.h"
+#include "runtime/tensor_copy_plan.h"
 
 #include <gtest/gtest.h>
 
@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace vernon::runtime::program_execution {
+namespace vernon::runtime {
 namespace {
 
 struct View {
@@ -86,4 +86,4 @@ TEST(ProgramTensorCopy, RejectsBlocksPastTheBacking) {
 }
 
 } // namespace
-} // namespace vernon::runtime::program_execution
+} // namespace vernon::runtime

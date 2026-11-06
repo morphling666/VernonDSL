@@ -130,7 +130,7 @@ public:
             (descriptor.usage & (VERNON_IMAGE_COLOR_ATTACHMENT | VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
             return fail<std::unique_ptr<VernonHalImage>>(VERNON_HAL_UNSUPPORTED,
                                                          "the CPU device has no attachments or multisampled images");
-        if ((descriptor.usage & VERNON_IMAGE_STORAGE) && !format->allows(VERNON_RHI_FORMAT_STORAGE))
+        if ((descriptor.usage & VERNON_IMAGE_STORAGE) && !format->allows(VERNON_HAL_FORMAT_STORAGE))
             return fail<std::unique_ptr<VernonHalImage>>(VERNON_HAL_UNSUPPORTED, "the format has no storage images");
         const VernonImageExtent &extent = descriptor.extent;
         const uint32_t largest = std::max({extent.width, extent.height, extent.depth});

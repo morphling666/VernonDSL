@@ -21,7 +21,7 @@ Detailed contracts are split into:
 - [`implementation_roadmap.md`](implementation_roadmap.md): implementation
   sequence and acceptance workloads.
 
-Nothing here changes the current Program, compiler, manifest, Runtime, RHI, or
+Nothing here changes the current Program, compiler, manifest, Runtime, HAL, or
 public ABI. A future design becomes current only through a separately
 versioned release with implementation and acceptance coverage.
 

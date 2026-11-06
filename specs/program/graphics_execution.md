@@ -185,21 +185,18 @@ buffers and images flow through ordinary Program Values and Storage versions.
 The resolved transfer and hazard plan orders producer writes, graphics reads,
 attachment transitions, and publications.
 
-`ProgramGraph` may link separately cooked graphics Programs into that same
-static Program DAG before physical resolve. Child-local boundary names are not
+`ProgramGraph` may compose separately cooked graphics Programs, whose pass
+fragments link into one schedule. Child-local boundary names are not
 flattened. A graph connection maps each attachment transition to one symbolic
 Image Storage version chain, and only an explicitly exported graph boundary
-becomes public. The graph invocation binds the concrete framebuffer view to
-the imported Image Storage once.
+becomes public. Each pass's render-pass control names the concrete
+framebuffer view it renders to.
 
-Global resolve groups adjacent graphics Nodes into static fusion-candidate
-regions only when symbolic attachment identity and subresources, format,
-sample count, version continuity, intervening hazards, and backend capabilities
-permit fusion. Each candidate boundary retains both resolved fused and split
-execution paths.
+Adjacent graphics passes are fusion candidates only when attachment identity
+and subresources, format, sample count, intervening hazards, and backend
+capabilities permit fusion.
 
-Invocation materialization selects between those pre-resolved paths using the
-bound image identity, render area, attachment geometry, and
+The pass planner decides each call, using the bound image identity, render area, attachment geometry, and
 load/store/clear/resolve controls. Compatible controls materialize one native
 scope; incompatible controls materialize the split path without changing
 logical ordering, barriers, or publication. Any transfer or barrier command

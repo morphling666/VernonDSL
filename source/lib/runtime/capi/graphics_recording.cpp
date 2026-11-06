@@ -2,14 +2,14 @@
 #include "runtime/capi/boundary.h"
 #include "runtime/capi/program_state.h"
 #include "runtime/graphics_invocation_planner.h"
-#include "runtime/program_execution/materialized_node_frame.h"
-#include "runtime/program_execution/program_boundary_contract.h"
+#include "runtime/program_boundary_contract.h"
 #include "runtime/recorded_graphics.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_dispatch.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -40,15 +40,13 @@ struct ForwardGraphicsNode {
 
 std::optional<ForwardGraphicsNode> forwardGraphicsNode(const VernonProgramExecutable &executable,
                                                        VernonProgramNodeId id) {
-    std::vector<const program::Node *> nodes;
-    collectForwardGraphicsNodes(&executable, nodes);
-    for (const program::Node *node : nodes) {
-        if (node->id != id)
+    for (const GraphicsNodeRef &node : forwardGraphicsNodes(executable)) {
+        if (node.id != id || node.owner != &executable)
             continue;
         const program::ResolvedNodePlan *plan = executable.executionPlan->node(program::GraphDirection::Forward, id);
         if (!plan || !plan->stage)
             return std::nullopt;
-        return ForwardGraphicsNode{node, plan};
+        return ForwardGraphicsNode{node.node, plan};
     }
     return std::nullopt;
 }
@@ -63,6 +61,12 @@ recorded::NodeEndpointsResult classifyExecutableNode(const VernonProgramExecutab
 
 PipelineStateResult vernon::runtime::capi::passPipelineState(VernonProgramExecutable &executable,
                                                              VernonProgramNodeId nodeId) {
+    if (executable.composition) {
+        for (const GraphicsNodeRef &node : forwardGraphicsNodes(executable))
+            if (node.id == nodeId)
+                return passPipelineState(*node.owner, node.local);
+        return PipelineStateResult{vernon::err(std::string("node is not a graphics Node of the composed graph"))};
+    }
     std::lock_guard lock(executable.passPipelineMutex);
     if (const auto found = executable.passPipelines.find(nodeId); found != executable.passPipelines.end())
         return PipelineStateResult{vernon::ok(found->second)};
@@ -179,7 +183,7 @@ vernon::runtime::capi::matchBindingSet(RuntimeBindingSetState &set,
     match->endpoints.assign(pipeline->endpoints.size(), 0);
     match->failures.resize(set.entries.size());
     match->entryEndpoints.resize(set.entries.size());
-    std::vector<vernon::runtime::program_execution::ProgramValueState> values(program.values.size());
+    std::vector<vernon::runtime::ProgramValueState> values(program.values.size());
     std::vector<char> supplied;
     for (size_t entryIndex = 0; entryIndex < set.entries.size(); ++entryIndex) {
         const RuntimeBindingSetEntry &entry = set.entries[entryIndex];
@@ -204,25 +208,24 @@ vernon::runtime::capi::matchBindingSet(RuntimeBindingSetState &set,
             const program::BoundarySlot &boundary = program.abi.boundarySlots[alias];
             if (boundary.role != program::BoundaryRole::Input || boundary.value >= values.size())
                 continue;
-            vernon::runtime::program_execution::ProgramValueState &value = values[boundary.value];
+            vernon::runtime::ProgramValueState &value = values[boundary.value];
             value.argument = entry.binding->argument;
             value.argument.slot = alias;
             if (value.argument.kind != VERNON_PROGRAM_TENSOR) {
-                value.ownership = vernon::runtime::program_execution::ProgramValueOwnership::BorrowedDevice;
+                value.ownership = vernon::runtime::ProgramValueOwnership::BorrowedDevice;
                 continue;
             }
             const VernonTensorView &tensor = value.argument.tensor;
-            value.argument.tensor.access = vernon::runtime::program_execution::boundaryValueAccess(boundary.access);
+            value.argument.tensor.access = vernon::runtime::boundaryValueAccess(boundary.access);
             value.ownership = tensor.storage == VERNON_TENSOR_HOST
-                                  ? vernon::runtime::program_execution::ProgramValueOwnership::BorrowedHost
-                                  : vernon::runtime::program_execution::ProgramValueOwnership::BorrowedDevice;
+                                  ? vernon::runtime::ProgramValueOwnership::BorrowedHost
+                                  : vernon::runtime::ProgramValueOwnership::BorrowedDevice;
             const size_t rank = std::min<size_t>(program.values[boundary.value].shape.size(), tensor.rank);
             value.concreteShape.emplace(tensor.shape, tensor.shape + rank);
             value.strides.assign(tensor.byte_strides, tensor.byte_strides + rank);
         }
     }
-    match->values = std::make_shared<const vernon::runtime::program_execution::ProgramInvocationState>(
-        *executable.executionPlan, std::move(values), std::map<uint32_t, program_execution::ProgramStorageBacking>{});
+    match->values = std::make_shared<const vernon::runtime::SetValues>(*executable.executionPlan, std::move(values));
     std::lock_guard lock(set.matchMutex);
     for (auto entry = set.matches.begin(); entry != set.matches.end();)
         entry = entry->second->pipeline.expired() ? set.matches.erase(entry) : std::next(entry);
@@ -242,10 +245,16 @@ bool vernon::runtime::capi::lowerSetFrame(VernonRuntimeContext &context, const R
         const RuntimeGraphicsPipelineState &pipeline = *frame.pipeline;
         const VernonStageExecutable &stage = *pipeline.sourcePlan->stage;
         auto lowered = std::make_shared<RuntimeLoweredSetFrame>();
-        if (!vernon::runtime::program_execution::materializeNodeFrame(
-                *match.values, *executableProgram(*pipeline.source), *pipeline.sourceNode, *pipeline.sourcePlan, {},
-                lowered->frame, error, &match.endpoints))
+        if (!vernon::runtime::materializeNodeFrame(*match.values, *executableProgram(*pipeline.source),
+                                                   *pipeline.sourceNode, *pipeline.sourcePlan, lowered->frame, error,
+                                                   match.endpoints))
             return false;
+        const vernon::runtime::MaterializedNodeFrame &made = lowered->frame;
+        // A sealed set's values never change, so its carriers are filled once; nothing would copy a write back.
+        if (!made.copiesAfter.empty())
+            return error = "a binding set cannot supply a Value a Stage writes through a carrier", false;
+        for (const vernon::runtime::MaterializedNodeFrame::HostCopy &copy : made.copiesBefore)
+            std::memcpy(copy.destination + copy.destinationOffset, copy.source + copy.sourceOffset, copy.size);
         lowered->planned.resize(stage.bindingProjection.parameters.size());
         for (uint32_t parameter = 0; parameter < lowered->planned.size(); ++parameter)
             if (match.endpoints[parameter] &&
@@ -253,9 +262,7 @@ bool vernon::runtime::capi::lowerSetFrame(VernonRuntimeContext &context, const R
                                       lowered->frame.arguments[parameter], describeRuntimeImage, &context,
                                       lowered->planned[parameter], error))
                 return false;
-        const vernon::runtime::program_execution::MaterializedNodeFrame &made = lowered->frame;
-        if (!made.copiesBefore.empty() || !made.copiesAfter.empty() || !made.deviceCopiesBefore.empty() ||
-            !made.deviceCopiesAfter.empty() || !made.deviceEndpointCarriers.empty()) {
+        if (!made.copiesBefore.empty()) {
             output = {lowered, {lowered.get(), nullptr}};
             return true;
         }
@@ -293,6 +300,11 @@ GraphicsPipelineHandleResult createGraphicsPipelineOperation(VernonProgramExecut
     }
     auto handle = std::make_unique<VernonGraphicsPipeline>();
     handle->context = context;
+    // Pipeline 0 binds by its pass Program's slots, which in a composed graph are a node's, not the graph's.
+    if (!source && executable->composition) {
+        fail(context, "a composed Program graph's graphics pipelines draw with a source Program");
+        return failure(vernon::RuntimeErrorCode::InvalidArgument);
+    }
     if (!source) {
         handle->state = std::move(pass).value();
         handle->lease = std::move(passLease).value();
@@ -328,8 +340,8 @@ GraphicsPipelineHandleResult createGraphicsPipelineOperation(VernonProgramExecut
     }
     auto state = std::make_shared<RuntimeGraphicsPipelineState>();
     state->serial = ++graphicsPipelineSerial;
-    state->pass = executable;
-    state->node = nodeId;
+    state->pass = passState->pass;
+    state->node = passState->node;
     state->source = source;
     state->sourceNode = sourceNode->node;
     state->sourcePlan = sourceNode->plan;

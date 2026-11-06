@@ -1,8 +1,7 @@
 # Indirect draws
 
 Status: proposed. Extends [`recorded_draws.md`](recorded_draws.md) section 10
-("GPU-produced draws") into a design; amends its sections 7, 9 and 11 and
-[`../runtime/stored_plans.md`](../runtime/stored_plans.md) section 11.2.
+("GPU-produced draws") into a design; amends its sections 7, 9 and 11.
 
 A renderer that draws each object with its own draw pays a per-draw cost on
 the CPU, in the driver and on the GPU: the Editor's 1000 boxes take 4000
@@ -70,7 +69,8 @@ draws (GPU culling) without a CPU round trip.
   Other targets use the native argument layout, which is the same order on
   Vulkan, OpenGL and Metal.
 - The per-record loop is the backend's lowering of a multi-draw, not a
-  second path: it runs inside one packet (`stored_plans.md` section 11.2).
+  second path: it is one operation of the device's recording
+  (`../runtime/architecture_v2.md` section 16.3).
   The compiler emits the `draw_index` source for the target (built-in or
   Runtime uniform) from the target version and extensions it cooks for, and
   the Runtime checks the device against the Stage's runtime requirements.

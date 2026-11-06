@@ -173,6 +173,8 @@ struct Fragment {
     // For a Program's fragment: per graph node in order, the number of operations up to and including its own, so
     // the operations before `nodeOperationEnds[n]` run graph nodes 0 through n.
     std::vector<uint32_t> nodeOperationEnds;
+    // Per graph node, its debug label: its name, or its Stage when it has none.
+    std::vector<std::string> nodeLabels;
     // The record's arguments, which a caller writes; `shapes[i]` is slot i's declared shape, -1 for a dynamic extent,
     // and `extents[i]` its extents as the caller must supply them. A slot's first binding is its offset; every
     // further binding repeats its bytes as an ADDRESS or VALUE field, and each binding of a TensorView has its own
@@ -241,7 +243,7 @@ struct Fragment {
 // The fragment of one graph of a Program variant (specs/runtime/architecture_v2.md section 16.1), from the variant's
 // `program` JSON and the kernel fragment of each logical Stage its nodes run. Slots are the graph's ABI boundary slots
 // in order, then the `exposed` Storages (VernonScheduleProgramDescriptor); `zeroed` names the owned Storages that start
-// as zeros. Fails for what fragments do not carry yet, and the Program then runs as a Program.
+// as zeros. Fails for what fragments do not carry yet, which fails the Program's call.
 [[nodiscard]] Result<Fragment, std::string> programFragment(const nlohmann::json &program, const std::string &graph,
                                                             const std::map<std::string, Fragment> &stages,
                                                             const std::vector<uint32_t> &zeroed,

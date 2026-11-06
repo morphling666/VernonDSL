@@ -20,7 +20,7 @@ bool kindMatches(const Parameter &parameter, const VernonProgramArgument &argume
 
 bool validTensor(const VernonTensorView &tensor) {
     if (tensor.struct_size < sizeof(VernonTensorView) || tensor.access > VERNON_ACCESS_READ_WRITE ||
-        (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE))
+        (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE))
         return false;
     if (tensor.storage == VERNON_TENSOR_HOST && !tensorFitsAllocation(tensor))
         return false;
@@ -211,6 +211,15 @@ bool planRenderTargets(const VernonRenderPass *source, DescribeImageResource des
         targets.depthFormat = format;
         targets.attachmentSubresources.push_back(providerImageSubresources(description));
     }
+    const uint32_t *area = renderPass.render_area;
+    if (!area[2] || !area[3]) {
+        targets.renderArea = {0, 0, targets.attachmentWidth, targets.attachmentHeight};
+    } else {
+        if (area[0] > targets.attachmentWidth || area[2] > targets.attachmentWidth - area[0] ||
+            area[1] > targets.attachmentHeight || area[3] > targets.attachmentHeight - area[1])
+            return fail(error, "the render area exceeds the attachments");
+        targets.renderArea = {area[0], area[1], area[2], area[3]};
+    }
     return true;
 }
 
@@ -335,7 +344,7 @@ bool planGraphicsArgument(const StageBindingPlan &stagePlan, const GraphicsDrawL
     if (std::none_of(layout.vertexInputs.begin(), layout.vertexInputs.end(),
                      [&](const GraphicsDrawLayout::VertexInput &input) { return input.parameter == index; }))
         return true;
-    if (tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !tensor.resource.resource.value || !tensor.rank ||
+    if (tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE || !tensor.resource.resource.value || !tensor.rank ||
         !tensor.shape || !tensor.byte_strides)
         return fail(error, "graphics Tensor view is invalid");
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)

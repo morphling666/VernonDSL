@@ -1,7 +1,7 @@
 # Future designs
 
 Documents in this directory are proposals. They are not current VernonDSL
-language, compiler, Program, manifest, Runtime, RHI, or ABI contracts.
+language, compiler, Program, manifest, Runtime, HAL, or ABI contracts.
 
 Current normative architecture remains under the corresponding directories in
 `specs/`. A future design becomes current only through an explicit versioned

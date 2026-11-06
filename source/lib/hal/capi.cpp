@@ -3,8 +3,17 @@
 #include "VernonSchedule.h"
 #include "hal/cuda/cuda_device.h"
 #include "hal/opengl/opengl_resources.h"
+#include "hal/opengl/opengl_state.h"
 #include "hal/resources.h"
 #include "hal/vulkan/vulkan_resources.h"
+#include "runtime/runtime_dispatch.h"
+
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+#include "hal/cuda/cuda_state.h"
+#endif
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "hal/vulkan/vulkan_state.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -49,52 +58,87 @@ std::string runtimeError(const VernonRuntimeContext *context, const char *what) 
     return message;
 }
 
-// The RHI device that a CUDA, Vulkan or OpenGL HAL device runs on.
-vernon::hal::Done<VernonRhiDevice> createRhiDevice(const VernonHalDeviceDescriptor &descriptor) {
-    using Created = vernon::hal::Done<VernonRhiDevice>;
-    uint32_t flags = 0;
-    if (descriptor.flags & VERNON_HAL_DEVICE_VALIDATION)
-        flags |= VERNON_RHI_DEVICE_VALIDATION;
-    if (descriptor.flags & VERNON_HAL_DEVICE_LABELS)
-        flags |= VERNON_RHI_DEVICE_LABELS;
-    if (descriptor.flags & VERNON_HAL_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT)
-        flags |= VERNON_RHI_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT;
-    const VernonRhiDevice invalidDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiDevice device = invalidDevice;
-    switch (descriptor.backend) {
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        if (!descriptor.opengl)
-            return vernon::hal::fail<VernonRhiDevice>(VERNON_HAL_INVALID_ARGUMENT, "an OpenGL device adopts a context");
-        device = vernonRhiCreateOpenGLDevice(descriptor.opengl, descriptor.backend == VERNON_RUNTIME_OPENGL_ES, flags);
-        break;
-    case VERNON_RUNTIME_CUDA:
-    case VERNON_RUNTIME_VULKAN: {
-        VernonRhiOwnedDeviceDescriptor owned{};
-        owned.struct_size = sizeof(owned);
-        owned.backend = descriptor.backend == VERNON_RUNTIME_CUDA ? VERNON_RHI_BACKEND_CUDA : VERNON_RHI_BACKEND_VULKAN;
-        owned.device_index = descriptor.device_index;
-        owned.flags = flags;
-        if (descriptor.flags & VERNON_HAL_DEVICE_FORCE_SOFTWARE)
-            owned.flags |= VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE;
-        device = vernonRhiCreateDevice(&owned);
-        break;
+// A Vulkan device owns its instance and device through one state, which its resources, its runtime context and the
+// HAL device that the runtime creates on first use share. Its labels follow VK_EXT_debug_utils, whatever the flags.
+VernonHalStatus createVulkanDevice(const VernonHalDeviceDescriptor &descriptor, VernonHalDevice &device) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (descriptor.flags & VERNON_HAL_DEVICE_FORCE_SOFTWARE)
+        return report(VERNON_HAL_UNSUPPORTED, "Vulkan devices have no software fallback");
+    auto state = std::make_shared<vernon::hal::vulkan::DeviceState>();
+    {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        std::string error;
+        if (!state->initialize(descriptor.device_index, error))
+            return report(VERNON_HAL_UNSUPPORTED, "cannot create the device: " + error);
     }
-    case VERNON_RUNTIME_DIRECTX12:
-    case VERNON_RUNTIME_METAL:
-        return vernon::hal::fail<VernonRhiDevice>(VERNON_HAL_UNSUPPORTED,
-                                                  "DirectX 12 and Metal have no HAL device yet");
-    default:
-        return vernon::hal::fail<VernonRhiDevice>(VERNON_HAL_INVALID_ARGUMENT, "the backend is unknown");
+    device.resources = vernon::hal::createVulkanResources(state);
+    if (!device.resources)
+        return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
+    auto runtime =
+        vernon::runtime::createRuntimeContextForHal(VERNON_RUNTIME_VULKAN, [&](VernonRuntimeContext &context) {
+            return vernon::runtime::initializeVulkanBackend(context, state);
+        });
+    if (runtime.isErr())
+        return report(VERNON_HAL_INTERNAL_ERROR, "cannot create the device's runtime");
+    device.runtime = std::move(runtime).value().release();
+    return VERNON_HAL_OK;
+#else
+    (void)descriptor;
+    (void)device;
+    return report(VERNON_HAL_UNSUPPORTED, "VernonRuntime was built without Vulkan support");
+#endif
+}
+
+// A CUDA device owns its CUDA state, which its HAL device, its resources and its runtime context share.
+VernonHalStatus createCudaDevice(const VernonHalDeviceDescriptor &descriptor, VernonHalDevice &device) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    auto state = std::make_shared<vernon::hal::cuda::DeviceState>();
+    const vernon::hal::cuda::Result status = state->initialize(descriptor.device_index);
+    if (status != vernon::hal::cuda::kSuccess)
+        return report(VERNON_HAL_UNSUPPORTED,
+                      "cannot create the device: " + vernon::hal::cuda::describeResult(status, "CUDA device creation"));
+    const bool labels = (descriptor.flags & (VERNON_HAL_DEVICE_LABELS | VERNON_HAL_DEVICE_VALIDATION)) != 0;
+    std::shared_ptr<vernon::hal::Device> hal(vernon::hal::createCudaDevice(state, labels).release());
+    device.resources = vernon::hal::createCudaResources(state);
+    if (!hal || !device.resources)
+        return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
+    auto runtime = vernon::runtime::createRuntimeContextForHal(VERNON_RUNTIME_CUDA, [&](VernonRuntimeContext &context) {
+        return vernon::runtime::initializeCudaBackend(context, hal, *state);
+    });
+    if (runtime.isErr())
+        return report(VERNON_HAL_INTERNAL_ERROR, "cannot create the device's runtime");
+    device.runtime = std::move(runtime).value().release();
+    return VERNON_HAL_OK;
+#else
+    (void)descriptor;
+    (void)device;
+    return report(VERNON_HAL_UNSUPPORTED, "VernonRuntime was built without CUDA support");
+#endif
+}
+
+// An OpenGL device adopts the host's context through one state, which its resources, its runtime context and the HAL
+// device that the runtime creates on first use share.
+VernonHalStatus createOpenGLDevice(const VernonHalDeviceDescriptor &descriptor, VernonHalDevice &device) {
+    if (!descriptor.opengl)
+        return invalid("an OpenGL device adopts a context");
+    std::shared_ptr<vernon::hal::opengl::DeviceState> state = vernon::hal::opengl::createDeviceState();
+    {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        std::string error;
+        if (!state->initialize(*descriptor.opengl, descriptor.backend == VERNON_RUNTIME_OPENGL_ES, descriptor.flags,
+                               error))
+            return report(VERNON_HAL_UNSUPPORTED, "cannot create the device: " + error);
     }
-    if (device.index == invalidDevice.index) {
-        std::string message = "cannot create the device";
-        const VernonStringView detail = vernonRhiDeviceGetLastError(invalidDevice);
-        if (detail.data && detail.size)
-            message += ": " + std::string(detail.data, detail.size);
-        return vernon::hal::fail<VernonRhiDevice>(VERNON_HAL_UNSUPPORTED, std::move(message));
-    }
-    return Created{vernon::ok(device)};
+    device.resources = vernon::hal::createOpenGLResources(state);
+    if (!device.resources)
+        return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
+    auto runtime = vernon::runtime::createRuntimeContextForHal(descriptor.backend, [&](VernonRuntimeContext &context) {
+        return vernon::runtime::initializeOpenGLBackend(context, state);
+    });
+    if (runtime.isErr())
+        return report(VERNON_HAL_INTERNAL_ERROR, "cannot create the device's runtime");
+    device.runtime = std::move(runtime).value().release();
+    return VERNON_HAL_OK;
 }
 
 bool fits(uint64_t offset, uint64_t size, uint64_t total) { return offset <= total && size <= total - offset; }
@@ -134,30 +178,26 @@ VernonHalStatus vernonHalCreateDevice(const VernonHalDeviceDescriptor *descripto
             if (!device->runtime)
                 return report(VERNON_HAL_INTERNAL_ERROR, runtimeError(nullptr, "cannot create the CPU runtime"));
             device->resources = vernon::hal::createCpuResources();
+        } else if (descriptor->backend == VERNON_RUNTIME_CUDA) {
+            if (descriptor->opengl)
+                return invalid("only an OpenGL device adopts a context");
+            if (const VernonHalStatus status = createCudaDevice(*descriptor, *device); status != VERNON_HAL_OK)
+                return status;
+        } else if (descriptor->backend == VERNON_RUNTIME_OPENGL || descriptor->backend == VERNON_RUNTIME_OPENGL_ES) {
+            if (const VernonHalStatus status = createOpenGLDevice(*descriptor, *device); status != VERNON_HAL_OK)
+                return status;
+        } else if (descriptor->backend == VERNON_RUNTIME_VULKAN) {
+            if (descriptor->opengl)
+                return invalid("only an OpenGL device adopts a context");
+            if (const VernonHalStatus status = createVulkanDevice(*descriptor, *device); status != VERNON_HAL_OK)
+                return status;
+        } else if (descriptor->backend == VERNON_RUNTIME_DIRECTX12 || descriptor->backend == VERNON_RUNTIME_METAL) {
+            return report(VERNON_HAL_UNSUPPORTED, "DirectX 12 and Metal have no HAL device yet");
         } else {
-            auto rhi = createRhiDevice(*descriptor);
-            if (rhi.isErr())
-                return report(rhi.error());
-            const VernonRhiDevice handle = rhi.value();
-            device->release = [handle] { (void)vernonRhiDestroyDevice(handle); };
-            device->runtime = vernonRuntimeCreateForRhiDevice(descriptor->backend, handle, nullptr);
-            if (!device->runtime) {
-                device->release();
-                return report(VERNON_HAL_INTERNAL_ERROR, runtimeError(nullptr, "cannot create the device's runtime"));
-            }
-            if (descriptor->backend == VERNON_RUNTIME_CUDA)
-                device->resources = vernon::hal::createCudaResources(handle);
-#if VERNON_HAS_VULKAN_RUNTIME
-            else if (descriptor->backend == VERNON_RUNTIME_VULKAN)
-                device->resources = vernon::hal::createVulkanResources(handle);
-#endif
-            else if (descriptor->backend == VERNON_RUNTIME_OPENGL || descriptor->backend == VERNON_RUNTIME_OPENGL_ES)
-                device->resources = vernon::hal::createOpenGLResources(handle);
+            return invalid("the backend is unknown");
         }
         if (!device->resources) {
             (void)vernonRuntimeDestroy(device->runtime);
-            if (device->release)
-                device->release();
             return report(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate the device");
         }
         *output = device.release();
@@ -175,8 +215,6 @@ VernonHalStatus vernonHalDestroyDevice(VernonHalDevice *device) {
         if (vernonRuntimeDestroy(device->runtime) != VERNON_STATUS_OK)
             return report(VERNON_HAL_INVALID_ARGUMENT, runtimeError(device->runtime, "cannot destroy the runtime"));
         device->resources.reset();
-        if (device->release)
-            device->release();
         delete device;
         return VERNON_HAL_OK;
     });
@@ -491,6 +529,22 @@ VernonHalStatus vernonHalSurfaceConfigure(VernonHalSurface *surface,
             return invalid("the surface's extent is zero");
         if (!(configuration->usage & VERNON_IMAGE_COLOR_ATTACHMENT))
             return invalid("a surface's images are color attachments");
+        if (configuration->present_mode > VERNON_HAL_PRESENT_IMMEDIATE)
+            return invalid("the present mode is unknown");
+        auto queried = surface->device->resources->capabilities(*surface);
+        if (queried.isErr())
+            return report(queried.error());
+        const VernonHalSurfaceCapabilities &capabilities = queried.value();
+        const VernonTextureFormat *formatsEnd = capabilities.formats + capabilities.format_count;
+        if (std::find(capabilities.formats, formatsEnd, configuration->format) == formatsEnd)
+            return report(VERNON_HAL_UNSUPPORTED, "the surface cannot present the format");
+        if (configuration->usage & ~capabilities.usage)
+            return report(VERNON_HAL_UNSUPPORTED, "the surface's images cannot have the usage");
+        if (!(capabilities.present_modes & (1u << configuration->present_mode)))
+            return report(VERNON_HAL_UNSUPPORTED, "the surface cannot present in the mode");
+        if (configuration->image_count < capabilities.min_image_count ||
+            (capabilities.max_image_count && configuration->image_count > capabilities.max_image_count))
+            return report(VERNON_HAL_UNSUPPORTED, "the surface cannot have the image count");
         auto configured = surface->device->resources->configure(*surface, *configuration);
         return configured.isErr() ? report(configured.error()) : VERNON_HAL_OK;
     });

@@ -13,7 +13,7 @@
 namespace mlir::vernon {
 
 inline std::optional<spirv::ImageFormat> spirvStorageImageFormat(llvm::StringRef format) {
-#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+#define VERNON_FORMAT(name, NAME, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,       \
                       vulkan, dxgi, metal, spirvFormat)                                                                \
     if (format == #name && spirv::ImageFormat::spirvFormat != spirv::ImageFormat::Unknown)                             \
         return spirv::ImageFormat::spirvFormat;

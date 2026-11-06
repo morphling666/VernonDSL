@@ -198,26 +198,6 @@ if(VERNON_HOST_TAPE_INSTRUMENTATION)
     target_compile_definitions(VernonRuntimeImplementation PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
 endif()
 
-option(VERNON_BUILD_IOS_METAL_SMOKE_HOST "Build the iOS Metal RHI smoke-test application" OFF)
-if(VERNON_BUILD_IOS_METAL_SMOKE_HOST)
-    if(NOT _vernon_is_ios
-       OR NOT
-          CMAKE_SOURCE_DIR
-          STREQUAL
-          CMAKE_CURRENT_SOURCE_DIR)
-        message(FATAL_ERROR "VERNON_BUILD_IOS_METAL_SMOKE_HOST is available only in standalone iOS Runtime builds")
-    endif()
-    add_executable(VernonIosMetalSmoke MACOSX_BUNDLE "${_VERNON_RUNTIME_IMPL_DIR}/tests/ios_metal_smoke.mm")
-    target_link_libraries(VernonIosMetalSmoke PRIVATE Vernon::RHI)
-    set_target_properties(
-        VernonIosMetalSmoke
-        PROPERTIES MACOSX_BUNDLE_BUNDLE_NAME "Vernon Metal Smoke"
-                   MACOSX_BUNDLE_GUI_IDENTIFIER "dev.vernon.runtime.metal-smoke"
-                   XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "dev.vernon.runtime.metal-smoke"
-                   XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
-                   XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
-endif()
-
 # The combined build registers tests after compiler and Python targets exist. Register here only when Runtime is
 # configured as a standalone project.
 if(BUILD_TESTING
@@ -270,14 +250,10 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGraphicsState.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonHal.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
-              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
-              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonTextureTypes.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp"
-              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h"
-              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeRHIAdapter.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonSchedule.h"
         DESTINATION vernon_dsl/runtime_src/include
         COMPONENT VernonWheel)
@@ -294,15 +270,6 @@ if(SKBUILD)
         PATTERN "*.mm"
         PATTERN "*.h")
     install(
-        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../rhi/"
-        DESTINATION vernon_dsl/runtime_src/lib/rhi
-        COMPONENT VernonWheel
-        FILES_MATCHING
-        PATTERN "*.cpp"
-        PATTERN "*.mm"
-        PATTERN "*.h"
-        PATTERN "*.hlsl")
-    install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../hal/"
         DESTINATION vernon_dsl/runtime_src/lib/hal
         COMPONENT VernonWheel
@@ -317,8 +284,7 @@ if(SKBUILD)
         PATTERN "*.cpp"
         PATTERN "*.h")
     install(
-        FILES "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
-              "${_vernon_repository_root}/cmake/IncludeNlohmannJson.cmake"
+        FILES "${_vernon_repository_root}/cmake/IncludeNlohmannJson.cmake"
               "${_vernon_repository_root}/cmake/IncludeVulkanHeaders.cmake"
               "${_vernon_repository_root}/cmake/IncludeNvtx.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake

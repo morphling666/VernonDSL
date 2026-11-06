@@ -1,14 +1,16 @@
 # Presentable surfaces
 
-Status: proposed design, under review. Phase 1 (section 6) is implemented:
-the RHI API and OpenGL surfaces.
+Status: implemented on Vulkan (Windows), OpenGL and OpenGL ES. DirectX 12
+and Metal surfaces come with their HAL devices in phase 4
+(`architecture_v2.md` section 16).
 
-A presentable surface lets a Program draw into an operating-system window.
-VernonRHI owns the swapchain; the host owns the window and supplies its native
-handle; Runtime sees each acquired swapchain image as an ordinary imported
-color target. The language, the compiler and Program artifacts do not change.
+A presentable surface lets a linked schedule draw into an operating-system
+window. The HAL owns the surface and its images; the host owns the window
+and supplies its native handle; a schedule sees each acquired image as an
+ordinary image argument. The language, the compiler and Program artifacts do
+not change.
 
-## 1. Why the RHI owns presentation
+## 1. Why the HAL owns presentation
 
 A host that renders with Programs needs its final image on screen. Every
 production graphics abstraction puts presentation next to the device and
@@ -21,7 +23,7 @@ do that without exporting its synchronization primitives.
 
 Rejected alternatives:
 
-- **The host presents a Runtime texture.** The host would copy each frame from
+- **The host presents a Runtime image.** The host would copy each frame from
   a Runtime image into its own back buffer, an extra full-screen copy per
   window per frame, and it would have to wait for Runtime's work through a
   fence Runtime does not export. On OpenGL the host could share the context
@@ -30,201 +32,138 @@ Rejected alternatives:
   a resource, not a computation. A `present` node would tie the Program's
   meaning to a window, and a Program could no longer run headless or in a
   test.
-- **The RHI creates windows or links a window-system library.** It would duplicate
-  SDL or the host's toolkit and fix one windowing policy. The OpenGL context
-  is already host-owned (`design.md` section 10); surfaces follow the same
-  rule.
-- **Borrowed-device presentation.** A borrowed device records into the host's
-  command list, which the host executes and presents. Such a host already has
-  a swapchain, so a borrowed device does not report presentation.
+- **The HAL creates windows or links a window-system library.** It would
+  duplicate SDL or the host's toolkit and fix one windowing policy. The
+  OpenGL context is already host-owned (`design.md` section 10); surfaces
+  follow the same rule.
 
 ## 2. Model
 
 ```text
-host window  --native handle-->  Surface (RHI)  --configure-->  swapchain images
+host window  --native handle-->  Surface (HAL)  --configure-->  surface images
                                     |
                      acquire  ----> SurfaceImage {image, view}   valid until present
                                     |
-   Runtime invocations bind the view as a color target, as any imported image
+   linked schedules write the view as a color attachment, as any image argument
                                     |
-                     present  ----> queue-ordered after every submission so far
+                     present  ----> ordered after every submission so far
 ```
 
 - A surface belongs to one device and one window. A multi-window host
   creates one surface per window, all on the same device.
 - A surface has at most one acquired image at a time. Acquire after acquire,
   present without acquire, and configure or destroy while an image is
-  acquired fail with `INVALID_ARGUMENT`.
+  acquired fail with `VERNON_HAL_INVALID_ARGUMENT`.
 - The acquired image is a 2D image with one mip level, one layer and one
-  sample, in the configured format, extent and usage. Its public handles are
-  valid from acquire until present. The surface owns them, so destroying
-  either through the image API fails with `INVALID_ARGUMENT`. Configuring
-  or destroying the surface destroys its images; an encoder that retained
-  one keeps it alive until its submission completes, as for any destroyed
-  image (`image_resources.md` section 7).
+  sample, in the configured format, extent and usage, with a view of all of
+  it. The surface owns both, so destroying either fails with
+  `VERNON_HAL_INVALID_ARGUMENT`. They are valid from acquire until present;
+  configuring or destroying the surface replaces or destroys them after the
+  submissions that use them, as for any destroyed image
+  (`image_resources.md` section 7).
+- A surface is a ring of `image_count` HAL images. Acquire hands out the
+  next one; present copies it to the window (section 5). So an acquired
+  image is a normal image whose descriptor, views, hazards and readback are
+  those of any other, on every backend.
 - Its contents are undefined at acquire, because the previous frame's
-  contents are not guaranteed on any backend. Until a submitted command
-  writes the image, that is a rendering scope that loads it with `CLEAR` or
-  `DISCARD` or a copy into it, the RHI command layer rejects a rendering
-  scope that preserves it, a read of it in a rendering scope, a copy from
-  it and a download of it. Writes count in submission order: an encoder
-  may read the image after its own earlier write, and another encoder may
-  read it only once the writing encoder is submitted. Runtime records
-  through the same command layer, so the rule needs nothing in Runtime.
-- Present transitions the image to `VERNON_RHI_STATE_PRESENT` itself. The
-  RHI tracks the image's state, so neither Runtime nor the host declares
-  that final transition.
+  contents are not guaranteed on any backend. Until a submitted schedule
+  writes the image, that is a render scope that loads it with `CLEAR` or
+  `DISCARD`, or a host write does, a submission that preserves it or reads
+  it fails, and so does a host read (`design.md` section 10). Writes count at
+  submission: a recording may read the image after its own earlier write,
+  and another may read it only once the writing one is submitted.
 
-## 3. RHI API
+## 3. HAL API
 
-```c
-VERNON_RHI_DECLARE_HANDLE(VernonRhiSurface);
+The declarations are in `VernonHal.h`: `VernonHalSurfaceDescriptor`,
+`VernonHalSurfaceCapabilities`, `VernonHalSurfaceConfiguration`,
+`VernonHalSurfaceImage`, `VernonHalPresentMode` (`FIFO`, which every surface
+supports, `MAILBOX`, `IMMEDIATE`), and `vernonHalCreateSurface`,
+`vernonHalSurfaceGetCapabilities`, `vernonHalSurfaceConfigure`,
+`vernonHalSurfaceAcquire`, `vernonHalSurfacePresent` and
+`vernonHalDestroySurface`. The descriptor's `native` member is the one the
+device's backend reads: a window on Vulkan and D3D12, a layer on Metal,
+callbacks on OpenGL and OpenGL ES (section 5), copied at creation.
 
-VERNON_RHI_STATUS_SURFACE_OUT_OF_DATE = 5  /* configure again, then retry */
-VERNON_RHI_STATUS_SURFACE_LOST = 6         /* destroy and recreate the surface */
-
-typedef enum VernonRhiPresentMode {
-    VERNON_RHI_PRESENT_FIFO = 0,       /* vertical sync; supported everywhere */
-    VERNON_RHI_PRESENT_MAILBOX = 1,
-    VERNON_RHI_PRESENT_IMMEDIATE = 2
-} VernonRhiPresentMode;
-
-typedef struct VernonRhiSurfaceDescriptor {
-    uint32_t struct_size;
-    VernonRhiBackend backend;
-    union {
-        void *win32_window;                             /* HWND for DirectX 12 */
-        void *metal_layer;                              /* CAMetalLayer */
-        const VernonOpenGLSurfaceCallbacks *opengl;     /* section 5 */
-    } native;
-    uint32_t reserved[4];
-} VernonRhiSurfaceDescriptor;
-
-typedef struct VernonRhiSurfaceCapabilities {
-    uint32_t struct_size;
-    VernonRhiFormat formats[8];
-    uint32_t format_count;
-    uint32_t present_modes;            /* 1u << VernonRhiPresentMode */
-    uint32_t usage;                    /* VernonRhiImageUsageBits the images may have */
-    uint32_t min_image_count;
-    uint32_t max_image_count;          /* 0: no limit */
-    uint32_t current_width;            /* UINT32_MAX: the configuration decides */
-    uint32_t current_height;
-    uint32_t reserved[4];
-} VernonRhiSurfaceCapabilities;
-
-typedef struct VernonRhiSurfaceConfiguration {
-    uint32_t struct_size;
-    VernonRhiFormat format;
-    uint32_t usage;                    /* must include COLOR_ATTACHMENT */
-    uint32_t width;
-    uint32_t height;
-    VernonRhiPresentMode present_mode;
-    uint32_t image_count;
-    uint32_t reserved[4];
-} VernonRhiSurfaceConfiguration;
-
-typedef struct VernonRhiSurfaceImage {
-    uint32_t struct_size;
-    VernonRhiImage image;
-    VernonRhiImageView view;
-    uint32_t suboptimal;               /* still presentable; reconfigure when convenient */
-    uint32_t reserved[4];
-} VernonRhiSurfaceImage;
-
-VernonRhiStatus vernonRhiDeviceCreateSurface(VernonRhiDevice, const VernonRhiSurfaceDescriptor *, VernonRhiSurface *);
-VernonRhiStatus vernonRhiSurfaceGetCapabilities(VernonRhiDevice, VernonRhiSurface, VernonRhiSurfaceCapabilities *);
-VernonRhiStatus vernonRhiSurfaceConfigure(VernonRhiDevice, VernonRhiSurface, const VernonRhiSurfaceConfiguration *);
-VernonRhiStatus vernonRhiSurfaceAcquireImage(VernonRhiDevice, VernonRhiSurface, VernonRhiSurfaceImage *);
-VernonRhiStatus vernonRhiSurfacePresent(VernonRhiDevice, VernonRhiSurface);
-VernonRhiStatus vernonRhiDeviceDestroySurface(VernonRhiDevice, VernonRhiSurface);
-```
-
-- `VernonRhiSurfaceImage` is an output with `struct_size` and `reserved`,
-  so a backend can later return more from acquire, such as a wait handle;
-  acquire fails with `INVALID_ARGUMENT` when `struct_size` is too small.
-- A backend or device that cannot present fails surface creation with
-  `UNSUPPORTED`. There is no capability bit for it, because no host queries
-  RHI capabilities before creating the resource that needs them. The
-  descriptor's `backend` must be the device's, OpenGL and OpenGL ES being
-  one backend; otherwise creation fails with `INVALID_ARGUMENT`.
-- Configure fails with `UNSUPPORTED` for a format, mode, usage or image
-  count outside the capabilities, and with `INVALID_ARGUMENT` for a zero
-  extent, a usage without `COLOR_ATTACHMENT` or an unknown present mode. A
+- A device that cannot present fails surface creation with
+  `VERNON_HAL_UNSUPPORTED`. There is no capability bit for it, because no
+  host queries capabilities before creating the resource that needs them.
+- Configure fails with `VERNON_HAL_INVALID_ARGUMENT` for a zero extent, a
+  usage without `COLOR_ATTACHMENT` or an unknown present mode, and with
+  `VERNON_HAL_UNSUPPORTED` for a format, usage, present mode or image count
+  outside the capabilities. `hal/capi.cpp` checks both for every backend. A
   minimized window has a zero extent; the host skips the window's frame
   until it resizes. A failed configure keeps the previous images.
-- Acquire may block until the swapchain returns an image, which is how
-  `FIFO` paces a frame. With `N` calls in flight, which the application
-  paces on their timeline points (`architecture_v2.md` section 8),
-  `image_count` of at least
-  `N + 1` keeps acquire from waiting for the GPU as well.
-- Acquire and present return `SURFACE_OUT_OF_DATE` after a resize the
-  swapchain can no longer serve. A failed acquire leaves no image acquired;
-  a failed present still releases the image.
-- Destroying a surface does not wait for the submissions that use its
-  images; their encoders keep the images alive (section 2).
+- Acquire may block until an image is available, which is how `FIFO` paces
+  a frame. With `N` calls in flight, which the application paces on their
+  timeline points (`architecture_v2.md` section 8), `image_count` of at
+  least `N + 1` keeps acquire from waiting for the GPU as well.
+- Acquire returns `VERNON_HAL_SURFACE_OUT_OF_DATE` once the window no
+  longer matches the configuration; the host configures again and retries.
+  `VERNON_HAL_SURFACE_LOST` means the window is gone. A failed acquire
+  leaves no image acquired; a failed present still releases the image.
+- `VernonHalSurfaceImage::suboptimal` reports an image that still presents
+  but whose surface would match the window better configured again.
 
 ## 4. Synchronization
 
-The RHI orders presentation the way it orders everything else, by queue
+The HAL orders presentation the way it orders everything else, by queue
 submission:
 
-- The first submission that uses an acquired image waits for the
-  swapchain's acquire signal. Submissions after it are ordered by the queue.
-- Present runs after every submission made before it. It records the
-  transition to `PRESENT` in the RHI's own final command buffer and then
-  hands the image to the swapchain. Runtime's own barriers for color
-  targets stay as they are (`image_resources.md` section 8).
+- Present runs after every submission made before it, so the schedules that
+  wrote the image finish first, without a host wait.
 - Neither present nor acquire waits on the host for completion; a host that
-  wants to bound latency waits on its own completions as it does today.
+  wants to bound latency waits on its calls' timeline points.
 
 ## 5. Backend mappings
 
-| Backend | Native input | Swapchain | Acquire | Present |
-|---|---|---|---|---|
-| Vulkan | open (section 9); the descriptor gains its member when that is decided | `VkSwapchainKHR` | `vkAcquireNextImageKHR` with a per-image semaphore | transition to `PRESENT_SRC_KHR`, signal a semaphore, `vkQueuePresentKHR` |
-| DirectX 12 | `HWND` | `IDXGISwapChain3`, flip-discard, created on the RHI's direct queue | frame-latency waitable object, `GetCurrentBackBufferIndex` | transition to `PRESENT`, `Present` |
-| Metal | `CAMetalLayer` | the layer | `nextDrawable` | `presentDrawable:` on a command buffer committed after the last submission |
-| OpenGL, OpenGL ES | `VernonOpenGLSurfaceCallbacks` | RHI-owned textures, `image_count` of them | immediate | make the window current, flipped blit, swap |
+| Backend | Native input | Present |
+|---|---|---|
+| Vulkan | `HWND` | acquire a swapchain image, blit the surface image into it, `vkQueuePresentKHR` |
+| OpenGL, OpenGL ES | `VernonOpenGLSurfaceCallbacks` | make the window current, blit with rows reversed, swap |
+| DirectX 12 (phase 4) | `HWND` | flip-discard `IDXGISwapChain3` on the device's direct queue |
+| Metal (phase 4) | `CAMetalLayer` | `nextDrawable`, `presentDrawable:` after the last submission |
 
-The DXGI factory belongs to the Direct3D 12 stack and does not link a
-window-system library. Who creates the Vulkan surface is open (section 9);
-the native input in the table cannot work for an owned device as it stands.
+### Vulkan
+
+The Vulkan device enables `VK_KHR_surface` and the platform surface
+extension when the loader offers them, and creates the `VkSurfaceKHR` from
+the window itself (`hal/vulkan/vulkan_platform_surface.cpp`, Win32 for now),
+as wgpu and Dawn do. Exposing the instance for the host to create the
+surface was rejected: the host would have to name instance extensions at
+device creation and link the platform's Vulkan surface code.
+
+The swapchain is the surface's private target. Present acquires a swapchain
+image with a semaphore, transitions the surface image for transfer, blits it
+into the swapchain image, scaling with a linear filter when the swapchain's
+extent differs from the configured one, and presents after a semaphore the
+copy signals. The swapchain format follows what the surface reports, which
+need not be the configured format, because the blit converts. A frame whose
+swapchain is out of date or whose window is minimized is dropped, and the
+surface goes stale: the next acquire reports `SURFACE_OUT_OF_DATE`, and the
+next present rebuilds the swapchain. Rendering into swapchain images
+directly was rejected: their formats and counts are the driver's, so a
+pipeline could not be cooked for them, and their acquire would block inside
+a call.
 
 ### OpenGL
 
-```c
-typedef void (*VernonOpenGLSwapIntervalFn)(void *user_data, int32_t interval);
-typedef void (*VernonOpenGLSwapBuffersFn)(void *user_data);
-typedef void (*VernonOpenGLDrawableSizeFn)(void *user_data, uint32_t *width, uint32_t *height);
+`VernonOpenGLSurfaceCallbacks` (`VernonOpenGLContext.h`) supplies
+`make_current` (the device's context on this window), `swap_interval`
+(`SDL_GL_SetSwapInterval`, with the window current), `swap_buffers`
+(`SDL_GL_SwapWindow`) and `drawable_size` (`SDL_GetWindowSizeInPixels`).
+Present makes the device's context current on the window, blits the
+surface image into framebuffer 0 with its rows reversed, swaps, and makes
+the device's own target current again.
 
-typedef struct VernonOpenGLSurfaceCallbacks {
-    uint32_t struct_size;
-    void *user_data;
-    VernonOpenGLMakeCurrentFn make_current;       /* the device's context on this window */
-    VernonOpenGLSwapIntervalFn swap_interval;     /* SDL_GL_SetSwapInterval, with the window current */
-    VernonOpenGLSwapBuffersFn swap_buffers;       /* SDL_GL_SwapWindow */
-    VernonOpenGLDrawableSizeFn drawable_size;     /* SDL_GetWindowSizeInPixels */
-    uint32_t reserved[4];
-} VernonOpenGLSurfaceCallbacks;
-```
+The rows are reversed because of the vertex convention. Every GL vertex
+stage negates y (`design.md` section 10), so a Program's row 0 is the
+image's top row on every backend, while the default framebuffer counts rows
+from the bottom of the window. Drawing into it directly would show every
+frame upside down, and the negation is compiled into the cooked shaders, so
+it cannot change per target.
 
-An OpenGL surface image is an ordinary RHI texture, not the window's default
-framebuffer. Present makes the device's context current on the window, blits
-the texture into framebuffer 0 with its rows reversed, swaps, and makes the
-device's own current target current again.
-
-The texture is required by the vertex convention. Every GL vertex stage
-negates y (`design.md` section 10), so a Program's row 0 is the image's top
-row on every backend. The default framebuffer counts rows from the bottom
-of the window. Drawing into it directly would show every frame upside down,
-and the negation is compiled into the cooked shaders, so it cannot change per
-target. The texture also makes the GL surface image a normal image whose
-descriptor, views, hazards and readback are those of any other image, and it
-makes multiple windows independent of which window is current while a frame
-records.
-
-Costs and limits of the fallback tier, recorded as such:
+Costs and limits of the fallback tier:
 
 - one full-window blit per present;
 - every surface's window must accept the device's own context
@@ -233,60 +172,45 @@ Costs and limits of the fallback tier, recorded as such:
   one context per window cannot present those windows through one device;
 - `MAILBOX` and `IMMEDIATE` map to a swap interval of 0, `FIFO` to 1, and
   the driver alone paces the frame, so `suboptimal` is never reported;
-- the window does not resize the textures, so acquire reports
+- the window does not resize the images, so acquire reports
   `SURFACE_OUT_OF_DATE` whenever `drawable_size` differs from the configured
-  extent;
-- the surface offers `rgba8_unorm` only, with `COLOR_ATTACHMENT` and
-  `TRANSFER_SOURCE` usage. Sampled and storage usage are withheld so that
-  every read of an acquired image is one the command layer checks
-  (section 2).
+  extent.
 
 ## 6. Formats and color space
 
-Surfaces present nonlinear sRGB, and every surface offers at least one of
-`rgba8_unorm` and `bgra8_unorm`:
-
-| Backend | Formats offered |
-|---|---|
-| Vulkan | what the surface reports; some drivers report `B8G8R8A8` and not `R8G8B8A8` |
-| DirectX 12 | `rgba8_unorm`, `bgra8_unorm` |
-| Metal | `bgra8_unorm` (`CAMetalLayer` has no RGBA8) |
-| OpenGL | `rgba8_unorm` |
-
-So the format table (`VernonFormats.def`) gains `bgra8_unorm` and
-`bgra8_srgb` rows: renderable, blendable, filterable and copyable, with host
-data format `BGRA`. A host whose display pass writes display-encoded values
-configures the `unorm` format; the `srgb` formats encode on store. HDR
-surfaces (`rgba16_float` scRGB, `rgb10a2` PQ) are out of scope.
+Surfaces present nonlinear sRGB. Every surface offers `rgba8_unorm`, with
+`COLOR_ATTACHMENT` and `TRANSFER_SOURCE` usage. Sampled and storage usage
+are withheld so that every read of an acquired image is a preserving render
+scope or a read, which the undefined-contents rule of section 2 checks. A
+host whose display pass writes display-encoded values configures the
+`unorm` format; the `srgb` formats encode on store. HDR surfaces
+(`rgba16_float` scRGB, `rgb10a2` PQ) are out of scope.
 
 A graphics pipeline's color target formats are fixed when it is cooked, and
 every backend requires the pipeline's format to match the attachment's
 exactly. A Program that draws into a surface therefore needs one cooked
 pipeline per format the host may configure. A pipeline's color target
 formats are a static specialization argument (`language/contract.md`
-section 6.6.1): one declaration cooks an `rgba8_unorm` and a `bgra8_unorm`
-specialization, and the host selects the one matching the configured format.
-Cooking a separate asset per format was rejected because it duplicates the
-declaration; restricting surfaces to `rgba8_unorm` was rejected because Metal
-and some Vulkan drivers do not offer it.
+section 6.6.1): one declaration cooks a specialization per format, and the
+host selects the one matching the configured format. Cooking a separate
+asset per format was rejected because it duplicates the declaration.
 
-The work is phased. Phase 1 is format specialization and OpenGL surfaces,
-which offer only `rgba8_unorm`. The `bgra8` rows land with the first backend
-whose surfaces need them (Metal, or Vulkan on a driver without `R8G8B8A8`),
-together with their view-compatibility classes and DirectX 12 typeless
-mapping, so each row is exercised by a surface test when it is added.
+Metal's `CAMetalLayer` has no RGBA8, so the phase 4 Metal surface adds
+`bgra8_unorm` and `bgra8_srgb` rows to `VernonFormats.def` (renderable,
+blendable, filterable and copyable, host data format `BGRA`), with their
+view-compatibility classes and DirectX 12 typeless mapping, so each row is
+exercised by a surface test when it is added.
 
 ## 7. Runtime
 
-Runtime gains no new invocation fields. An acquired view is an imported image
-view:
+Runtime gains no surface concept. An acquired view is an ordinary image
+argument of a linked schedule:
 
-- the provider resolves its descriptor from the RHI record, as for any image;
-- Runtime's existing check that a color target's format equals the Program's
-  cooked target format applies unchanged;
-- the "no read before a write" rule of section 2 is checked by the RHI
-  command layer that Runtime's rendering scopes go through, so Runtime does
-  not learn what a surface is.
+- the schedule describes it from the HAL view registry, as for any view;
+- the check that a color attachment's format equals the Program's cooked
+  target format applies unchanged;
+- the undefined-contents rule of section 2 is checked by the HAL at
+  submission, so Runtime does not learn what a surface is.
 
 ## 8. Engine consumer (non-normative)
 
@@ -311,45 +235,32 @@ applies to transient textures.
 
 ## 9. Open questions
 
-1. **Python.** Whether `RuntimeSession` exposes surfaces now or after the
-   C++ host path is accepted.
-2. **Version.** The RHI ABI change falls under `PROGRAM_VERSION`
-   (`README.md`); the release decision belongs to the owner.
-3. **Vulkan surface creation.** An owned device creates its `VkInstance`
-   without `VK_KHR_surface` or a platform surface extension and does not
-   expose the instance, so a host cannot create a `VkSurfaceKHR` for it. The
-   candidates are: the host passes native window handles and the RHI
-   creates the surface, enabling the surface extensions the loader offers
-   (wgpu, Dawn); the host names the instance extensions at device creation
-   and the RHI exposes its instance; or the RHI always enables the surface
-   extensions and exposes its instance. Vulkan and DirectX 12 surfaces are
-   deferred until this is decided, and both backends fail surface creation
-   with `UNSUPPORTED`.
+1. **Python.** Whether `RuntimeSession` exposes surfaces, or only the C++
+   host path does.
+2. **Vulkan surfaces off Windows.** `vulkan_platform_surface.cpp` creates
+   Win32 surfaces only; Linux and macOS (MoltenVK) need their platform
+   surface extensions and native handles in the descriptor.
 
 ## 10. Acceptance
 
-- Every backend that creates surfaces: create, configure, acquire, clear,
-  present, and on OpenGL read the surface image back exactly before
-  present. Every other backend fails creation with `UNSUPPORTED`.
-- A recorded Program draws into an acquired image and the result matches the
-  same draw into an ordinary image of that format.
-- Two surfaces on one device present in one frame, with one submission
-  writing both images.
-- Rejected before native encoding: `PRESERVE` load or sampled read of a freshly
-  acquired image; acquire twice; present without acquire; configure or
-  destroy while an image is acquired; a format, mode or usage outside the
-  capabilities; a borrowed device creating a surface.
-- Resize: acquire or present reports `SURFACE_OUT_OF_DATE`, and configure
-  followed by acquire succeeds.
-- No backend renders into the OpenGL default framebuffer, and no host-side
-  copy of a Runtime image to a back buffer remains.
+`source/tests/runtime/hal_resources_test.cpp` covers, on every device that
+creates surfaces:
 
-## 11. Contract changes on acceptance
+- create, configure, acquire and present, with the acquired image and view
+  in the configured format and extent; every other device fails creation
+  with `VERNON_HAL_UNSUPPORTED`;
+- a read of a freshly acquired image fails, and after a host write the image
+  reads back exactly before present;
+- two surfaces on one device present their own images (Vulkan);
+- rejected before native work: acquire twice; present without acquire;
+  configure, destroy, or destroying the image or view while an image is
+  acquired; a zero extent, a usage without `COLOR_ATTACHMENT` or an unknown
+  mode (`INVALID_ARGUMENT`); a format, usage or image count outside the
+  capabilities (`UNSUPPORTED`);
+- resize: acquire reports `SURFACE_OUT_OF_DATE`, and configure followed by
+  acquire succeeds at the new extent.
 
-- `VernonRHI.h` and `VernonOpenGLContext.h`: the API in sections 3 and 5.
-- `VernonFormats.def`: the `bgra8` rows, with the backend that first needs
-  them (section 6).
-- [`image_resources.md`](image_resources.md): surface images and the
-  undefined-at-acquire rule.
-- [`design.md`](design.md) section 10: the backend mappings.
-- `README.md`: this document moves from active plans to architecture.
+The Engine's UI renderer draws into surface images through linked
+schedules on Vulkan and both OpenGL tiers. No backend renders into the
+OpenGL default framebuffer, and no host-side copy of a Runtime image to a
+back buffer remains.

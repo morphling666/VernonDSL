@@ -74,21 +74,8 @@ GraphicsRenderScope graphicsRenderScope(const PlannedRenderTargets &targets, Gra
     scope.reads = std::move(reads);
     scope.width = targets.attachmentWidth;
     scope.height = targets.attachmentHeight;
+    scope.area = targets.renderArea;
     return scope;
-}
-
-VernonRuntimeProviderRenderingDescriptor graphicsRenderingDescriptor(const GraphicsRenderScope &scope) {
-    VernonRuntimeProviderRenderingDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.color_attachments = scope.colors.data();
-    descriptor.color_attachment_count = scope.colors.size();
-    descriptor.depth_stencil_attachment = scope.depth ? &*scope.depth : nullptr;
-    descriptor.render_area[2] = scope.width;
-    descriptor.render_area[3] = scope.height;
-    descriptor.layers = 1;
-    descriptor.sampled_images = scope.reads.images.data();
-    descriptor.sampled_image_count = scope.reads.images.size();
-    return descriptor;
 }
 
 // A node whose reads overlap its own attachments never reaches the materializer, so a node fusing into the scope,
@@ -98,7 +85,8 @@ bool GraphicsScopeMaterializer::canFuse(const PlannedRenderTargets &next) const 
         return false;
     if (scope_.colors.size() != next.attachments.size() || scope_.colorFormats != next.attachmentFormats ||
         scope_.width != next.attachmentWidth || scope_.height != next.attachmentHeight ||
-        scope_.depthFormat != next.depthFormat || scope_.depth.has_value() != bool(next.depthAttachment))
+        scope_.area != next.renderArea || scope_.depthFormat != next.depthFormat ||
+        scope_.depth.has_value() != bool(next.depthAttachment))
         return false;
     for (size_t index = 0; index < scope_.colors.size(); ++index) {
         const VernonRuntimeProviderColorAttachment &previous = scope_.colors[index];

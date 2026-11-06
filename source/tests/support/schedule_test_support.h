@@ -261,7 +261,7 @@ public:
             result.storage = VERNON_TENSOR_HOST;
             result.host_data = buffer_.address();
         } else {
-            result.storage = VERNON_TENSOR_RHI_RESOURCE;
+            result.storage = VERNON_TENSOR_DEVICE_RESOURCE;
             result.resource = buffer_.reference();
         }
         result.rank = static_cast<uint32_t>(shape_.size());

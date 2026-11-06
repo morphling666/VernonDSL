@@ -1760,31 +1760,33 @@ serialized.
 
 ### 15.1 Runtime composition of cooked Programs
 
-`ProgramGraph` is an in-memory pre-resolution linker. It is not serialized as
-another manifest type. Each child is one loaded, validated Program variant and
-its ArtifactSystem. All children must belong to the same Runtime context,
-target, and selected specialization key.
+`ProgramGraph` is an in-memory composition of cooked Programs. It is not
+serialized as another manifest type. Each child is one loaded, validated
+Program variant and its ArtifactSystem, resolved once as its own executable.
+All children must belong to the same Runtime context and target; each selects
+its own specialization key.
 
-Linking produces one ordinary `Program` and `ArtifactSystem`:
+Composition produces only the composite ABI; the children's fragments link
+into its schedule
+([`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) section
+16.2):
 
-- child Stage, Parameter, Storage, Value, Node, graph-control, Blob, and
-  artifact identities are namespaced and deterministically remapped;
 - child boundary names remain local to an opaque Program-node identity;
 - graph Value handles retain one child output and connect it to one or more
-  compatible child inputs; linking replaces those boundaries with one
-  composite Value;
+  compatible child inputs; connected boundaries share one composite Value;
 - graph Storage handles retain an explicit ordered list of compatible child
-  output boundaries; linking forms one physical Storage alias domain while
-  preserving every logical Value version and never invents a dataflow edge;
-- the final boundary of every graph Storage remains externally bindable even
+  output boundaries, which share one composite Storage while every logical
+  Value version stays its child's; composition never invents a dataflow edge;
+- the final boundary of every graph Storage remains a composite boundary even
   when its Value also feeds a graph Value connection;
-- unconnected child boundaries remain externally bindable through node-local
-  tokens; explicit exports additionally assign graph-level names;
+- unconnected child boundaries remain composite boundaries named
+  `node/<id>/<path>`; explicit exports assign graph-level names, and only
+  exported boundaries are bindable;
 - intermediate child publications are removed, while exported publication is
-  derived and validated for the composite boundary;
-- only child forward graphs and their required tape carriers enter the linked
-  Program; backward graphs, residual contracts, derivative projections, and
-  derivative boundaries remain node-local;
+  derived for the composite boundary;
+- only child forward graphs link into the composite schedule; backward graphs,
+  residual contracts, derivative projections, and derivative boundaries remain
+  node-local;
 - artifact bytes and Stage contracts are reused without source or Stage
   recompilation.
 
@@ -1792,16 +1794,16 @@ Names are diagnostic and reflection data, not connection identity. Public
 construction APIs resolve a child name to a stable node-local token before
 finalization; duplicate names in different children are valid.
 
-The linker must reject incompatible logical types, Storage descriptors,
-ownership/lifetime, mutability, access, publication, target, specialization key,
-artifact identity, or graph directions. It must also reject unresolved
+Composition rejects incompatible logical types, shapes, layouts, Storage
+descriptors, ownership/lifetime, mutability, access, publication, target, or a
+child without a forward graph. It also rejects unresolved
 connected destinations exported as external boundaries, intermediate Storage
 versions exported as final outputs, and non-linear Storage-version chains. It
 never guesses a connection from equal names or equal runtime resource handles.
 
-The linked forward Program enters the ordinary Resolve algorithm below.
-Graph forward submits no child executable: one globally resolved forward
-schedule is the only primal execution path.
+Each child enters the ordinary Resolve algorithm below on its own. Graph
+forward submits no child executable separately: one linked forward schedule
+of the children's fragments is the only primal execution path.
 
 ## 16. Resolve
 

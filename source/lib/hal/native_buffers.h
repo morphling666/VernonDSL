@@ -1,7 +1,7 @@
 #ifndef VERNON_HAL_NATIVE_BUFFERS_H
 #define VERNON_HAL_NATIVE_BUFFERS_H
 
-// References to the buffers a HAL device allocates itself, outside the RHI's registry.
+// References to the buffers a HAL device allocates.
 
 #include "hal/hal.h"
 
@@ -18,7 +18,7 @@
 namespace vernon::hal {
 
 // The low bits of a HAL reference's identity, over the address of the device's state, which name what its resource
-// value is the serial of; RHI references set kinds 1 to 4.
+// value is the serial of.
 inline constexpr uint64_t kNativeBufferReference = 5;
 inline constexpr uint64_t kNativeViewReference = 6;
 inline constexpr uint64_t kNativeSamplerReference = 7;

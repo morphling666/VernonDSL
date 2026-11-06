@@ -226,9 +226,8 @@ The high tier runs on **Vulkan** on Windows and Linux, as Vernon's render
 architecture plans (Vernon `specs/render/architecture.md` section 8): it
 has compute, multi-draw indirect, descriptor indexing, timeline semaphores
 and command buffers that replay (`runtime/architecture_v2.md` section 6).
-OpenGL 3.3 remains the compatibility tier, with the tape as its floor. The RHI has a Vulkan backend; the engine's
-`Runtime::initialize` accepts only OpenGL today, and admitting Vulkan there
-is the engine's part of this phase.
+OpenGL 3.3 remains the compatibility tier, with the tape as its floor. The
+engine's `Runtime::initialize` admits Vulkan and both OpenGL tiers.
 
 ## 6. Requirements on the engine
 
@@ -251,7 +250,25 @@ bounds assume:
   resident and roundtrip, with bit-for-bit agreement with numpy.
 - `PlanetWalker --no-vsync`, standing and `--walk`, with a per-frame CPU
   and GPU breakdown (`runtime/gpu_profiling.md`).
-- The Editor scenes of `execution_model.md` section 13.
+- The Editor scenes, with `--frame-stats` and `--no-vsync`
+  ([`../reports/benchmarks/editor_scenes.md`](../reports/benchmarks/editor_scenes.md)):
+  the Editor's `dog`, `bodies` and `planet` demos and its panels, on OpenGL
+  and on every high-tier backend the Editor runs on.
+
+  | Scene | Target |
+  |---|---|
+  | boxes1000 (OpenGL, about 6000 draws) | a frame's host time bounded by driver time plus the tape, about 0.3 ms |
+  | cave + acrobot, simulating | no regression in any phase |
+  | a pass whose structure changes every frame (the ImGui pass) | recording no slower than the old per-Execute path, `ui.end` 0.7 ms |
+
+- Comparisons with other runtimes:
+
+  | Workload | Compared against | Target |
+  |---|---|---|
+  | 10000 draws, distinct materials, static | the same scene in UE 5.7 (render and RHI thread time in Unreal Insights) | Vulkan, D3D12 and Metal: a call under 20 µs plus the changed bytes; the OpenGL tape under 30 ns per command plus driver time |
+  | a chain of 1000 compute kernels | `cuLaunchKernel` in a loop; a CUDA graph built by hand | within 10% of the hand-built graph |
+  | small-model LLM decode, growing sequence | PyTorch with CUDA graphs; llama.cpp | tokens per second at least equal; no new recording within a capacity class |
+  | training step (forward, pullback, update) | PyTorch with CUDA graphs | CPU time per step independent of layer count |
 
 Each phase reports before and after in `reports/`, with the provenance
 `roadmap.md` section 8 requires.

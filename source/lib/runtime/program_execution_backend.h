@@ -20,7 +20,7 @@ struct ArtifactSystem;
 struct Diagnostic;
 struct Program;
 
-// The VernonRhiFormatCapabilityBits a device grants a table format.
+// The VernonHalFormatCapabilityBits a device grants a table format.
 using FormatCapabilityQuery = std::function<uint32_t(const vernon::formats::Format &)>;
 
 // Program load rejects image storages and graphics attachments whose formats the device cannot use as declared, so
@@ -37,6 +37,8 @@ using ProgramLoadResult = vernon::Result<std::unique_ptr<VernonProgramExecutable
 
 ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context, const Program &program,
                                              const ArtifactSystem &artifacts, const std::filesystem::path &bundleRoot);
+// An executable that only presents `program`'s ABI: a composed Program graph, whose nodes run as their own executables.
+ProgramLoadResult composedProgramExecutable(VernonRuntimeContext &context, Program program);
 std::string renderProgramLoadError(const ProgramLoadError &error);
 
 } // namespace vernon::runtime::program

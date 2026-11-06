@@ -4,11 +4,11 @@
 #include <stdint.h>
 
 typedef enum VernonTextureFormat {
-#define VERNON_FORMAT(name, NAME, rhi, texture, ...) VERNON_TEXTURE_##NAME = texture,
+#define VERNON_FORMAT(name, NAME, texture, ...) VERNON_TEXTURE_##NAME = texture,
 #include "VernonFormats.def"
 } VernonTextureFormat;
 
-/* Values and layer rules match VernonRhiImageDimension: a cube-array layer is cube * 6 + face. */
+/* A cube-array layer is cube * 6 + face. */
 typedef enum VernonTextureDimension {
     VERNON_TEXTURE_2D = 0,
     VERNON_TEXTURE_3D = 1,
@@ -31,6 +31,38 @@ typedef enum VernonImageAspectBits {
     VERNON_IMAGE_ASPECT_DEPTH = 1u << 1,
     VERNON_IMAGE_ASPECT_STENCIL = 1u << 2
 } VernonImageAspectBits;
+
+/* The words of the format table's baseline column; a device narrows a format's baseline. */
+typedef enum VernonHalFormatCapabilityBits {
+    VERNON_HAL_FORMAT_RENDERABLE = 1u << 0,
+    VERNON_HAL_FORMAT_BLENDABLE = 1u << 1,
+    VERNON_HAL_FORMAT_FILTERABLE = 1u << 2,
+    VERNON_HAL_FORMAT_STORAGE = 1u << 3,
+    VERNON_HAL_FORMAT_RESOLVABLE = 1u << 4,
+    VERNON_HAL_FORMAT_MULTISAMPLE = 1u << 5,
+    VERNON_HAL_FORMAT_COPYABLE = 1u << 6
+} VernonHalFormatCapabilityBits;
+
+/* The host layout of image transfer data, tightly packed rows of texels; the format table's data_format and data_type
+ * columns name these. */
+typedef enum VernonHalImageDataFormat {
+    VERNON_HAL_IMAGE_DATA_RED = 0,
+    VERNON_HAL_IMAGE_DATA_RG = 1,
+    VERNON_HAL_IMAGE_DATA_RGB = 2,
+    VERNON_HAL_IMAGE_DATA_BGR = 3,
+    VERNON_HAL_IMAGE_DATA_RGBA = 4,
+    VERNON_HAL_IMAGE_DATA_BGRA = 5,
+    VERNON_HAL_IMAGE_DATA_DEPTH = 6,
+    VERNON_HAL_IMAGE_DATA_DEPTH_STENCIL = 7,
+    VERNON_HAL_IMAGE_DATA_STENCIL = 8
+} VernonHalImageDataFormat;
+
+typedef enum VernonHalImageDataType {
+    VERNON_HAL_IMAGE_DATA_UINT8 = 0,
+    VERNON_HAL_IMAGE_DATA_FLOAT16 = 1,
+    VERNON_HAL_IMAGE_DATA_FLOAT32 = 2,
+    VERNON_HAL_IMAGE_DATA_UINT32 = 3
+} VernonHalImageDataType;
 
 typedef enum VernonImageBindingRole {
     VERNON_IMAGE_BINDING_SAMPLED = 0,

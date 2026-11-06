@@ -4,7 +4,7 @@
 #include "hal/native_buffers.h"
 #include "hal/native_images.h"
 #include "hal/resources.h"
-#include "rhi/vulkan_backend.h"
+#include "hal/vulkan/vulkan_state.h"
 
 #include <algorithm>
 #include <array>
@@ -20,47 +20,20 @@
 namespace vernon::hal {
 namespace {
 
-namespace rv = rhi::vulkan;
+using vulkan::DeviceState;
 
-static_assert(VERNON_IMAGE_ASPECT_COLOR == VK_IMAGE_ASPECT_COLOR_BIT &&
-              VERNON_IMAGE_ASPECT_DEPTH == VK_IMAGE_ASPECT_DEPTH_BIT &&
-              VERNON_IMAGE_ASPECT_STENCIL == VK_IMAGE_ASPECT_STENCIL_BIT);
-
-Serials<rv::Buffer> &serials() {
-    static Serials<rv::Buffer> instance;
+Serials<vulkan::Buffer> &serials() {
+    static Serials<vulkan::Buffer> instance;
     return instance;
-}
-
-template <typename T = void> Done<T> vulkanFailure(VernonRhiDevice device, const RhiError &error, const char *what) {
-    std::string message = what;
-    const VernonStringView detail = vernonRhiDeviceGetLastError(device);
-    if (detail.data && detail.size)
-        message += ": " + std::string(detail.data, detail.size);
-    return fail<T>(static_cast<VernonHalStatus>(toVernonRhiStatus(error)), std::move(message));
 }
 
 template <typename T = void> Done<T> internal(const char *what, const std::string &detail) {
     return fail<T>(VERNON_HAL_INTERNAL_ERROR, detail.empty() ? std::string(what) : std::string(what) + ": " + detail);
 }
 
-uint32_t rhiBufferUsage(uint32_t usage) {
-    constexpr std::pair<uint32_t, uint32_t> kBufferUsage[] = {
-        {VERNON_HAL_BUFFER_UNIFORM, VERNON_RHI_BUFFER_UNIFORM},
-        {VERNON_HAL_BUFFER_STORAGE, VERNON_RHI_BUFFER_STORAGE},
-        {VERNON_HAL_BUFFER_VERTEX, VERNON_RHI_BUFFER_VERTEX},
-        {VERNON_HAL_BUFFER_INDEX, VERNON_RHI_BUFFER_INDEX},
-        {VERNON_HAL_BUFFER_INDIRECT, VERNON_RHI_BUFFER_INDIRECT},
-    };
-    uint32_t result = 0;
-    for (const auto &[hal, rhi] : kBufferUsage)
-        if (usage & hal)
-            result |= rhi;
-    return result;
-}
-
 VkFormat vulkanFormat(VernonTextureFormat format) {
     switch (format) {
-#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+#define VERNON_FORMAT(name, NAME, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,       \
                       vulkan, ...)                                                                                     \
     case VERNON_TEXTURE_##NAME:                                                                                        \
         return vulkan;
@@ -144,7 +117,7 @@ void imageDependency(VkImageLayout layout, VkPipelineStageFlags &stages, VkAcces
     }
 }
 
-rv::ImageSubresources everything(const rv::Image &image) {
+vulkan::ImageSubresources everything(const vulkan::Image &image) {
     const uint32_t layers =
         image.mipLevels ? static_cast<uint32_t>(image.subresourceLayouts.size() / image.mipLevels) : 0;
     return {0, image.mipLevels, 0, layers};
@@ -152,8 +125,8 @@ rv::ImageSubresources everything(const rv::Image &image) {
 
 // Transitions the subresources `range` of `image`, which tracks their layouts, within recording `command`. Runs under
 // the device's lock.
-bool transition(rv::DeviceState &state, VkCommandBuffer command, rv::Image &image, const rv::ImageSubresources &range,
-                VkImageLayout target, std::string &error) {
+bool transition(DeviceState &state, VkCommandBuffer command, vulkan::Image &image,
+                const vulkan::ImageSubresources &range, VkImageLayout target, std::string &error) {
     if (!range.mipLevelCount || !range.arrayLayerCount || state.movedToLayout(command, image, range, target))
         return true;
     // A subresource whose source is `target` needs no barrier here.
@@ -177,7 +150,7 @@ bool transition(rv::DeviceState &state, VkCommandBuffer command, rv::Image &imag
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image.image;
-        barrier.subresourceRange = {rv::imageAspectMask(image.format), baseMip, mipCount, baseLayer, layerCount};
+        barrier.subresourceRange = {vulkan::imageAspectMask(image.format), baseMip, mipCount, baseLayer, layerCount};
         VkPipelineStageFlags sourceStage{};
         VkPipelineStageFlags destinationStage{};
         imageDependency(source, sourceStage, barrier.srcAccessMask);
@@ -197,32 +170,32 @@ bool transition(rv::DeviceState &state, VkCommandBuffer command, rv::Image &imag
                      range.baseArrayLayer + static_cast<uint32_t>(index / range.mipLevelCount), 1);
     }
     if (!barriers.empty())
-        rv::driver().cmdPipelineBarrier(command, sourceStages, destinationStages, 0, 0, nullptr, 0, nullptr,
-                                        static_cast<uint32_t>(barriers.size()), barriers.data());
+        vulkan::driver().cmdPipelineBarrier(command, sourceStages, destinationStages, 0, 0, nullptr, 0, nullptr,
+                                            static_cast<uint32_t>(barriers.size()), barriers.data());
     return true;
 }
 
 // The layout that operations outside passes leave `image` in: the one it last shared, or its resting layout before
 // anything wrote it.
-VkImageLayout restoredLayout(const rv::Image &image, uint32_t usage) {
+VkImageLayout restoredLayout(const vulkan::Image &image, uint32_t usage) {
     return image.layout == VK_IMAGE_LAYOUT_UNDEFINED ? restingLayout(usage) : image.layout;
 }
 
 // One Vulkan buffer, named by its serial.
 class NativeBuffer {
 public:
-    NativeBuffer(VernonRhiDevice rhi, const rv::DeviceState &state, rv::Buffer buffer, uint64_t size)
-        : rhi_(rhi), identity_(nativeBufferIdentity(&state)), buffer_(buffer), size_(size) {
+    NativeBuffer(std::shared_ptr<DeviceState> state, vulkan::Buffer buffer, uint64_t size)
+        : state_(std::move(state)), identity_(nativeBufferIdentity(state_.get())), buffer_(buffer), size_(size) {
         serial_ = serials().add(&buffer_);
     }
     NativeBuffer(const NativeBuffer &) = delete;
     NativeBuffer &operator=(const NativeBuffer &) = delete;
     ~NativeBuffer() {
         serials().remove(serial_);
-        (void)rv::destroyBuffer(rhi_, buffer_);
+        vulkan::destroyBuffer(*state_, buffer_);
     }
 
-    rv::Buffer &buffer() { return buffer_; }
+    vulkan::Buffer &buffer() { return buffer_; }
     uint64_t size() const { return size_; }
     VernonRuntimeProviderResourceReference reference(uint64_t offset, uint64_t size) const {
         VernonRuntimeProviderResourceReference reference{};
@@ -234,76 +207,76 @@ public:
     }
 
 private:
-    VernonRhiDevice rhi_;
+    std::shared_ptr<DeviceState> state_;
     uint64_t identity_;
-    rv::Buffer buffer_;
+    vulkan::Buffer buffer_;
     uint64_t size_;
     uint64_t serial_{};
 };
 
 struct VulkanHalBuffer final : VernonHalBuffer {
-    VulkanHalBuffer(VernonRhiDevice rhi, const rv::DeviceState &state, rv::Buffer buffer, uint64_t size)
-        : native(rhi, state, buffer, size) {}
+    VulkanHalBuffer(std::shared_ptr<DeviceState> state, vulkan::Buffer buffer, uint64_t size)
+        : native(std::move(state), buffer, size) {}
 
     NativeBuffer native;
 };
 
 // Destroys native objects once the work submitted so far completes.
-void destroyLater(const rv::DeviceAccess &access, rv::DeviceState::DeferredDestruction destruction) {
-    std::lock_guard<std::mutex> guard(*access.mutex);
-    access.state->destroyAfterSubmittedWork(std::move(destruction));
+void destroyLater(DeviceState &state, DeviceState::DeferredDestruction destruction) {
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.destroyAfterSubmittedWork(std::move(destruction));
 }
 
 struct VulkanImage final : VernonHalImage {
-    explicit VulkanImage(rv::DeviceAccess access) : access(access) {}
+    explicit VulkanImage(std::shared_ptr<DeviceState> state) : state(std::move(state)) {}
     VulkanImage(const VulkanImage &) = delete;
     VulkanImage &operator=(const VulkanImage &) = delete;
     ~VulkanImage() override {
         forgetUndefined(&serial, 1);
-        rv::DeviceState::DeferredDestruction destruction;
+        DeviceState::DeferredDestruction destruction;
         destruction.image = native;
-        destroyLater(access, std::move(destruction));
+        destroyLater(*state, std::move(destruction));
     }
 
-    rv::DeviceAccess access;
+    std::shared_ptr<DeviceState> state;
     // Tracks the layouts of every subresource, for the image and all its views.
-    rv::Image native;
+    vulkan::Image native;
     uint64_t serial{nextImageSerial()};
 };
 
 struct VulkanView final : VernonHalImageView {
-    explicit VulkanView(rv::DeviceAccess access) : access(access) {}
+    explicit VulkanView(std::shared_ptr<DeviceState> state) : state(std::move(state)) {}
     VulkanView(const VulkanView &) = delete;
     VulkanView &operator=(const VulkanView &) = delete;
     ~VulkanView() override {
         if (serial)
             nativeViews().remove(serial);
-        rv::DeviceState::DeferredDestruction destruction;
+        DeviceState::DeferredDestruction destruction;
         destruction.view = binding.view;
-        destroyLater(access, std::move(destruction));
+        destroyLater(*state, std::move(destruction));
     }
 
-    rv::DeviceAccess access;
+    std::shared_ptr<DeviceState> state;
     // What passes bind: the view over its subresources of the image, whose layouts the image tracks.
-    rv::Image binding;
+    vulkan::Image binding;
     NativeView entry;
     uint64_t serial{};
 };
 
 struct VulkanSampler final : VernonHalSampler {
-    explicit VulkanSampler(rv::DeviceAccess access) : access(access) {}
+    explicit VulkanSampler(std::shared_ptr<DeviceState> state) : state(std::move(state)) {}
     VulkanSampler(const VulkanSampler &) = delete;
     VulkanSampler &operator=(const VulkanSampler &) = delete;
     ~VulkanSampler() override {
         if (serial)
             nativeSamplers().remove(serial);
-        rv::DeviceState::DeferredDestruction destruction;
+        DeviceState::DeferredDestruction destruction;
         destruction.sampler = sampler;
-        destroyLater(access, std::move(destruction));
+        destroyLater(*state, std::move(destruction));
     }
 
-    rv::DeviceAccess access;
-    rv::Sampler sampler;
+    std::shared_ptr<DeviceState> state;
+    vulkan::Sampler sampler;
     uint64_t serial{};
 };
 
@@ -316,12 +289,12 @@ struct AcquireSemaphore {
 // A window's swapchain, and the ring of images that passes render to and presents blit to it. The images are the
 // surface's own rather than the swapchain's, so a frame acquires one without waiting for the presentation engine.
 struct VulkanSurface final : VernonHalSurface {
-    explicit VulkanSurface(rv::DeviceAccess access) : access(access) {}
+    explicit VulkanSurface(std::shared_ptr<DeviceState> state) : state(std::move(state)) {}
     VulkanSurface(const VulkanSurface &) = delete;
     VulkanSurface &operator=(const VulkanSurface &) = delete;
     ~VulkanSurface() override;
 
-    rv::DeviceAccess access;
+    std::shared_ptr<DeviceState> state;
     VkSurfaceKHR surface{};
     VernonHalSurfaceConfiguration configuration{};
     // Index-aligned; each view covers its image.
@@ -341,8 +314,8 @@ struct VulkanSurface final : VernonHalSurface {
 
 // Runs under the device's lock with the queue idle, so no submission or present still uses what it destroys.
 void destroySwapchain(VulkanSurface &surface) {
-    const rv::Driver &api = rv::driver();
-    const VkDevice device = surface.access.state->device;
+    const vulkan::Driver &api = vulkan::driver();
+    const VkDevice device = surface.state->device;
     for (VkSemaphore semaphore : surface.presentReady)
         api.destroySemaphore(device, semaphore, nullptr);
     for (const AcquireSemaphore &acquire : surface.acquires)
@@ -358,12 +331,12 @@ void destroySwapchain(VulkanSurface &surface) {
 }
 
 VulkanSurface::~VulkanSurface() {
-    std::lock_guard<std::mutex> guard(*access.mutex);
+    std::lock_guard<std::mutex> guard(state->mutex);
     std::string ignored;
-    (void)access.state->synchronize(ignored);
+    (void)state->synchronize(ignored);
     destroySwapchain(*this);
     if (surface)
-        rv::driver().destroySurface(access.state->instance, surface, nullptr);
+        vulkan::driver().destroySurface(state->instance, surface, nullptr);
 }
 
 VkPresentModeKHR presentMode(VernonHalPresentMode mode) {
@@ -381,8 +354,8 @@ VkPresentModeKHR presentMode(VernonHalPresentMode mode) {
 // Replaces the swapchain with one at the window's extent in the configured present mode. Runs under the device's
 // lock. A minimized window has no extent and leaves the surface without a swapchain until it has one.
 bool rebuildSwapchain(VulkanSurface &surface, std::string &error) {
-    const rv::Driver &api = rv::driver();
-    rv::DeviceState &state = *surface.access.state;
+    const vulkan::Driver &api = vulkan::driver();
+    DeviceState &state = *surface.state;
     // The old swapchain's images and semaphores are idle once the queue is.
     if (!state.synchronize(error))
         return false;
@@ -492,17 +465,15 @@ bool rebuildSwapchain(VulkanSurface &surface, std::string &error) {
 
 class VulkanDeviceBuffers final : public DeviceBuffers {
 public:
-    VulkanDeviceBuffers(VernonRhiDevice device, const rv::DeviceState &state)
-        : device_(device), pool_(std::make_shared<BufferPool<NativeBuffer>>([device, &state](uint64_t size) {
+    explicit VulkanDeviceBuffers(std::shared_ptr<DeviceState> state)
+        : state_(state), pool_(std::make_shared<BufferPool<NativeBuffer>>([state](uint64_t size) {
               using Created = Result<std::unique_ptr<NativeBuffer>, std::string>;
-              rv::Buffer native{};
-              auto created = rv::createBuffer(device, size,
-                                              VERNON_RHI_BUFFER_STORAGE | VERNON_RHI_BUFFER_TRANSFER_SOURCE |
-                                                  VERNON_RHI_BUFFER_TRANSFER_DESTINATION,
-                                              VERNON_RHI_MEMORY_DEVICE, native);
+              vulkan::Buffer native{};
+              auto created =
+                  vulkan::createBuffer(*state, size, VERNON_HAL_BUFFER_STORAGE, VERNON_HAL_MEMORY_DEVICE, native);
               if (created.isErr())
-                  return Created{err(std::string("cannot create a Vulkan buffer"))};
-              return Created{ok(std::make_unique<NativeBuffer>(device, state, native, size))};
+                  return Created{err("cannot create a Vulkan buffer: " + created.error())};
+              return Created{ok(std::make_unique<NativeBuffer>(state, native, size))};
           })) {}
 
     Result<std::unique_ptr<Buffer>, std::string> allocate(uint64_t size) override { return pool_->allocate(size); }
@@ -511,31 +482,26 @@ public:
         NativeBuffer &native = static_cast<BufferPool<NativeBuffer>::Pooled &>(buffer).native();
         if (size > native.size())
             return Result<void, std::string>{err(std::string("the upload overruns the buffer"))};
-        const VernonRhiBufferUploadRange range{0, bytes, size};
-        if (rv::uploadBuffer(device_, native.buffer(), native.size(), VERNON_RHI_MEMORY_DEVICE, &range, 1).isErr())
-            return Result<void, std::string>{err(std::string("cannot upload to a Vulkan buffer"))};
-        return Result<void, std::string>{ok()};
+        const VernonHalBufferWrite write{0, bytes, size};
+        return vulkan::writeBuffer(*state_, native.buffer(), native.size(), VERNON_HAL_MEMORY_DEVICE, &write, 1);
     }
 
     Result<void, std::string> download(const Buffer &buffer, void *bytes, size_t size) override {
         NativeBuffer &native = static_cast<const BufferPool<NativeBuffer>::Pooled &>(buffer).native();
         if (size > native.size())
             return Result<void, std::string>{err(std::string("the download overruns the buffer"))};
-        const VernonRhiBufferDownloadRange range{0, bytes, size};
-        if (rv::downloadBuffer(device_, native.buffer(), native.size(), &range, 1).isErr())
-            return Result<void, std::string>{err(std::string("cannot read a Vulkan buffer back"))};
-        return Result<void, std::string>{ok()};
+        const VernonHalBufferRead read{0, bytes, size};
+        return vulkan::readBuffer(*state_, native.buffer(), native.size(), &read, 1);
     }
 
 private:
-    VernonRhiDevice device_;
+    std::shared_ptr<DeviceState> state_;
     std::shared_ptr<BufferPool<NativeBuffer>> pool_;
 };
 
 class VulkanResources final : public Resources {
 public:
-    VulkanResources(VernonRhiDevice device, rv::DeviceAccess access)
-        : device_(device), access_(access), state_(*access.state) {}
+    explicit VulkanResources(std::shared_ptr<DeviceState> state) : owner_(std::move(state)), state_(*owner_) {}
 
     Done<uint32_t> formatCapabilities(VernonTextureFormat format) override {
         if (!formats::find(format))
@@ -543,7 +509,7 @@ public:
         const VkFormat native = vulkanFormat(format);
         if (native == VK_FORMAT_UNDEFINED)
             return Done<uint32_t>{ok(0u)};
-        const rv::Driver &api = rv::driver();
+        const vulkan::Driver &api = vulkan::driver();
         VkFormatProperties properties{};
         api.getPhysicalDeviceFormatProperties(state_.physicalDevice, native, &properties);
         const VkFormatFeatureFlags features = properties.optimalTilingFeatures;
@@ -575,42 +541,33 @@ public:
 
     Done<std::unique_ptr<VernonHalBuffer>> createBuffer(const VernonHalBufferDescriptor &descriptor) override {
         using Created = Done<std::unique_ptr<VernonHalBuffer>>;
-        rv::Buffer native{};
-        auto created = rv::createBuffer(device_, descriptor.size, rhiBufferUsage(descriptor.usage),
-                                        static_cast<VernonRhiMemoryClass>(descriptor.memory), native);
+        vulkan::Buffer native{};
+        auto created = vulkan::createBuffer(state_, descriptor.size, descriptor.usage, descriptor.memory, native);
         if (created.isErr())
-            return vulkanFailure<std::unique_ptr<VernonHalBuffer>>(device_, created.error(),
-                                                                   "cannot create the buffer");
-        auto buffer = std::unique_ptr<VulkanHalBuffer>(new (std::nothrow)
-                                                           VulkanHalBuffer(device_, state_, native, descriptor.size));
+            return internal<std::unique_ptr<VernonHalBuffer>>("cannot create the buffer", created.error());
+        auto buffer =
+            std::unique_ptr<VulkanHalBuffer>(new (std::nothrow) VulkanHalBuffer(owner_, native, descriptor.size));
         if (!buffer) {
-            (void)rv::destroyBuffer(device_, native);
+            vulkan::destroyBuffer(state_, native);
             return fail<std::unique_ptr<VernonHalBuffer>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate a buffer");
         }
         return Created{ok(std::unique_ptr<VernonHalBuffer>(std::move(buffer)))};
     }
 
     Done<void> write(VernonHalBuffer &buffer, const VernonHalBufferWrite *writes, size_t count) override {
-        std::vector<VernonRhiBufferUploadRange> ranges(count);
-        for (size_t index = 0; index < count; ++index)
-            ranges[index] = {writes[index].offset, writes[index].source, writes[index].size};
         NativeBuffer &native = static_cast<VulkanHalBuffer &>(buffer).native;
-        auto written =
-            rv::uploadBuffer(device_, native.buffer(), buffer.descriptor.size,
-                             static_cast<VernonRhiMemoryClass>(buffer.descriptor.memory), ranges.data(), ranges.size());
+        auto written = vulkan::writeBuffer(state_, native.buffer(), buffer.descriptor.size, buffer.descriptor.memory,
+                                           writes, count);
         if (written.isErr())
-            return vulkanFailure(device_, written.error(), "cannot write the buffer");
+            return internal("cannot write the buffer", written.error());
         return Done<void>{ok()};
     }
 
     Done<void> read(VernonHalBuffer &buffer, const VernonHalBufferRead *reads, size_t count) override {
-        std::vector<VernonRhiBufferDownloadRange> ranges(count);
-        for (size_t index = 0; index < count; ++index)
-            ranges[index] = {reads[index].offset, reads[index].destination, reads[index].size};
         NativeBuffer &native = static_cast<VulkanHalBuffer &>(buffer).native;
-        auto read = rv::downloadBuffer(device_, native.buffer(), buffer.descriptor.size, ranges.data(), ranges.size());
+        auto read = vulkan::readBuffer(state_, native.buffer(), buffer.descriptor.size, reads, count);
         if (read.isErr())
-            return vulkanFailure(device_, read.error(), "cannot read the buffer");
+            return internal("cannot read the buffer", read.error());
         return Done<void>{ok()};
     }
 
@@ -638,7 +595,7 @@ public:
             offsets[index] = (total + 15) & ~size_t{15};
             total = offsets[index] + *bytes;
         }
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(state_.mutex);
         std::string error;
         VkCommandBuffer command{};
         if (!state_.beginCommands(command, error))
@@ -676,13 +633,13 @@ public:
                 regions.push_back(copy);
             }
         }
-        rv::Image &native = target.native;
+        vulkan::Image &native = target.native;
         if (!transition(state_, command, native, everything(native), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, error)) {
             state_.abandonCommands(command);
             return internal("cannot write the image", error);
         }
-        rv::driver().cmdCopyBufferToImage(command, staging, native.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                          static_cast<uint32_t>(regions.size()), regions.data());
+        vulkan::driver().cmdCopyBufferToImage(command, staging, native.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                              static_cast<uint32_t>(regions.size()), regions.data());
         if (!transition(state_, command, native, everything(native), restingLayout(image.descriptor.usage), error)) {
             state_.abandonCommands(command);
             return internal("cannot write the image", error);
@@ -691,6 +648,7 @@ public:
         uint64_t serial = 0;
         if (!state_.submitCommands(command, serial, error))
             return internal("cannot submit the image's write", error);
+        forgetUndefined(&target.serial, 1);
         return Done<void>{ok()};
     }
 
@@ -698,6 +656,8 @@ public:
         if (!count)
             return Done<void>{ok()};
         auto &source = static_cast<VulkanImage &>(image);
+        if (anyUndefined(&source.serial, 1))
+            return fail(VERNON_HAL_INVALID_ARGUMENT, "the image's contents are undefined");
         std::vector<size_t> offsets(count);
         size_t total = 0;
         for (size_t index = 0; index < count; ++index) {
@@ -707,8 +667,8 @@ public:
             offsets[index] = (total + 15) & ~size_t{15};
             total = offsets[index] + *bytes;
         }
-        std::lock_guard<std::mutex> guard(*access_.mutex);
-        rv::Image &native = source.native;
+        std::lock_guard<std::mutex> guard(state_.mutex);
+        vulkan::Image &native = source.native;
         const VkImageLayout restore = restoredLayout(native, image.descriptor.usage);
         std::string error;
         VkCommandBuffer command{};
@@ -737,8 +697,8 @@ public:
             state_.abandonCommands(command);
             return internal("cannot read the image", error);
         }
-        rv::driver().cmdCopyImageToBuffer(command, native.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging,
-                                          static_cast<uint32_t>(regions.size()), regions.data());
+        vulkan::driver().cmdCopyImageToBuffer(command, native.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging,
+                                              static_cast<uint32_t>(regions.size()), regions.data());
         if (!transition(state_, command, native, everything(native), restore, error)) {
             state_.abandonCommands(command);
             return internal("cannot read the image", error);
@@ -773,16 +733,16 @@ public:
             !(descriptor.usage & VERNON_IMAGE_TRANSFER_DESTINATION))
             return fail(VERNON_HAL_INVALID_ARGUMENT,
                         "mipmaps need a color image with several mips that transfers in both directions");
-        rv::Image &native = static_cast<VulkanImage &>(image).native;
+        vulkan::Image &native = static_cast<VulkanImage &>(image).native;
         VkFormatProperties properties{};
-        rv::driver().getPhysicalDeviceFormatProperties(state_.physicalDevice, native.format, &properties);
+        vulkan::driver().getPhysicalDeviceFormatProperties(state_.physicalDevice, native.format, &properties);
         constexpr VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
         if ((properties.optimalTilingFeatures & blit) != blit)
             return fail(VERNON_HAL_UNSUPPORTED, "the device cannot blit images of the format");
         const VkFilter filter = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
                                     ? VK_FILTER_LINEAR
                                     : VK_FILTER_NEAREST;
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(state_.mutex);
         const VkImageLayout restore = restoredLayout(native, descriptor.usage);
         std::string error;
         VkCommandBuffer command{};
@@ -790,7 +750,7 @@ public:
             return internal("cannot generate the image's mipmaps", error);
         const uint32_t layers = descriptor.array_layer_count;
         const uint32_t mips = descriptor.mip_level_count;
-        const auto moved = [&](const rv::ImageSubresources &range, VkImageLayout target) {
+        const auto moved = [&](const vulkan::ImageSubresources &range, VkImageLayout target) {
             if (transition(state_, command, native, range, target, error))
                 return true;
             state_.abandonCommands(command);
@@ -811,8 +771,8 @@ public:
             region.srcOffsets[1] = extent(level - 1);
             region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, layers};
             region.dstOffsets[1] = extent(level);
-            rv::driver().cmdBlitImage(command, native.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, native.image,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
+            vulkan::driver().cmdBlitImage(command, native.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, native.image,
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
         }
         if (!moved({0, mips, 0, layers}, restore))
             return internal("cannot generate the image's mipmaps", error);
@@ -855,7 +815,7 @@ public:
         info.addressModeV = kAddress[descriptor.address_v];
         info.addressModeW = kAddress[descriptor.address_w];
         info.maxLod = VK_LOD_CLAMP_NONE;
-        auto sampler = std::unique_ptr<VulkanSampler>(new (std::nothrow) VulkanSampler(access_));
+        auto sampler = std::unique_ptr<VulkanSampler>(new (std::nothrow) VulkanSampler(owner_));
         if (!sampler)
             return fail<std::unique_ptr<VernonHalSampler>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate a sampler");
         std::string error;
@@ -869,19 +829,15 @@ public:
         using Created = Done<std::unique_ptr<VernonHalSurface>>;
         if (!state_.presentation)
             return fail<std::unique_ptr<VernonHalSurface>>(VERNON_HAL_UNSUPPORTED, "the device cannot present");
-        auto surface = std::unique_ptr<VulkanSurface>(new (std::nothrow) VulkanSurface(access_));
+        auto surface = std::unique_ptr<VulkanSurface>(new (std::nothrow) VulkanSurface(owner_));
         if (!surface)
             return fail<std::unique_ptr<VernonHalSurface>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate a surface");
-        VernonRhiSurfaceDescriptor window{};
-        window.struct_size = sizeof(window);
-        window.backend = VERNON_RHI_BACKEND_VULKAN;
-        window.native.win32_window = descriptor.native.win32_window;
         std::string error;
-        if (!rv::createPlatformSurface(state_.instance, window, surface->surface, error))
+        if (!vulkan::createPlatformSurface(state_.instance, descriptor.native.win32_window, surface->surface, error))
             return internal<std::unique_ptr<VernonHalSurface>>("cannot create the surface", error);
         VkBool32 presentable = VK_FALSE;
-        if (rv::driver().getPhysicalDeviceSurfaceSupport(state_.physicalDevice, state_.queueFamily, surface->surface,
-                                                         &presentable) != VK_SUCCESS ||
+        if (vulkan::driver().getPhysicalDeviceSurfaceSupport(state_.physicalDevice, state_.queueFamily,
+                                                             surface->surface, &presentable) != VK_SUCCESS ||
             !presentable)
             return fail<std::unique_ptr<VernonHalSurface>>(VERNON_HAL_UNSUPPORTED,
                                                            "the device's queue cannot present to the window");
@@ -889,7 +845,7 @@ public:
     }
 
     Done<VernonHalSurfaceCapabilities> capabilities(VernonHalSurface &surface) override {
-        const rv::Driver &api = rv::driver();
+        const vulkan::Driver &api = vulkan::driver();
         const VkSurfaceKHR native = static_cast<VulkanSurface &>(surface).surface;
         VkSurfaceCapabilitiesKHR window{};
         if (api.getPhysicalDeviceSurfaceCapabilities(state_.physicalDevice, native, &window) != VK_SUCCESS)
@@ -923,8 +879,6 @@ public:
     // The new images replace the old ones only once all of them exist.
     Done<void> configure(VernonHalSurface &surface, const VernonHalSurfaceConfiguration &configuration) override {
         auto &target = static_cast<VulkanSurface &>(surface);
-        if (!configuration.image_count || !formats::find(configuration.format))
-            return fail(VERNON_HAL_INVALID_ARGUMENT, "the surface configuration is invalid");
         VernonImageDescriptor descriptor{VERNON_TEXTURE_2D,
                                          {configuration.width, configuration.height, 1},
                                          configuration.format,
@@ -961,7 +915,7 @@ public:
         std::string error;
         bool rebuilt = false;
         {
-            std::lock_guard<std::mutex> guard(*access_.mutex);
+            std::lock_guard<std::mutex> guard(state_.mutex);
             rebuilt = rebuildSwapchain(target, error);
         }
         oldViews.clear();
@@ -978,7 +932,7 @@ public:
         if (source.images.empty())
             return fail<VernonHalSurfaceImage>(VERNON_HAL_INVALID_ARGUMENT, "the surface is not configured");
         VkSurfaceCapabilitiesKHR window{};
-        if (rv::driver().getPhysicalDeviceSurfaceCapabilities(state_.physicalDevice, source.surface, &window) !=
+        if (vulkan::driver().getPhysicalDeviceSurfaceCapabilities(state_.physicalDevice, source.surface, &window) !=
             VK_SUCCESS)
             return fail<VernonHalSurfaceImage>(VERNON_HAL_INTERNAL_ERROR, "cannot query the surface");
         const bool resized =
@@ -986,7 +940,7 @@ public:
                                                          window.currentExtent.height != source.configuration.height);
         bool stale = false;
         {
-            std::lock_guard<std::mutex> guard(*access_.mutex);
+            std::lock_guard<std::mutex> guard(state_.mutex);
             stale = source.stale;
         }
         if (stale || resized)
@@ -1001,8 +955,8 @@ public:
         auto &target = static_cast<VulkanSurface &>(surface);
         VulkanImage &presented = *target.images[target.next];
         target.next = (target.next + 1) % target.images.size();
-        std::lock_guard<std::mutex> guard(*access_.mutex);
-        const rv::Driver &api = rv::driver();
+        std::lock_guard<std::mutex> guard(state_.mutex);
+        const vulkan::Driver &api = vulkan::driver();
         std::string error;
         if ((!target.swapchain || target.stale) && !rebuildSwapchain(target, error))
             return internal("cannot present the surface", error);
@@ -1031,7 +985,7 @@ public:
             target.stale = true;
             return internal("cannot present the surface", error);
         }
-        rv::Image &native = presented.native;
+        vulkan::Image &native = presented.native;
         if (!transition(state_, command, native, everything(native), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, error)) {
             state_.abandonCommands(command);
             target.stale = true;
@@ -1145,7 +1099,7 @@ private:
                 imageUsage |= native.second;
             }
         VkFormatProperties properties{};
-        rv::driver().getPhysicalDeviceFormatProperties(state_.physicalDevice, format, &properties);
+        vulkan::driver().getPhysicalDeviceFormatProperties(state_.physicalDevice, format, &properties);
         if ((properties.optimalTilingFeatures & features) != features)
             return fail<std::unique_ptr<VulkanImage>>(VERNON_HAL_UNSUPPORTED,
                                                       "the image's format does not support its usage");
@@ -1166,14 +1120,14 @@ private:
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.viewType = viewType(descriptor.dimension);
         viewInfo.format = format;
-        viewInfo.subresourceRange = {rv::imageAspectMask(format), 0, descriptor.mip_level_count, 0,
+        viewInfo.subresourceRange = {vulkan::imageAspectMask(format), 0, descriptor.mip_level_count, 0,
                                      imageInfo.arrayLayers};
-        auto image = std::unique_ptr<VulkanImage>(new (std::nothrow) VulkanImage(access_));
+        auto image = std::unique_ptr<VulkanImage>(new (std::nothrow) VulkanImage(owner_));
         if (!image)
             return fail<std::unique_ptr<VulkanImage>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate an image");
         std::string error;
         {
-            std::lock_guard<std::mutex> guard(*access_.mutex);
+            std::lock_guard<std::mutex> guard(state_.mutex);
             if (!state_.createImage(image->native, imageInfo, viewInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, error))
                 return internal<std::unique_ptr<VulkanImage>>("cannot create the image", error);
             image->native.subresourceLayouts.assign(size_t{descriptor.mip_level_count} * imageInfo.arrayLayers,
@@ -1190,7 +1144,7 @@ private:
         const VkFormat format = vulkanFormat(descriptor.format);
         if (format == VK_FORMAT_UNDEFINED)
             return fail<std::unique_ptr<VulkanView>>(VERNON_HAL_UNSUPPORTED, "Vulkan cannot view the format");
-        auto view = std::unique_ptr<VulkanView>(new (std::nothrow) VulkanView(access_));
+        auto view = std::unique_ptr<VulkanView>(new (std::nothrow) VulkanView(owner_));
         if (!view)
             return fail<std::unique_ptr<VulkanView>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate a view");
         const VernonImageSubresourceRange &range = descriptor.subresources;
@@ -1200,8 +1154,8 @@ private:
         info.format = format;
         info.subresourceRange = {range.aspects, range.base_mip_level, range.mip_level_count, range.base_array_layer,
                                  range.array_layer_count};
-        rv::Image &binding = view->binding;
-        if (rv::driver().createImageView(state_.device, &info, nullptr, &binding.view) != VK_SUCCESS)
+        vulkan::Image &binding = view->binding;
+        if (vulkan::driver().createImageView(state_.device, &info, nullptr, &binding.view) != VK_SUCCESS)
             return fail<std::unique_ptr<VulkanView>>(VERNON_HAL_INTERNAL_ERROR, "vkCreateImageView failed");
         binding.image = image.native.image;
         binding.layoutOwner = &image.native;
@@ -1215,27 +1169,24 @@ private:
         return Made{ok(std::move(view))};
     }
 
-    VernonRhiDevice device_;
-    rv::DeviceAccess access_;
-    rv::DeviceState &state_;
+    std::shared_ptr<DeviceState> owner_;
+    DeviceState &state_;
 };
 
 } // namespace
 
-rv::Buffer *vulkanBuffer(uint64_t serial) { return serials().find(serial); }
+vulkan::Buffer *vulkanBuffer(uint64_t serial) { return serials().find(serial); }
 
-std::unique_ptr<Resources> createVulkanResources(VernonRhiDevice device) {
-    auto access = rv::deviceAccess(device);
-    if (access.isErr() || !access.value().state)
+std::unique_ptr<Resources> createVulkanResources(std::shared_ptr<vulkan::DeviceState> state) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<Resources>(new (std::nothrow) VulkanResources(device, access.value()));
+    return std::unique_ptr<Resources>(new (std::nothrow) VulkanResources(std::move(state)));
 }
 
-std::unique_ptr<DeviceBuffers> createVulkanDeviceBuffers(VernonRhiDevice device) {
-    auto state = rv::deviceStateOf(device);
-    if (state.isErr() || !state.value())
+std::unique_ptr<DeviceBuffers> createVulkanDeviceBuffers(std::shared_ptr<vulkan::DeviceState> state) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<DeviceBuffers>(new (std::nothrow) VulkanDeviceBuffers(device, *state.value()));
+    return std::unique_ptr<DeviceBuffers>(new (std::nothrow) VulkanDeviceBuffers(std::move(state)));
 }
 
 } // namespace vernon::hal

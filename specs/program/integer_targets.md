@@ -20,7 +20,7 @@ themselves live in the contracts listed in section 6.
   (per-primitive data) and screen-linear varyings need the same qualifier, so
   it is general from the start.
 - **Formats added file by file.** Format facts live in about 22 files across
-  Python, compiler, Runtime and four RHI backends; each new format would
+  Python, compiler, Runtime and four graphics backends; each new format would
   repeat that edit. One X-macro table is the source instead
   ([`image_resources.md`](../runtime/image_resources.md) section 7).
 
@@ -129,7 +129,7 @@ On every backend with graphics support:
 Nothing consumes multisampled images. The Engine antialiases with TSR rather
 than MSAA, picking reads the single-sample visibility buffer, and the OpenGL
 fallback tier writes IDs as a single-sample color output (Engine
-`specs/render/architecture.md` section 8). The RHI and every provider adapter therefore accept only
+`specs/render/architecture.md` section 8). Every HAL device therefore accepts only
 one sample, and the RenderPass has no resolve target.
 
 A future consumer would bring a multisampling extension with its own spec. It

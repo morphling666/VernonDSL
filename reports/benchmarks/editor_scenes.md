@@ -45,6 +45,35 @@ section 13.
   world's placed entities. Orbiting changes the selected tiles as walking
   does.
 
+## After step 5
+
+The same command after section 16.3 step 5 of
+[`architecture_v2.md`](../../specs/runtime/architecture_v2.md), with
+`--device opengl` and `--device vulkan`, at VernonDSL `f840106` and Vernon
+`90254343`, both with uncommitted work. One run per scene and device,
+except OpenGL `bodies` simulating and `planet` orbiting, which took three:
+
+| Scene | OpenGL frame | OpenGL host | Vulkan frame | Vulkan host |
+|---|---:|---:|---:|---:|
+| empty editor (panels only) | 0.57 ms | 0.53–0.58 ms | 0.62 ms | 0.60–0.61 ms |
+| `dog`, editing | 0.58 ms | 0.51–0.65 ms | 0.65 ms | 0.64–0.65 ms |
+| `dog`, simulating | 0.69 ms | 0.65–0.71 ms | 0.77 ms | 0.74–0.78 ms |
+| `bodies`, editing | 0.56 ms | 0.48–0.62 ms | 0.67 ms | 0.66–0.70 ms |
+| `bodies`, simulating | 3.92–4.08 ms | 2.75–4.20 ms | 2.99 ms | 2.19–3.22 ms |
+| `planet`, standing | 4.49 ms | 1.58–1.67 ms | 4.21 ms | 2.45–2.60 ms |
+| `planet`, orbiting at 10°/s | 4.49–4.58 ms | 2.15–3.19 ms | 4.27 ms | 2.81–3.56 ms |
+
+- **OpenGL** is at or under the table above in every scene but simulating
+  `bodies`, whose frame is 0.15–0.3 ms longer in all three runs, about 5%.
+  Its host time varies by 1 ms between windows as the bodies settle, so
+  the cause is not separated from the simulation's own variation, and no
+  older build remains to compare against.
+- **Vulkan** host time is 0.05–0.1 ms above OpenGL in the small scenes, and
+  0.9 ms above it in `planet` standing, where PlanetWalker's gap is 0.37 ms
+  (`planet_walker_frame.md`). The remaining 0.5 ms is Editor-only work on
+  Vulkan, not yet profiled. Simulating `bodies` is 0.9 ms shorter a frame
+  on Vulkan.
+
 ## Hierarchy
 
 Before this measurement the Scene Hierarchy panel visited every descendant

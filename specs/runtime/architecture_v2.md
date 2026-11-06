@@ -2,15 +2,13 @@
 
 Status: accepted design, migrating as section 16 lists; linked schedules are
 the only execution path ([`design.md`](design.md) sections 2 to 8). It
-replaces the per-Execute interpreter, the stored plans of
-[`stored_plans.md`](stored_plans.md), the binding groups of
-[`binding_groups.md`](binding_groups.md), transactional publication
+replaced the per-Execute interpreter, stored plans, binding groups,
+transactional publication
 ([`../program/architecture.md`](../program/architecture.md) section 9) and
 the per-submission completion effects of pipelined submission, as section
-15 lists. It keeps the goals of
-[`execution_model.md`](execution_model.md) and makes them the only path
-rather than a cache. The compiler and engine parts of the performance work
-are [`../performance.md`](../performance.md) sections 4 to 6.
+15 lists. The compiler and engine parts of the performance work are
+[`../performance.md`](../performance.md) sections 4 to 6, and its
+benchmarks section 7.
 
 ## 1. Goal
 
@@ -93,8 +91,9 @@ depends only on the Program:
   or a transient with its lifetime as an interval of operations.
 - **Sizes are arithmetic on shape symbols.** Each dynamic extent is a symbol
   bound by the call. An allocation's size is rounded up to its **capacity
-  class** (the next power of two, or a maximum the Program declares)
-  (`execution_model.md` section 8).
+  class** (the next power of two, or a maximum the Program declares), so a
+  KV cache of class 4096 serves every sequence length from 2049 to 4096
+  with one allocation.
 - **Grids and sizes are data.** Every dispatch reads its grid, and every
   copy its size, from the argument arena by indirect dispatch and indirect
   copy; a kernel reads its extents from its TensorViews. So an operation's
@@ -189,9 +188,10 @@ A standalone Program links as a one-node graph by the same code.
   ([`../program/architecture.md`](../program/architecture.md) section 8).
   Kernel fusion across nodes and cross-node autodiff belong to a Module
   cooked as one Program.
-- **The linker never merges Program IR.** Today's graph linker builds one
-  canonical Program and resolves it; fragments make that unnecessary, so the
-  runtime holds no Program IR.
+- **The linker never merges Program IR.** A composed Program graph's
+  executable presents only the ABI its nodes' boundary slots compose; its
+  nodes run as their own executables, linked as fragments, so no merged
+  Program is built, resolved or loaded.
 
 ## 5. The artifact
 
@@ -218,16 +218,27 @@ then creates the HAL executables. It plans nothing; linking plans the graph.
 | Command buffer | recorded once, submitted many times, reading its arguments from an arena |
 | Allocator | sub-allocation, arenas and pools per memory class |
 
-- **Backends.** The RHI backends become HAL backends: Vulkan (with
-  descriptor indexing and buffer device addresses, core in 1.2), D3D12,
-  Metal, CUDA, WebGPU, OpenGL and OpenGL ES.
+- **Backends.** Vulkan (with descriptor indexing and buffer device
+  addresses, core in 1.2), D3D12, Metal, CUDA, WebGPU, OpenGL and OpenGL
+  ES.
 - **The CPU is a device.** Its memory is unified, its command buffer is a
   tape of chunk calls, and its queue is the worker pool (`performance.md`
   section 3.2). There is no separate CPU execution path.
-- **A command buffer's native form** is the one of `execution_model.md`
-  section 5: a Vulkan primary command buffer, a D3D12 command list, a CUDA
-  graph built node by node, Metal indirect command buffers, WebGPU render
-  bundles, and a pre-resolved tape on OpenGL and the CPU.
+- **A command buffer's native form** is the one each backend replays
+  without translation:
+
+  | Backend | Native form | A call |
+  |---|---|---|
+  | Vulkan | a primary command buffer recorded without `ONE_TIME_SUBMIT` | submits it again |
+  | D3D12 | a closed command list | `ExecuteCommandLists` again |
+  | Metal | indirect command buffers for draws and dispatches | one execute per pass |
+  | CUDA | a graph built node by node from the schedule, not by stream capture | `cuGraphLaunch`; a changed grid updates its node |
+  | WebGPU | render bundles per pass | `executeBundles` per pass |
+  | OpenGL, OpenGL ES | a tape of resolved native calls | runs the tape |
+  | CPU | a tape of chunk calls | runs the tape |
+
+  Nothing a call changes lives in a command: values, counts and grids are
+  arena bytes, so a recorded command buffer stays valid across calls.
 
 ## 7. The executor
 
@@ -372,7 +383,7 @@ fragments with device placement, which the linker honours.
 | Today | Fate |
 |---|---|
 | `ResolvedExecutionPlan` physical resolve at load | split: the Program's part into its fragment, the graph's part into the linker |
-| `program_graph_linker`, merging child Programs into one canonical Program | the fragment linker (section 4.2) |
+| `program_graph_linker`, merging child Programs into one canonical Program | the fragment linker (section 4.2), and a composed ABI of the nodes' boundary slots (`program_graph_composition`) |
 | `MaterializedNodeFrame`, endpoint carriers | removed; Stages read the canonical layout, explicit conversions where needed |
 | `ResolvedTransferExecutor` | schedule transfers |
 | Command DAG (`source/lib/execution_graph`) at run time | barriers and queues in the linked schedule |
@@ -407,7 +418,7 @@ index allows before publication.
    the next call then links. A linked device write publishes as a
    Program's does: the owner's version advances, the residency holds it,
    and the host downloads before it reads. A CUDA call returns once its
-   launch is enqueued on the device's stream, which the RHI's copies share,
+   launch is enqueued on the device's stream, which the device's copies share,
    so a readback orders after it.
 2. **Multi-kernel fragments, compute graphs, Modules and VJP.** Linking
    across nodes, arena aliasing, capacity classes, the two-executable VJP.
@@ -418,8 +429,8 @@ index allows before publication.
    `FrameGraph` links its nodes' fragments. Gate: `PlanetWalker` standing
    and walking (`performance.md` section 1), which
   `reports/benchmarks/planet_walker_frame.md` measures, and the Editor
-  scenes (`reports/benchmarks/editor_scenes.md`). Section 16.3 moves the
-  graphics backends onto the HAL and deletes the RHI.
+  scenes (`reports/benchmarks/editor_scenes.md`). Section 16.3 puts the
+  graphics backends on the HAL in place of the RHI.
 4. **Remaining backends** (D3D12, Metal, WebGPU, OpenGL ES, wasm32 CPU), then
    deletion of the old runtime.
 
@@ -624,37 +635,32 @@ index allows before publication.
   built-in PTX kernel, one lane per element, with the copy's addresses
   and extents passed by value, so a command buffer with copies launches on
   the stream rather than as a graph.
-- **What does not link falls back.** Struct values, grids computed from
-  Values, Instance storages and Module parameters make
-  `programFragment` fail, and the call runs as a Program, as phase 1
-  kernels do. Graphics nodes link on graphics devices (section 16.2).
+- **What does not link fails.** A Program `programFragment` refuses fails
+  its call with `VERNON_STATUS_UNSUPPORTED_TARGET`; no other executor runs
+  it. The frontend already rejects grids computed from Values and Module
+  attributes that capture Storages, and the compiler emits no Instance
+  storages, so those refusals are not reachable from Python. Graphics nodes
+  link on graphics devices (section 16.2).
 
 ### 16.2 Phase 3: passes, tables and streams
 
-- **Graphics devices are Core devices until section 16.3 replaces them.**
-  The HAL device of Vulkan, OpenGL and OpenGL ES is one implementation
-  over RuntimeCore's provider (`VernonRuntimeCore.h`). This bullet and the
-  Core-specific ones after it (plans, stored scopes, packet batches, the
-  OpenGL adapter, scope fusion in `GraphicsScopeMaterializer`) describe that
-  interim device; slots, tables, streams, labels and the compute and VJP
-  links carry over to the HAL backends unchanged. An
-  executable is a Core pipeline with its binding plan, prepared from the
-  Stage artifacts as Program resolution prepares them; a command buffer is
-  a Core packet batch; a submission begins commands on the RHI encoder,
-  writes the call's value bytes into updatable groups, encodes the batch
-  with the call's payload (draw counts, grids, viewports, clear values) and
-  submits. The batch is the pre-resolved tape of section 6 on every Core
-  backend: on Vulkan a call encodes it into a fresh primary command buffer
-  instead of resubmitting a native one, since the RHI tracks image layouts
-  and staging per command frame. Encoding is O(commands), and with draw
-  streams a pass has a command per table entry, not per draw.
+- **Graphics devices are HAL devices** (section 16.3). An executable is a
+  pipeline with its binding plan, prepared from the Stage artifacts as
+  Program resolution prepares them; a command buffer is the native
+  recording the HAL device keeps, and a submission writes the call's
+  payload (value bytes, draw counts, grids, viewports, clear values) into
+  the recording's arena and submits it. With draw streams a pass has a
+  command per table entry, not per draw.
 - **A graphics node is a pass.** The descriptor names the resolved Program
   executable (`VernonScheduleProgramDescriptor::executable`) whose Stages
   prepared the pipelines, so linking prepares nothing. The fragment's slots
   are the graph's input boundary slots as `ARGUMENT` slots, each a
-  `VernonProgramArgument` (an RHI buffer view, image view, sampler or host
-  value bytes), then per node a `PASS` slot (a `const VernonRenderPass *`:
-  attachment views, load and store operations, clear values, render area),
+  `VernonProgramArgument` (a tensor view of a HAL buffer, an image view, a
+  sampler or host value bytes), then per node a `PASS` slot (a `const VernonRenderPass *`:
+  attachment views, load and store operations, clear values, render area;
+  the render area bounds the clears, a zero width or height covers the
+  whole attachments, an area outside them fails the call, and scopes of
+  different areas do not fuse),
   a `DRAW` slot (a `VernonDrawCommand`, whose template is the node's default
   draw), a `DYNAMIC` slot (a `VernonDynamicState`; zero `struct_size` draws
   with the render area as viewport and scissor) and a `STREAM` slot (a
@@ -675,54 +681,28 @@ index allows before publication.
   counts, or per axis the host scalar of the boundary Value a control names
   (32- or 64-bit, negative rejected), or for a linearized dispatch the
   element count of its first shaped Tensor argument, all resolved at call
-  time as an invocation resolves them. It encodes outside every render
-  scope (`encodeResolvedStage`), so it ends the scope before it and no pass
-  after it fuses with one before it; Core orders its writes before later
-  draws that read them. A frame that culls on the GPU and then draws links
+  time as an invocation resolves them. It records outside every render
+  scope, so it ends the scope before it and no pass after it fuses with one
+  before it; the linker orders its writes before later draws that read
+  them. A frame that culls on the GPU and then draws links
   as one schedule this way.
-- **A pass is planned once per structure on Core devices.** Without
-  buffer addresses in shaders, a bound resource is a group the batch names,
-  so planning a draw command (the node's draw, its stream, or one per table
+- **A pass is planned once per structure** (`runtime/schedule/pass_plan.h`).
+  Planning a draw command (the node's draw, its stream, or one per table
   entry) costs O(bindings). A call reuses the plan an earlier call made of
   the same table and revision, or for a pass without a table of the same
   draw, when the words of everything else the draws depend on match: the
   node's arguments but for the bytes of host Tensors, the attachments'
   formats and extent, the render area and the dynamic state. A reused plan
-  takes the call's host bytes again.
-- **A render scope of reused plans replays.** The first call that encodes
-  a scope whose passes are all reused plans stores its packet batch, keyed
-  by the plans and the attachments. A later call that matches the key
-  rewrites only the updatable groups whose bytes changed and encodes the
-  stored batch with its payload; stream records are read when the batch is
-  decoded. A steady frame therefore plans, validates and creates nothing.
-  Each command keeps up to four stored scopes, the oldest evicted first,
-  so a call never evicts a scope it replays later; swapchain images are
-  attachments, so each presented image has its own stored scope.
-- **A packet batch prepares its render scopes.** Building a batch checks
-  each render scope against the device once: attachment formats, the
-  stencil aspect, and the subresources its reads sample and their overlap
-  with the attachments (`prepareRendering`). The batch leases the
-  attachment and sampled images, so destroying one hides it at once and
-  frees it when the last batch naming it retires, as stored plans do.
-  Beginning a prepared scope on an encoder checks only the encoder's state:
-  no image the scope loads or samples is still undefined; then it records
-  the attachments defined and takes the clear values from the payload.
-- **The OpenGL adapter applies only what changed.** A draw binds its
-  program only when another is bound, and a group's bindings only when the
-  group differs or the program reads an entry the last application skipped.
-  Each program keeps a read mask of the group entries it reads (active
-  uniform blocks and sampler uniforms, and the samplers of their units), so
-  entries a program never reads are never bound. Named uniforms upload per
-  program when its group changes. With separate attribute formats (OpenGL
-  4.3, OpenGL ES 3.1) a vertex buffer change is one call per binding;
-  otherwise the attribute pointers are specified again.
+  takes the call's host bytes again, and keeps its id, which keys the HAL
+  device's recording (section 16.3), so a steady frame plans, validates and
+  records nothing.
 - **Adjacent passes share a render scope.** A submission plans every pass
   before it begins a scope, since a scope names the images all its passes
   sample when it begins; then `GraphicsScopeMaterializer` fuses a pass whose
   attachments are the previous pass's views and which loads rather than
   clears them into that pass's scope. Image layouts and buffer barriers
-  between operations follow from the accesses the linker ordered, as Core
-  emits them for the resources each command binds.
+  between operations follow from the accesses the linker ordered, which the
+  HAL device records for the resources each command binds.
   `vernonScheduleGetGraphicsTelemetry` reports the scopes and draw commands
   of the last call; a stream is one draw command.
 - **A pass table is a pass's structure.** `VernonSchedulePassTable` holds
@@ -749,10 +729,11 @@ index allows before publication.
   scope its own group and each dispatch one, and encodes the debug commands
   of a table's entries before their draws and its trailing ones after the
   last entry (`VernonScheduleDebugCommand`); a recording's debug commands
-  end a run, so they go with the entry after them. They are packets, so a
-  stored scope replays them. `vernonScheduleSetTimings` makes later calls
-  bracket each scope and dispatch with RHI timers, which flushes the
-  packet stream at each edge; `vernonScheduleGetScopeTimings` reports the
+  end a run, so they go with the entry after them. They are part of the
+  recording, so a reused recording keeps them. `vernonScheduleSetTimings`
+  makes later calls bracket each scope and dispatch with timestamp queries,
+  and a timed call keys its own recording; `vernonScheduleGetScopeTimings`
+  reports the
   spans of a waited call as `VernonScopeTiming`, so a caller maps them to
   its passes as it maps an Execute's (`gpu_profiling.md` section 3). The
   device keeps the spans of its latest 32 timed calls. Per-node counts
@@ -764,30 +745,28 @@ index allows before publication.
   layout: index count, instance count, first index, base vertex, first
   instance; 20 bytes, also OpenGL's `DrawElementsIndirectCommand`) and
   `uint32_t` counts; a stream draws the first `min(counts[count_index],
-  max_records)` records from `first_record` on. It is one Core packet,
-  `DRAW_INDEXED_STREAM`, whose payload carries the range and, for a host
-  stream, the host addresses, so a stored batch draws another stream by
-  patching payload words. A device stream names buffers and is one
-  `vkCmdDrawIndexedIndirectCount` on Vulkan (`VK_KHR_draw_indirect_count`,
-  which the 1.1 instance admits where core 1.2 would not; providers
-  advertise `VERNON_RUNTIME_PROVIDER_DEVICE_DRAW_STREAMS`). A host stream
-  lives in host memory (`VERNON_RUNTIME_PROVIDER_HOST_DRAW_STREAMS`, on
-  Vulkan, OpenGL and OpenGL ES): the provider reads it while it encodes,
-  one native draw per record, and Core checks each drawn record's indices
-  against the index buffer first, O(drawn records), which the per-record
-  native draws cost anyway. A kernel that writes a device stream clamps to
+  max_records)` records from `first_record` on. It is one operation of the
+  recording, whose arena bytes carry the range, so a reused recording draws
+  another stream by rewriting arena bytes. A device stream names buffers
+  and is one `vkCmdDrawIndexedIndirectCount` on Vulkan
+  (`VK_KHR_draw_indirect_count`, which the 1.1 instance admits where core
+  1.2 would not). A host stream lives in host memory: a call copies its
+  records into the arena, checking each drawn record's indices against the
+  index buffer first, O(drawn records), and draws them as a device stream,
+  or on OpenGL without multi-draws one native draw per record. A kernel
+  that writes a device stream clamps to
   the same bounds. Writers zero the records past their count, so a stale
   count draws nothing.
 - **First instance is portable on OpenGL.** SPIRV-Cross emits
   `gl_InstanceID + SPIRV_Cross_BaseInstance`, defined as
   `gl_BaseInstanceARB` under `GL_ARB_shader_draw_parameters` and a uniform
-  otherwise. The adapter draws with base-instance entry points where the
-  driver has them and sets the uniform where the program has it; without
-  base-instance draws it offsets each per-instance attribute pointer by
-  `first / divisor` records, and a divisor that does not divide `first` is
-  unsupported. Records with nonzero `first_instance` therefore draw on every
-  Core backend except D3D12, whose `SV_InstanceID` lacks a base constant
-  yet.
+  otherwise. The OpenGL device draws with base-instance entry points where
+  the driver has them and sets the uniform where the program has it;
+  without base-instance draws it offsets each per-instance attribute pointer
+  by `first / divisor` records, and a divisor that does not divide `first`
+  is unsupported. Records with nonzero `first_instance` therefore draw on
+  every HAL backend; D3D12's `SV_InstanceID` lacks a base constant, which
+  its phase 4 device must supply.
 - **A compute Program links from its executable on the CPU and CUDA.** The
   fragment is built from the variant's `program` JSON and the Stage kernel
   fragments prepared at load, and every owned Invocation buffer Storage is
@@ -804,19 +783,27 @@ index allows before publication.
   their physical leaves sit at the canonical layout's offsets.
   `vernonScheduleSlotBoundary` names the boundary slot of every `ARGUMENT`
   slot, on graphics devices too.
-- **A composed Program graph links per node on the CPU and CUDA.** Resolving
-  a composed graph there loads each node's bundle executable once and keeps
-  the graph's connections and exports (`ProgramGraphComposition`); a link
-  builds each node's fragment from its own executable and links them with
+- **A composed Program graph links per node on every device.** Resolving a
+  composed graph loads each node's bundle executable once and keeps the
+  graph's connections and exports (`ProgramGraphComposition`); a link builds
+  each node's fragment from its own executable, kernel fragments on the CPU
+  and CUDA and pass fragments on a graphics device, and links them with
   `vernon::schedule::link`, a Value edge or Storage chain as one connection.
   A connection no export names is internal, as is a boundary row no
-  connection or export covers, such as an output no node reads. Rejected:
-  serializing the composed Program to JSON for one fragment, which would
-  duplicate the graph linker's renumbering. Graphics devices keep linking
-  the composed Program itself, whose passes are already per node, and keep
-  the composition only when every node has a backward graph, for the VJP:
-  its forward and backward schedules link the nodes' pass fragments as the
-  CPU links their kernel fragments.
+  connection or export covers, such as an output no node reads. An image a
+  pass renders to has no row: its PASS slot names it, so connecting or
+  exporting it adds no slot. The composed executable itself holds only the
+  ABI: the nodes' boundary slots that stay visible, exported ones under their
+  export paths and the others as `node/<id>/<path>`, with connected
+  boundaries sharing Value and Storage ids. A node binds only what the graph
+  exports from it, so its pass pipelines classify connected endpoints as
+  fixed. Graphics node `n` of the composed graph is the forward Node that
+  follows the forward Nodes of every earlier node, as the linked schedule
+  numbers its fragments' Nodes; its pipeline 0 is that node's, and a
+  pipeline on a composed executable draws with a source Program, since
+  pipeline 0 binds by a node's slots. Rejected: merging the nodes into one
+  Program and resolving it, which loads and compiles every Stage twice and
+  keeps Program IR at run time.
 - **A linked VJP is two schedules and a residual block.** `planVjp` takes
   from the variant JSON the forward allocations the backward graph reads
   (residuals), the tapes that are slots (every tape on the CPU, one a
@@ -825,7 +812,7 @@ index allows before publication.
   schedule exposes residuals and tapes as block slots; the backward exposes
   its captured Storages, tapes and scalars. A forward call copies its record
   into the block and allocates the residuals there, 256-byte aligned, in a
-  host buffer on the CPU and an RHI device buffer on CUDA, sized from the
+  host buffer on the CPU and a HAL buffer on CUDA, sized from the
   extents the call's arguments resolve; tapes are owned by the block. A
   backward call rereads captured arguments from that record at their
   forward offsets and binds its block slots to the block's entries. The
@@ -895,28 +882,28 @@ index allows before publication.
   linked by `vernonScheduleLinkGraph`; scene passes are `STREAM` passes
   whose tables hold Vernon's buckets (`gpu_scene.md`). On the high tier a
   culling kernel node writes the streams and counts; on the compatibility
-  tier the CPU cook of the same kernel writes them into host streams. `Runtime::initialize`
-  admits Vulkan and presents through an RHI surface.
+  tier the CPU cook of the same kernel writes them into host streams.
+  `Runtime::initialize` admits Vulkan and both OpenGL tiers and presents
+  through HAL surfaces.
 
 ### 16.3 The HAL replaces the RHI
 
-The Core device of section 16.2 encodes every call again through four
-layers: RuntimeCore packets, the RHI adapter's decoder, the RHI's command
-layer (encoder slots, leases, registry lookups, layout tracking) and the
-RHI backend. That per-call cost is what held Vulkan above the phase 3
-gate, and it is the design sections 6 and 7 replace, so it is not tuned
-further. The CPU, CUDA, Vulkan, OpenGL and OpenGL ES devices are HAL
-backends, and the Core device is deleted. This section ends with
-`VernonRHI.h` and RuntimeCore deleted and every backend a HAL backend.
+Phase 3 first ran graphics on an interim Core device, which encoded every
+call again through four layers: RuntimeCore packets, the RHI adapter's
+decoder, the RHI's command layer (encoder slots, leases, registry lookups,
+layout tracking) and the RHI backend. That per-call cost held Vulkan above
+the phase 3 gate, and it is the design sections 6 and 7 replace. The CPU,
+CUDA, Vulkan, OpenGL and OpenGL ES devices are HAL backends; the RHI,
+RuntimeCore and the Core device are deleted.
 
 - **Layout.** `source/lib/hal/` holds the interface (`hal.h`, moved from
   `runtime/schedule`) and a directory per backend: `cpu/`, `cuda/`,
   `vulkan/`, `opengl/` (OpenGL 3.3 and 4.x, OpenGL ES 3.x), and in phase 4
   `d3d12/`, `metal/` and `webgpu/`. The RHI backends' device, memory,
-  staging, format and surface code moves there; their command encoders,
-  registry and validation do not. The linker and executor stay in
+  staging, format and surface code moved there; their command encoders,
+  registry and validation did not. The linker and executor stay in
   `runtime/schedule`.
-- **One public device API.** `VernonHal.h` replaces `VernonRHI.h`: devices
+- **One public device API.** `VernonHal.h` is it: devices
   (created on an adapter, or adopting a caller's OpenGL context), buffers
   with one home, images and views, samplers, surfaces (configure, acquire,
   present), uploads and readbacks ordered on the queue's timeline, and
@@ -927,7 +914,7 @@ backends, and the Core device is deleted. This section ends with
   with no registry, lease or lookup on the call path. Destroying a resource
   frees it after the device's latest submitted point, O(1); a recording
   that names it is evicted with it (section 7).
-- **Vulkan records once.** The baseline is the RHI's: a 1.1 instance,
+- **Vulkan records once.** The baseline is a 1.1 instance,
   dynamic rendering where present and render passes otherwise,
   `VK_KHR_draw_indirect_count` for counted streams. A recording is a primary
   command buffer per frame slot (two or three in flight), keyed as section
@@ -943,11 +930,11 @@ backends, and the Core device is deleted. This section ends with
   frame makes no Vulkan call but the submit. Host streams are copied into
   the block and drawn as device streams, so stream contents never change a
   recording; a table's structure revision does. A call is one
-  `vkQueueSubmit` that signals the queue's timeline semaphore, after one
-  batched transfer submission for the uploads queued since the last.
-- **The Vulkan device as built in step 1** (`hal/vulkan/vulkan_device.cpp`)
-  differs from that end state where the RHI device code or the pass
-  planner still decides:
+  `vkQueueSubmit`, with the uploads queued since the last call ahead of the
+  recording in the same submission, that signals the frame's fence, whose
+  serial is the call's timeline point.
+- **The Vulkan device as built** (`hal/vulkan/vulkan_device.cpp`) differs
+  from that end state where the pass planner still decides:
   - A recording covers every pass of a command buffer. Its key is each
     graphics pass's plan id, each compute pass's executable, resources and
     whether its grid is empty, the attachments of every render scope, and
@@ -969,23 +956,24 @@ backends, and the Core device is deleted. This section ends with
     and attachment formats.
   - Image layouts are tracked per recording from the first use of each
     subresource; submission records the transitions from the layouts the
-    RHI tracks into a prologue, or after the pending uploads, which go in
-    the same `vkQueueSubmit` ahead of the recording. Completion is the RHI
-    frame's fence and serial until step 4.
-  - A device whose host owns the native objects (a borrowed RHI device)
-    links no schedule, since its host submits; `VernonHal.h` has no
-    borrowed Vulkan device.
+    images hold into a prologue, or after the pending uploads, which go in
+    the same `vkQueueSubmit` ahead of the recording (`design.md` section
+    12).
+  - `VernonHal.h` has no borrowed Vulkan device, whose host would own the
+    native objects and submit: a linked schedule submits its own
+    recordings.
 - **OpenGL executes a tape.** Recording resolves each command to GL names,
-  drops state the previous command already set (the Core OpenGL adapter's
-  change tracking moves here), and stores a flat array of operations; a
+  drops state the previous command already set (the change tracking the
+  deleted OpenGL adapter did per call), and stores a flat array of operations; a
   call patches the names of arguments whose resources changed, reads host
   streams, and runs the array. OpenGL 4.3 and OpenGL ES 3.1 dispatch
   compute nodes; on OpenGL 3.3 a compute node runs on the CPU device and
   writes host streams, from the same DSL kernel.
-- **The OpenGL device as built in step 2** (`hal/opengl/opengl_device.cpp`),
-  where the RHI device code or the pass planner still decides:
-  - It drives the RHI device's context, under the RHI device's mutex. The
-    device's own mutex is taken before that one, never after, so building
+- **The OpenGL device as built** (`hal/opengl/opengl_device.cpp`), where
+  the pass planner still decides:
+  - It drives the device state's context, under the device state's mutex
+    (`hal/opengl/opengl_state.h`). The device's own mutex is taken before
+    that one, never after, so building
     a scope's framebuffer (which takes it) happens only while a recording
     is built.
   - Recordings are keyed and kept as on Vulkan: eight per command buffer,
@@ -1009,7 +997,7 @@ backends, and the Core device is deleted. This section ends with
   - A compute dispatch is followed by a barrier of every bit, as the next
     pass's reads are not known to the tape.
   - A render scope binds a framebuffer for its attachments from the
-    context's cache, which drops a framebuffer when a texture it attaches
+    device state's cache, which drops a framebuffer when a texture it attaches
     is destroyed, since GL reuses texture names. It enables sRGB writes on
     desktop OpenGL, which the tape's end disables again, and invalidates
     discarded attachments the render area covers.
@@ -1017,25 +1005,21 @@ backends, and the Core device is deleted. This section ends with
     read when the call retires.
 - **CPU and CUDA move unchanged** to `hal/cpu/` and `hal/cuda/`.
 - **A CUDA buffer is a HAL allocation** (`hal/cuda/cuda_resources.cpp`)
-  in the CUDA context of the device's RHI device, outside the RHI's
-  registry. Its reference carries its device address as the resource
-  value, with an identity whose low bits (kind 5) no RHI adapter identity
-  uses, so a schedule binds it without a lookup and the Program invocation
-  runtime rejects it. Residual blocks are buffers of the device the
-  schedule links on. Freeing one returns it to the context's allocation
-  cache, which the device's single stream orders after every submission
-  that read it. Rejected: keeping RHI buffers and caching the registry
-  lookup, which costs a lookup per argument per call on the RHI path this
-  section removes.
-- **A Vulkan or OpenGL buffer is a HAL allocation**, outside the RHI's
-  registry:
-  - On Vulkan (`hal/vulkan/vulkan_resources.cpp`) it is made by the RHI's
-    unregistered-buffer functions of `rhi/vulkan_backend.h`. These share the
-    device's lock, staging and queue order with registered buffers, and a
-    destroyed buffer lives on until every submission made so far completes.
+  in the device's CUDA context. Its reference carries its device address as the resource
+  value, with identity kind 5, so a schedule binds it without a lookup and
+  the Program invocation runtime rejects it. Residual blocks are buffers of
+  the device the schedule links on. Freeing one returns it to the context's
+  allocation cache, which the device's single stream orders after every
+  submission that read it. Rejected: keeping RHI buffers and caching the
+  registry lookup, which cost a lookup per argument per call.
+- **A Vulkan or OpenGL buffer is a HAL allocation**:
+  - On Vulkan (`hal/vulkan/vulkan_resources.cpp`) it is made by the device
+    state (`hal/vulkan/vulkan_state.h`) under its lock, with its staging and
+    queue order, and a destroyed buffer lives on until every submission
+    made so far completes.
   - On OpenGL and OpenGL ES (`hal/opengl/opengl_resources.cpp`) it is an
-    OpenGL buffer made under the device's mutex through
-    `rhi/opengl_access.h`.
+    OpenGL buffer made under the mutex of the device state
+    (`hal/opengl/opengl_state.h`), which the HAL device owns.
   - Its reference has identity kind 5 over the device state's address
     (`hal/native_buffers.h`). Its resource value is a serial no later buffer
     reuses, never the native handle. Recordings and plan keys compare
@@ -1045,7 +1029,7 @@ backends, and the Core device is deleted. This section ends with
     process-wide registry.
 - **A Vulkan or OpenGL image, view, sampler or surface is a HAL object**
   (`hal/vulkan/vulkan_resources.cpp`, `hal/opengl/opengl_resources.cpp`,
-  `hal/native_images.h`), outside the RHI's registry:
+  `hal/native_images.h`):
   - A view's reference has identity kind 6 and a sampler's kind 7, over the
     device state's address, with a serial as the resource value, for the
     reason buffers use one. The view's registry entry holds its image's
@@ -1055,8 +1039,8 @@ backends, and the Core device is deleted. This section ends with
     (`checkRenderScope`): live views of the device, attachment usage, one
     mip and layer covering the format's aspects, and sampled reads.
   - A surface image's contents are undefined from its acquire until a
-    submitted pass writes it, and a submission that reads it before then is
-    rejected. The set is process-wide, keyed by image serial, with a flag
+    submitted pass or a host write writes it, and a submission or host read
+    that reads it before then is rejected. The set is process-wide, keyed by image serial, with a flag
     that skips its lock while it is empty.
   - A surface is a ring of its own images. Present blits one to the window:
     on Vulkan to an acquired swapchain image, on OpenGL to the default
@@ -1069,15 +1053,12 @@ backends, and the Core device is deleted. This section ends with
 - **DirectX 12 and Metal have no HAL device until phase 4.** Creating one
   returns `VERNON_HAL_UNSUPPORTED`, and Python sessions report both
   unavailable. Their compiler targets remain.
-- **`VernonHal.h` as built in step 3** (`hal/capi.cpp`, `hal/resources.h`),
-  where the RHI device code still decides:
+- **`VernonHal.h`** (`hal/capi.cpp`, `hal/resources.h`):
   - It is a C header exported by `VernonRuntime`. Images, views, formats,
     usage and aspects are the `VernonTextureTypes.h` types schedules
     already take, so a HAL image's descriptor is the one a schedule
     argument declares. Status, buffer, sampler and surface types are the
-    HAL's own; values shared with `VernonRHI.h` are equal, so the RHI
-    device code the backends still call takes them by cast until it moves
-    into `hal/`.
+    HAL's own.
   - A HAL device owns its runtime context; schedules link on
     `vernonHalDeviceGetRuntime`, and waiting on the device waits on its
     schedules. A device, an image with views, and a surface with an
@@ -1092,9 +1073,21 @@ backends, and the Core device is deleted. This section ends with
   - The CPU device's resources are native host memory: buffers 256-byte
     aligned and zero-filled, image transfers in the format's whole-texel
     layout, no mipmap generation, attachments, multisampling or surfaces.
-  - The CUDA, Vulkan and OpenGL devices run on an RHI device that
-    `hal/capi.cpp` creates for them, for its context, queue and staging
-    only. The CUDA device has no images, samplers or surfaces.
+  - The Vulkan device owns its state (`hal/vulkan/vulkan_state.h`): the
+    instance, physical and logical device, queue, mutex, command frames and
+    upload and readback staging pools, which its HAL device, its resources
+    and its runtime context share.
+  - The OpenGL and OpenGL ES device owns its state
+    (`hal/opengl/opengl_state.h`): the adopted context, the loaded driver,
+    the mutex, the framebuffer cache and the debug output, which its HAL
+    device, its resources and its runtime context share. The last owner
+    to release it shuts it down with the context current.
+  - The CUDA device owns its CUDA state (`hal/cuda/cuda_state.h`): the
+    primary context, the stream, the allocation cache and pinned staging,
+    which its HAL device, its resources and its runtime context share. Its
+    runtime context is created over the HAL device
+    (`createRuntimeContextForHal`) rather than the HAL device over a
+    context. It has no images, samplers or surfaces.
 - **Programs as schedules in step 4**, the cases a Program fragment links
   that section 16.1 does not name:
   - A TensorView of Structs is one BUFFER slot. Its storage leaves index
@@ -1118,7 +1111,7 @@ backends, and the Core device is deleted. This section ends with
   - An owned Storage whose extents follow an input (`vd.empty_like`) is
     an internal buffer sized when its pass is planned, from the input's
     ARGUMENT slot. Internal buffers, carriers and tape launch counts are
-    buffers of the device's own pool, never the RHI's. An internal buffer
+    buffers of the device's own pool. An internal buffer
     grows to the largest call so far; the buffer it
     outgrows is freed when the device is idle, since a running submission
     may read it.
@@ -1174,10 +1167,9 @@ backends, and the Core device is deleted. This section ends with
        memory, so adding them adds kinds and not calls.
      Each recording key (section 7) is listed with what invalidates it,
      since every invalidation is a frame that records again.
-  1. The Vulkan HAL backend beside the Core device. Until step 4 it adopts
-     the RHI device's native device and resolves an RHI resource to its
-     native handle only when an argument's resource changes. Gate: Vulkan
-     PlanetWalker under 1 ms standing and 2 ms walking.
+  1. The Vulkan HAL backend beside the Core device, on a bridge to the RHI
+     device's native objects. Gate: Vulkan PlanetWalker under 1 ms standing
+     and 2 ms walking.
   2. The OpenGL tape backend on the same bridge. Gate: OpenGL at or under
      the numbers above, OpenGL 3.3 included.
   3. CPU and CUDA under `source/lib/hal/`; `VernonHal.h` with the resource
@@ -1189,10 +1181,23 @@ backends, and the Core device is deleted. This section ends with
   5. Deletion, then the benchmarks of `performance.md` section 7: the
      Core device (`hal_core`, `pass_fragment`'s Core parts), `rhi/`,
      `runtime/rhi_adapter/`, RuntimeCore and the provider
-     (`VernonRuntimeCore.h`, `VernonRuntimeProvider.h`,
-     `VernonRuntimeRHIAdapter.h`), `VernonRHI.h`, `execution_graph/`,
-     `runtime/program_execution/`, and the Program invocation runtime of
-     section 15, with their tests.
+     (`VernonRuntimeCore.h`, `VernonRuntimeRHIAdapter.h`, and the provider
+     callbacks of `VernonRuntimeProvider.h`, which keeps the binding-layout,
+     binding-value and draw-record types schedules use), `VernonRHI.h`,
+     `execution_graph/`, `runtime/program_execution/`, and the Program
+     invocation runtime of section 15, with their tests.
+
+  Steps 0 to 5 are done, and the benchmarks are in `reports/benchmarks/`.
+  Every executor but the schedule's is deleted, and so are the load-time
+  residency, transfer, hazard, alias and scope policies, which the linker
+  decides instead. `ResolvedExecutionPlan`
+  is now only each node's loaded Stage and projections, which fragments are
+  built from. The graphics planners (`graphics_invocation_planner.h`,
+  `graphics_scope_materializer.h`) and the binding-set frames
+  (`set_frame.h`) are what the pass planner builds passes and draw tables
+  with. A composed Program graph takes its ABI from its nodes and links as a
+  graph of them on every device (section 16.2), so no merged Program
+  remains.
 
 ## 17. Risks
 
@@ -1231,14 +1236,20 @@ backends, and the Core device is deleted. This section ends with
   its arena and fence its boundaries: no aliasing between nodes, a full
   barrier at every edge, and no render-pass merging, which tile GPUs pay for
   most.
-- **Linking Program IR, then resolving it** (today's graph linker). The
-  runtime would keep Program IR and a resolver; fragments link in
-  O(operations + edges).
+- **Linking Program IR, then resolving it**, as a merged-Program graph
+  linker does. The runtime would keep Program IR and a resolver; fragments
+  link in O(operations + edges).
 - **Validating draws per Execute.** Draw records checked when written cost
   O(1) each once, not every frame.
 - **CUDA stream capture** to build graphs: it captures runtime-internal work;
-  recording from the schedule is deterministic (as `execution_model.md`
-  section 16 already rejects).
+  recording from the schedule is deterministic.
+- **Faster per-command translation**, the immediate-mode design of UE5's
+  RHI, bgfx, Diligent, NVRHI and wgpu: the engine issues every command
+  again each frame and the RHI rediscovers its state, so the cost still
+  scales with commands times frames.
+- **Dynamic offsets per group**: still one bind per draw, and Vulkan
+  guarantees only 8 dynamic uniform and 4 dynamic storage buffers per
+  layout.
 - **Shape as structure.** Every new extent would record again; indirect
   grids make extents payload, and capacity classes bound reallocation.
 - **Recording per capacity class on every backend.** A tensor crossing a
@@ -1249,7 +1260,7 @@ backends, and the Core device is deleted. This section ends with
   in the runtime, and fusing kernels is the compiler's job when a Program,
   or a Module of several, is cooked. The linker only merges graphics passes
   into one render scope where their attachments allow (section 4.2).
-- **A graphics HAL device over RuntimeCore** (section 16.2's Core device).
+- **A graphics HAL device over RuntimeCore** (phase 3's interim Core device).
   It reaches every backend at once, but encodes each call again through
   packets, the RHI adapter and the RHI's validation; on Vulkan that held
   PlanetWalker near 1.5 ms of host time, against OpenGL's 0.8 ms through the

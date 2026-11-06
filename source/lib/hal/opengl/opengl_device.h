@@ -13,7 +13,7 @@ struct VernonRuntimeContext;
 
 namespace vernon::hal {
 
-// Null when the context's RHI device is not OpenGL or OpenGL ES.
+// The device over the context's OpenGL state (runtime/backend_opengl.h); null for a context of another backend.
 std::unique_ptr<Device> createOpenGLDevice(VernonRuntimeContext &context);
 
 } // namespace vernon::hal

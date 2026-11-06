@@ -73,7 +73,7 @@ must be deferred.
 A params class has no physical meaning, so the source unit that aggregates
 parameters is independent of the unit the Runtime binds: a leaf's group is
 its update frequency, written as its `set`, not the class it is declared in
-([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3).
+([`placement.md`](placement.md)).
 Fields therefore carry their own interface metadata, and a class places its
 leaves the same way wherever it is used. With bindless resource tables
 (Engine extension E3), typed handles become ABI-stable Values that a Struct

@@ -12,7 +12,7 @@ struct VernonRuntimeContext;
 
 namespace vernon::hal {
 
-// Null when the context's RHI device is not Vulkan or borrows its native objects, whose host submits for it.
+// Null unless the context is a Vulkan context with its device state.
 std::unique_ptr<Device> createVulkanDevice(VernonRuntimeContext &context);
 
 } // namespace vernon::hal

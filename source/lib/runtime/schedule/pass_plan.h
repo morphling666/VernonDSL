@@ -5,7 +5,6 @@
 // command buffer from the record it is given, reusing the plan an earlier call made of the same table and inputs, and
 // groups adjacent graphics passes into render scopes where their attachments allow.
 
-#include "VernonRHI.h"
 #include "VernonSchedule.h"
 #include "hal/hal.h"
 #include "hal/native_buffers.h"
@@ -170,6 +169,8 @@ struct PlannedCopy {
 // is a compute pass with no executable and its `copy`.
 struct PlannedPass {
     const PassExecutable *executable{};
+    // The dispatch it plans, whose schedule node and label name it in timings and debug groups.
+    const DispatchCommand *command{};
     runtime::PlannedRenderTargets targets;
     runtime::GraphicsScopeReads reads;
     // Reserved before it is filled: the transient groups of the stream are keyed by each draw's address.

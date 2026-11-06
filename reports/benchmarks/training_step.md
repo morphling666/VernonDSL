@@ -105,6 +105,24 @@ follows:
 | the schedule call: record copy, node comparison and `cuGraphLaunch` of about 513 nodes | 67–98 |
 | publishing the 256 gradient writes | 11 |
 
+## After step 5
+
+The same commands after section 16.3 step 5 of `architecture_v2.md`, at
+`f840106` with uncommitted work, with `_step5` added to each result file's
+name. µs per step, step / idle step:
+
+| layers | unbound CPU | bound CPU | unbound CUDA | bound CUDA |
+|---:|---:|---:|---:|---:|
+| 1 | 19.5 / 20.1 | 14.9 / 14.6 | 99.5 / 38.2 | 91.5 / 28.1 |
+| 8 | 42.9 / 44.5 | 22.0 / 21.6 | 150.1 / 76.8 | 120.7 / 36.5 |
+| 64 | 226.5 / 228.5 | 75.1 / 75.2 | 512.4 / 359.4 | 364.0 / 105.0 |
+| 256 | 948.6 / 921.1 | 253.7 / 252.2 | 2660.9 / 1471.9 | 2029.7 / 339.0 |
+
+The CPU rows are at or under the tables above. The CUDA idle steps, which
+measure the host, are within 2% unbound and 7% bound. The back-to-back
+256-layer CUDA steps are 11–12% higher, almost all of it in the Python
+column, which is waiting for the device.
+
 ## Reading
 
 - **Python is nearly flat in a bound step.** It grows from 10 µs to 37 µs

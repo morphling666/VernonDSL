@@ -1,9 +1,7 @@
 # Runtime design
 
 Status: current Runtime architecture. Programs run as linked schedules over
-the HAL ([`architecture_v2.md`](architecture_v2.md)). RuntimeCore and the RHI
-remain for Stage resolution and pipeline preparation until step 5 of
-`architecture_v2.md` section 16.3 removes them; the Python claims and
+the HAL ([`architecture_v2.md`](architecture_v2.md)). The Python claims and
 residencies of section 1 remain until buffers have one home.
 
 Program semantics and deployment are defined by
@@ -14,28 +12,27 @@ Graphics-specific semantics are defined by
 
 ## 1. Ownership layers
 
-Runtime execution is split into four layers:
+Runtime execution is split into two layers:
 
-- **Runtime API** owns Program bundles, executables, linked schedules and
-  VJPs, timeline points, validation diagnostics, and public resource
-  references.
-- **RuntimeCore** owns manifest resolution, Stage binding plans, pipeline
-  preparation, and provider-neutral caches.
-- **HAL** owns devices, resources, surfaces, recorded command buffers,
-  submission, and timeline points (`VernonHal.h`).
-- **VernonRHI** is the provider that RuntimeCore prepares pipelines through.
-  It still backs DirectX 12 and Metal, which have no HAL device yet.
+- **Runtime API** owns Program bundles, executables, manifest resolution,
+  Stage binding plans, linked schedules and VJPs, validation diagnostics,
+  and public resource references (`VernonRuntime.h`, `VernonSchedule.h`).
+- **HAL** owns devices, resources, surfaces, pipelines, recorded command
+  buffers, submission, and timeline points (`VernonHal.h`). A HAL device
+  owns the runtime context its schedules link on. DirectX 12 and Metal have
+  no HAL device until phase 4 of `architecture_v2.md` section 16.
 
-RuntimeCore stores opaque provider resource references. It does not own native
-textures, framebuffers, descriptor heaps, queues, command encoders, or fences.
+A schedule names resources by opaque references (`vernonHalReference*`). The
+Runtime API does not own native textures, framebuffers, descriptor heaps,
+queues, command buffers, or fences.
 
 ### Python RuntimeSession ownership
 
 `RuntimeSession` selects one fully constructed native Runtime. The native
-binding stores the Runtime and optional RHI host in one shared `RuntimeState`;
-an internally created OpenGL context is owned directly by that RHI host rather
-than by a Python helper. Destruction is ordered Runtime → RHI device → owned GL
-context. Runtime, executable, schedule, VJP, argument-record, residual, and
+binding stores the HAL device, whose runtime context it uses, in one shared
+`RuntimeState`; an internally created OpenGL context is owned by the device's
+state rather than by a Python helper. Destruction is ordered Runtime → HAL
+device → owned GL context. Runtime, executable, schedule, VJP, argument-record, residual, and
 timeline wrappers retain the shared state directly. Teardown therefore does not depend on
 Python garbage-collection order or binding-layer parent/child keep-alive
 edges. Its
@@ -50,7 +47,7 @@ different configurations may probe concurrently. A candidate is fully
 constructed and capability-probed before a short registry critical section
 publishes it. Probe failure leaves the current default unchanged. Replacement
 retires the old default but does not invalidate its native objects; Runtime,
-RHI, executable, schedule, resource, and residual owner leases determine
+device, executable, schedule, resource, and residual owner leases determine
 final teardown.
 
 `RuntimeSession` is also a context manager. Its selection uses `ContextVar`, so
@@ -237,9 +234,9 @@ Node.
 A Value's residency at a Node follows the Stage parameter, not only its
 target carrier. By-value parameters (`hostProjected`: uniforms, values,
 results and native uniforms) are packed by the Stage from host memory, even
-when their carrier is a uniform or storage buffer, because the provider
+when their carrier is a uniform or storage buffer, because the HAL device
 places those bytes in a push constant, a native uniform, or a buffer it
-fills, such as its encoder's transient memory. Such a Value therefore needs host
+fills, such as its recording's arena. Such a Value therefore needs host
 residency there, and a host argument gets no device copy. Only resource
 parameters require device residency. Linking uses the same
 predicate, so the plan never uploads a Value that the Stage then reads from
@@ -378,8 +375,9 @@ worker pool.
 
 ## 10. GPU backend loading
 
-VernonRHI owns runtime discovery of CUDA and Vulkan loaders. Vulkan headers are
-compile-time dependencies only. Vulkan loader discovery uses the standard
+The HAL backends discover the CUDA and Vulkan loaders at run time
+(`hal/cuda/cuda_driver.cpp`, `hal/vulkan/vulkan_driver.cpp`). Vulkan headers
+are compile-time dependencies only. Vulkan loader discovery uses the standard
 Khronos loader and preserves ordinary ICD discovery.
 
 Backend inclusion at build time does not imply runtime availability. Runtime
@@ -394,19 +392,15 @@ timeline support. Absence maps to `Unsupported`; failure after invoking a
 present callback is a typed `Result` error. Dispatch registration names each
 field explicitly and does not use positional null sentinels.
 
-Compute and graphics resolve are shared by every RuntimeCore provider backend
-(Vulkan, DirectX 12, Metal, OpenGL/ES, CUDA) in `rhi_provider_pipeline`. A
-backend supplies only a target: its diagnostic name and artifact kind.
-Whether the provider receives the artifact's binary or source follows from
-which one the Stage loader filled. Metal also supplies native binding
-resolvers that remap layouts to argument-buffer locations. Resolve prepares a
-Stage's binding plan and group layouts but creates no groups: the HAL device
-that runs a linked schedule makes them under the owner rule of
-`binding_groups.md` section 6. The shared pipeline objects own their provider
-handles and release them on destruction, so a resolve that fails halfway leaks
-nothing and backends need no teardown hook. Sharing keeps the backends from
-drifting: they report identical diagnostics, each including the provider's
-last error.
+Compute and graphics resolve are shared by every backend: a backend supplies
+only its diagnostic name and artifact kind, and whether a device receives the
+artifact's binary or source follows from which one the Stage loader filled.
+Resolve validates the artifact and prepares the Stage's binding plan and group
+layouts, and creates no native object. The HAL device that creates a linked
+schedule creates its pipelines and lowers its group layouts then
+(`architecture_v2.md` section 16.3), so a resolve that fails halfway leaks
+nothing. Sharing keeps the backends from drifting: they report identical
+resolve diagnostics.
 
 ### CUDA
 
@@ -427,58 +421,47 @@ current on the calling thread, so a CUDA device accepts calls from any thread.
 Vulkan supports compute and offscreen graphics. Instance and device extensions
 are enabled only when advertised. SPIR-V modules, descriptor layouts, pipeline
 layouts, graphics/compute pipelines, barriers, and resource transfers are
-owned by VernonRHI.
+owned by the HAL device (`hal/vulkan/`).
 
-Submissions do not wait. Each recording owns a command frame (pool, command
-buffer, fence, and the staging chunks it bumps through) that is reused once the
-device's submission serial passes the serial the frame was submitted under; at
-most 64 frames are in flight. A retired frame returns its staging chunks to a
-pool the device's frames share (`rhi/staging_pool.h`, also used by DirectX 12),
-so staging memory follows the data in flight rather than the frame count; a
+Submissions do not wait. Each transfer recording owns a command frame (pool,
+command buffer, fence, and the staging chunks it bumps through) that is reused
+once the device's submission serial passes the serial the frame was submitted
+under; at most 64 frames are in flight. A retired frame returns its staging
+chunks to a pool the device's frames share (`hal/vulkan/staging_pool.h`), so
+staging memory follows the data in flight rather than the frame count; a
 frame that outgrows its chunk takes the smallest free chunk that fits or a new
 one twice as large. Every recording begins with a global memory barrier, so
 it observes all work submitted before it without a host wait and individual
 transfers need no barriers of their own. Native objects the caller destroys
 are destroyed once the queue reaches the serial submitted before the destroy.
 
-Descriptor sets belong to binding snapshots and live as long as them, not as
-long as a submission, so they come from a chain of free-capable pools rather
-than per-frame pools. Allocation tries the pool that last had room, then every
-other pool (freed sets return space to their own pool), and only then creates
-a pool twice the size of the last, up to sixteen times the first. Pools are
-created on first use, so borrowed devices allocate sets the same way.
+Descriptor sets belong to a recording's frame slot, which keeps its
+descriptor pool, sized up to powers of two, while the slot is pooled
+(`architecture_v2.md` section 16.3).
 
 Native Vulkan rasterizes normalized device y = -1 to image row 0, the
 opposite of the shared convention (`graphics_execution.md` section 6). The
-adapter therefore sets a negative-height viewport (origin y + height, height
+HAL device therefore sets a negative-height viewport (origin y + height, height
 -height), core since Vulkan 1.1, which the backend requires. Front face and
 scissor pass through unchanged, because the flipped viewport keeps winding and
 framebuffer rows in the shared convention. Negating `gl_Position.y` in the
 shader, as on GL, was rejected: GL gets the negation from SPIRV-Cross, but
 Vulkan consumes SPIR-V directly and would need a SPIR-V rewrite of every
-vertex stage, while the viewport is dynamic state the adapter already sets.
+vertex stage, while the viewport is dynamic state the device already sets.
 
 ### DirectX 12
 
-DirectX 12 loads pre-cooked DXIL and never invokes DXC at deployment. The
-provider owns device, queue, allocators, fences, resources, descriptor heaps,
-and transient upload/readback storage. Tests may select WARP through an
-internal facility; normal creation selects hardware adapters.
-
-Submissions do not wait. Each recording owns a command frame (allocator,
-command list, pooled staging chunks, descriptor heaps) that is reused once the
-queue fence reaches the frame's value; a device records one list at a time and
-keeps at most 64 frames in flight. Recordings need no queue-order barrier: separate
-`ExecuteCommandLists` calls on one queue complete in submission order and
-flush caches at their boundaries. Owned resources the caller destroys are
-released once the fence reaches the value submitted before the destroy.
+DirectX 12 has no HAL device until phase 4 (`architecture_v2.md` section
+16), so `Runtime::initialize` rejects it. The compiler still cooks DXIL, and
+a deployment never invokes DXC; the rules below fix the artifacts the phase 4
+device consumes.
 
 Inline uniforms lower to the same SPIR-V push-constant block as on Vulkan, in
 the `vulkan_push_constant` layout. SPIRV-Cross emits that block as an explicit
 `cbuffer` at b0 space0 with `packoffset` taken from the SPIR-V member offsets,
 and the root signature declares the same register as one 32-bit root-constant
 parameter per stage (`kDirectXRootConstantRegister` in
-`runtime/interface_names.h`). The adapter places each value at its running
+`runtime/interface_names.h`). The device places each value at its running
 offset aligned to the reflected element alignment, the rule the SPIR-V
 lowering uses, so every byte offset is decided by the compiler-owned layout.
 Loose HLSL globals were rejected: DXC packs them into an implicit `$Globals`
@@ -490,12 +473,12 @@ and `packoffset` cannot express the tighter std430 stride of 2-row matrices.
 
 Descriptor set N uses register space N + 1
 (`kDirectXDescriptorSetRegisterSpaceOffset`): the compiler shifts every
-resource before emitting HLSL, and the adapter shifts every descriptor range,
+resource before emitting HLSL, and the device shifts every descriptor range,
 so space 0 holds only the root constants. Otherwise the uniform block planned
 at set 0 binding 0 would also take b0 space0. A constant-buffer block takes its
 layout from the std140 SPIR-V interface decorations, as on every other backend.
 
-Compute and graphics root signatures share one descriptor-table builder: a
+Compute and graphics root signatures have the same descriptor tables: a
 CBV/SRV/UAV table and a sampler table, each in layout entry order. They
 differ only in inline values, which are read storage buffers in compute and
 root constants in graphics.
@@ -503,7 +486,7 @@ root constants in graphics.
 A storage buffer whose layout access has no write is a raw SRV
 (`ByteAddressBuffer`, a `t` register); only written ones are raw UAVs. Reads
 then need no UAV state, so a buffer one dispatch writes and the next reads
-takes an ordinary state transition, and an encoder's transient values can be
+takes an ordinary state transition, and a recording's packed values can be
 read in place from upload staging, which cannot be a UAV. The compiler matches
 the layout access: VernonToGPU records each texture's and storage argument's
 access (`vernon.resource_access`; by-value storage is `read`), and since the
@@ -513,23 +496,20 @@ gives their globals a block type whose members are `NonWritable`, as glslang
 emits `readonly` blocks. A `NonWritable` variable decoration is not enough:
 the lowering shares one block type between equal leaves, and a Vulkan driver
 then served stale reads of the leaves a kernel wrote. Graphics storage reads
-are `NonWritable` blocks too. Dispatches and draws write storage buffers, images
-and samplers through one descriptor writer, so both report the same errors.
-A dispatch or draw that reuses the descriptors an earlier one of its binding
-set wrote in the same encoder still transitions every resource, because a
-command in between may have left a resource in another state.
+are `NonWritable` blocks too.
 
 ### Metal
 
-Metal consumes cooked MSL on supported Apple platforms. Runtime validates MSL,
-OS, device feature, argument-buffer, and workgroup requirements before
-creating compute or graphics pipelines.
+Metal has no HAL device until phase 4 (`architecture_v2.md` section 16), so
+`Runtime::initialize` rejects it. The compiler still cooks MSL with its MSL,
+OS, device feature, argument-buffer, and workgroup requirements, which the
+phase 4 device validates before it creates pipelines.
 
 ### OpenGL and OpenGL ES
 
 OpenGL and OpenGL ES require a host-owned current context. The owner supplies
-`make_current` and `get_proc_address` callbacks. Runtime and VernonRHI do not
-link a window-system library.
+`make_current` and `get_proc_address` callbacks. Runtime does not link a
+window-system library.
 
 Each backend accepts only artifacts for its matching GLSL profile. Compute
 requires OpenGL 4.3+ or OpenGL ES 3.1+. Capabilities that depend on API version
@@ -538,7 +518,7 @@ are queried after context creation.
 Graphics GLSL targets 3.30, which cannot declare `layout(binding)` on a uniform
 block, so every block links at binding point 0. The compiler names each GLSL
 uniform block from its SPIR-V binding (`openGLUniformBlockName`, shared through
-`runtime/interface_names.h`). After linking, the adapter looks up each
+`runtime/interface_names.h`). After linking, the HAL device looks up each
 uniform-buffer entry's block by its planned binding and calls
 `glUniformBlockBinding`. Pipeline creation fails if any active block is left
 unassigned, because that block would silently read binding point 0. Names come
@@ -549,7 +529,7 @@ OpenGL 4.1 does not expose it.
 
 GL rasterizes normalized device y = +1 to the last image row, as native
 Vulkan does (`graphics_execution.md` section 6). Every GL vertex stage therefore
-negates `gl_Position.y` (SPIRV-Cross `flip_vert_y`), and the adapter inverts
+negates `gl_Position.y` (SPIRV-Cross `flip_vert_y`), and the HAL device inverts
 `glFrontFace`, because the negation mirrors window-space winding. Window
 coordinates then count rows from row 0, so `gl_FragCoord`, `glViewport` and
 `glScissor` need no change. wgpu and Dawn emulate the same convention on GL.
@@ -565,15 +545,15 @@ range lost anyway.
 
 Writes and clears to an `srgb` color attachment store encoded values on
 every backend. OpenGL ES always encodes, but desktop GL encodes only while
-`GL_FRAMEBUFFER_SRGB` is enabled, so the desktop adapter enables it from
-`beginRendering` to `endRendering`. It is not left enabled across the device:
+`GL_FRAMEBUFFER_SRGB` is enabled, so the desktop HAL device enables it for
+each render scope. It is not left enabled across the device:
 2D image copies and present are framebuffer blits, which would then decode and
 re-encode `srgb` texels instead of copying them unchanged, and the host's own
 draws would see the state. Every blit also disables it, because a scope whose
 native begin fails is never ended.
 
 GL surfaces (`presentable_surfaces.md` section 5) map acquire to handing out
-the next RHI texture of the configuration, after comparing `drawable_size`
+the next HAL image of the configuration, after comparing `drawable_size`
 with the configured extent, and present to: make the device's context current
 on the window, set the swap interval, blit the texture into framebuffer 0 with
 its rows reversed, swap, and make the device's own target current again. The
@@ -583,16 +563,15 @@ framebuffer object created and deleted per present, because the cached
 framebuffers belong to rendering scopes and per-present names cost nothing
 next to the blit.
 
-On every backend the command layer keeps the keys of acquired images whose
-contents are still undefined in a per-device list. Each surface reserves one
-entry when it is created, and holds at most one acquired image, so marking at
-acquire never allocates and an acquire cannot fail after the backend has
-handed out the image. Present removes the entry even when nothing wrote the image, which
-keeps the list within its reservation. An encoder lists the undefined images
-it writes and removes them from the device list only when it is submitted, so
-a read in another encoder cannot pass on a write that has not been submitted
-and may never be. The encoder reserves its list entry before it records the
-write, so a write the backend has recorded is always listed.
+On every backend the HAL keeps the serials of acquired images whose contents
+are still undefined in one process-wide set (`hal/native_images.h`). Acquire
+adds the image; a host write, or the submission of a recording that writes
+it, removes it, and so does destroying the image. A host read, or the
+submission of a recording that reads the image, fails with
+`VERNON_HAL_INVALID_ARGUMENT` while it is in the set. Removal happens at
+submission rather than at recording, so a read cannot pass on a write that has
+not been submitted and may never be. A flag that is clear while the set is
+empty keeps the check off the hot path of processes that never acquire.
 
 The GL draw state that Runtime sets on a host context, including the inverted
 front face, persists after Runtime returns. The host re-establishes any state
@@ -601,7 +580,7 @@ in turn reapplies its own state whenever the host may have changed it.
 Restoring host state after each draw was rejected because it would need a
 query of every state Runtime touches.
 
-The context owner outlives RHI and Runtime children. All GL allocation,
+The context owner outlives the HAL device and Runtime. All GL allocation,
 transfer, deletion, and dispatch operations first make the associated
 context current. A context is current on one thread at a time, so a GL device
 is bound to the thread that owns its context; other backends advertise
@@ -609,12 +588,14 @@ concurrent submission instead. A submission inserts a fence sync, which
 completion polls and waits on; GL itself orders later commands after it and
 defers deleting objects that pending commands use.
 
-The spilled uniform bytes of a transient group go to its encoder's
-transient memory (`binding_groups.md` section 8) rather than a buffer per
-group, and those of a persistent group to a block of the device's persistent
-block pool, written once with the group. Every draw uses one vertex array per adapter, made
-when the first graphics pipeline is prepared, so calls create no GL
-objects of their own.
+The packed uniform bytes of a recording, and the records of its host draw
+streams, go to the recording's arena rather than a buffer per group. A call
+uploads the arena into one of three buffers the recording uses in turn, and
+only when the bytes differ from what that buffer holds, so a call rarely
+rewrites bytes the previous calls' commands read; GL orders the write after
+them either way, so no call waits. Every draw uses one vertex array per
+device, made when the device is created, so calls create no GL objects of
+their own.
 
 GL reports invalid transfers only through `glGetError`, leaving the
 destination untouched, so downloads, and mipmap generation, which reports an
@@ -673,7 +654,7 @@ Every sampled Texture binds as a combined image-sampler, so a Sampler has no
 descriptor of its own, in compute and graphics alike. The prepared binding
 plan gives a Sampler one layout entry at the native descriptor of each
 Texture it samples (the reflected relation is in the
-[compiler design](../compiler/design.md)), and the adapter merges each pair
+[compiler design](../compiler/design.md)), and the HAL device merges each pair
 at that descriptor. Vulkan writes one combined descriptor. D3D12 places the
 sampler in a sampler table at the Texture's register. OpenGL binds the
 sampler object to the Texture's unit. Metal resolves the sampler member that
@@ -684,36 +665,25 @@ graphics GLSL 3.30.
 
 Render scopes:
 
-- A scope begins and ends explicitly: RHI `BeginRendering`/`EndRendering`, or
-  the provider `begin_rendering`/`end_rendering` callbacks that Runtime reaches
-  through `vernonRuntimeCoreBeginRendering`/`EndRendering`. The RHI adapter
-  forwards both callbacks to the RHI with view resource keys. Draw descriptors
-  carry no attachments, operations, or render area; a draw renders into the
-  open scope. Keeping attachments in one place removed the draw-versus-scope
-  consistency checks that every adapter needed.
-- The RHI owns the native scope. Each backend implements `beginRendering` and
-  the RHI opens it lazily, on the first draw or at `EndRendering`. A scope
-  without draws is opened at `EndRendering` so its clears and stores still
-  apply; that is how a graphics Node without draws clears. Clears requested
-  before the native scope opens become load operations.
-- A scope declares the images its draws sample (`sampled_images` of the
-  provider rendering descriptor). Core rejects a read without sampled usage
-  or overlapping an attachment (same parent, overlapping mips, layers and
+- A render scope belongs to a pass fragment: the HAL device begins and ends
+  it when it records the pass (`architecture_v2.md` section 11). Draws carry
+  no attachments, operations, or render area; a draw renders into its scope.
+  A scope without draws still begins and ends, so its clears and stores
+  apply; that is how a graphics Node without draws clears.
+- A scope declares the images its draws sample. `checkRenderScope`
+  (`hal/native_images.h`) rejects a read without sampled usage or
+  overlapping an attachment (same parent, overlapping mips, layers and
   aspects), and Runtime reports a Node sampling what it renders to. The
-  backend makes the reads shader-readable before it opens the native scope.
+  device makes the reads shader-readable before it begins the native scope.
   This is required because a Vulkan render pass cannot change layouts, and
   the first draw of a fused scope cannot transition the images that later
   draws sample. Splitting the native scope at such a draw was rejected:
   Vulkan fixes store operations when the scope begins, so the first half
-  would have to store contents that the scope's DISCARD stores drop. The
-  Vulkan draw only checks that its sampled images are readable and fails
-  clearly when a read was not declared. D3D12, OpenGL and Metal can make
-  images readable inside a scope, so their draws do not depend on the
-  declaration.
-- Vulkan and D3D12 track image layouts and states per subresource on the
-  image only. A view points to its image and covers the subresources its
-  descriptor selects, so transitions through a view and through its image,
-  or through two views of one image, see the same state.
+  would have to store contents that the scope's DISCARD stores drop.
+- Vulkan tracks image layouts per subresource on the image only. A view
+  points to its image and covers the subresources its descriptor selects,
+  so transitions through a view and through its image, or through two views
+  of one image, see the same state.
 - Vulkan image layouts follow submission order, because independent
   recordings may be submitted in another order than they were recorded in. A
   recording keeps, per subresource it uses, the layout it needs first and the
@@ -722,33 +692,14 @@ Render scopes:
   the transitions from the image's layouts to those first layouts into a
   prologue command buffer of the same frame, submits the prologue and the
   recording in one batch, and then sets the image's layouts to the ones the
-  recording leaves. Abandoning a recording has nothing to restore. A first
-  use under an explicit barrier keeps the barrier as a same-layout memory
-  dependency, since the recording's earlier untracked accesses still need
-  it. Recordings on a borrowed device execute in the order they are
-  recorded, inside the host's command buffer, so a first use transitions
-  inline from the image's layouts. An abandoned borrowed recording commits
-  its layouts, because the host still executes what it recorded. This is the
-  Dawn and wgpu model; a journal with rollback was rejected because it cannot
-  order two recordings that are both still open. D3D12 keeps its journal:
-  it records one encoder at a time, so recording order is submission order.
-- A borrowed Vulkan or D3D12 device only records; its host executes the
-  commands. Device-side immediate operations (uploads, mipmaps) record into
-  the host's command buffer in call order, and their staging is retired when
-  the host signals completion. Each borrowed submission takes a serial, and
-  the completion of serial s retires only the storage recorded up to s, since
-  the host may not have executed later submissions yet. An abandoned borrowed
-  recording keeps its storage until the next submission retires it, because
-  the host still executes what it recorded. Downloads are rejected with
-  `UNSUPPORTED` before anything is recorded, because they would return before
-  the copy ran.
-  The device advertises `BackendCommandExternalExecution`, and the RHI front
-  end rejects every operation whose results the host reads, so the rule
-  holds for every backend that borrows. Submitting into a private command
-  buffer on the borrowed queue was rejected: the host owns that queue and
-  would have to promise never to use it concurrently.
+  recording leaves. Abandoning a recording has nothing to restore. This is
+  the Dawn and wgpu model; a journal with rollback was rejected because it
+  cannot order two recordings that are both still open.
+- The HAL has no borrowed Vulkan device, whose host would execute the
+  commands: a linked schedule submits its own recordings.
 - Scope objects do not depend on a pipeline. Vulkan without dynamic rendering
-  caches render passes and framebuffers in the RHI device. OpenGL caches one
+  caches render passes in the HAL device, and a recording makes the
+  framebuffers of its scopes. OpenGL caches one
   complete framebuffer per attachment set (texture names plus the stencil
   flag), attached and completeness-checked when the set is first rendered, so
   a scope opening only binds it. Re-attaching one shared framebuffer whenever
@@ -756,32 +707,32 @@ Render scopes:
   `glCheckFramebufferStatus`, because frames alternate their targets.
   Destroying an image deletes the framebuffers that attach it, imported
   images included: GL may reuse the texture name, and an unbound framebuffer
-  keeps the texture storage alive. The device's `drawStateGeneration` advances
-  whenever the RHI binds a scope framebuffer or changes write masks or the
-  scissor, so the adapter's cached draw state is reapplied.
+  keeps the texture storage alive. The HAL device makes the framebuffer when
+  a schedule is built, and the builder tracks the draw state it has recorded,
+  so it records a bind only when that state changes.
 - `GraphicsScopeMaterializer` owns the fused scope: it takes the first Node's
   load operations, updates the stores from each fused Node, and collects the
-  reads of every draw of every fused Node; the managed batch begins exactly
+  reads of every draw of every fused Node; the pass fragment records exactly
   that scope. A depth-only attachment uses
   DISCARD stencil operations, because a stencil load or store of a format
   without stencil is invalid on D3D12 and Vulkan.
-- Metal checks pipeline attachment formats against the open scope at every
-  draw because a mismatch is a Metal validation error. Other backends do not
-  check this at draw time.
+- The phase 4 Metal device checks pipeline attachment formats against the
+  scope at every draw, because a mismatch is a Metal validation error. Other
+  backends do not check this at draw time.
 - Format facts live in one public X-macro table,
-  `source/include/VernonFormats.def`, read by the RHI and texture enums, every
+  `source/include/VernonFormats.def`, read by the texture format enum, every
   backend mapping, layout and aspect checks, compiler storage checks and
-  Python. It is public because the RHI enum is public ABI and its values are
+  Python. It is public because that enum is public ABI and its values are
   generated from the table; rows are append-only so the enum values never
   move. Backend native formats are expanded in each backend's own switch, so
   the shared accessor `VernonFormats.hpp` needs no Vulkan, D3D12 or Metal
   headers. Python reads a checked-in generated module, like `_versions.py`,
   so the pure-Python package and type checkers see the formats without a
   build step; `VernonGeneratedFormatsCheck` fails when it is stale.
-- `vernonRhiDeviceGetFormatCapabilities` returns the table baseline
+- `vernonHalDeviceGetFormatCapabilities` returns the table baseline
   intersected with what the backend reports, so a device never claims more than
-  every backend allows. Vulkan and D3D12 query per-format features; Metal and
-  OpenGL apply version and extension rules: OpenGL ES float color rendering
+  every backend allows. Vulkan queries per-format features; OpenGL applies
+  version and extension rules: OpenGL ES float color rendering
   needs ES 3.2 or `GL_EXT_color_buffer_float`, 32-bit float filtering and
   blending need `GL_OES_texture_float_linear` and `GL_EXT_float_blend`, ES never
   linearly filters depth, and ES storage images take only the ES 3.1 formats.
@@ -798,97 +749,44 @@ Render scopes:
   component class, so integer clears are exact; Runtime rejects non-finite
   clear values only for non-integer formats, where the bits are floats.
   D3D12 `ClearRenderTargetView` takes floats, which cannot carry every 32-bit
-  integer, so integer color attachments are created with unordered access and
-  cleared with `ClearUnorderedAccessViewUint` (preferred over a clear draw,
-  which needs a pipeline per format). The clear needs a non-shader-visible
-  CPU descriptor, which comes from a separate staged descriptor ring. The
-  clear transitions render target to unordered access and back inside the
-  callback, so the tracked state is unchanged and nothing is journaled.
-- The RHI front end checks the image descriptor rules that hold on every
-  backend (shape, mip chain length, single sample, known usages, attachment
-  usage matching the format's aspects) before it dispatches, so every
-  backend rejects them alike with `INVALID_ARGUMENT`. Backends check only
-  their own limits, such as native format support and cube arrays.
+  integer, so the phase 4 D3D12 device creates integer color attachments with
+  unordered access and clears them with `ClearUnorderedAccessViewUint`
+  (preferred over a clear draw, which needs a pipeline per format).
+- Every HAL backend checks the image and view descriptor rules that hold on
+  every backend (`validImage` and `validView` in `hal/native_images.h`, over
+  `runtime/image_rules.h`: shape, mip chain length, single sample, known
+  usages, attachment usage matching the format's aspects, view ranges) before
+  it creates anything, so every backend rejects them alike with
+  `VERNON_HAL_INVALID_ARGUMENT`. Backends check only their own limits, such as
+  native format support and cube arrays.
 The full image contract is [`image_resources.md`](image_resources.md).
 
 ## 13. Resource lifetime and failure
 
-Program bindings, provider references, transient descriptor storage, command
-resources, and completion objects remain alive until the provider reports
-completion.
-
-Destroying a public owner does not release a resource still retained by an
-in-flight call or by residuals. Caller-owned RHI resources are not tracked as
-pending owners; caller writes to them are ordered by memory class instead.
-A host upload into `VERNON_RHI_MEMORY_DEVICE` is queue-ordered after every
-earlier submission on the device, without a CPU wait. A write into
-`VERNON_RHI_MEMORY_UPLOAD` or Metal shared memory is immediate, so the
-caller keeps one region per call in flight. Runtime generation changes invalidate
-cached native handles.
-
-Each RHI device registry publishes an immutable lookup snapshot. Device-local
-resource and command slots have stable addresses, are allocated fallibly
-before native creation, and publish only after their device-child reservation
-and native payload are complete. Buffer, Image, ImageView, Sampler,
-NativeDescriptorRange, CommandEncoder, and Completion therefore have one
-lifecycle authority; there is no parallel binding-reference record.
-
-Persistent binding, graph, encoder, and completion ownership is represented by
-move-only typed retained leases. A retained lease delays native recycle, while
-an operation pin protects only one admitted operation. Native resolution and
-descriptor access validate the exact device, generation, resource kind, key,
-and retained lease before pinning. Public destroy hides a retained resource
-immediately and tears it down only when its final retained lease is released.
-
-Command state belongs to its device. Encoder and completion lookup uses
-acquire-published stable slot pages rather than a process-global command
-registry or hot-path registry mutex. Submit transactionally moves retained
-resource leases and cleanup state from the encoder to the completion; failed
-native submit rolls the encoder destruction attempt back.
+Destroying a HAL resource frees it after the device's latest submitted
+point, so the submissions that name it finish first; a recording that names
+it is evicted with it (`architecture_v2.md` section 7). Residual blocks are
+buffers of the device the schedule links on and live as long as the residual
+that holds them. Host writes are ordered on the device's timeline rather than
+tracked per owner: a write takes effect after every submission made before
+it and before every later one, and its source bytes are free when it
+returns.
 
 Each `RuntimeContext` has the same owner state machine and a separate local
 operation control. Bundles, ProgramGraphs, resolved Stages, Program
 executables, linked schedules and VJPs hold committed context-child leases.
-Context close therefore rejects live direct or transitive work without relying on raw
-pointer counts. Device-backed contexts and their RHI adapters each retain an
-explicit RHI device-child lease, so an attempted device destroy cannot
-invalidate adapter state. `vernonRhiDestroyDevice` then returns
-`VERNON_RHI_STATUS_INVALID_ARGUMENT` and leaves the device published; the owner
-must release its children and destroy again, because a device still published
-at process exit aborts in the device registry's destructor. Every destroy
-failure is reported rather than aborting. A backend teardown failure rolls the
-registry's close and destroy guards back, returns
-`VERNON_RHI_STATUS_INTERNAL_ERROR`, and also leaves the device published and
-retryable.
+Context close therefore rejects live direct or transitive work without relying
+on raw pointer counts. A HAL device owns its context and refuses destruction,
+returning `VERNON_HAL_INVALID_ARGUMENT` and staying valid, while it has
+objects or its context has children; the owner releases them and destroys
+again. An image with views and a surface with an acquired image refuse
+destruction alike.
 
-RuntimeCore publishes an immutable binding revision containing the provider
-object, retained resources, and canonical value snapshot. Replacement
-validates and constructs a complete candidate before swapping one retained
-revision reference under the binding-set-local lock. Encode retains the
-published revision under that short lock, releases the lock, and only then
-calls the provider; an old revision is destroyed after its final in-flight
-encode reference is released. Failure releases only candidate state and leaves
-the published revision unchanged. Unchanged canonical bindings are recognized
-without allocation or provider mutation. Providers expose creation and
-destruction only; in-place binding mutation is not part of the provider
-contract.
+Backend implementation boundaries return allocation-free `Result` errors.
+Public C ABI entry points are the only layer that maps those errors to status
+values and cold diagnostics.
 
-A provider with `VERNON_RUNTIME_PROVIDER_PARTIAL_BINDING_SETS` accepts binding
-sets that cover part of a layout (`vernonRuntimeCoreCreateBindingSubset`) and
-draws that compose several of them through `partial_bindings`. Composition,
-not a provider-side merge, is the contract because immutable sets must stay
-shareable between draws and pipelines of one layout; RuntimeCore checks that
-the composed sets cover every slot once before the provider sees the draw.
-Recorded draws use it to bind a sealed set's native state once
-([`../program/recorded_draws.md`](../program/recorded_draws.md) section 13).
-Only OpenGL implements it; set-based backends map it onto per-group
-descriptor sets with the group partitions of the compiler cut.
-
-Backend and built-in provider implementation boundaries return allocation-free
-`Result` errors. Public C ABI and provider-vtable callbacks are the only layers
-that map those errors to status values and cold diagnostics.
-
-Authored Runtime/RHI expected control flow does not throw. Standard-library and
+Authored Runtime and HAL expected control flow does not throw. Standard-library and
 third-party operations may still throw; each public C entry point contains
 those exceptions in one shared cold boundary around an internal
 `Result`-returning operation. Fallible handle construction additionally exposes
@@ -899,10 +797,10 @@ after the native result reaches the binding boundary. No failure silently
 changes backend, narrows dtype, serializes an invalid dispatch, or falls back
 to a compatibility path.
 
-The native Runtime/RHI support layer provides move-aware, non-sentinel
+The native Runtime and HAL support layer provides move-aware, non-sentinel
 `Option<T>`, `Result<T, E>`, and `Result<void, E>` values. Inactive-alternative
-access is a contract violation. Lifecycle, RHI, Runtime, and resource-access
-errors, together with provider-boundary errors, are allocation-free values
+access is a contract violation. Lifecycle, HAL, Runtime, and resource-access
+errors are allocation-free values
 with stable codes and bounded numeric/static context; explicit adapters map
 them to the existing C statuses. Checked arithmetic, checked atomic
 retain/release, and non-throwing allocation helpers use these results.
@@ -916,12 +814,12 @@ operation: successful cleanup does not erase its failure, while the next
 primary operation replaces it. If rich diagnostic storage fails, the original
 typed error is rendered into bounded emergency storage without allocating.
 
-Foreign provider lease callbacks and backend deferred actions catch exceptions
+Backend deferred actions catch exceptions
 at the immediate callback boundary. Deferred drains preserve the first typed
 failure, continue required cleanup, and retain failed resource-release work for
 retry. A command-recording allocation failure makes pending-write state
 conservatively unknown rather than losing a required synchronization.
-The source policy rejects authored Runtime/RHI `throw` expressions and requires
+The source policy rejects authored Runtime and HAL `throw` expressions and requires
 each remaining `catch` site to have an exact reviewed fingerprint, category,
 and reason; moving or substituting a catch invalidates that review.
 

@@ -157,7 +157,7 @@ argument record and must be a value the table refers to:
 ## 6. Physical layout
 
 Semantics never refer to groups. A group is the set of leaves that declare
-one `set` ([`../runtime/binding_groups.md`](../runtime/binding_groups.md)
+one `set` ([`../language/placement.md`](../language/placement.md)
 section 3), the unit the compiler uses to partition native bindings, so that
 the common per-draw switch touches only the switched native state:
 
@@ -166,8 +166,7 @@ the common per-draw switch touches only the switched native state:
   or above the target's set limit fails compilation.
 - Every TensorView metadata carrier is in set 0, one per module, until
   per-set carriers land with uniform packing
-  ([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section
-  3.4).
+  ([`../language/placement.md`](../language/placement.md) section 4).
 - OpenGL keeps flat bindings, unique across sets.
 
 Runtime reads these partitions from the target implementation records it
@@ -313,8 +312,8 @@ Run on every backend with graphics support:
 - [`execution_manifest.md`](execution_manifest.md): section 2 admits
   pass tables; section 11.5 states that a graphics Node draws a pass table;
   section 18 adds the diagnostics; section 15.1 stops requiring one
-  specialization key for all ProgramGraph children, which the linker already
-  does not require.
+  specialization key for all ProgramGraph children, which composition does
+  not require.
 - [`graphics_storage_reads.md`](graphics_storage_reads.md) sections 2 to 4
   and [`../language/contract.md`](../language/contract.md) section 6.4:
   metadata carriers and native binding partitions follow top-level group

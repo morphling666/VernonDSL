@@ -108,7 +108,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     VernonProgramArgument argument{};
     argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     argument.tensor.resource = {1, {2}, 0, 4096};
     argument.tensor.element_layout = pipelineValueLayout(variant.parameters.front().elementLayout);
     argument.tensor.access = VERNON_ACCESS_READ;
@@ -180,7 +180,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     arguments[0].slot = 0;
     arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[0].tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     arguments[0].tensor.resource = vertexBuffer;
     arguments[0].tensor.element_layout = pipelineValueLayout(vertices.elementLayout);
     arguments[0].tensor.access = VERNON_ACCESS_READ;
@@ -474,10 +474,10 @@ TEST(GraphicsScopeMaterializer, FusedScopeDeclaresTheReadsOfEveryNode) {
     GraphicsScopeMaterializer materializer;
     EXPECT_EQ(materializer.materialize(0, first, firstReads), GraphicsScopeMaterialization::Begin);
     EXPECT_EQ(materializer.materialize(0, second, secondReads), GraphicsScopeMaterialization::Fuse);
-    const VernonRuntimeProviderRenderingDescriptor descriptor = graphicsRenderingDescriptor(materializer.scope());
-    ASSERT_EQ(descriptor.sampled_image_count, 2u);
-    EXPECT_EQ(descriptor.sampled_images[0].identity, albedo.identity);
-    EXPECT_EQ(descriptor.sampled_images[1].identity, normal.identity);
+    const std::vector<VernonRuntimeProviderResourceReference> &sampled = materializer.scope().reads.images;
+    ASSERT_EQ(sampled.size(), 2u);
+    EXPECT_EQ(sampled[0].identity, albedo.identity);
+    EXPECT_EQ(sampled[1].identity, normal.identity);
 }
 
 TEST(GraphicsScopeMaterializer, DetectsReadsOverlappingTheirAttachments) {

@@ -1533,7 +1533,7 @@ public:
                 argument.strides[dimension] = buffer.strides[dimension] * buffer.itemSize;
             }
             if (device_) {
-                view.storage = VERNON_TENSOR_RHI_RESOURCE;
+                view.storage = VERNON_TENSOR_DEVICE_RESOURCE;
                 view.resource = buffer.reference;
             } else {
                 view.storage = VERNON_TENSOR_HOST;

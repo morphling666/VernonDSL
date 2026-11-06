@@ -21,10 +21,10 @@ The correct architecture has four independent authorities:
 1. the Program owns logical Values, Storages, endpoint identity, and portable
    ABI slots;
 2. the compiler owns target code and the physical ABI expected by that code;
-3. RuntimeCore owns Program-to-endpoint projection and invocation
+3. Runtime owns Program-to-endpoint projection and invocation
    materialization;
-4. the provider owns native resource creation, command encoding, submission,
-   completion, and native limit validation.
+4. the HAL device owns native resource creation, command recording,
+   submission, completion, and native limit validation.
 
 These authorities must not be collapsed. In particular:
 
@@ -56,8 +56,8 @@ typed Vernon entry IR
   -> PreparedComputeBindingPlan or PreparedGraphicsBindingPlan
   -> PlannedComputeLaunch metadataPayload or PlannedGraphicsInvocation
   -> shared invocation binding materialization
-  -> RuntimeCore binding revision
-  -> RHI adapter / CPU provider
+  -> linked schedule pass plan
+  -> HAL device (CPU, CUDA, Vulkan, OpenGL)
   -> native API encoding
 ```
 
@@ -330,8 +330,8 @@ compute argument index and creates `PlannedComputeLaunch`.
 Materialization performs these operations:
 
 - validate Program argument kind and resource range;
-- preserve an existing RHI Tensor resource for true storage;
-- preserve host Tensor storage for the CPU provider;
+- preserve an existing device Tensor resource for true storage;
+- preserve host Tensor storage for the CPU device;
 - pack canonical Value bytes with `compileWholeValueCopyPlan()` or
   `compileElementStreamCopyPlan()` and `packTensor()`;
 - retain packed bytes in invocation-owned `hostTensorStorage`;
@@ -341,7 +341,7 @@ Materialization performs these operations:
 - prove TensorView projection bounds and selected integer-width
   representability, then materialize one `metadataPayload` from the reflected
   semantic-to-physical mapping;
-- retain the command encoder and concrete dispatch grid.
+- retain the concrete dispatch grid.
 
 `commitComputeResults()` unpacks host Value results only after successful
 execution. Device Storage writes remain device-resident and are published by
@@ -379,18 +379,15 @@ for shader reference behavior only where explicitly supported.
 
 ### 7.2 CUDA
 
-`runtime_pipeline_cuda.cpp` creates the ordered `cuLaunchKernel` argument
-sequence. True storage and ranked Value carriers use storage-buffer provider
-bindings; scalar kernel values remain inline. All TensorView offset, extent,
-and stride fields are packed into one reflected
-`cuda_kernel_metadata_i64` aggregate parameter.
-
-`rhi_adapter/adapter_cuda.cpp` converts storage bindings to the five-word
-memref descriptor expected by lowered kernels. Packed host Values whose
-physical carrier is storage use
-`VERNON_RUNTIME_PROVIDER_BINDING_HOST_STORAGE`: the adapter owns aligned device
-storage, uploads the compiler-packed bytes, and passes the resulting memref.
-It does not reinterpret canonical layout.
+The kernel's schedule fragment (`schedule/fragment.cpp`,
+`cudaKernelFragment`) lays out the ordered `cuLaunchKernel` parameters in the
+call record, following the reflected bindings. Storage bindings are the
+five-word memref descriptor expected by lowered kernels; scalar kernel values
+remain inline. All TensorView offset, extent, and stride fields are packed
+into one reflected `cuda_kernel_metadata_i64` aggregate parameter. A packed
+Struct, Tuple or ranked Tensor Value is passed by pointer: its compiler-packed
+bytes are record bytes, and the device writes their device address into the
+descriptor before the launch. Neither reinterprets canonical layout.
 
 CUDA is compute-only.
 
@@ -404,33 +401,27 @@ Value tensors transported through buffers are packed with their
 
 Graphics uses reflected vertex leaves, descriptor-backed resources, packed
 uniforms, generated resolution, and explicit sampler provenance.
-`adapter_vulkan.cpp` owns descriptor sets, pipeline layouts, barriers, and
-native command encoding.
+`hal/vulkan/vulkan_device.cpp` owns descriptor sets, pipeline layouts,
+barriers, and native command recording.
 
 ### 7.4 DirectX 12
 
-`runtime_pipeline_directx12.cpp` maps the provider binding plan to root
-constants, constant buffers, SRV/UAV descriptors, vertex buffers, images, and
-samplers. The Runtime consumes compiler-generated DXIL and never runs DXC.
-TensorView metadata uses one constant-buffer view; the compute root signature
-classifies that binding as CBV rather than UAV.
-
-Graphics resources currently require descriptor set zero and a stricter
-single-use parameter shape than the general Stage model. Depth-only graphics
-pipelines are valid and must produce a complete PSO even when there are no
-color attachments.
+DirectX 12 has no HAL device until phase 4 (`architecture_v2.md` section
+16). Its device maps the provider binding plan to root constants, constant
+buffers, SRV/UAV descriptors, vertex buffers, images, and samplers, and
+consumes compiler-generated DXIL without running DXC. TensorView metadata
+uses one constant-buffer view; the compute root signature classifies that
+binding as CBV rather than UAV. Depth-only graphics pipelines are valid and
+must produce a complete PSO even when there are no color attachments.
 
 ### 7.5 Metal
 
-`runtime_pipeline_metal.cpp` resolves portable `(stage, kind, set, binding)`
-facts through `NativeResourceSlot` into Metal argument-buffer indices and
-member IDs. It maps Values to inline constants or reflected buffers, vertex
-inputs to Metal vertex buffer indices, and images/samplers to their native
-indices. TensorView metadata uses one constant-buffer binding carrying the
-portable 32-bit aggregate.
-
-`adapter_metal.mm` owns `MTLArgumentEncoder`, pipeline state, render/compute
-encoders, and completion lifetime.
+Metal has no HAL device until phase 4. Its device resolves portable
+`(stage, kind, set, binding)` facts through `NativeResourceSlot` into Metal
+argument-buffer indices and member IDs. It maps Values to inline constants
+or reflected buffers, vertex inputs to Metal vertex buffer indices, and
+images/samplers to their native indices. TensorView metadata uses one
+constant-buffer binding carrying the portable 32-bit aggregate.
 
 ### 7.6 OpenGL and OpenGL ES
 
@@ -440,9 +431,10 @@ the provider layout. Native uniforms use the reflected `uniform_name` and
 physical scalar/vector/matrix shape. Buffered Values are packed from their
 `InterfacePlan`. TensorView metadata uses one uniform-buffer binding.
 
-`adapter_opengl.cpp` performs `glUniform*`, indexed buffer binding,
-texture/image unit, sampler, vertex attribute, framebuffer, and draw encoding
-after making the associated context current. It uses `glBindBufferRange` when
+`hal/opengl/opengl_device.cpp` encodes `glUniform*`, indexed buffer binding,
+texture/image unit, sampler, vertex attribute, framebuffer, and draw commands
+when a schedule is built, and replays them with the associated context
+current. It uses `glBindBufferRange` when
 the prepared resource has a non-zero offset and validates native range
 alignment. OpenGL ES uses the same architecture with its stricter
 storage-image and language-version constraints.
@@ -651,16 +643,11 @@ Backend and provider mapping:
 
 - `source/lib/runtime/runtime_pipeline_dispatch.cpp`
 - `source/lib/runtime/runtime_pipeline_backend.h`
-- `source/lib/runtime/rhi_provider_pipeline.cpp`
-- `source/lib/runtime/runtime_pipeline_cpu.cpp`
 - `source/lib/runtime/runtime_pipeline_cuda.cpp`
 - `source/lib/runtime/runtime_pipeline_vulkan.cpp`
-- `source/lib/runtime/runtime_pipeline_directx12.cpp`
-- `source/lib/runtime/runtime_pipeline_metal.cpp`
 - `source/lib/runtime/runtime_pipeline_opengl.cpp`
-- `source/lib/runtime/runtime_core.cpp`
 - `source/lib/runtime/backend_cpu.cpp`
-- `source/lib/runtime/rhi_adapter/adapter_*.cpp`
+- `source/lib/hal/*/`
 
 ## 12. Build and binary boundaries
 

@@ -119,7 +119,7 @@ bool tensorPhysicalRange(const VernonTensorView &tensor, TensorPhysicalRange &ra
         if (!tensor.host_data)
             return false;
         range.base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tensor.host_data));
-    } else if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+    } else if (tensor.storage == VERNON_TENSOR_DEVICE_RESOURCE) {
         if (!tensor.resource.identity || !tensor.resource.resource.value ||
             (tensor.resource.size && tensor.byte_size > tensor.resource.size) ||
             tensor.byte_size > std::numeric_limits<uint64_t>::max() - tensor.resource.offset)
@@ -385,13 +385,13 @@ bool tensorByteLayoutInjective(const VernonTensorView &tensor) {
 
 TensorPhysicalOverlap tensorViewsPhysicalOverlap(const VernonTensorView &left, const VernonTensorView &right) {
     const auto supportedStorage = [](VernonTensorStorage storage) {
-        return storage == VERNON_TENSOR_HOST || storage == VERNON_TENSOR_RHI_RESOURCE;
+        return storage == VERNON_TENSOR_HOST || storage == VERNON_TENSOR_DEVICE_RESOURCE;
     };
     if (!supportedStorage(left.storage) || !supportedStorage(right.storage))
         return TensorPhysicalOverlap::Unknown;
     if (left.storage != right.storage)
         return TensorPhysicalOverlap::Disjoint;
-    if (left.storage == VERNON_TENSOR_RHI_RESOURCE) {
+    if (left.storage == VERNON_TENSOR_DEVICE_RESOURCE) {
         if (!left.resource.identity || !right.resource.identity || !left.resource.resource.value ||
             !right.resource.resource.value)
             return TensorPhysicalOverlap::Unknown;

@@ -155,6 +155,28 @@ results section describes. All three workloads agree bit for bit with numba
 and numpy. The training step's measurements are in
 [`training_step.md`](training_step.md).
 
+## After step 5
+
+The same commands after section 16.3 step 5 of `architecture_v2.md`, which
+deleted the RHI, RuntimeCore, the Program invocation runtime and the
+ProgramGraph linker, at `f840106` with uncommitted work. Raw results:
+`linked_schedules_cpu_32t_step5.json` and
+`linked_schedules_cpu_32t_pinned_step5.json`; the one-thread run is not saved.
+
+| workload | mode | numba | VernonDSL | ratio | pinned: numba | VernonDSL | ratio | 1 thread, numba / VernonDSL |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| axpy | resident | 6.07 | 7.96 | 1.31x | 6.26 | 7.20 | 1.15x | 7.13 / 7.16 |
+| axpy | roundtrip | 12.3 | 37.2 | 3.0x | 9.48 | 34.9 | 3.7x | 10.5 / 35.7 |
+| launch_64 | resident | 0.007 | 0.003 | 0.50x | 0.007 | 0.003 | 0.48x | 0.001 / 0.002 |
+| relief | resident | 2.11 | 2.98 | 1.41x | 2.11 | 2.24 | 1.06x | 27.7 / 29.7 |
+| relief | roundtrip | 14.5 | 31.4 | 2.2x | 14.5 | 28.1 | 1.9x | 39.7 / 54.3 |
+| nearest_segment | resident | 31.0 | 28.0 | 0.90x | 29.9 | 27.8 | 0.93x | 396 / 398 |
+| nearest_segment | roundtrip | 37.2 | 48.8 | 1.31x | 32.5 | 47.3 | 1.46x | 400 / 418 |
+
+Every 32-thread VernonDSL median is under the phase 2 table or within 1% of
+it, and every one-thread median within 2% of the phase 1 column. All three workloads agree bit for bit with
+numba and numpy.
+
 ## What remains
 
 - **Gate.** `relief` resident at 32 threads ties numba only pinned and

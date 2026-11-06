@@ -2,8 +2,9 @@
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 
-#include "rhi/cuda_backend.h"
-#include "rhi/rhi_internal.h"
+#include "hal/cuda/cuda_state.h"
+
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +19,8 @@
 namespace vernon::hal {
 namespace {
 
-using rhi::cuda::DeviceState;
-using rhi::cuda::PreparedFunction;
+using cuda::DeviceState;
+using cuda::PreparedFunction;
 
 struct CudaExecutable final : Executable {
     explicit CudaExecutable(DeviceState &state) : state(state) {}
@@ -28,9 +29,41 @@ struct CudaExecutable final : Executable {
     DeviceState &state;
     PreparedFunction function;
     // The compiler's `<entry>__vernon_indirect` twin, when its parameter layout is the record's.
-    rhi::cuda::Function indirect{};
+    cuda::Function indirect{};
     uint32_t workgroup[3]{};
     std::vector<uint64_t> parameterOffsets;
+};
+
+nvtxDomainHandle_t debugDomain() noexcept {
+    static const nvtxDomainHandle_t domain = nvtxDomainCreateA("Vernon");
+    return domain;
+}
+
+// An NVTX range around one dispatch's launch. Ranges are started and ended rather than pushed and popped because a
+// push/pop range belongs to its thread, and submissions of one device may come from several threads.
+class DebugRange {
+public:
+    DebugRange(bool enabled, const std::string &label) noexcept {
+        if (!enabled || label.empty())
+            return;
+        nvtxEventAttributes_t attributes{};
+        attributes.version = NVTX_VERSION;
+        attributes.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        attributes.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        attributes.message.ascii = label.c_str();
+        range_ = nvtxDomainRangeStartEx(debugDomain(), &attributes);
+        open_ = true;
+    }
+    DebugRange(const DebugRange &) = delete;
+    DebugRange &operator=(const DebugRange &) = delete;
+    ~DebugRange() {
+        if (open_)
+            nvtxDomainRangeEnd(debugDomain(), range_);
+    }
+
+private:
+    nvtxRangeId_t range_{};
+    bool open_{};
 };
 
 // The fills of a graph replay: row y of the grid zeroes the byte count at `arguments + 16y + 8` from the address at
@@ -243,7 +276,7 @@ bool packedParameters(const std::string &ptx, const std::string &entry, const st
 
 class CudaBuffer final : public Buffer {
 public:
-    CudaBuffer(DeviceState &state, rhi::cuda::DevicePointer pointer) : state_(state), pointer_(pointer) {}
+    CudaBuffer(DeviceState &state, cuda::DevicePointer pointer) : state_(state), pointer_(pointer) {}
     CudaBuffer(const CudaBuffer &) = delete;
     CudaBuffer &operator=(const CudaBuffer &) = delete;
     ~CudaBuffer() override { (void)state_.free(pointer_); }
@@ -252,7 +285,7 @@ public:
 
 private:
     DeviceState &state_;
-    rhi::cuda::DevicePointer pointer_;
+    cuda::DevicePointer pointer_;
 };
 
 // A command buffer of several commands whose kernels all have indirect twins replays as a CUDA graph: each stream
@@ -265,8 +298,8 @@ struct CudaCommandBuffer final : CommandBuffer {
     static constexpr size_t kSlots = 4;
 
     struct Slot {
-        rhi::cuda::GraphExec exec{};
-        rhi::cuda::Event done{};
+        cuda::GraphExec exec{};
+        cuda::Event done{};
         bool pending{};
         // The record `exec` was last launched with, whose grids and fills its nodes hold.
         std::vector<uint8_t> record;
@@ -278,8 +311,8 @@ struct CudaCommandBuffer final : CommandBuffer {
     ~CudaCommandBuffer() override {
         if (!graph && !ring && !staging)
             return;
-        rhi::cuda::Driver &api = rhi::cuda::driver();
-        if (state.makeCurrent() != rhi::cuda::kSuccess)
+        cuda::Driver &api = cuda::driver();
+        if (state.makeCurrent() != cuda::kSuccess)
             return;
         // An in-flight graph instance is freed when it completes; the ring and the staging are not, so the stream
         // drains first.
@@ -306,7 +339,7 @@ struct CudaCommandBuffer final : CommandBuffer {
     bool indirect{};
     // Whether a dispatch takes record addresses, so even a stream launch stages its record in the ring.
     bool addresses{};
-    mutable rhi::cuda::Graph graph{};
+    mutable cuda::Graph graph{};
     // Per graph node, its first command and how many it runs: one dispatch, or a run of fills whose arguments lie
     // side by side in the record.
     struct Group {
@@ -314,9 +347,9 @@ struct CudaCommandBuffer final : CommandBuffer {
         size_t count;
     };
     mutable std::vector<Group> groups;
-    mutable std::vector<rhi::cuda::GraphNode> nodes;
+    mutable std::vector<cuda::GraphNode> nodes;
     // `kSlots` records of `stride` bytes on the device, and their pinned host staging.
-    mutable rhi::cuda::DevicePointer ring{};
+    mutable cuda::DevicePointer ring{};
     mutable uint8_t *staging{};
     mutable size_t stride{};
     mutable Slot slots[kSlots];
@@ -331,11 +364,12 @@ struct CudaCommandBuffer final : CommandBuffer {
 
 class CudaDevice final : public Device {
 public:
-    explicit CudaDevice(DeviceState &state) : state_(state) {}
+    CudaDevice(std::shared_ptr<DeviceState> state, bool labels)
+        : owner_(std::move(state)), state_(*owner_), labels_(labels) {}
     CudaDevice(const CudaDevice &) = delete;
     CudaDevice &operator=(const CudaDevice &) = delete;
     ~CudaDevice() override {
-        if (!timings_.empty() && state_.makeCurrent() == rhi::cuda::kSuccess) {
+        if (!timings_.empty() && state_.makeCurrent() == cuda::kSuccess) {
             (void)state_.synchronize();
             for (TimedCall &call : timings_)
                 destroyEvents(call);
@@ -351,18 +385,18 @@ public:
         auto executable = std::unique_ptr<CudaExecutable>(new (std::nothrow) CudaExecutable(state_));
         if (!executable)
             return Created{err(std::string("cannot allocate a CUDA executable"))};
-        const rhi::cuda::Result status =
+        const cuda::Result status =
             executable->function.create(state_, source.artifact.data(), source.artifact.size(), source.entry.c_str());
-        if (status != rhi::cuda::kSuccess)
-            return Created{err(rhi::cuda::describeResult(status, "CUDA kernel load"))};
+        if (status != cuda::kSuccess)
+            return Created{err(cuda::describeResult(status, "CUDA kernel load"))};
         std::memcpy(executable->workgroup, source.workgroup, sizeof(executable->workgroup));
         try {
             executable->parameterOffsets = source.parameterOffsets;
             const std::string twin = source.entry + "__vernon_indirect";
-            if (rhi::cuda::driver().hasGraphs() &&
+            if (cuda::driver().hasGraphs() &&
                 packedParameters(source.artifact, source.entry, source.parameterOffsets) &&
-                rhi::cuda::driver().moduleGetFunction(&executable->indirect, executable->function.module,
-                                                      twin.c_str()) != rhi::cuda::kSuccess)
+                cuda::driver().moduleGetFunction(&executable->indirect, executable->function.module, twin.c_str()) !=
+                    cuda::kSuccess)
                 executable->indirect = nullptr;
         } catch (const std::bad_alloc &) {
             return Created{err(std::string("cannot allocate a CUDA executable"))};
@@ -372,10 +406,10 @@ public:
 
     Result<std::unique_ptr<Buffer>, std::string> allocate(uint64_t size) override {
         using Allocated = Result<std::unique_ptr<Buffer>, std::string>;
-        rhi::cuda::DevicePointer pointer{};
-        const rhi::cuda::Result status = state_.allocate(pointer, static_cast<size_t>(std::max<uint64_t>(size, 1)));
-        if (status != rhi::cuda::kSuccess)
-            return Allocated{err(rhi::cuda::describeResult(status, "CUDA arena allocation"))};
+        cuda::DevicePointer pointer{};
+        const cuda::Result status = state_.allocate(pointer, static_cast<size_t>(std::max<uint64_t>(size, 1)));
+        if (status != cuda::kSuccess)
+            return Allocated{err(cuda::describeResult(status, "CUDA arena allocation"))};
         auto buffer = std::unique_ptr<CudaBuffer>(new (std::nothrow) CudaBuffer(state_, pointer));
         if (!buffer) {
             (void)state_.free(pointer);
@@ -389,14 +423,14 @@ public:
         if (!size)
             return Result<void, std::string>{ok()};
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto target = static_cast<rhi::cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
-        rhi::cuda::Result status = state_.makeCurrent();
-        if (status == rhi::cuda::kSuccess)
-            status = rhi::cuda::driver().copyHostToDeviceAsync(target, bytes, size, state_.stream);
-        if (status == rhi::cuda::kSuccess)
+        const auto target = static_cast<cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
+        cuda::Result status = state_.makeCurrent();
+        if (status == cuda::kSuccess)
+            status = cuda::driver().copyHostToDeviceAsync(target, bytes, size, state_.stream);
+        if (status == cuda::kSuccess)
             status = state_.synchronize();
-        if (status != rhi::cuda::kSuccess)
-            return Result<void, std::string>{err(rhi::cuda::describeResult(status, "CUDA constant upload"))};
+        if (status != cuda::kSuccess)
+            return Result<void, std::string>{err(cuda::describeResult(status, "CUDA constant upload"))};
         completed_ = submitted_;
         return Result<void, std::string>{ok()};
     }
@@ -406,10 +440,10 @@ public:
         if (!size)
             return Result<void, std::string>{ok()};
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto target = static_cast<rhi::cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
-        const rhi::cuda::Result status = state_.upload(target, bytes, size);
-        if (status != rhi::cuda::kSuccess)
-            return Result<void, std::string>{err(rhi::cuda::describeResult(status, "CUDA upload"))};
+        const auto target = static_cast<cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
+        const cuda::Result status = state_.upload(target, bytes, size);
+        if (status != cuda::kSuccess)
+            return Result<void, std::string>{err(cuda::describeResult(status, "CUDA upload"))};
         return Result<void, std::string>{ok()};
     }
 
@@ -417,10 +451,10 @@ public:
         if (!size)
             return Result<void, std::string>{ok()};
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto source = static_cast<rhi::cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
-        const rhi::cuda::Result status = state_.download(bytes, source, size);
-        if (status != rhi::cuda::kSuccess)
-            return Result<void, std::string>{err(rhi::cuda::describeResult(status, "CUDA readback"))};
+        const auto source = static_cast<cuda::DevicePointer>(reinterpret_cast<uintptr_t>(buffer.address()));
+        const cuda::Result status = state_.download(bytes, source, size);
+        if (status != cuda::kSuccess)
+            return Result<void, std::string>{err(cuda::describeResult(status, "CUDA readback"))};
         return Result<void, std::string>{ok()};
     }
 
@@ -430,7 +464,7 @@ public:
         if (!buffer)
             return Recorded{err(std::string("cannot allocate a CUDA command buffer"))};
         size_t parameters = 0;
-        buffer->indirect = commands.size() > 1 && rhi::cuda::driver().hasGraphs();
+        buffer->indirect = commands.size() > 1 && cuda::driver().hasGraphs();
         bool copies = false;
         for (const DispatchCommand &command : commands) {
             if (command.kind == CommandKind::Fill)
@@ -468,7 +502,7 @@ public:
             buffer->indirect = false;
             std::lock_guard<std::mutex> lock(mutex_);
             if (!leafCopy_.function && leafCopy_.create(state_, kLeafCopyKernel, sizeof(kLeafCopyKernel),
-                                                        "vernon_leaf_copy") != rhi::cuda::kSuccess) {
+                                                        "vernon_leaf_copy") != cuda::kSuccess) {
                 leafCopy_ = {};
                 return Recorded{err(std::string("cannot load the CUDA leaf copy kernel"))};
             }
@@ -480,7 +514,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             if (!fillAttempted_) {
                 fillAttempted_ = true;
-                if (fill_.create(state_, kFillKernel, sizeof(kFillKernel), "vernon_fill") != rhi::cuda::kSuccess)
+                if (fill_.create(state_, kFillKernel, sizeof(kFillKernel), "vernon_fill") != cuda::kSuccess)
                     fill_ = {};
             }
             buffer->indirect = fill_.function != nullptr;
@@ -494,8 +528,9 @@ public:
         const auto &tape = static_cast<const CudaCommandBuffer &>(commands);
         std::lock_guard<std::mutex> lock(mutex_);
         const bool timed = tape.timed.load(std::memory_order_relaxed);
-        // An empty grid has no graph node, so such a record goes to the stream.
-        bool graphable = tape.indirect && !tape.streamOnly && !timed;
+        // An empty grid has no graph node, so such a record goes to the stream, as do labelled launches, whose ranges
+        // a graph launch would merge into one.
+        bool graphable = tape.indirect && !tape.streamOnly && !timed && !labels_;
         for (const DispatchCommand &command : tape.commands) {
             if (command.kind == CommandKind::Fill) {
                 if (command.argumentsOffset > size || 2 * sizeof(uint64_t) > size - command.argumentsOffset)
@@ -517,18 +552,18 @@ public:
             std::memcpy(grid, record + command.gridOffset, sizeof(grid));
             graphable = graphable && grid[0] && grid[1] && grid[2];
         }
-        rhi::cuda::Result status = state_.makeCurrent();
-        if (status != rhi::cuda::kSuccess)
-            return Submitted{err(rhi::cuda::describeResult(status, "CUDA submission"))};
+        cuda::Result status = state_.makeCurrent();
+        if (status != cuda::kSuccess)
+            return Submitted{err(cuda::describeResult(status, "CUDA submission"))};
         if (graphable) {
             bool launched = false;
             status = launchGraph(tape, record, size, launched);
-            if (status != rhi::cuda::kSuccess)
-                return Submitted{err(rhi::cuda::describeResult(status, "CUDA graph launch"))};
+            if (status != cuda::kSuccess)
+                return Submitted{err(cuda::describeResult(status, "CUDA graph launch"))};
             if (launched)
                 return Submitted{ok(++submitted_)};
         }
-        rhi::cuda::Driver &api = rhi::cuda::driver();
+        cuda::Driver &api = cuda::driver();
         // Record addresses name the device copy of the record, so a stream launch reads its parameters from the
         // staged copy whose addresses are set.
         size_t staged = CudaCommandBuffer::kSlots;
@@ -537,10 +572,10 @@ public:
                 return Submitted{err(std::string("cannot stage a CUDA record in device memory"))};
             staged = tape.cursor;
             status = waitSlot(tape, staged);
-            if (status == rhi::cuda::kSuccess)
+            if (status == cuda::kSuccess)
                 status = stage(tape, record, size, staged);
-            if (status != rhi::cuda::kSuccess)
-                return Submitted{err(rhi::cuda::describeResult(status, "CUDA record staging"))};
+            if (status != cuda::kSuccess)
+                return Submitted{err(cuda::describeResult(status, "CUDA record staging"))};
             record = tape.staging + staged * tape.stride;
         }
         TimedCall call;
@@ -556,8 +591,8 @@ public:
                 if (!fill.bytes)
                     continue;
                 status = api.memsetD8Async(fill.address, 0, static_cast<size_t>(fill.bytes), state_.stream);
-                if (status != rhi::cuda::kSuccess)
-                    return Submitted{err(rhi::cuda::describeResult(status, "CUDA fill"))};
+                if (status != cuda::kSuccess)
+                    return Submitted{err(cuda::describeResult(status, "CUDA fill"))};
                 continue;
             }
             if (command.kind == CommandKind::Copy) {
@@ -569,24 +604,25 @@ public:
                     std::min<uint64_t>((params.total + kLeafCopyWorkgroup - 1) / kLeafCopyWorkgroup, 65535));
                 status = api.launchKernel(leafCopy_.function, groups, 1, 1, kLeafCopyWorkgroup, 1, 1, 0, state_.stream,
                                           arguments, nullptr);
-                if (status != rhi::cuda::kSuccess)
-                    return Submitted{err(rhi::cuda::describeResult(status, "CUDA leaf copy"))};
+                if (status != cuda::kSuccess)
+                    return Submitted{err(cuda::describeResult(status, "CUDA leaf copy"))};
                 continue;
             }
             // cuLaunchKernel copies the parameters it is pointed at, so the record is free once the launch returns.
-            const rhi::cuda::KernelNodeParams launch = kernelParams(tape, record, command);
+            const cuda::KernelNodeParams launch = kernelParams(tape, record, command);
+            const DebugRange range(labels_, command.label);
             if (timed) {
-                if (status = recordEvent(call); status != rhi::cuda::kSuccess)
-                    return Submitted{err(rhi::cuda::describeResult(status, "CUDA timer"))};
+                if (status = recordEvent(call); status != cuda::kSuccess)
+                    return Submitted{err(cuda::describeResult(status, "CUDA timer"))};
             }
             status =
                 api.launchKernel(launch.function, launch.gridDimX, launch.gridDimY, launch.gridDimZ, launch.blockDimX,
                                  launch.blockDimY, launch.blockDimZ, 0, state_.stream, launch.kernelParams, nullptr);
-            if (status != rhi::cuda::kSuccess)
-                return Submitted{err(rhi::cuda::describeResult(status, "CUDA kernel launch"))};
+            if (status != cuda::kSuccess)
+                return Submitted{err(cuda::describeResult(status, "CUDA kernel launch"))};
             if (timed) {
-                if (status = recordEvent(call); status != rhi::cuda::kSuccess)
-                    return Submitted{err(rhi::cuda::describeResult(status, "CUDA timer"))};
+                if (status = recordEvent(call); status != cuda::kSuccess)
+                    return Submitted{err(cuda::describeResult(status, "CUDA timer"))};
                 try {
                     call.nodes.push_back(command.node);
                 } catch (const std::bad_alloc &) {
@@ -596,8 +632,8 @@ public:
         }
         if (staged != CudaCommandBuffer::kSlots) {
             status = api.eventRecord(tape.slots[staged].done, state_.stream);
-            if (status != rhi::cuda::kSuccess)
-                return Submitted{err(rhi::cuda::describeResult(status, "CUDA record staging"))};
+            if (status != cuda::kSuccess)
+                return Submitted{err(cuda::describeResult(status, "CUDA record staging"))};
             tape.slots[staged].pending = true;
             tape.cursor = (staged + 1) % CudaCommandBuffer::kSlots;
         }
@@ -628,12 +664,12 @@ public:
             return {true, std::nullopt};
         TimedCall &call = *found;
         if (!call.events.empty()) {
-            if (state_.makeCurrent() != rhi::cuda::kSuccess)
+            if (state_.makeCurrent() != cuda::kSuccess)
                 return {true, std::nullopt};
-            rhi::cuda::Driver &api = rhi::cuda::driver();
-            const auto since = [&](rhi::cuda::Event event, uint64_t &nanoseconds) {
+            cuda::Driver &api = cuda::driver();
+            const auto since = [&](cuda::Event event, uint64_t &nanoseconds) {
                 float milliseconds = 0.0f;
-                if (api.eventElapsedTime(&milliseconds, call.events.front(), event) != rhi::cuda::kSuccess)
+                if (api.eventElapsedTime(&milliseconds, call.events.front(), event) != cuda::kSuccess)
                     return false;
                 nanoseconds = static_cast<uint64_t>(static_cast<double>(milliseconds) * 1.0e6);
                 return true;
@@ -660,16 +696,16 @@ public:
         if (point <= completed_)
             return Result<void, std::string>{ok()};
         // The stream is in order, so draining it completes every point submitted so far.
-        const rhi::cuda::Result status = state_.synchronize();
-        if (status != rhi::cuda::kSuccess)
-            return Result<void, std::string>{err(rhi::cuda::describeResult(status, "CUDA stream synchronize"))};
+        const cuda::Result status = state_.synchronize();
+        if (status != cuda::kSuccess)
+            return Result<void, std::string>{err(cuda::describeResult(status, "CUDA stream synchronize"))};
         completed_ = submitted_;
         return Result<void, std::string>{ok()};
     }
 
 private:
     struct Fill {
-        rhi::cuda::DevicePointer address{};
+        cuda::DevicePointer address{};
         uint64_t bytes{};
     };
 
@@ -677,29 +713,29 @@ private:
     struct TimedCall {
         TimelinePoint point{};
         std::vector<uint32_t> nodes;
-        std::vector<rhi::cuda::Event> events;
+        std::vector<cuda::Event> events;
         std::optional<std::vector<ScopeTiming>> scopes;
     };
     static constexpr size_t kKeptTimings = 8;
 
-    rhi::cuda::Result recordEvent(TimedCall &call) {
-        rhi::cuda::Driver &api = rhi::cuda::driver();
-        rhi::cuda::Event event{};
-        rhi::cuda::Result status = api.eventCreate(&event, 0);
-        if (status != rhi::cuda::kSuccess)
+    cuda::Result recordEvent(TimedCall &call) {
+        cuda::Driver &api = cuda::driver();
+        cuda::Event event{};
+        cuda::Result status = api.eventCreate(&event, 0);
+        if (status != cuda::kSuccess)
             return status;
         try {
             call.events.push_back(event);
         } catch (const std::bad_alloc &) {
             api.eventDestroy(event);
-            return rhi::cuda::kErrorOutOfMemory;
+            return cuda::kErrorOutOfMemory;
         }
         return api.eventRecord(event, state_.stream);
     }
 
     static void destroyEvents(TimedCall &call) {
-        for (rhi::cuda::Event event : call.events)
-            rhi::cuda::driver().eventDestroy(event);
+        for (cuda::Event event : call.events)
+            cuda::driver().eventDestroy(event);
         call.events.clear();
     }
 
@@ -736,26 +772,26 @@ private:
     }
 
     // Points the tape's parameter array into the record; the result is valid until the next call.
-    static rhi::cuda::KernelNodeParams kernelParams(const CudaCommandBuffer &tape, const uint8_t *record,
-                                                    const DispatchCommand &command) {
+    static cuda::KernelNodeParams kernelParams(const CudaCommandBuffer &tape, const uint8_t *record,
+                                               const DispatchCommand &command) {
         const auto &executable = static_cast<const CudaExecutable &>(*command.executable);
         uint8_t *arguments = const_cast<uint8_t *>(record + command.argumentsOffset);
         for (size_t index = 0; index < executable.parameterOffsets.size(); ++index)
             tape.parameters[index] = arguments + executable.parameterOffsets[index];
         uint32_t grid[3];
         std::memcpy(grid, record + command.gridOffset, sizeof(grid));
-        return rhi::cuda::KernelNodeParams{executable.function.function,
-                                           grid[0],
-                                           grid[1],
-                                           grid[2],
-                                           executable.workgroup[0],
-                                           executable.workgroup[1],
-                                           executable.workgroup[2],
-                                           0,
-                                           tape.parameters.data(),
-                                           nullptr,
-                                           nullptr,
-                                           nullptr};
+        return cuda::KernelNodeParams{executable.function.function,
+                                      grid[0],
+                                      grid[1],
+                                      grid[2],
+                                      executable.workgroup[0],
+                                      executable.workgroup[1],
+                                      executable.workgroup[2],
+                                      0,
+                                      tape.parameters.data(),
+                                      nullptr,
+                                      nullptr,
+                                      nullptr};
     }
 
     // The one parameter of an indirect twin: the device address of its arguments, and the parameter array the driver
@@ -772,12 +808,12 @@ private:
     // The graph node of a group reading its arguments from slot `slot`: a dispatch's indirect twin, or the fill kernel
     // with a row per fill over a grid sized for the largest at the first record, whose loop covers any later size.
     // `argument` must outlive the use of the result.
-    rhi::cuda::KernelNodeParams nodeParams(const CudaCommandBuffer &tape, const uint8_t *record,
-                                           const CudaCommandBuffer::Group &group, size_t slot,
-                                           IndirectArgument &argument) const {
+    cuda::KernelNodeParams nodeParams(const CudaCommandBuffer &tape, const uint8_t *record,
+                                      const CudaCommandBuffer::Group &group, size_t slot,
+                                      IndirectArgument &argument) const {
         const DispatchCommand &command = tape.commands[group.command];
         argument.address = tape.ring + slot * tape.stride + command.argumentsOffset;
-        rhi::cuda::KernelNodeParams params{};
+        cuda::KernelNodeParams params{};
         params.kernelParams = argument.parameters;
         params.gridDimY = params.gridDimZ = params.blockDimY = params.blockDimZ = 1;
         if (command.kind == CommandKind::Fill) {
@@ -812,40 +848,40 @@ private:
 
     // Builds the graph on first use, then copies `record` into the next slot and launches that slot's instance.
     // `launched` stays false when the graph cannot take this record, and the caller launches on the stream instead.
-    rhi::cuda::Result launchGraph(const CudaCommandBuffer &tape, const uint8_t *record, size_t size, bool &launched) {
-        rhi::cuda::Driver &api = rhi::cuda::driver();
+    cuda::Result launchGraph(const CudaCommandBuffer &tape, const uint8_t *record, size_t size, bool &launched) {
+        cuda::Driver &api = cuda::driver();
         if (!tape.graph && !buildGraph(tape, record, size)) {
             tape.streamOnly = true;
-            return rhi::cuda::kSuccess;
+            return cuda::kSuccess;
         }
         if (size > tape.stride || tape.slots[0].record.size() != size)
-            return rhi::cuda::kSuccess;
+            return cuda::kSuccess;
         const size_t index = tape.cursor;
         CudaCommandBuffer::Slot &slot = tape.slots[index];
-        if (const rhi::cuda::Result status = waitSlot(tape, index); status != rhi::cuda::kSuccess)
+        if (const cuda::Result status = waitSlot(tape, index); status != cuda::kSuccess)
             return status;
         for (size_t node = 0; node < tape.groups.size(); ++node) {
             if (sameNode(slot.record.data(), record, tape.commands[tape.groups[node].command]))
                 continue;
             IndirectArgument argument;
-            const rhi::cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], index, argument);
-            if (api.graphExecKernelNodeSetParams(slot.exec, tape.nodes[node], &launch) != rhi::cuda::kSuccess) {
+            const cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], index, argument);
+            if (api.graphExecKernelNodeSetParams(slot.exec, tape.nodes[node], &launch) != cuda::kSuccess) {
                 tape.streamOnly = true;
-                return rhi::cuda::kSuccess;
+                return cuda::kSuccess;
             }
         }
         std::memcpy(slot.record.data(), record, size);
-        rhi::cuda::Result status = stage(tape, record, size, index);
-        if (status == rhi::cuda::kSuccess)
+        cuda::Result status = stage(tape, record, size, index);
+        if (status == cuda::kSuccess)
             status = api.graphLaunch(slot.exec, state_.stream);
-        if (status == rhi::cuda::kSuccess)
+        if (status == cuda::kSuccess)
             status = api.eventRecord(slot.done, state_.stream);
-        if (status != rhi::cuda::kSuccess)
+        if (status != cuda::kSuccess)
             return status;
         slot.pending = true;
         tape.cursor = (index + 1) % CudaCommandBuffer::kSlots;
         launched = true;
-        return rhi::cuda::kSuccess;
+        return cuda::kSuccess;
     }
 
     // One instance per slot, its dispatches reading that slot. Nodes run in command order, each depending on the one
@@ -855,54 +891,53 @@ private:
     bool ensureRing(const CudaCommandBuffer &tape, size_t size) {
         if (tape.staging)
             return true;
-        rhi::cuda::Driver &api = rhi::cuda::driver();
+        cuda::Driver &api = cuda::driver();
         if (!tape.ring) {
             tape.stride = (size + 255) / 256 * 256;
-            if (state_.allocate(tape.ring, tape.stride * CudaCommandBuffer::kSlots) != rhi::cuda::kSuccess) {
+            if (state_.allocate(tape.ring, tape.stride * CudaCommandBuffer::kSlots) != cuda::kSuccess) {
                 tape.ring = 0;
                 return false;
             }
         }
         for (CudaCommandBuffer::Slot &slot : tape.slots)
-            if (!slot.done && api.eventCreate(&slot.done, rhi::cuda::kEventDisableTiming) != rhi::cuda::kSuccess) {
+            if (!slot.done && api.eventCreate(&slot.done, cuda::kEventDisableTiming) != cuda::kSuccess) {
                 slot.done = nullptr;
                 return false;
             }
         void *host = nullptr;
-        if (api.hostAllocate(&host, tape.stride * CudaCommandBuffer::kSlots, 0) != rhi::cuda::kSuccess)
+        if (api.hostAllocate(&host, tape.stride * CudaCommandBuffer::kSlots, 0) != cuda::kSuccess)
             return false;
         tape.staging = static_cast<uint8_t *>(host);
         return true;
     }
 
     // A slot is rewritten once the launches that read it have completed.
-    static rhi::cuda::Result waitSlot(const CudaCommandBuffer &tape, size_t index) {
+    static cuda::Result waitSlot(const CudaCommandBuffer &tape, size_t index) {
         CudaCommandBuffer::Slot &slot = tape.slots[index];
         if (!slot.pending)
-            return rhi::cuda::kSuccess;
-        if (const rhi::cuda::Result status = rhi::cuda::driver().eventSynchronize(slot.done);
-            status != rhi::cuda::kSuccess)
+            return cuda::kSuccess;
+        if (const cuda::Result status = cuda::driver().eventSynchronize(slot.done); status != cuda::kSuccess)
             return status;
         slot.pending = false;
-        return rhi::cuda::kSuccess;
+        return cuda::kSuccess;
     }
 
     // Copies `record` into slot `index`'s staging with each record address set into the slot's device copy, then
     // enqueues the copy to the device.
-    rhi::cuda::Result stage(const CudaCommandBuffer &tape, const uint8_t *record, size_t size, size_t index) {
+    cuda::Result stage(const CudaCommandBuffer &tape, const uint8_t *record, size_t size, size_t index) {
         uint8_t *host = tape.staging + index * tape.stride;
         std::memcpy(host, record, size);
-        const rhi::cuda::DevicePointer device = tape.ring + index * tape.stride;
+        const cuda::DevicePointer device = tape.ring + index * tape.stride;
         for (const DispatchCommand &command : tape.commands)
             for (const RecordAddress &address : command.recordAddresses) {
                 const uint64_t target = device + address.target;
                 std::memcpy(host + address.at, &target, sizeof(target));
             }
-        return rhi::cuda::driver().copyHostToDeviceAsync(device, host, size, state_.stream);
+        return cuda::driver().copyHostToDeviceAsync(device, host, size, state_.stream);
     }
 
     bool buildGraph(const CudaCommandBuffer &tape, const uint8_t *record, size_t size) {
-        rhi::cuda::Driver &api = rhi::cuda::driver();
+        cuda::Driver &api = cuda::driver();
         constexpr size_t kMaximumFills = 65535;
         try {
             tape.groups.clear();
@@ -927,36 +962,38 @@ private:
         }
         if (!ensureRing(tape, size))
             return false;
-        if (api.graphCreate(&tape.graph, 0) != rhi::cuda::kSuccess) {
+        if (api.graphCreate(&tape.graph, 0) != cuda::kSuccess) {
             tape.graph = nullptr;
             return false;
         }
         for (size_t node = 0; node < tape.groups.size(); ++node) {
-            const rhi::cuda::GraphNode *dependency = node ? &tape.nodes[node - 1] : nullptr;
+            const cuda::GraphNode *dependency = node ? &tape.nodes[node - 1] : nullptr;
             IndirectArgument argument;
-            const rhi::cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], 0, argument);
+            const cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], 0, argument);
             if (api.graphAddKernelNode(&tape.nodes[node], tape.graph, dependency, node ? 1 : 0, &launch) !=
-                rhi::cuda::kSuccess)
+                cuda::kSuccess)
                 return false;
         }
         for (size_t index = 0; index < CudaCommandBuffer::kSlots; ++index) {
             CudaCommandBuffer::Slot &slot = tape.slots[index];
-            if (api.graphInstantiate(&slot.exec, tape.graph, 0) != rhi::cuda::kSuccess) {
+            if (api.graphInstantiate(&slot.exec, tape.graph, 0) != cuda::kSuccess) {
                 slot.exec = nullptr;
                 return false;
             }
             for (size_t node = 0; index && node < tape.groups.size(); ++node) {
                 IndirectArgument argument;
-                const rhi::cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], index, argument);
-                if (api.graphExecKernelNodeSetParams(slot.exec, tape.nodes[node], &launch) != rhi::cuda::kSuccess)
+                const cuda::KernelNodeParams launch = nodeParams(tape, record, tape.groups[node], index, argument);
+                if (api.graphExecKernelNodeSetParams(slot.exec, tape.nodes[node], &launch) != cuda::kSuccess)
                     return false;
             }
         }
         return true;
     }
 
+    std::shared_ptr<DeviceState> owner_;
     DeviceState &state_;
     std::mutex mutex_;
+    const bool labels_;
     TimelinePoint submitted_{};
     TimelinePoint completed_{};
     std::deque<TimedCall> timings_;
@@ -969,11 +1006,10 @@ private:
 
 } // namespace
 
-std::unique_ptr<Device> createCudaDevice(VernonRhiDevice device) {
-    auto state = rhi::deviceState(device, VERNON_RHI_BACKEND_CUDA);
-    if (state.isErr() || !state.value())
+std::unique_ptr<Device> createCudaDevice(std::shared_ptr<cuda::DeviceState> state, bool labels) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<Device>(new (std::nothrow) CudaDevice(*static_cast<DeviceState *>(state.value())));
+    return std::unique_ptr<Device>(new (std::nothrow) CudaDevice(std::move(state), labels));
 }
 
 } // namespace vernon::hal
@@ -982,7 +1018,7 @@ std::unique_ptr<Device> createCudaDevice(VernonRhiDevice device) {
 
 namespace vernon::hal {
 
-std::unique_ptr<Device> createCudaDevice(VernonRhiDevice) { return nullptr; }
+std::unique_ptr<Device> createCudaDevice(std::shared_ptr<cuda::DeviceState>, bool) { return nullptr; }
 
 } // namespace vernon::hal
 

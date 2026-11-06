@@ -1,5 +1,4 @@
 #include "runtime/compute_launch_planner.h"
-#include "runtime/program_execution/device_commands.h"
 
 #include <gtest/gtest.h>
 
@@ -12,14 +11,6 @@
 namespace {
 
 using namespace vernon::runtime;
-
-TEST(DeviceCommandsTest, RejectsOffsetsOutsideHostAddressSpace) {
-    size_t result = 0;
-    EXPECT_TRUE(program_execution::checkedDeviceBufferOffset(7, 5, result));
-    EXPECT_EQ(result, 12u);
-    EXPECT_FALSE(program_execution::checkedDeviceBufferOffset(std::numeric_limits<uint64_t>::max(), 1, result));
-    EXPECT_FALSE(program_execution::checkedDeviceBufferOffset(std::numeric_limits<size_t>::max(), 1, result));
-}
 
 void setScalarLayout(Parameter &parameter, const char *dtype, VernonDataType dataType) {
     const VernonValueLayoutView view = vernonRuntimeGetScalarValueLayout(dataType);
@@ -190,7 +181,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.slot = 0;
     supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
-    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     supplied.tensor.resource = resource;
     supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     supplied.tensor.access = VERNON_ACCESS_READ;
@@ -256,7 +247,7 @@ TEST(ComputeLaunchPlannerTest, MaterializesRankZeroMetadataCarrier) {
     supplied.slot = 0;
     supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
-    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     supplied.tensor.resource = {1, {2}, 0, sizeof(float)};
     supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     supplied.tensor.access = VERNON_ACCESS_READ_WRITE;
@@ -287,7 +278,7 @@ TEST(ComputeLaunchPlannerTest, ZeroExtentSkipsProjectionButValidatesRepresentati
                                              static_cast<int64_t>(sizeof(float))};
     VernonTensorView tensor{};
     tensor.struct_size = sizeof(tensor);
-    tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     tensor.resource = {1, {2}, 0, sizeof(float)};
     tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     tensor.access = VERNON_ACCESS_READ;
@@ -315,7 +306,7 @@ TEST(ComputeLaunchPlannerTest, RejectsProjectionIntermediateOverflow) {
                                          static_cast<int64_t>(sizeof(float))};
     VernonTensorView tensor{};
     tensor.struct_size = sizeof(tensor);
-    tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     tensor.resource = {1, {2}, 0, std::numeric_limits<size_t>::max()};
     tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     tensor.access = VERNON_ACCESS_READ;
@@ -350,7 +341,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     supplied.slot = 0;
     supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
-    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     supplied.tensor.resource = {1, {2}, 0, 2 * sizeof(float)};
     supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     supplied.tensor.access = VERNON_ACCESS_WRITE;

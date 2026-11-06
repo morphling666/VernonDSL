@@ -137,7 +137,7 @@ Result<void, std::string> writeDeviceTape(const TapeUse &use, const DeviceTape &
             VernonProgramArgument argument{};
             argument.kind = VERNON_PROGRAM_TENSOR;
             argument.tensor.struct_size = sizeof(argument.tensor);
-            argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+            argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
             argument.tensor.resource = buffer->reference(0, bytes);
             argument.tensor.access = VERNON_ACCESS_READ_WRITE;
             argument.tensor.rank = 1;
@@ -217,6 +217,9 @@ Result<Recording, std::string> record(hal::Device &device, const LinkedSchedule 
             if (operation.kind == OperationKind::Pass) {
                 hal::DispatchCommand pass{hal::CommandKind::Pass, recording.executables[operation.executable].get()};
                 pass.pass = operation.pass;
+                pass.node = node;
+                if (node < schedule.nodeLabels.size())
+                    pass.label = schedule.nodeLabels[node];
                 commands.push_back(std::move(pass));
                 continue;
             }
@@ -246,6 +249,8 @@ Result<Recording, std::string> record(hal::Device &device, const LinkedSchedule 
             }
             dispatch.recordAddresses = operation.recordAddresses;
             dispatch.node = node;
+            if (node < schedule.nodeLabels.size())
+                dispatch.label = schedule.nodeLabels[node];
             commands.push_back(std::move(dispatch));
         }
         recording.record.resize(schedule.recordSize);

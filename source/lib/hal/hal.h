@@ -194,6 +194,8 @@ struct DispatchCommand {
     LeafCopy copy{};
     // The graph node it runs, which a timed dispatch's ScopeTiming names.
     uint32_t node{};
+    // The node's debug label, which a device created with labels emits around the dispatch; empty for a kernel's.
+    std::string label;
 };
 
 // Device memory with one home. On a CPU or CUDA device its address is what kernels and records name it by; a graphics
@@ -222,7 +224,7 @@ public:
 // A point on the device queue's timeline. Each submission signals the next point; zero precedes every submission.
 using TimelinePoint = uint64_t;
 
-// The device time of a render scope of `nodeCount` graphics nodes from Program node `firstNode`, or of one compute
+// The device time of a render scope of `nodeCount` graphics nodes from schedule node `firstNode`, or of one compute
 // node, from the begin of the submission's first timed scope.
 struct ScopeTiming {
     uint32_t firstNode{};

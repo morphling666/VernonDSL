@@ -72,8 +72,10 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
   - backend-specific ABI or interop capabilities.
 - [x] Derive availability from existing compiler, runtime, and context capability APIs.
 - [x] Distinguish platform-not-built, device/context-unavailable, and capability-unsupported skip reasons.
-- [ ] Consolidate RHI device/context ownership in `source/tests/support/runtime_rhi_test_utils.h`.
-- [ ] Remove duplicated `OwnedGpuRuntime` implementations after migration.
+- [ ] Consolidate HAL device/context ownership in `HalTestDevice`
+  (`source/tests/support/schedule_test_support.h`); `hal_resources_test.cpp` and
+  `schedule_graphics_test.cpp` still create their own devices.
+- [x] Remove duplicated `OwnedGpuRuntime` implementations after migration.
 - [x] Add `python/tests/backend_test_matrix.py` with the same backend and requirement semantics.
 - [ ] Reject catch-all exception-based skips in the shared harness.
 

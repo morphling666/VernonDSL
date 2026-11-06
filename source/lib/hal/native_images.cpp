@@ -2,6 +2,7 @@
 
 #include "VernonFormats.hpp"
 #include "runtime/graphics_scope_materializer.h"
+#include "runtime/image_rules.h"
 
 #include <algorithm>
 #include <atomic>
@@ -11,64 +12,14 @@
 namespace vernon::hal {
 namespace {
 
-constexpr uint32_t kCubeFaces = 6;
+using runtime::compatibleViewDimension;
+using runtime::maximumMipLevels;
+using runtime::validImageShape;
 
 std::mutex undefinedMutex;
 std::vector<uint64_t> undefinedImages;
 // Whether `undefinedImages` may hold any image, read without the lock on the submission path.
 std::atomic<bool> anyUndefinedImage{false};
-
-bool cube(VernonTextureDimension dimension) {
-    return dimension == VERNON_TEXTURE_CUBE || dimension == VERNON_TEXTURE_CUBE_ARRAY;
-}
-
-bool validShape(const VernonImageDescriptor &image) {
-    const auto &extent = image.extent;
-    if (!extent.width || !extent.height || !extent.depth || !image.array_layer_count)
-        return false;
-    switch (image.dimension) {
-    case VERNON_TEXTURE_2D:
-        return extent.depth == 1 && image.array_layer_count == 1;
-    case VERNON_TEXTURE_2D_ARRAY:
-        return extent.depth == 1;
-    case VERNON_TEXTURE_3D:
-        return image.array_layer_count == 1;
-    case VERNON_TEXTURE_CUBE:
-        return extent.width == extent.height && extent.depth == 1 && image.array_layer_count == kCubeFaces;
-    case VERNON_TEXTURE_CUBE_ARRAY:
-        return extent.width == extent.height && extent.depth == 1 && image.array_layer_count % kCubeFaces == 0;
-    }
-    return false;
-}
-
-uint32_t maximumMipLevels(const VernonImageDescriptor &image) {
-    uint32_t extent = std::max(image.extent.width, image.extent.height);
-    if (image.dimension == VERNON_TEXTURE_3D)
-        extent = std::max(extent, image.extent.depth);
-    uint32_t levels = 1;
-    for (; extent > 1; extent >>= 1)
-        ++levels;
-    return levels;
-}
-
-// A view reinterprets layers, never the 3D/layered split: 2D and 2D_ARRAY views select layers of any non-3D image,
-// and cube views select whole cubes, which start at a multiple of 6 layers.
-bool compatibleDimension(VernonTextureDimension image, VernonTextureDimension view, uint32_t baseLayer,
-                         uint32_t layerCount) {
-    switch (view) {
-    case VERNON_TEXTURE_2D:
-        return image != VERNON_TEXTURE_3D && layerCount == 1;
-    case VERNON_TEXTURE_2D_ARRAY:
-        return image != VERNON_TEXTURE_3D;
-    case VERNON_TEXTURE_3D:
-        return image == VERNON_TEXTURE_3D && baseLayer == 0 && layerCount == 1;
-    case VERNON_TEXTURE_CUBE:
-        return cube(image) && baseLayer % kCubeFaces == 0 && layerCount == kCubeFaces;
-    case VERNON_TEXTURE_CUBE_ARRAY:
-        return cube(image) && baseLayer % kCubeFaces == 0 && layerCount % kCubeFaces == 0;
-    }
-    return false;
-}
 
 // The host bytes of one texel of `aspect`: a packed depth-stencil texel, one aspect of a depth-stencil format, or a
 // whole texel of any other; zero when the data layout does not match.
@@ -159,7 +110,7 @@ bool validImage(const VernonImageDescriptor &image) {
     constexpr uint32_t usages = VERNON_IMAGE_SAMPLED | VERNON_IMAGE_STORAGE | VERNON_IMAGE_COLOR_ATTACHMENT |
                                 VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_IMAGE_TRANSFER_SOURCE |
                                 VERNON_IMAGE_TRANSFER_DESTINATION;
-    if (!formats::find(image.format) || !validShape(image))
+    if (!formats::find(image.format) || !validImageShape(image))
         return false;
     const bool depth = formats::hasDepth(image.format);
     return image.mip_level_count != 0 && image.mip_level_count <= maximumMipLevels(image) && image.sample_count == 1 &&
@@ -175,7 +126,7 @@ bool validView(const VernonImageDescriptor &image, const VernonImageViewDescript
            range.mip_level_count <= image.mip_level_count - range.base_mip_level &&
            range.base_array_layer < image.array_layer_count &&
            range.array_layer_count <= image.array_layer_count - range.base_array_layer &&
-           compatibleDimension(image.dimension, view.dimension, range.base_array_layer, range.array_layer_count);
+           compatibleViewDimension(image.dimension, view.dimension, range.base_array_layer, range.array_layer_count);
 }
 
 std::optional<size_t> regionBytes(const VernonImageDescriptor &image, const VernonHalImageRegion &region) {

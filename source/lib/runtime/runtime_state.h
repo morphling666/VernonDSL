@@ -61,13 +61,10 @@ struct VernonRuntimeContext {
     std::atomic<uint64_t> nextProgramGraphId{1};
     void *backendState{};
     void (*destroyBackendState)(void *){};
-    VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    vernon::Option<vernon::ChildLease> rhiDeviceLease;
     std::mutex cpuEntriesMutex;
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
-    std::mutex referencedRhiBuffersMutex;
-    std::map<std::pair<uint64_t, uint64_t>, VernonRhiBuffer> referencedRhiBuffers;
-    // The HAL device linked schedules record on, created by the first one; it shares the backend's CPU scheduler.
+    // The HAL device linked schedules record on. A CUDA context is created over it; on other backends the first
+    // schedule creates it, and on the CPU it shares the backend's scheduler.
     std::mutex halDeviceMutex;
     std::shared_ptr<vernon::hal::Device> halDevice;
 };
@@ -78,11 +75,6 @@ std::string &invocationDiagnostic(VernonRuntimeContext &context);
 const std::string *currentInvocationDiagnostic(const VernonRuntimeContext &context);
 VernonStringView currentInvocationDiagnosticView(const VernonRuntimeContext &context) noexcept;
 void clearInvocationDiagnostic(const VernonRuntimeContext &context) noexcept;
-
-// Providers may report failure with an empty last error; the fallback names the failed operation instead.
-inline std::string providerDiagnostic(VernonStringView error, std::string_view fallback) {
-    return error.data && error.size ? std::string(error.data, error.size) : std::string(fallback);
-}
 
 class RuntimeDiagnosticScope {
 public:
@@ -175,7 +167,7 @@ struct CanonicalProgramAutodiffState {
 struct VernonProgramExecutable;
 struct RuntimeGraphicsPipelineState;
 
-// A composed Program graph as the CPU and CUDA link it: one schedule node per Program node, in run order.
+// A composed Program graph: one schedule node per Program node, in run order.
 struct ProgramGraphComposition {
     // A boundary slot of a node's own Program, by the node's index in `nodes`.
     struct Site {
@@ -192,10 +184,20 @@ struct ProgramGraphComposition {
         // The composed executable's boundary slot.
         uint32_t boundary{};
     };
+    // A graphics Node of a node's forward graph. Its composed id counts the forward Nodes of every earlier node, as
+    // the linked schedule numbers the Nodes of its fragments.
+    struct GraphicsNode {
+        uint32_t id{};
+        uint32_t node{};
+        uint32_t local{};
+    };
 
     std::vector<std::shared_ptr<VernonProgramExecutable>> nodes;
+    // Per node, the label its schedule Nodes are named under; empty keeps the node's own names.
+    std::vector<std::string> labels;
     std::vector<Connection> connections;
     std::vector<Export> exports;
+    std::vector<GraphicsNode> graphicsNodes;
 };
 
 struct VernonProgramExecutable {

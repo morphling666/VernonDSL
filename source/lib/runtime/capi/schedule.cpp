@@ -186,8 +186,8 @@ vernon::Result<vernon::schedule::BufferRange, std::string> resolveBuffer(void *o
             const_cast<uint8_t *>(static_cast<const uint8_t *>(view.host_data)), view.byte_size})};
     }
     const VernonRuntimeProviderResourceReference &resource = view.resource;
-    if (view.storage != VERNON_TENSOR_RHI_RESOURCE || !resource.resource.value || view.byte_size > resource.size)
-        return Resolved{vernon::err(std::string("RHI Tensor view is invalid"))};
+    if (view.storage != VERNON_TENSOR_DEVICE_RESOURCE || !resource.resource.value || view.byte_size > resource.size)
+        return Resolved{vernon::err(std::string("device Tensor view is invalid"))};
     const auto &context = *static_cast<const VernonRuntimeContext *>(opaque);
     const auto base = static_cast<uintptr_t>(resource.resource.value);
     if (context.backend == VERNON_RUNTIME_CUDA && !vernon::hal::isNativeBufferReference(resource.identity))
@@ -204,8 +204,8 @@ std::shared_ptr<vernon::hal::Device> contextDevice(VernonRuntimeContext &context
         context.halDevice = std::shared_ptr<vernon::hal::Device>(
             vernon::hal::createCpuDevice(vernon::runtime::cpuWorkgroupScheduler(context)).release());
     } else if (context.backend == VERNON_RUNTIME_CUDA) {
-        context.halDevice =
-            std::shared_ptr<vernon::hal::Device>(vernon::hal::createCudaDevice(context.rhiDevice).release());
+        error = "a CUDA context is created over its HAL device";
+        return nullptr;
     } else if (vernon::runtime::isOpenGLBackend(context.backend)) {
         context.halDevice = std::shared_ptr<vernon::hal::Device>(vernon::hal::createOpenGLDevice(context).release());
     } else if (context.backend == VERNON_RUNTIME_VULKAN) {
@@ -248,6 +248,9 @@ vernon::Result<vernon::schedule::Fragment, std::string> executableFragment(const
                                                                            VernonProgramExecutable &executable,
                                                                            const std::string &graph,
                                                                            const std::vector<uint32_t> &exposed) {
+    if (executable.composition)
+        return vernon::Result<vernon::schedule::Fragment, std::string>{
+            vernon::err(std::string("a composed Program graph links as a whole, not as a node of another graph"))};
     if (linksComputeExecutables(context))
         return vernon::schedule::computeProgramFragment(executable, graph, exposed);
     return vernon::schedule::graphicsProgramFragment(executable, graph, exposed);
@@ -507,7 +510,7 @@ vernon::Result<void, std::string> bindResiduals(VernonLinkedSchedule &schedule, 
             argument.kind = VERNON_PROGRAM_TENSOR;
             VernonTensorView &tensor = argument.tensor;
             tensor.struct_size = sizeof(tensor);
-            tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+            tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
             tensor.resource = block.device->reference(entry.offset, bytes);
             tensor.access =
                 described.access & VERNON_SCHEDULE_ACCESS_WRITE ? VERNON_ACCESS_READ_WRITE : VERNON_ACCESS_READ;
@@ -752,7 +755,7 @@ replayForward(VernonLinkedSchedule &forward, const VernonScheduleResiduals &bloc
             scratch.extents.assign(view.shape, view.shape + view.rank);
             scratch.byteStrides.assign(view.byte_strides, view.byte_strides + view.rank);
             VernonProgramArgument output = argument;
-            output.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+            output.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
             output.tensor.resource = replay->scratch.back()->reference(0, bytes);
             output.tensor.shape = scratch.extents.empty() ? nullptr : scratch.extents.data();
             output.tensor.byte_strides = scratch.byteStrides.empty() ? nullptr : scratch.byteStrides.data();
@@ -832,6 +835,7 @@ vernon::Result<VernonLinkedSchedule *, std::string> recomputeSchedule(VernonSche
     schedule->linked = forward.linked;
     schedule->linked.operations.resize(forward.linked.nodeOperationEnds[nodes - 1]);
     schedule->linked.nodeOperationEnds.resize(nodes);
+    schedule->linked.nodeLabels.resize(nodes);
     auto recording = vernon::schedule::record(*schedule->device, schedule->linked);
     if (recording.isErr())
         return Linked{vernon::err(std::move(recording).error())};
@@ -1065,41 +1069,77 @@ bool linkComposedForward(VernonRuntimeContext *context, const ProgramGraphCompos
         auto fragment = executableFragment(*context, *composition.nodes[node], "forward", exposed[node]);
         if (fragment.isErr())
             return unsupported("node " + std::to_string(node) + ": " + fragment.error());
+        const std::string &label = composition.labels[node];
+        std::vector<std::string> &labels = fragment.value().nodeLabels;
+        if (!label.empty())
+            for (std::string &name : labels)
+                name = labels.size() == 1 ? label : label + "/" + name;
         forward.fragments.push_back(std::move(fragment).value());
     }
+    // A pass fragment has no slot for an image a pass renders to, which its PASS slot names; on a graphics device such
+    // a boundary is no argument of the composed schedule, and connecting it shares nothing the schedule allocates.
+    const auto rendered = [&](const ProgramGraphComposition::Site &site) {
+        if (linksComputeExecutables(*context))
+            return false;
+        const vernon::runtime::program::BoundarySlot &boundary =
+            vernon::runtime::capi::executableProgram(*composition.nodes[site.node])->abi.boundarySlots[site.slot];
+        return boundary.storage &&
+               boundary.storage->descriptorKind == vernon::runtime::program::StorageDescriptorKind::Image;
+    };
+    const auto boundaryName = [&](const ProgramGraphComposition::Site &site) {
+        return "node " + std::to_string(site.node) + " boundary '" +
+               vernon::runtime::capi::executableProgram(*composition.nodes[site.node])
+                   ->abi.boundarySlots[site.slot]
+                   .path +
+               "'";
+    };
     std::set<std::pair<uint32_t, uint32_t>> exported;
     std::set<std::pair<uint32_t, uint32_t>> arguments;
     for (const ProgramGraphComposition::Export &entry : composition.exports) {
         const uint32_t slot = fragmentSlot(forward.fragments[entry.site.node], entry.site.slot);
+        if (slot == kNoSlot && rendered(entry.site))
+            continue;
         if (slot == kNoSlot)
-            return unsupported("an exported boundary slot is no slot of its node's schedule");
+            return unsupported("exported " + boundaryName(entry.site) + " is no slot of its node's schedule");
         exported.insert({entry.site.node, entry.site.slot});
         arguments.insert({entry.site.node, slot});
     }
     std::vector<vernon::schedule::Connection> connections;
+    // Per composition connection, its index in `connections`, or SIZE_MAX when none of its sites has a slot.
+    std::vector<size_t> linkedConnections;
     for (size_t index = 0; index < composition.connections.size(); ++index) {
-        vernon::schedule::Connection &connection = connections.emplace_back();
+        vernon::schedule::Connection connection;
         bool exports = false;
         for (const ProgramGraphComposition::Site &site : composition.connections[index].sites) {
             const uint32_t slot = fragmentSlot(forward.fragments[site.node], site.slot);
+            if (slot == kNoSlot && rendered(site))
+                continue;
             if (slot == kNoSlot)
-                return unsupported("a connected boundary slot is no slot of its node's schedule");
+                return unsupported("connected " + boundaryName(site) + " is no slot of its node's schedule");
             connection.sites.push_back({site.node, slot});
             exports = exports || exported.count({site.node, site.slot}) != 0;
         }
         connection.internal = !exports && !kept[index];
+        linkedConnections.push_back(connection.sites.empty() ? SIZE_MAX : connections.size());
+        if (!connection.sites.empty())
+            connections.push_back(std::move(connection));
     }
     forward.schedule.reset(linkComposed(context, forward.fragments, connections, arguments));
     if (!forward.schedule)
         return false;
     const std::vector<std::vector<uint32_t>> &nodeSlots = forward.schedule->linked.nodeSlots;
-    for (const vernon::schedule::Connection &connection : connections)
+    for (const size_t linked : linkedConnections) {
+        const vernon::schedule::Connection *connection = linked == SIZE_MAX ? nullptr : &connections[linked];
         forward.connectionSlots.push_back(
-            connection.internal ? kNoSlot : nodeSlots[connection.sites.front().node][connection.sites.front().slot]);
-    for (const ProgramGraphComposition::Export &entry : composition.exports)
-        forward.boundarySlots.push_back(
-            {entry.boundary,
-             nodeSlots[entry.site.node][fragmentSlot(forward.fragments[entry.site.node], entry.site.slot)]});
+            !connection || connection->internal
+                ? kNoSlot
+                : nodeSlots[connection->sites.front().node][connection->sites.front().slot]);
+    }
+    for (const ProgramGraphComposition::Export &entry : composition.exports) {
+        const uint32_t slot = fragmentSlot(forward.fragments[entry.site.node], entry.site.slot);
+        if (slot != kNoSlot)
+            forward.boundarySlots.push_back({entry.boundary, nodeSlots[entry.site.node][slot]});
+    }
     return true;
 }
 
@@ -1114,6 +1154,14 @@ VernonLinkedSchedule *linkComposedProgram(VernonRuntimeContext *context, VernonP
     if (!linkComposedForward(context, composition, std::vector<std::vector<uint32_t>>(composition.nodes.size()),
                              std::vector<bool>(composition.connections.size(), false), forward))
         return nullptr;
+    if (!linksComputeExecutables(*context)) {
+        VernonLinkedSchedule &schedule = *forward.schedule;
+        schedule.slotBoundaries.assign(schedule.linked.slots.size(), UINT32_MAX);
+        for (const auto &[boundary, slot] : forward.boundarySlots)
+            if (slot != kNoSlot)
+                schedule.slotBoundaries[slot] = boundary;
+        return forward.schedule.release();
+    }
     const std::unordered_set<uint32_t> &parameters = executable.bindableParameterSlots;
     auto arguments = vernon::schedule::programArguments(forward.schedule->linked, forward.boundarySlots,
                                                         [&](uint32_t boundary) { return parameters.count(boundary); });
@@ -1582,7 +1630,7 @@ VernonLinkedSchedule *vernonScheduleLinkProgram(VernonRuntimeContext *context,
                 return nullptr;
             }
             if (descriptor->struct_size >= sizeof(*descriptor) && descriptor->executable &&
-                descriptor->executable->composition && linksComputeExecutables(*context)) {
+                descriptor->executable->composition) {
                 if (!descriptor->graph.data) {
                     (void)fail(context, "schedule Program descriptor is invalid");
                     return nullptr;

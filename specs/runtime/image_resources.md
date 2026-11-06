@@ -3,17 +3,16 @@
 Status: current image-resource architecture.
 
 This document defines Texture, sampled-image, storage-image, image-view,
-Runtime provider, and RHI integration. Program reflection contains the
-required image binding role, dimension, sample-result class, storage format,
-and access constraints.
+schedule and HAL integration. Program reflection contains the required image
+binding role, dimension, sample-result class, storage format, and access
+constraints.
 
-Provider-neutral logical texture enums live in `VernonTextureTypes.h`;
-`VernonRuntimeProvider.h` and RuntimeCore do not depend on `VernonRHI.h`.
-Invocation attachments and image arguments carry image-view references rather
-than caller-authored copies of image format or extent. Provider descriptor
-queries return the immutable parent descriptor, the selected view descriptor,
-the parent hazard identity, and whether the reference denotes an owner or a
-view.
+Logical texture enums live in `VernonTextureTypes.h`, and HAL images take
+the same descriptors, so a HAL image's descriptor is the one a schedule
+argument declares. Attachments and image arguments carry image-view
+references rather than caller-authored copies of image format or extent. A
+view's descriptor query returns the immutable parent descriptor, the
+selected view descriptor and the parent hazard identity.
 
 ## 1. Semantic model
 
@@ -58,10 +57,10 @@ ImageDescriptor
   usage capabilities
 ```
 
-Invocation, launch-plan, and provider-binding records must not carry independent
-copies of these properties as authoritative metadata. An adapter resolves the
-retained resource reference to its resource record and reads the descriptor
-there. Imported native images provide the complete descriptor at import time.
+Schedule arguments, pass plans and binding records must not carry independent
+copies of these properties as authoritative metadata. A schedule resolves a
+view reference through the HAL view registry (`hal/native_images.h`), whose
+entry holds the image's descriptor, and reads the descriptor there.
 
 An image view contains:
 
@@ -91,13 +90,14 @@ A view reinterprets layers but never crosses the 3D/layered split:
 | `CUBE_ARRAY` | `CUBE` or `CUBE_ARRAY` | base a multiple of 6, count a multiple of 6 |
 
 These shape and view rules are header-only `constexpr` functions in
-`rhi/image_descriptor_validation.h`, so the backend-agnostic RuntimeCore applies
-the same rules as the RHI without linking it. Shader bindings resolve through
-the view, so dimension checks against reflection use the view dimension.
+`runtime/image_rules.h`, so every HAL device and the graphics planner apply
+the same rules. Shader bindings resolve through the view, so dimension checks
+against reflection use the view dimension.
 
-Views retain their parent image. Destroying a public owner handle invalidates
-that handle immediately, while prepared bindings and recorded commands retain
-the logical resource record until completion. All views of one image share the
+An image with views refuses destruction with `VERNON_HAL_INVALID_ARGUMENT`,
+so a view never outlives its image. A destroyed image or view is freed after
+the device's latest submitted point, and recordings that name it are evicted
+with it (`architecture_v2.md` section 7). All views of one image share the
 parent image's execution-graph hazard identity even when their native view
 objects differ.
 
@@ -184,12 +184,12 @@ Use `TensorView` for general structured computation and use a storage image
 when the result must remain an image consumed by rendering, sampling, image
 processing, or native graphics interop.
 
-## 5. RuntimeCore planning
+## 5. Schedule planning
 
-RuntimeCore remains independent of VernonRHI and native graphics SDK types. It
-validates invocation arguments against reflection and produces typed internal
-plans. C++ plans use discriminated payloads instead of a kind plus unrelated
-nullable fields:
+The linker and pass planner are independent of native graphics SDK types.
+They validate schedule arguments against reflection and produce typed
+internal plans. C++ plans use discriminated payloads instead of a kind plus
+unrelated nullable fields:
 
 ```text
 ComputeArgument =
@@ -199,24 +199,19 @@ ComputeArgument =
   | SamplerArgument
 ```
 
-`ImageArgument` carries one retained opaque image-view reference. Samplers are
+`ImageArgument` carries one opaque image-view reference. Samplers are
 separate pipeline arguments and are never embedded in an image argument.
-Image descriptor metadata is not
-converted to RHI enum values in RuntimeCore. Once validation is complete,
-physical format and dimension are obtained from the provider's resource
-record, not trusted from repeated invocation fields.
+Once validation is complete, physical format and dimension are obtained from
+the view registry, not trusted from repeated argument fields.
 
 Reflection owns pipeline constraints. Resource records own concrete resource
 metadata. Planning compares the two and reports mismatches before encoding.
 Neither side silently overwrites the other.
 
-## 6. Provider contract
+## 6. Binding values
 
-The provider API is backend-independent and must not include `VernonRHI.h` or
-expose `VernonRhiFormat`. A foreign engine can implement RuntimeCore's provider
-without adopting VernonRHI.
-
-Provider binding values use a C tagged union with role-specific payloads:
+Binding values (`VernonRuntimeProvider.h`) are backend-independent and use a
+C tagged union with role-specific payloads:
 
 ```text
 ProviderBindingValue
@@ -230,42 +225,35 @@ ProviderBindingValue
     | SamplerReference
 ```
 
-An image payload contains only the opaque retained image-view reference
-required to resolve the provider-owned resource record. Owner references are
-valid for ownership and transfer operations, but shader and attachment
-bindings require views. Format,
+An image payload contains only the opaque image-view reference that the view
+registry resolves. Shader and attachment bindings require views. Format,
 dimension, extent, and usage do not appear as loose fields on every binding.
 The prepared binding layout already records sampled versus storage role,
 shader access, and exact storage-format constraints derived from reflection.
 
-The provider must be able to resolve a resource reference to immutable
-descriptor metadata while the reference is retained. For the VernonRHI
-adapter, this resolution uses the generation-checked logical RHI record. It
-must continue working after public handle destruction when a prepared binding
-or recorded command still retains the record.
+A view's reference has identity kind 6 with a serial no later view reuses as
+its resource value (`architecture_v2.md` section 16.3), so a recording that
+names a destroyed view cannot bind a new one through a reused handle.
 
-## 7. RHI contract
+## 7. HAL contract
 
-VernonRHI owns physical image descriptors, native images and views, resource
-state, command encoding, submission, and completion. Runtime-to-RHI format
-conversion occurs at the backend-provider boundary from the authoritative
-logical view format.
-
-The RHI adapter must have an internal descriptor query over a retained resource
-record. A public `get image descriptor` function is optional; the architectural
-requirement is authoritative internal lookup, not a particular public API.
+The HAL device owns physical image descriptors, native images and views,
+resource state, command recording, submission and completion. Native formats
+come from the authoritative logical view format at the backend boundary.
+`vernonHalImageGetDescriptor` and `vernonHalImageViewGetImage` expose the
+descriptors; the schedule reads them through the view registry instead.
 
 Backend mappings are explicit functions rather than arithmetic enum casts:
 
 ```text
-logical storage constraint -> RHI format compatibility check
-RHI format                 -> Vulkan/D3D12/Metal/OpenGL native format
-RHI view dimension         -> backend native view target
+logical storage constraint -> format capability check
+texture format             -> Vulkan/D3D12/Metal/OpenGL native format
+view dimension             -> backend native view target
 ```
 
 Format facts have one source, the X-macro table
-`source/include/VernonFormats.def`. Each row gives the public name, RHI and
-texture enum values, component class, pixel size, host data format and type,
+`source/include/VernonFormats.def`. Each row gives the public name, the
+texture enum value, component class, pixel size, host data format and type,
 the native GL, Vulkan, D3D12, Metal and SPIR-V formats, and the baseline
 capabilities its class allows (renderable, blendable, filterable, storage,
 resolvable, multisample, copyable). Every C++ and Python consumer reads it
@@ -273,7 +261,7 @@ resolvable, multisample, copyable). Every C++ and Python consumer reads it
 formats (`r32_uint`, `rg32_uint`) are never blendable, filterable or
 resolvable.
 
-A device narrows the baseline: `vernonRhiDeviceGetFormatCapabilities` reports
+A device narrows the baseline: `vernonHalDeviceGetFormatCapabilities` reports
 the capabilities it actually supports, and Program load rejects, with
 `PROGRAM_OPERATION_UNSUPPORTED`, a target format the device cannot render,
 store or multisample, and blending on an integer-only attachment.
@@ -290,9 +278,9 @@ OpenGL 4.3 or `ARB_texture_view` is required for true shader-visible aliased
 views. A canonical identity view whose format, dimension, aspects, and complete
 subresource range equal its parent may resolve directly to the parent's texture
 object. Older OpenGL and OpenGL ES otherwise continue to support transfer-region
-slicing without claiming aliased image-view support. D3D12 mip generation uses
-a build-time compiled and embedded utility compute shader; it does not add a
-runtime shader compiler dependency.
+slicing without claiming aliased image-view support. The phase 4 D3D12 device
+generates mips with a build-time compiled and embedded utility compute
+shader, so it adds no runtime shader compiler dependency.
 
 Layered dimension mappings with backend-specific constraints:
 
@@ -314,15 +302,16 @@ ordinary `2D` images with one mip level and one layer, so their descriptors,
 views, hazards and readback follow this document. Three rules differ:
 
 - The surface owns the image and its view. Destroying either through the image
-  API fails with `INVALID_ARGUMENT`; configuring or destroying the surface
-  destroys them, and retained records stay valid as for any destroyed image.
-- An acquired image's contents are undefined until a submitted command writes
-  it: a rendering scope that loads it with `CLEAR` or `DISCARD`, or a copy
-  into it. Until then the RHI command layer rejects a rendering scope that
-  preserves it, a sampled read of it, a copy from it and a download of it.
-  An encoder may read the image after its own earlier write.
-- Present transitions the image to `VERNON_RHI_STATE_PRESENT`, so no caller
-  declares that final transition.
+  API fails with `VERNON_HAL_INVALID_ARGUMENT`; configuring or destroying the
+  surface destroys them after the submissions that use them, as for any
+  destroyed image.
+- An acquired image's contents are undefined until a submitted schedule
+  writes it, with a render scope that loads it with `CLEAR` or `DISCARD`, or
+  a host write does. Until then a submission that preserves or reads it
+  fails, and so does a host read. A recording may read the image after its
+  own earlier write.
+- Present copies the image to the window itself, so no caller declares a
+  final transition.
 
 ## 8. Synchronization and hazards
 
@@ -340,7 +329,7 @@ subresource range
 pipeline stages
 ```
 
-The RHI translates those declarations into image layouts, resource states,
+The HAL device translates those declarations into image layouts, resource states,
 barriers, and cache visibility operations. Backend code must not infer hazards
 from shader code or rely on implicit whole-device synchronization.
 
@@ -348,24 +337,21 @@ from shader code or rely on implicit whole-device synchronization.
 
 The implementation must preserve these invariants:
 
-1. RuntimeCore and Provider headers remain free of RHI image types;
-2. provider retain/release callbacks are mandatory;
-3. shader and attachment bindings accept image views only;
-4. descriptors are queried from retained resource records;
-5. a linked schedule tracks hazards by parent identity plus subresource
+1. HAL images and schedule arguments share the `VernonTextureTypes.h`
+   descriptors;
+2. shader and attachment bindings accept image views only;
+3. descriptors are read from the view registry;
+4. a linked schedule tracks hazards by parent identity plus subresource
    overlap;
-6. backend state tracking and barriers preserve per-mip and per-layer state,
+5. backend state tracking and barriers preserve per-mip and per-layer state,
    with aspect planes tracked separately where the native API supports it;
-7. no flattened compatibility records, implicit image-owned sampler field, or
+6. no flattened compatibility records, implicit image-owned sampler field, or
    parallel binding path is reintroduced.
 
 ## 10. Acceptance requirements
 
 The architecture is accepted only when:
 
-- RuntimeCore builds and tests without VernonRHI headers or libraries;
-- a foreign mock provider binds sampled and storage images using only the
-  provider contract;
 - descriptor metadata has one authoritative resource-owned source;
 - invalid format, dimension, usage, access, and view compatibility fail before
   native command encoding;
@@ -374,7 +360,7 @@ The architecture is accepted only when:
 - one image written as storage can be synchronized and sampled in a dependent
   pass;
 - TensorView and storage-image reflection and binding paths remain distinct;
-- public-handle destruction cannot invalidate retained prepared or recorded
-  image/view references;
+- destroying an image or view cannot let a recording bind a later object
+  through a reused handle;
 - no compatibility parser, enum alias, duplicate binding path, or
   test-specific backend specialization remains.

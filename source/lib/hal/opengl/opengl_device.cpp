@@ -2,11 +2,10 @@
 #include "hal/native_buffers.h"
 #include "hal/native_images.h"
 #include "hal/opengl/opengl_resources.h"
+#include "hal/opengl/opengl_state.h"
 
 #include "VernonFormats.hpp"
 #include "VernonSchedule.h"
-#include "rhi/opengl_access.h"
-#include "rhi/rhi_internal.h"
 #include "runtime/backend_opengl.h"
 #include "runtime/compute_launch_planner.h"
 #include "runtime/dispatch_contract.h"
@@ -36,7 +35,7 @@
 namespace vernon::hal {
 namespace {
 
-namespace gl = rhi::opengl;
+namespace gl = opengl;
 using runtime::PreparedComputeBindingPlan;
 using runtime::PreparedGraphicsBindingPlan;
 
@@ -117,23 +116,22 @@ struct Caps {
 struct Slot;
 
 // What the device, the Stages' programs and the recordings share, any of which may be destroyed first: the context's
-// state and mutex, a lease that keeps the RHI device alive, and the arenas of dropped recordings for later ones.
+// state, and the arenas of dropped recordings for later ones.
 class Context {
 public:
-    Context(VernonRhiDevice device, gl::DeviceAccess access, ChildLease lease)
-        : device_(device), access_(access), lease_(std::move(lease)) {}
+    explicit Context(std::shared_ptr<gl::DeviceState> state) : state_(std::move(state)) {}
     Context(const Context &) = delete;
     Context &operator=(const Context &) = delete;
     ~Context();
 
-    VernonRhiDevice device() const { return device_; }
-    gl::DeviceState &state() const { return *access_.state; }
-    gl::Driver &driver() const { return access_.state->driver; }
+    gl::DeviceState &state() const { return *state_; }
+    gl::Driver &driver() const { return state_->driver; }
+    const std::shared_ptr<gl::DeviceState> &shared() const { return state_; }
 
     // Holds the context's mutex with the context current.
     std::unique_lock<std::mutex> lock() const {
-        std::unique_lock<std::mutex> held(*access_.mutex);
-        access_.state->makeCurrent();
+        std::unique_lock<std::mutex> held(state_->mutex);
+        state_->makeCurrent();
         return held;
     }
 
@@ -144,9 +142,7 @@ public:
 private:
     static constexpr size_t kPooledSlots = 32;
 
-    VernonRhiDevice device_;
-    gl::DeviceAccess access_;
-    ChildLease lease_;
+    std::shared_ptr<gl::DeviceState> state_;
     std::mutex mutex_;
     std::vector<std::unique_ptr<Slot>> slots_;
 };
@@ -268,7 +264,7 @@ struct SlotPlan {
     std::string name;
 };
 
-// Binding set `set` of a Stage: the slots in it, and what decides its values as PipelineGroups groups them.
+// Binding set `set` of a Stage: the slots in it, and the argument owners that decide its values.
 struct SetPlan {
     std::vector<uint32_t> slots;
     std::vector<uint32_t> parameters;
@@ -401,8 +397,8 @@ struct Binding {
     bool transpose{};
 };
 
-// A set instance of a recording: one per binding group as PipelineGroups finds it, so draws whose groups' owners agree
-// share it. A named uniform's binding holds the offset of its bytes in the recording's values.
+// A set instance of a recording: one per binding group, so draws whose groups' owners agree share it. A named uniform's
+// binding holds the offset of its bytes in the recording's values.
 struct SetInstance {
     std::vector<Binding> bindings;
 };
@@ -591,8 +587,8 @@ enum class Kind : uint64_t {
 // attachment.
 bool renderAreaCovers(const NativeView &view, const runtime::GraphicsRenderScope &scope) {
     const uint32_t mip = view.view.subresources.base_mip_level;
-    return scope.width == std::max(view.image.extent.width >> mip, 1u) &&
-           scope.height == std::max(view.image.extent.height >> mip, 1u);
+    return scope.area[0] == 0 && scope.area[1] == 0 && scope.area[2] == std::max(view.image.extent.width >> mip, 1u) &&
+           scope.area[3] == std::max(view.image.extent.height >> mip, 1u);
 }
 
 // Attaches mip 0 and layer 0 of the view's texture: a texture view starts at the view's subresources, and an identity
@@ -773,7 +769,7 @@ class OpenGLDevice final : public Device {
 public:
     OpenGLDevice(VernonRuntimeContext &context, std::shared_ptr<Context> shared, const Caps &caps, gl::Uint vertexArray)
         : context_(context), shared_(std::move(shared)), state_(shared_->state()), caps_(caps),
-          vertexArray_(vertexArray), buffers_(createOpenGLDeviceBuffers(context.rhiDevice)),
+          vertexArray_(vertexArray), buffers_(createOpenGLDeviceBuffers(shared_->shared())),
           internals_(buffers_.get()) {}
 
     ~OpenGLDevice() override {
@@ -795,7 +791,6 @@ public:
     gl::DeviceState &state() const { return state_; }
     const Caps &caps() const { return caps_; }
     const std::shared_ptr<Context> &shared() const { return shared_; }
-    VernonRhiDevice rhiDevice() const { return context_.rhiDevice; }
     gl::Uint vertexArray() const { return vertexArray_; }
 
     Made<std::unique_ptr<Executable>> createExecutable(const ExecutableSource &source) override {
@@ -851,12 +846,13 @@ public:
             while (!pending_.empty() && pending_.front().point <= point)
                 retire(gl::kTimeoutIgnored);
         }
-        const auto failed = std::find_if(failed_.begin(), failed_.end(), [&](TimelinePoint at) { return at <= point; });
+        const auto reached = [&](const Failed &failed) { return failed.point <= point; };
+        const auto failed = std::find_if(failed_.begin(), failed_.end(), reached);
         if (failed == failed_.end())
             return Made<void>{ok()};
-        failed_.erase(std::remove_if(failed_.begin(), failed_.end(), [&](TimelinePoint at) { return at <= point; }),
-                      failed_.end());
-        return failure<void>("a pass submission failed on the device");
+        std::string message = failed->message;
+        failed_.erase(std::remove_if(failed_.begin(), failed_.end(), reached), failed_.end());
+        return failure<void>(std::move(message));
     }
 
     // The program of a Stage this device draws or dispatches with, made on first use.
@@ -869,6 +865,10 @@ private:
         TimelinePoint point{};
         gl::Sync fence{};
         std::shared_ptr<TimingCapture> timing;
+    };
+    struct Failed {
+        TimelinePoint point{};
+        std::string message;
     };
 
     static constexpr size_t kKeptTimings = 32;
@@ -900,8 +900,10 @@ private:
         if (status == gl::kTimeoutExpired)
             return false;
         state_.driver.deleteSync(pending.fence);
-        if ((status != gl::kAlreadySignaled && status != gl::kConditionSatisfied) || state_.takeErrors())
-            failed_.push_back(pending.point);
+        if (status != gl::kAlreadySignaled && status != gl::kConditionSatisfied)
+            failed_.push_back({pending.point, "the fence of a pass submission failed"});
+        else if (std::optional<std::string> errors = state_.takeErrors())
+            failed_.push_back({pending.point, "a pass submission failed on the device: " + *errors});
         std::optional<std::vector<ScopeTiming>> scopes;
         if (pending.timing) {
             scopes = readTimings(*pending.timing);
@@ -962,7 +964,7 @@ private:
     // Taken before the context's mutex.
     std::mutex mutex_;
     std::deque<Pending> pending_;
-    std::vector<TimelinePoint> failed_;
+    std::vector<Failed> failed_;
     std::deque<std::pair<TimelinePoint, std::optional<std::vector<ScopeTiming>>>> timings_;
     TimelinePoint next_{1};
 };
@@ -1086,7 +1088,6 @@ Made<std::shared_ptr<StageObjects>> buildStageObjects(const std::shared_ptr<Cont
     if (!graphics)
         return Built{ok(std::move(objects))};
     driver.useProgram(objects->program);
-    ++device.drawStateGeneration;
     objects->baseInstanceLocation = driver.getUniformLocation(objects->program, "SPIRV_Cross_BaseInstance");
     // A separate sampler serves the texture unit of its binding, which only active sampled images read.
     std::vector<uint32_t> sampledUnits;
@@ -1145,7 +1146,6 @@ Made<void> OpenGLDevice::reserveZeros(uint64_t bytes) {
     state_.driver.bindBuffer(gl::kCopyWriteBuffer, zeros_);
     state_.driver.bufferData(gl::kCopyWriteBuffer, static_cast<gl::SizePtr>(bytes), zeros.data(), kDynamicDraw);
     zeroBytes_ = bytes;
-    ++state_.drawStateGeneration;
     return Made<void>{ok()};
 }
 
@@ -1307,7 +1307,7 @@ Made<uint32_t> Builder::instance(StageObjects &stage, uint32_t set, bool persist
                 if (image.value().format != slot.storageFormat)
                     return failure<uint32_t>("a storage image's format is not the one its kernel declares");
                 const vernon::formats::Format *format = vernon::formats::find(image.value().format);
-                if (!format || !format->allows(VERNON_RHI_FORMAT_STORAGE))
+                if (!format || !format->allows(VERNON_HAL_FORMAT_STORAGE))
                     return failure<uint32_t>("a storage image's format cannot be stored to");
                 binding.format = format->glInternalFormat;
             }
@@ -1599,9 +1599,9 @@ Made<void> Builder::build(const std::vector<const InternalBuffers::Internal *> &
         }
         if (pass.compute) {
             if (recording_.timed && caps_.timers)
-                recording_.timers.push_back({pass.executable->source().node->id, 1, 0, 0});
+                recording_.timers.push_back({pass.command->node, 1, 0, 0});
             timer(true);
-            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, nodeLabel(*pass.executable->source().node));
+            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, pass.command->label);
             if (auto built = buildCompute(at); built.isErr())
                 return built;
             debug(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP, {});
@@ -1613,7 +1613,7 @@ Made<void> Builder::build(const std::vector<const InternalBuffers::Internal *> &
         while (end < passes.size() && !passes[end]->compute && passes[end]->scope == pass.scope)
             ++end;
         if (recording_.timed && caps_.timers)
-            recording_.timers.push_back({pass.executable->source().node->id, static_cast<uint32_t>(end - at), 0, 0});
+            recording_.timers.push_back({pass.command->node, static_cast<uint32_t>(end - at), 0, 0});
         timer(true);
         if (auto built = buildScope(at, end); built.isErr())
             return built;
@@ -1746,8 +1746,8 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
         const SetPlan &setPlan = stageObjects.sets[set];
         if (setPlan.slots.empty())
             continue;
-        // As PipelineGroups finds a group: by the owners of what decides it, and by the draw when it also depends
-        // on the command. A group whose owners share one persistent store keeps its bytes across calls.
+        // A group is found by the owners of what decides it, and by the draw when it also depends on the command. A
+        // group whose owners share one persistent store keeps its bytes across calls.
         std::vector<const void *> found{&stageObjects, reinterpret_cast<const void *>(uintptr_t{set})};
         runtime::GroupStore *owner =
             setPlan.parameters.empty() ? nullptr : draw.owners[setPlan.parameters.front()].groups;
@@ -1768,18 +1768,18 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
         sets[set] = created.value();
         instances_.emplace(std::move(found), created.value());
     }
-    VernonRuntimeCoreDrawInvocation invocation{};
+    runtime::DrawInvocation invocation{};
     if (!runtime::prepareGraphicsDrawInvocation(draw.draw, draw.state->topology, invocation, error))
         return failure<void>(error);
     if (invocation.topology > 2)
         return failure<void>("the draw's topology is unsupported");
     const gl::Enum topology = kTopologies[invocation.topology];
-    const bool indexed = invocation.index_count != 0 || draw.streamed;
+    const bool indexed = invocation.indexCount != 0 || draw.streamed;
     gl::Uint indexBuffer = 0;
     if (indexed) {
-        if (!invocation.index_count)
+        if (!invocation.indexCount)
             return failure<void>("a draw stream needs an index binding");
-        auto index = nameOf(invocation.index_buffer, Kind::Buffer);
+        auto index = nameOf(invocation.indexBuffer, Kind::Buffer);
         if (index.isErr())
             return failure<void>("an index buffer: " + index.error());
         indexBuffer = index.value();
@@ -1796,7 +1796,7 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
         if (stream.maxRecords == 0)
             return Made<void>{ok()};
     }
-    const uint32_t firstInstance = draw.streamed ? 0 : invocation.first_instance;
+    const uint32_t firstInstance = draw.streamed ? 0 : invocation.firstInstance;
     const bool baseInstanceDraw =
         firstInstance != 0 && (indexed ? driver.drawElementsInstancedBaseVertexBaseInstance != nullptr
                                        : driver.drawArraysInstancedBaseInstance != nullptr);
@@ -1805,11 +1805,11 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
         for (uint32_t binding = 0; binding < kMaxVertexBindings; ++binding)
             if (stageObjects.divisors[binding] > 1 && firstInstance % stageObjects.divisors[binding] != 0)
                 return failure<void>("the draw's first instance is not a multiple of a vertex divisor");
-    if (indexed && !draw.streamed && invocation.base_vertex != 0 && !driver.drawElementsInstancedBaseVertex)
+    if (indexed && !draw.streamed && invocation.baseVertex != 0 && !driver.drawElementsInstancedBaseVertex)
         return failure<void>("the device draws no base vertices");
 
     set(Tracker::Program, 0, {stageObjects.program}, {Op::UseProgram, stageObjects.program});
-    if (auto applied = fixedFunction(key, invocation.stencil_reference); applied.isErr())
+    if (auto applied = fixedFunction(key, invocation.stencilReference); applied.isErr())
         return applied;
     set(Tracker::VertexArray, 0, {device_.vertexArray()}, {Op::BindVertexArray, device_.vertexArray()});
     vertexInputs(stageObjects, sources, baseInstanceDraw ? 0 : firstInstance);
@@ -1834,22 +1834,21 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
         {Op::Scissor, scissor[0], scissor[1], scissor[2], scissor[3]});
     if (indexed)
         bindBuffer(gl::kElementArrayBuffer, indexBuffer);
-    const uint64_t indexOffset = invocation.index_buffer.offset;
+    const uint64_t indexOffset = invocation.indexBuffer.offset;
     if (!draw.streamed) {
         if (indexed) {
             Command command{Op::DrawElements,
                             topology,
-                            invocation.index_count,
-                            invocation.instance_count,
-                            static_cast<uint32_t>(invocation.base_vertex),
+                            invocation.indexCount,
+                            invocation.instanceCount,
+                            static_cast<uint32_t>(invocation.baseVertex),
                             firstInstance};
-            command.f = baseInstanceDraw ? 2 : invocation.base_vertex != 0 ? 1 : 0;
-            command.offset = indexOffset + uint64_t{invocation.first_index} * sizeof(uint32_t);
+            command.f = baseInstanceDraw ? 2 : invocation.baseVertex != 0 ? 1 : 0;
+            command.offset = indexOffset + uint64_t{invocation.firstIndex} * sizeof(uint32_t);
             add(command);
         } else {
-            Command command{Op::DrawArrays, topology, invocation.vertex_count, invocation.instance_count,
-                            firstInstance};
-            command.f = baseInstanceDraw ? 2 : invocation.instance_count == 1 ? 0 : 1;
+            Command command{Op::DrawArrays, topology, invocation.vertexCount, invocation.instanceCount, firstInstance};
+            command.f = baseInstanceDraw ? 2 : invocation.instanceCount == 1 ? 0 : 1;
             add(command);
         }
         return Made<void>{ok()};
@@ -1886,7 +1885,7 @@ Made<void> Builder::draw(const PlannedPass &pass, const PlannedDraw &draw) {
     HostStream host;
     host.draw = &draw;
     host.stage = &stageObjects;
-    host.indexCapacity = invocation.index_buffer.size / sizeof(uint32_t);
+    host.indexCapacity = invocation.indexBuffer.size / sizeof(uint32_t);
     host.indexOffset = indexOffset;
     host.topology = topology;
     host.indirect = caps_.deviceStreams && stageObjects.baseInstanceLocation < 0;
@@ -1950,7 +1949,6 @@ Made<gl::Uint> Builder::scopeFramebuffer(const runtime::GraphicsRenderScope &sco
         attachments.stencil = images.stencil;
     }
     auto held = device_.shared()->lock();
-    ++state_.drawStateGeneration;
     gl::Driver &driver = state_.driver;
     auto &framebuffers = state_.attachmentFramebuffers;
     const auto cached = std::find_if(framebuffers.begin(), framebuffers.end(),
@@ -2020,7 +2018,9 @@ Made<ScopeImages> Builder::beginRendering(const runtime::GraphicsRenderScope &sc
         set(Tracker::StencilMask, gl::kFront, {UINT32_MAX}, {Op::StencilMask, gl::kFront, UINT32_MAX});
         set(Tracker::StencilMask, gl::kBack, {UINT32_MAX}, {Op::StencilMask, gl::kBack, UINT32_MAX});
         capability(gl::kScissorTest, true);
-        set(Tracker::Scissor, 0, {0, 0, scope.width, scope.height}, {Op::Scissor, 0, 0, scope.width, scope.height});
+        const std::array<uint32_t, 4> &area = scope.area;
+        set(Tracker::Scissor, 0, {area[0], area[1], area[2], area[3]},
+            {Op::Scissor, area[0], area[1], area[2], area[3]});
         for (size_t index = 0; index < scope.colors.size(); ++index) {
             const VernonRuntimeProviderColorAttachment &color = scope.colors[index];
             if (color.load_operation != VERNON_RUNTIME_PROVIDER_LOAD_CLEAR)
@@ -2046,7 +2046,7 @@ Made<void> Builder::buildScope(size_t begin, size_t end) {
     const runtime::GraphicsRenderScope &scope = planned_.scopes[passes[begin]->scope];
     std::string label;
     for (size_t at = begin; at < end; ++at)
-        label += (at == begin ? "" : "+") + nodeLabel(*passes[at]->executable->source().node);
+        label += (at == begin ? "" : "+") + passes[at]->command->label;
     debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, label);
     auto begun = beginRendering(scope);
     if (begun.isErr())
@@ -2056,7 +2056,7 @@ Made<void> Builder::buildScope(size_t begin, size_t end) {
     for (size_t at = begin; at < end; ++at) {
         const PlannedPass &pass = *passes[at];
         if (memberGroups)
-            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, nodeLabel(*pass.executable->source().node));
+            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, pass.command->label);
         for (const PlannedDraw &planned : pass.draws) {
             for (const PlannedDebug &command : planned.debug)
                 debug(command.kind, command.label);
@@ -2643,7 +2643,6 @@ Made<TimelinePoint> OpenGLDevice::submit(const CommandBuffer &commands, const ui
             for (int drained = 0; drained < 16 && state_.readError() != 0; ++drained) {
             }
         execute(*recording, slot, queries);
-        ++state_.drawStateGeneration;
         if (state_.validation && state_.readError() != 0) {
             if (!queries.empty())
                 state_.releaseQueries(queries);
@@ -2676,14 +2675,10 @@ Made<TimelinePoint> OpenGLDevice::submit(const CommandBuffer &commands, const ui
 std::unique_ptr<Device> createOpenGLDevice(VernonRuntimeContext &context) {
     if (context.backend != VERNON_RUNTIME_OPENGL && context.backend != VERNON_RUNTIME_OPENGL_ES)
         return nullptr;
-    auto access = gl::deviceAccess(context.rhiDevice);
-    if (access.isErr())
+    const std::shared_ptr<gl::DeviceState> &device = runtime::openGLState(context).device;
+    if (!device)
         return nullptr;
-    auto lease = rhi::retainDeviceLease(context.rhiDevice);
-    if (lease.isErr())
-        return nullptr;
-    auto labels = rhi::deviceEmitsLabels(context.rhiDevice);
-    auto shared = std::make_shared<Context>(context.rhiDevice, access.value(), std::move(lease).value());
+    auto shared = std::make_shared<Context>(device);
     Caps caps;
     gl::Uint vertexArray = 0;
     {
@@ -2699,7 +2694,7 @@ std::unique_ptr<Device> createOpenGLDevice(VernonRuntimeContext &context) {
         caps.deviceStreams = caps.desktop && state.apiVersionAtLeast(4, 3) && driver.multiDrawElementsIndirect;
         caps.countedStreams =
             caps.deviceStreams && state.apiVersionAtLeast(4, 6) && driver.multiDrawElementsIndirectCount;
-        caps.labels = labels.isOk() && labels.value();
+        caps.labels = state.labels;
         caps.timers = driver.queryCounter != nullptr;
         gl::Int value = 0;
         driver.getIntegerv(gl::kUniformBufferOffsetAlignment, &value);

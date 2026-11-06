@@ -122,19 +122,6 @@ if(TARGET VernonRuntime)
     target_link_libraries(VernonRuntimePublicCHeaderCheck PRIVATE Vernon::Runtime)
     add_library(VernonRuntimeAutodiffAbiCHeaderCheck OBJECT runtime/runtime_autodiff_abi_compile.c)
     target_include_directories(VernonRuntimeAutodiffAbiCHeaderCheck PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
-    add_library(VernonRhiPublicCHeaderCheck OBJECT runtime/runtime_rhi_public_header_compile.c)
-    target_link_libraries(VernonRhiPublicCHeaderCheck PRIVATE Vernon::RHI Vernon::RuntimeCore)
-
-    get_target_property(_vernon_runtime_core_links VernonRuntimeCore LINK_LIBRARIES)
-    if(_vernon_runtime_core_links MATCHES "(^|;)Vernon(RHI|::RHI)(;|$)")
-        message(FATAL_ERROR "VernonRuntimeCore must not link VernonRHI")
-    endif()
-
-    add_executable(VernonRuntimeCoreProviderTests runtime/runtime_foreign_provider_test.cpp)
-    target_link_libraries(VernonRuntimeCoreProviderTests PRIVATE GTest::gtest_main Vernon::RuntimeCore)
-    target_include_directories(VernonRuntimeCoreProviderTests PRIVATE "${VERNON_TEST_ROOT}/support")
-    add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
-    vernon_discover_gtests(VernonRuntimeCoreProviderTests)
 
     add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp)
     target_link_libraries(VernonRuntimeSupportTests PRIVATE GTest::gtest_main Vernon::Runtime)
@@ -142,50 +129,15 @@ if(TARGET VernonRuntime)
     add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
     target_link_libraries(VernonLifecycleControlTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonLifecycleControlTests)
-    add_executable(VernonRhiLifecycleCoreTests rhi/rhi_lifecycle_core_test.cpp)
-    target_include_directories(VernonRhiLifecycleCoreTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
-                                                                   "${VERNON_REPOSITORY_ROOT}/source/lib")
-    target_link_libraries(VernonRhiLifecycleCoreTests PRIVATE GTest::gtest_main)
-    if(MSVC)
-        target_compile_options(VernonRhiLifecycleCoreTests PRIVATE /EHs-c-)
-    else()
-        target_compile_options(VernonRhiLifecycleCoreTests PRIVATE -fno-exceptions)
-    endif()
-    vernon_discover_gtests(VernonRhiLifecycleCoreTests)
-    add_executable(VernonRhiImageShapeTests rhi/image_shape_rules_test.cpp)
-    target_include_directories(VernonRhiImageShapeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
-                                                                "${VERNON_REPOSITORY_ROOT}/source/lib")
-    target_link_libraries(VernonRhiImageShapeTests PRIVATE GTest::gtest_main)
-    vernon_discover_gtests(VernonRhiImageShapeTests)
-    add_executable(VernonRhiStagingPoolTests rhi/staging_pool_test.cpp)
-    target_include_directories(VernonRhiStagingPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib/rhi")
-    target_link_libraries(VernonRhiStagingPoolTests PRIVATE GTest::gtest_main)
-    vernon_discover_gtests(VernonRhiStagingPoolTests)
-    add_executable(VernonRhiBlockPoolTests rhi/block_pool_test.cpp)
-    target_include_directories(VernonRhiBlockPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib/rhi")
-    target_link_libraries(VernonRhiBlockPoolTests PRIVATE GTest::gtest_main)
-    vernon_discover_gtests(VernonRhiBlockPoolTests)
-    add_executable(VernonRhiDeferredActionTests rhi/rhi_deferred_action_test.cpp)
-    target_include_directories(VernonRhiDeferredActionTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
-                                                                    "${VERNON_REPOSITORY_ROOT}/source/lib")
-    target_link_libraries(VernonRhiDeferredActionTests PRIVATE GTest::gtest_main Vernon::RHI)
-    vernon_discover_gtests(VernonRhiDeferredActionTests)
-    vernon_stage_target_files(VernonRhiDeferredActionTests VernonRHI)
-    add_executable(VernonRhiStrictBoundaryTests rhi/rhi_strict_boundary_test.cpp)
-    target_include_directories(VernonRhiStrictBoundaryTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
-                                                                    "${VERNON_REPOSITORY_ROOT}/source/lib")
-    target_link_libraries(VernonRhiStrictBoundaryTests PRIVATE GTest::gtest_main Vernon::RHI)
-    vernon_discover_gtests(VernonRhiStrictBoundaryTests)
-    vernon_stage_target_files(VernonRhiStrictBoundaryTests VernonRHI)
-    add_executable(VernonRhiCommandLifecycleTests rhi/rhi_command_lifecycle_test.cpp)
-    set_target_properties(VernonRhiCommandLifecycleTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                                                    "${CMAKE_BINARY_DIR}/source")
-    target_include_directories(VernonRhiCommandLifecycleTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                      "${VERNON_TEST_ROOT}/support")
-    target_link_libraries(VernonRhiCommandLifecycleTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
-    vernon_enable_glfw_context_owner_for_test(VernonRhiCommandLifecycleTests)
-    vernon_discover_gtests(VernonRhiCommandLifecycleTests)
-    vernon_stage_target_files(VernonRhiCommandLifecycleTests VernonRuntime VernonRHI)
+    add_executable(VernonImageRulesTests runtime/image_rules_test.cpp)
+    target_include_directories(VernonImageRulesTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
+                                                             "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonImageRulesTests PRIVATE GTest::gtest_main)
+    vernon_discover_gtests(VernonImageRulesTests)
+    add_executable(VernonVulkanStagingPoolTests runtime/vulkan_staging_pool_test.cpp)
+    target_include_directories(VernonVulkanStagingPoolTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonVulkanStagingPoolTests PRIVATE GTest::gtest_main)
+    vernon_discover_gtests(VernonVulkanStagingPoolTests)
     add_library(VernonRuntimeSupportNoExceptionsCheck OBJECT runtime/runtime_support_no_exceptions_compile.cpp)
     target_link_libraries(VernonRuntimeSupportNoExceptionsCheck PRIVATE Vernon::Runtime)
     if(MSVC)
@@ -197,24 +149,18 @@ if(TARGET VernonRuntime)
     add_dependencies(VernonLifecycleControlTests VernonRuntimeSupportNoExceptionsCheck)
 
     if(VERNON_ENABLE_CUDA_RUNTIME)
-        add_executable(VernonRuntimeRHIAdapterTests rhi/cuda_adapter_test.cpp)
-        target_include_directories(VernonRuntimeRHIAdapterTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                        "${VERNON_TEST_ROOT}/support")
-        target_link_libraries(VernonRuntimeRHIAdapterTests PRIVATE GTest::gtest_main Vernon::RuntimeCore
-                                                                   Vernon::RuntimeRHIAdapter)
-        vernon_stage_target_files(VernonRuntimeRHIAdapterTests VernonRHI)
-        vernon_discover_gtests(VernonRuntimeRHIAdapterTests)
-
         # The executable links the recorder from the path NVTX loads it from, so both share one copy of its state.
         add_library(VernonNvtxCallRecorder SHARED support/nvtx_call_recorder.cpp)
         target_compile_definitions(VernonNvtxCallRecorder PRIVATE VERNON_NVTX_CALL_RECORDER_BUILD=1)
         target_link_libraries(VernonNvtxCallRecorder PRIVATE nvtx3::nvtx3-c)
-        add_executable(VernonCudaDebugLabelTests rhi/cuda_debug_label_test.cpp)
+        add_executable(VernonCudaDebugLabelTests runtime/cuda_debug_label_test.cpp)
         set_target_properties(VernonNvtxCallRecorder VernonCudaDebugLabelTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                           "${CMAKE_BINARY_DIR}/source")
-        target_include_directories(VernonCudaDebugLabelTests PRIVATE "${VERNON_TEST_ROOT}/support")
-        target_link_libraries(VernonCudaDebugLabelTests PRIVATE GTest::gtest_main Vernon::RHI VernonNvtxCallRecorder)
-        vernon_stage_target_files(VernonCudaDebugLabelTests VernonRHI)
+        target_compile_definitions(VernonCudaDebugLabelTests PRIVATE VERNON_HAS_CUDA_RUNTIME=1)
+        target_include_directories(VernonCudaDebugLabelTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                     "${VERNON_TEST_ROOT}/support")
+        target_link_libraries(VernonCudaDebugLabelTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting
+                                                                VernonNvtxCallRecorder)
         vernon_discover_gtests(
             VernonCudaDebugLabelTests
             PROPERTIES
@@ -234,16 +180,12 @@ if(TARGET VernonRuntime)
     add_executable(
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
-        runtime/directx_command_state_test.cpp
         runtime/dirty_range_set_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/hal_resources_test.cpp
         runtime/program_manifest_test.cpp
         runtime/program_tensor_copy_test.cpp
         runtime/resolved_execution_plan_test.cpp
-        runtime/rhi_adapter_backend_storage_test.cpp
-        runtime/rhi_resource_lifetime_test.cpp
-        runtime/rhi_surface_test.cpp
         runtime/runtime_architecture_type_test.cpp
         runtime/runtime_autodiff_test.cpp
         runtime/runtime_c_api_test.cpp
@@ -265,7 +207,6 @@ if(TARGET VernonRuntime)
                                                      nlohmann_json::nlohmann_json)
     vernon_enable_glfw_context_owner_for_test(VernonRuntimeTests)
     add_dependencies(VernonRuntimeTests VernonRuntimeAutodiffAbiCHeaderCheck VernonRuntimePublicCHeaderCheck)
-    vernon_stage_target_files(VernonRuntimeTests VernonRHI)
     add_executable(VernonRuntimeCpuWorkgroupTests runtime/cpu_workgroup_dispatch_test.cpp)
     set_target_properties(VernonRuntimeCpuWorkgroupTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                     "${CMAKE_BINARY_DIR}/source")
@@ -280,14 +221,10 @@ if(TARGET VernonRuntime)
             VernonCompilerRuntimeIntegrationTests
             PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
                     "${VERNON_TEST_BINARY_ROOT}/generated")
-        target_link_libraries(
-            VernonCompilerRuntimeIntegrationTests
-            PRIVATE GTest::gtest_main
-                    Vernon::RuntimeTesting
-                    Vernon::RHI
-                    VernonDSLCompiler)
+        target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting
+                                                                            VernonDSLCompiler)
         vernon_enable_glfw_context_owner_for_test(VernonCompilerRuntimeIntegrationTests)
-        vernon_stage_target_files(VernonCompilerRuntimeIntegrationTests VernonRHI VernonDSLCompiler)
+        vernon_stage_target_files(VernonCompilerRuntimeIntegrationTests VernonDSLCompiler)
         vernon_discover_gtests(VernonCompilerRuntimeIntegrationTests)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
@@ -668,12 +605,11 @@ if(TARGET VernonRuntime)
             target_include_directories(
                 VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
                                                "${VERNON_TEST_BINARY_ROOT}/generated")
-            target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting Vernon::RHI)
+            target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::RuntimeTesting)
             vernon_enable_glfw_context_owner_for_test(VernonGpuAutodiffTests)
             add_dependencies(VernonGpuAutodiffTests ${gpu_autodiff_fixture_targets})
             set_target_properties(VernonGpuAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                     "${CMAKE_BINARY_DIR}/source")
-            vernon_stage_target_files(VernonGpuAutodiffTests VernonRHI)
             vernon_discover_gtests(VernonGpuAutodiffTests)
         endif()
         add_executable(VernonModuleProgramScheduleTests runtime/runtime_module_program_schedule_test.cpp)
@@ -681,7 +617,6 @@ if(TARGET VernonRuntime)
             VernonModuleProgramScheduleTests
             PRIVATE GTest::gtest_main
                     Vernon::RuntimeTesting
-                    Vernon::RHI
                     nlohmann_json::nlohmann_json
                     ${module_program_cpu_fixture_targets})
         vernon_enable_glfw_context_owner_for_test(VernonModuleProgramScheduleTests)
@@ -696,17 +631,12 @@ if(TARGET VernonRuntime)
         endif()
         set_target_properties(VernonModuleProgramScheduleTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                           "${CMAKE_BINARY_DIR}/source")
-        vernon_stage_target_files(VernonModuleProgramScheduleTests VernonRHI)
         vernon_discover_gtests(VernonModuleProgramScheduleTests)
         if(module_graphics_fixture_targets)
             add_executable(VernonModuleGraphicsProgramRuntimeTests
                            runtime/runtime_module_graphics_program_c_api_test.cpp runtime/schedule_graphics_test.cpp)
-            target_link_libraries(
-                VernonModuleGraphicsProgramRuntimeTests
-                PRIVATE GTest::gtest_main
-                        Vernon::RuntimeTesting
-                        Vernon::RHI
-                        nlohmann_json::nlohmann_json)
+            target_link_libraries(VernonModuleGraphicsProgramRuntimeTests
+                                  PRIVATE GTest::gtest_main Vernon::RuntimeTesting nlohmann_json::nlohmann_json)
             vernon_enable_glfw_context_owner_for_test(VernonModuleGraphicsProgramRuntimeTests)
             target_include_directories(
                 VernonModuleGraphicsProgramRuntimeTests
@@ -715,7 +645,6 @@ if(TARGET VernonRuntime)
             add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
             set_target_properties(VernonModuleGraphicsProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                      "${CMAKE_BINARY_DIR}/source")
-            vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRHI)
             vernon_discover_gtests(VernonModuleGraphicsProgramRuntimeTests)
         endif()
         if(language_contract_fixture_targets OR language_contract_cpu_fixture_targets)
@@ -724,7 +653,6 @@ if(TARGET VernonRuntime)
                 VernonLanguageContractAcceptanceTests
                 PRIVATE GTest::gtest_main
                         Vernon::Runtime
-                        Vernon::RHI
                         nlohmann_json::nlohmann_json
                         ${language_contract_cpu_fixture_targets})
             vernon_enable_glfw_context_owner_for_test(VernonLanguageContractAcceptanceTests)
@@ -737,7 +665,7 @@ if(TARGET VernonRuntime)
             add_dependencies(VernonLanguageContractAcceptanceTests ${language_contract_fixture_targets})
             set_target_properties(VernonLanguageContractAcceptanceTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                    "${CMAKE_BINARY_DIR}/source")
-            vernon_stage_target_files(VernonLanguageContractAcceptanceTests VernonRuntime VernonRHI)
+            vernon_stage_target_files(VernonLanguageContractAcceptanceTests VernonRuntime)
             vernon_discover_gtests(VernonLanguageContractAcceptanceTests)
         endif()
 
@@ -885,71 +813,6 @@ if(TARGET VernonRuntime)
                 "${dynamic_parity_mixed_alias_manifest}"
                 "$<TARGET_FILE_DIR:VernonDynamicParitySignedStridePythonFixture>" "${VERNON_REPOSITORY_ROOT}/python"
                 "${VERNON_TEST_ROOT}/fixtures")
-    endif()
-
-    if(VERNON_ENABLE_VULKAN_RUNTIME AND TARGET VernonDSLCompiler)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_test.cpp)
-        target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-    endif()
-
-    if(VERNON_ENABLE_VULKAN_RUNTIME)
-        target_sources(VernonRuntimeTests PRIVATE rhi/vulkan_native_interop_test.cpp)
-        target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI Vulkan::Headers)
-    endif()
-
-    if(VERNON_ENABLE_METAL_RUNTIME)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
-        set_source_files_properties(runtime/runtime_metal_test.cpp PROPERTIES LANGUAGE OBJCXX)
-        if(TARGET vernon-dsl-native AND Python_FOUND)
-            add_test(
-                NAME vernon-metal-mandelbulb-showcase
-                COMMAND
-                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/mandelbulb_showcase.py" --architecture
-                    metal --headless --preset smoke --output "${VERNON_TEST_BINARY_ROOT}/metal_mandelbulb_showcase.png")
-            add_test(NAME vernon-metal-fractal-example
-                     COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/fractal.py" --architecture metal
-                             --headless --frames 1)
-            add_test(
-                NAME vernon-metal-pbr-example
-                COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/pbr.py" --architecture metal
-                        --headless --frames 1 --size 128 --output "${VERNON_TEST_BINARY_ROOT}/metal_pbr_example.png")
-            add_test(
-                NAME vernon-metal-complete-pipeline-example
-                COMMAND
-                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/complete_pipeline.py" --architecture metal
-                    --headless --frames 1 --size 64 --instances 2 --output
-                    "${VERNON_TEST_BINARY_ROOT}/metal_complete_pipeline_example.png")
-            add_test(
-                NAME vernon-metal-dynamic-ocean-example
-                COMMAND
-                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_ocean.py" --arch metal --headless
-                    --frames 1 --size 64 --grid 16 --output "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_ocean.png")
-            add_test(
-                NAME vernon-metal-dynamic-terrain-erosion-example
-                COMMAND
-                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_terrain_erosion.py" --arch metal
-                    --headless --frames 1 --size 64 --grid 16 --output
-                    "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_terrain_erosion.png")
-            set_tests_properties(
-                vernon-metal-mandelbulb-showcase
-                vernon-metal-fractal-example
-                vernon-metal-pbr-example
-                vernon-metal-complete-pipeline-example
-                vernon-metal-dynamic-ocean-example
-                vernon-metal-dynamic-terrain-erosion-example
-                PROPERTIES ENVIRONMENT
-                           "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
-                           SKIP_REGULAR_EXPRESSION
-                           "Metal argument-buffer encoding is unavailable on this device")
-        endif()
-    endif()
-
-    if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-        target_sources(
-            VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp runtime/runtime_directx12_pipeline_test.cpp
-                                       rhi/directx12_native_interop_test.cpp)
-        target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
-        target_compile_definitions(VernonRuntimeTests PRIVATE NOMINMAX)
     endif()
 
     if(VERNON_ENABLE_VULKAN_RUNTIME

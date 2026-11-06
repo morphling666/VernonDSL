@@ -11,7 +11,7 @@ typedef void (*VernonOpenGLMakeCurrentFn)(void *user_data);
 typedef void *(*VernonOpenGLGetProcAddressFn)(void *user_data, const char *name);
 
 /*
- * OpenGL context ownership is intentionally outside the RHI. Python context
+ * OpenGL context ownership is intentionally outside the HAL. Python context
  * owners and host engines provide the same callbacks; their origin is not
  * observable by the OpenGL backend.
  *

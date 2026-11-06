@@ -1,7 +1,7 @@
 #ifndef VERNON_RUNTIME_RUNTIME_DISPATCH_H
 #define VERNON_RUNTIME_RUNTIME_DISPATCH_H
 
-#include "VernonRuntimeCore.h"
+#include "VernonRuntimeProvider.h"
 #include "backend_stage_pipeline.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
@@ -10,6 +10,7 @@
 #include "resolved_stage_invocation.h"
 #include "runtime_state.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -19,14 +20,37 @@ struct VernonProgramExecutable;
 struct VernonProgramBundle;
 struct VernonRuntimeContext;
 
+namespace vernon::hal::cuda {
+struct DeviceState;
+} // namespace vernon::hal::cuda
+namespace vernon::hal::opengl {
+struct DeviceState;
+} // namespace vernon::hal::opengl
+namespace vernon::hal::vulkan {
+struct DeviceState;
+} // namespace vernon::hal::vulkan
+
 namespace vernon::runtime {
 
 template <typename T> using RuntimeResult = vernon::Result<T, vernon::RuntimeError>;
 
+// A context whose backend `initialize` sets up over a device that the HAL created.
+RuntimeResult<std::unique_ptr<VernonRuntimeContext>>
+createRuntimeContextForHal(VernonRuntimeBackend backend,
+                           const std::function<RuntimeResult<void>(VernonRuntimeContext &)> &initialize);
+
 bool isOpenGLBackend(VernonRuntimeBackend backend);
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic);
 RuntimeResult<void> initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex);
-RuntimeResult<void> initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevice device);
+// A CUDA context runs on `device`, which the HAL created over `state`.
+RuntimeResult<void> initializeCudaBackend(VernonRuntimeContext &context, std::shared_ptr<hal::Device> device,
+                                          const hal::cuda::DeviceState &state);
+// An OpenGL context reaches the host's context through `state`; its HAL device is created on first use.
+RuntimeResult<void> initializeOpenGLBackend(VernonRuntimeContext &context,
+                                            std::shared_ptr<hal::opengl::DeviceState> state);
+// A Vulkan context runs on the device of `state`; its HAL device is created on first use.
+RuntimeResult<void> initializeVulkanBackend(VernonRuntimeContext &context,
+                                            std::shared_ptr<hal::vulkan::DeviceState> state);
 void destroyBackend(VernonRuntimeContext &context);
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &capabilities);
 RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
@@ -42,19 +66,9 @@ BackendPipelineResult resolveBackendPipeline(BackendStageBuildInputs &inputs, co
                                              VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);
 
-RuntimeResult<VernonRuntimeProviderResourceReference>
-referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size);
-RuntimeResult<VernonRhiBuffer>
-resolveBackendRhiBufferReference(VernonRuntimeContext &context,
-                                 const VernonRuntimeProviderResourceReference &reference);
-RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiImageView(VernonRuntimeContext &context,
-                                                                                   VernonRhiImageView view);
-RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiSampler(VernonRuntimeContext &context,
-                                                                                 VernonRhiSampler sampler);
+// Describes a HAL image view, the only image a schedule binds.
 RuntimeResult<VernonRuntimeProviderImageDescription>
 describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource);
-RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
-                                                                          VernonRhiCommandEncoder encoder);
 
 } // namespace vernon::runtime
 

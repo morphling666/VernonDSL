@@ -209,21 +209,15 @@ TEST(FallibleValueTest, SuccessfulPrimitiveOperationsDoNotAllocate) {
 
 TEST(FallibleValueTest, ErrorsConvertExplicitlyAtNativeBoundaries) {
     constexpr vernon::LifecycleError saturated{vernon::LifecycleErrorCode::AdmissionSaturated, {"retain", 42, 3}};
-    static_assert(vernon::toVernonRhiStatus(saturated) == VERNON_RHI_STATUS_RESOURCE_EXHAUSTED);
     static_assert(vernon::toVernonStatus(saturated) == VERNON_STATUS_INTERNAL_ERROR);
-
-    constexpr vernon::RhiError unsupported{vernon::RhiErrorCode::Unsupported, {"create_device", 0, 0}};
-    static_assert(vernon::toVernonRhiStatus(unsupported) == VERNON_RHI_STATUS_UNSUPPORTED);
-    static_assert(vernon::toVernonStatus(unsupported) == VERNON_STATUS_UNSUPPORTED_TARGET);
 
     constexpr vernon::ProviderError exhausted{vernon::ProviderErrorCode::ResourceExhausted,
                                               {"create_binding_set", 4096, 0}};
-    static_assert(vernon::toVernonRhiStatus(exhausted) == VERNON_RHI_STATUS_RESOURCE_EXHAUSTED);
     static_assert(vernon::toVernonStatus(exhausted) == VERNON_STATUS_INTERNAL_ERROR);
 }
 
 TEST(FallibleValueTest, EmergencyDiagnosticIsBoundedAndNullTerminated) {
-    constexpr vernon::RuntimeError error{vernon::RuntimeErrorCode::RhiFailure,
+    constexpr vernon::RuntimeError error{vernon::RuntimeErrorCode::DeviceFailure,
                                          {"synchronize_device_with_a_deliberately_long_static_name", 19, 2}};
     char output[32];
     const std::size_t required = vernon::renderEmergencyDiagnostic(error, output, sizeof(output));

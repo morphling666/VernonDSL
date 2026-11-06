@@ -12,12 +12,12 @@ version axes:
 - `COMPILER_CONTRACT_VERSION` covers Python semantics, MLIR module attributes,
   canonical Value layout, stage topology, and compiler reflection.
 - `PROGRAM_VERSION` covers Program manifests and invocation, CPU/GPU
-  artifacts, graphics draw data, device providers, and the RHI API.
+  artifacts, graphics draw data, and the Runtime, schedule and HAL APIs.
 
 Generated Python, C/C++, and CMake constants are consumed directly. Caches use
 the compiler-contract and Program versions instead of private cache epochs.
-Changing `PROGRAM_VERSION` requires rebuilding every Runtime, Provider, and RHI
-component; third-party precompiled Provider/RHI plugins are not supported.
+Changing `PROGRAM_VERSION` requires rebuilding every Runtime and HAL
+component; third-party precompiled HAL backends are not supported.
 
 ## Compute kernel compile vs bind
 
@@ -795,8 +795,8 @@ argument index, validation rejects any other pair on a compute Resource, and
 interface ABI bindings. The frontend rejects `resource(...)`, and
 `uniform(...)` with a set or binding, on Kernel parameters and params leaves.
 This numbering is interim: Kernel placement by `set` lands with uniform
-packing ([`../runtime/binding_groups.md`](../runtime/binding_groups.md)
-section 3.4), which gives each set's by-value leaves one carrier instead of
+packing ([`../language/placement.md`](../language/placement.md)
+section 4), which gives each set's by-value leaves one carrier instead of
 the single argument-order carrier of set 0.
 
 ### Compute sampling

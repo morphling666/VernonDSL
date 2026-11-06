@@ -1,22 +1,16 @@
 #include "runtime_dispatch.h"
 
-#include "VernonRuntimeCore.h"
 #include "hal/native_images.h"
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-#include "rhi/cuda_backend.h"
+#include "hal/cuda/cuda_state.h"
 #endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-#include "rhi/directx12_backend.h"
-#endif
-#include "rhi/opengl_backend.h"
-#include "rhi/rhi_internal.h"
+#include "hal/opengl/opengl_state.h"
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "rhi/vulkan_backend.h"
+#include "hal/vulkan/vulkan_state.h"
 #endif
 #include "backend_cpu.h"
 #include "backend_opengl.h"
-#include "rhi_adapter/adapter_internal.h"
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 #include "backend_cuda.h"
@@ -24,13 +18,8 @@
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "backend_vulkan.h"
 #endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-#include "backend_directx12.h"
-#endif
-#if defined(VERNON_HAS_METAL_RUNTIME)
-#include "backend_metal.h"
-#include <TargetConditionals.h>
-#endif
+
+#include <new>
 
 namespace vernon::runtime {
 
@@ -46,310 +35,111 @@ bool isOpenGLBackend(VernonRuntimeBackend backend) {
     return backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES;
 }
 
-RuntimeResult<void> initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevice device) {
-    VernonRhiBackend backend;
-    switch (context.backend) {
-    case VERNON_RUNTIME_CUDA:
-        backend = VERNON_RHI_BACKEND_CUDA;
-        break;
-    case VERNON_RUNTIME_VULKAN:
-        backend = VERNON_RHI_BACKEND_VULKAN;
-        break;
-    case VERNON_RUNTIME_DIRECTX12:
-        backend = VERNON_RHI_BACKEND_DIRECTX12;
-        break;
-    case VERNON_RUNTIME_METAL:
-        backend = VERNON_RHI_BACKEND_METAL;
-        break;
-    case VERNON_RUNTIME_OPENGL:
-        backend = VERNON_RHI_BACKEND_OPENGL;
-        break;
-    case VERNON_RUNTIME_OPENGL_ES:
-        backend = VERNON_RHI_BACKEND_OPENGL_ES;
-        break;
-    case VERNON_RUNTIME_CPU:
-        invocationDiagnostic(context) = "CPU Runtime does not use a Vernon RHI device";
-        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "initialize_backend_for_rhi_device");
-    }
-    auto deviceLease = rhi::retainDeviceLease(device);
-    if (deviceLease.isErr()) {
-        invocationDiagnostic(context) = "cannot retain Vernon RHI device for Runtime context";
-        return RuntimeResult<void>{err(toRuntimeError(std::move(deviceLease).error()))};
-    }
-    context.rhiDeviceLease.emplace(std::move(deviceLease).value());
-    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, backend);
-    if (!adapter) {
-        invocationDiagnostic(context) = "cannot create Runtime adapter for Vernon RHI device";
-        return runtimeFailure(RuntimeErrorCode::RhiFailure, "create_runtime_rhi_adapter");
-    }
-    auto resolvedDeviceState = rhi::deviceState(device, backend);
-    if (resolvedDeviceState.isErr()) {
-        vernonRuntimeRhiAdapterDestroy(adapter);
-        invocationDiagnostic(context) = "cannot resolve Vernon RHI backend state";
-        return RuntimeResult<void>{err(toRuntimeError(std::move(resolvedDeviceState).error()))};
-    }
-    void *backendDeviceState = resolvedDeviceState.value();
-    switch (context.backend) {
+RuntimeResult<void> initializeCudaBackend(VernonRuntimeContext &context, std::shared_ptr<hal::Device> device,
+                                          const hal::cuda::DeviceState &state) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-    case VERNON_RUNTIME_CUDA: {
-        auto *state = new CudaContextState();
-        state->adapter = adapter;
-        const auto *deviceState = static_cast<const rhi::cuda::DeviceState *>(backendDeviceState);
-        state->computeCapabilityMajor = deviceState->computeCapabilityMajor;
-        state->computeCapabilityMinor = deviceState->computeCapabilityMinor;
-        state->driverVersion = deviceState->driverVersion;
-        installRuntimeBackendState(context, state);
-        break;
-    }
+    if (context.backend != VERNON_RUNTIME_CUDA || !device)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "initialize_cuda_backend");
+    auto *backendState = new (std::nothrow) CudaContextState();
+    if (!backendState)
+        return runtimeFailure(RuntimeErrorCode::InternalFailure, "initialize_cuda_backend");
+    backendState->computeCapabilityMajor = state.computeCapabilityMajor;
+    backendState->computeCapabilityMinor = state.computeCapabilityMinor;
+    backendState->driverVersion = state.driverVersion;
+    installRuntimeBackendState(context, backendState);
+    std::lock_guard<std::mutex> lock(context.halDeviceMutex);
+    context.halDevice = std::move(device);
+    return RuntimeResult<void>{ok()};
+#else
+    (void)device;
+    (void)state;
+    invocationDiagnostic(context) = "VernonRuntime was built without CUDA support";
+    return runtimeFailure(RuntimeErrorCode::Unsupported, "initialize_cuda_backend");
 #endif
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    case VERNON_RUNTIME_VULKAN: {
-        auto *state = new VulkanContextState();
-        state->adapter = adapter;
-        const auto *deviceState = static_cast<const rhi::vulkan::DeviceState *>(backendDeviceState);
-        state->apiVersion = deviceState->apiVersion;
-        state->maxComputeWorkGroupInvocations = deviceState->maxComputeWorkGroupInvocations;
-        std::copy(std::begin(deviceState->maxComputeWorkGroupSize), std::end(deviceState->maxComputeWorkGroupSize),
-                  std::begin(state->maxComputeWorkGroupSize));
-        state->dynamicRendering = deviceState->dynamicRendering;
-        installRuntimeBackendState(context, state);
-        break;
-    }
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    case VERNON_RUNTIME_DIRECTX12: {
-        auto *state = new DirectX12ContextState();
-        state->adapter = adapter;
-        const auto *deviceState = static_cast<const rhi::directx12::DeviceState *>(backendDeviceState);
-        state->featureLevel = deviceState->featureLevel;
-        state->shaderModel = deviceState->shaderModel;
-        state->rootSignatureVersion = deviceState->rootSignatureVersion;
-        state->resourceBindingTier = deviceState->resourceBindingTier;
-        state->maxComputeInvocations = deviceState->maxComputeInvocations;
-        std::copy(std::begin(deviceState->maxComputeWorkGroupSize), std::end(deviceState->maxComputeWorkGroupSize),
-                  std::begin(state->maxComputeWorkGroupSize));
-        installRuntimeBackendState(context, state);
-        break;
-    }
-#endif
-#if defined(VERNON_HAS_METAL_RUNTIME)
-    case VERNON_RUNTIME_METAL: {
-        auto *state = new MetalContextState();
-        state->adapter = adapter;
-        const MetalRuntimeDeviceCapabilities capabilities = metalRhiAdapterDeviceCapabilities(*adapter);
-        state->maxComputeInvocations = capabilities.maxComputeInvocations;
-        std::copy_n(capabilities.maxComputeWorkGroupSize, 3, state->maxComputeWorkGroupSize);
-        state->operatingSystemVersion = {capabilities.operatingSystemVersion[0],
-                                         capabilities.operatingSystemVersion[1]};
-        state->argumentBuffersTier = capabilities.argumentBuffersTier;
-        state->argumentBufferEncodingSupported = capabilities.argumentBufferEncodingSupported;
-        installRuntimeBackendState(context, state);
-        break;
-    }
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES: {
-        auto *state = new OpenGLContextState();
-        state->adapter = adapter;
-        const auto *deviceState = static_cast<const rhi::opengl::DeviceState *>(backendDeviceState);
-        state->device.callbacks = deviceState->callbacks;
-        installRuntimeBackendState(context, state);
-        break;
-    }
-    default:
-        vernonRuntimeRhiAdapterDestroy(adapter);
-        invocationDiagnostic(context) = "Runtime backend is unavailable for Vernon RHI device";
-        return runtimeFailure(RuntimeErrorCode::Unsupported, "initialize_backend_for_rhi_device");
-    }
-    context.rhiDevice = device;
+}
+
+RuntimeResult<void> initializeOpenGLBackend(VernonRuntimeContext &context,
+                                            std::shared_ptr<hal::opengl::DeviceState> state) {
+    if (!isOpenGLBackend(context.backend) || !state)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "initialize_opengl_backend");
+    auto *backendState = new (std::nothrow) OpenGLContextState();
+    if (!backendState)
+        return runtimeFailure(RuntimeErrorCode::InternalFailure, "initialize_opengl_backend");
+    backendState->device = std::move(state);
+    installRuntimeBackendState(context, backendState);
     return RuntimeResult<void>{ok()};
 }
 
-VernonRuntimeRhiAdapter *borrowedRhiAdapter(VernonRuntimeContext &context) {
-    if (!context.rhiDeviceLease)
-        return nullptr;
-    VernonRuntimeRhiAdapter *adapter = nullptr;
-    switch (context.backend) {
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-    case VERNON_RUNTIME_CUDA:
-        adapter = cudaState(context).adapter;
-        break;
-#endif
+RuntimeResult<void> initializeVulkanBackend(VernonRuntimeContext &context,
+                                            std::shared_ptr<hal::vulkan::DeviceState> state) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    case VERNON_RUNTIME_VULKAN:
-        adapter = vulkanState(context).adapter;
-        break;
+    if (context.backend != VERNON_RUNTIME_VULKAN || !state)
+        return runtimeFailure(RuntimeErrorCode::InvalidArgument, "initialize_vulkan_backend");
+    auto *backendState = new (std::nothrow) VulkanContextState();
+    if (!backendState)
+        return runtimeFailure(RuntimeErrorCode::InternalFailure, "initialize_vulkan_backend");
+    backendState->device = std::move(state);
+    installRuntimeBackendState(context, backendState);
+    return RuntimeResult<void>{ok()};
+#else
+    (void)state;
+    invocationDiagnostic(context) = "VernonRuntime was built without Vulkan support";
+    return runtimeFailure(RuntimeErrorCode::Unsupported, "initialize_vulkan_backend");
 #endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    case VERNON_RUNTIME_DIRECTX12:
-        adapter = directX12State(context).adapter;
-        break;
-#endif
-#if defined(VERNON_HAS_METAL_RUNTIME)
-    case VERNON_RUNTIME_METAL:
-        adapter = metalState(context).adapter;
-        break;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        adapter = openGLState(context).adapter;
-        break;
-    default:
-        return nullptr;
-    }
-    return adapter;
-}
-
-RuntimeResult<VernonRuntimeProviderResourceReference>
-referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    if (!adapter)
-        return RuntimeResult<VernonRuntimeProviderResourceReference>{
-            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"reference_rhi_buffer", 0, 0}})};
-    VernonRuntimeProviderResourceReference output{};
-    const VernonStatus status = vernonRuntimeRhiAdapterReferenceBuffer(adapter, buffer, offset, size, &output);
-    if (status == VERNON_STATUS_OK) {
-        const std::lock_guard<std::mutex> lock(context.referencedRhiBuffersMutex);
-        context.referencedRhiBuffers[{output.identity, output.resource.value}] = buffer;
-        return RuntimeResult<VernonRuntimeProviderResourceReference>{ok(output)};
-    }
-    return RuntimeResult<VernonRuntimeProviderResourceReference>{
-        err(runtimeErrorFromStatus(status, {"reference_rhi_buffer", 0, 0}))};
-}
-
-RuntimeResult<VernonRhiBuffer>
-resolveBackendRhiBufferReference(VernonRuntimeContext &context,
-                                 const VernonRuntimeProviderResourceReference &reference) {
-    const std::lock_guard<std::mutex> lock(context.referencedRhiBuffersMutex);
-    const auto found = context.referencedRhiBuffers.find({reference.identity, reference.resource.value});
-    if (found == context.referencedRhiBuffers.end())
-        return RuntimeResult<VernonRhiBuffer>{
-            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"resolve_rhi_buffer_reference", 0, 0}})};
-    if (!vernonRhiDeviceIsBufferValid(context.rhiDevice, found->second)) {
-        context.referencedRhiBuffers.erase(found);
-        return RuntimeResult<VernonRhiBuffer>{
-            err(RuntimeError{RuntimeErrorCode::LifecycleFailure, {"resolve_rhi_buffer_reference", 0, 0}})};
-    }
-    return RuntimeResult<VernonRhiBuffer>{ok(found->second)};
-}
-
-RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiImageView(VernonRuntimeContext &context,
-                                                                                   VernonRhiImageView view) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    VernonRuntimeProviderResourceReference output{};
-    if (!adapter)
-        return RuntimeResult<VernonRuntimeProviderResourceReference>{
-            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"reference_rhi_image_view", 0, 0}})};
-    const VernonStatus status = vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &output);
-    return status == VERNON_STATUS_OK ? RuntimeResult<VernonRuntimeProviderResourceReference>{ok(output)}
-                                      : RuntimeResult<VernonRuntimeProviderResourceReference>{
-                                            err(runtimeErrorFromStatus(status, {"reference_rhi_image_view", 0, 0}))};
-}
-
-RuntimeResult<VernonRuntimeProviderResourceReference> referenceBackendRhiSampler(VernonRuntimeContext &context,
-                                                                                 VernonRhiSampler sampler) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    VernonRuntimeProviderResourceReference output{};
-    if (!adapter)
-        return RuntimeResult<VernonRuntimeProviderResourceReference>{
-            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"reference_rhi_sampler", 0, 0}})};
-    const VernonStatus status = vernonRuntimeRhiAdapterReferenceSampler(adapter, sampler, &output);
-    return status == VERNON_STATUS_OK ? RuntimeResult<VernonRuntimeProviderResourceReference>{ok(output)}
-                                      : RuntimeResult<VernonRuntimeProviderResourceReference>{
-                                            err(runtimeErrorFromStatus(status, {"reference_rhi_sampler", 0, 0}))};
 }
 
 RuntimeResult<VernonRuntimeProviderImageDescription>
-describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource) {
-    if ((resource.identity & hal::kReferenceKindMask) == hal::kNativeViewReference) {
-        VernonRuntimeProviderImageDescription description{};
-        description.struct_size = sizeof(description);
-        if (!hal::describeNativeView(resource, description))
-            return RuntimeResult<VernonRuntimeProviderImageDescription>{
-                err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"describe_backend_image", 0, 0}})};
-        return RuntimeResult<VernonRuntimeProviderImageDescription>{ok(description)};
-    }
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    const VernonRuntimeDeviceProvider *provider = adapter ? vernonRuntimeRhiAdapterGetProvider(adapter) : nullptr;
-    if (!provider || !provider->describe_image)
-        return RuntimeResult<VernonRuntimeProviderImageDescription>{
-            err(RuntimeError{RuntimeErrorCode::Unsupported, {"describe_backend_image", 0, 0}})};
+describeBackendImage(VernonRuntimeContext &, VernonRuntimeProviderResourceReference resource) {
     VernonRuntimeProviderImageDescription description{};
     description.struct_size = sizeof(description);
-    const VernonStatus status = provider->describe_image(provider->user_data, resource, &description);
-    return status == VERNON_STATUS_OK ? RuntimeResult<VernonRuntimeProviderImageDescription>{ok(description)}
-                                      : RuntimeResult<VernonRuntimeProviderImageDescription>{
-                                            err(runtimeErrorFromStatus(status, {"describe_backend_image", 0, 0}))};
-}
-
-RuntimeResult<VernonRuntimeProviderObject> referenceBackendCommandEncoder(VernonRuntimeContext &context,
-                                                                          VernonRhiCommandEncoder encoder) {
-    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    if (!adapter)
-        return RuntimeResult<VernonRuntimeProviderObject>{
-            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"reference_command_encoder", 0, 0}})};
-    VernonRuntimeProviderObject output{};
-    const VernonStatus status = vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, encoder, &output);
-    return status == VERNON_STATUS_OK ? RuntimeResult<VernonRuntimeProviderObject>{ok(output)}
-                                      : RuntimeResult<VernonRuntimeProviderObject>{
-                                            err(runtimeErrorFromStatus(status, {"reference_command_encoder", 0, 0}))};
+    if ((resource.identity & hal::kReferenceKindMask) != hal::kNativeViewReference ||
+        !hal::describeNativeView(resource, description))
+        return RuntimeResult<VernonRuntimeProviderImageDescription>{
+            err(RuntimeError{RuntimeErrorCode::InvalidArgument, {"describe_backend_image", 0, 0}})};
+    return RuntimeResult<VernonRuntimeProviderImageDescription>{ok(description)};
 }
 
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
-    auto probeRhi = [&](VernonRhiBackend rhiBackend) {
-        VernonRhiOwnedDeviceDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.backend = rhiBackend;
-        VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
-        if (device.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX)) {
-            diagnostic = providerDiagnostic(rhi::deviceCreationError(), "no usable Vernon RHI device was found");
-            return runtimeFailure(RuntimeErrorCode::RhiFailure, "probe_backend");
-        }
-        if (vernonRhiDestroyDevice(device) != VERNON_RHI_STATUS_OK) {
-            diagnostic = "the probed Vernon RHI device could not be destroyed";
-            return runtimeFailure(RuntimeErrorCode::RhiFailure, "probe_backend_destroy");
-        }
-        return RuntimeResult<void>{ok()};
-    };
     switch (backend) {
     case VERNON_RUNTIME_CPU:
         return RuntimeResult<void>{ok()};
     case VERNON_RUNTIME_CUDA:
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-        return probeRhi(VERNON_RHI_BACKEND_CUDA);
+    {
+        hal::cuda::DeviceState probe;
+        const hal::cuda::Result status = probe.initialize(0);
+        if (status == hal::cuda::kSuccess)
+            return RuntimeResult<void>{ok()};
+        diagnostic = hal::cuda::describeResult(status, "CUDA device creation");
+        return runtimeFailure(RuntimeErrorCode::DeviceFailure, "probe_backend");
+    }
 #else
         diagnostic = "VernonRuntime was built without CUDA support";
         return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
 #endif
     case VERNON_RUNTIME_VULKAN:
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return probeRhi(VERNON_RHI_BACKEND_VULKAN);
+    {
+        hal::vulkan::DeviceState probe;
+        if (probe.initialize(0, diagnostic))
+            return RuntimeResult<void>{ok()};
+        return runtimeFailure(RuntimeErrorCode::DeviceFailure, "probe_backend");
+    }
 #else
         diagnostic = "VernonRuntime was built without Vulkan support";
         return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
 #endif
     case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return probeRhi(VERNON_RHI_BACKEND_DIRECTX12);
-#else
-        diagnostic = "VernonRuntime was built without DirectX 12 support";
-        return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
-#endif
     case VERNON_RUNTIME_METAL:
-#if defined(VERNON_HAS_METAL_RUNTIME)
-        return probeRhi(VERNON_RHI_BACKEND_METAL);
-#else
-        diagnostic = "VernonRuntime was built without Metal support";
+        diagnostic = "DirectX 12 and Metal have no HAL device yet";
         return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
-#endif
     case VERNON_RUNTIME_OPENGL:
     case VERNON_RUNTIME_OPENGL_ES:
         diagnostic = "backend requires a host-owned external context";
         return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
-    default:
-        diagnostic = "VernonRuntime backend is not enabled";
-        return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
     }
+    diagnostic = "VernonRuntime backend is not enabled";
+    return runtimeFailure(RuntimeErrorCode::Unsupported, "probe_backend");
 }
 
 RuntimeResult<void> initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex) {
@@ -357,20 +147,17 @@ RuntimeResult<void> initializeBackend(VernonRuntimeContext &context, uint32_t de
         return initializeCpuContext(context, deviceIndex)
                    ? RuntimeResult<void>{ok()}
                    : runtimeFailure(RuntimeErrorCode::InternalFailure, "initialize_cpu_backend");
-    invocationDiagnostic(context) = "GPU Runtime contexts require a Vernon RHI device";
+    invocationDiagnostic(context) = "GPU Runtime contexts are created over a HAL device";
     return runtimeFailure(RuntimeErrorCode::InvalidArgument, "initialize_backend");
 }
 
 void destroyBackend(VernonRuntimeContext &context) {
-    // The HAL device waits for its submissions on the RHI device, which the context stops leasing below.
+    // The HAL device waits for its submissions on the backend state, which is destroyed below.
     {
         std::lock_guard<std::mutex> lock(context.halDeviceMutex);
         context.halDevice.reset();
     }
-    if (VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context))
-        vernonRuntimeRhiAdapterDestroy(adapter);
     destroyRuntimeBackendState(context);
-    context.rhiDeviceLease.reset();
 }
 
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &result) {
@@ -380,22 +167,15 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
         result.supports_storage_buffers = 1;
         return;
     }
-    if (context.backend == VERNON_RUNTIME_VULKAN || context.backend == VERNON_RUNTIME_DIRECTX12 ||
-        context.backend == VERNON_RUNTIME_METAL) {
+    if (context.backend == VERNON_RUNTIME_VULKAN) {
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
         result.supports_graphics = 1;
         result.graphics_draw_abi_version = VERNON_PROGRAM_VERSION;
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        if (context.backend == VERNON_RUNTIME_DIRECTX12) {
-            result.api_version_major = 12;
-            result.api_version_minor = 0;
-        }
-#endif
         return;
     }
     result.supports_graphics = 1;
-    const VernonOpenGLContextCallbacks &external = openGLState(context).device.callbacks;
+    const VernonOpenGLContextCallbacks &external = openGLState(context).device->callbacks;
     result.api_version_major = external.api_version_major;
     result.api_version_minor = external.api_version_minor;
     result.supports_compute =
@@ -432,7 +212,7 @@ RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context,
         return RuntimeResult<void>{ok()};
     }
     if (isOpenGLBackend(context.backend)) {
-        const VernonOpenGLContextCallbacks &actual = openGLState(context).device.callbacks;
+        const VernonOpenGLContextCallbacks &actual = openGLState(context).device->callbacks;
         const RuntimeVersion actualApi{actual.api_version_major, actual.api_version_minor};
         const bool apiSatisfied = runtimeVersionAtLeast(actualApi, requirements.apiVersion);
         const uint32_t actualGlsl = glslVersionForApi(actualApi);
@@ -448,7 +228,7 @@ RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context,
     }
     if (context.backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-        const VulkanContextState &actual = vulkanState(context);
+        const hal::vulkan::DeviceState &actual = *vulkanState(context).device;
         const uint32_t actualMajor = VK_VERSION_MAJOR(actual.apiVersion);
         const uint32_t actualMinor = VK_VERSION_MINOR(actual.apiVersion);
         if (!runtimeVersionAtLeast({actualMajor, actualMinor}, requirements.apiVersion)) {
@@ -490,92 +270,6 @@ RuntimeResult<void> validateRuntimeRequirements(VernonRuntimeContext &context,
                                             " invocations, device provides " +
                                             std::to_string(actual.maxComputeWorkGroupInvocations);
             return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_vulkan_runtime_requirements");
-        }
-        return RuntimeResult<void>{ok()};
-#endif
-    }
-    if (context.backend == VERNON_RUNTIME_DIRECTX12) {
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        const DirectX12ContextState &actual = directX12State(context);
-        const uint32_t featureLevel = static_cast<uint32_t>(actual.featureLevel);
-        const uint32_t requiredFeatureLevel =
-            requirements.minimumFeatureLevel.major * 0x1000 + requirements.minimumFeatureLevel.minor * 0x100;
-        if (featureLevel < requiredFeatureLevel) {
-            invocationDiagnostic(context) =
-                "pipeline requires D3D feature level " + std::to_string(requirements.minimumFeatureLevel.major) + "." +
-                std::to_string(requirements.minimumFeatureLevel.minor) + ", device provides " +
-                std::to_string((featureLevel >> 12) & 0xf) + "." + std::to_string((featureLevel >> 8) & 0xf);
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_directx12_runtime_requirements");
-        }
-        const uint32_t actualShaderModel = static_cast<uint32_t>(actual.shaderModel);
-        const uint32_t requiredShaderModel = requirements.shaderVersion.major * 0x10 + requirements.shaderVersion.minor;
-        if (actualShaderModel < requiredShaderModel) {
-            invocationDiagnostic(context) =
-                "pipeline requires Shader Model " + std::to_string(requirements.shaderVersion.major) + "." +
-                std::to_string(requirements.shaderVersion.minor) + ", device provides " +
-                std::to_string((actualShaderModel >> 4) & 0xf) + "." + std::to_string(actualShaderModel & 0xf);
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_directx12_runtime_requirements");
-        }
-        const uint32_t requiredRootSignature =
-            requirements.rootSignatureVersion.major == 1 ? 1 + requirements.rootSignatureVersion.minor : UINT32_MAX;
-        if (static_cast<uint32_t>(actual.rootSignatureVersion) < requiredRootSignature) {
-            invocationDiagnostic(context) = "pipeline requires a newer D3D12 root-signature version";
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_directx12_runtime_requirements");
-        }
-        uint64_t invocations = 1;
-        for (size_t index = 0; index < 3; ++index) {
-            if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
-                invocationDiagnostic(context) = "pipeline compute workgroup dimension exceeds D3D12 device limits";
-                return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_directx12_runtime_requirements");
-            }
-            invocations *= requirements.computeWorkgroupSize[index];
-        }
-        if (invocations > actual.maxComputeInvocations) {
-            invocationDiagnostic(context) = "pipeline compute workgroup exceeds D3D12 thread-group limit";
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_directx12_runtime_requirements");
-        }
-        return RuntimeResult<void>{ok()};
-#endif
-    }
-    if (context.backend == VERNON_RUNTIME_METAL) {
-#if defined(VERNON_HAS_METAL_RUNTIME)
-#if TARGET_OS_OSX
-        constexpr const char *platform = "macos";
-#else
-        constexpr const char *platform = "ios";
-#endif
-        if (requirements.applePlatform != platform) {
-            invocationDiagnostic(context) = "pipeline targets Apple platform '" + requirements.applePlatform +
-                                            "', but this Runtime targets '" + platform + "'";
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_metal_runtime_requirements");
-        }
-        if (requirements.shaderVersion.major != 2 || requirements.shaderVersion.minor != 4) {
-            invocationDiagnostic(context) =
-                "pipeline requires unsupported MSL " + std::to_string(requirements.shaderVersion.major) + "." +
-                std::to_string(requirements.shaderVersion.minor) + "; Runtime supports MSL 2.4";
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_metal_runtime_requirements");
-        }
-        const MetalContextState &actual = metalState(context);
-        if (!runtimeVersionAtLeast(actual.operatingSystemVersion, requirements.minimumOsVersion)) {
-            invocationDiagnostic(context) = "pipeline requires " + requirements.applePlatform + " " +
-                                            std::to_string(requirements.minimumOsVersion.major) + "." +
-                                            std::to_string(requirements.minimumOsVersion.minor) + ", host provides " +
-                                            std::to_string(actual.operatingSystemVersion.major) + "." +
-                                            std::to_string(actual.operatingSystemVersion.minor);
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_metal_runtime_requirements");
-        }
-        uint64_t invocations = 1;
-        for (size_t index = 0; index < 3; ++index) {
-            if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
-                invocationDiagnostic(context) =
-                    "pipeline compute workgroup dimension " + std::to_string(index) + " exceeds Metal device limit";
-                return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_metal_runtime_requirements");
-            }
-            invocations *= requirements.computeWorkgroupSize[index];
-        }
-        if (invocations > actual.maxComputeInvocations) {
-            invocationDiagnostic(context) = "pipeline compute workgroup exceeds Metal threadgroup limit";
-            return runtimeFailure(RuntimeErrorCode::Unsupported, "validate_metal_runtime_requirements");
         }
         return RuntimeResult<void>{ok()};
 #endif

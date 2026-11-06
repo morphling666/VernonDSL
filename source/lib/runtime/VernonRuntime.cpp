@@ -71,44 +71,25 @@ createRuntimeContextForBackend(VernonRuntimeBackend backend, const VernonRuntime
     return created;
 }
 
-vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError>
-createRuntimeContextForRhiDevice(VernonRuntimeBackend backend, VernonRhiDevice device,
-                                 const VernonRuntimeCreateOptions *options) {
-    using Result = vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError>;
-    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX ||
-        (options && (options->struct_size < sizeof(VernonRuntimeCreateOptions) || options->device_index)))
-        return Result{vernon::err(vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument,
-                                                       {"create_runtime_context_for_rhi_device", 0, 0}})};
+} // namespace
+
+namespace vernon::runtime {
+
+RuntimeResult<std::unique_ptr<VernonRuntimeContext>>
+createRuntimeContextForHal(VernonRuntimeBackend backend,
+                           const std::function<RuntimeResult<void>(VernonRuntimeContext &)> &initialize) {
+    using Result = RuntimeResult<std::unique_ptr<VernonRuntimeContext>>;
     auto created = createRuntimeContext();
     if (created.isErr())
         return created;
     created.value()->backend = backend;
-    auto initialized = initializeBackendForRhiDevice(*created.value(), device);
+    auto initialized = initialize(*created.value());
     if (initialized.isErr())
         return Result{vernon::err(std::move(initialized).error())};
     return created;
 }
 
-template <typename Output, typename Reference>
-VernonStatus referenceRhiObject(VernonRuntimeContext *context, Output *output, std::string_view invalid,
-                                Reference &&reference) {
-    return runtimeStatusBoundary(context, [&] {
-        if (!context)
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        auto contextPin = context->operations.tryPin();
-        if (contextPin.isErr())
-            return vernon::toVernonStatus(contextPin.error());
-        if (!output)
-            return fail(context, invalid);
-        auto referenced = std::forward<Reference>(reference)(*context);
-        if (referenced.isErr())
-            return publishRuntimeError(context, std::move(referenced).error());
-        *output = referenced.value();
-        return VERNON_STATUS_OK;
-    });
-}
-
-} // namespace
+} // namespace vernon::runtime
 
 VernonValueLayoutView vernonRuntimeGetScalarValueLayout(VernonDataType dtype) {
     return runtimeValueBoundary(nullptr, VernonValueLayoutView{}, [&] {
@@ -148,9 +129,7 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
         if (backend == VERNON_RUNTIME_CPU && result.available) {
             result.supports_compute = 1;
             result.supports_storage_buffers = 1;
-        } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN ||
-                    backend == VERNON_RUNTIME_DIRECTX12 || backend == VERNON_RUNTIME_METAL) &&
-                   result.available) {
+        } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN) && result.available) {
             result.supports_compute = result.available;
             result.supports_storage_buffers = result.available;
         } else if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {
@@ -165,12 +144,6 @@ VernonRuntimeContext *vernonRuntimeCreateWithOptions(VernonRuntimeBackend backen
                                                      const VernonRuntimeCreateOptions *options) {
     return runtimePointerResultBoundary<VernonRuntimeContext *>(
         nullptr, [&] { return createRuntimeContextForBackend(backend, options); });
-}
-
-VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backend, VernonRhiDevice device,
-                                                      const VernonRuntimeCreateOptions *options) {
-    return runtimePointerResultBoundary<VernonRuntimeContext *>(
-        nullptr, [&] { return createRuntimeContextForRhiDevice(backend, device, options); });
 }
 
 VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
@@ -313,31 +286,4 @@ VernonStatus vernonRuntimeUnregisterCpuEntry(VernonRuntimeContext *context, Vern
             context->cpuEntries.erase(found);
         return VERNON_STATUS_OK;
     });
-}
-
-VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer, uint64_t offset,
-                                             uint64_t size, VernonRuntimeProviderResourceReference *output) {
-    return referenceRhiObject(context, output, "invalid RHI buffer reference", [&](VernonRuntimeContext &pinned) {
-        return referenceBackendRhiBuffer(pinned, buffer, offset, size);
-    });
-}
-
-VernonStatus vernonRuntimeReferenceRhiImageView(VernonRuntimeContext *context, VernonRhiImageView view,
-                                                VernonRuntimeProviderResourceReference *output) {
-    return referenceRhiObject(context, output, "invalid RHI image view reference",
-                              [&](VernonRuntimeContext &pinned) { return referenceBackendRhiImageView(pinned, view); });
-}
-
-VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context, VernonRhiSampler sampler,
-                                              VernonRuntimeProviderResourceReference *output) {
-    return referenceRhiObject(context, output, "invalid RHI sampler reference", [&](VernonRuntimeContext &pinned) {
-        return referenceBackendRhiSampler(pinned, sampler);
-    });
-}
-
-VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *context, VernonRhiCommandEncoder encoder,
-                                                     VernonRuntimeProviderObject *output) {
-    return referenceRhiObject(
-        context, output, "invalid RHI command encoder reference",
-        [&](VernonRuntimeContext &pinned) { return referenceBackendCommandEncoder(pinned, encoder); });
 }

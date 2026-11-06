@@ -2,7 +2,6 @@
 #define VERNON_RUNTIME_GRAPHICS_INVOCATION_PLANNER_H
 
 #include "VernonRuntime.h"
-#include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
 #include "pipeline_groups.h"
 #include "provider_image_description.h"
@@ -46,6 +45,9 @@ struct PlannedRenderTargets {
     VernonTextureFormat depthFormat{};
     uint32_t attachmentWidth{};
     uint32_t attachmentHeight{};
+    // {x, y, width, height} within the attachments, which loads and stores apply to; a RenderPass whose render area
+    // is empty renders to the whole attachment extent.
+    std::array<uint32_t, 4> renderArea{};
 };
 
 struct PlannedGraphicsDraw {
@@ -59,8 +61,9 @@ struct PlannedGraphicsDraw {
     uint32_t scissor[4]{};
 };
 
-// Indexed draws from records, which replace the command's one draw; see VernonRuntimeCoreStreamDrawInvocation. A
-// host stream leaves both resources zero.
+// Indexed draws from records, which replace the command's one draw. A device stream names buffer resources of
+// records and, optionally, counts; without counts it draws all maxRecords records, which is the same draw since
+// writers zero the records past their count. A host stream leaves both resources zero.
 struct GraphicsDrawStream {
     const VernonRuntimeProviderDrawRecord *hostRecords{};
     const uint32_t *hostCounts{};

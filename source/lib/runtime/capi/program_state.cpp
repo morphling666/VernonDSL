@@ -1,5 +1,5 @@
 #include "runtime/capi/program_state.h"
-#include "runtime/program_execution/program_boundary_contract.h"
+#include "runtime/program_boundary_contract.h"
 
 #include <algorithm>
 #include <cstring>
@@ -186,23 +186,31 @@ bool stringViewEquals(VernonStringView view, const std::string &value) {
     return view.size == value.size() && (!view.size || std::memcmp(view.data, value.data(), view.size) == 0);
 }
 
-void collectForwardGraphicsNodes(const VernonProgramExecutable *pipeline, std::vector<const program::Node *> &nodes) {
-    const program::Program *program = pipeline ? executableProgram(*pipeline) : nullptr;
-    if (!program)
-        return;
-    const program::Graph *graph = program::findGraph(*program, "forward");
-    if (!graph)
-        return;
-    for (const program::Node &node : graph->nodes) {
-        if (program::executionKind(node) == program::ExecutionKind::Graphics)
-            nodes.push_back(&node);
+std::vector<GraphicsNodeRef> forwardGraphicsNodes(const VernonProgramExecutable &pipeline) {
+    std::vector<GraphicsNodeRef> nodes;
+    if (pipeline.composition) {
+        for (const ProgramGraphComposition::GraphicsNode &entry : pipeline.composition->graphicsNodes) {
+            VernonProgramExecutable *owner = pipeline.composition->nodes[entry.node].get();
+            const program::Graph *graph = program::findGraph(*executableProgram(*owner), "forward");
+            const auto node = std::find_if(graph->nodes.begin(), graph->nodes.end(),
+                                           [&](const program::Node &candidate) { return candidate.id == entry.local; });
+            nodes.push_back({entry.id, owner, entry.local, &*node});
+        }
+        return nodes;
     }
+    const program::Graph *graph = program::findGraph(*executableProgram(pipeline), "forward");
+    if (!graph)
+        return nodes;
+    for (const program::Node &node : graph->nodes)
+        if (program::executionKind(node) == program::ExecutionKind::Graphics)
+            nodes.push_back({node.id, const_cast<VernonProgramExecutable *>(&pipeline), node.id, &node});
+    return nodes;
 }
 
 const char *programArgumentDiagnostic(const program::BoundarySlot &boundary, const VernonProgramArgument &argument) {
     if (argument.kind < VERNON_PROGRAM_TENSOR || argument.kind > VERNON_PROGRAM_SAMPLER)
         return "Program binding has an invalid argument kind";
-    if (!vernon::runtime::program_execution::argumentMatchesBoundary(boundary, argument))
+    if (!vernon::runtime::argumentMatchesBoundary(boundary, argument))
         return "Program binding does not match its canonical boundary contract";
     if (argument.kind != VERNON_PROGRAM_TENSOR)
         return nullptr;

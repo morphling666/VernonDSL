@@ -3,8 +3,8 @@
 #include "VernonFormats.hpp"
 #include "hal/native_buffers.h"
 #include "hal/native_images.h"
+#include "hal/opengl/opengl_state.h"
 #include "hal/resources.h"
-#include "rhi/opengl_access.h"
 
 #include <algorithm>
 #include <cstring>
@@ -19,7 +19,8 @@
 namespace vernon::hal {
 namespace {
 
-namespace gl = rhi::opengl;
+namespace gl = opengl;
+using Access = std::shared_ptr<gl::DeviceState>;
 
 constexpr gl::Enum kUnpackAlignment = 0x0CF5;
 constexpr gl::Enum kDepthComponent = 0x1902;
@@ -115,31 +116,29 @@ void prepareBlits(gl::DeviceState &state) {
     state.driver.disable(gl::kScissorTest);
     if (!state.embeddedProfile)
         state.driver.disable(gl::kFramebufferSrgb);
-    ++state.drawStateGeneration;
 }
 
 // One OpenGL buffer, named by its serial. Every OpenGL call holds the device's mutex and makes its context current
 // first.
 class NativeBuffer {
 public:
-    NativeBuffer(gl::DeviceAccess access, gl::Buffer buffer, uint64_t size)
-        : access_(access), buffer_(buffer), size_(size) {
+    NativeBuffer(Access access, gl::Buffer buffer, uint64_t size) : access_(access), buffer_(buffer), size_(size) {
         serial_ = serials().add(&buffer_);
     }
     NativeBuffer(const NativeBuffer &) = delete;
     NativeBuffer &operator=(const NativeBuffer &) = delete;
     ~NativeBuffer() {
         serials().remove(serial_);
-        std::lock_guard<std::mutex> guard(*access_.mutex);
-        access_.state->makeCurrent();
-        access_.state->destroyBuffer(buffer_);
+        std::lock_guard<std::mutex> guard(access_->mutex);
+        access_->makeCurrent();
+        access_->destroyBuffer(buffer_);
     }
 
     const gl::Buffer &buffer() const { return buffer_; }
     uint64_t size() const { return size_; }
     VernonRuntimeProviderResourceReference reference(uint64_t offset, uint64_t size) const {
         VernonRuntimeProviderResourceReference reference{};
-        reference.identity = nativeBufferIdentity(access_.state);
+        reference.identity = nativeBufferIdentity(access_.get());
         reference.resource.value = serial_;
         reference.offset = offset;
         reference.size = size;
@@ -147,65 +146,65 @@ public:
     }
 
 private:
-    gl::DeviceAccess access_;
+    Access access_;
     gl::Buffer buffer_;
     uint64_t size_;
     uint64_t serial_{};
 };
 
 struct OpenGLHalBuffer final : VernonHalBuffer {
-    OpenGLHalBuffer(gl::DeviceAccess access, gl::Buffer buffer, uint64_t size) : native(access, buffer, size) {}
+    OpenGLHalBuffer(Access access, gl::Buffer buffer, uint64_t size) : native(access, buffer, size) {}
 
     NativeBuffer native;
 };
 
-Result<gl::Buffer, std::string> createNative(gl::DeviceAccess access, uint64_t size) {
+Result<gl::Buffer, std::string> createNative(Access access, uint64_t size) {
     using Created = Result<gl::Buffer, std::string>;
     if (size > (std::numeric_limits<size_t>::max)())
         return Created{err(std::string("the buffer is too large"))};
     gl::Buffer native{};
-    std::lock_guard<std::mutex> guard(*access.mutex);
-    access.state->makeCurrent();
+    std::lock_guard<std::mutex> guard(access->mutex);
+    access->makeCurrent();
     std::string error;
-    if (!access.state->createBuffer(native, static_cast<size_t>(size), error))
+    if (!access->createBuffer(native, static_cast<size_t>(size), error))
         return Created{err("cannot create the buffer: " + error)};
     return Created{ok(native)};
 }
 
-void destroyNative(gl::DeviceAccess access, gl::Buffer &native) {
-    std::lock_guard<std::mutex> guard(*access.mutex);
-    access.state->makeCurrent();
-    access.state->destroyBuffer(native);
+void destroyNative(Access access, gl::Buffer &native) {
+    std::lock_guard<std::mutex> guard(access->mutex);
+    access->makeCurrent();
+    access->destroyBuffer(native);
 }
 
 struct OpenGLImage final : VernonHalImage {
-    explicit OpenGLImage(gl::DeviceAccess access) : access(access) {}
+    explicit OpenGLImage(Access access) : access(access) {}
     OpenGLImage(const OpenGLImage &) = delete;
     OpenGLImage &operator=(const OpenGLImage &) = delete;
     ~OpenGLImage() override {
         forgetUndefined(&serial, 1);
-        std::lock_guard<std::mutex> guard(*access.mutex);
-        access.state->destroyImage(native);
+        std::lock_guard<std::mutex> guard(access->mutex);
+        access->destroyImage(native);
     }
 
-    gl::DeviceAccess access;
+    Access access;
     gl::Image native;
     gl::Enum target{};
     uint64_t serial{nextImageSerial()};
 };
 
 struct OpenGLView final : VernonHalImageView {
-    explicit OpenGLView(gl::DeviceAccess access) : access(access) {}
+    explicit OpenGLView(Access access) : access(access) {}
     OpenGLView(const OpenGLView &) = delete;
     OpenGLView &operator=(const OpenGLView &) = delete;
     ~OpenGLView() override {
         if (serial)
             nativeViews().remove(serial);
-        std::lock_guard<std::mutex> guard(*access.mutex);
-        access.state->destroyImage(owned);
+        std::lock_guard<std::mutex> guard(access->mutex);
+        access->destroyImage(owned);
     }
 
-    gl::DeviceAccess access;
+    Access access;
     // A texture view's own texture; empty for an identity view.
     gl::Image owned;
     OpenGLViewTexture texture;
@@ -214,18 +213,18 @@ struct OpenGLView final : VernonHalImageView {
 };
 
 struct OpenGLSampler final : VernonHalSampler {
-    explicit OpenGLSampler(gl::DeviceAccess access) : access(access) {}
+    explicit OpenGLSampler(Access access) : access(access) {}
     OpenGLSampler(const OpenGLSampler &) = delete;
     OpenGLSampler &operator=(const OpenGLSampler &) = delete;
     ~OpenGLSampler() override {
         if (serial)
             nativeSamplers().remove(serial);
-        std::lock_guard<std::mutex> guard(*access.mutex);
-        access.state->makeCurrent();
-        access.state->destroySampler(sampler);
+        std::lock_guard<std::mutex> guard(access->mutex);
+        access->makeCurrent();
+        access->destroySampler(sampler);
     }
 
-    gl::DeviceAccess access;
+    Access access;
     gl::Sampler sampler;
     uint64_t serial{};
 };
@@ -249,8 +248,8 @@ uint32_t embeddedFormatCapabilities(const gl::DeviceState &device, const formats
     uint32_t result = entry.baseline;
     const bool color = entry.aspects() == VERNON_IMAGE_ASPECT_COLOR;
     const bool floatColor = color && entry.componentClass == formats::ComponentClass::Float;
-    const bool float32 = floatColor && entry.dataType == VERNON_RHI_IMAGE_DATA_FLOAT32;
-    const bool float16 = floatColor && entry.dataType == VERNON_RHI_IMAGE_DATA_FLOAT16;
+    const bool float32 = floatColor && entry.dataType == VERNON_HAL_IMAGE_DATA_FLOAT32;
+    const bool float16 = floatColor && entry.dataType == VERNON_HAL_IMAGE_DATA_FLOAT16;
     if (floatColor && !device.apiVersionAtLeast(3, 2) && !device.hasExtension("GL_EXT_color_buffer_float") &&
         !(float16 && device.hasExtension("GL_EXT_color_buffer_half_float")))
         result &= ~(VERNON_HAL_FORMAT_RENDERABLE | VERNON_HAL_FORMAT_BLENDABLE | VERNON_HAL_FORMAT_MULTISAMPLE |
@@ -276,7 +275,7 @@ uint32_t embeddedFormatCapabilities(const gl::DeviceState &device, const formats
 
 class OpenGLDeviceBuffers final : public DeviceBuffers {
 public:
-    explicit OpenGLDeviceBuffers(gl::DeviceAccess access)
+    explicit OpenGLDeviceBuffers(Access access)
         : access_(access), pool_(std::make_shared<BufferPool<NativeBuffer>>([access](uint64_t size) {
               using Created = Result<std::unique_ptr<NativeBuffer>, std::string>;
               auto created = createNative(access, size);
@@ -297,10 +296,10 @@ public:
         const NativeBuffer &native = static_cast<BufferPool<NativeBuffer>::Pooled &>(buffer).native();
         if (size > native.size())
             return Result<void, std::string>{err(std::string("the upload overruns the buffer"))};
-        std::lock_guard<std::mutex> guard(*access_.mutex);
-        access_.state->makeCurrent();
+        std::lock_guard<std::mutex> guard(access_->mutex);
+        access_->makeCurrent();
         std::string error;
-        if (!access_.state->uploadBuffer(native.buffer(), 0, bytes, size, error))
+        if (!access_->uploadBuffer(native.buffer(), 0, bytes, size, error))
             return Result<void, std::string>{err("cannot upload to an OpenGL buffer: " + error)};
         return Result<void, std::string>{ok()};
     }
@@ -309,28 +308,28 @@ public:
         const NativeBuffer &native = static_cast<const BufferPool<NativeBuffer>::Pooled &>(buffer).native();
         if (size > native.size())
             return Result<void, std::string>{err(std::string("the download overruns the buffer"))};
-        std::lock_guard<std::mutex> guard(*access_.mutex);
-        access_.state->makeCurrent();
+        std::lock_guard<std::mutex> guard(access_->mutex);
+        access_->makeCurrent();
         std::string error;
-        if (!access_.state->downloadBuffer(native.buffer(), 0, bytes, size, error))
+        if (!access_->downloadBuffer(native.buffer(), 0, bytes, size, error))
             return Result<void, std::string>{err("cannot read an OpenGL buffer back: " + error)};
         return Result<void, std::string>{ok()};
     }
 
 private:
-    gl::DeviceAccess access_;
+    Access access_;
     std::shared_ptr<BufferPool<NativeBuffer>> pool_;
 };
 
 class OpenGLResources final : public Resources {
 public:
-    explicit OpenGLResources(gl::DeviceAccess access) : access_(access), state_(*access.state) {}
+    explicit OpenGLResources(Access access) : access_(access), state_(*access_) {}
     OpenGLResources(const OpenGLResources &) = delete;
     OpenGLResources &operator=(const OpenGLResources &) = delete;
     ~OpenGLResources() override {
         if (!presentFramebuffer_)
             return;
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         state_.destroyFramebuffer(presentFramebuffer_);
     }
@@ -339,7 +338,7 @@ public:
         const formats::Format *entry = formats::find(format);
         if (!entry)
             return fail<uint32_t>(VERNON_HAL_INVALID_ARGUMENT, "the format is unknown");
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         uint32_t result = state_.embeddedProfile ? embeddedFormatCapabilities(state_, *entry) : entry->baseline;
         if (!state_.supportsCompute())
@@ -376,7 +375,7 @@ public:
 
     Done<void> write(VernonHalBuffer &buffer, const VernonHalBufferWrite *writes, size_t count) override {
         const gl::Buffer &native = static_cast<OpenGLHalBuffer &>(buffer).native.buffer();
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         std::string error;
         for (size_t index = 0; index < count; ++index)
@@ -388,7 +387,7 @@ public:
 
     Done<void> read(VernonHalBuffer &buffer, const VernonHalBufferRead *reads, size_t count) override {
         const gl::Buffer &native = static_cast<OpenGLHalBuffer &>(buffer).native.buffer();
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         std::string error;
         for (size_t index = 0; index < count; ++index)
@@ -422,7 +421,7 @@ public:
                 return fail(VERNON_HAL_UNSUPPORTED, "OpenGL writes the depth and stencil of a packed image together");
         }
         const auto &target = static_cast<OpenGLImage &>(image);
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         if (auto opened = openScope(state_, "writing an image"))
             return fail(VERNON_HAL_INTERNAL_ERROR, *opened);
@@ -450,7 +449,10 @@ public:
                     layout.type, writes[index].source);
         }
         driver.bindTexture(target.target, 0);
-        return closeScope(state_, "writing an image");
+        Done<void> closed = closeScope(state_, "writing an image");
+        if (!closed.isErr())
+            forgetUndefined(&target.serial, 1);
+        return closed;
     }
 
     Done<void> read(VernonHalImage &image, const VernonHalImageRead *reads, size_t count) override {
@@ -458,7 +460,9 @@ public:
             if (!regionBytes(image.descriptor, reads[index].region))
                 return fail(VERNON_HAL_INVALID_ARGUMENT, "a read's data layout does not match the image");
         const auto &source = static_cast<OpenGLImage &>(image);
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        if (anyUndefined(&source.serial, 1))
+            return fail(VERNON_HAL_INVALID_ARGUMENT, "the image's contents are undefined");
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         for (size_t index = 0; index < count; ++index) {
             // glReadPixels reports an unsupported format or type only through glGetError and leaves the destination
@@ -481,7 +485,7 @@ public:
         if (descriptor.mip_level_count < 2 || formats::hasDepth(descriptor.format))
             return fail(VERNON_HAL_INVALID_ARGUMENT, "the image has no mips to generate");
         const auto &target = static_cast<OpenGLImage &>(image);
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         // glGenerateMipmap reports an unsupported format only through glGetError, so the check runs in every mode.
         if (auto opened = openScope(state_, "generating mipmaps", Scope::Always))
@@ -527,7 +531,7 @@ public:
             return fail<std::unique_ptr<VernonHalSampler>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate a sampler");
         std::string error;
         {
-            std::lock_guard<std::mutex> guard(*access_.mutex);
+            std::lock_guard<std::mutex> guard(access_->mutex);
             state_.makeCurrent();
             if (!state_.createSampler(sampler->sampler, kAddress[descriptor.address_u], kAddress[descriptor.address_v],
                                       kAddress[descriptor.address_w], minFilter, magFilter, error))
@@ -572,8 +576,6 @@ public:
     // The new images replace the old ones only once all of them exist.
     Done<void> configure(VernonHalSurface &surface, const VernonHalSurfaceConfiguration &configuration) override {
         auto &target = static_cast<OpenGLSurface &>(surface);
-        if (!configuration.image_count || !formats::find(configuration.format))
-            return fail(VERNON_HAL_INVALID_ARGUMENT, "the surface configuration is invalid");
         const VernonImageDescriptor descriptor{VERNON_TEXTURE_2D,
                                                {configuration.width, configuration.height, 1},
                                                configuration.format,
@@ -629,7 +631,7 @@ public:
         const OpenGLImage &presented = *target.images[target.next];
         target.next = (target.next + 1) % target.images.size();
         const VernonOpenGLSurfaceCallbacks &callbacks = target.callbacks;
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         callbacks.make_current(callbacks.user_data);
         const int32_t interval = target.configuration.present_mode == VERNON_HAL_PRESENT_FIFO ? 1 : 0;
         if (target.interval != interval) {
@@ -677,7 +679,7 @@ private:
             return fail<std::unique_ptr<OpenGLImage>>(VERNON_HAL_RESOURCE_EXHAUSTED, "cannot allocate an image");
         image->target = target;
         const auto internalFormat = static_cast<gl::Int>(entry->glInternalFormat);
-        std::lock_guard<std::mutex> guard(*access_.mutex);
+        std::lock_guard<std::mutex> guard(access_->mutex);
         state_.makeCurrent();
         gl::Driver &driver = state_.driver;
         driver.genTextures(1, &image->native.name);
@@ -746,7 +748,7 @@ private:
             if (state_.embeddedProfile || !state_.driver.textureView)
                 return fail<std::unique_ptr<OpenGLView>>(VERNON_HAL_UNSUPPORTED,
                                                          "the OpenGL context views only whole images");
-            std::lock_guard<std::mutex> guard(*access_.mutex);
+            std::lock_guard<std::mutex> guard(access_->mutex);
             state_.makeCurrent();
             state_.driver.genTextures(1, &view->owned.name);
             if (!view->owned.name)
@@ -877,7 +879,7 @@ private:
         return closeScope(state_, "presenting a surface");
     }
 
-    gl::DeviceAccess access_;
+    Access access_;
     gl::DeviceState &state_;
     // Reads a presented image; made on the first present.
     gl::Uint presentFramebuffer_{};
@@ -903,18 +905,16 @@ uint32_t openGLTarget(VernonTextureDimension dimension) {
 
 gl::Buffer *openGLBuffer(uint64_t serial) { return serials().find(serial); }
 
-std::unique_ptr<Resources> createOpenGLResources(VernonRhiDevice device) {
-    auto access = gl::deviceAccess(device);
-    if (access.isErr() || !access.value().state || !access.value().mutex)
+std::unique_ptr<Resources> createOpenGLResources(std::shared_ptr<opengl::DeviceState> state) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<Resources>(new (std::nothrow) OpenGLResources(access.value()));
+    return std::unique_ptr<Resources>(new (std::nothrow) OpenGLResources(std::move(state)));
 }
 
-std::unique_ptr<DeviceBuffers> createOpenGLDeviceBuffers(VernonRhiDevice device) {
-    auto access = gl::deviceAccess(device);
-    if (access.isErr() || !access.value().state || !access.value().mutex)
+std::unique_ptr<DeviceBuffers> createOpenGLDeviceBuffers(std::shared_ptr<opengl::DeviceState> state) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<DeviceBuffers>(new (std::nothrow) OpenGLDeviceBuffers(access.value()));
+    return std::unique_ptr<DeviceBuffers>(new (std::nothrow) OpenGLDeviceBuffers(std::move(state)));
 }
 
 } // namespace vernon::hal

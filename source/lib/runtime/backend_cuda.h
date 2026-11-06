@@ -2,19 +2,14 @@
 #define VERNON_RUNTIME_BACKEND_CUDA_H
 
 #include "VernonRuntime.h"
-#include "VernonRuntimeCore.h"
-#include "rhi/cuda_backend.h"
 #include "runtime_state.h"
 
-struct VernonRuntimeRhiAdapter;
+#include <cstdint>
+
 namespace vernon::runtime {
 
-using CudaDevicePointer = rhi::cuda::DevicePointer;
-using CudaResult = rhi::cuda::Result;
-constexpr CudaResult kCudaSuccess = rhi::cuda::kSuccess;
-
+// What a CUDA context knows of its HAL device, for validating Program requirements.
 struct CudaContextState {
-    VernonRuntimeRhiAdapter *adapter{};
     uint32_t computeCapabilityMajor{};
     uint32_t computeCapabilityMinor{};
     uint32_t driverVersion{};

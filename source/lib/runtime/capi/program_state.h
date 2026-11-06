@@ -4,15 +4,14 @@
 #include "VernonRuntime.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/pipeline_groups.h"
-#include "runtime/program_execution/materialized_node_frame.h"
-#include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution_manifest.h"
-#include "runtime/program_graph_linker.h"
+#include "runtime/program_graph_composition.h"
 #include "runtime/program_graphics_executor.h"
 #include "runtime/recorded_graphics.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_lifecycle.h"
 #include "runtime/runtime_state.h"
+#include "runtime/set_frame.h"
 #include "runtime/stage_binding_plan.h"
 
 #include <cstddef>
@@ -119,7 +118,7 @@ struct RuntimeBindingSetEntry {
 
 // A match's argument frame lowered for its pipeline's Stage once, then read by every pass that draws with it.
 struct RuntimeLoweredSetFrame {
-    vernon::runtime::program_execution::MaterializedNodeFrame frame;
+    vernon::runtime::MaterializedNodeFrame frame;
     // Per Stage parameter; meaningful for the parameters the match supplies.
     std::vector<vernon::runtime::PlannedGraphicsArgument> planned;
 };
@@ -134,7 +133,7 @@ struct RuntimeBindingSetMatch {
     std::vector<vernon::runtime::program::Diagnostic> failures;
     // Per entry: the pipeline endpoints it supplies; empty for an entry that fails.
     std::vector<std::vector<uint32_t>> entryEndpoints;
-    std::shared_ptr<const vernon::runtime::program_execution::ProgramInvocationState> values;
+    std::shared_ptr<const vernon::runtime::SetValues> values;
     // The groups whose values only this match decides; draws in flight share them.
     mutable vernon::runtime::GroupStore groups;
     mutable std::mutex loweringMutex;
@@ -212,8 +211,16 @@ std::optional<program::BoundaryRole> reflectedBoundaryRole(VernonProgramBoundary
 const program::BoundarySlot *boundaryAt(const program::Program &program, program::BoundaryRole role, size_t index);
 const ValueLayout *boundaryLayoutView(const VernonProgramExecutable &pipeline, const program::BoundarySlot &slot);
 bool stringViewEquals(VernonStringView view, const std::string &value);
-/* Collects the forward graph's graphics nodes in graph order, which is the order the controls query indexes by. */
-void collectForwardGraphicsNodes(const VernonProgramExecutable *pipeline, std::vector<const program::Node *> &nodes);
+// A graphics Node of an executable's forward graph: `id` names it in the executable, and it is Node `local` of
+// `owner`, the executable itself or, in a composed graph, the node that draws it.
+struct GraphicsNodeRef {
+    VernonProgramNodeId id{};
+    VernonProgramExecutable *owner{};
+    VernonProgramNodeId local{};
+    const program::Node *node{};
+};
+// The forward graphics Nodes in graph order, which is the order the controls query indexes by.
+std::vector<GraphicsNodeRef> forwardGraphicsNodes(const VernonProgramExecutable &pipeline);
 
 const char *programArgumentDiagnostic(const program::BoundarySlot &boundary, const VernonProgramArgument &argument);
 using ProgramBindingValueResult = vernon::Result<std::shared_ptr<RuntimeProgramBinding>, vernon::RuntimeError>;

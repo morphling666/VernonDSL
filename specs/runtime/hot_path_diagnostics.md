@@ -17,18 +17,15 @@ checks per operation what it could check per submission.
 
 ## 1. Validation mode
 
-Device creation (the `flags` of `VernonRhiOwnedDeviceDescriptor` and of the
-Vulkan and D3D12 borrowed descriptors, and a `flags` argument of
-`vernonRhiCreateOpenGLDevice`) gains the flags
-`VERNON_RHI_DEVICE_VALIDATION`, `VERNON_RHI_DEVICE_LABELS` and, for OpenGL,
-`VERNON_RHI_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT`.
+Device creation (the `flags` of `VernonHalDeviceDescriptor`) takes
+`VERNON_HAL_DEVICE_VALIDATION`, `VERNON_HAL_DEVICE_LABELS` and, for OpenGL,
+`VERNON_HAL_DEVICE_OPENGL_OWNS_DEBUG_OUTPUT`.
 
-With `VALIDATION`, the device keeps today's behaviour: an error scope around
-every operation that can raise a native error, attributed to that
-operation, and the adapter's per-command checks. Tests of exact error
-attribution and developers chasing a driver error use it, as they would
-Vulkan's validation layers. Without it, sections 2 to 4 apply. RHI-level
-validation (handles, ranges, nesting, scope rules) does not depend on the
+With `VALIDATION`, the device puts an error scope around every operation
+that can raise a native error, attributed to that operation. Tests of exact
+error attribution and developers chasing a driver error use it, as they
+would Vulkan's validation layers. Without it, sections 2 to 4 apply.
+HAL-level validation (handles, ranges, scope rules) does not depend on the
 mode, since it is not a driver round trip.
 
 ## 2. OpenGL errors without validation
@@ -62,23 +59,19 @@ mode, since it is not a driver round trip.
   its own call instead of returning zeroed data. The scope first queues the
   errors already on the context, so that it fails only for its own, and drops
   its own errors from the queue, since it reported them.
-- The adapter's per-command `glGetError` drain discarded errors the RHI's
-  own calls raised. Without it, ES devices on NVIDIA failed every timed
-  submission: their contexts list `EXT_disjoint_timer_query` but reject
-  `GL_GPU_DISJOINT_EXT`. An ES device reads the flag once at creation and,
-  when the read fails, times without disjoint detection, as desktop GL does.
+- ES contexts on NVIDIA list `EXT_disjoint_timer_query` but reject
+  `GL_GPU_DISJOINT_EXT`, which would fail every timed submission. An ES
+  device reads the flag once at creation and, when the read fails, times
+  without disjoint detection, as desktop GL does.
 
 ## 3. Timers
 
-- Each device keeps a pool of timer query objects. An encoder takes queries
-  from it at each timer edge and returns them when the completion that read
-  them is destroyed, so a steady state creates no query objects. The pool
-  only grows.
-- Timer edges are RHI commands recorded between packet batches
-  (`stored_plans.md` section 11.2), one per scope edge.
-- Results are read only after the completion's fence has signalled, when
-  `GL_QUERY_RESULT` no longer waits. Vulkan, D3D12 and Metal already pool
-  their query storage per encoder; they reuse it the same way.
+- Each device keeps a pool of timer query objects. A timed call takes
+  queries from it at each scope edge and returns them when the call
+  retires, so a steady state creates no query objects. The pool only grows.
+- Results are read only after the call's fence has signalled, when
+  `GL_QUERY_RESULT` no longer waits. Vulkan pools its query storage per
+  frame slot and reuses it the same way.
 
 Scope timings stay opt-in per schedule through `vernonScheduleSetTimings`
 (`gpu_profiling.md` section 3).
@@ -88,8 +81,8 @@ Scope timings stay opt-in per schedule through `vernonScheduleSetTimings`
 - Debug groups and markers reach the native API only on a device created
   with `LABELS`; `VALIDATION` implies it.
 - Without `LABELS`, recording debug commands are still validated
-  (balance, `PROGRAM_RECORDING_INVALID`) and then dropped when the packet
-  batch is built, so recordings are portable between the two modes.
+  (balance, `PROGRAM_RECORDING_INVALID`) and then dropped when the device
+  builds its recording, so recordings are portable between the two modes.
 - A capture tool launch sets `LABELS` through the host: the Engine exposes it
   as a command-line flag. Detecting capture tools from inside the Runtime was
   rejected: each tool has its own injection mechanism, and NVTX already
@@ -127,9 +120,8 @@ and without `LABELS`.
 
 ## 7. Contract changes (applied)
 
-- [`binding_groups.md`](binding_groups.md) section 8: `glGetError` is read
-  per render scope only in validation mode.
-- [`design.md`](design.md) section 10: transfers run inside an error scope in
+- [`design.md`](design.md) section 10: `glGetError` is read per render scope
+  only in validation mode; transfers run inside an error scope in
   validation mode; synchronous downloads always do.
 - [`gpu_profiling.md`](gpu_profiling.md) section 2: Execute wraps Nodes in
   debug groups when the device emits labels; section 3: GL timers come from

@@ -376,7 +376,7 @@ bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared,
         layout.interface_kind != VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
         const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
         if (!tensor || !tensor->resource.resource.value) {
-            error = "prepared storage binding requires an RHI Tensor";
+            error = "prepared storage binding requires a device Tensor";
             return false;
         }
         value.payload.buffer.resource = tensor->resource;
@@ -391,14 +391,14 @@ bool fillPreparedComputeBindingValue(const PreparedComputeBindingPlan &prepared,
                layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
         const auto *image = std::get_if<ComputeImageArgument>(&argument);
         if (!image || !image->view.resource.value) {
-            error = "prepared image binding requires an RHI Texture";
+            error = "prepared image binding requires a device Texture";
             return false;
         }
         value.payload.image.view = image->view;
     } else if (layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
         const auto *sampler = std::get_if<ComputeSamplerArgument>(&argument);
         if (!sampler || !sampler->resource.resource.value) {
-            error = "prepared sampler binding requires an RHI Sampler";
+            error = "prepared sampler binding requires a device Sampler";
             return false;
         }
         value.payload.sampler.resource = sampler->resource;
@@ -1003,9 +1003,9 @@ bool fillPreparedGraphicsBindingValue(const PreparedGraphicsBindingPlan &prepare
     }
     case PreparedGraphicsBindingSourceKind::ExternalStorage:
         if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
-            argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
+            argument->tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE || !argument->tensor.resource.resource.value ||
             argument->tensor.byte_size > argument->tensor.resource.size) {
-            error = "graphics TensorView storage argument must be an RHI Tensor within its resource";
+            error = "graphics TensorView storage argument must be a device Tensor within its resource";
             return false;
         }
         // The view offset travels in the metadata carrier, so every leaf
@@ -1058,7 +1058,7 @@ bool preparedGraphicsVertexBuffer(const PreparedGraphicsBindingPlan &prepared, c
                                   std::string &error) {
     const VernonProgramArgument *argument = inputs.arguments[prepared.vertexInputs[binding]];
     if (!argument || argument->kind != VERNON_PROGRAM_TENSOR ||
-        argument->tensor.storage != VERNON_TENSOR_RHI_RESOURCE || !argument->tensor.resource.resource.value ||
+        argument->tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE || !argument->tensor.resource.resource.value ||
         !argument->tensor.byte_strides || argument->tensor.byte_strides[0] <= 0 ||
         static_cast<uint64_t>(argument->tensor.byte_strides[0]) > UINT32_MAX ||
         argument->tensor.byte_offset >= argument->tensor.resource.size) {

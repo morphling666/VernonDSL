@@ -139,6 +139,7 @@ private:
             operationBase_.push_back(operationCount_);
             for (const uint32_t operationEnd : node->nodeOperationEnds)
                 linked_.nodeOperationEnds.push_back(operationCount_ + operationEnd);
+            linked_.nodeLabels.insert(linked_.nodeLabels.end(), node->nodeLabels.begin(), node->nodeLabels.end());
             operationCount_ += static_cast<uint32_t>(node->operations.size());
             transientBase_.push_back(nodeTransients_);
             nodeTransients_ += static_cast<uint32_t>(node->transients.size());

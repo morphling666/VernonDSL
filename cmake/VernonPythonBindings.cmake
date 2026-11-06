@@ -84,12 +84,7 @@ function(vernon_add_python_bindings package_directory source_directory)
     if(NOT SKBUILD)
         _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
     endif()
-    target_link_libraries(
-        vernon-dsl-native
-        PRIVATE VernonRuntimeUtilities
-                VernonDSLCompiler
-                Vernon::Runtime
-                Vernon::RHI)
+    target_link_libraries(vernon-dsl-native PRIVATE VernonRuntimeUtilities VernonDSLCompiler Vernon::Runtime)
     target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler" "${source_directory}/lib")
     if(BUILD_TESTING)
         target_compile_definitions(vernon-dsl-native PRIVATE VERNON_ENABLE_LIFECYCLE_TEST_HOOKS=1)
@@ -101,11 +96,7 @@ function(vernon_add_python_bindings package_directory source_directory)
     if(MSVC)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)
     endif()
-    vernon_stage_target_files(
-        vernon-dsl-native
-        VernonDSLCompiler
-        VernonRuntime
-        VernonRHI)
+    vernon_stage_target_files(vernon-dsl-native VernonDSLCompiler VernonRuntime)
     set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
     if(BUILD_TESTING)
         _vernon_add_bindgen_sample("${package_directory}")

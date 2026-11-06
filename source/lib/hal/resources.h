@@ -110,8 +110,6 @@ struct VernonHalDevice {
     std::unique_ptr<vernon::hal::Resources> resources;
     // Buffers, images, views, samplers and surfaces not yet destroyed.
     std::atomic<uint64_t> objects{};
-    // Releases what the resources and the runtime were created on, after both are gone.
-    std::function<void()> release;
 };
 
 #endif

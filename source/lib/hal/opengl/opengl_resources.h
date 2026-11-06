@@ -2,14 +2,14 @@
 #define VERNON_HAL_OPENGL_RESOURCES_H
 
 #include "VernonHal.h"
-#include "VernonRHI.h"
 
 #include <cstdint>
 #include <memory>
 
-namespace vernon::rhi::opengl {
+namespace vernon::hal::opengl {
 struct Buffer;
-}
+struct DeviceState;
+} // namespace vernon::hal::opengl
 
 namespace vernon::hal {
 
@@ -26,17 +26,15 @@ struct OpenGLViewTexture {
 
 uint32_t openGLTarget(VernonTextureDimension dimension);
 
-// The resources of an OpenGL or OpenGL ES HAL device: buffers, textures, samplers and surfaces outside the RHI's
-// registry, named by the native references of hal/native_buffers.h and hal/native_images.h. Null for a device of
-// another backend; the RHI device must outlive them.
-std::unique_ptr<Resources> createOpenGLResources(VernonRhiDevice device);
+// The resources of an OpenGL or OpenGL ES HAL device over `state`: buffers, textures, samplers and surfaces, named by
+// the native references of hal/native_buffers.h and hal/native_images.h.
+std::unique_ptr<Resources> createOpenGLResources(std::shared_ptr<opengl::DeviceState> state);
 
-// The buffers an OpenGL HAL device allocates for its schedules, named the same way. Null for a device of another
-// backend; the RHI device must outlive them.
-std::unique_ptr<DeviceBuffers> createOpenGLDeviceBuffers(VernonRhiDevice device);
+// The buffers an OpenGL HAL device allocates for its schedules, named the same way.
+std::unique_ptr<DeviceBuffers> createOpenGLDeviceBuffers(std::shared_ptr<opengl::DeviceState> state);
 
 // The buffer of `serial`; null once it is destroyed. The caller keeps the buffer alive while it uses the result.
-rhi::opengl::Buffer *openGLBuffer(uint64_t serial);
+opengl::Buffer *openGLBuffer(uint64_t serial);
 
 } // namespace vernon::hal
 

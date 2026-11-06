@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -63,7 +64,7 @@ VernonProgramArgument verticesArgument(const VernonProgramParameterView &paramet
     argument.slot = parameter.slot;
     argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(argument.tensor);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     argument.tensor.resource = resource;
     argument.tensor.element_layout = parameter.element_layout;
     argument.tensor.access = parameter.access;
@@ -435,6 +436,39 @@ TEST_P(HalGraphicsSchedule, AProgramLinksAsOnePass) {
     schedule.write(0, passVertices(right_));
     ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << lastError(runtime_);
     EXPECT_TRUE(drewTriangles(target.pixels(), true, true));
+}
+
+// A clear covers only the render area, whose row 0 is the image's top row; a render area outside the attachments is
+// rejected.
+TEST_P(HalGraphicsSchedule, ClearsOnlyTheRenderArea) {
+    Linked schedule(runtime_, linkProgram(executable_));
+    ASSERT_TRUE(schedule) << lastError(runtime_);
+    Target target(device_);
+    PassControls controls(target.reference());
+    controls.attachment.clear_color.f32[0] = 1.0f;
+    schedule.write(0, passVertices(left_));
+    schedule.write(1, controls.pointer);
+    schedule.write(3, controls.dynamic);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << lastError(runtime_);
+
+    controls.attachment.clear_color.f32[0] = 0.0f;
+    controls.attachment.clear_color.f32[1] = 1.0f;
+    controls.renderPass.render_area[1] = 1;
+    controls.renderPass.render_area[3] = 2;
+    controls.dynamic.scissor[1] = 1;
+    controls.dynamic.scissor[3] = 2;
+    schedule.write(3, controls.dynamic);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << lastError(runtime_);
+    const std::vector<uint8_t> pixels = target.pixels();
+    EXPECT_EQ(pixelAt(pixels, 0, 0), (Pixel{255, 0, 0, 255}));
+    EXPECT_EQ(pixelAt(pixels, 0, 1), (Pixel{0, 255, 0, 255}));
+    EXPECT_EQ(pixelAt(pixels, 0, 2), (Pixel{0, 255, 0, 255}));
+    EXPECT_EQ(pixelAt(pixels, 0, 3), (Pixel{255, 0, 0, 255}));
+    EXPECT_EQ(pixelAt(pixels, kExtent - 1, kExtent - 1), (Pixel{255, 0, 0, 255}));
+
+    controls.renderPass.render_area[1] = kExtent - 1;
+    EXPECT_NE(schedule.call(), VERNON_STATUS_OK);
+    EXPECT_NE(lastError(runtime_).find("render area"), std::string::npos) << lastError(runtime_);
 }
 
 // Two graph nodes into one target: the second preserves what the first cleared and drew, so their passes share a
@@ -832,6 +866,177 @@ TEST_P(HalGraphicsSchedule, PassesDrawIntoAcquiredSurfaceImages) {
         ASSERT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << halError();
     }
 }
+
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+#if defined(_WIN32)
+#define VERNON_TEST_GL_CALL __stdcall
+#else
+#define VERNON_TEST_GL_CALL
+#endif
+
+// An OpenGL window whose surface reads the window's leftmost column as each swap begins, when the back buffer holds
+// what present blitted. It reads inside present with the device's context current on the window, so it restores the
+// bindings it changes.
+class ReadWindow {
+public:
+    ReadWindow(const VernonOpenGLSurfaceCallbacks &surface, const VernonOpenGLContextCallbacks &context)
+        : window_(surface), callbacks_(surface) {
+        const auto load = [&context](auto &function, const char *name) {
+            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+                context.get_proc_address(context.user_data, name));
+            return function != nullptr;
+        };
+        loaded_ = load(getError_, "glGetError") && load(getIntegerv_, "glGetIntegerv") &&
+                  load(bindFramebuffer_, "glBindFramebuffer") && load(bindBuffer_, "glBindBuffer") &&
+                  load(readBuffer_, "glReadBuffer") && load(readPixels_, "glReadPixels");
+        callbacks_.user_data = this;
+        callbacks_.make_current = [](void *self) { window(self).make_current(window(self).user_data); };
+        callbacks_.swap_interval = [](void *self, int32_t interval) {
+            window(self).swap_interval(window(self).user_data, interval);
+        };
+        callbacks_.drawable_size = [](void *self, uint32_t *width, uint32_t *height) {
+            window(self).drawable_size(window(self).user_data, width, height);
+        };
+        callbacks_.swap_buffers = [](void *self) {
+            static_cast<ReadWindow *>(self)->readColumn();
+            window(self).swap_buffers(window(self).user_data);
+        };
+    }
+    ReadWindow(const ReadWindow &) = delete;
+    ReadWindow &operator=(const ReadWindow &) = delete;
+
+    bool loaded() const { return loaded_; }
+    const VernonOpenGLSurfaceCallbacks *callbacks() const { return &callbacks_; }
+    // The leftmost column at the last swap, from the window's bottom row up.
+    const std::vector<uint8_t> &column() const { return column_; }
+    unsigned error() const { return error_; }
+
+private:
+    static const VernonOpenGLSurfaceCallbacks &window(void *self) { return static_cast<ReadWindow *>(self)->window_; }
+
+    void readColumn() {
+        constexpr unsigned kReadFramebuffer = 0x8CA8;
+        constexpr unsigned kReadFramebufferBinding = 0x8CAA;
+        constexpr unsigned kPixelPackBuffer = 0x88EB;
+        constexpr unsigned kPixelPackBufferBinding = 0x88ED;
+        constexpr unsigned kBack = 0x0405;
+        constexpr unsigned kRgba = 0x1908;
+        constexpr unsigned kUnsignedByte = 0x1401;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        window_.drawable_size(window_.user_data, &width, &height);
+        int framebuffer = 0;
+        int packBuffer = 0;
+        getIntegerv_(kReadFramebufferBinding, &framebuffer);
+        getIntegerv_(kPixelPackBufferBinding, &packBuffer);
+        bindFramebuffer_(kReadFramebuffer, 0);
+        bindBuffer_(kPixelPackBuffer, 0);
+        readBuffer_(kBack);
+        column_.assign(size_t{height} * 4, 0);
+        readPixels_(0, 0, 1, static_cast<int>(height), kRgba, kUnsignedByte, column_.data());
+        bindBuffer_(kPixelPackBuffer, static_cast<unsigned>(packBuffer));
+        bindFramebuffer_(kReadFramebuffer, static_cast<unsigned>(framebuffer));
+        error_ = getError_();
+    }
+
+    VernonOpenGLSurfaceCallbacks window_;
+    VernonOpenGLSurfaceCallbacks callbacks_;
+    bool loaded_{};
+    unsigned(VERNON_TEST_GL_CALL *getError_)(){};
+    void(VERNON_TEST_GL_CALL *getIntegerv_)(unsigned, int *){};
+    void(VERNON_TEST_GL_CALL *bindFramebuffer_)(unsigned, unsigned){};
+    void(VERNON_TEST_GL_CALL *bindBuffer_)(unsigned, unsigned){};
+    void(VERNON_TEST_GL_CALL *readBuffer_)(unsigned){};
+    void(VERNON_TEST_GL_CALL *readPixels_)(int, int, int, int, unsigned, unsigned, void *){};
+    std::vector<uint8_t> column_;
+    unsigned error_{};
+};
+
+// A surface image holds its top row at row 0 like every image, and present shows that row at the top of the window.
+TEST_P(HalGraphicsSchedule, PresentShowsTheImageTopRowAtTheTopOfTheWindow) {
+    if (!context_)
+        GTEST_SKIP() << "only an OpenGL window is read back";
+    ReadWindow window(context_->surfaceCallbacks(), callbacks_);
+    ASSERT_TRUE(window.loaded());
+    VernonHalSurfaceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.native.opengl = window.callbacks();
+    VernonHalSurface *created = nullptr;
+    ASSERT_EQ(vernonHalCreateSurface(device_, &descriptor, &created), VERNON_HAL_OK) << halError();
+    const auto destroy = [](VernonHalSurface *owned) {
+        EXPECT_EQ(vernonHalDestroySurface(owned), VERNON_HAL_OK) << halError();
+    };
+    const std::unique_ptr<VernonHalSurface, decltype(destroy)> owner(created, destroy);
+    VernonHalSurfaceCapabilities capabilities{};
+    capabilities.struct_size = sizeof(capabilities);
+    ASSERT_EQ(vernonHalSurfaceGetCapabilities(created, &capabilities), VERNON_HAL_OK) << halError();
+    VernonHalSurfaceConfiguration configuration{};
+    configuration.struct_size = sizeof(configuration);
+    configuration.format = VERNON_TEXTURE_RGBA8_UNORM;
+    configuration.usage = VERNON_IMAGE_COLOR_ATTACHMENT | VERNON_IMAGE_TRANSFER_SOURCE;
+    configuration.width = capabilities.current_width;
+    configuration.height = capabilities.current_height;
+    configuration.present_mode = VERNON_HAL_PRESENT_FIFO;
+    configuration.image_count = 1;
+    ASSERT_EQ(vernonHalSurfaceConfigure(created, &configuration), VERNON_HAL_OK) << halError();
+    const uint32_t height = configuration.height;
+    ASSERT_GT(height, 1u);
+
+    Linked schedule(runtime_, linkProgram(executable_));
+    ASSERT_TRUE(schedule) << lastError(runtime_);
+    schedule.write(0, passVertices(left_));
+    VernonHalSurfaceImage image{};
+    ASSERT_EQ(vernonHalSurfaceAcquire(created, &image), VERNON_HAL_OK) << halError();
+    VernonRuntimeProviderResourceReference view{};
+    ASSERT_EQ(vernonHalReferenceImageView(image.view, &view), VERNON_HAL_OK) << halError();
+    // The triangle stays clear of the leftmost column, which holds only the clear colors.
+    PassControls controls(view);
+    controls.renderPass.render_area[2] = configuration.width;
+    controls.renderPass.render_area[3] = height;
+    controls.dynamic.viewport[2] = static_cast<float>(configuration.width);
+    controls.dynamic.viewport[3] = static_cast<float>(height);
+    controls.dynamic.scissor[2] = configuration.width;
+    controls.dynamic.scissor[3] = height;
+    controls.attachment.clear_color.f32[0] = 1.0f;
+    schedule.write(1, controls.pointer);
+    schedule.write(3, controls.dynamic);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << lastError(runtime_);
+    controls.attachment.clear_color.f32[0] = 0.0f;
+    controls.attachment.clear_color.f32[1] = 1.0f;
+    controls.renderPass.render_area[3] = 1;
+    controls.dynamic.scissor[3] = 1;
+    schedule.write(3, controls.dynamic);
+    ASSERT_EQ(schedule.call(), VERNON_STATUS_OK) << lastError(runtime_);
+
+    const Pixel red{255, 0, 0, 255};
+    const Pixel green{0, 255, 0, 255};
+    std::array<uint8_t, 8> rows{};
+    VernonHalImageRead read{};
+    read.region.aspect = VERNON_IMAGE_ASPECT_COLOR;
+    read.region.width = 1;
+    read.region.height = 2;
+    read.region.depth = 1;
+    read.region.data_format = VERNON_HAL_IMAGE_DATA_RGBA;
+    read.region.data_type = VERNON_HAL_IMAGE_DATA_UINT8;
+    read.destination = rows.data();
+    read.size = rows.size();
+    ASSERT_EQ(vernonHalImageRead(image.image, &read, 1), VERNON_HAL_OK) << halError();
+    EXPECT_EQ((Pixel{rows[0], rows[1], rows[2], rows[3]}), green) << "the image's row 0 is the cleared top row";
+    EXPECT_EQ((Pixel{rows[4], rows[5], rows[6], rows[7]}), red);
+
+    ASSERT_EQ(vernonHalSurfacePresent(created), VERNON_HAL_OK) << halError();
+    EXPECT_EQ(window.error(), 0u);
+    const std::vector<uint8_t> &column = window.column();
+    ASSERT_EQ(column.size(), size_t{height} * 4);
+    const auto windowRow = [&column](uint32_t row) {
+        const size_t offset = size_t{row} * 4;
+        return Pixel{column[offset], column[offset + 1], column[offset + 2], column[offset + 3]};
+    };
+    EXPECT_EQ(windowRow(height - 1), green) << "the window's top row";
+    EXPECT_EQ(windowRow(height - 2), red);
+    EXPECT_EQ(windowRow(0), red) << "the window's bottom row";
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(Devices, HalGraphicsSchedule, testing::ValuesIn(graphicsScheduleCases()),
                          [](const testing::TestParamInfo<ProgramFixtureManifest> &info) {

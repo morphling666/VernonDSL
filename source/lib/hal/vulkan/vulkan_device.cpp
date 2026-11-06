@@ -4,8 +4,7 @@
 #include "hal/vulkan/vulkan_resources.h"
 
 #include "VernonSchedule.h"
-#include "rhi/rhi_internal.h"
-#include "rhi/vulkan_backend.h"
+#include "hal/vulkan/vulkan_state.h"
 #include "runtime/backend_vulkan.h"
 #include "runtime/compute_launch_planner.h"
 #include "runtime/dispatch_contract.h"
@@ -34,7 +33,7 @@
 namespace vernon::hal {
 namespace {
 
-namespace rv = rhi::vulkan;
+namespace rv = vulkan;
 using LayoutUse = rv::DeviceState::ImageLayoutUse;
 using runtime::PreparedComputeBindingPlan;
 using runtime::PreparedGraphicsBindingPlan;
@@ -59,10 +58,6 @@ Made<void> vulkanCall(VkResult result, const char *operation) {
                          ")");
 }
 
-std::string rhiMessage(const char *what, const RhiError &error) {
-    return error.context.operation ? std::string(what) + " (" + error.context.operation + ")" : std::string(what);
-}
-
 uint64_t align(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
 uint64_t roundUp(uint64_t value, uint64_t minimum) {
@@ -79,8 +74,7 @@ struct Slot;
 // recordings for later ones, since a pass whose plan changes every call builds a recording every call.
 class Retirer {
 public:
-    Retirer(VernonRhiDevice device, rv::DeviceState &state, ChildLease lease)
-        : device_(device), state_(state), lease_(std::move(lease)) {}
+    explicit Retirer(std::shared_ptr<rv::DeviceState> state) : state_(std::move(state)) {}
     Retirer(const Retirer &) = delete;
     Retirer &operator=(const Retirer &) = delete;
     ~Retirer() { drain(); }
@@ -89,8 +83,8 @@ public:
     void pool(std::unique_ptr<Slot> slot);
     std::unique_ptr<Slot> pooled();
 
-    VernonRhiDevice device() const { return device_; }
-    rv::DeviceState &state() const { return state_; }
+    rv::DeviceState &state() const { return *state_; }
+    const std::shared_ptr<rv::DeviceState> &owner() const { return state_; }
 
     void submitted(uint64_t serial) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -108,7 +102,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             while (!pending_.empty()) {
                 if (const uint64_t serial = pending_.front().serial) {
-                    auto completed = rv::submissionCompleted(device_, serial);
+                    auto completed = rv::submissionCompleted(*state_, serial);
                     if (completed.isErr() || !completed.value())
                         break;
                 }
@@ -134,7 +128,7 @@ public:
             if (pending.empty())
                 break;
             if (last)
-                (void)rv::waitForSubmission(device_, last);
+                (void)rv::waitForSubmission(*state_, last);
             for (Pending &entry : pending)
                 entry.destroy();
         }
@@ -157,9 +151,7 @@ private:
 
     static constexpr size_t kPooledSlots = 32;
 
-    VernonRhiDevice device_;
-    rv::DeviceState &state_;
-    ChildLease lease_;
+    std::shared_ptr<rv::DeviceState> state_;
     std::mutex mutex_;
     std::deque<Pending> pending_;
     uint64_t submitted_{};
@@ -220,7 +212,7 @@ VkFormat vertexFormat(uint32_t dtype, uint32_t components) {
 
 std::optional<VkFormat> attachmentFormat(VernonTextureFormat format) {
     switch (format) {
-#define VERNON_FORMAT(name, NAME, rhi, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,  \
+#define VERNON_FORMAT(name, NAME, texture, cls, bytes, dataFormat, dataType, caps, glInternal, glFormat, glType,       \
                       vulkan, ...)                                                                                     \
     case VERNON_TEXTURE_##NAME:                                                                                        \
         return vulkan == VK_FORMAT_UNDEFINED ? std::nullopt : std::optional<VkFormat>(static_cast<VkFormat>(vulkan));
@@ -425,7 +417,7 @@ struct SlotPlan {
     VkFormat storageFormat{VK_FORMAT_UNDEFINED};
 };
 
-// Descriptor set `set` of a Stage: the slots in it, and what decides its values as PipelineGroups groups them.
+// Descriptor set `set` of a Stage: the slots in it, and the argument owners that decide its values.
 struct SetPlan {
     VkDescriptorSetLayout layout{};
     std::vector<uint32_t> slots;
@@ -592,8 +584,8 @@ struct Write {
     VkSampler sampler{};
 };
 
-// A descriptor set of a recording and the push data of its set: one per binding group as PipelineGroups finds it, so
-// draws whose groups' owners agree share it.
+// A descriptor set of a recording and the push data of its set: one per binding group, so draws whose groups' owners
+// agree share it.
 struct SetInstance {
     VkDescriptorSetLayout layout{};
     std::vector<Write> writes;
@@ -661,10 +653,10 @@ struct Slot {
 void Retirer::destroy(Slot &slot) {
     auto &api = rv::driver();
     if (slot.pool)
-        api.destroyCommandPool(state_.device, slot.pool, nullptr);
+        api.destroyCommandPool(state_->device, slot.pool, nullptr);
     if (slot.descriptors)
-        api.destroyDescriptorPool(state_.device, slot.descriptors, nullptr);
-    state_.destroyBuffer(slot.arena);
+        api.destroyDescriptorPool(state_->device, slot.descriptors, nullptr);
+    state_->destroyBuffer(slot.arena);
 }
 
 void Retirer::pool(std::unique_ptr<Slot> slot) {
@@ -782,7 +774,7 @@ private:
         std::array<uint32_t, kMaxSets> sets{};
         uint32_t vertexFirst{};
         uint32_t vertexCount{};
-        VernonRuntimeCoreDrawInvocation invocation{};
+        runtime::DrawInvocation invocation{};
         VkBuffer indexBuffer{};
         uint64_t indexOffset{};
     };
@@ -847,7 +839,7 @@ class VulkanDevice final : public Device {
 public:
     VulkanDevice(VernonRuntimeContext &context, std::shared_ptr<Retirer> retirer)
         : context_(context), retirer_(std::move(retirer)), state_(retirer_->state()),
-          buffers_(createVulkanDeviceBuffers(context.rhiDevice)), internals_(buffers_.get()) {}
+          buffers_(createVulkanDeviceBuffers(retirer_->owner())), internals_(buffers_.get()) {}
 
     ~VulkanDevice() override {
         retirer_->drain();
@@ -856,7 +848,6 @@ public:
     }
 
     rv::DeviceState &state() const { return state_; }
-    VernonRhiDevice rhiDevice() const { return context_.rhiDevice; }
     const std::shared_ptr<Retirer> &retirer() const { return retirer_; }
 
     Made<std::unique_ptr<Executable>> createExecutable(const ExecutableSource &source) override {
@@ -911,7 +902,7 @@ public:
         while (!pending_.empty() && pending_.front().point <= point) {
             Pending retired = std::move(pending_.front());
             pending_.pop_front();
-            if (rv::waitForSubmission(context_.rhiDevice, retired.serial).isErr())
+            if (rv::waitForSubmission(state_, retired.serial).isErr())
                 failed = true;
             else
                 keepTimings(retired);
@@ -995,7 +986,7 @@ private:
     void retireCompleted() {
         std::lock_guard<std::mutex> lock(mutex_);
         while (!pending_.empty()) {
-            auto completed = rv::submissionCompleted(context_.rhiDevice, pending_.front().serial);
+            auto completed = rv::submissionCompleted(state_, pending_.front().serial);
             if (completed.isErr() || !completed.value())
                 return;
             keepTimings(pending_.front());
@@ -1773,9 +1764,9 @@ Made<void> Builder::build(const std::vector<const InternalBuffers::Internal *> &
         }
         if (pass.compute) {
             if (recording_.timed)
-                recording_.timers.push_back({pass.executable->source().node->id, 1, 0, 0});
+                recording_.timers.push_back({pass.command->node, 1, 0, 0});
             timer(true);
-            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, nodeLabel(*pass.executable->source().node));
+            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, pass.command->label);
             if (auto built = buildCompute(at); built.isErr())
                 return built;
             debug(VERNON_GRAPHICS_COMMAND_POP_DEBUG_GROUP, {});
@@ -1787,7 +1778,7 @@ Made<void> Builder::build(const std::vector<const InternalBuffers::Internal *> &
         while (end < passes.size() && !passes[end]->compute && passes[end]->scope == pass.scope)
             ++end;
         if (recording_.timed)
-            recording_.timers.push_back({pass.executable->source().node->id, static_cast<uint32_t>(end - at), 0, 0});
+            recording_.timers.push_back({pass.command->node, static_cast<uint32_t>(end - at), 0, 0});
         timer(true);
         if (auto built = buildScope(at, end); built.isErr())
             return built;
@@ -1981,8 +1972,8 @@ Made<Builder::DrawPlan> Builder::planDraw(const PlannedPass &pass, const Planned
         const SetPlan &setPlan = stageObjects.sets[set];
         if (setPlan.slots.empty())
             continue;
-        // As PipelineGroups finds a group: by the owners of what decides it, and by the draw when it also depends
-        // on the command. A group whose owners share one persistent store keeps its bytes across calls.
+        // A group is found by the owners of what decides it, and by the draw when it also depends on the command. A
+        // group whose owners share one persistent store keeps its bytes across calls.
         std::vector<const void *> found{&stageObjects, reinterpret_cast<const void *>(uintptr_t{set})};
         runtime::GroupStore *owner =
             setPlan.parameters.empty() ? nullptr : draw.owners[setPlan.parameters.front()].groups;
@@ -2007,14 +1998,14 @@ Made<Builder::DrawPlan> Builder::planDraw(const PlannedPass &pass, const Planned
     }
     if (!runtime::prepareGraphicsDrawInvocation(draw.draw, draw.state->topology, result.invocation, error))
         return failure<DrawPlan>(error);
-    if (result.invocation.index_count || draw.streamed) {
-        if (!result.invocation.index_count)
+    if (result.invocation.indexCount || draw.streamed) {
+        if (!result.invocation.indexCount)
             return failure<DrawPlan>("a draw stream needs an index binding");
-        auto index = nativeOf<rv::Buffer>(result.invocation.index_buffer, Kind::Buffer);
+        auto index = nativeOf<rv::Buffer>(result.invocation.indexBuffer, Kind::Buffer);
         if (index.isErr())
             return failure<DrawPlan>("an index buffer: " + index.error());
         result.indexBuffer = index.value()->buffer;
-        result.indexOffset = result.invocation.index_buffer.offset;
+        result.indexOffset = result.invocation.indexBuffer.offset;
     }
     return Planned{ok(result)};
 }
@@ -2072,7 +2063,7 @@ Made<void> Builder::emitDraw(const DrawPlan &plan) {
         bind.b = plan.vertexCount;
         add(bind);
     }
-    const VernonRuntimeCoreDrawInvocation &invocation = plan.invocation;
+    const runtime::DrawInvocation &invocation = plan.invocation;
     const std::array<uint32_t, 4> viewport{invocation.viewport[0], invocation.viewport[1], invocation.viewport[2],
                                            invocation.viewport[3]};
     if (viewport_ != viewport) {
@@ -2085,9 +2076,9 @@ Made<void> Builder::emitDraw(const DrawPlan &plan) {
         add({Op::Scissor, scissor[0], scissor[1], scissor[2], scissor[3]});
         scissor_ = scissor;
     }
-    if (stencil_ != invocation.stencil_reference) {
-        add({Op::Stencil, invocation.stencil_reference});
-        stencil_ = invocation.stencil_reference;
+    if (stencil_ != invocation.stencilReference) {
+        add({Op::Stencil, invocation.stencilReference});
+        stencil_ = invocation.stencilReference;
     }
     if (plan.indexBuffer && (indexBuffer_ != plan.indexBuffer || indexOffset_ != plan.indexOffset)) {
         Command bind{Op::BindIndexBuffer};
@@ -2100,10 +2091,10 @@ Made<void> Builder::emitDraw(const DrawPlan &plan) {
     auto &api = rv::driver();
     if (!draw.streamed) {
         if (plan.indexBuffer)
-            add({Op::DrawIndexed, invocation.index_count, invocation.instance_count, invocation.first_index,
-                 static_cast<uint32_t>(invocation.base_vertex), invocation.first_instance});
+            add({Op::DrawIndexed, invocation.indexCount, invocation.instanceCount, invocation.firstIndex,
+                 static_cast<uint32_t>(invocation.baseVertex), invocation.firstInstance});
         else
-            add({Op::Draw, invocation.vertex_count, invocation.instance_count, invocation.first_instance});
+            add({Op::Draw, invocation.vertexCount, invocation.instanceCount, invocation.firstInstance});
         return Made<void>{ok()};
     }
     const runtime::GraphicsDrawStream &stream = draw.stream;
@@ -2140,7 +2131,7 @@ Made<void> Builder::emitDraw(const DrawPlan &plan) {
         return Made<void>{ok()};
     HostStream host;
     host.draw = &draw;
-    host.indexCapacity = invocation.index_buffer.size / sizeof(uint32_t);
+    host.indexCapacity = invocation.indexBuffer.size / sizeof(uint32_t);
     const auto index = static_cast<uint32_t>(recording_.streams.size());
     if (stream.maxRecords > 1 && !state_.multiDrawIndirect) {
         recording_.volatileCommands = true;
@@ -2180,7 +2171,8 @@ Made<Rendering> Builder::rendering(const runtime::GraphicsRenderScope &scope) {
         transition(*native.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     Rendering result;
-    result.area = {{0, 0}, {scope.width, scope.height}};
+    result.area = {{static_cast<int32_t>(scope.area[0]), static_cast<int32_t>(scope.area[1])},
+                   {scope.area[2], scope.area[3]}};
     RenderPassKey key;
     for (const VernonRuntimeProviderColorAttachment &color : scope.colors) {
         auto native = nativeOf<rv::Image>(color.view, Kind::View);
@@ -2255,7 +2247,7 @@ Made<void> Builder::buildScope(size_t begin, size_t end) {
     const runtime::GraphicsRenderScope &scope = planned_.scopes[passes[begin]->scope];
     std::string label;
     for (size_t at = begin; at < end; ++at)
-        label += (at == begin ? "" : "+") + nodeLabel(*passes[at]->executable->source().node);
+        label += (at == begin ? "" : "+") + passes[at]->command->label;
     debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, label);
     std::vector<DrawPlan> draws;
     std::vector<ImageUse> images;
@@ -2281,7 +2273,7 @@ Made<void> Builder::buildScope(size_t begin, size_t end) {
     for (size_t at = begin; at < end; ++at) {
         const PlannedPass &pass = *passes[at];
         if (memberGroups)
-            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, nodeLabel(*pass.executable->source().node));
+            debug(VERNON_GRAPHICS_COMMAND_PUSH_DEBUG_GROUP, pass.command->label);
         for (const PlannedDraw &draw : pass.draws) {
             for (const PlannedDebug &command : draw.debug)
                 debug(command.kind, command.label);
@@ -2511,9 +2503,9 @@ Made<Slot *> VulkanDevice::acquire(Recording &recording) {
     for (const std::unique_ptr<Slot> &slot : recording.slots) {
         if (!slot->serial)
             return reuse(*slot);
-        auto completed = rv::submissionCompleted(context_.rhiDevice, slot->serial);
+        auto completed = rv::submissionCompleted(state_, slot->serial);
         if (completed.isErr())
-            return failure<Slot *>(rhiMessage("the device was lost", completed.error()));
+            return failure<Slot *>("the device was lost: " + completed.error());
         if (completed.value())
             return reuse(*slot);
     }
@@ -2531,8 +2523,8 @@ Made<Slot *> VulkanDevice::acquire(Recording &recording) {
     for (const std::unique_ptr<Slot> &slot : recording.slots)
         if (slot->serial < oldest->serial)
             oldest = slot.get();
-    if (auto waited = rv::waitForSubmission(context_.rhiDevice, oldest->serial); waited.isErr())
-        return failure<Slot *>(rhiMessage("a pass submission failed on the device", waited.error()));
+    if (auto waited = rv::waitForSubmission(state_, oldest->serial); waited.isErr())
+        return failure<Slot *>("a pass submission failed on the device: " + waited.error());
     return reuse(*oldest);
 }
 
@@ -2870,9 +2862,9 @@ Made<TimelinePoint> VulkanDevice::submit(const CommandBuffer &commands, const ui
         }
     if (anyUndefined(recording->reads.data(), recording->reads.size()))
         return failure<TimelinePoint>("a pass reads an image whose contents are undefined");
-    auto submitted = rv::submitRecordedCommands(context_.rhiDevice, slot.command, recording->layouts);
+    auto submitted = rv::submitRecordedCommands(state_, slot.command, recording->layouts);
     if (submitted.isErr())
-        return failure<TimelinePoint>(rhiMessage("cannot submit the passes", submitted.error()));
+        return failure<TimelinePoint>("cannot submit the passes: " + submitted.error());
     const uint64_t serial = submitted.value();
     retirer_->submitted(serial);
     slot.serial = serial;
@@ -2899,14 +2891,10 @@ Made<TimelinePoint> VulkanDevice::submit(const CommandBuffer &commands, const ui
 std::unique_ptr<Device> createVulkanDevice(VernonRuntimeContext &context) {
     if (context.backend != VERNON_RUNTIME_VULKAN)
         return nullptr;
-    auto state = rv::deviceStateOf(context.rhiDevice);
-    if (state.isErr() || !state.value() || state.value()->nativeObjectsBorrowed)
+    const std::shared_ptr<rv::DeviceState> &state = runtime::vulkanState(context).device;
+    if (!state)
         return nullptr;
-    auto lease = rhi::retainDeviceLease(context.rhiDevice);
-    if (lease.isErr())
-        return nullptr;
-    auto retirer = std::make_shared<Retirer>(context.rhiDevice, *state.value(), std::move(lease).value());
-    return std::make_unique<VulkanDevice>(context, std::move(retirer));
+    return std::make_unique<VulkanDevice>(context, std::make_shared<Retirer>(state));
 }
 
 } // namespace vernon::hal

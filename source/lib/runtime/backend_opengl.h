@@ -2,22 +2,22 @@
 #define VERNON_RUNTIME_BACKEND_OPENGL_H
 
 #include "VernonRuntime.h"
-#include "VernonRuntimeCore.h"
 #include "prepared_binding_plan.h"
-#include "rhi/opengl_backend.h"
 #include "runtime_state.h"
 
 #include <memory>
 #include <mutex>
 #include <string>
 
-struct VernonRuntimeRhiAdapter;
+namespace vernon::hal::opengl {
+struct DeviceState;
+} // namespace vernon::hal::opengl
+
 namespace vernon::runtime {
 
+// The OpenGL state of the context's HAL device (hal/opengl/opengl_state.h).
 struct OpenGLContextState {
-    rhi::opengl::DeviceState device;
-    rhi::opengl::Driver &driver{device.driver};
-    VernonRuntimeRhiAdapter *adapter{};
+    std::shared_ptr<hal::opengl::DeviceState> device;
 };
 
 // A graphics Stage has vertex and fragment GLSL and `graphicsPlan`; a compute Stage has compute GLSL and `computePlan`.
@@ -40,11 +40,6 @@ inline OpenGLContextState &openGLState(VernonRuntimeContext &context) {
 inline const OpenGLContextState &openGLState(const VernonRuntimeContext &context) {
     return runtimeBackendState<OpenGLContextState>(context);
 }
-
-bool isOpenGL(const VernonRuntimeContext *context);
-void makeCurrent(VernonRuntimeContext *context);
-
-VernonStatus synchronizeOpenGL(VernonRuntimeContext &context);
 
 } // namespace vernon::runtime
 

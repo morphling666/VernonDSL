@@ -139,6 +139,8 @@ Checked checkExtents(const std::vector<Extent> &extents, const std::vector<Verno
 Result<void, std::string> Fragment::validate() const {
     if (shapes.size() != slots.size() || extents.size() != slots.size())
         return failCheck("fragment shapes or extents do not match its slots");
+    if (nodeLabels.size() != nodeOperationEnds.size())
+        return failCheck("fragment node labels do not match its nodes");
     if (recordTemplate.size() != recordSize)
         return failCheck("fragment record template does not cover its record");
     std::vector<Range> ranges;
@@ -894,6 +896,8 @@ public:
             if (auto added = addNode(node); added.isErr())
                 return failBuild(std::move(added).error());
             fragment_.nodeOperationEnds.push_back(static_cast<uint32_t>(fragment_.operations.size()));
+            std::string label = readString(member(node, "name"));
+            fragment_.nodeLabels.push_back(label.empty() ? readString(member(node, "stage")) : std::move(label));
         }
         if (auto outputs = checkOutputs(*graph); outputs.isErr())
             return failBuild(std::move(outputs).error());

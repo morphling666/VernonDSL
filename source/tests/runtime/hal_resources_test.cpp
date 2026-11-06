@@ -102,6 +102,108 @@ protected:
         return image;
     }
 
+    // An image of `format` and one mip level with only transfer usage; null when the device cannot copy the format.
+    VernonHalImage *createCopyableImage(VernonTextureFormat format) {
+        uint32_t capabilities = 0;
+        EXPECT_EQ(vernonHalDeviceGetFormatCapabilities(device_, format, &capabilities), VERNON_HAL_OK) << lastError();
+        if (!(capabilities & VERNON_HAL_FORMAT_COPYABLE))
+            return nullptr;
+        VernonImageDescriptor descriptor{};
+        descriptor.dimension = VERNON_TEXTURE_2D;
+        descriptor.extent = {kWidth, kHeight, 1};
+        descriptor.format = format;
+        descriptor.mip_level_count = 1;
+        descriptor.array_layer_count = 1;
+        descriptor.sample_count = 1;
+        descriptor.usage = VERNON_IMAGE_TRANSFER_SOURCE | VERNON_IMAGE_TRANSFER_DESTINATION;
+        VernonHalImage *image = nullptr;
+        EXPECT_EQ(vernonHalCreateImage(device_, &descriptor, &image), VERNON_HAL_OK) << lastError();
+        return image;
+    }
+
+    // A surface of the device's window, whose drawable size `resizeWindow` sets; null on a device that presents no
+    // window, which must then reject surfaces.
+    VernonHalSurface *createSurface() {
+        VernonHalSurfaceDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        bool presents = false;
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        if (context_) {
+            window_ = context_->surfaceCallbacks();
+            window_.drawable_size(window_.user_data, &drawableWidth_, &drawableHeight_);
+            surfaceCallbacks_ = window_;
+            surfaceCallbacks_.user_data = this;
+            surfaceCallbacks_.make_current = [](void *self) { window(self).make_current(window(self).user_data); };
+            surfaceCallbacks_.swap_interval = [](void *self, int32_t interval) {
+                window(self).swap_interval(window(self).user_data, interval);
+            };
+            surfaceCallbacks_.swap_buffers = [](void *self) { window(self).swap_buffers(window(self).user_data); };
+            surfaceCallbacks_.drawable_size = [](void *self, uint32_t *width, uint32_t *height) {
+                *width = static_cast<HalResources *>(self)->drawableWidth_;
+                *height = static_cast<HalResources *>(self)->drawableHeight_;
+            };
+            descriptor.native.opengl = &surfaceCallbacks_;
+            presents = true;
+        }
+#if defined(_WIN32)
+        if (GetParam().runtime == VERNON_RUNTIME_VULKAN) {
+            native_ = std::make_unique<vernon::host::GlfwWindowOwner>(kWidth, kHeight);
+            descriptor.native.win32_window = native_->win32Window();
+            presents = true;
+        }
+#endif
+#endif
+        VernonHalSurface *surface = nullptr;
+        const VernonHalStatus created = vernonHalCreateSurface(device_, &descriptor, &surface);
+        if (!presents) {
+            EXPECT_EQ(created, VERNON_HAL_UNSUPPORTED);
+            return nullptr;
+        }
+        EXPECT_EQ(created, VERNON_HAL_OK) << lastError();
+        return surface;
+    }
+
+    // An OpenGL window reports the size the test sets, so a resize needs no window system.
+    void resizeWindow(uint32_t width, uint32_t height) {
+        drawableWidth_ = width;
+        drawableHeight_ = height;
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
+        if (native_)
+            native_->resize(width, height);
+#endif
+    }
+
+    // A configuration of `surface` for its current extent, or for kWidth x kHeight where the surface takes any.
+    static VernonHalSurfaceConfiguration supported(VernonHalSurface *surface) {
+        VernonHalSurfaceCapabilities capabilities{};
+        EXPECT_EQ(vernonHalSurfaceGetCapabilities(surface, &capabilities), VERNON_HAL_OK) << lastError();
+        VernonHalSurfaceConfiguration configuration{};
+        configuration.struct_size = sizeof(configuration);
+        configuration.format = capabilities.formats[0];
+        configuration.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+        configuration.width = capabilities.current_width == UINT32_MAX ? kWidth : capabilities.current_width;
+        configuration.height = capabilities.current_height == UINT32_MAX ? kHeight : capabilities.current_height;
+        configuration.present_mode = VERNON_HAL_PRESENT_FIFO;
+        configuration.image_count = std::max(capabilities.min_image_count, 2u);
+        if (capabilities.max_image_count)
+            configuration.image_count = std::min(configuration.image_count, capabilities.max_image_count);
+        return configuration;
+    }
+
+    static VernonHalSurfaceConfiguration configure(VernonHalSurface *surface) {
+        const VernonHalSurfaceConfiguration configuration = supported(surface);
+        EXPECT_EQ(vernonHalSurfaceConfigure(surface, &configuration), VERNON_HAL_OK) << lastError();
+        return configuration;
+    }
+
+    // The color region of a whole surface image, in RGBA8.
+    static VernonHalImageRegion surfaceRegion(const VernonHalSurfaceConfiguration &configuration) {
+        VernonHalImageRegion result = region(0);
+        result.width = configuration.width;
+        result.height = configuration.height;
+        return result;
+    }
+
     static VernonHalImageRegion region(uint32_t mip) {
         VernonHalImageRegion result{};
         result.mip_level = mip;
@@ -115,9 +217,17 @@ protected:
     }
 
     VernonHalDevice *device_{};
+    uint32_t drawableWidth_{kWidth};
+    uint32_t drawableHeight_{kHeight};
 #if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
     std::unique_ptr<vernon::host::GlfwContextOwner> context_;
     VernonOpenGLContextCallbacks callbacks_{};
+    VernonOpenGLSurfaceCallbacks window_{};
+    VernonOpenGLSurfaceCallbacks surfaceCallbacks_{};
+    std::unique_ptr<vernon::host::GlfwWindowOwner> native_;
+
+private:
+    static const VernonOpenGLSurfaceCallbacks &window(void *self) { return static_cast<HalResources *>(self)->window_; }
 #endif
 };
 
@@ -342,33 +452,139 @@ TEST_P(HalResources, FormatCapabilitiesNarrowTheBaseline) {
         EXPECT_EQ(capabilities & VERNON_HAL_FORMAT_RENDERABLE, 0u);
 }
 
-TEST_P(HalResources, ASurfacePresentsOneAcquiredImageAtATime) {
-    VernonHalSurfaceDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    bool presents = false;
-#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE)
-    VernonOpenGLSurfaceCallbacks window{};
-    std::unique_ptr<vernon::host::GlfwWindowOwner> native;
-    if (context_) {
-        window = context_->surfaceCallbacks();
-        descriptor.native.opengl = &window;
-        presents = true;
+TEST_P(HalResources, IntegerImagesRoundTripExactly) {
+    struct Case {
+        VernonTextureFormat format;
+        VernonHalImageDataFormat data;
+        uint32_t channels;
+    };
+    for (const Case &entry : {Case{VERNON_TEXTURE_R32_UINT, VERNON_HAL_IMAGE_DATA_RED, 1},
+                              Case{VERNON_TEXTURE_RG32_UINT, VERNON_HAL_IMAGE_DATA_RG, 2}}) {
+        SCOPED_TRACE(entry.channels);
+        VernonHalImage *image = createCopyableImage(entry.format);
+        if (!image)
+            continue;
+        std::vector<uint32_t> texels(size_t{kWidth} * kHeight * entry.channels);
+        for (size_t index = 0; index < texels.size(); ++index)
+            texels[index] = static_cast<uint32_t>(0x80000001u * (index + 1)) ^ 0xFFFF0000u;
+        VernonHalImageRegion whole = region(0);
+        whole.data_format = entry.data;
+        whole.data_type = VERNON_HAL_IMAGE_DATA_UINT32;
+        const VernonHalImageWrite write{whole, texels.data()};
+        ASSERT_EQ(vernonHalImageWrite(image, &write, 1), VERNON_HAL_OK) << lastError();
+        std::vector<uint32_t> read(texels.size());
+        const VernonHalImageRead full{whole, read.data(), read.size() * sizeof(uint32_t)};
+        ASSERT_EQ(vernonHalImageRead(image, &full, 1), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(read, texels);
+
+        // A region reads its own texels, the image's rows below and right of its offset.
+        VernonHalImageRegion corner = whole;
+        corner.offset_x = 1;
+        corner.offset_y = 2;
+        corner.width = 2;
+        corner.height = 2;
+        std::vector<uint32_t> part(size_t{2} * 2 * entry.channels);
+        const VernonHalImageRead partial{corner, part.data(), part.size() * sizeof(uint32_t)};
+        ASSERT_EQ(vernonHalImageRead(image, &partial, 1), VERNON_HAL_OK) << lastError();
+        for (uint32_t y = 0; y < 2; ++y)
+            for (uint32_t x = 0; x < 2 * entry.channels; ++x)
+                EXPECT_EQ(part[y * 2 * entry.channels + x], texels[((y + 2) * kWidth + 1) * entry.channels + x])
+                    << "texel row " << y << " word " << x;
+        EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
     }
-#if defined(_WIN32)
-    if (GetParam().runtime == VERNON_RUNTIME_VULKAN) {
-        native = std::make_unique<vernon::host::GlfwWindowOwner>(kWidth, kHeight);
-        descriptor.native.win32_window = native->win32Window();
-        presents = true;
+}
+
+// A packed depth-stencil texel is a float depth and a stencil byte in eight bytes.
+TEST_P(HalResources, DepthStencilImagesReadByAspectAndRegion) {
+    VernonHalImage *image = createCopyableImage(VERNON_TEXTURE_D32_FLOAT_S8_UINT);
+    if (!image)
+        return;
+    constexpr size_t kTexelBytes = 8;
+    std::vector<uint8_t> packed(size_t{kWidth} * kHeight * kTexelBytes);
+    for (size_t index = 0; index < size_t{kWidth} * kHeight; ++index) {
+        const float depth = static_cast<float>(index) / 16.0f;
+        std::memcpy(packed.data() + index * kTexelBytes, &depth, sizeof(depth));
+        packed[index * kTexelBytes + sizeof(depth)] = static_cast<uint8_t>(3 * index + 1);
     }
-#endif
-#endif
-    VernonHalSurface *surface = nullptr;
-    const VernonHalStatus created = vernonHalCreateSurface(device_, &descriptor, &surface);
-    if (!presents) {
-        EXPECT_EQ(created, VERNON_HAL_UNSUPPORTED);
+    VernonHalImageRegion whole = region(0);
+    whole.aspect = VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL;
+    whole.data_format = VERNON_HAL_IMAGE_DATA_DEPTH_STENCIL;
+    whole.data_type = VERNON_HAL_IMAGE_DATA_FLOAT32;
+    const VernonHalImageWrite write{whole, packed.data()};
+    ASSERT_EQ(vernonHalImageWrite(image, &write, 1), VERNON_HAL_OK) << lastError();
+
+    // OpenGL ES 3.0 has no compute pass to read depth with.
+    const bool reads = GetParam().runtime != VERNON_RUNTIME_OPENGL_ES;
+    std::vector<uint8_t> both(packed.size());
+    const VernonHalImageRead full{whole, both.data(), both.size()};
+    const VernonHalStatus readBoth = vernonHalImageRead(image, &full, 1);
+    if (!reads) {
+        EXPECT_EQ(readBoth, VERNON_HAL_UNSUPPORTED) << lastError();
+        EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
         return;
     }
-    ASSERT_EQ(created, VERNON_HAL_OK) << lastError();
+    ASSERT_EQ(readBoth, VERNON_HAL_OK) << lastError();
+    for (size_t index = 0; index < size_t{kWidth} * kHeight; ++index) {
+        EXPECT_EQ(std::memcmp(both.data() + index * kTexelBytes, packed.data() + index * kTexelBytes, 5), 0)
+            << "texel " << index;
+    }
+
+    VernonHalImageRegion corner = whole;
+    corner.offset_x = 2;
+    corner.offset_y = 1;
+    corner.width = 2;
+    corner.height = 3;
+    corner.aspect = VERNON_IMAGE_ASPECT_DEPTH;
+    corner.data_format = VERNON_HAL_IMAGE_DATA_DEPTH;
+    std::vector<float> depth(size_t{2} * 3);
+    const VernonHalImageRead depthRead{corner, depth.data(), depth.size() * sizeof(float)};
+    // The CPU device transfers only whole packed texels.
+    if (GetParam().runtime == VERNON_RUNTIME_CPU) {
+        EXPECT_EQ(vernonHalImageRead(image, &depthRead, 1), VERNON_HAL_UNSUPPORTED);
+        EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+        return;
+    }
+    ASSERT_EQ(vernonHalImageRead(image, &depthRead, 1), VERNON_HAL_OK) << lastError();
+    corner.aspect = VERNON_IMAGE_ASPECT_STENCIL;
+    corner.data_format = VERNON_HAL_IMAGE_DATA_STENCIL;
+    corner.data_type = VERNON_HAL_IMAGE_DATA_UINT8;
+    std::vector<uint8_t> stencil(size_t{2} * 3);
+    const VernonHalImageRead stencilRead{corner, stencil.data(), stencil.size()};
+    ASSERT_EQ(vernonHalImageRead(image, &stencilRead, 1), VERNON_HAL_OK) << lastError();
+    for (uint32_t y = 0; y < 3; ++y)
+        for (uint32_t x = 0; x < 2; ++x) {
+            const size_t texel = size_t{y + 1} * kWidth + x + 2;
+            EXPECT_FLOAT_EQ(depth[y * 2 + x], static_cast<float>(texel) / 16.0f) << "texel " << texel;
+            EXPECT_EQ(stencil[y * 2 + x], static_cast<uint8_t>(3 * texel + 1)) << "texel " << texel;
+        }
+    EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, ReportsOutOfDateAfterAResizeUntilConfiguredAgain) {
+    VernonHalSurface *surface = createSurface();
+    if (!surface)
+        return;
+    const VernonHalSurfaceConfiguration configured = configure(surface);
+    VernonHalSurfaceImage image{};
+    ASSERT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_OK) << lastError();
+    ASSERT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << lastError();
+
+    resizeWindow(2 * configured.width, 3 * configured.height);
+    EXPECT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_SURFACE_OUT_OF_DATE);
+    EXPECT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_INVALID_ARGUMENT);
+    const VernonHalSurfaceConfiguration resized = configure(surface);
+    EXPECT_EQ(resized.width, 2 * configured.width);
+    EXPECT_EQ(resized.height, 3 * configured.height);
+    ASSERT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(vernonHalImageGetDescriptor(image.image)->extent.width, resized.width);
+    ASSERT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << lastError();
+    EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
+}
+
+TEST_P(HalResources, ASurfacePresentsOneAcquiredImageAtATime) {
+    VernonHalSurface *surface = createSurface();
+    if (!surface)
+        return;
     VernonHalSurfaceCapabilities capabilities{};
     ASSERT_EQ(vernonHalSurfaceGetCapabilities(surface, &capabilities), VERNON_HAL_OK) << lastError();
     ASSERT_GE(capabilities.format_count, 1u);
@@ -376,17 +592,7 @@ TEST_P(HalResources, ASurfacePresentsOneAcquiredImageAtATime) {
 
     VernonHalSurfaceImage image{};
     EXPECT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_INVALID_ARGUMENT);
-    VernonHalSurfaceConfiguration configuration{};
-    configuration.struct_size = sizeof(configuration);
-    configuration.format = capabilities.formats[0];
-    configuration.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
-    configuration.width = capabilities.current_width == UINT32_MAX ? kWidth : capabilities.current_width;
-    configuration.height = capabilities.current_height == UINT32_MAX ? kHeight : capabilities.current_height;
-    configuration.present_mode = VERNON_HAL_PRESENT_FIFO;
-    configuration.image_count = std::max(capabilities.min_image_count, 2u);
-    if (capabilities.max_image_count)
-        configuration.image_count = std::min(configuration.image_count, capabilities.max_image_count);
-    ASSERT_EQ(vernonHalSurfaceConfigure(surface, &configuration), VERNON_HAL_OK) << lastError();
+    const VernonHalSurfaceConfiguration configuration = configure(surface);
 
     for (int frame = 0; frame < 2; ++frame) {
         ASSERT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_OK) << lastError();
@@ -407,6 +613,106 @@ TEST_P(HalResources, ASurfacePresentsOneAcquiredImageAtATime) {
     EXPECT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_INVALID_ARGUMENT);
     EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
 }
+
+TEST_P(HalResources, RejectsConfigurationsOutsideTheCapabilities) {
+    VernonHalSurface *surface = createSurface();
+    if (!surface)
+        return;
+    const VernonHalSurfaceConfiguration valid = supported(surface);
+    VernonHalSurfaceConfiguration zeroExtent = valid;
+    zeroExtent.width = 0;
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &zeroExtent), VERNON_HAL_INVALID_ARGUMENT);
+    VernonHalSurfaceConfiguration noColorAttachment = valid;
+    noColorAttachment.usage = VERNON_IMAGE_TRANSFER_SOURCE;
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &noColorAttachment), VERNON_HAL_INVALID_ARGUMENT);
+    VernonHalSurfaceConfiguration unknownMode = valid;
+    unknownMode.present_mode = static_cast<VernonHalPresentMode>(3);
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &unknownMode), VERNON_HAL_INVALID_ARGUMENT);
+
+    VernonHalSurfaceConfiguration srgb = valid;
+    srgb.format = VERNON_TEXTURE_RGBA8_SRGB;
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &srgb), VERNON_HAL_UNSUPPORTED);
+    VernonHalSurfaceConfiguration sampled = valid;
+    sampled.usage |= VERNON_IMAGE_SAMPLED;
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &sampled), VERNON_HAL_UNSUPPORTED);
+    VernonHalSurfaceConfiguration noImages = valid;
+    noImages.image_count = 0;
+    EXPECT_EQ(vernonHalSurfaceConfigure(surface, &noImages), VERNON_HAL_UNSUPPORTED);
+
+    VernonHalSurfaceImage image{};
+    EXPECT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
+}
+
+// An acquired image's contents are undefined until written, and again once it is acquired after a present.
+TEST_P(HalResources, ASurfaceImageIsReadOnlyOnceWritten) {
+    VernonHalSurface *surface = createSurface();
+    if (!surface)
+        return;
+    const VernonHalSurfaceConfiguration configuration = configure(surface);
+    const VernonHalImageRegion whole = surfaceRegion(configuration);
+    const size_t bytes = size_t{configuration.width} * configuration.height * 4;
+    const std::array<std::array<uint8_t, 4>, 3> colors{{{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}}};
+    for (const auto &color : colors) {
+        VernonHalSurfaceImage image{};
+        ASSERT_EQ(vernonHalSurfaceAcquire(surface, &image), VERNON_HAL_OK) << lastError();
+        std::vector<uint8_t> texels(bytes);
+        const VernonHalImageRead read{whole, texels.data(), texels.size()};
+        EXPECT_EQ(vernonHalImageRead(image.image, &read, 1), VERNON_HAL_INVALID_ARGUMENT);
+        std::vector<uint8_t> filled;
+        for (size_t texel = 0; texel < bytes / 4; ++texel)
+            filled.insert(filled.end(), color.begin(), color.end());
+        const VernonHalImageWrite write{whole, filled.data()};
+        ASSERT_EQ(vernonHalImageWrite(image.image, &write, 1), VERNON_HAL_OK) << lastError();
+        ASSERT_EQ(vernonHalImageRead(image.image, &read, 1), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(texels, filled);
+        ASSERT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << lastError();
+    }
+    EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
+}
+
+#if defined(VERNON_GLFW_CONTEXT_OWNER_AVAILABLE) && defined(_WIN32)
+// Each surface presents its own window and keeps its own images, so one device presents both in turn.
+TEST_P(HalResources, TwoSurfacesPresentTheirOwnImages) {
+    if (GetParam().runtime != VERNON_RUNTIME_VULKAN)
+        GTEST_SKIP() << "only Vulkan surfaces present windows the test opens";
+    VernonHalSurface *first = createSurface();
+    ASSERT_NE(first, nullptr);
+    const vernon::host::GlfwWindowOwner secondWindow(kWidth, kHeight);
+    VernonHalSurfaceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.native.win32_window = secondWindow.win32Window();
+    VernonHalSurface *second = nullptr;
+    ASSERT_EQ(vernonHalCreateSurface(device_, &descriptor, &second), VERNON_HAL_OK) << lastError();
+
+    const std::array<VernonHalSurface *, 2> surfaces{first, second};
+    const std::array<std::array<uint8_t, 4>, 2> colors{{{255, 255, 0, 255}, {0, 255, 255, 255}}};
+    std::array<VernonHalSurfaceImage, 2> images{};
+    std::array<VernonHalImageRegion, 2> regions{};
+    for (size_t index = 0; index < surfaces.size(); ++index) {
+        regions[index] = surfaceRegion(configure(surfaces[index]));
+        ASSERT_EQ(vernonHalSurfaceAcquire(surfaces[index], &images[index]), VERNON_HAL_OK) << lastError();
+    }
+    EXPECT_NE(images[0].image, images[1].image);
+    std::array<std::vector<uint8_t>, 2> filled;
+    for (size_t index = 0; index < surfaces.size(); ++index) {
+        for (size_t texel = 0; texel < size_t{regions[index].width} * regions[index].height; ++texel)
+            filled[index].insert(filled[index].end(), colors[index].begin(), colors[index].end());
+        const VernonHalImageWrite write{regions[index], filled[index].data()};
+        ASSERT_EQ(vernonHalImageWrite(images[index].image, &write, 1), VERNON_HAL_OK) << lastError();
+    }
+    for (size_t index = 0; index < surfaces.size(); ++index) {
+        std::vector<uint8_t> texels(filled[index].size());
+        const VernonHalImageRead read{regions[index], texels.data(), texels.size()};
+        ASSERT_EQ(vernonHalImageRead(images[index].image, &read, 1), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(texels, filled[index]);
+    }
+    for (VernonHalSurface *surface : surfaces) {
+        EXPECT_EQ(vernonHalSurfacePresent(surface), VERNON_HAL_OK) << lastError();
+        EXPECT_EQ(vernonHalDestroySurface(surface), VERNON_HAL_OK);
+    }
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(Backends, HalResources, testing::ValuesIn(vernon::tests::backendTestMatrix),
                          [](const testing::TestParamInfo<BackendTestRow> &info) {

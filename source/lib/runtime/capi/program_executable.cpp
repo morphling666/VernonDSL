@@ -1,7 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/capi/boundary.h"
 #include "runtime/capi/program_state.h"
-#include "runtime/program_execution/program_boundary_contract.h"
+#include "runtime/program_boundary_contract.h"
 #include "runtime/stage_binding_plan.h"
 
 #include <algorithm>
@@ -32,9 +32,9 @@ bool fillBoundaryParameterView(const VernonProgramExecutable &pipeline, const pr
         return false;
     destination = {source.id,
                    {source.path.data(), source.path.size()},
-                   program_execution::boundaryArgumentKind(source.category),
+                   boundaryArgumentKind(source.category),
                    layout ? valueLayoutView(*layout) : VernonValueLayoutView{},
-                   program_execution::boundaryValueAccess(source.access),
+                   boundaryValueAccess(source.access),
                    static_cast<uint32_t>(source.outerShape.size()),
                    source.outerShape.empty() ? nullptr : source.outerShape.data()};
     return true;
@@ -258,9 +258,7 @@ size_t vernonRuntimeProgramExecutableGetGraphicsNodeCount(const VernonProgramExe
         auto pipelinePin = pipeline->lifecycle.pin();
         if (pipelinePin.isErr())
             return size_t{0};
-        std::vector<const program::Node *> nodes;
-        collectForwardGraphicsNodes(pipeline, nodes);
-        return nodes.size();
+        return forwardGraphicsNodes(*pipeline).size();
     });
 }
 
@@ -273,13 +271,11 @@ VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(const Vern
         auto pipelinePin = pipeline->lifecycle.pin();
         if (pipelinePin.isErr())
             return vernon::toVernonStatus(pipelinePin.error());
-        std::vector<const program::Node *> nodes;
-        collectForwardGraphicsNodes(pipeline, nodes);
+        const std::vector<GraphicsNodeRef> nodes = forwardGraphicsNodes(*pipeline);
         if (index >= nodes.size())
             return VERNON_STATUS_INVALID_ARGUMENT;
-        const program::Node &node = *nodes[index];
-        const program::GraphicsOperation &graphics = program::graphicsOperation(node);
-        *output = {sizeof(VernonProgramGraphicsControlsView), node.id, graphics.renderPassControl,
+        const program::GraphicsOperation &graphics = program::graphicsOperation(*nodes[index].node);
+        *output = {sizeof(VernonProgramGraphicsControlsView), nodes[index].id, graphics.renderPassControl,
                    graphics.drawCommandControl, graphics.dynamicStateControl};
         return VERNON_STATUS_OK;
     });

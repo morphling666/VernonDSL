@@ -452,7 +452,7 @@ struct ProgramInvocationBuilder {
         argument.shape = shape;
         argument.strides = strides;
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
-        argument.value.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+        argument.value.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
         requireReference(vernonHalReferenceBuffer(buffer->handle, 0, buffer->size, &argument.value.tensor.resource),
                          "buffer");
         argument.value.tensor.access = static_cast<VernonValueAccess>(access);

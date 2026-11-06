@@ -85,7 +85,7 @@ public:
     bool bindDeviceTensor(const char *name, VernonRuntimeProviderResourceReference resource, size_t size, uint32_t rank,
                           const uint64_t *shape, const int64_t *strides) {
         VernonProgramArgument argument = tensor(name, rank, shape, strides, size);
-        argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+        argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
         argument.tensor.resource = resource;
         return bind(name, argument);
     }

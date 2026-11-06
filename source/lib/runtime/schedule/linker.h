@@ -60,6 +60,8 @@ struct LinkedSchedule {
     std::vector<LinkedDispatch> operations;
     // The nodeOperationEnds of each fragment in node order, in linked operation indices.
     std::vector<uint32_t> nodeOperationEnds;
+    // The nodeLabels of each fragment in node order.
+    std::vector<std::string> nodeLabels;
     // Each node's argument record sits at its node offset, so its slots and fields keep their fragment offsets plus
     // that offset.
     std::vector<uint64_t> nodeOffsets;

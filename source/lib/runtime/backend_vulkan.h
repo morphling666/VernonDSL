@@ -2,7 +2,6 @@
 #define VERNON_RUNTIME_BACKEND_VULKAN_H
 
 #include "VernonRuntime.h"
-#include "VernonRuntimeCore.h"
 #include "prepared_binding_plan.h"
 #include "runtime_state.h"
 
@@ -11,25 +10,18 @@
 #include <string>
 #include <vector>
 
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "rhi/vulkan_backend.h"
-#endif
+namespace vernon::hal::vulkan {
+struct DeviceState;
+} // namespace vernon::hal::vulkan
 
-struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
+// The Vulkan state of the context's HAL device (hal/vulkan/vulkan_state.h).
 struct VulkanContextState {
-    VernonRuntimeRhiAdapter *adapter{};
-    uint32_t apiVersion{};
-    uint32_t maxComputeWorkGroupInvocations{};
-    uint32_t maxComputeWorkGroupSize[3]{};
-    uint32_t defaultImplicitSamplerCreations{};
-    uint32_t commandBufferAllocations{};
-    uint32_t descriptorPoolCreations{};
-    uint32_t stagingBufferAllocations{};
-    bool dynamicRendering{};
+    std::shared_ptr<hal::vulkan::DeviceState> device;
 };
+
 inline VulkanContextState &vulkanState(VernonRuntimeContext &context) {
     return runtimeBackendState<VulkanContextState>(context);
 }

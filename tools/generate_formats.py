@@ -13,7 +13,6 @@ OUTPUT = ROOT / "python/vernon_dsl/_formats.py"
 _COLUMNS = (
     "name",
     "NAME",
-    "rhi",
     "texture",
     "component_class",
     "pixel_bytes",
@@ -39,7 +38,6 @@ _COLOR_DATA_FORMATS = frozenset({"RED", "RG", "RGB", "RGBA"})
 class _Row:
     name: str
     native_name: str
-    rhi: int
     texture: int
     component_class: str
     element: str
@@ -87,7 +85,6 @@ def _parse_row(arguments: str) -> _Row:
     return _Row(
         name=name,
         native_name=column["NAME"],
-        rhi=int(column["rhi"]),
         texture=int(column["texture"]),
         component_class=component_class,
         element=element,
@@ -103,12 +100,12 @@ def _rows() -> list[_Row]:
     rows = [_parse_row(arguments) for arguments in re.findall(r"^VERNON_FORMAT\(([^)]*)\)", text, re.MULTILINE)]
     if not rows:
         raise ValueError(f"{TABLE.relative_to(ROOT).as_posix()} has no VERNON_FORMAT rows")
-    for key in ("name", "rhi", "texture"):
+    for key in ("name", "texture"):
         values = [getattr(row, key) for row in rows]
         if len(set(values)) != len(values):
             raise ValueError(f"VernonFormats.def repeats a {key}")
-    if any(row.rhi <= 0 or row.texture < 0 for row in rows):
-        raise ValueError("VernonFormats.def rhi values must be positive and texture values nonnegative")
+    if any(row.texture < 0 for row in rows):
+        raise ValueError("VernonFormats.def texture values must be nonnegative")
     return rows
 
 

@@ -125,7 +125,7 @@ LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, 
     }
     const StringRef kind = attachment ? "attachment" : "storage";
     const ::vernon::formats::Format *entry = ::vernon::formats::find(std::string_view(format.data(), format.size()));
-    if (!entry || !entry->allows(attachment ? VERNON_RHI_FORMAT_RENDERABLE : VERNON_RHI_FORMAT_STORAGE))
+    if (!entry || !entry->allows(attachment ? VERNON_HAL_FORMAT_RENDERABLE : VERNON_HAL_FORMAT_STORAGE))
         return emitError() << "unsupported " << kind << " Texture format " << format;
     if (entry->integer() ? !elementType.isInteger(32) : !elementType.isF32())
         return emitError() << kind << " Texture shader element type does not match format " << format;

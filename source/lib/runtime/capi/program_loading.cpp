@@ -2,9 +2,9 @@
 #include "VernonRuntime.h"
 #include "runtime/capi/boundary.h"
 #include "runtime/capi/program_state.h"
-#include "runtime/program_execution/program_boundary_contract.h"
+#include "runtime/program_boundary_contract.h"
 #include "runtime/program_execution_backend.h"
-#include "runtime/program_graph_linker.h"
+#include "runtime/program_graph_composition.h"
 #include "runtime/stage_artifact.h"
 
 #include <nlohmann/json.hpp>
@@ -141,7 +141,7 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
                            tag == "format" && value.is_string()
                                ? vernon::formats::find(value.get_ref<const std::string &>())
                                : nullptr;
-                       format && format->aspects() == VERNON_RHI_IMAGE_ASPECT_COLOR) {
+                       format && format->aspects() == VERNON_IMAGE_ASPECT_COLOR) {
                 specialization.kind = vernon::runtime::ProgramSpecializationKind::Format;
                 specialization.value = format->texture;
             } else {
@@ -272,7 +272,7 @@ selectProgramDeployment(VernonRuntimeContext &context,
                 destination.value = std::string(source.value.type_value.data, source.value.type_value.size);
                 break;
             case VERNON_PROGRAM_SPECIALIZATION_FORMAT:
-                if (vernon::formats::aspects(source.value.format_value) != VERNON_RHI_IMAGE_ASPECT_COLOR) {
+                if (vernon::formats::aspects(source.value.format_value) != VERNON_IMAGE_ASPECT_COLOR) {
                     fail(&context, "Program format specialization requires a color format");
                     return Result{vernon::err(
                         vernon::RuntimeError{vernon::RuntimeErrorCode::InvalidArgument,
@@ -649,7 +649,7 @@ VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *gra
         token->graph_id = graph->id;
         token->node = node;
         token->local_slot = found->id;
-        token->kind = vernon::runtime::program_execution::boundaryArgumentKind(found->category);
+        token->kind = vernon::runtime::boundaryArgumentKind(found->category);
         return VERNON_STATUS_OK;
     });
 }
@@ -809,9 +809,8 @@ ProgramGraphExecutableResult resolveProgramGraphOperation(VernonProgramGraph *gr
     }
     std::vector<ProgramGraphNodeSource> sources;
     sources.reserve(graph->nodes.size());
-    for (RuntimeProgramGraphNode &node : graph->nodes) {
-        sources.push_back({node.id, node.bundleId, node.label, node.contentHash, &node.deployment, node.bundleRoot});
-    }
+    for (RuntimeProgramGraphNode &node : graph->nodes)
+        sources.push_back({node.id, node.bundleId, node.contentHash, &node.deployment});
     std::vector<ProgramGraphConnection> connections;
     for (const RuntimeProgramGraphValue &value : graph->values)
         for (ProgramGraphBoundaryKey destination : value.destinations)
@@ -823,39 +822,26 @@ ProgramGraphExecutableResult resolveProgramGraphOperation(VernonProgramGraph *gr
     retainedBoundaries.reserve(graph->storages.size());
     for (const RuntimeProgramGraphStorage &storage : graph->storages)
         retainedBoundaries.push_back(storage.versions.back());
-    LinkedProgramDeployment linked;
-    program::Diagnostic linkDiagnostic;
-    if (!linkProgramGraph(sources, connections, retainedBoundaries, graph->exports, linked, linkDiagnostic)) {
+    ComposedProgramAbi composed;
+    program::Diagnostic composeDiagnostic;
+    if (!composeProgramGraph(sources, connections, retainedBoundaries, graph->exports, composed, composeDiagnostic)) {
         fail(graph->context,
-             linkDiagnostic.code + (linkDiagnostic.path.empty() ? ": " : " at " + linkDiagnostic.path + ": ") +
-                 linkDiagnostic.message,
+             composeDiagnostic.code + (composeDiagnostic.path.empty() ? ": " : " at " + composeDiagnostic.path + ": ") +
+                 composeDiagnostic.message,
              VERNON_STATUS_PARSE_ERROR);
         return ProgramGraphExecutableResult{vernon::err(vernon::RuntimeError{
-            vernon::RuntimeErrorCode::VerificationFailure, {"ProgramGraph link verification", 0, 0}})};
+            vernon::RuntimeErrorCode::VerificationFailure, {"ProgramGraph composition verification", 0, 0}})};
     }
-    auto loaded = program::loadBackendProgramPipeline(*graph->context, linked.deployment.program,
-                                                      linked.deployment.artifactSystem, {});
-    if (loaded.isErr()) {
-        const vernon::RuntimeErrorCode code = programLoadErrorCode(loaded.error());
-        fail(graph->context, program::renderProgramLoadError(loaded.error()),
-             vernon::toVernonStatus(vernon::RuntimeError{code, {}}));
-        return ProgramGraphExecutableResult{
-            vernon::err(vernon::RuntimeError{code, {"ProgramGraph executable resolution", 0, 0}})};
-    }
-    std::unique_ptr<VernonProgramExecutable, decltype(&vernonRuntimeProgramExecutableDestroy)> executable(
-        std::move(loaded).value().release(), vernonRuntimeProgramExecutableDestroy);
-    // The CPU and CUDA link a composed graph from its nodes' own executables; the graphics devices link the composed
-    // Program itself, and its VJP from the nodes' executables, which exists only when every node has a backward graph.
-    const bool composes =
-        graph->context->backend == VERNON_RUNTIME_CPU || graph->context->backend == VERNON_RUNTIME_CUDA ||
-        std::all_of(graph->nodes.begin(), graph->nodes.end(), [](const RuntimeProgramGraphNode &node) {
-            return program::findGraph(node.deployment.program, "backward") != nullptr;
-        });
     auto composition = std::make_shared<ProgramGraphComposition>();
     std::map<uint32_t, uint32_t> nodeIndex;
+    uint32_t forwardNodes = 0;
     for (const RuntimeProgramGraphNode &node : graph->nodes) {
-        if (!composes)
-            break;
+        const program::Graph &forward = *program::findGraph(node.deployment.program, "forward");
+        for (const program::Node &forwardNode : forward.nodes)
+            if (program::executionKind(forwardNode) == program::ExecutionKind::Graphics)
+                composition->graphicsNodes.push_back(
+                    {forwardNodes + forwardNode.id, static_cast<uint32_t>(composition->nodes.size()), forwardNode.id});
+        forwardNodes += static_cast<uint32_t>(forward.nodes.size());
         auto childResult = program::loadBackendProgramPipeline(*graph->context, node.deployment.program,
                                                                node.deployment.artifactSystem, node.bundleRoot);
         if (childResult.isErr()) {
@@ -870,32 +856,49 @@ ProgramGraphExecutableResult resolveProgramGraphOperation(VernonProgramGraph *gr
         child->programSource = node.deployment.source;
         nodeIndex.emplace(node.id, static_cast<uint32_t>(composition->nodes.size()));
         composition->nodes.push_back(std::move(child));
+        composition->labels.push_back(node.label);
     }
-    if (composes) {
-        const auto site = [&](ProgramGraphBoundaryKey key) {
-            return ProgramGraphComposition::Site{nodeIndex.at(key.node), key.slot};
-        };
-        for (const RuntimeProgramGraphValue &value : graph->values) {
-            ProgramGraphComposition::Connection &connection = composition->connections.emplace_back();
-            connection.sites.push_back(site(value.source));
-            for (ProgramGraphBoundaryKey destination : value.destinations)
-                connection.sites.push_back(site(destination));
-        }
-        for (const RuntimeProgramGraphStorage &storage : graph->storages) {
-            ProgramGraphComposition::Connection &connection = composition->connections.emplace_back();
-            connection.storage = true;
-            for (ProgramGraphBoundaryKey version : storage.versions)
-                connection.sites.push_back(site(version));
-        }
-        for (const ProgramGraphExport &exported : graph->exports)
-            composition->exports.push_back({site(exported.boundary), linked.boundarySlots.at(exported.boundary)});
-        executable->composition = std::move(composition);
+    const auto site = [&](ProgramGraphBoundaryKey key) {
+        return ProgramGraphComposition::Site{nodeIndex.at(key.node), key.slot};
+    };
+    for (const RuntimeProgramGraphValue &value : graph->values) {
+        ProgramGraphComposition::Connection &connection = composition->connections.emplace_back();
+        connection.sites.push_back(site(value.source));
+        for (ProgramGraphBoundaryKey destination : value.destinations)
+            connection.sites.push_back(site(destination));
     }
-    executable->id = linked.id;
+    for (const RuntimeProgramGraphStorage &storage : graph->storages) {
+        ProgramGraphComposition::Connection &connection = composition->connections.emplace_back();
+        connection.storage = true;
+        for (ProgramGraphBoundaryKey version : storage.versions)
+            connection.sites.push_back(site(version));
+    }
+    for (const ProgramGraphExport &exported : graph->exports)
+        composition->exports.push_back({site(exported.boundary), composed.boundarySlots.at(exported.boundary)});
+    // A node binds only what the graph exports from it, so its pass pipelines classify connected and internal
+    // endpoints as fixed.
+    for (const std::shared_ptr<VernonProgramExecutable> &child : composition->nodes) {
+        buildExecutableBindingIndex(*child);
+        child->bindableParameterSlots.clear();
+    }
+    for (const ProgramGraphComposition::Export &exported : composition->exports)
+        composition->nodes[exported.site.node]->bindableParameterSlots.insert(exported.site.slot);
+    auto made = program::composedProgramExecutable(*graph->context, std::move(composed.program));
+    if (made.isErr()) {
+        const vernon::RuntimeErrorCode code = programLoadErrorCode(made.error());
+        fail(graph->context, program::renderProgramLoadError(made.error()),
+             vernon::toVernonStatus(vernon::RuntimeError{code, {}}));
+        return ProgramGraphExecutableResult{
+            vernon::err(vernon::RuntimeError{code, {"ProgramGraph executable resolution", 0, 0}})};
+    }
+    std::unique_ptr<VernonProgramExecutable, decltype(&vernonRuntimeProgramExecutableDestroy)> executable(
+        std::move(made).value().release(), vernonRuntimeProgramExecutableDestroy);
+    executable->composition = std::move(composition);
+    executable->id = composed.id;
     executable->programGraphId = graph->id;
     executable->publicParameterSlots.reserve(graph->exports.size());
     for (const ProgramGraphExport &exported : graph->exports) {
-        const uint32_t slot = linked.boundarySlots.at(exported.boundary);
+        const uint32_t slot = composed.boundarySlots.at(exported.boundary);
         if (std::find(executable->publicParameterSlots.begin(), executable->publicParameterSlots.end(), slot) ==
             executable->publicParameterSlots.end())
             executable->publicParameterSlots.push_back(slot);

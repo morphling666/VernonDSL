@@ -6,7 +6,7 @@ shared semantic IR into target-specific CPU, CUDA, Vulkan, OpenGL, DirectX, and
 Metal artifacts.
 
 For an end-to-end explanation of the language, compiler backends, Program
-runtime, RHI command scheduling, and offline cooking model, see
+runtime, linked schedules over the HAL, and offline cooking model, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ```python

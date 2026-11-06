@@ -125,7 +125,9 @@ protected:
         ASSERT_NE(intermediate, forward->nodes[0].results.end());
         ASSERT_LT(*intermediate, plan.resolvedProgram->program.values.size());
         EXPECT_TRUE(plan.resolvedProgram->program.values[*intermediate].storage.has_value());
-        const std::vector<uint32_t> &predecessors = plan.predecessors(GraphDirection::Forward, 1);
+        const size_t graph = static_cast<size_t>(forward - plan.resolvedProgram->program.graphs.data());
+        ASSERT_LT(graph, plan.resolvedProgram->graphs.size());
+        const std::vector<uint32_t> &predecessors = plan.resolvedProgram->graphs[graph].predecessors.at(1);
         EXPECT_NE(std::find(predecessors.begin(), predecessors.end(), 0), predecessors.end());
 
         LinkedProgram linked(runtime(), program.get());

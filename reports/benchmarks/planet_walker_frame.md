@@ -246,6 +246,27 @@ Every case is at or under part 1. The first Vulkan walking run after the
 build measured 1.61 ms mean and 1.95 ms worst and is left out, as part 5
 does with such runs; the two reruns are in the table.
 
+### Step 5 complete (section 16.3 step 5)
+
+The Program invocation runtime and the ProgramGraph linker are deleted;
+every call is a linked schedule, and a composed Program graph links per
+node. VernonDSL `f840106` and Vernon `90254343`, both with uncommitted
+work. 1500 frames per run, excluding frames 0-299:
+
+| Device | Case | Runs | Frame | Host (mean of windows) | Host (worst window) |
+|---|---|---:|---:|---:|---:|
+| Vulkan | standing | 1 | 4.18-4.20 ms | 0.88 ms | 0.89 ms |
+| Vulkan | walking | 2 | 3.8-4.9 ms | 1.36-1.48 ms | 1.58-1.72 ms |
+| OpenGL 4.6 | standing | 1 | 4.18 ms | 0.51 ms | 0.54 ms |
+| OpenGL 4.6 | walking | 1 | 3.7-4.9 ms | 1.03 ms | 1.31 ms |
+| OpenGL 3.3 | standing | 1 | 4.10-4.11 ms | 2.17 ms | 2.23 ms |
+| OpenGL 3.3 | walking | 1 | 3.7-4.8 ms | 2.87 ms | 2.95 ms |
+
+Standing is at or under part 2 on every device, and OpenGL 3.3 walking is
+0.25 ms under part 5. As in part 2, the first Vulkan walking run measured
+higher (1.60 ms mean, 1.93 ms worst) and is left out; the two reruns span
+the 0.1 ms variance part 3 notes.
+
 ## Standing frame
 
 Measured once with temporary scope timers (since removed), which added

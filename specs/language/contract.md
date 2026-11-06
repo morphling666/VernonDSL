@@ -528,12 +528,12 @@ by-value leaf and `resource(set=None, binding=None)` on a TensorView, Texture
 or Sampler leaf. `set` is the leaf's group, its update-frequency partition,
 and a leaf without it is in set 0; `binding` pins the leaf to that binding of
 its set, and the compiler assigns every unpinned binding at the pipeline link
-after reserving the pinned ones. The Runtime's group model is
-[`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3.
+after reserving the pinned ones. Groups and packing are defined by
+[`placement.md`](placement.md).
 
 Kernel parameters bind in argument order: set 0, at the flattened binding of
 their argument, until Kernel placement lands with uniform packing
-([`../runtime/binding_groups.md`](../runtime/binding_groups.md) section 3.4).
+([`placement.md`](placement.md) section 4).
 A Kernel parameter or params leaf annotated with `resource(...)`, or with
 `uniform(...)` that gives a set or binding, fails with
 `kernel parameters bind in argument order; set and binding apply only to graphics stages`.

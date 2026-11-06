@@ -191,16 +191,13 @@ The Runtime records and submits backend commands internally
 
 ## 8. ProgramGraph composition
 
-[`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) section 4
-keeps this composition model but links the children's schedule fragments
-instead of finalizing one canonical Program and resolving it. Until its
-migration:
-
-`ProgramGraph` composes independently cooked Programs before physical resolve.
-It does not accept resolved executables, Stages, backend resources, command
-encoders, or callback passes, and it does not create another executable type.
-Finalization namespaces and links the child Programs into one canonical
-Program; the result follows the ordinary resolve and link lifecycle.
+`ProgramGraph` composes independently cooked Programs. It does not accept
+resolved executables, Stages, backend resources, command encoders, or callback
+passes. Resolving it loads each child once and composes only their ABI: the
+composed executable's boundary slots are the children's that stay visible,
+and its schedule links the children's fragments
+([`../runtime/architecture_v2.md`](../runtime/architecture_v2.md) sections 4
+and 16.2). No merged Program is built or resolved.
 
 Each graph node has an opaque identity and a local boundary/control namespace.
 Equal child boundary names never collide. Names enter the composite public ABI
@@ -227,10 +224,9 @@ symbolic graph Image Storage-version chain; this is storage composition, not a
 producer-to-consumer Value edge.
 
 A child Program owns its semantic subgraph but never owns an independently
-submitted physical command graph. Global resolve derives one hazard, transfer,
-residency, and static render-scope candidate regions for the composite
-Program. Linking forms fused or split native scopes only from the paths
-admitted by those candidates.
+submitted physical command graph. The schedule linker orders the children's
+operations, places their barriers and fuses adjacent passes into native render
+scopes where their attachments allow it.
 
 ProgramGraph composition adds no backward graph, derivative boundary, or
 accumulation operation to the composite Program. A linked VJP of a graph of
@@ -324,7 +320,8 @@ Artifacts from unsupported Program versions are rejected, not normalized.
 ## 13. Invariants
 
 - Every executable is a Program.
-- ProgramGraph composition finalizes into a Program before physical resolve.
+- ProgramGraph composition links its children's fragments and merges no
+  Program IR.
 - Program, logical resolve, physical resolve, and a linked schedule form the
   only deployment path.
 - Node count and Stage kind never select another architecture.

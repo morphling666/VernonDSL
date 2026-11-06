@@ -160,9 +160,6 @@ TEST_P(ModuleGraphicsProgram, ProgramGraphFusesCookedGraphicsProgramsOnSharedFra
         vernonRuntimeResolveProgramGraph(graph), vernonRuntimeProgramExecutableDestroy);
     vernonRuntimeProgramGraphDestroy(graph);
     ASSERT_NE(executable, nullptr) << vernon::tests::runtimeError(runtime());
-    ASSERT_EQ(executable->executionPlan->graphicsScopeCandidates.size(), 2u);
-    EXPECT_EQ(executable->executionPlan->graphicsScopeCandidates[0].region,
-              executable->executionPlan->graphicsScopeCandidates[1].region);
 
     constexpr uint32_t extent = 8;
     HalImage target(device_.get(), VERNON_TEXTURE_RGBA8_UNORM, extent, extent, VERNON_IMAGE_COLOR_ATTACHMENT);

@@ -20,14 +20,13 @@ flowchart TD
     ProgramIR["MLIR Program IR"]
     Transform["Program transforms, including VJP"]
     Compile["Stage selection and target compilation"]
-    Bundle["Program + ArtifactSystem"]
-    Resolve["ResolvedProgram + ResolvedExecutionPlan"]
-    Invoke["Instance + Invocation"]
-    Commands["Private Command DAG"]
-    Backend["CPU or GPU backend"]
+    Bundle["Program + ArtifactSystem + schedule fragment"]
+    Link["Linked schedule"]
+    Record["Recorded native commands"]
+    Backend["HAL device: CPU, CUDA, Vulkan or OpenGL"]
 
     Source --> Frontend --> ProgramIR --> Transform --> Compile
-    Compile --> Bundle --> Resolve --> Invoke --> Commands --> Backend
+    Compile --> Bundle --> Link --> Record --> Backend
 ```
 
 核心约束：
@@ -36,8 +35,9 @@ flowchart TD
 2. Compiler 不拥有 invocation-time TensorView descriptor 或 launch extent。
 3. Runtime 只执行已经 resolve 的物理计划，不通过名称、sentinel 或资源扫描
    重新推导语义。
-4. RuntimeCore 通过 Provider SPI 与硬件隔离；VernonRHI 是内建 GPU provider。
-5. Command DAG 是 Runtime 私有调度模型，不是 Python 或部署层 API。
+4. Runtime 通过 HAL（`VernonHal.h`）与硬件隔离；每个后端是一个 HAL device。
+5. 工作按频率放置：只依赖单个 Program 的决定在 compiler 中完成，依赖相邻
+   节点的决定在图结构改变时由 linker 完成，每次调用只写入变化的参数并提交。
 
 ## 2. 语言与 frontend
 
@@ -145,48 +145,41 @@ description，不包含 invocation-time 资源、shape 或 command encoder。
 Canonical C/C++ 调用路径为：
 
 ```text
-load Program bundle
-  -> resolve typed specialization variant
-  -> create Program executable
-  -> create Program instance
-  -> begin invocation
-  -> bind Program Values and controls
-  -> execute
-  -> commit or rollback
-  -> optional reusable pullback
+cook   (compiler，每个 Program variant)：device code + schedule fragment + argument record layout
+load   (runtime，每个 artifact)：        校验并创建 executables
+link   (runtime，每个图结构)：           fragments + connections -> linked schedule
+record (runtime，每个 linked schedule)： linked schedule -> native command buffers
+call   (每次调用或每帧)：                写入变化的参数字节并提交
 ```
 
-`VernonProgramExecutable` 持有 immutable `ResolvedExecutionPlan`。该计划包含：
+Schedule fragment 是 compiler 为单个 Program 产出的可重定位调度，类似目标
+文件。Linker 在图结构改变时决定跨节点的 buffer identity、aliasing、边界
+barrier 和 render-pass 合并；executor 录制 linked schedule 并重放。Pass 按
+结构规划一次（`runtime/schedule/pass_plan.h`），其 HAL recording 按此缓存。
 
-- selected Stage implementations；
-- per-Node endpoint projections；
-- host/device residency；
-- upload、device-copy 和 readback edges；
-- resource hazards 和 backend barriers；
-- graphics scopes；
-- publication transactions；
-- tape、checkpoint 和 replay plans。
+每次调用都执行 linked schedule；`ResolvedExecutionPlan` 只保存加载时解析的
+每节点 Stage 表。组合的 `ProgramGraph` 从各节点取得 ABI，并在所有设备上按节点
+link 它们的 fragment
+（[`specs/runtime/architecture_v2.md`](specs/runtime/architecture_v2.md) 第 16.2 节）。
 
-Runtime 内部完成 command recording、submission、synchronization 和 publication。
-外部 encoder 是 engine embedding facility，不是 Program binding API。
+详见 [`specs/runtime/architecture_v2.md`](specs/runtime/architecture_v2.md) 和
+[`specs/runtime/design.md`](specs/runtime/design.md)。
 
-详见 [`specs/runtime/design.md`](specs/runtime/design.md)。
+## 7. HAL
 
-## 7. RuntimeCore、Provider 与 RHI
+HAL（`source/include/VernonHal.h`）是设备之上的薄层：buffer、image、view、
+sampler、recording、submission、timeline point 和 presentable surface。
+每个后端是一个 HAL device：
 
-RuntimeCore 处理 provider-neutral 的 Program resolve、binding plans、invocation
-materialization 和 publication。Provider 处理 physical resource、commands、
-submission 和 completion。VernonRHI 实现内建 GPU provider：
-
+- CPU：compute；
 - CUDA：compute；
-- Vulkan：compute 和 offscreen graphics；
-- DirectX 12：compute 和 offscreen graphics；
-- Metal：compute 和 offscreen graphics；
-- OpenGL/OpenGL ES：外部 context 下的 compute 和 graphics。
+- Vulkan：compute、graphics 和 presentable surface；
+- OpenGL 4.3：外部 context 下的 compute 和 graphics；
+- OpenGL 3.3：外部 context 下的 graphics，compute 在 CPU device 上运行。
 
-CPU provider 独立实现 compute，不依赖 VernonRHI。Backend 编译进 binary
-不代表运行时一定可用；loader、device、context、API version 和 required
-features 都必须通过 capability validation。
+DirectX 12、Metal、WebGPU、OpenGL ES 和 wasm32 CPU 在 phase 4 迁移到 HAL
+之前不受支持。Backend 编译进 binary 不代表运行时一定可用；loader、device、
+context、API version 和 required features 都必须通过 capability validation。
 
 ## 8. Graphics
 
@@ -204,7 +197,7 @@ Attachment load/store/clear/resolve 属于 render-pass semantics，不是 pipeli
 state。Draw counts 必须显式提供，不能从 vertex input 推导。
 
 Compute 与 graphics 通过相同 Program Values、Storages、transfers 和 hazards
-组合。相邻 draw 的 native render-pass fusion 是 Command DAG 优化。
+组合。相邻 draw 的 native render-pass 合并由 linker 决定。
 
 详见
 [`specs/program/graphics_execution.md`](specs/program/graphics_execution.md)。

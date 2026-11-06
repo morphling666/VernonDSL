@@ -370,7 +370,7 @@ Made<VernonProgramArgument> InternalBuffers::argument(const PassOffsets &offsets
         VernonProgramArgument argument{};
         argument.kind = VERNON_PROGRAM_TENSOR;
         argument.tensor.struct_size = sizeof(argument.tensor);
-        argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+        argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
         argument.tensor.resource = found.value()->reference;
         argument.tensor.access = VERNON_ACCESS_READ;
         argument.tensor.rank = 1;
@@ -429,7 +429,7 @@ Made<VernonProgramArgument> InternalBuffers::argument(const PassOffsets &offsets
     VernonProgramArgument argument{};
     argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(argument.tensor);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    argument.tensor.storage = VERNON_TENSOR_DEVICE_RESOURCE;
     argument.tensor.resource = found.value()->reference;
     argument.tensor.access = VERNON_ACCESS_READ_WRITE;
     argument.tensor.rank = static_cast<uint32_t>(extents->size());
@@ -491,7 +491,7 @@ Made<void> PassPlanner::plan(const PassCommandBuffer &commands, const uint8_t *r
             if (!command.pass.zeroed[parameter])
                 continue;
             const auto argument = readRecord<VernonProgramArgument>(record, command.pass.parameters[parameter]);
-            if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
+            if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_DEVICE_RESOURCE)
                 return Made<void>{err(
                     (copy ? std::string("a leaf copy")
                           : "pass '" + static_cast<const PassExecutable &>(*command.executable).source().node->name +
@@ -507,6 +507,7 @@ Made<void> PassPlanner::plan(const PassCommandBuffer &commands, const uint8_t *r
         }
         if (copy) {
             PlannedPass &pass = *planned.passes.emplace_back(&planned.fresh.emplace_back());
+            pass.command = &command;
             if (auto made = planCopy(command, record, pass); made.isErr())
                 return made;
             interrupted = true;
@@ -515,6 +516,7 @@ Made<void> PassPlanner::plan(const PassCommandBuffer &commands, const uint8_t *r
         const auto &executable = static_cast<const PassExecutable &>(*command.executable);
         if (command.pass.compute) {
             PlannedPass &pass = *planned.passes.emplace_back(&planned.fresh.emplace_back());
+            pass.command = &command;
             if (auto made = planCompute(executable, command.pass, record, pass); made.isErr())
                 return made;
             // A dispatch ends the scope before it: no pass after it fuses with a pass before it.
@@ -525,6 +527,7 @@ Made<void> PassPlanner::plan(const PassCommandBuffer &commands, const uint8_t *r
         if (made.isErr())
             return Made<void>{err(std::move(made).error())};
         PlannedPass &pass = *planned.passes.emplace_back(made.value());
+        pass.command = &command;
         // One candidate region: adjacent passes fuse whenever their attachments allow it.
         if (materializer.materialize(0, pass.targets, pass.reads, std::exchange(interrupted, false)) ==
             runtime::GraphicsScopeMaterialization::Fuse) {
@@ -605,7 +608,7 @@ Made<void> PassPlanner::planCopy(const DispatchCommand &command, const uint8_t *
         return Made<void>{err("a leaf copy: " + carrier.error())};
     const VernonTensorView &view = storage.value().tensor;
     const VernonTensorView &dense = carrier.value().tensor;
-    if (storage.value().kind != VERNON_PROGRAM_TENSOR || view.storage != VERNON_TENSOR_RHI_RESOURCE ||
+    if (storage.value().kind != VERNON_PROGRAM_TENSOR || view.storage != VERNON_TENSOR_DEVICE_RESOURCE ||
         (view.rank && !view.shape))
         return Made<void>{err(std::string("a leaf copy's Storage is no device Tensor"))};
     uint64_t elements = 1;

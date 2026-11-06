@@ -65,16 +65,6 @@ typedef struct VernonHalDeviceDescriptor {
     uint32_t reserved[4];
 } VernonHalDeviceDescriptor;
 
-typedef enum VernonHalFormatCapabilityBits {
-    VERNON_HAL_FORMAT_RENDERABLE = 1u << 0,
-    VERNON_HAL_FORMAT_BLENDABLE = 1u << 1,
-    VERNON_HAL_FORMAT_FILTERABLE = 1u << 2,
-    VERNON_HAL_FORMAT_STORAGE = 1u << 3,
-    VERNON_HAL_FORMAT_RESOLVABLE = 1u << 4,
-    VERNON_HAL_FORMAT_MULTISAMPLE = 1u << 5,
-    VERNON_HAL_FORMAT_COPYABLE = 1u << 6
-} VernonHalFormatCapabilityBits;
-
 /* Every buffer may be the source and destination of host transfers. */
 typedef enum VernonHalBufferUsageBits {
     VERNON_HAL_BUFFER_UNIFORM = 1u << 0,
@@ -111,26 +101,6 @@ typedef struct VernonHalBufferRead {
     void *destination;
     uint64_t size;
 } VernonHalBufferRead;
-
-/* The host layout of image transfer data, tightly packed rows of texels; values match the format table's columns. */
-typedef enum VernonHalImageDataFormat {
-    VERNON_HAL_IMAGE_DATA_RED = 0,
-    VERNON_HAL_IMAGE_DATA_RG = 1,
-    VERNON_HAL_IMAGE_DATA_RGB = 2,
-    VERNON_HAL_IMAGE_DATA_BGR = 3,
-    VERNON_HAL_IMAGE_DATA_RGBA = 4,
-    VERNON_HAL_IMAGE_DATA_BGRA = 5,
-    VERNON_HAL_IMAGE_DATA_DEPTH = 6,
-    VERNON_HAL_IMAGE_DATA_DEPTH_STENCIL = 7,
-    VERNON_HAL_IMAGE_DATA_STENCIL = 8
-} VernonHalImageDataFormat;
-
-typedef enum VernonHalImageDataType {
-    VERNON_HAL_IMAGE_DATA_UINT8 = 0,
-    VERNON_HAL_IMAGE_DATA_FLOAT16 = 1,
-    VERNON_HAL_IMAGE_DATA_FLOAT32 = 2,
-    VERNON_HAL_IMAGE_DATA_UINT32 = 3
-} VernonHalImageDataType;
 
 /* A box of one mip level and layer, the aspects it transfers (VernonImageAspectBits), and the host layout of its
  * data. */
@@ -231,7 +201,7 @@ typedef struct VernonHalSurfaceConfiguration {
 /*
  * A 2D image with one mip level, layer and sample in the configured format, extent and usage, and a view of all of
  * it. The surface owns both, which stay valid until the next present. The contents are undefined: the first use must
- * write the image, so a scope that preserves it and a read of it fail until one does.
+ * write the image, by a schedule or a host write, so a scope that preserves it and a read of it fail until one does.
  */
 typedef struct VernonHalSurfaceImage {
     VernonHalImage *image;
@@ -322,7 +292,10 @@ VERNON_RUNTIME_CAPI VernonHalStatus vernonHalCreateSurface(VernonHalDevice *devi
 VERNON_RUNTIME_CAPI VernonHalStatus vernonHalDestroySurface(VernonHalSurface *surface);
 VERNON_RUNTIME_CAPI VernonHalStatus vernonHalSurfaceGetCapabilities(VernonHalSurface *surface,
                                                                     VernonHalSurfaceCapabilities *output);
-/* Replaces the surface's images. A zero extent, which a minimized window reports, returns INVALID_ARGUMENT. */
+/*
+ * Replaces the surface's images. A zero extent, which a minimized window reports, or an unknown present mode returns
+ * INVALID_ARGUMENT; a format, usage, present mode or image count outside the surface's capabilities UNSUPPORTED.
+ */
 VERNON_RUNTIME_CAPI VernonHalStatus vernonHalSurfaceConfigure(VernonHalSurface *surface,
                                                               const VernonHalSurfaceConfiguration *configuration);
 /* May block until an image is available; a failed acquire leaves no image acquired. */

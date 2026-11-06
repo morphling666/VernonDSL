@@ -136,6 +136,25 @@ bit for bit with numba and numpy. Kernel launches take the same one-node
 path; multi-node schedules replay a CUDA graph, whose per-node cost is in
 [`training_step.md`](training_step.md).
 
+## After step 5
+
+The same command after section 16.3 step 5 of `architecture_v2.md`, at
+`f840106` with uncommitted work. Raw results:
+`linked_schedules_cuda_step5.json`.
+
+| workload | mode | numba | VernonDSL | ratio |
+|---|---|---:|---:|---:|
+| axpy | resident | 0.242 | 0.229 | 0.95x |
+| axpy | roundtrip | 25.6 | 93.3 | 3.6x |
+| launch_64 | resident | 0.026 | 0.012 | 0.47x |
+| relief | resident | 1.29 | 1.27 | 0.99x |
+| relief | roundtrip | 23.8 | 57.5 | 2.4x |
+| nearest_segment | resident | 10.4 | 9.79 | 0.94x |
+| nearest_segment | roundtrip | 27.4 | 77.3 | 2.8x |
+
+Every row matches phase 2 within 1%, or is below it, and all three
+workloads agree bit for bit with numba and numpy.
+
 ## What remains
 
 - **Gate.** Every resident row is at or below numba's, and `launch_64` is

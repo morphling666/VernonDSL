@@ -12,7 +12,6 @@
 #include "target_binding_plan.h"
 
 #include "VernonFormats.hpp"
-#include "VernonRHI.h"
 
 #include <nlohmann/json.hpp>
 
@@ -160,13 +159,9 @@ bool loadModuleBytes(const ArtifactSystem &artifacts, const std::string &artifac
     return loadCodeModuleBytes(artifacts, artifactId, bundleRoot, stage->second.modules.front(), bytes, diagnostic);
 }
 
-// A context without an RHI device has no images, so the table baseline stands in for it.
-uint32_t deviceFormatCapabilities(const VernonRuntimeContext &context, const vernon::formats::Format &format) {
-    uint32_t capabilities = format.baseline;
-    if (context.rhiDevice.index != VERNON_RHI_INVALID_HANDLE_INDEX &&
-        vernonRhiDeviceGetFormatCapabilities(context.rhiDevice, format.rhi, &capabilities) != VERNON_RHI_STATUS_OK)
-        capabilities = 0;
-    return capabilities;
+// Loading checks a format against its class baseline; the HAL device that creates an image narrows it there.
+uint32_t deviceFormatCapabilities(const VernonRuntimeContext &, const vernon::formats::Format &format) {
+    return format.baseline;
 }
 
 bool validateImageStorageFormats(const Program &program, const FormatCapabilityQuery &capabilities,
@@ -175,12 +170,12 @@ bool validateImageStorageFormats(const Program &program, const FormatCapabilityQ
         const Storage &storage = program.storages[index];
         if (storage.descriptorKind != StorageDescriptorKind::Image)
             continue;
-        uint32_t required = storage.image.sampleCount > 1 ? VERNON_RHI_FORMAT_MULTISAMPLE : 0u;
+        uint32_t required = storage.image.sampleCount > 1 ? VERNON_HAL_FORMAT_MULTISAMPLE : 0u;
         for (const std::string &usage : storage.image.usage)
             if (usage == "storage")
-                required |= VERNON_RHI_FORMAT_STORAGE;
+                required |= VERNON_HAL_FORMAT_STORAGE;
             else if (usage == "color_attachment" || usage == "depth_stencil_attachment")
-                required |= VERNON_RHI_FORMAT_RENDERABLE;
+                required |= VERNON_HAL_FORMAT_RENDERABLE;
         // Sampled-only images may leave their format unknown until binding.
         if (!required)
             continue;
@@ -199,8 +194,8 @@ bool validateAttachmentFormats(const GraphicsAttachmentSignature &attachment, bo
                                Diagnostic &diagnostic) {
     const bool singleSampled =
         std::find(attachment.sampleCounts.begin(), attachment.sampleCounts.end(), 1u) != attachment.sampleCounts.end();
-    const uint32_t required = VERNON_RHI_FORMAT_RENDERABLE | (blended ? VERNON_RHI_FORMAT_BLENDABLE : 0u) |
-                              (singleSampled ? 0u : VERNON_RHI_FORMAT_MULTISAMPLE);
+    const uint32_t required = VERNON_HAL_FORMAT_RENDERABLE | (blended ? VERNON_HAL_FORMAT_BLENDABLE : 0u) |
+                              (singleSampled ? 0u : VERNON_HAL_FORMAT_MULTISAMPLE);
     bool integer = !attachment.formats.empty();
     for (VernonTextureFormat texture : attachment.formats) {
         const vernon::formats::Format *format = vernon::formats::find(texture);
@@ -374,6 +369,18 @@ StageLoadResult loadComputeNodePipeline(VernonRuntimeContext &context, const Art
     return StageLoadResult{vernon::ok(std::move(loaded))};
 }
 
+std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews(const Program &program) {
+    std::vector<vernon::runtime::ValueLayout> views(program.abi.boundarySlots.size());
+    for (size_t index = 0; index < program.abi.boundarySlots.size(); ++index) {
+        const BoundarySlot &slot = program.abi.boundarySlots[index];
+        if (slot.layout) {
+            views[index] = materializeValueLayout(*slot.layout, slot.logicalType);
+            rebuildValueLayoutPathViews(views[index]);
+        }
+    }
+    return views;
+}
+
 } // namespace
 
 bool validateTargetFormats(const Program &program, const FormatCapabilityQuery &capabilities, Diagnostic &diagnostic) {
@@ -405,14 +412,7 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
         return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
     auto plan = std::make_shared<ResolvedExecutionPlan>();
     plan->resolvedProgram = std::move(program);
-    plan->boundaryLayoutViews.resize(plan->resolvedProgram->program.abi.boundarySlots.size());
-    for (size_t index = 0; index < plan->resolvedProgram->program.abi.boundarySlots.size(); ++index) {
-        const auto &slot = plan->resolvedProgram->program.abi.boundarySlots[index];
-        if (slot.layout) {
-            plan->boundaryLayoutViews[index] = materializeValueLayout(*slot.layout, slot.logicalType);
-            rebuildValueLayoutPathViews(plan->boundaryLayoutViews[index]);
-        }
-    }
+    plan->boundaryLayoutViews = boundaryLayoutViews(plan->resolvedProgram->program);
     std::unordered_map<std::string, size_t> cachedStages;
     for (const ResolvedExecutableNode &node : executable.nodes) {
         const std::string identity = physicalStageIdentity(node.stage->stage);
@@ -483,9 +483,8 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context,
         plan->nodes.emplace(
             key, ResolvedNodePlan{key, plan->stageCache[cached->second], std::move(projections), std::move(controls)});
     }
-    if (buildResolvedExecutionPolicies(*plan, diagnostic).isErr() ||
-        validateResolvedExecutionPlan(*plan, diagnostic).isErr())
-        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    if (auto completed = completeResolvedExecutionPlan(*plan); completed.isErr())
+        return ProgramLoadResult{vernon::err(programLoadError(completed.error()))};
     auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(child).value(),
                                                               std::move(instanceOwner).value(), std::move(plan));
     if (!vernon::runtime::ad::resolveDerivativeGroups(*pipeline)) {
@@ -513,6 +512,32 @@ ProgramLoadResult loadBackendProgramPipeline(VernonRuntimeContext &context, cons
     }
     auto owner = std::make_shared<ResolvedProgram>(std::move(resolved).value());
     return loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic);
+}
+
+ProgramLoadResult composedProgramExecutable(VernonRuntimeContext &context, Program program) {
+    Diagnostic diagnostic;
+    auto child = RuntimeChildLifecycle::reserve(context.owner);
+    if (child.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "runtime context cannot admit a Program executable");
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    }
+    auto instanceOwner = vernon::OwnerControlBlock::create();
+    if (instanceOwner.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot create Program executable lifecycle");
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    }
+    auto resolved = std::make_shared<ResolvedProgram>();
+    resolved->program = std::move(program);
+    auto plan = std::make_shared<ResolvedExecutionPlan>();
+    plan->boundaryLayoutViews = boundaryLayoutViews(resolved->program);
+    plan->resolvedProgram = std::move(resolved);
+    auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(child).value(),
+                                                              std::move(instanceOwner).value(), std::move(plan));
+    if (pipeline->lifecycle.publish().isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot publish Program executable");
+        return ProgramLoadResult{vernon::err(programLoadError(diagnostic))};
+    }
+    return ProgramLoadResult{vernon::ok(std::move(pipeline))};
 }
 
 std::string renderProgramLoadError(const ProgramLoadError &error) {

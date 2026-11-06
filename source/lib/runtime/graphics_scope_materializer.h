@@ -3,6 +3,7 @@
 
 #include "graphics_invocation_planner.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -32,12 +33,11 @@ struct GraphicsRenderScope {
     GraphicsScopeReads reads;
     uint32_t width{};
     uint32_t height{};
+    // {x, y, width, height}, as in PlannedRenderTargets.
+    std::array<uint32_t, 4> area{};
 };
 
 GraphicsRenderScope graphicsRenderScope(const PlannedRenderTargets &targets, GraphicsScopeReads reads);
-
-// Points into `scope`, which must outlive the descriptor.
-VernonRuntimeProviderRenderingDescriptor graphicsRenderingDescriptor(const GraphicsRenderScope &scope);
 
 enum class GraphicsScopeMaterialization {
     Begin,

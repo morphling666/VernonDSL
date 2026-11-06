@@ -676,7 +676,7 @@ bool planProgramImageEndpoint(const llvm::json::Object &row, const ProgramLogica
     if (role == "storage") {
         const std::string_view format(row.getString("exact_storage_format").value_or(""));
         const vernon::formats::Format *entry = vernon::formats::find(format);
-        if (!entry || !entry->allows(VERNON_RHI_FORMAT_STORAGE)) {
+        if (!entry || !entry->allows(VERNON_HAL_FORMAT_STORAGE)) {
             error = "compiled storage image endpoint has no storage-capable exact format";
             return false;
         }

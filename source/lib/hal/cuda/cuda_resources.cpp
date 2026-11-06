@@ -7,8 +7,7 @@
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 
-#include "rhi/cuda_backend.h"
-#include "rhi/rhi_internal.h"
+#include "hal/cuda/cuda_state.h"
 
 #include <limits>
 #include <new>
@@ -18,11 +17,11 @@
 namespace vernon::hal {
 namespace {
 
-using rhi::cuda::DevicePointer;
-using rhi::cuda::DeviceState;
+using cuda::DevicePointer;
+using cuda::DeviceState;
 
-template <typename T = void> Done<T> cudaFailure(rhi::cuda::Result status, const char *what) {
-    return fail<T>(VERNON_HAL_INTERNAL_ERROR, rhi::cuda::describeResult(status, what));
+template <typename T = void> Done<T> cudaFailure(cuda::Result status, const char *what) {
+    return fail<T>(VERNON_HAL_INTERNAL_ERROR, cuda::describeResult(status, what));
 }
 
 struct CudaHalBuffer final : VernonHalBuffer {
@@ -43,7 +42,7 @@ Done<VernonRuntimeProviderResourceReference> unsupported(const char *what) {
 
 class CudaResources final : public Resources {
 public:
-    explicit CudaResources(DeviceState &state) : state_(state) {}
+    explicit CudaResources(std::shared_ptr<DeviceState> state) : owner_(std::move(state)), state_(*owner_) {}
 
     Done<uint32_t> formatCapabilities(VernonTextureFormat format) override {
         if (!formats::find(format))
@@ -56,8 +55,8 @@ public:
         if (descriptor.size > (std::numeric_limits<size_t>::max)())
             return fail<std::unique_ptr<VernonHalBuffer>>(VERNON_HAL_RESOURCE_EXHAUSTED, "the buffer is too large");
         DevicePointer pointer{};
-        const rhi::cuda::Result status = state_.allocate(pointer, static_cast<size_t>(descriptor.size));
-        if (status != rhi::cuda::kSuccess)
+        const cuda::Result status = state_.allocate(pointer, static_cast<size_t>(descriptor.size));
+        if (status != cuda::kSuccess)
             return cudaFailure<std::unique_ptr<VernonHalBuffer>>(status, "cuMemAlloc");
         auto buffer = std::unique_ptr<CudaHalBuffer>(new (std::nothrow) CudaHalBuffer(state_, pointer));
         if (!buffer) {
@@ -68,23 +67,15 @@ public:
     }
 
     Done<void> write(VernonHalBuffer &buffer, const VernonHalBufferWrite *writes, size_t count) override {
-        std::vector<VernonRhiBufferUploadRange> ranges(count);
-        for (size_t index = 0; index < count; ++index)
-            ranges[index] = {writes[index].offset, writes[index].source, writes[index].size};
-        const rhi::cuda::Result status =
-            state_.uploadRanges(static_cast<CudaHalBuffer &>(buffer).pointer, ranges.data(), ranges.size());
-        if (status != rhi::cuda::kSuccess)
+        const cuda::Result status = state_.uploadRanges(static_cast<CudaHalBuffer &>(buffer).pointer, writes, count);
+        if (status != cuda::kSuccess)
             return cudaFailure(status, "cannot write the buffer");
         return Done<void>{ok()};
     }
 
     Done<void> read(VernonHalBuffer &buffer, const VernonHalBufferRead *reads, size_t count) override {
-        std::vector<VernonRhiBufferDownloadRange> ranges(count);
-        for (size_t index = 0; index < count; ++index)
-            ranges[index] = {reads[index].offset, reads[index].destination, reads[index].size};
-        const rhi::cuda::Result status =
-            state_.downloadRanges(static_cast<CudaHalBuffer &>(buffer).pointer, ranges.data(), ranges.size());
-        if (status != rhi::cuda::kSuccess)
+        const cuda::Result status = state_.downloadRanges(static_cast<CudaHalBuffer &>(buffer).pointer, reads, count);
+        if (status != cuda::kSuccess)
             return cudaFailure(status, "cannot read the buffer");
         return Done<void>{ok()};
     }
@@ -146,16 +137,16 @@ public:
     }
 
 private:
+    std::shared_ptr<DeviceState> owner_;
     DeviceState &state_;
 };
 
 } // namespace
 
-std::unique_ptr<Resources> createCudaResources(VernonRhiDevice device) {
-    auto state = rhi::deviceState(device, VERNON_RHI_BACKEND_CUDA);
-    if (state.isErr() || !state.value())
+std::unique_ptr<Resources> createCudaResources(std::shared_ptr<cuda::DeviceState> state) {
+    if (!state)
         return nullptr;
-    return std::unique_ptr<Resources>(new (std::nothrow) CudaResources(*static_cast<DeviceState *>(state.value())));
+    return std::unique_ptr<Resources>(new (std::nothrow) CudaResources(std::move(state)));
 }
 
 } // namespace vernon::hal
@@ -164,7 +155,7 @@ std::unique_ptr<Resources> createCudaResources(VernonRhiDevice device) {
 
 namespace vernon::hal {
 
-std::unique_ptr<Resources> createCudaResources(VernonRhiDevice) { return nullptr; }
+std::unique_ptr<Resources> createCudaResources(std::shared_ptr<cuda::DeviceState>) { return nullptr; }
 
 } // namespace vernon::hal
 

@@ -3,7 +3,6 @@
 
 #include "VernonCommon.h"
 #include "VernonOpenGLContext.h"
-#include "VernonRHI.h"
 #include "VernonRuntimeProvider.h"
 #include "VernonTextureTypes.h"
 
@@ -33,7 +32,7 @@ typedef enum VernonRuntimeOperationStatus {
     VERNON_RUNTIME_OPERATION_VERIFICATION_FAILURE = 3,
     VERNON_RUNTIME_OPERATION_UNSUPPORTED = 4,
     VERNON_RUNTIME_OPERATION_RESOURCE_EXHAUSTED = 5,
-    VERNON_RUNTIME_OPERATION_RHI_FAILURE = 6,
+    VERNON_RUNTIME_OPERATION_DEVICE_FAILURE = 6,
     VERNON_RUNTIME_OPERATION_LIFECYCLE_FAILURE = 7,
     VERNON_RUNTIME_OPERATION_INTERNAL_FAILURE = 8
 } VernonRuntimeOperationStatus;
@@ -61,7 +60,7 @@ typedef struct VernonRuntimeCapabilities {
 
 typedef struct VernonRuntimeCreateOptions {
     uint32_t struct_size;
-    /* Selects the device of a backend Runtime creates; zero for a context over a caller's RHI device. */
+    /* Selects the device of the backend. */
     uint32_t device_index;
     /* Reserved for future use; initialize all elements to zero. */
     uint32_t reserved[4];
@@ -77,10 +76,6 @@ VERNON_RUNTIME_CAPI VernonRuntimeCapabilities vernonRuntimeGetCapabilities(Verno
 VERNON_RUNTIME_CAPI VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateWithOptions(VernonRuntimeBackend backend,
                                                                          const VernonRuntimeCreateOptions *options);
-/* `options` may be null; its device_index must be zero. */
-VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backend,
-                                                                          VernonRhiDevice device,
-                                                                          const VernonRuntimeCreateOptions *options);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
 
@@ -312,19 +307,6 @@ typedef struct VernonDynamicState {
     uint32_t stencil_reference;
 } VernonDynamicState;
 
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
-                                                                 uint64_t offset, uint64_t size,
-                                                                 VernonRuntimeProviderResourceReference *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiImageView(VernonRuntimeContext *context,
-                                                                    VernonRhiImageView view,
-                                                                    VernonRuntimeProviderResourceReference *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context,
-                                                                  VernonRhiSampler sampler,
-                                                                  VernonRuntimeProviderResourceReference *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *context,
-                                                                         VernonRhiCommandEncoder encoder,
-                                                                         VernonRuntimeProviderObject *output);
-
 typedef enum VernonDataType {
     VERNON_DATA_BOOL = 0,
     VERNON_DATA_I32 = 1,
@@ -383,7 +365,7 @@ typedef enum VernonValueAccess {
     VERNON_ACCESS_READ_WRITE = 2
 } VernonValueAccess;
 
-typedef enum VernonTensorStorage { VERNON_TENSOR_HOST = 0, VERNON_TENSOR_RHI_RESOURCE = 1 } VernonTensorStorage;
+typedef enum VernonTensorStorage { VERNON_TENSOR_HOST = 0, VERNON_TENSOR_DEVICE_RESOURCE = 1 } VernonTensorStorage;
 
 typedef struct VernonValueLeafView {
     uint32_t dtype;
@@ -648,7 +630,9 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindImageConstrai
 /* The control slots a graphics node reads its per-call controls from.
  *
  * A Program assigns each control its own slot when it is compiled, so a caller cannot assume any particular number
- * and must ask before binding. `node` is the graph node id the controls belong to. */
+ * and must ask before binding. `node` is the graph node id the controls belong to; in a composed Program graph it
+ * counts the forward nodes of every earlier Program, as the graph's linked schedule numbers them, and the control
+ * slots are those of the Program that draws the node. */
 typedef struct VernonProgramGraphicsControlsView {
     uint32_t struct_size;
     uint32_t node;
@@ -663,7 +647,8 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsContro
 /*
  * Recorded draws (specs/program/recorded_draws.md). A pipeline draws inside graphics Node `node` of `executable`;
  * `source` is a resolved one-node graphics Program on the same context that conforms to the Node. A null `source`
- * returns pipeline 0, the Node's own Stage. Pipelines and binding sets retain the executables they refer to, so those
+ * returns pipeline 0, the Node's own Stage; a composed Program graph takes a `source`. Pipelines and binding sets
+ * retain the executables they refer to, so those
  * executables cannot be destroyed while either is alive.
  */
 typedef struct VernonGraphicsPipeline VernonGraphicsPipeline;

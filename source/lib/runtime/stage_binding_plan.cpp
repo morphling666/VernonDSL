@@ -30,7 +30,7 @@ std::optional<VernonTextureDimension> artifactTextureDimension(const std::string
 
 std::optional<VernonTextureFormat> artifactStorageFormat(const std::string &format) {
     const vernon::formats::Format *entry = vernon::formats::find(std::string_view(format));
-    if (!entry || !entry->allows(VERNON_RHI_FORMAT_STORAGE))
+    if (!entry || !entry->allows(VERNON_HAL_FORMAT_STORAGE))
         return std::nullopt;
     return entry->texture;
 }

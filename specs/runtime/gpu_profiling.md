@@ -15,8 +15,9 @@ Nodes and every backend, not only graphics.
 
 ## 1. Rejected alternatives
 
-- **Engine-side native markers.** The Engine has no command encoder; adding
-  one violates the Runtime's ownership of recording.
+- **Engine-side native markers.** `VernonHal.h` has no command encoder,
+  because commands are recorded only from linked schedules; adding one
+  violates the Runtime's ownership of recording.
 - **Labels only per Node.** Captures of a forward pass with hundreds of draws
   are unreadable without groups inside the pass, and adding recording
   commands later would change the recording format.
@@ -26,8 +27,8 @@ Nodes and every backend, not only graphics.
   schedule from the one that ships.
 - **Labels as identity.** Node names are diagnostic labels and never identity
   (`../program/execution_manifest.md` section 1).
-- **NVTX push/pop ranges on CUDA.** They belong to the calling thread, and an
-  encoder may pop or be abandoned on another thread than the one that pushed;
+- **NVTX push/pop ranges on CUDA.** They belong to the calling thread, and a
+  call's ranges may end on another thread than the one that began them;
   start/end ranges belong to the process.
 - **CPU labels.** No capture tool reads them; CPU profilers (Tracy, ETW,
   Instruments) have their own zones, and the Runtime takes no profiler
@@ -48,7 +49,7 @@ Node groups:
   when it has no name. Nesting under the label keeps captures readable when
   one child contributes several passes; the previous `node/<id>/<name>`
   prefix carried no information a capture reader can use.
-- On a device created with `VERNON_RHI_DEVICE_LABELS`
+- On a device created with `VERNON_HAL_DEVICE_LABELS`
   ([`hot_path_diagnostics.md`](hot_path_diagnostics.md) section 4), Execute
   wraps each Node's commands, including its barriers and render scope, in one
   debug group carrying the label. When graphics Nodes fuse into
@@ -75,16 +76,19 @@ carry the `KHR` suffix; no-ops without them, as on macOS OpenGL 4.1); Vulkan
 `BeginEvent`, `EndEvent` and `SetMarker` on the command list; Metal
 `pushDebugGroup`, `popDebugGroup` and `insertDebugSignpost` on the render
 encoder inside a rendering scope and on the command buffer outside one; CUDA
-NVTX `nvtxDomainRangeStartEx`, `nvtxDomainRangeEnd` and `nvtxDomainMarkEx` in
-the `Vernon` domain, at record time because CUDA enqueues commands as they are
-recorded. CPU Programs have no labels.
+NVTX `nvtxDomainRangeStartEx` and `nvtxDomainRangeEnd` in the `Vernon` domain
+around each labelled dispatch's launch, at submission because CUDA enqueues
+commands as they are submitted. CPU Programs have no labels.
 
 - NVTX is header-only and loads a tool only when one sets
   `NVTX_INJECTION64_PATH` (Nsight Systems does), so it adds no runtime
   dependency.
-- OpenGL groups live on the context and NVTX ranges on the process, so an
-  encoder destroyed with open groups closes them; other backends discard them
-  with the native recording.
+- A labelled CUDA device launches on the stream rather than replaying a CUDA
+  graph, as a timed call does (section 3): one graph launch would merge the
+  ranges of its dispatches.
+- OpenGL groups live on the context, and a recording's groups balance, so a
+  call never leaves a group open there; other backends keep groups in the
+  native command buffer.
 
 - GL limits the group depth and the message length. A push at the context's
   maximum depth is skipped together with its pop, and a label is cut at the
@@ -95,13 +99,9 @@ recorded. CPU Programs have no labels.
 - A Metal render encoder that restarts inside one rendering scope pops its
   open groups before it ends and pushes them again on the new encoder.
 
-RHI: `vernonRhiCommandEncoderPushDebugGroup(encoder, label)`,
-`vernonRhiCommandEncoderPopDebugGroup(encoder)` and
-`vernonRhiCommandEncoderInsertDebugMarker(encoder, label)`. Unsupported
-backends accept all three as no-ops. Labels are copied at the call, so callers
-may pass temporaries. The RHI validates nesting on every backend: a pop needs
-an open group, a group pushed inside a rendering scope closes before the scope
-ends, and Finish fails while a group is open.
+The HAL has no label functions of its own: labels reach a device only through
+schedules, whose recordings are checked for balance as above, and a backend
+without debug groups drops them when it builds its recording.
 
 ## 3. Timings
 
@@ -125,20 +125,13 @@ ends, and Finish fails while a group is open.
   (`architecture_v2.md` section 8): the getter returns
   `VERNON_STATUS_NOT_READY` until a `vernonScheduleWait` for the point
   returned, and a device keeps only its latest few calls' timings. A failed
-  call reports no scopes: like the RHI's timers, scope timings describe only
-  work that succeeded. A renderer with frames in flight reads frame `f - N`
-  from the point it waits on.
-- RHI: `vernonRhiCommandEncoderBeginTimer(encoder, &timer)` and
-  `vernonRhiCommandEncoderEndTimer(encoder, timer)` bracket commands outside
-  rendering scopes, and `vernonRhiCompletionGetTimers(completion, spans,
-  capacity, count)` reads `VernonRhiTimerSpan { begin_nanoseconds,
-  end_nanoseconds }` per timer in begin order, measured from the first
-  timer's begin, once the completion succeeded. Timers may nest, Finish fails
-  while one is open, and the encoder owns the backend's query storage, which
-  moves to the completion and is released when the completion is destroyed.
-  A backend without timing accepts the calls and records nothing; the getter
-  reports `VERNON_RHI_STATUS_UNSUPPORTED`.
-- Timers instead of raw timestamps: Metal samples counters only when an
+  call reports no scopes: scope timings describe only work that succeeded. A
+  renderer with frames in flight reads frame `f - N` from the point it waits
+  on.
+- Each scope has a begin and an end edge, recorded outside rendering
+  scopes. The device's query storage belongs to the recording's frame slot
+  and is read when the call retires.
+- Edge pairs instead of raw timestamps: Metal samples counters only when an
   encoder begins or ends (`MTLCounterSamplingPointAtStageBoundary` on tile
   GPUs), so a timestamp inside a rendering scope has no Metal equivalent,
   while a begin/end pair outside rendering scopes maps to every backend.
@@ -149,22 +142,17 @@ ends, and Finish fails while a group is open.
   whose disjoint flag fails the read where the driver accepts
   `GL_GPU_DISJOINT_EXT`); Vulkan timestamp query pools, reset on the command buffer
   before their first write, when the queue's `timestampValidBits` is not 0;
-  D3D12 timestamp query heaps resolved with `ResolveQueryData` and
-  `GetTimestampFrequency`; CUDA `cuEventRecord`, read with
-  `cuEventElapsedTime` from the first event, whose half-microsecond
-  resolution bounds the span; Metal an empty blit encoder per timer edge,
-  sampled at its start into a timestamp counter sample buffer and scaled to
-  nanoseconds with `sampleTimestamps` pairs. No encoder is open at a timer
-  edge, since edges lie outside rendering scopes, so the marker encoder needs
-  no change to the encoders that record work; a GPU that drops the empty
-  encoder reports an error sample, which fails the read. CPU Programs bypass
-  the RHI and time each Node with the host steady clock around its dispatch.
+  CUDA `cuEventRecord`, read with `cuEventElapsedTime` from the first event,
+  whose half-microsecond resolution bounds the span. In phase 4, D3D12 uses
+  timestamp query heaps resolved with `ResolveQueryData` and
+  `GetTimestampFrequency`, and Metal an empty blit encoder per edge, sampled
+  at its start into a timestamp counter sample buffer and scaled to
+  nanoseconds with `sampleTimestamps` pairs; a GPU that drops the empty
+  encoder reports an error sample, which fails the read.
 - A span covers the time the device reached its end edge after its begin
-  edge. GL and CUDA run commands as they are recorded, so an idle device
-  reaches each edge as soon as it is recorded and a span there also covers
-  the host time recording its commands; the spans of short scopes are host
-  bound on these backends. Section 8 records the deferred replay that would
-  remove this.
+  edge. Commands are recorded before the call (section 8), so a span does not
+  cover host recording time; on GL and CUDA, which execute as the call issues
+  them, it covers the driver's per-command cost of the call.
 - A backend without timing support (GL ES without
   `EXT_disjoint_timer_query`, Vulkan without timestamp bits, Metal without
   stage-boundary sampling) reports `VERNON_STATUS_UNSUPPORTED_TARGET` from the
@@ -197,7 +185,8 @@ Labels, on every backend with graphics support and on CUDA for compute:
    containing exactly its Node's render scope or dispatches, and a recording
    with nested groups shows them nested inside its Node.
 2. An unbalanced recording fails with `PROGRAM_RECORDING_INVALID`.
-3. An encoder destroyed with open groups leaves no group open.
+3. A recording with debug groups draws the same pixels with and without
+   `LABELS`.
 
 Timings, on every backend:
 
@@ -210,42 +199,27 @@ Timings, on every backend:
 ## 7. Contract changes on acceptance
 
 - [`design.md`](design.md): schedule calls emit debug groups and optional
-  timings (applied in section 8); the RHI functions of sections 2 and 3.
+  timings (applied in section 8).
 - [`../program/recorded_draws.md`](../program/recorded_draws.md): the
   recording gains the three debug commands and the balance rule (applied).
 - [`../program/execution_manifest.md`](../program/execution_manifest.md):
   `name` is also the debug label (applied).
-- `VernonRuntime.h`, `VernonSchedule.h` and `VernonRHI.h`
-  (`PROGRAM_VERSION`): the label functions, command kinds and `AddProgram`
-  label are in place, as are `vernonScheduleSetTimings`,
-  `vernonScheduleGetScopeTimings` and the RHI timer functions.
+- `VernonRuntime.h` and `VernonSchedule.h` (`PROGRAM_VERSION`): the label
+  functions, command kinds and `AddProgram` label are in place, as are
+  `vernonScheduleSetTimings` and `vernonScheduleGetScopeTimings`.
 
-## 8. Future work: deferred replay on GL and CUDA
+## 8. Recorded spans on GL and CUDA
 
-Status: not scheduled. Eager spans are accepted for pass comparison and
-regression tracking; this section applies once spans must mean the same on
-every backend.
+The OpenGL device executes a tape recorded when the schedule is built, and
+the CUDA device launches a linked schedule's dispatches at the call
+(`architecture_v2.md` section 16.3). Scope edges therefore reach the device
+back to back with the commands between them, as on Vulkan, and a span does
+not cover host recording time. Validation stays at link and record, so a
+call that breaks nesting, scope or binding rules fails before it runs; native
+driver errors fail the call's completion
+([`hot_path_diagnostics.md`](hot_path_diagnostics.md) section 2).
 
-- GL and CUDA encoders record into a host command list instead of calling
-  the driver, and Submit replays the list in order on the context or stream.
-  Timer edges then reach the device back to back with the commands between
-  them, as on Vulkan, D3D12 and Metal, so a span no longer covers host
-  recording time.
-- RHI validation stays at record, so the call that breaks nesting, scope or
-  binding rules still fails. Native driver errors move to Submit and fail the
-  submission instead of the recording call.
-- Every resource a recorded command references stays retained from record
-  to replay, and buffer contents that a command copies from host memory are
-  copied at record, so callers may still pass temporaries.
-- GL debug groups and NVTX ranges are emitted at replay, so capture tools see
-  them around the replayed commands; the record-time NVTX rule in section 2
-  changes accordingly.
-- CUDA may later replay through stream capture into a CUDA graph, cached by
-  recording shape, to cut launch overhead; plain in-order replay comes first.
-- What remains: the driver's per-command cost during replay, and on every
-  backend a span is device wall time, which includes device stalls. Device
-  busy time needs vendor counters (CUPTI activity records, GL performance
-  monitor extensions) and stays out of scope.
-- Acceptance: on GL and CUDA, a scope whose recording sleeps on the host
-  between two commands reports a span no longer than the same scope recorded
-  without the sleep, within timer resolution.
+What remains is the driver's per-command cost while the call runs, and on
+every backend a span is device wall time, which includes device stalls.
+Device busy time needs vendor counters (CUPTI activity records, GL
+performance monitor extensions) and stays out of scope.

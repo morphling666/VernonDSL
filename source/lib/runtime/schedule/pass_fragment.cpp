@@ -412,7 +412,7 @@ Built graphicsProgramFragment(VernonProgramExecutable &executable, const std::st
         }
         return Carried{ok()};
     };
-    const auto addPass = [&](Dispatch &&pass) {
+    const auto addPass = [&](Dispatch &&pass, const program::Node &node) {
         for (Dispatch &gather : gathers)
             fragment.operations.push_back(std::move(gather));
         fragment.operations.push_back(std::move(pass));
@@ -420,6 +420,8 @@ Built graphicsProgramFragment(VernonProgramExecutable &executable, const std::st
             fragment.operations.push_back(std::move(scatter));
         gathers.clear();
         scatters.clear();
+        fragment.nodeOperationEnds.push_back(static_cast<uint32_t>(fragment.operations.size()));
+        fragment.nodeLabels.push_back(hal::nodeLabel(node));
     };
     // The PASS slot and color attachment index (UINT32_MAX for depth) of each attachment Storage of a pass so far: a
     // later pass reads the attachment through the RenderPass the earliest pass rendering to it binds.
@@ -540,7 +542,7 @@ Built graphicsProgramFragment(VernonProgramExecutable &executable, const std::st
             if (pass.tape.present() && pass.pass.grid.linearized)
                 return failBuild("node '" + node.name + "' keeps an autodiff tape in a dispatch its arguments size");
             fragment.executables.push_back(std::move(executableSource));
-            addPass(std::move(pass));
+            addPass(std::move(pass), node);
             continue;
         }
         const uint32_t renderPass =
@@ -571,7 +573,7 @@ Built graphicsProgramFragment(VernonProgramExecutable &executable, const std::st
         defaultDraw.instance_count = static_cast<uint32_t>(graphics.instanceCount);
         defaultDraws.emplace_back(pass.pass.draw, defaultDraw);
         fragment.executables.push_back(std::move(executableSource));
-        addPass(std::move(pass));
+        addPass(std::move(pass), node);
     }
     fragment.recordSize = alignUp(fragment.recordSize, 16);
     fragment.recordTemplate.assign(fragment.recordSize, 0);
