@@ -25,6 +25,11 @@ class TextureFormat:
     component_class: str
     element: str
     channels: int
+    """Host array channels of a texel; a packed format holds all its components in one."""
+    components: int
+    """Components a shader reads and writes; the depth of a depth format."""
+    integer_bits: tuple[int, ...]
+    """Bits of each component of an integer format, in shader component order; empty for any other format."""
     pixel_bytes: int
     aspects: frozenset[str]
     capabilities: frozenset[str]

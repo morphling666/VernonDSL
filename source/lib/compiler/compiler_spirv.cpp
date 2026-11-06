@@ -182,7 +182,9 @@ namespace vernon::compiler {
 namespace {
 
 mlir::spirv::TargetEnvAttr targetEnv(mlir::MLIRContext *context, bool requireF32AtomicAdd) {
-    llvm::SmallVector<mlir::spirv::Capability> capabilities{mlir::spirv::Capability::Shader};
+    // Only the storage formats a device reports are ever bound, so the extended ones are always available to shaders.
+    llvm::SmallVector<mlir::spirv::Capability> capabilities{mlir::spirv::Capability::Shader,
+                                                            mlir::spirv::Capability::StorageImageExtendedFormats};
     llvm::SmallVector<mlir::spirv::Extension> extensions;
     if (requireF32AtomicAdd) {
         capabilities.push_back(mlir::spirv::Capability::AtomicFloat32AddEXT);

@@ -11,7 +11,7 @@
 
 namespace vernon::formats {
 
-enum class ComponentClass : uint8_t { Float, Unorm, Uint, Sint };
+enum class ComponentClass : uint8_t { Float, Unorm, Uint, Sint, Snorm };
 
 struct Format {
     std::string_view name;
@@ -73,6 +73,7 @@ constexpr ComponentClass componentClass(std::string_view name) {
            : name == "unorm" ? ComponentClass::Unorm
            : name == "uint"  ? ComponentClass::Uint
            : name == "sint"  ? ComponentClass::Sint
+           : name == "snorm" ? ComponentClass::Snorm
                              : static_cast<ComponentClass>(0xFFu);
 }
 
@@ -125,7 +126,7 @@ template <typename Key> constexpr bool isInteger(Key format) {
     return entry && entry->integer();
 }
 
-// Shaders read unorm and float views alike as floats; integer views keep their signedness.
+// Shaders read normalized and float views alike as floats; integer views keep their signedness.
 constexpr VernonImageSampleResultClass sampleResultClass(const Format &entry) {
     return entry.componentClass == ComponentClass::Uint   ? VERNON_IMAGE_SAMPLE_UNSIGNED_INTEGER
            : entry.componentClass == ComponentClass::Sint ? VERNON_IMAGE_SAMPLE_SIGNED_INTEGER
@@ -163,10 +164,13 @@ constexpr std::optional<VernonImageSampleResultClass> parseSampleResultClass(std
 template <typename Key> constexpr bool viewCompatible(Key image, Key view) {
     const Format *imageEntry = find(image);
     const Format *viewEntry = find(view);
-    const auto rgba8 = [](const Format *entry) {
-        return entry->texture == VERNON_TEXTURE_RGBA8_UNORM || entry->texture == VERNON_TEXTURE_RGBA8_SRGB;
+    const auto encodings = [](const Format *entry) {
+        return entry->texture == VERNON_TEXTURE_RGBA8_UNORM || entry->texture == VERNON_TEXTURE_RGBA8_SRGB   ? 1
+               : entry->texture == VERNON_TEXTURE_BGRA8_UNORM || entry->texture == VERNON_TEXTURE_BGRA8_SRGB ? 2
+                                                                                                             : 0;
     };
-    return imageEntry && viewEntry && (imageEntry == viewEntry || (rgba8(imageEntry) && rgba8(viewEntry)));
+    return imageEntry && viewEntry &&
+           (imageEntry == viewEntry || (encodings(imageEntry) != 0 && encodings(imageEntry) == encodings(viewEntry)));
 }
 
 namespace detail {
@@ -175,7 +179,7 @@ constexpr bool validTable() {
     for (size_t index = 0; index < table.size(); ++index) {
         const Format &entry = table[index];
         if (entry.pixelBytes == 0 ||
-            static_cast<uint8_t>(entry.componentClass) > static_cast<uint8_t>(ComponentClass::Sint) ||
+            static_cast<uint8_t>(entry.componentClass) > static_cast<uint8_t>(ComponentClass::Snorm) ||
             (entry.baseline & invalidColumn) != 0 || find(entry.texture) != &entry || find(entry.name) != &entry)
             return false;
     }

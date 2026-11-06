@@ -153,6 +153,7 @@ class Texture(_TextureResource):
             np.array(array, copy=True, order="C"),
             layers,
         )
+        self._attachment_by_default = usage is None and "color_attachment" in resolved_usage
 
     @staticmethod
     def _validate_configuration(
@@ -177,7 +178,7 @@ class Texture(_TextureResource):
             raise ValueError(f"Texture mip_levels cannot exceed {max_mip_levels} for shape {shape}")
         if usage is None:
             resolved_usage = {"sampled", "transfer_source", "transfer_destination"}
-            if dimension == "2d" and format.aspects == frozenset({"color"}):
+            if dimension == "2d" and format.aspects == frozenset({"color"}) and "renderable" in format.capabilities:
                 resolved_usage.add("color_attachment")
         else:
             if not isinstance(usage, tuple) or not usage or any(item not in _TEXTURE_USAGES for item in usage):
@@ -213,6 +214,7 @@ class Texture(_TextureResource):
         self._layers = layers
         self._mip_levels = mip_levels
         self._usage = usage
+        self._attachment_by_default = False
         self._region = _ImageRegion(
             frozenset(
                 (aspect, mip_level, layer)
@@ -957,7 +959,11 @@ class Texture(_TextureResource):
             "color_attachment": "IMAGE_COLOR_ATTACHMENT",
             "depth_stencil_attachment": "IMAGE_DEPTH_STENCIL_ATTACHMENT",
         }
-        return sum(int(getattr(state.native, names[item])) for item in self._usage)
+        usage = self._usage
+        # A default attachment role the device cannot render is dropped, so the texture still samples and copies.
+        if self._attachment_by_default and "renderable" not in state.format_capabilities(self._format):
+            usage = usage - {"color_attachment"}
+        return sum(int(getattr(state.native, names[item])) for item in usage)
 
     def _publish_device_write(
         self,

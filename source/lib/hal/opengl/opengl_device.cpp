@@ -1396,7 +1396,8 @@ Made<void> Builder::fixedFunction(const runtime::GraphicsVariantKey &key, uint32
         rasterization.front_face > VERNON_RHI_FRONT_FACE_CLOCKWISE || rasterization.depth_clamp ||
         !std::isfinite(rasterization.depth_bias_constant) || !std::isfinite(rasterization.depth_bias_slope) ||
         depthStencil.depth_compare > VERNON_RHI_COMPARE_ALWAYS ||
-        (key.depthStencilFormat && key.depthStencilFormat != gl::kDepthComponent32f && !stencilFormat) ||
+        (key.depthStencilFormat && key.depthStencilFormat != gl::kDepthComponent16 &&
+         key.depthStencilFormat != gl::kDepthComponent32f && !stencilFormat) ||
         (!key.depthStencilFormat && (depthStencil.depth_test || depthStencil.depth_write)) ||
         (depthStencil.stencil_test && !stencilFormat) || depthStencil.stencil_read_mask > 0xff ||
         depthStencil.stencil_write_mask > 0xff ||

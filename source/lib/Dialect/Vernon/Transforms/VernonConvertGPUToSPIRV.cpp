@@ -98,6 +98,16 @@ struct Atan2ToSPIRVPattern final : OpConversionPattern<math::Atan2Op> {
     }
 };
 
+struct RemFToSPIRVPattern final : OpConversionPattern<arith::RemFOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(arith::RemFOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.replaceOp(op, lowerRemFToSpirv(op.getLoc(), adaptor.getLhs(), adaptor.getRhs(), rewriter));
+        return success();
+    }
+};
+
 struct AtomicRMWToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> {
     using OpConversionPattern::OpConversionPattern;
 
@@ -228,8 +238,7 @@ struct TextureIntrinsicToSPIRVPattern final : OpConversionPattern<IntrinsicOp> {
             rewriter.replaceOp(
                 op, buildSpirvTextureLoad(rewriter, op.getLoc(), resultType, image, adaptor.getOperands()[1]));
         } else {
-            spirv::ImageWriteOp::create(rewriter, op.getLoc(), image, adaptor.getOperands()[1],
-                                        adaptor.getOperands()[2], spirv::ImageOperandsAttr(), ValueRange{});
+            buildSpirvTextureStore(rewriter, op.getLoc(), image, adaptor.getOperands()[1], adaptor.getOperands()[2]);
             rewriter.eraseOp(op);
         }
         return success();
@@ -488,7 +497,7 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
             populateMemRefToSPIRVPatterns(typeConverter, patterns);
             populateFuncToSPIRVPatterns(typeConverter, patterns);
             populateVectorToSPIRVPatterns(typeConverter, patterns);
-            patterns.add<Atan2ToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
+            patterns.add<Atan2ToSPIRVPattern, RemFToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
             patterns.add<AtomicRMWToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
             patterns.add<TextureIntrinsicToSPIRVPattern>(typeConverter, &getContext());
             if (usesIntegerCasStorage) {

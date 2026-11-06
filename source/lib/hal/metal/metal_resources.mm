@@ -864,9 +864,10 @@ private:
             native |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         if (usage & (VERNON_IMAGE_COLOR_ATTACHMENT | VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT))
             native |= MTLTextureUsageRenderTarget;
-        // Views reinterpret only 8-bit RGBA between UNORM and sRGB, and a sampled depth-stencil image's stencil.
-        // Apple GPUs do not compress such images, so the others stay without it.
+        // Views reinterpret only 8-bit RGBA and BGRA between UNORM and sRGB, and a sampled depth-stencil image's
+        // stencil. Apple GPUs do not compress such images, so the others stay without it.
         if (descriptor.format == VERNON_TEXTURE_RGBA8_UNORM || descriptor.format == VERNON_TEXTURE_RGBA8_SRGB ||
+            descriptor.format == VERNON_TEXTURE_BGRA8_UNORM || descriptor.format == VERNON_TEXTURE_BGRA8_SRGB ||
             (formats::hasStencil(descriptor.format) && (usage & VERNON_IMAGE_SAMPLED)))
             native |= MTLTextureUsagePixelFormatView;
         auto image = std::unique_ptr<MetalImage>(new (std::nothrow) MetalImage(owner_));

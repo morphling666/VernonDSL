@@ -353,10 +353,10 @@ allocation, failure, and synchronization policies remain explicit.
 `2d_array`, or `cube_array` and `sample_type` is `f32`, `i32`, or `u32`. A
 storage texture is `Texture[dimension, format, access]`, where `dimension` is
 `2d`, `3d`, or `2d_array`,
-`access` is `read`, `write`, or `read_write`, and format is one of
-`r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
-`rgba16_float`, `rgba32_float`, `r32_uint`, or `rg32_uint`: the formats whose
-row in `source/include/VernonFormats.def` allows `storage`.
+`access` is `read`, `write`, or `read_write`, and format is one whose row in
+`source/include/VernonFormats.def` allows `storage`: every color format except
+`rgb8_unorm`, `rgb32_float`, `rgb9e5_ufloat`, and the sRGB and BGRA formats.
+A device may support fewer.
 
 Texture queries and sampling use resource-specific operations; they are not
 ordinary TensorView loads or stores. Sampler state is separate from sampled
@@ -871,9 +871,7 @@ is rejected.
 
 `//` floors on every numeric type. On floats it is numpy's `floor_divide`:
 the result is `floor` of the exact quotient, `-0.0` when that quotient is a
-negative zero, and `a / b` when `b` is zero. Shading-language `fmod` is NaN
-for an infinite divisor, so on the Vulkan, DirectX, and OpenGL backends `a // inf` is NaN where CPU, CUDA, and host code return `0.0` or
-`-1.0`; `%` behaves the same.
+negative zero, and `a / b` when `b` is zero.
 
 Comparing two Tensors, or a Tensor and a scalar, is elementwise and yields a
 bool Tensor of the Tensor shape, as in numpy and WGSL. A bool Tensor has no

@@ -341,6 +341,17 @@ With contrast-adaptive sharpening in the display pass and material textures
 sampled at a -0.5 mip bias, DirectX 12 standing measures 4.87-4.89 ms a frame
 and 1.36-1.43 ms host, within the variance of the run without them.
 
+With object motion added, DirectX 12 over 1800 frames, excluding frames
+0-299, measures:
+
+- Standing: 4.88-4.91 ms a frame and 1.38-1.48 ms host.
+- Walking: 4.36-5.42 ms a frame and 1.56-1.93 ms host.
+
+Object motion means the forward pass writes a third RG16Float target, and
+instance rows grow from 5 to 10 float texels. Both cases stay within the
+variance of the runs above. Static draws skip the previous-frame projection,
+and only moved rows and changed poses upload anything extra.
+
 ## Standing frame
 
 Measured once with temporary scope timers (since removed), which added

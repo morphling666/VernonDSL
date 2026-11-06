@@ -292,6 +292,46 @@ void shiftDirectXDescriptorSets(spirv_cross::Compiler &compiler) {
                                             ::vernon::runtime::kDirectXDescriptorSetRegisterSpaceOffset);
 }
 
+// D3D12 links a pixel shader's input signature to the vertex shader's output signature by register, and SPIRV-Cross
+// places SV_Position after the varyings on both sides, so a fragment that declares fewer varyings than its vertex
+// stage writes, or reads no position, would shift every register after them. Each stage compiles alone, so it cannot
+// see the other's varyings. Instead both signatures start with SV_Position, the pixel shader's even when it reads no
+// position. A fragment declares a prefix of the vertex outputs by location, so its signature is then always a
+// register prefix of the vertex shader's.
+bool leadWithDirectXPosition(std::string &source, spv::ExecutionModel stage, std::string &diagnostics) {
+    if (stage != spv::ExecutionModelVertex && stage != spv::ExecutionModelFragment)
+        return true;
+    const std::string header =
+        stage == spv::ExecutionModelVertex ? "struct SPIRV_Cross_Output\n{\n" : "struct SPIRV_Cross_Input\n{\n";
+    const size_t open = source.find(header);
+    if (open == std::string::npos)
+        return true;
+    const size_t first = open + header.size();
+    const size_t close = source.find("};\n", first);
+    if (close == std::string::npos) {
+        diagnostics = "DirectX stage signature struct is not closed";
+        return false;
+    }
+    std::string position;
+    size_t line = first;
+    while (line < close) {
+        const size_t end = source.find('\n', line) + 1;
+        if (llvm::StringRef(source).slice(line, end).contains(" : SV_Position;")) {
+            position = source.substr(line, end - line);
+            source.erase(line, end - line);
+            break;
+        }
+        line = end;
+    }
+    // A vertex stage that writes no position feeds no pixel shader.
+    if (position.empty() && stage == spv::ExecutionModelVertex)
+        return true;
+    if (position.empty())
+        position = "    float4 vernon_position : SV_Position;\n";
+    source.insert(first, position);
+    return true;
+}
+
 } // namespace
 
 bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostics, VernonTarget target,
@@ -408,6 +448,8 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                                                          ::vernon::runtime::kDirectXDrawOffsetsRegister,
                                                          ::vernon::runtime::kDirectXRootConstantRegisterSpace);
                     source = compiler.compile();
+                    if (!leadWithDirectXPosition(source, entry.execution_model, diagnostics))
+                        return false;
                     extension = "hlsl";
                 } else {
                     spirv_cross::CompilerGLSL compiler(words);

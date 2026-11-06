@@ -699,6 +699,23 @@ their source names; module-wide SPIR-V symbol collisions receive a deterministic
 stage suffix. This preserves location-based linkage without discarding author
 names or requiring GLSL 4.30 varying-location qualifiers.
 
+## Cross-stage HLSL signatures
+
+D3D12 links a pixel shader's input signature to the vertex shader's output
+signature by register. A pixel input must sit in the register the matching
+vertex output does. SPIRV-Cross puts `SV_Position` after the varyings on both
+sides. A fragment that declares fewer varyings than its vertex stage writes,
+and also reads the position, would then hold `SV_Position` in a varying's
+register, and pipeline creation fails with `E_INVALIDARG`.
+
+The stages compile separately, so neither side can copy the other's varyings.
+Instead the HLSL interface structs are rewritten so both signatures start with
+`SV_Position`. The pixel shader declares it even when it reads no position.
+Fragment varyings are always a location prefix of the vertex outputs, so the
+pixel signature is then a register prefix of the vertex signature for every
+pair the language accepts. Rewriting the emitted struct keeps SPIRV-Cross
+unpatched.
+
 Unbound graphics uniforms use target-specific SPIR-V interfaces. Vulkan packs
 them into one aligned push-constant block per module role within the graphics
 StageArtifact, while OpenGL, OpenGL ES,
@@ -821,7 +838,10 @@ without a LOD, and any other operation on a sampled Texture, such as
 `texture_load` or `texture_size`.
 Graphics and compute lowering build sampled-image types, samples and fetches
 with the same helpers (`VernonSpirvImageFormat.h`), so the two paths cannot
-disagree on image operands.
+disagree on image operands. A storage image of a `sint` format has a signed
+`i32` sampled type, because SPIRV-Cross rejects a signed image format over
+an unsigned sampled type. The Vernon texel stays signless, and each read and
+write bitcasts it, since a SPIR-V texel must match the sampled type exactly.
 
 Image Storage usage and `sample_result_class` come from endpoint requirements
 that the compute and graphics stage builders plan with one function, so a
@@ -950,7 +970,10 @@ CUDA (libdevice `__nv_fmodf`, called directly because the NVVM pipeline turns
 `arith.remf` into an illegal `llvm.frem` before its libdevice patterns run).
 Shading languages define it through approximate division (D3D12 as
 `frac(x / y) * y`), so it loses precision for quotients near an integer or of
-large magnitude.
+large magnitude. That definition is also NaN for a finite dividend over an
+infinite divisor, so both SPIR-V converters select the dividend there, as C's
+`fmod` does; the guard is two compares and a select, and CPU and CUDA keep a
+bare `fmod`.
 
 ## Python control-flow type convergence
 

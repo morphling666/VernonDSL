@@ -42,6 +42,28 @@ VkFormat vulkanFormat(VernonTextureFormat format) {
     return VK_FORMAT_UNDEFINED;
 }
 
+// A shader names any other storage format through StorageImageExtendedFormats, which needs the device feature.
+bool coreStorageFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 VkImageViewType viewType(VernonTextureDimension dimension) {
     switch (dimension) {
     case VERNON_TEXTURE_3D:
@@ -522,9 +544,12 @@ public:
             result |= VERNON_HAL_FORMAT_BLENDABLE;
         if (has(VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
             result |= VERNON_HAL_FORMAT_FILTERABLE;
-        if (has(VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        if (has(VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+            (state_.shaderStorageImageExtendedFormats || coreStorageFormat(native)))
             result |= VERNON_HAL_FORMAT_STORAGE;
-        if (has(VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
+        // Textures sample by default, so a format the device copies but cannot sample has no use as one.
+        if (has(VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
             result |= VERNON_HAL_FORMAT_COPYABLE;
         // A color format renderable with more than one sample is also a resolve destination; the table baseline
         // removes resolving from formats whose class cannot average samples.

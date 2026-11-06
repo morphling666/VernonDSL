@@ -34,6 +34,7 @@ from pipeline_shader import (
     array_layer_fragment,
     array_uniform_fragment,
     colored_fragment,
+    coordinate_fragment,
     copy_static_tensor_value,
     cube_array_fragment,
     cube_direction_fragment,
@@ -43,7 +44,9 @@ from pipeline_shader import (
     f16_attribute_vertex,
     f32_attribute_vertex,
     f64_attribute_vertex,
+    first_varying_fragment,
     flat_coordinate_fragment,
+    half_pair_fragment,
     heightmap_fragment,
     heightmap_vertex,
     i32_attribute_vertex,
@@ -75,6 +78,7 @@ from pipeline_shader import (
     translated_vertex,
     triangle_vertex,
     u32_attribute_vertex,
+    unread_varying_fragment,
     volume_coordinate_fragment,
 )
 from vernon_dsl.diagnostics import ProgramCompileError
@@ -874,6 +878,20 @@ def assert_identifier_pairs_round_trip(test: unittest.TestCase) -> None:
     )
 
 
+def assert_half_pairs_round_trip(test: unittest.TestCase) -> None:
+    pairs = vd.Texture.zeros(shape=(4, 4), format=vd.rg16_float)
+    position, base = _identifier_draw_inputs(covered=True)
+    vd.pipeline(identifier_vertex, half_pair_fragment)(
+        position=position,
+        base=base,
+        render_pass=vd.render_pass(vd.RenderTarget.from_attachments(colors={0: pairs}), color=vd.clear((0, 0, 0, 0))),
+    )
+    rows, columns = np.indices((4, 4), dtype=np.float32) + 0.5
+    expected = np.stack(((columns - 2.0) * 0.001, rows * -0.25), axis=-1)
+    # Render targets may convert to half-float by truncation as well as by rounding.
+    np.testing.assert_allclose(pairs.to_numpy().reshape(4, 4, 2), expected, rtol=2.0**-10)
+
+
 def assert_varyings_follow_their_interpolation(test: unittest.TestCase) -> None:
     size = 16
     corners = np.array(((-0.9, -0.9), (0.9, -0.9), (-0.9, 0.9)), dtype=np.float64)
@@ -905,6 +923,27 @@ def assert_varyings_follow_their_interpolation(test: unittest.TestCase) -> None:
     np.testing.assert_allclose(pixels[:, 0], perspective[interior], atol=1e-4)
     np.testing.assert_allclose(pixels[:, 1], linear[interior], atol=1e-4)
     np.testing.assert_array_equal(pixels[:, 2], np.full(pixels.shape[0], 0.75, np.float32))
+
+
+def assert_fragments_link_with_varyings_they_do_not_read(test: unittest.TestCase) -> None:
+    # A fragment may leave vertex outputs unread: one it declares, every one while it reads only the position, or
+    # those after the ones it declares.
+    position, base = _identifier_draw_inputs(covered=True)
+    rows, columns = np.indices((4, 4), dtype=np.float32) + 0.5
+    for fragment in (unread_varying_fragment, coordinate_fragment):
+        unread = vd.Texture.zeros(shape=(4, 4), format=vd.rgba32_float)
+        vd.pipeline(identifier_vertex, fragment)(position=position, base=base, render_pass=render_target(unread))
+        np.testing.assert_array_equal(unread.to_numpy()[..., 0], columns)
+        np.testing.assert_array_equal(unread.to_numpy()[..., 1], rows)
+
+    clip = np.array(((-1.0, -1.0, 0.0, 1.0), (3.0, -1.0, 0.0, 1.0), (-1.0, 3.0, 0.0, 1.0)), np.float32)
+    first = vd.Texture.zeros(shape=(4, 4), format=vd.rgba32_float)
+    vd.pipeline(interpolation_vertex, first_varying_fragment)(
+        position=vd.storage.from_numpy(clip),
+        value=vd.storage.from_numpy(np.full(3, 0.5, np.float32)),
+        render_pass=render_target(first),
+    )
+    np.testing.assert_array_equal(first.to_numpy()[..., 0], np.full((4, 4), 0.5, np.float32))
 
 
 def assert_front_face_follows_normalized_device_winding(test: unittest.TestCase) -> None:
@@ -1429,8 +1468,14 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_identifier_pairs_round_trip(self) -> None:
         assert_identifier_pairs_round_trip(self)
 
+    def test_half_pairs_round_trip(self) -> None:
+        assert_half_pairs_round_trip(self)
+
     def test_varyings_follow_their_interpolation(self) -> None:
         assert_varyings_follow_their_interpolation(self)
+
+    def test_fragments_link_with_varyings_they_do_not_read(self) -> None:
+        assert_fragments_link_with_varyings_they_do_not_read(self)
 
     def test_front_face_follows_normalized_device_winding(self) -> None:
         assert_front_face_follows_normalized_device_winding(self)
@@ -1650,8 +1695,14 @@ class OpenGLESPipelineTests(unittest.TestCase):
     def test_identifier_pairs_round_trip(self) -> None:
         assert_identifier_pairs_round_trip(self)
 
+    def test_half_pairs_round_trip(self) -> None:
+        assert_half_pairs_round_trip(self)
+
     def test_varyings_follow_their_interpolation(self) -> None:
         assert_varyings_follow_their_interpolation(self)
+
+    def test_fragments_link_with_varyings_they_do_not_read(self) -> None:
+        assert_fragments_link_with_varyings_they_do_not_read(self)
 
     def test_front_face_follows_normalized_device_winding(self) -> None:
         assert_front_face_follows_normalized_device_winding(self)
@@ -1753,8 +1804,14 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_identifier_pairs_round_trip(self) -> None:
         assert_identifier_pairs_round_trip(self)
 
+    def test_half_pairs_round_trip(self) -> None:
+        assert_half_pairs_round_trip(self)
+
     def test_varyings_follow_their_interpolation(self) -> None:
         assert_varyings_follow_their_interpolation(self)
+
+    def test_fragments_link_with_varyings_they_do_not_read(self) -> None:
+        assert_fragments_link_with_varyings_they_do_not_read(self)
 
     def test_front_face_follows_normalized_device_winding(self) -> None:
         assert_front_face_follows_normalized_device_winding(self)
@@ -1925,8 +1982,14 @@ class DirectXPipelineTests(unittest.TestCase):
     def test_identifier_pairs_round_trip(self) -> None:
         assert_identifier_pairs_round_trip(self)
 
+    def test_half_pairs_round_trip(self) -> None:
+        assert_half_pairs_round_trip(self)
+
     def test_varyings_follow_their_interpolation(self) -> None:
         assert_varyings_follow_their_interpolation(self)
+
+    def test_fragments_link_with_varyings_they_do_not_read(self) -> None:
+        assert_fragments_link_with_varyings_they_do_not_read(self)
 
     def test_front_face_follows_normalized_device_winding(self) -> None:
         assert_front_face_follows_normalized_device_winding(self)

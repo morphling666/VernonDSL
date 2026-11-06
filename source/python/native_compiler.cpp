@@ -7,6 +7,7 @@
 #include "runtime/runtime_python_bridge.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -153,6 +154,13 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0, nb::arg("array_layers") = 0)
         .def("create_attachment_image", &HalDevice::createAttachmentImage)
         .def("create_sampler", &HalDevice::createSampler, nb::arg("address") = VERNON_HAL_ADDRESS_REPEAT)
+        .def("format_capabilities",
+             [](const HalDevice &value, VernonTextureFormat format) {
+                 uint32_t capabilities = 0;
+                 if (vernonHalDeviceGetFormatCapabilities(value.state->device, format, &capabilities) != VERNON_HAL_OK)
+                     throw std::runtime_error(halError());
+                 return capabilities;
+             })
         .def("create_runtime", &deviceRuntime);
     nb::class_<HalBuffer>(module, "HalBuffer")
         .def_prop_ro("size", [](const HalBuffer &value) { return value.size; })

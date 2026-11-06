@@ -478,33 +478,57 @@ bool DeviceState::uploadImage2D(const Image &image, Size width, Size height, Enu
     return true;
 }
 
-bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel, Int layer, Int x, Int y, Size width,
-                                  Size height, Enum externalFormat, Enum type, void *destination, std::string &error) {
-    if (!image.name || !destination)
-        return false;
-    makeCurrent();
+Uint DeviceState::readFramebuffer(const Image &image, Enum target, Int mipLevel, Int layer, Enum attachment) {
     Uint framebuffer = 0;
     driver.genFramebuffers(1, &framebuffer);
-    if (!framebuffer) {
-        error = "OpenGL readback framebuffer creation failed";
-        return false;
-    }
+    if (!framebuffer)
+        return 0;
     driver.bindFramebuffer(kFramebuffer, framebuffer);
-    // Stencil is only ever read from a packed depth-stencil image, which must attach at the depth-stencil point.
-    const bool depthStencil = externalFormat == 0x84F9 || externalFormat == 0x1901;
-    const bool depthOnly = externalFormat == 0x1902;
-    const Enum attachment = depthStencil ? kDepthStencilAttachment : depthOnly ? kDepthAttachment : kColorAttachment0;
     if (target == kTexture2DArray || target == kTextureCubeMapArray)
         driver.framebufferTextureLayer(kFramebuffer, attachment, image.name, mipLevel, layer);
     else
         driver.framebufferTexture2D(kFramebuffer, attachment, target, image.name, mipLevel);
-    if (depthStencil || depthOnly) {
+    if (attachment != kColorAttachment0) {
         const Enum none = kNone;
         driver.drawBuffers(1, &none);
         driver.readBuffer(kNone);
     }
     if (driver.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
         driver.deleteFramebuffers(1, &framebuffer);
+        return 0;
+    }
+    return framebuffer;
+}
+
+std::pair<Enum, Enum> DeviceState::implementationColorReadPair(const Image &image, Enum target, Int mipLevel,
+                                                               Int layer) {
+    if (!image.name)
+        return {};
+    makeCurrent();
+    const Uint framebuffer = readFramebuffer(image, target, mipLevel, layer, kColorAttachment0);
+    if (!framebuffer)
+        return {};
+    constexpr Enum implementationColorReadType = 0x8B9A;
+    constexpr Enum implementationColorReadFormat = 0x8B9B;
+    Int format = 0;
+    Int type = 0;
+    driver.getIntegerv(implementationColorReadFormat, &format);
+    driver.getIntegerv(implementationColorReadType, &type);
+    driver.deleteFramebuffers(1, &framebuffer);
+    return {static_cast<Enum>(format), static_cast<Enum>(type)};
+}
+
+bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel, Int layer, Int x, Int y, Size width,
+                                  Size height, Enum externalFormat, Enum type, void *destination, std::string &error) {
+    if (!image.name || !destination)
+        return false;
+    makeCurrent();
+    // Stencil is only ever read from a packed depth-stencil image, which must attach at the depth-stencil point.
+    const bool depthStencil = externalFormat == 0x84F9 || externalFormat == 0x1901;
+    const bool depthOnly = externalFormat == 0x1902;
+    const Enum attachment = depthStencil ? kDepthStencilAttachment : depthOnly ? kDepthAttachment : kColorAttachment0;
+    const Uint framebuffer = readFramebuffer(image, target, mipLevel, layer, attachment);
+    if (!framebuffer) {
         error = "OpenGL image is not readable as an attachment";
         return false;
     }

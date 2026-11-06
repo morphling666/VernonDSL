@@ -1,3 +1,4 @@
+#include "VernonFormats.hpp"
 #include "VernonHal.h"
 #include "backend_test_matrix.h"
 
@@ -456,29 +457,86 @@ TEST_P(HalResources, FormatCapabilitiesNarrowTheBaseline) {
         EXPECT_EQ(capabilities & VERNON_HAL_FORMAT_RENDERABLE, 0u);
 }
 
-TEST_P(HalResources, IntegerImagesRoundTripExactly) {
-    struct Case {
-        VernonTextureFormat format;
-        VernonHalImageDataFormat data;
-        uint32_t channels;
-    };
-    for (const Case &entry : {Case{VERNON_TEXTURE_R32_UINT, VERNON_HAL_IMAGE_DATA_RED, 1},
-                              Case{VERNON_TEXTURE_RG32_UINT, VERNON_HAL_IMAGE_DATA_RG, 2}}) {
-        SCOPED_TRACE(entry.channels);
-        VernonHalImage *image = createCopyableImage(entry.format);
+size_t elementBytes(VernonHalImageDataType type) {
+    switch (type) {
+    case VERNON_HAL_IMAGE_DATA_UINT8:
+    case VERNON_HAL_IMAGE_DATA_INT8:
+        return 1;
+    case VERNON_HAL_IMAGE_DATA_UINT16:
+    case VERNON_HAL_IMAGE_DATA_INT16:
+    case VERNON_HAL_IMAGE_DATA_FLOAT16:
+        return 2;
+    case VERNON_HAL_IMAGE_DATA_UINT32:
+    case VERNON_HAL_IMAGE_DATA_INT32:
+    case VERNON_HAL_IMAGE_DATA_FLOAT32:
+        return 4;
+    }
+    return 0;
+}
+
+// Pseudo-random texels of `format` that every transfer keeps bit for bit: floats are finite and normal, depth lies in
+// [0, 1], and snorm components avoid the second encoding of -1, which a normalized read folds into the first.
+std::vector<uint8_t> exactTexels(const vernon::formats::Format &format, size_t texels) {
+    std::vector<uint8_t> bytes(texels * format.pixelBytes);
+    uint32_t state = 0x9E3779B9u ^ static_cast<uint32_t>(format.texture);
+    for (uint8_t &byte : bytes) {
+        state = state * 1664525u + 1013904223u;
+        byte = static_cast<uint8_t>(state >> 24);
+    }
+    const size_t width = elementBytes(format.dataType);
+    const bool snorm = format.componentClass == vernon::formats::ComponentClass::Snorm;
+    for (size_t offset = 0; offset < bytes.size(); offset += width) {
+        uint8_t *element = bytes.data() + offset;
+        if (format.dataType == VERNON_HAL_IMAGE_DATA_FLOAT32) {
+            float value = static_cast<float>(offset / width % 61) / 60.0f;
+            if (format.aspects() == VERNON_IMAGE_ASPECT_COLOR) {
+                uint32_t bits{};
+                std::memcpy(&bits, element, sizeof(bits));
+                bits = (bits & ~(1u << 30)) | (1u << 29);
+                std::memcpy(&value, &bits, sizeof(value));
+            }
+            std::memcpy(element, &value, sizeof(value));
+        } else if (format.dataType == VERNON_HAL_IMAGE_DATA_FLOAT16) {
+            element[1] = static_cast<uint8_t>((element[1] & ~0x40u) | 0x20u);
+        } else if (snorm && element[width - 1] == 0x80 && (width == 1 || element[0] == 0)) {
+            element[0] = 1;
+        } else if (format.texture == VERNON_TEXTURE_R11G11B10_FLOAT) {
+            uint32_t bits{};
+            std::memcpy(&bits, element, sizeof(bits));
+            bits &= ~((1u << 10) | (1u << 21) | (1u << 31));
+            std::memcpy(element, &bits, sizeof(bits));
+        }
+    }
+    return bytes;
+}
+
+// Every format a device copies keeps its texels exactly through a write and whole and partial reads. Depth-stencil
+// images transfer in a packed layout of their own, which DepthStencilImagesReadByAspectAndRegion covers.
+TEST_P(HalResources, EveryCopyableFormatRoundTripsItsTexels) {
+    for (const vernon::formats::Format &format : vernon::formats::table) {
+        if (vernon::formats::hasStencil(format.texture))
+            continue;
+        SCOPED_TRACE(std::string(format.name));
+        VernonHalImage *image = createCopyableImage(format.texture);
         if (!image)
             continue;
-        std::vector<uint32_t> texels(size_t{kWidth} * kHeight * entry.channels);
-        for (size_t index = 0; index < texels.size(); ++index)
-            texels[index] = static_cast<uint32_t>(0x80000001u * (index + 1)) ^ 0xFFFF0000u;
+        const std::vector<uint8_t> texels = exactTexels(format, size_t{kWidth} * kHeight);
         VernonHalImageRegion whole = region(0);
-        whole.data_format = entry.data;
-        whole.data_type = VERNON_HAL_IMAGE_DATA_UINT32;
+        whole.aspect = format.aspects();
+        whole.data_format = format.dataFormat;
+        whole.data_type = format.dataType;
         const VernonHalImageWrite write{whole, texels.data()};
         ASSERT_EQ(vernonHalImageWrite(image, &write, 1), VERNON_HAL_OK) << lastError();
-        std::vector<uint32_t> read(texels.size());
-        const VernonHalImageRead full{whole, read.data(), read.size() * sizeof(uint32_t)};
-        ASSERT_EQ(vernonHalImageRead(image, &full, 1), VERNON_HAL_OK) << lastError();
+        std::vector<uint8_t> read(texels.size());
+        const VernonHalImageRead full{whole, read.data(), read.size()};
+        const VernonHalStatus readFull = vernonHalImageRead(image, &full, 1);
+        // OpenGL ES 3.0 has no compute pass to read depth with.
+        if (GetParam().runtime == VERNON_RUNTIME_OPENGL_ES && vernon::formats::hasDepth(format.texture)) {
+            EXPECT_EQ(readFull, VERNON_HAL_UNSUPPORTED) << lastError();
+            EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
+            continue;
+        }
+        ASSERT_EQ(readFull, VERNON_HAL_OK) << lastError();
         EXPECT_EQ(read, texels);
 
         // A region reads its own texels, the image's rows below and right of its offset.
@@ -487,13 +545,15 @@ TEST_P(HalResources, IntegerImagesRoundTripExactly) {
         corner.offset_y = 2;
         corner.width = 2;
         corner.height = 2;
-        std::vector<uint32_t> part(size_t{2} * 2 * entry.channels);
-        const VernonHalImageRead partial{corner, part.data(), part.size() * sizeof(uint32_t)};
+        std::vector<uint8_t> part(size_t{2} * 2 * format.pixelBytes);
+        const VernonHalImageRead partial{corner, part.data(), part.size()};
         ASSERT_EQ(vernonHalImageRead(image, &partial, 1), VERNON_HAL_OK) << lastError();
         for (uint32_t y = 0; y < 2; ++y)
-            for (uint32_t x = 0; x < 2 * entry.channels; ++x)
-                EXPECT_EQ(part[y * 2 * entry.channels + x], texels[((y + 2) * kWidth + 1) * entry.channels + x])
-                    << "texel row " << y << " word " << x;
+            EXPECT_EQ(std::memcmp(part.data() + size_t{y} * 2 * format.pixelBytes,
+                                  texels.data() + (size_t{y + 2} * kWidth + 1) * format.pixelBytes,
+                                  size_t{2} * format.pixelBytes),
+                      0)
+                << "texel row " << y;
         EXPECT_EQ(vernonHalDestroyImage(image), VERNON_HAL_OK);
     }
 }

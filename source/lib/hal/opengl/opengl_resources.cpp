@@ -7,6 +7,7 @@
 #include "hal/resources.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -26,7 +27,14 @@ constexpr gl::Enum kUnpackAlignment = 0x0CF5;
 constexpr gl::Enum kDepthComponent = 0x1902;
 constexpr gl::Enum kStencilIndex = 0x1901;
 constexpr gl::Enum kFloat = 0x1406;
+constexpr gl::Enum kRgba = 0x1908;
+constexpr gl::Enum kRgbaInteger = 0x8D99;
+constexpr gl::Enum kByte = 0x1400;
 constexpr gl::Enum kUnsignedByte = 0x1401;
+constexpr gl::Enum kShort = 0x1402;
+constexpr gl::Enum kUnsignedShort = 0x1403;
+constexpr gl::Enum kInt = 0x1404;
+constexpr gl::Enum kUnsignedInt = 0x1405;
 constexpr gl::Enum kInvalidOperation = 0x0502;
 
 Serials<gl::Buffer> &serials() {
@@ -71,6 +79,100 @@ TransferLayout transferLayout(VernonTextureFormat format, uint32_t aspect) {
     if (aspect == VERNON_IMAGE_ASPECT_STENCIL)
         return {kStencilIndex, kUnsignedByte};
     return {};
+}
+
+struct EmbeddedRead {
+    gl::Enum format{};
+    gl::Enum type{};
+    size_t componentBytes{};
+};
+
+// OpenGL ES reads a color buffer as four components in the format and type its component class guarantees on every
+// implementation, and in any other pair only where the implementation names it, so an image whose own layout is not
+// that pair reads through it and is repacked. Packed unorm and float layouts are their own guaranteed pair or are not
+// renderable, so they never read through RGBA.
+std::optional<EmbeddedRead> embeddedRead(const formats::Format &entry) {
+    if (entry.aspects() != VERNON_IMAGE_ASPECT_COLOR)
+        return std::nullopt;
+    const bool wide = entry.dataType == VERNON_HAL_IMAGE_DATA_UINT16 || entry.dataType == VERNON_HAL_IMAGE_DATA_INT16;
+    EmbeddedRead read;
+    switch (entry.componentClass) {
+    case formats::ComponentClass::Float:
+        if (entry.dataType != VERNON_HAL_IMAGE_DATA_FLOAT16 && entry.dataType != VERNON_HAL_IMAGE_DATA_FLOAT32)
+            return std::nullopt;
+        read = {kRgba, kFloat, sizeof(float)};
+        break;
+    case formats::ComponentClass::Unorm:
+        if (entry.dataType == VERNON_HAL_IMAGE_DATA_UINT32)
+            return std::nullopt;
+        read = wide ? EmbeddedRead{kRgba, kUnsignedShort, 2} : EmbeddedRead{kRgba, kUnsignedByte, 1};
+        break;
+    case formats::ComponentClass::Snorm:
+        read = wide ? EmbeddedRead{kRgba, kShort, 2} : EmbeddedRead{kRgba, kByte, 1};
+        break;
+    case formats::ComponentClass::Uint:
+        read = {kRgbaInteger, kUnsignedInt, sizeof(uint32_t)};
+        break;
+    case formats::ComponentClass::Sint:
+        read = {kRgbaInteger, kInt, sizeof(int32_t)};
+        break;
+    }
+    if (read.format == entry.glFormat && read.type == entry.glType)
+        return std::nullopt;
+    return read;
+}
+
+// The half-float bits of `value`, which must be a half-float's value, as every texel of a half-float image is.
+uint16_t exactHalf(float value) {
+    uint32_t bits{};
+    std::memcpy(&bits, &value, sizeof(bits));
+    const auto sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent == 0xFFu)
+        return static_cast<uint16_t>(sign | 0x7C00u | (mantissa != 0 ? 0x200u : 0u));
+    const int biased = static_cast<int>(exponent) - 127 + 15;
+    if (biased >= 31)
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    if (biased <= 0) {
+        if (exponent == 0 || biased < -10)
+            return sign;
+        mantissa |= 0x800000u;
+        return static_cast<uint16_t>(sign | (mantissa >> (14 - biased)));
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(biased) << 10) | (mantissa >> 13));
+}
+
+// Repacks `texels` read as `read` into the image's whole-texel layout. An integer narrows to its low bytes, which hold
+// its value on the little-endian hosts OpenGL ES runs on.
+void repackEmbeddedRead(const formats::Format &entry, const EmbeddedRead &read, const uint8_t *rgba, size_t texels,
+                        uint8_t *output) {
+    const size_t stride = 4 * read.componentBytes;
+    if (entry.texture == VERNON_TEXTURE_RGB10A2_UINT) {
+        for (size_t texel = 0; texel < texels; ++texel) {
+            uint32_t component[4]{};
+            std::memcpy(component, rgba + texel * stride, sizeof(component));
+            const uint32_t word = (component[0] & 0x3FFu) | ((component[1] & 0x3FFu) << 10) |
+                                  ((component[2] & 0x3FFu) << 20) | ((component[3] & 0x3u) << 30);
+            std::memcpy(output + texel * sizeof(word), &word, sizeof(word));
+        }
+        return;
+    }
+    const uint32_t components = entry.components();
+    const size_t elementBytes = entry.pixelBytes / components;
+    for (size_t texel = 0; texel < texels; ++texel)
+        for (uint32_t component = 0; component < components; ++component) {
+            const uint8_t *from = rgba + texel * stride + component * read.componentBytes;
+            uint8_t *to = output + (texel * components + component) * elementBytes;
+            if (entry.dataType == VERNON_HAL_IMAGE_DATA_FLOAT16) {
+                float value{};
+                std::memcpy(&value, from, sizeof(value));
+                const uint16_t bits = exactHalf(value);
+                std::memcpy(to, &bits, sizeof(bits));
+            } else {
+                std::memcpy(to, from, elementBytes);
+            }
+        }
 }
 
 void storePackedDepthStencil(uint8_t *texel, float depth, uint8_t stencil) {
@@ -241,19 +343,30 @@ struct OpenGLSurface final : VernonHalSurface {
     int32_t interval{-1};
 };
 
-// OpenGL ES differs from desktop OpenGL in four rules: float color rendering needs ES 3.2 or an extension, 32-bit float
-// filtering and blending need extensions, depth textures are never linearly filtered, and image units accept only the
+// OpenGL ES differs from desktop OpenGL in these rules: float color rendering needs ES 3.2 or an extension, 32-bit
+// float filtering and blending need extensions, 16-bit normalized formats need an extension and snorm rendering
+// another, BGRA images are not core, depth textures are never linearly filtered, and image units accept only the
 // formats listed in ES 3.1.
 uint32_t embeddedFormatCapabilities(const gl::DeviceState &device, const formats::Format &entry) {
+    constexpr uint32_t rendering = VERNON_HAL_FORMAT_RENDERABLE | VERNON_HAL_FORMAT_BLENDABLE |
+                                   VERNON_HAL_FORMAT_MULTISAMPLE | VERNON_HAL_FORMAT_RESOLVABLE;
     uint32_t result = entry.baseline;
     const bool color = entry.aspects() == VERNON_IMAGE_ASPECT_COLOR;
     const bool floatColor = color && entry.componentClass == formats::ComponentClass::Float;
     const bool float32 = floatColor && entry.dataType == VERNON_HAL_IMAGE_DATA_FLOAT32;
     const bool float16 = floatColor && entry.dataType == VERNON_HAL_IMAGE_DATA_FLOAT16;
+    const bool normalized = entry.componentClass == formats::ComponentClass::Unorm ||
+                            entry.componentClass == formats::ComponentClass::Snorm;
+    const bool norm16 =
+        color && normalized &&
+        (entry.dataType == VERNON_HAL_IMAGE_DATA_UINT16 || entry.dataType == VERNON_HAL_IMAGE_DATA_INT16);
+    if (entry.dataFormat == VERNON_HAL_IMAGE_DATA_BGRA || (norm16 && !device.hasExtension("GL_EXT_texture_norm16")))
+        return 0;
     if (floatColor && !device.apiVersionAtLeast(3, 2) && !device.hasExtension("GL_EXT_color_buffer_float") &&
         !(float16 && device.hasExtension("GL_EXT_color_buffer_half_float")))
-        result &= ~(VERNON_HAL_FORMAT_RENDERABLE | VERNON_HAL_FORMAT_BLENDABLE | VERNON_HAL_FORMAT_MULTISAMPLE |
-                    VERNON_HAL_FORMAT_RESOLVABLE);
+        result &= ~rendering;
+    if (entry.componentClass == formats::ComponentClass::Snorm && !device.hasExtension("GL_EXT_render_snorm"))
+        result &= ~rendering;
     if (float32 && !device.hasExtension("GL_OES_texture_float_linear"))
         result &= ~VERNON_HAL_FORMAT_FILTERABLE;
     if (float32 && !device.hasExtension("GL_EXT_float_blend"))
@@ -262,10 +375,18 @@ uint32_t embeddedFormatCapabilities(const gl::DeviceState &device, const formats
         result &= ~VERNON_HAL_FORMAT_FILTERABLE;
     switch (entry.texture) {
     case VERNON_TEXTURE_RGBA8_UNORM:
+    case VERNON_TEXTURE_RGBA8_SNORM:
+    case VERNON_TEXTURE_RGBA8_UINT:
+    case VERNON_TEXTURE_RGBA8_SINT:
     case VERNON_TEXTURE_RGBA16_FLOAT:
+    case VERNON_TEXTURE_RGBA16_UINT:
+    case VERNON_TEXTURE_RGBA16_SINT:
     case VERNON_TEXTURE_R32_FLOAT:
-    case VERNON_TEXTURE_RGBA32_FLOAT:
     case VERNON_TEXTURE_R32_UINT:
+    case VERNON_TEXTURE_R32_SINT:
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+    case VERNON_TEXTURE_RGBA32_UINT:
+    case VERNON_TEXTURE_RGBA32_SINT:
         break;
     default:
         result &= ~VERNON_HAL_FORMAT_STORAGE;
@@ -791,6 +912,22 @@ private:
                                     : image.target;
         const auto layer = static_cast<gl::Int>(region.array_layer);
         const bool packed = region.aspect == (VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL);
+        const formats::Format &entry = *formats::find(descriptor.format);
+        std::optional<EmbeddedRead> through = state_.embeddedProfile && !packed ? embeddedRead(entry) : std::nullopt;
+        // Reading through the guaranteed pair converts on the implementation, and some lose the sign of a 16-bit snorm
+        // read as RGBA, so the image's own layout is read whenever the implementation names it.
+        if (through && state_.implementationColorReadPair(image.native, target, mip, layer) ==
+                           std::pair<gl::Enum, gl::Enum>{layout.format, layout.type})
+            through.reset();
+        if (through) {
+            const size_t texels = size_t{region.width} * region.height;
+            std::vector<uint8_t> rgba(texels * 4 * through->componentBytes);
+            if (!state_.downloadImage2D(image.native, target, mip, layer, x, y, width, height, through->format,
+                                        through->type, rgba.data(), error))
+                return internal("cannot read the image", error);
+            repackEmbeddedRead(entry, *through, rgba.data(), texels, static_cast<uint8_t *>(destination));
+            return Done<void>{ok()};
+        }
         if (!packed) {
             if (!state_.downloadImage2D(image.native, target, mip, layer, x, y, width, height, layout.format,
                                         layout.type, destination, error))
@@ -842,17 +979,23 @@ private:
             return state_.supportsCompute() ? internal("cannot read the image", error)
                                             : fail(VERNON_HAL_UNSUPPORTED, "OpenGL ES reads depth with compute");
         auto *output = static_cast<uint8_t *>(destination);
+        // The compute pass reads depth as a float, which holds a 16-bit unorm depth exactly.
+        const bool unorm16 = formats::find(image.descriptor.format)->dataType == VERNON_HAL_IMAGE_DATA_UINT16;
         for (size_t index = 0; index < texels; ++index) {
             float value{};
             if (readDepth)
                 std::memcpy(&value, &depth[index], sizeof(value));
-            if (readDepth && readStencil)
+            if (readDepth && readStencil) {
                 storePackedDepthStencil(output + index * kPackedDepthStencilBytes, value,
                                         static_cast<uint8_t>(stencil[index]));
-            else if (readDepth)
+            } else if (readDepth && unorm16) {
+                const auto unorm = static_cast<uint16_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 65535.0f));
+                std::memcpy(output + index * sizeof(unorm), &unorm, sizeof(unorm));
+            } else if (readDepth) {
                 std::memcpy(output + index * sizeof(value), &value, sizeof(value));
-            else
+            } else {
                 output[index] = static_cast<uint8_t>(stencil[index]);
+            }
         }
         return Done<void>{ok()};
     }

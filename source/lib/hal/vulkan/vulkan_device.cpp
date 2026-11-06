@@ -1296,8 +1296,8 @@ Made<VkPipeline> VulkanDevice::variant(StageObjects &stage, const runtime::Graph
         if (runtime::graphicsVariantKeysEqual(variant.key, key))
             return Made<VkPipeline>{ok(variant.pipeline)};
     if (key.sampleCount != 1 || key.colorFormats.size() > kMaxColors ||
-        (key.depthStencilFormat && key.depthStencilFormat != VK_FORMAT_D32_SFLOAT &&
-         key.depthStencilFormat != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        (key.depthStencilFormat && key.depthStencilFormat != VK_FORMAT_D16_UNORM &&
+         key.depthStencilFormat != VK_FORMAT_D32_SFLOAT && key.depthStencilFormat != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
         key.colorBlends.size() != key.colorFormats.size())
         return failure<VkPipeline>("the graphics pipeline uses an unsupported attachment configuration");
     const bool hasDepth = key.depthStencilFormat != 0;

@@ -1320,7 +1320,8 @@ Made<ID3D12PipelineState *> DirectX12Device::variant(StageObjects &stage, const 
         if (runtime::graphicsVariantKeysEqual(variant.key, key))
             return Made<ID3D12PipelineState *>{ok(variant.pipeline)};
     if (key.sampleCount != 1 || key.colorFormats.size() > kMaxColors ||
-        (key.depthStencilFormat && key.depthStencilFormat != DXGI_FORMAT_D32_FLOAT &&
+        (key.depthStencilFormat && key.depthStencilFormat != DXGI_FORMAT_D16_UNORM &&
+         key.depthStencilFormat != DXGI_FORMAT_D32_FLOAT &&
          key.depthStencilFormat != DXGI_FORMAT_D32_FLOAT_S8X24_UINT) ||
         key.colorBlends.size() != key.colorFormats.size())
         return failure<ID3D12PipelineState *>("the graphics pipeline uses an unsupported attachment configuration");
@@ -2113,6 +2114,13 @@ Made<Rendering> Builder::rendering(const runtime::GraphicsRenderScope &scope) {
             integer.view = view.clear;
             integer.set = static_cast<uint32_t>(recording_.sets.size());
             integer.color = color.clear_color;
+            // ClearUnorderedAccessViewUint saturates each value to the component's unsigned range, so a negative
+            // value of a narrower signed format clears to its two's-complement bits instead.
+            const formats::Format &entry = *formats::find(format);
+            const uint32_t bits = 8 * entry.pixelBytes / entry.components();
+            if (entry.componentClass == formats::ComponentClass::Sint && bits < 32)
+                for (uint32_t &component : integer.color.u32)
+                    component &= (1u << bits) - 1;
             integer.area = result.area;
             SetInstance descriptor;
             descriptor.resources.push_back({Write::Type::Copy, nullptr, 0, 0, view.clear});

@@ -62,4 +62,14 @@ FailureOr<Value> lowerAtan2ToSpirv(Location location, Type resultType, Value y, 
     return spirv::SelectOp::create(builder, location, resultType, useZeroResult, zeroResult, angle).getResult();
 }
 
+Value lowerRemFToSpirv(Location location, Value dividend, Value divisor, OpBuilder &builder) {
+    // GLSL, HLSL and MSL define fmod through x - y * trunc(x / y), which is NaN for an infinite divisor where C's
+    // fmod returns a finite dividend unchanged.
+    Value remainder = spirv::FRemOp::create(builder, location, dividend, divisor);
+    Value finiteOverInfinite = spirv::LogicalAndOp::create(
+        builder, location, spirv::IsInfOp::create(builder, location, divisor),
+        spirv::LogicalNotOp::create(builder, location, spirv::IsInfOp::create(builder, location, dividend)));
+    return spirv::SelectOp::create(builder, location, dividend.getType(), finiteOverInfinite, dividend, remainder);
+}
+
 } // namespace mlir::vernon

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "VernonFormats.hpp"
 #include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
@@ -40,9 +41,31 @@ inline std::optional<spirv::ImageType> spirvTextureImageType(TextureType texture
     std::optional<spirv::ImageFormat> format = spirvStorageImageFormat(texture.getFormat());
     if (!format || texture.isCube())
         return std::nullopt;
-    return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth, arrayed,
+    // A signed format needs a signed sampled type: SPIRV-Cross rejects an Rgba8i image of OpTypeInt 32 0. The texel
+    // of a read or write must match the sampled type exactly, so it is bitcast at each access.
+    const std::string_view name(texture.getFormat().data(), texture.getFormat().size());
+    const ::vernon::formats::Format *entry = ::vernon::formats::find(name);
+    Type sampledType = entry && entry->componentClass == ::vernon::formats::ComponentClass::Sint
+                           ? Type(IntegerType::get(texture.getContext(), 32, IntegerType::Signed))
+                           : texture.getElementType();
+    return spirv::ImageType::get(sampledType, *dimension, spirv::ImageDepthInfo::NoDepth, arrayed,
                                  spirv::ImageSamplingInfo::SingleSampled, spirv::ImageSamplerUseInfo::NoSampler,
                                  *format);
+}
+
+// The texel type an access to `image` uses: `texelType` with the image's sampled type as its element.
+inline Type spirvImageTexelType(spirv::ImageType image, Type texelType) {
+    auto vector = dyn_cast<VectorType>(texelType);
+    if (!vector || vector.getElementType() == image.getElementType())
+        return texelType;
+    return VectorType::get(vector.getShape(), image.getElementType());
+}
+
+inline void buildSpirvTextureStore(OpBuilder &builder, Location location, Value image, Value coordinates, Value texel) {
+    Type imageTexelType = spirvImageTexelType(cast<spirv::ImageType>(image.getType()), texel.getType());
+    if (imageTexelType != texel.getType())
+        texel = spirv::BitcastOp::create(builder, location, imageTexelType, texel);
+    spirv::ImageWriteOp::create(builder, location, image, coordinates, texel, spirv::ImageOperandsAttr(), ValueRange{});
 }
 
 inline std::optional<Type> spirvTextureDescriptorType(TextureType texture) {
@@ -77,9 +100,12 @@ inline Value buildSpirvTextureSampleBias(OpBuilder &builder, Location location, 
 inline Value buildSpirvTextureLoad(OpBuilder &builder, Location location, Type resultType, Value image,
                                    Value coordinates) {
     auto sampledImageType = dyn_cast<spirv::SampledImageType>(image.getType());
-    if (!sampledImageType)
-        return spirv::ImageReadOp::create(builder, location, resultType, image, coordinates, spirv::ImageOperandsAttr(),
-                                          ValueRange{});
+    if (!sampledImageType) {
+        Type imageTexelType = spirvImageTexelType(cast<spirv::ImageType>(image.getType()), resultType);
+        Value texel = spirv::ImageReadOp::create(builder, location, imageTexelType, image, coordinates,
+                                                 spirv::ImageOperandsAttr(), ValueRange{});
+        return imageTexelType == resultType ? texel : spirv::BitcastOp::create(builder, location, resultType, texel);
+    }
     Value texels = spirv::ImageOp::create(builder, location, sampledImageType.getImageType(), image);
     return spirv::ImageFetchOp::create(builder, location, resultType, texels, coordinates, spirv::ImageOperandsAttr(),
                                        ValueRange{});

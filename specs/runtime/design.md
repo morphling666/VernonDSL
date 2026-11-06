@@ -818,14 +818,28 @@ Render scopes:
   build step; `VernonGeneratedFormatsCheck` fails when it is stale.
 - `vernonHalDeviceGetFormatCapabilities` returns the table baseline
   intersected with what the backend reports, so a device never claims more than
-  every backend allows. Vulkan queries per-format features; OpenGL applies
-  version and extension rules: OpenGL ES float color rendering
+  every backend allows. Vulkan queries per-format features, counts a format
+  copyable only if it can also be sampled, and reports storage for formats
+  outside the core SPIR-V set only when it enables
+  `shaderStorageImageExtendedFormats`; every SPIR-V module declares
+  `StorageImageExtendedFormats`, because only formats the device reports are
+  bound. D3D12 reports nothing for a format that cannot be a `TEXTURE2D`.
+  OpenGL applies version and extension rules: OpenGL ES float color rendering
   needs ES 3.2 or `GL_EXT_color_buffer_float`, 32-bit float filtering and
-  blending need `GL_OES_texture_float_linear` and `GL_EXT_float_blend`, ES never
-  linearly filters depth, and ES storage images take only the ES 3.1 formats.
-  OpenGL storage needs compute, multisampling comes from `GL_NUM_SAMPLE_COUNTS`,
-  and copies need a color-renderable format because 2D copies are framebuffer
-  blits.
+  blending need `GL_OES_texture_float_linear` and `GL_EXT_float_blend`, 16-bit
+  unorm and snorm need `GL_EXT_texture_norm16`, snorm rendering needs
+  `GL_EXT_render_snorm`, ES has no BGRA formats, ES never linearly filters
+  depth, and ES storage images take only the ES 3.1 formats. OpenGL storage
+  needs compute, multisampling comes from `GL_NUM_SAMPLE_COUNTS`, and copies
+  need a color-renderable format because 2D copies are framebuffer blits.
+- The table holds the uncompressed formats every backend shares. Block
+  compression has a different host layout and per-platform families (BC on
+  desktop, ETC2 and ASTC on mobile), so it is separate work.
+  `d24_unorm_s8_uint` is left out because Apple GPUs and AMD's Vulkan driver
+  lack it, so a portable Program could not rely on it, and its packed
+  depth-stencil layout differs from the float-plus-stencil layout the
+  depth-stencil paths assume. `s8_uint` is left out because D3D12 has no
+  stencil-only format and image aspects cannot name stencil alone.
 - Program load checks every image storage and graphics attachment against
   those capabilities, so an unsupported target fails at load with
   `PROGRAM_OPERATION_UNSUPPORTED` rather than at its first call. An
@@ -838,7 +852,10 @@ Render scopes:
   D3D12 `ClearRenderTargetView` takes floats, which cannot carry every 32-bit
   integer, so the D3D12 device creates integer color attachments with
   unordered access and clears them with `ClearUnorderedAccessViewUint`
-  (preferred over a clear draw, which needs a pipeline per format).
+  (preferred over a clear draw, which needs a pipeline per format). That
+  call saturates each value to the component's unsigned range, so values of
+  8- and 16-bit signed formats are masked to their two's-complement bits
+  first.
 - Every HAL backend checks the image and view descriptor rules that hold on
   every backend (`validImage` and `validView` in `hal/native_images.h`, over
   `runtime/image_rules.h`: shape, mip chain length, single sample, known

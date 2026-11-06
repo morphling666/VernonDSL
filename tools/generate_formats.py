@@ -27,11 +27,22 @@ _COLUMNS = (
     "metal",
     "spirv_storage",
 )
-_COMPONENT_CLASSES = frozenset({"float", "unorm", "uint", "sint"})
+_COMPONENT_CLASSES = frozenset({"float", "unorm", "snorm", "uint", "sint"})
 _CAPABILITIES = ("renderable", "blendable", "filterable", "storage", "resolvable", "multisample", "copyable")
-_ELEMENT_BYTES = {"UINT8": ("uint8", 1), "FLOAT16": ("float16", 2), "FLOAT32": ("float32", 4), "UINT32": ("uint32", 4)}
+_ELEMENT_BYTES = {
+    "UINT8": ("uint8", 1),
+    "INT8": ("int8", 1),
+    "UINT16": ("uint16", 2),
+    "INT16": ("int16", 2),
+    "FLOAT16": ("float16", 2),
+    "UINT32": ("uint32", 4),
+    "INT32": ("int32", 4),
+    "FLOAT32": ("float32", 4),
+}
 _ASPECTS = {"DEPTH": "depth", "DEPTH_STENCIL": "depth stencil"}
-_COLOR_DATA_FORMATS = frozenset({"RED", "RG", "RGB", "RGBA"})
+_COLOR_COMPONENTS = {"RED": 1, "RG": 2, "RGB": 3, "RGBA": 4, "BGRA": 4}
+# A packed integer texel holds several components in one element, so its component widths are not the element's.
+_PACKED_INTEGER_BITS = {"rgb10a2_uint": (10, 10, 10, 2)}
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,8 @@ class _Row:
     component_class: str
     element: str
     channels: int
+    components: int
+    integer_bits: tuple[int, ...]
     pixel_bytes: int
     aspects: str
     capabilities: str
@@ -78,10 +91,16 @@ def _parse_row(arguments: str) -> _Row:
     data_format = column["data_format"]
     if data_format in _ASPECTS:
         channels = 1
-    elif data_format in _COLOR_DATA_FORMATS and pixel_bytes % element_bytes == 0:
+    elif data_format in _COLOR_COMPONENTS and pixel_bytes % element_bytes == 0:
         channels = pixel_bytes // element_bytes
     else:
         raise ValueError(f"{name}: {pixel_bytes} bytes do not hold whole {data_format} {element} texels")
+    components = _COLOR_COMPONENTS.get(data_format, 1)
+    integer_bits: tuple[int, ...] = ()
+    if component_class in ("uint", "sint"):
+        integer_bits = _PACKED_INTEGER_BITS.get(name, (8 * element_bytes,) * components)
+        if channels not in (1, components) or len(integer_bits) != components:
+            raise ValueError(f"{name}: integer components do not fill {data_format} {element} texels")
     return _Row(
         name=name,
         native_name=column["NAME"],
@@ -89,6 +108,8 @@ def _parse_row(arguments: str) -> _Row:
         component_class=component_class,
         element=element,
         channels=channels,
+        components=components,
+        integer_bits=integer_bits,
         pixel_bytes=pixel_bytes,
         aspects=_ASPECTS.get(data_format, "color"),
         capabilities=" ".join(word for word in _CAPABILITIES if word in words),
@@ -130,6 +151,8 @@ def _rendered() -> str:
             f'    component_class="{row.component_class}",',
             f'    element="{row.element}",',
             f"    channels={row.channels},",
+            f"    components={row.components},",
+            f"    integer_bits={row.integer_bits!r},",
             f"    pixel_bytes={row.pixel_bytes},",
             f'    aspects=_words("{row.aspects}"),',
             f'    capabilities=_words("{row.capabilities}"),',

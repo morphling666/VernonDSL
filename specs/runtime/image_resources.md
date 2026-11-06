@@ -257,9 +257,23 @@ texture enum value, component class, pixel size, host data format and type,
 the native GL, Vulkan, D3D12, Metal and SPIR-V formats, and the baseline
 capabilities its class allows (renderable, blendable, filterable, storage,
 resolvable, multisample, copyable). Every C++ and Python consumer reads it
-(the reasons are in the [runtime design](design.md) section 12). Integer
-formats (`r32_uint`, `rg32_uint`) are never blendable, filterable or
-resolvable.
+(the reasons are in the [runtime design](design.md) section 12). The table
+holds every uncompressed format all backends share:
+
+- `float`: `r16`/`rg16`/`rgba16`/`r32`/`rg32`/`rgb32`/`rgba32_float`,
+  `r11g11b10_float` and `rgb9e5_ufloat`;
+- `unorm`: `r8`/`rg8`/`rgb8`/`rgba8`/`r16`/`rg16`/`rgba16_unorm`,
+  `bgra8_unorm`, `rgb10a2_unorm`, and the `rgba8_srgb` and `bgra8_srgb`
+  encodings;
+- `snorm`: `r8`/`rg8`/`rgba8`/`r16`/`rg16`/`rgba16_snorm`, sampled as `f32`;
+- `uint` and `sint`: one, two and four components of 8, 16 and 32 bits, and
+  `rgb10a2_uint`;
+- depth: `d16_unorm`, `d32_float` and `d32_float_s8_uint`.
+
+Integer formats are never blendable, filterable or resolvable. `rgb9e5_ufloat`
+is only sampled and copied. Block-compressed formats, `d24_unorm_s8_uint` and
+`s8_uint` are not in the table (see the [runtime design](design.md)
+section 12).
 
 A device narrows the baseline: `vernonHalDeviceGetFormatCapabilities` reports
 the capabilities it actually supports, and Program load rejects, with
@@ -267,8 +281,26 @@ the capabilities it actually supports, and Program load rejects, with
 store or multisample, and blending on an integer-only attachment.
 
 Host image data follows the row's host data format and type, tightly packed
-row by row, with no conversion. Integer formats transfer one host `uint32`
-per component, so uploads and readbacks are exact.
+row by row, with no conversion, so uploads and readbacks are exact. A packed
+format (`rgb10a2`, `r11g11b10_float`, `rgb9e5_ufloat`) transfers one `uint32`
+per texel. OpenGL ES guarantees `glReadPixels` of a color buffer only as four
+components in one pair per component class: RGBA `FLOAT` for float, RGBA
+`UNSIGNED_BYTE` or `UNSIGNED_SHORT` for 8- or 16-bit unorm, RGBA `BYTE` or
+`SHORT` for snorm, and `RGBA_INTEGER` `UNSIGNED_INT` or `INT` for integers;
+any other pair must be the one the framebuffer names as its implementation
+read pair. The OpenGL backend reads in the image's own pair when the
+implementation names it, and otherwise through the guaranteed pair,
+repacking the texels to the row's components and type, so the host sees the
+same bytes on every backend. The own pair is preferred because some
+implementations lose the sign of 16-bit snorm components read as RGBA. ES
+reads depth only through a compute copy, which converts `d16_unorm` depth
+back to its 16-bit codes.
+
+Python `Texture` constructors default to color attachment usage only for
+formats whose baseline is renderable, and drop it when the session's device
+cannot render the format. `RuntimeSession.format_capabilities(format)` returns
+the capabilities the current device supports, as the names of the baseline
+words.
 
 Color clears take a `VernonClearColor` (`VernonGraphicsState.h`), read
 according to the attachment's component class, so integer clears are exact

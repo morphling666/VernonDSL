@@ -89,6 +89,7 @@ constexpr Enum kColor = 0x1800;
 constexpr Enum kDepth = 0x1801;
 constexpr Enum kStencil = 0x1802;
 constexpr Enum kDepthStencil = 0x84F9;
+constexpr Enum kDepthComponent16 = 0x81A5;
 constexpr Enum kDepthComponent32f = 0x8CAC;
 constexpr Enum kDepth32fStencil8 = 0x8CAD;
 constexpr Enum kDepthTest = 0x0B71;

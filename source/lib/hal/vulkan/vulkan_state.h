@@ -194,6 +194,7 @@ struct DeviceState {
     bool multiDrawIndirect{};
     bool shaderBufferFloat32AtomicAdd{};
     bool imageCubeArray{};
+    bool shaderStorageImageExtendedFormats{};
     // VK_KHR_surface, the platform's surface extension and VK_KHR_swapchain are enabled.
     bool presentation{};
     bool portabilityEnumeration{};

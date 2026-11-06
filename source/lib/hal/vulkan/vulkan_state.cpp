@@ -240,6 +240,8 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     imageCubeArray = features.features.imageCubeArray == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.imageCubeArray = features.features.imageCubeArray;
+    shaderStorageImageExtendedFormats = features.features.shaderStorageImageExtendedFormats == VK_TRUE;
+    enabledFeatures.shaderStorageImageExtendedFormats = features.features.shaderStorageImageExtendedFormats;
     multiDrawIndirect =
         features.features.multiDrawIndirect == VK_TRUE && features.features.drawIndirectFirstInstance == VK_TRUE;
     enabledFeatures.multiDrawIndirect = multiDrawIndirect ? VK_TRUE : VK_FALSE;
@@ -357,6 +359,7 @@ void DeviceState::shutdown() {
     portabilityEnumeration = false;
     portabilitySubset = false;
     imageCubeArray = false;
+    shaderStorageImageExtendedFormats = false;
     cmdBeginDebugUtilsLabel = nullptr;
     cmdEndDebugUtilsLabel = nullptr;
     cmdInsertDebugUtilsLabel = nullptr;

@@ -59,13 +59,15 @@ def unsigned_builtins(
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def float_floor_division(
-    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    quotients: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    remainders: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     dividends: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     divisors: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
-    output[x] = dividends[x] // divisors[x]
+    quotients[x] = dividends[x] // divisors[x]
+    remainders[x] = dividends[x] % divisors[x]
 
 
 @vd.kernel(workgroup_size=(4, 1, 1))
@@ -144,7 +146,7 @@ def _signed_expected(rows: np.ndarray) -> np.ndarray:
 
 def _floor_division_operands() -> tuple[np.ndarray, np.ndarray]:
     # Shading-language fmod is approximate, so inexact divisors pair with small dividends; the floor, sign, and
-    # zero-divisor rules are what must agree on every backend. It is also NaN for an infinite divisor, as `%` is.
+    # zero-divisor and infinite-operand rules are what must agree on every backend.
     pairs = (
         (7.5, 2.0),
         (-7.5, 2.0),
@@ -166,6 +168,10 @@ def _floor_division_operands() -> tuple[np.ndarray, np.ndarray]:
         (float("nan"), 1.0),
         (-3.0, 4.0),
         (3.0, -4.0),
+        (3.0, float("inf")),
+        (-3.0, float("inf")),
+        (3.0, float("-inf")),
+        (float("inf"), 2.0),
     )
     dividends, divisors = (np.array(axis, dtype=np.float32) for axis in zip(*pairs, strict=True))
     return dividends, divisors
@@ -203,19 +209,21 @@ class BuiltinMathKernelTests(unittest.TestCase):
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_float_floor_division_matches_numpy(self, backend: BackendRow) -> None:
         dividends, divisors = _floor_division_operands()
-        output = vd.storage.zeros(dtype=vd.f32, shape=(dividends.size,))
+        quotients = vd.storage.zeros(dtype=vd.f32, shape=(dividends.size,))
+        remainders = vd.storage.zeros(dtype=vd.f32, shape=(dividends.size,))
         float_floor_division(
-            output,
+            quotients,
+            remainders,
             vd.storage.from_numpy(dividends),
             vd.storage.from_numpy(divisors),
             grid=(dividends.size // 4, 1, 1),
         )
-        actual = output.to_numpy()
         with np.errstate(divide="ignore", invalid="ignore"):
-            expected = np.floor_divide(dividends, divisors)
-        np.testing.assert_array_equal(actual, expected)
-        numbers = ~np.isnan(expected)
-        np.testing.assert_array_equal(np.signbit(actual[numbers]), np.signbit(expected[numbers]))
+            expected = (np.floor_divide(dividends, divisors), np.remainder(dividends, divisors))
+        for actual, wanted in zip((quotients.to_numpy(), remainders.to_numpy()), expected, strict=True):
+            np.testing.assert_array_equal(actual, wanted)
+            numbers = ~np.isnan(wanted)
+            np.testing.assert_array_equal(np.signbit(actual[numbers]), np.signbit(wanted[numbers]))
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_vector_comparisons_select_elementwise(self, backend: BackendRow) -> None:
@@ -290,6 +298,8 @@ class _BuiltinMathFragmentCases:
                 (-0.25, 2.0, 0.0, 3.0),
                 (7.5, 3.0, 8.0, 1.0),
                 (-7.5, 3.0, -7.5, 3.0),
+                (-3.0, np.inf, 1.0, 2.0),
+                (3.0, -np.inf, 3.0, -np.inf),
             ),
             dtype=np.float32,
         )

@@ -35,16 +35,47 @@ uint32_t mipExtent(uint32_t size, uint32_t level) { return (std::max)(size >> le
 size_t alignUp(size_t value, size_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
 // The format an image's resource is created in: the typeless format of its family where views reinterpret it, so
-// that an 8-bit RGBA image has UNORM and sRGB views and a sampled depth image has a color view.
+// that an 8-bit RGBA or BGRA image has UNORM and sRGB views and a sampled depth image has a color view.
 DXGI_FORMAT resourceFormat(DXGI_FORMAT format, uint32_t usage) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
         return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:
+        return (usage & VERNON_IMAGE_SAMPLED) ? DXGI_FORMAT_R16_TYPELESS : format;
     case DXGI_FORMAT_D32_FLOAT:
         return (usage & VERNON_IMAGE_SAMPLED) ? DXGI_FORMAT_R32_TYPELESS : format;
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
         return (usage & VERNON_IMAGE_SAMPLED) ? DXGI_FORMAT_R32G8X24_TYPELESS : format;
+    default:
+        return format;
+    }
+}
+
+// The color format a shader reads a depth format's depth through.
+DXGI_FORMAT depthColorFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_D16_UNORM:
+        return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_D32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default:
+        return format;
+    }
+}
+
+// UAVs have no sRGB formats, so an sRGB image is stored through its UNORM view.
+DXGI_FORMAT linearFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
     default:
         return format;
     }
@@ -138,7 +169,9 @@ bool planCopies(ID3D12Device *device, const VernonImageDescriptor &descriptor, c
             copy.transfer = index;
             copy.plane = planes[which];
             copy.subresource = image.subresource(region.mip_level, region.array_layer, copy.plane);
-            copy.texelBytes = !depth ? static_cast<uint32_t>(*bytes / texels) : copy.plane == 0 ? 4u : 1u;
+            copy.texelBytes = !formats::hasStencil(descriptor.format) ? static_cast<uint32_t>(*bytes / texels)
+                              : copy.plane == 0                       ? 4u
+                                                                      : 1u;
             if (depth) {
                 copy.regionX = region.offset_x;
                 copy.regionY = region.offset_y;
@@ -505,12 +538,11 @@ public:
             return Done<uint32_t>{ok(0u)};
         const D3D12_FEATURE_DATA_FORMAT_SUPPORT support = query(native);
         // Depth images are sampled through a color view of their typeless resource, which decides filtering.
-        const D3D12_FEATURE_DATA_FORMAT_SUPPORT sampled = native == DXGI_FORMAT_D32_FLOAT ? query(DXGI_FORMAT_R32_FLOAT)
-                                                          : native == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                                                              ? query(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
-                                                              : support;
+        const D3D12_FEATURE_DATA_FORMAT_SUPPORT sampled = query(depthColorFormat(native));
         const auto has1 = [&](D3D12_FORMAT_SUPPORT1 bits) { return (support.Support1 & bits) == bits; };
         const auto has2 = [&](D3D12_FORMAT_SUPPORT2 bits) { return (support.Support2 & bits) == bits; };
+        if (!has1(D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+            return Done<uint32_t>{ok(0u)};
         uint32_t result = VERNON_HAL_FORMAT_COPYABLE;
         if (has1(formats::hasDepth(format) ? D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL : D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
             result |= VERNON_HAL_FORMAT_RENDERABLE;
@@ -688,9 +720,9 @@ public:
         if (!(native.flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !state_.mipmapRoot)
             return fail(VERNON_HAL_UNSUPPORTED, "the device cannot filter the image's mips");
         const bool volume = descriptor.dimension == VERNON_TEXTURE_3D;
-        const bool srgb = descriptor.format == VERNON_TEXTURE_RGBA8_SRGB;
         const DXGI_FORMAT shaderFormat = d3d12::dxgiFormat(descriptor.format);
-        const DXGI_FORMAT storageFormat = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM : shaderFormat;
+        const DXGI_FORMAT storageFormat = linearFormat(shaderFormat);
+        const bool srgb = storageFormat != shaderFormat;
         const uint32_t mips = descriptor.mip_level_count;
         const uint32_t layers = native.layers;
         std::lock_guard<std::mutex> guard(state_.mutex);
@@ -1022,7 +1054,7 @@ private:
         if (usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT)
             flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         // Mips are filtered by a compute shader, and integer color attachments are cleared, through UAVs.
-        const DXGI_FORMAT storage = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
+        const DXGI_FORMAT storage = linearFormat(format);
         const bool mipmapped = descriptor.mip_level_count > 1 && !formats::isInteger(descriptor.format);
         const bool integerTarget = (usage & VERNON_IMAGE_COLOR_ATTACHMENT) && formats::isInteger(descriptor.format);
         if (!depth && ((usage & VERNON_IMAGE_STORAGE) || ((mipmapped || integerTarget) && typedStore(storage))))
@@ -1130,8 +1162,8 @@ private:
         srv.Format = view.format;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         uint32_t plane = 0;
-        if (view.format == DXGI_FORMAT_D32_FLOAT) {
-            srv.Format = DXGI_FORMAT_R32_FLOAT;
+        if (view.format == DXGI_FORMAT_D16_UNORM || view.format == DXGI_FORMAT_D32_FLOAT) {
+            srv.Format = depthColorFormat(view.format);
         } else if (view.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
             if (view.aspects == VERNON_IMAGE_ASPECT_STENCIL) {
                 // The stencil plane reads in green; shaders read it in red.

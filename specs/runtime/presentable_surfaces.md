@@ -197,9 +197,10 @@ asset per format was rejected because it duplicates the declaration.
 Metal's `CAMetalLayer` has no RGBA8, so the Metal surface keeps RGBA8 ring
 images and present draws the presented image into the layer's BGRA8
 drawable with a fullscreen-triangle pass, which also converts to the
-drawable's encoding. Adding BGRA8 rows to `VernonFormats.def` was rejected:
-every schedule and cooked asset would then need a second variant per
-surface format for one backend's swapchain.
+drawable's encoding. `bgra8_unorm` and `bgra8_srgb` are ordinary image
+formats, but a Metal surface configured as BGRA8 was rejected: every schedule
+and cooked asset would then need a second variant per surface format for one
+backend's swapchain.
 
 ## 7. Runtime
 

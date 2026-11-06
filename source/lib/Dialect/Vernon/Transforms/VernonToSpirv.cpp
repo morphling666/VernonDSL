@@ -1575,7 +1575,10 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         if (name == arith::DivFOp::getOperationName())
             return lowerBinary([&](Value a, Value b) { return spirv::FDivOp::create(builder, location, a, b); });
         if (name == arith::RemFOp::getOperationName())
-            return lowerBinary([&](Value a, Value b) { return spirv::FRemOp::create(builder, location, a, b); });
+            return lowerCompositeElementwise(location, *resultType, ArrayRef<Value>{lhs, rhs}, builder,
+                                             [&](Type, ArrayRef<Value> values) -> FailureOr<Value> {
+                                                 return lowerRemFToSpirv(location, values[0], values[1], builder);
+                                             });
         if (name == arith::DivSIOp::getOperationName())
             return lowerBinary([&](Value a, Value b) { return spirv::SDivOp::create(builder, location, a, b); });
         if (name == arith::DivUIOp::getOperationName())
@@ -1651,8 +1654,7 @@ LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, I
     Value texel = mapping.lookupOrNull(intrinsic.getOperand(2));
     if (!image || !coordinates || !texel)
         return failure();
-    spirv::ImageWriteOp::create(builder, operation.getLoc(), image, coordinates, texel, spirv::ImageOperandsAttr(),
-                                ValueRange{});
+    buildSpirvTextureStore(builder, operation.getLoc(), image, coordinates, texel);
     return success();
 }
 

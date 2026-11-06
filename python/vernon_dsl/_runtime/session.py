@@ -8,10 +8,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
+from .._texture_format import TextureFormat
+
 try:
     from .. import _native
 except (ImportError, OSError):
     _native = None
+
+# The words of VernonHalFormatCapabilityBits, in bit order.
+_CAPABILITY_BITS = ("renderable", "blendable", "filterable", "storage", "resolvable", "multisample", "copyable")
 
 
 @dataclass(frozen=True)
@@ -469,6 +474,11 @@ class RuntimeSession:
     @property
     def retired(self) -> bool:
         return self._retired
+
+    def format_capabilities(self, texture_format: TextureFormat) -> frozenset[str]:
+        """The capabilities the session's device gives ``texture_format``: its baseline, narrowed by the device."""
+        bits = self.device.format_capabilities(getattr(_native.TextureFormat, texture_format._native_name))
+        return frozenset(word for index, word in enumerate(_CAPABILITY_BITS) if bits & (1 << index))
 
     @property
     def interactive_glsl_version(self) -> int:

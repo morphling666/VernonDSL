@@ -2186,10 +2186,8 @@ ranked Values serialize as `tensor`.
 Aggregate field order is semantic, field names are unique NFC identifiers,
 and nesting is recursive. Tensor/type dimensions MUST equal Value shape
 dimensions after symbol substitution. Resource formats are the names in
-`source/include/VernonFormats.def` (`r8_unorm`, `rg8_unorm`, `rgb8_unorm`,
-`rgba8_unorm`, `rgba8_srgb`, `r16_float`, `rgba16_float`, `r32_float`,
-`rg32_float`, `rgb32_float`, `rgba32_float`, `r11g11b10_float`, `d32_float`,
-`d32_float_s8_uint`, `r32_uint`, `rg32_uint`) or `unknown`. `unknown` is
+`source/include/VernonFormats.def` (listed in
+[`runtime/image_resources.md`](../runtime/image_resources.md)) or `unknown`. `unknown` is
 allowed only for sampled image logical types and the borrowed Storage they
 bind, whose `sample_result_class` then constrains the bound view's format.
 

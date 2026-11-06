@@ -345,6 +345,12 @@ def identifier_pair_fragment(
     return vd.Vector([base + column * vd.u32(0x40000000) + row, vd.u32(0xFFFFFFFF) - column * vd.u32(0x01010101) - row])
 
 
+@vd.fragment
+def half_pair_fragment() -> vd.Vector[vd.f32, 2]:
+    pixel = vd.fragment_coord()
+    return vd.Vector([(pixel.x - 2.0) * 0.001, pixel.y * -0.25])
+
+
 @vd.struct
 class InterpolatedVaryings:
     position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
@@ -368,6 +374,97 @@ def interpolation_fragment(
     flat: Annotated[vd.f32, vd.varying(vd.Interpolation.FLAT)],
 ) -> vd.Vector[vd.f32, 4]:
     return vd.Vector([perspective, linear, flat, 1.0])
+
+
+@vd.fragment
+def first_varying_fragment(
+    perspective: Annotated[vd.f32, vd.varying()],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([perspective, 0.0, 0.0, 1.0])
+
+
+@vd.fragment
+def coordinate_fragment() -> vd.Vector[vd.f32, 4]:
+    pixel = vd.fragment_coord()
+    return vd.Vector([pixel.x, pixel.y, 0.0, 1.0])
+
+
+@vd.fragment
+def unread_varying_fragment(
+    base: Annotated[vd.u32, vd.varying()],
+) -> vd.Vector[vd.f32, 4]:
+    pixel = vd.fragment_coord()
+    return vd.Vector([pixel.x, pixel.y, 0.0, 1.0])
+
+
+# Fragments that write a uniform to a target of each result class and component count.
+@vd.fragment
+def f32x1_fragment(color: Annotated[vd.f32, vd.uniform()]) -> vd.f32:
+    return color
+
+
+@vd.fragment
+def f32x2_fragment(color: Annotated[vd.Vector[vd.f32, 2], vd.uniform()]) -> vd.Vector[vd.f32, 2]:
+    return color
+
+
+@vd.fragment
+def f32x3_fragment(color: Annotated[vd.Vector[vd.f32, 3], vd.uniform()]) -> vd.Vector[vd.f32, 3]:
+    return color
+
+
+@vd.fragment
+def u32x1_fragment(color: Annotated[vd.u32, vd.uniform()]) -> vd.u32:
+    return color
+
+
+@vd.fragment
+def u32x2_fragment(color: Annotated[vd.Vector[vd.u32, 2], vd.uniform()]) -> vd.Vector[vd.u32, 2]:
+    return color
+
+
+@vd.fragment
+def u32x4_fragment(color: Annotated[vd.Vector[vd.u32, 4], vd.uniform()]) -> vd.Vector[vd.u32, 4]:
+    return color
+
+
+@vd.fragment
+def i32x1_fragment(color: Annotated[vd.i32, vd.uniform()]) -> vd.i32:
+    return color
+
+
+@vd.fragment
+def i32x2_fragment(color: Annotated[vd.Vector[vd.i32, 2], vd.uniform()]) -> vd.Vector[vd.i32, 2]:
+    return color
+
+
+@vd.fragment
+def i32x4_fragment(color: Annotated[vd.Vector[vd.i32, 4], vd.uniform()]) -> vd.Vector[vd.i32, 4]:
+    return color
+
+
+@vd.fragment
+def float_fetch_fragment(
+    source: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+) -> vd.Vector[vd.f32, 4]:
+    pixel = vd.fragment_coord()
+    return vd.texture_load(source, vd.Vector([vd.i32(pixel.x), vd.i32(pixel.y)]))
+
+
+@vd.fragment
+def uint_fetch_fragment(
+    source: Annotated[vd.Texture["2d", vd.u32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+) -> vd.Vector[vd.u32, 4]:
+    pixel = vd.fragment_coord()
+    return vd.texture_load(source, vd.Vector([vd.i32(pixel.x), vd.i32(pixel.y)]))
+
+
+@vd.fragment
+def sint_fetch_fragment(
+    source: Annotated[vd.Texture["2d", vd.i32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+) -> vd.Vector[vd.i32, 4]:
+    pixel = vd.fragment_coord()
+    return vd.texture_load(source, vd.Vector([vd.i32(pixel.x), vd.i32(pixel.y)]))
 
 
 @vd.fragment

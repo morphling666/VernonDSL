@@ -949,7 +949,8 @@ Made<const StageObjects::Variant *> MetalDevice::variant(StageObjects &stage, co
         if (runtime::graphicsVariantKeysEqual(variant.key, key))
             return Found{ok(&variant)};
     if (key.sampleCount != 1 || key.colorFormats.size() > kMaxColors ||
-        (key.depthStencilFormat && key.depthStencilFormat != MTLPixelFormatDepth32Float &&
+        (key.depthStencilFormat && key.depthStencilFormat != MTLPixelFormatDepth16Unorm &&
+         key.depthStencilFormat != MTLPixelFormatDepth32Float &&
          key.depthStencilFormat != MTLPixelFormatDepth32Float_Stencil8) ||
         key.colorBlends.size() != key.colorFormats.size())
         return failure<const StageObjects::Variant *>(

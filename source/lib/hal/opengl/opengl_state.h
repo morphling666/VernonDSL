@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace vernon::hal::opengl {
@@ -90,6 +91,9 @@ struct DeviceState {
     // `layer` selects the layer of 2D-array and cube-array targets; other targets ignore it.
     bool downloadImage2D(const Image &image, Enum target, Int mipLevel, Int layer, Int x, Int y, Size width,
                          Size height, Enum externalFormat, Enum type, void *destination, std::string &error);
+    // The format and type glReadPixels reads a color image in besides the pair its component class guarantees; OpenGL
+    // ES reads in no other pair. Zeros when the image is not readable as a color attachment.
+    std::pair<Enum, Enum> implementationColorReadPair(const Image &image, Enum target, Int mipLevel, Int layer);
     bool downloadImage3D(const Image &image, Int mipLevel, Int x, Int y, Int z, Size width, Size height, Size depth,
                          Enum externalFormat, Enum type, size_t layerSize, void *destination, std::string &error);
     // Writes one 32-bit word per texel of the region into `destination` from offset 0, row by row from (x, y): the
@@ -160,6 +164,8 @@ struct DeviceState {
     Uint depthStencilCopySampler{};
 
 private:
+    // A new framebuffer, bound, that reads `image` at `attachment`; zero, deleted, when it is incomplete.
+    Uint readFramebuffer(const Image &image, Enum target, Int mipLevel, Int layer, Enum attachment);
     Uint depthStencilCopyProgram(Enum target, DepthStencilAspect aspect, std::string &error);
     Size debugLabelLength(std::string_view label) const;
 

@@ -323,15 +323,19 @@ def _graphics_pipeline_state_data(value: GraphicsPipelineState) -> dict[str, Any
     return normalize(value)
 
 
-_INTEGER_CLEAR_RANGES = {"uint": (0, 2**32 - 1), "sint": (-(2**31), 2**31 - 1)}
+def _integer_clear_range(texture_format: TextureFormat, component: int) -> tuple[int, int]:
+    """Components the format stores clear within their width; the rest are dropped, so any 32-bit value clears them."""
+    bits = texture_format.integer_bits[component] if component < len(texture_format.integer_bits) else 32
+    if texture_format.component_class == "uint":
+        return 0, 2**bits - 1
+    return -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
 
 
 def _validate_color_clear_value(value: Any, texture_format: TextureFormat | None) -> None:
     """Clear values follow the target's component class: integers for uint/sint formats, finite numbers otherwise."""
     components = list(value) if isinstance(value, (tuple, list, np.ndarray)) else None
-    integer_range = _INTEGER_CLEAR_RANGES.get(texture_format.component_class) if texture_format else None
-    if integer_range is not None:
-        low, high = integer_range
+    if texture_format is not None and texture_format.integer:
+        ranges = [_integer_clear_range(texture_format, index) for index in range(4)]
         if (
             components is None
             or len(components) != 4
@@ -339,10 +343,11 @@ def _validate_color_clear_value(value: Any, texture_format: TextureFormat | None
                 not isinstance(component, (int, np.integer))
                 or isinstance(component, bool)
                 or not low <= int(component) <= high
-                for component in components
+                for component, (low, high) in zip(components, ranges, strict=True)
             )
         ):
-            raise ValueError(f"{texture_format.name} clear values must contain four integers in [{low}, {high}]")
+            bounds = ", ".join(f"[{low}, {high}]" for low, high in ranges)
+            raise ValueError(f"{texture_format.name} clear values must contain four integers in {bounds}")
         return
     if (
         components is None
